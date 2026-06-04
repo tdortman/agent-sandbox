@@ -58,6 +58,31 @@ When `agent-sandbox.network.enable` is true, systemd runs `agent-sandbox-policy`
 
 See `nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for mount paths, declarative allow/deny lists, veth addresses, and proxy tuning.
 
+## Home Manager (OMP extension)
+
+Policy prompts inside [oh-my-pi](https://github.com/can1357/oh-my-pi) sessions use a TypeScript extension shipped with this flake. OMP also auto-discovers `~/.omp/agent/extensions/*/index.ts`; the Home Manager module installs this tree for you.
+
+```nix
+{
+  inputs.agent-sandbox.url = "github:tdortman/agent-sandbox";
+  inputs.agent-sandbox.inputs.nixpkgs.follows = "nixpkgs";
+}
+```
+
+```nix
+# flake.nix (snowfall-lib dotfiles example)
+homes.modules = [
+  inputs.agent-sandbox.homeModules.agent-sandbox
+];
+```
+
+```nix
+# home.nix
+programs.agent-sandbox.ompExtension.enable = true;
+```
+
+Source lives in `extensions/agent-sandbox/` (`index.ts`, `policy-client.ts`). With the extension enabled, policyd treats OMP as the primary UI (`ui_client: "omp"`) and `agent-sandbox-ui` exits when OMP is already connected.
+
 ## Architecture
 
 ```mermaid
