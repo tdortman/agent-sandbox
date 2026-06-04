@@ -6,12 +6,14 @@
   ...
 }:
 let
+  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
+
   agentSandboxLib = import ./lib.nix {
     inherit lib;
-    jail-nix = inputs.jail-nix;
+    jail-nix = flake.jail-nix;
   };
 
-  policyPkg = inputs.self.packages.${pkgs.system}.agent-sandbox;
+  policyPkg = flake.package "agent-sandbox";
 
   isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
 
