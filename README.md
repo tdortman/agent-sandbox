@@ -81,6 +81,13 @@ homes.modules = [
 programs.agent-sandbox.ompExtension.enable = true;
 ```
 
+Make sure to add the following to your `config.yml` to enable the OMP extension:
+
+```yaml
+extensions:
+    ./extensions/agent-sandbox
+```
+
 Source lives in `extensions/agent-sandbox/` (`index.ts`, `policy-client.ts`). With the extension enabled, policyd treats OMP as the primary UI (`ui_client: "omp"`) and `agent-sandbox-ui` exits when OMP is already connected.
 
 ## Architecture
