@@ -1,6 +1,6 @@
 //! Approve a pending network or elevation request.
 
-use agent_sandbox_core::{allow_keys, ApprovalScope, RpcReply, ScopeActionReply};
+use agent_sandbox_core::{ApprovalScope, RpcReply, ScopeActionReply};
 
 use crate::wire::{NetworkScopeOp, PendingDecision, SudoScopeOp};
 
@@ -30,12 +30,8 @@ impl PolicyStore {
             let host = pending.host.clone().unwrap_or_default();
             let port = pending.port.unwrap_or(0);
             if scope == ApprovalScope::Once {
-                {
-                    let mut inner = self.inner.lock().await;
-                    for key in allow_keys(&host, port) {
-                        inner.once_allow.insert(key);
-                    }
-                }
+                // UI "allow once" only unblocks this pending check. Do not add to once_allow —
+                // that would auto-allow the next connection without a prompt (see Python policyd).
                 Self::audit("approve", Some(&host), Some(port), scope_label);
                 self.finish_network(&pending_id, true, "once").await;
                 return RpcReply::ScopeAction(ScopeActionReply::ok_network(
