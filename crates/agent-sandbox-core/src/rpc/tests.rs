@@ -1,6 +1,6 @@
 use super::{
-    CheckReply, RegisterUiReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, StatusReply,
-    UiPush,
+    CheckReply, ElevateReply, RegisterUiReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
+    StatusReply, UiPush,
 };
 
 #[test]
@@ -62,6 +62,41 @@ fn status_reply_includes_merged_policy() {
     };
     let json = serde_json::to_value(&reply).unwrap();
     assert!(json.get("merged").unwrap().is_object());
+}
+
+#[test]
+fn check_reply_deserializes_as_check_not_simple() {
+    let line = serde_json::to_string(&CheckReply::allowed("once")).unwrap();
+    let reply: RpcReply = serde_json::from_str(&line).unwrap();
+    assert!(matches!(reply, RpcReply::Check(c) if c.allowed && c.source == "once"));
+}
+
+#[test]
+fn elevate_reply_deserializes_as_elevate_not_simple() {
+    let line = serde_json::to_string(&ElevateReply::executed(
+        0,
+        "root\n".into(),
+        String::new(),
+    ))
+    .unwrap();
+    let reply: RpcReply = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        reply,
+        RpcReply::Elevate(e) if e.allowed && e.exit_code == 0 && e.stdout == "root\n"
+    ));
+}
+
+#[test]
+fn scope_action_reply_deserializes_as_scope_action() {
+    let line = serde_json::to_string(&ScopeActionReply::ok_network(
+        "example.com".into(),
+        443,
+        "once",
+        None,
+    ))
+    .unwrap();
+    let reply: RpcReply = serde_json::from_str(&line).unwrap();
+    assert!(matches!(reply, RpcReply::ScopeAction(s) if s.host.as_deref() == Some("example.com")));
 }
 
 #[test]
