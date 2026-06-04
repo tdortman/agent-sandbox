@@ -1,0 +1,17 @@
+[package]
+name = "agent-sandbox-enter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-sandbox-enter"
+path = "src/main.rs"
+
+[dependencies]
+caps = "0.5"
+libc = "0.2"
+nix = { version = "0.31.3", features = ["sched"] }
