@@ -7,16 +7,19 @@ use crate::policy::Policy;
 use super::message::RpcMessage;
 
 /// policyd → client response line.
+///
+/// `Simple` must be last: it only has `ok`, so untagged serde would otherwise
+/// accept any `{"ok": true, ...}` object as `SimpleOkReply` and drop fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RpcReply {
     Error(ErrorReply),
-    Simple(SimpleOkReply),
     RegisterUi(RegisterUiReply),
     Check(CheckReply),
     Elevate(ElevateReply),
     ScopeAction(ScopeActionReply),
     Status(StatusReply),
+    Simple(SimpleOkReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
