@@ -41,15 +41,15 @@
       "locked": {
         "lastModified": 1772137954,
         "narHash": "sha256-h4MGNbOo7L3RHi4uNFmsg5g17/DHXEfnv/xiG6BrNFQ=",
-        "ref": "refs/heads/main",
+        "owner": "~alexdavid",
+        "repo": "jail.nix",
         "rev": "42b355c38ca63dab4904acc5c0d95f17954a8c9b",
-        "revCount": 111,
-        "type": "git",
-        "url": "https://git.sr.ht/~alexdavid/jail.nix"
+        "type": "sourcehut"
       },
       "original": {
-        "type": "git",
-        "url": "https://git.sr.ht/~alexdavid/jail.nix"
+        "owner": "~alexdavid",
+        "repo": "jail.nix",
+        "type": "sourcehut"
       }
     },
     "nixpkgs": {
