@@ -13,6 +13,46 @@ use crate::wire::{MergeContext, NetworkCheckRequest, UiSpawnContext, UiSpawnGate
 use super::types::{Pending, PendingKind, PolicyStore};
 
 impl PolicyStore {
+    /// Finish pending network checks that declarative/session policy already allows (e.g. after OMP registers).
+    pub async fn resolve_pending_declarative_allow(&self) {
+        let pending: Vec<Pending> = self
+            .inner
+            .lock()
+            .await
+            .pending
+            .values()
+            .filter(|p| p.kind == PendingKind::Network)
+            .cloned()
+            .collect();
+        for p in pending {
+            let Some(host) = p.host.clone() else {
+                continue;
+            };
+            let Some(port) = p.port.filter(|&p| p > 0) else {
+                continue;
+            };
+            let merge = MergeContext {
+                paths: SandboxPaths::from_wire(p.cwd.clone(), p.home.clone(), p.project_root.clone()),
+                ids: Default::default(),
+            };
+            let Some(source) = self.allow_source(&host, port, merge).await else {
+                continue;
+            };
+            if source == "deny" || source == "once" {
+                continue;
+            }
+            tracing::info!(
+                %host,
+                port,
+                %source,
+                pending_id = %p.id,
+                "auto-allow pending (policy already allows)"
+            );
+            self.finish_network(&p.id, true, &source).await;
+            self.inner.lock().await.pending.remove(&p.id);
+        }
+    }
+
     pub(crate) async fn finish_network(&self, pending_id: &str, allowed: bool, source: &str) {
         let mut inner = self.inner.lock().await;
         if let Some(tx) = inner.network_futures.remove(pending_id) {

@@ -38,6 +38,7 @@ pub async fn handle_client(store: Arc<PolicyStore>, stream: UnixStream) -> std::
 
         reply(writer.clone(), &resp).await;
         if flush_pending && resp.is_ok() {
+            store.resolve_pending_declarative_allow().await;
             store.flush_pending_to_ui().await;
         }
     }
