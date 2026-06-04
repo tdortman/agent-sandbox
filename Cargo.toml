@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/agent-sandbox-core",
     "crates/agent-sandbox-policyd",
+    "crates/agent-sandbox-proxy",
 ]
 [workspace.package]
 version = "0.1.0"
