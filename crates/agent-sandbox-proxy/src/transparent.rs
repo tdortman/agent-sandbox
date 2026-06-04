@@ -1,4 +1,5 @@
 use agent_sandbox_core::{ProcessIds, policy_host_for_connect};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
@@ -8,7 +9,7 @@ use crate::policy::check_destination;
 use crate::state::ProxyState;
 
 pub(crate) async fn handle_transparent(
-    stream: TcpStream,
+    mut stream: TcpStream,
     connect_host: String,
     port: u16,
     state: ProxyState,
@@ -35,12 +36,14 @@ pub(crate) async fn handle_transparent(
             port,
             "transparent deny (client may report TLS handshake failure)"
         );
+        let _ = stream.shutdown().await;
         return Ok(());
     }
     let remote = match TcpStream::connect((upstream_host.as_str(), port)).await {
         Ok(s) => s,
         Err(err) => {
             warn!(host = %upstream_host, port, error = %err, "transparent upstream failed");
+            let _ = stream.shutdown().await;
             return Ok(());
         }
     };
