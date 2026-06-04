@@ -15,7 +15,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    jail-nix.url = "git+https://git.sr.ht/~alexdavid/jail.nix";
+    jail-nix.url = "sourcehut:~alexdavid/jail.nix";
   };
 
   outputs =
