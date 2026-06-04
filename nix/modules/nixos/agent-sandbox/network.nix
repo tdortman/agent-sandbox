@@ -200,6 +200,7 @@ lib.mkIf policyEnabled (
           AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
           AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
           AGENT_SANDBOX_KDIALOG = "${pkgs.kdePackages.kdialog}/bin/kdialog";
+          AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
         };
       };
     }
