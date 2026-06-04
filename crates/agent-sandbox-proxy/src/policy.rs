@@ -49,8 +49,12 @@ fn log_check(host: &str, port: u16, resp: &RpcReply) {
         RpcReply::Check(c) if c.source == "deny" => {
             info!(%host, port, "policy deny (project policy)");
         }
-        RpcReply::Check(_) => {
-            info!(%host, port, "policy blocked");
+        RpcReply::Check(c) => {
+            if let Some(err) = &c.error {
+                info!(%host, port, source = %c.source, error = %err, "policy blocked");
+            } else {
+                info!(%host, port, source = %c.source, "policy blocked");
+            }
         }
         RpcReply::Error(e) => {
             warn!(%host, port, error = %e.error, "policy check error");
