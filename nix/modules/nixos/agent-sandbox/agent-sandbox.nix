@@ -262,6 +262,8 @@ in
           { host = "*.factory.ai"; port = 443; }
           { host = "api.workos.com"; port = 443; }
           { host = "*.cursor.sh"; port = 443; }
+          { host = "*.cursor.com"; port = 443; }
+          { host = "*.cursorapi.com"; port = 443; }
           { host = "data.charm.land"; port = 443; }
           { host = "catwalk.charm.sh"; port = 443; }
           { host = "models.dev"; port = 443; }
