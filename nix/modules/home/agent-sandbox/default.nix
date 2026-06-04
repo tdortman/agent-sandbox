@@ -8,8 +8,10 @@
 }:
 
 let
+  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
+
   cfg = config.programs.agent-sandbox.ompExtension;
-  extensionPkg = inputs.self.packages.${pkgs.system}.agent-sandbox-omp-extension;
+  extensionPkg = flake.package "agent-sandbox-omp-extension";
   extensionPath = "${cfg.agentDir}/extensions/agent-sandbox";
 in
 {
