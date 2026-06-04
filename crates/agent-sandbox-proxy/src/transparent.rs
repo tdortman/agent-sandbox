@@ -29,7 +29,12 @@ pub(crate) async fn handle_transparent(
         );
     }
     if !check_destination(&state, &policy_host, &upstream_host, port, scheme, ids).await? {
-        info!(policy_host = %policy_host, port, "transparent deny");
+        warn!(
+            policy_host = %policy_host,
+            connect_host = %connect_host,
+            port,
+            "transparent deny (client may report TLS handshake failure)"
+        );
         return Ok(());
     }
     let remote = match TcpStream::connect((upstream_host.as_str(), port)).await {
