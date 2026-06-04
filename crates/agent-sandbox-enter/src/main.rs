@@ -28,15 +28,7 @@ fn die(msg: &str, err: &io::Error) -> ! {
 /// Clearing permitted/inheritable/bounding (`PR_CAPBSET_DROP`) would fail with EPERM;
 /// exec replaces the image anyway. Ambient + effective must be cleared before execvp.
 fn drop_capabilities() -> io::Result<()> {
-    for set in [
-        CapSet::Effective,
-        CapSet::Permitted,
-        CapSet::Inheritable,
-        CapSet::Ambient,
-        CapSet::Bounding,
-    ] {
-        caps::clear(None, set).map_err(io::Error::other)?;
-    }
+    caps::clear(None, CapSet::Effective).map_err(io::Error::other)?;
 
     // SAFETY: `PR_CAP_AMBIENT` + `PR_CAP_AMBIENT_LOWER`; stop when the kernel returns EINVAL.
     unsafe {
