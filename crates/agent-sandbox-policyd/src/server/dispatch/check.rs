@@ -67,17 +67,22 @@ pub(crate) async fn handle_check(
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return Ok(RpcReply::Check(CheckReply::denied("deny")));
         }
-        let allowed = store
-            .is_allowed(&policy_host, port, merge, source == "once")
-            .await;
-        if allowed {
-            tracing::info!(%policy_host, port, %source, "check allow");
+        // "once" must consume the grant atomically; other sources were already verified.
+        if source == "once" {
+            let allowed = store.is_allowed(&policy_host, port, merge, true).await;
+            if allowed {
+                tracing::info!(%policy_host, port, %source, "check allow");
+            } else {
+                tracing::info!(%policy_host, port, %source, "check deny (once grant consumed)");
+            }
+            return Ok(RpcReply::Check(if allowed {
+                CheckReply::allowed(source)
+            } else {
+                CheckReply::denied(source)
+            }));
         }
-        return Ok(RpcReply::Check(if allowed {
-            CheckReply::allowed(source)
-        } else {
-            CheckReply::denied(source)
-        }));
+        tracing::info!(%policy_host, port, %source, "check allow");
+        return Ok(RpcReply::Check(CheckReply::allowed(source)));
     }
     Ok(RpcReply::Check(
         store
