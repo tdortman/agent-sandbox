@@ -8,6 +8,7 @@ members = [
     "crates/agent-sandbox-cli",
     "crates/agent-sandbox-enter",
 ]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
