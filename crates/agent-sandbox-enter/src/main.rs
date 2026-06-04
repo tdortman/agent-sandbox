@@ -21,7 +21,12 @@ fn die(msg: &str, err: &io::Error) -> ! {
     process::exit(1);
 }
 
-/// Clear file caps and lower all ambient capabilities (bwrap refuses inherited file caps).
+/// Drop caps granted to this wrapper so bubblewrap does not inherit them across exec.
+///
+/// The NixOS wrapper uses file capabilities (`setuid = false`), so we only have
+/// `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` in the effective set — not `CAP_SETPCAP`.
+/// Clearing permitted/inheritable/bounding (`PR_CAPBSET_DROP`) would fail with EPERM;
+/// exec replaces the image anyway. Ambient + effective must be cleared before execvp.
 fn drop_capabilities() -> io::Result<()> {
     for set in [
         CapSet::Effective,
