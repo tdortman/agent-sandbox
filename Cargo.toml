@@ -5,6 +5,7 @@ members = [
     "crates/agent-sandbox-policyd",
     "crates/agent-sandbox-proxy",
     "crates/agent-sandbox-dns",
+    "crates/agent-sandbox-cli",
 ]
 [workspace.package]
 version = "0.1.0"
