@@ -1,6 +1,6 @@
 //! Approve a pending network or elevation request.
 
-use agent_sandbox_core::{ApprovalScope, RpcReply, ScopeActionReply};
+use agent_sandbox_core::{allow_keys, ApprovalScope, RpcReply, ScopeActionReply};
 
 use crate::wire::{NetworkScopeOp, PendingDecision, SudoScopeOp};
 
