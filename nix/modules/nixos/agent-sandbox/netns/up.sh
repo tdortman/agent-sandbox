@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NETNS="@netnsName@"
+HOST_IF="@vethHost@"
+NS_IF="@vethNetns@"
+NETNS_IP="@netnsIp@"
+HOST_IP="@hostIp@"
+NETNS_IP_CIDR="@netnsIp@/30"
+
+ip netns add "$NETNS" 2>/dev/null || true
+ip link del "$HOST_IF" 2>/dev/null || true
+ip link add "$HOST_IF" type veth peer name "$NS_IF"
+ip link set "$NS_IF" netns "$NETNS"
+ip addr add "@hostIpCidr@" dev "$HOST_IF"
+ip link set "$HOST_IF" up
+
+ip netns exec "$NETNS" ip addr add "$NETNS_IP_CIDR" dev "$NS_IF"
+ip netns exec "$NETNS" ip link set lo up
+ip netns exec "$NETNS" ip link set "$NS_IF" up
+ip netns exec "$NETNS" ip route replace default via "$HOST_IP"
+
+ip netns exec "$NETNS" nft -f - <<EOF
+@nftRules@
+EOF
+
+"@hostNatBin@"
+
+nft add rule ip agent_sandbox_host postrouting \
+  ip saddr "$NETNS_IP" masquerade 2>/dev/null || true
+nft list table ip agent_sandbox_fwd >/dev/null 2>&1 \
+  || nft add table ip agent_sandbox_fwd
+nft list chain ip agent_sandbox_fwd forward >/dev/null 2>&1 \
+  || nft add chain ip agent_sandbox_fwd forward \
+    '{ type filter hook forward priority -20; policy accept; }'
+nft add rule ip agent_sandbox_fwd forward iifname "$HOST_IF" accept 2>/dev/null || true
+nft add rule ip agent_sandbox_fwd forward oifname "$HOST_IF" accept 2>/dev/null || true
