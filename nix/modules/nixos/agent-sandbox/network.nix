@@ -6,10 +6,12 @@
   ...
 }:
 let
+  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
+
   rootCfg = config.agent-sandbox;
   cfg = config.agent-sandbox.network;
   policyEnabled = cfg.enable || rootCfg.sudoPolicy == "approve";
-  sandboxPkg = inputs.self.packages.${pkgs.system}.agent-sandbox;
+  sandboxPkg = flake.package "agent-sandbox";
   policyPkg = sandboxPkg;
   enterBin = sandboxPkg;
   proxy = cfg.proxyAddress;
