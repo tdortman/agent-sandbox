@@ -50,6 +50,7 @@ impl From<crate::error::ScopeResolveError> for RpcReply {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimpleOkReply {
     pub ok: bool,
 }
