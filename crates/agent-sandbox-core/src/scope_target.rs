@@ -1,0 +1,85 @@
+//! Resolved approval scope: typestate after validating RPC context.
+//!
+//! Wire format still uses `scope: String` on requests; parse with [`ApprovalScope::parse`]
+//! then call [`ScopeTarget::resolve`] so session/global/project requirements are enforced
+//! once, in one place.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use crate::error::ScopeResolveError;
+use crate::merge_policy::resolve_project_policy_path;
+use crate::rpc::ApprovalScope;
+
+/// Where an approved/denied rule is stored after scope + context validation.
+#[derive(Debug, Clone)]
+pub enum ScopeTarget {
+    /// `once` — in-memory only for this policyd process.
+    Ephemeral,
+    Session {
+        session_id: String,
+    },
+    Project {
+        policy_path: PathBuf,
+        project_root: String,
+    },
+    Global {
+        policy_path: PathBuf,
+        home: String,
+    },
+}
+
+/// Inputs required to turn a wire-level scope into a [`ScopeTarget`].
+pub struct ScopeContext<'a> {
+    pub scope: ApprovalScope,
+    pub session_id: Option<&'a str>,
+    pub home: Option<&'a str>,
+    pub project_root: Option<&'a str>,
+    pub active_session_ids: &'a HashSet<String>,
+}
+
+impl ScopeTarget {
+    pub fn resolve(ctx: &ScopeContext<'_>) -> Result<Self, ScopeResolveError> {
+        match ctx.scope {
+            ApprovalScope::Once => Ok(Self::Ephemeral),
+            ApprovalScope::Session => {
+                let session_id = ctx.session_id.ok_or(ScopeResolveError::SessionRequired)?;
+                if !ctx.active_session_ids.contains(session_id) {
+                    return Err(ScopeResolveError::SessionRequired);
+                }
+                Ok(Self::Session {
+                    session_id: session_id.to_string(),
+                })
+            }
+            ApprovalScope::Project => {
+                let project_root = ctx
+                    .project_root
+                    .ok_or(ScopeResolveError::ProjectRootRequired)?;
+                let policy_path = resolve_project_policy_path(None, Some(Path::new(project_root)))?;
+                Ok(Self::Project {
+                    policy_path,
+                    project_root: project_root.to_string(),
+                })
+            }
+            ApprovalScope::Global => {
+                let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
+                let policy_path = global_policy_path(home);
+                Ok(Self::Global {
+                    policy_path,
+                    home: home.to_string(),
+                })
+            }
+        }
+    }
+
+    pub fn project_root(&self) -> Option<&str> {
+        match self {
+            Self::Project { project_root, .. } => Some(project_root.as_str()),
+            _ => None,
+        }
+    }
+}
+
+fn global_policy_path(home: &str) -> PathBuf {
+    PathBuf::from(home).join(".config/agent-sandbox/policy.json")
+}
