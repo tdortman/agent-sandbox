@@ -30,6 +30,12 @@ impl PolicyStore {
             let host = pending.host.clone().unwrap_or_default();
             let port = pending.port.unwrap_or(0);
             if scope == ApprovalScope::Once {
+                {
+                    let mut inner = self.inner.lock().await;
+                    for key in allow_keys(&host, port) {
+                        inner.once_allow.insert(key);
+                    }
+                }
                 Self::audit("approve", Some(&host), Some(port), scope_label);
                 self.finish_network(&pending_id, true, "once").await;
                 return RpcReply::ScopeAction(ScopeActionReply::ok_network(
