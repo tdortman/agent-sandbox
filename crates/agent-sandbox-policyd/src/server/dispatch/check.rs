@@ -1,6 +1,5 @@
 //! Network `Check` RPC handling.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use agent_sandbox_core::{
@@ -48,9 +47,7 @@ pub(crate) async fn handle_check(
     let port = port.unwrap_or(0);
     let mut policy_host = normalize_host(host.as_deref().unwrap_or(""));
     if policy_host.is_empty() || is_ipv4_literal(&policy_host) {
-        let cache_path = std::env::var("AGENT_SANDBOX_DNS_CACHE").ok();
-        let cache_ref = cache_path.as_deref().map(Path::new);
-        policy_host = policy_host_for_connect(&connect_host, None, cache_ref).0;
+        policy_host = policy_host_for_connect(&connect_host, None, None).0;
     }
     let url = url.unwrap_or_else(|| format!("{scheme}://{policy_host}:{port}"));
     if home.is_some() {

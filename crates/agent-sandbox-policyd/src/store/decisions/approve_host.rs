@@ -1,6 +1,6 @@
 //! Approve a host directly (without a pending id).
 
-use agent_sandbox_core::{RpcReply, SandboxPaths, normalize_host};
+use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, normalize_host};
 
 use crate::error::PolicydError;
 use crate::wire::{HostApproveRequest, MergeContext, NetworkScopeOp, ScopeWire};
@@ -16,7 +16,7 @@ impl PolicyStore {
             session_id,
             ctx,
         } = req;
-        let scope = match Self::parse_scope(&scope) {
+        let scope = match scope.parse::<ApprovalScope>() {
             Ok(s) => s,
             Err(err) => return err.into(),
         };

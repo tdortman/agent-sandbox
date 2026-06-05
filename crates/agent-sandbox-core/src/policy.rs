@@ -73,14 +73,5 @@ impl SudoRule {
 }
 
 pub fn sudo_argv_matches(rule: &SudoRule, argv: &[String]) -> bool {
-    if rule.argv.is_empty() {
-        return false;
-    }
-    if rule.argv.len() > argv.len() {
-        return false;
-    }
-    if rule.argv.len() == argv.len() {
-        return rule.argv == argv;
-    }
-    argv.starts_with(&rule.argv)
+    !rule.argv.is_empty() && argv.starts_with(&rule.argv)
 }

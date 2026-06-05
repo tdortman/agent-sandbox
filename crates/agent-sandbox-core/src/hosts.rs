@@ -14,11 +14,7 @@ use crate::dns_cache::lookup_dns_cache;
 const TLS_RECORD_HEADER_LEN: usize = 5;
 
 pub fn is_ipv4_literal(host: &str) -> bool {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return false;
-    }
-    parts.iter().all(|p| p.parse::<u8>().is_ok())
+    host.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
 pub fn normalize_host(host: &str) -> String {

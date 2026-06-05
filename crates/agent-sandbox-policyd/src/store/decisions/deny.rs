@@ -8,23 +8,12 @@ use super::super::types::{PendingKind, PolicyStore};
 
 impl PolicyStore {
     pub async fn deny(&self, decision: PendingDecision) -> RpcReply {
-        let crate::wire::PendingDecision {
-            pending_id,
-            scope,
-            wire,
-        } = decision;
-        let scope = match Self::parse_scope(&scope) {
-            Ok(s) => s,
-            Err(err) => return err.into(),
+        let (pending, scope, wire) = match self.take_pending_decision(decision).await {
+            Ok(v) => v,
+            Err(err) => return err,
         };
+        let pending_id = pending.id.clone();
         let scope_label = scope.as_str();
-        let pending = {
-            let mut inner = self.inner.lock().await;
-            inner.pending.remove(&pending_id)
-        };
-        let Some(pending) = pending else {
-            return crate::error::PolicydError::UnknownPendingId.into();
-        };
 
         if pending.kind == PendingKind::Network {
             let host = pending.host.clone().unwrap_or_default();

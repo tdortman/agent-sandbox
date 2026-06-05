@@ -18,9 +18,7 @@ pub(crate) async fn handle_connect(
     state: ProxyState,
     ids: ProcessIds,
 ) -> Result<(), ProxyClientError> {
-    let cache_path = std::env::var("AGENT_SANDBOX_DNS_CACHE").ok();
-    let cache_ref = cache_path.as_deref().map(std::path::Path::new);
-    let (policy_host, connect_host) = policy_host_for_connect(host, None, cache_ref);
+    let (policy_host, connect_host) = policy_host_for_connect(host, None, None);
     if !check_destination(&state, &policy_host, &connect_host, port, "https", ids).await? {
         write_http_response(
             &mut stream,
