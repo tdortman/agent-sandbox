@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use agent_sandbox_core::{CheckReply, SandboxPaths, UiPush, normalize_host};
+use agent_sandbox_core::{CheckReply, ProcessIds, SandboxPaths, UiPush, normalize_host};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
@@ -33,7 +33,7 @@ impl PolicyStore {
             };
             let merge = MergeContext {
                 paths: SandboxPaths::from_wire(p.cwd.clone(), p.home.clone(), p.project_root.clone()),
-                ids: Default::default(),
+                ids: ProcessIds::default(),
             };
             let Some(source) = self.allow_source(&host, port, merge).await else {
                 continue;
