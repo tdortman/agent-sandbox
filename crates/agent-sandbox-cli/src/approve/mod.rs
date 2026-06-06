@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent_sandbox_core::{
-    ApprovalScope, PendingSummary, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
+    ApprovalScope, PendingSummary, RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
 use clap::{Parser, Subcommand};
 
@@ -81,9 +81,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
         } => {
             let p = paths(home, cwd, project_root);
             let req = RpcRequest::Status {
-                cwd: p.cwd_string(),
-                home: p.home_string(),
-                project_root: p.project_root_string(),
+                ctx: RequestContext::from(&p),
             };
             let resp = rpc(&cli.socket, req).await?;
             let RpcReply::Status(body) = resp else {
@@ -118,12 +116,9 @@ pub async fn run() -> Result<(), ApproveCliError> {
             let p = paths(home, cwd, project_root);
             let req = RpcRequest::Approve {
                 id,
-                scope: scope.as_str().to_string(),
+                scope,
                 session_id,
-                cwd: p.cwd_string(),
-                home: p.home_string(),
-                project_root: p.project_root_string(),
-                uid: None,
+                ctx: RequestContext::from(&p),
             };
             let resp = rpc(&cli.socket, req).await?;
             print_json(&resp)?;
@@ -141,13 +136,9 @@ pub async fn run() -> Result<(), ApproveCliError> {
             let req = RpcRequest::ApproveHost {
                 host,
                 port,
-                scope: scope.as_str().to_string(),
+                scope,
                 session_id,
-                cwd: p.cwd_string(),
-                home: p.home_string(),
-                project_root: p.project_root_string(),
-                pid: None,
-                uid: None,
+                ctx: RequestContext::from(&p),
             };
             let resp = rpc(&cli.socket, req).await?;
             print_json(&resp)?;
@@ -163,12 +154,9 @@ pub async fn run() -> Result<(), ApproveCliError> {
             let p = paths(home, cwd, project_root);
             let req = RpcRequest::Deny {
                 id,
-                scope: scope.as_str().to_string(),
+                scope,
                 session_id,
-                cwd: p.cwd_string(),
-                home: p.home_string(),
-                project_root: p.project_root_string(),
-                uid: None,
+                ctx: RequestContext::from(&p),
             };
             let resp = rpc(&cli.socket, req).await?;
             print_json(&resp)?;

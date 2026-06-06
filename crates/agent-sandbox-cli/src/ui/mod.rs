@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_sandbox_core::{RpcConnection, RpcMessage, RpcReply, RpcRequest, SandboxPaths, UiPush};
+use agent_sandbox_core::{
+    RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, SandboxPaths, UiPush,
+};
 use clap::Parser;
 pub use error::UiCliError;
 use tokio::sync::Mutex;
@@ -67,9 +69,7 @@ impl UiClient {
         let mut conn = RpcConnection::connect(&self.socket).await?;
         conn.write_request(&RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
-            cwd: self.paths.cwd_string(),
-            home: self.paths.home_string(),
-            project_root: self.paths.project_root_string(),
+            ctx: RequestContext::from(&self.paths),
         })
         .await?;
 
