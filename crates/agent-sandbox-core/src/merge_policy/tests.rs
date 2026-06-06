@@ -1,58 +1,11 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
 use super::*;
-use crate::policy::{NetworkRule, Policy, SudoRule};
+use crate::policy::{NetworkRule, Policy};
 
 fn empty_policy() -> Policy {
     Policy::default()
-}
-
-#[test]
-fn prefers_project_root_over_ephemeral_cwd() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("dotfiles");
-    fs::create_dir_all(repo.join(".agent-sandbox")).unwrap();
-    let policy_file = repo.join(".agent-sandbox/policy.json");
-    fs::write(
-        &policy_file,
-        r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
-    )
-    .unwrap();
-    let ephemeral = tmp.path().join("omp-python-runner");
-    fs::create_dir(&ephemeral).unwrap();
-    let resolved = resolve_project_policy_path(Some(&ephemeral), Some(&repo)).unwrap();
-    assert_eq!(resolved, policy_file);
-}
-
-#[test]
-fn ephemeral_cwd_without_project_root_errors() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ephemeral = tmp.path().join("omp-python-runner");
-    fs::create_dir(&ephemeral).unwrap();
-    assert!(resolve_project_policy_path(Some(&ephemeral), None).is_err());
-}
-
-#[test]
-fn rejects_root_cwd() {
-    assert!(resolve_project_policy_path(Some(Path::new("/")), None).is_err());
-}
-
-#[test]
-fn discovers_policy_from_cwd() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("proj");
-    fs::create_dir_all(repo.join("src")).unwrap();
-    let policy_file = repo.join(".agent-sandbox/policy.json");
-    fs::create_dir_all(policy_file.parent().unwrap()).unwrap();
-    fs::write(
-        &policy_file,
-        r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
-    )
-    .unwrap();
-    let resolved = resolve_project_policy_path(Some(&repo.join("src")), None).unwrap();
-    assert_eq!(resolved, policy_file);
 }
 
 #[test]
@@ -74,32 +27,6 @@ fn deny_removes_allow_from_earlier_layer() {
     let merged = merge_layers(&[low, high]);
     assert!(merged.network.allow.is_empty());
     assert_eq!(merged.network.deny.len(), 1);
-}
-
-#[test]
-fn sudo_argv_prefix_match() {
-    let rule = SudoRule::new(vec!["systemctl".into(), "restart".into()], "");
-    assert!(crate::policy::sudo_argv_matches(
-        &rule,
-        &["systemctl".into(), "restart".into(), "nginx".into()]
-    ));
-    assert!(!crate::policy::sudo_argv_matches(
-        &rule,
-        &["systemctl".into(), "stop".into()]
-    ));
-}
-
-#[test]
-fn infer_home_from_project_root() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home/tim");
-    let repo = home.join("dotfiles");
-    fs::create_dir_all(&repo).unwrap();
-    assert_eq!(
-        infer_home_from_paths([&repo]),
-        Some(home.to_string_lossy().into_owned())
-    );
-    assert!(infer_home_from_paths([Path::new("/var/tmp/runner")]).is_none());
 }
 
 #[test]

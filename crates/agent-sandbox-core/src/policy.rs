@@ -70,8 +70,22 @@ impl SudoRule {
             Some(self.argv.clone())
         }
     }
+
+    pub fn matches(&self, argv: &[String]) -> bool {
+        !self.argv.is_empty() && argv.starts_with(&self.argv)
+    }
 }
 
-pub fn sudo_argv_matches(rule: &SudoRule, argv: &[String]) -> bool {
-    !rule.argv.is_empty() && argv.starts_with(&rule.argv)
+#[cfg(test)]
+mod tests {
+    use super::SudoRule;
+
+    #[test]
+    fn sudo_rule_matches_prefix() {
+        let rule = SudoRule::new(vec!["systemctl".into(), "restart".into()], "");
+        let argv = ["systemctl".into(), "restart".into(), "nginx".into()];
+        let wrong_argv = ["systemctl".into(), "stop".into()];
+        assert!(rule.matches(&argv));
+        assert!(!rule.matches(&wrong_argv));
+    }
 }

@@ -4,14 +4,6 @@ use std::collections::BTreeMap;
 
 use crate::policy::{NetworkRule, NetworkSection, Policy, SudoRule, SudoSection};
 
-pub fn network_rule_key(rule: &NetworkRule) -> (String, u16) {
-    rule.key()
-}
-
-pub fn sudo_rule_key(rule: &SudoRule) -> Option<Vec<String>> {
-    rule.key()
-}
-
 pub fn merge_layers(layers: &[Policy]) -> Policy {
     if layers.is_empty() {
         return Policy::default();
