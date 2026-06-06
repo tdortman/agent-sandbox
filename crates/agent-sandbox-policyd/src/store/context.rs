@@ -1,10 +1,10 @@
 //! Policy store — context.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agent_sandbox_core::{
-    Policy, ProcessIds, SandboxPaths, context_from_pid, home_from_uid, infer_home_from_paths,
-    load_policy, merge_layers, project_policy_paths, read_session_context,
+    Policy, ProcessIds, ProjectPolicyContext, SandboxPaths, context_from_pid, home_from_uid,
+    load_policy, merge_layers, read_session_context,
 };
 
 use crate::wire::MergeContext;
@@ -12,79 +12,82 @@ use crate::wire::MergeContext;
 use super::types::PolicyStore;
 
 impl PolicyStore {
-    pub async fn resolve_context(
-        &self,
-        cwd: Option<String>,
-        home: Option<String>,
-        project_root: Option<String>,
-        pid: Option<u32>,
-        uid: Option<u32>,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    pub async fn resolve_context(&self, ctx: MergeContext) -> MergeContext {
         let file_ctx = read_session_context();
-        let mut cwd = cwd.or(file_ctx.cwd);
-        let mut home = home.or(file_ctx.home);
-        let mut project_root = project_root.or(file_ctx.project_root);
+        let file_paths =
+            SandboxPaths::from_wire(file_ctx.cwd, file_ctx.home, file_ctx.project_root);
+        let mut paths = file_paths.merged_with(
+            ctx.paths.cwd_string(),
+            ctx.paths.home_string(),
+            ctx.paths.project_root_string(),
+        );
 
-        if let Some(pid) = pid.filter(|p| *p > 0) {
-            let (pc, ph, pp) = context_from_pid(pid);
-            cwd = cwd.or(pc);
-            home = home.or(ph);
-            project_root = project_root.or(pp);
+        if let Some(pid) = ctx.ids.pid() {
+            let (cwd, home, project_root) = context_from_pid(pid);
+            let proc_paths = SandboxPaths::from_wire(cwd, home, project_root);
+            paths = proc_paths.merged_with(
+                paths.cwd_string(),
+                paths.home_string(),
+                paths.project_root_string(),
+            );
         }
-        home = home.or_else(|| home_from_uid(uid));
 
-        if cwd.is_some() && home.is_some() && project_root.is_some() {
-            return (cwd, home, project_root);
-        }
+        let mut home = paths.home_string().or_else(|| home_from_uid(ctx.ids.uid()));
+        let mut project_root = paths.project_root_string();
 
-        let inner = self.inner.lock().await;
-        for session in inner.ui_clients.values() {
-            if let Some(ctx) = inner.ui_context_by_session.get(&session.session_id) {
-                cwd = cwd.clone().or_else(|| ctx.cwd.clone());
-                home = home.clone().or_else(|| ctx.home.clone());
-                project_root = project_root.clone().or_else(|| ctx.project_root.clone());
-                if cwd.is_some() && home.is_some() && project_root.is_some() {
-                    break;
+        if paths.cwd().is_none() || home.is_none() || project_root.is_none() {
+            let inner = self.inner.lock().await;
+            for session in inner.ui_clients.values() {
+                if let Some(session_ctx) = inner.ui_context_by_session.get(&session.session_id) {
+                    let session_paths = SandboxPaths::from_wire(
+                        session_ctx.cwd.clone(),
+                        session_ctx.home.clone(),
+                        session_ctx.project_root.clone(),
+                    );
+                    paths = session_paths.merged_with(
+                        paths.cwd_string(),
+                        home.clone(),
+                        project_root.clone(),
+                    );
+                    home = paths.home_string().or(home);
+                    project_root = paths.project_root_string().or(project_root);
+                    if paths.cwd().is_some() && home.is_some() && project_root.is_some() {
+                        break;
+                    }
                 }
             }
         }
-        drop(inner);
 
-        let path_hints: Vec<&Path> = [project_root.as_deref(), cwd.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(Path::new)
-            .collect();
-        home = home.or_else(|| infer_home_from_paths(path_hints));
-        (cwd, home, project_root)
-    }
+        let project = ProjectPolicyContext::new(
+            home.as_deref().map(Path::new),
+            paths.cwd().map(Path::new),
+            project_root.as_deref().map(Path::new),
+        );
+        if project_root.is_none() {
+            project_root = project
+                .project_root()
+                .map(|path| path.to_string_lossy().into_owned());
+        }
+        if home.is_none() {
+            home = project.home_hint();
+        }
 
-    pub(crate) fn user_global_path(home: &str) -> PathBuf {
-        PathBuf::from(home).join(".config/agent-sandbox/policy.json")
+        MergeContext {
+            paths: SandboxPaths::from_wire(paths.cwd_string(), home, project_root),
+            ids: ctx.ids,
+        }
     }
 
     pub async fn merged_for(&self, ctx: MergeContext) -> Policy {
-        let (cwd, home, project_root) = self
-            .resolve_context(
-                ctx.paths.cwd_string(),
-                ctx.paths.home_string(),
-                ctx.paths.project_root_string(),
-                ctx.ids.pid(),
-                ctx.ids.uid(),
-            )
-            .await;
+        let ctx = self.resolve_context(ctx).await;
         let mut layers = vec![load_policy(&self.args.declarative)];
-        if let Some(ref home) = home {
-            let path = Self::user_global_path(home);
-            if path.is_file() {
-                layers.push(load_policy(&path));
-            }
-        }
-        for path in project_policy_paths(
-            home.as_deref().map(Path::new),
-            cwd.as_deref().map(Path::new),
-            project_root.as_deref().map(Path::new),
-        ) {
+        for path in ProjectPolicyContext::new(
+            ctx.paths.home().map(Path::new),
+            ctx.paths.cwd().map(Path::new),
+            ctx.paths.project_root().map(Path::new),
+        )
+        .layer_paths()
+        {
             layers.push(load_policy(&path));
         }
         merge_layers(&layers)

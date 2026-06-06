@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use agent_sandbox_core::{SandboxPaths, allow_keys, normalize_host, sudo_argv_matches};
+use agent_sandbox_core::{allow_keys, normalize_host};
 
 use crate::wire::MergeContext;
 
@@ -67,20 +67,12 @@ impl PolicyStore {
 
     pub(crate) async fn sudo_policy_denied(&self, argv: &[String], ctx: MergeContext) -> bool {
         let merged = self.merged_for(ctx).await;
-        merged
-            .sudo
-            .deny
-            .iter()
-            .any(|rule| sudo_argv_matches(rule, argv))
+        merged.sudo.deny.iter().any(|rule| rule.matches(argv))
     }
 
     pub(crate) async fn sudo_policy_allowed(&self, argv: &[String], ctx: MergeContext) -> bool {
         let merged = self.merged_for(ctx).await;
-        merged
-            .sudo
-            .allow
-            .iter()
-            .any(|rule| sudo_argv_matches(rule, argv))
+        merged.sudo.allow.iter().any(|rule| rule.matches(argv))
     }
 
     pub(crate) async fn session_sudo_denied(&self, argv: &[String]) -> bool {
@@ -109,19 +101,7 @@ impl PolicyStore {
 
     pub async fn allow_source(&self, host: &str, port: u16, ctx: MergeContext) -> Option<String> {
         let host = normalize_host(host);
-        let (cwd, home, project_root) = self
-            .resolve_context(
-                ctx.paths.cwd_string(),
-                ctx.paths.home_string(),
-                ctx.paths.project_root_string(),
-                ctx.ids.pid(),
-                ctx.ids.uid(),
-            )
-            .await;
-        let resolved = MergeContext {
-            paths: SandboxPaths::from_wire(cwd, home, project_root),
-            ids: ctx.ids,
-        };
+        let resolved = self.resolve_context(ctx).await;
         if self.policy_denied(&host, port, resolved.clone()).await {
             return Some("deny".into());
         }
@@ -137,7 +117,7 @@ impl PolicyStore {
         let merged = self.merged_for(resolved).await;
         for rule in &merged.network.allow {
             if Self::host_matches(&rule.host, &host) && rule.port == port {
-                if let Some(ref comment) = rule.comment
+                if let Some(comment) = &rule.comment
                     && !comment.is_empty()
                 {
                     return Some(format!("allow:{comment}"));
@@ -156,19 +136,7 @@ impl PolicyStore {
         consume_once: bool,
     ) -> bool {
         let host = normalize_host(host);
-        let (cwd, home, project_root) = self
-            .resolve_context(
-                ctx.paths.cwd_string(),
-                ctx.paths.home_string(),
-                ctx.paths.project_root_string(),
-                ctx.ids.pid(),
-                ctx.ids.uid(),
-            )
-            .await;
-        let resolved = MergeContext {
-            paths: SandboxPaths::from_wire(cwd, home, project_root),
-            ids: ctx.ids,
-        };
+        let resolved = self.resolve_context(ctx).await;
         if self.policy_denied(&host, port, resolved.clone()).await {
             return false;
         }
