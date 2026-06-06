@@ -81,7 +81,7 @@ pub(crate) async fn handle(
             .approve(PendingDecision {
                 pending_id: id,
                 scope,
-                wire: ScopeWire::from_request(ctx, session_id),
+                wire: ScopeWire::from_request(&ctx, session_id),
             })
             .await),
         RpcRequest::ApproveHost {
@@ -113,7 +113,7 @@ pub(crate) async fn handle(
             .deny(PendingDecision {
                 pending_id: id,
                 scope,
-                wire: ScopeWire::from_request(ctx, session_id),
+                wire: ScopeWire::from_request(&ctx, session_id),
             })
             .await),
         RpcRequest::Status { ctx } => {

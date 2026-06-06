@@ -38,7 +38,7 @@ pub struct ScopeWire {
 
 impl ScopeWire {
     #[must_use]
-    pub fn from_request(ctx: RequestContext, session_id: Option<String>) -> Self {
+    pub fn from_request(ctx: &RequestContext, session_id: Option<String>) -> Self {
         let owner_uid = ctx.uid;
         Self {
             paths: ctx.sandbox_paths(),

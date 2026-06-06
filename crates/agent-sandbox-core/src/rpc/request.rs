@@ -36,7 +36,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn with_paths(mut self, paths: SandboxPaths) -> Self {
+    pub fn with_paths(mut self, paths: &SandboxPaths) -> Self {
         self.cwd = paths.cwd_string();
         self.home = paths.home_string();
         self.project_root = paths.project_root_string();
