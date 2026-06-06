@@ -248,8 +248,7 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     if (!choice) return;
 
     const scope = SCOPE_BY_LABEL[choice];
-    const { cwd: rpcCwd, home: rpcHome, project_root: rpcProjectRoot } =
-      sandboxContext(req);
+    const rpcCtx = rpcContext(req);
     const sessionId = policySessionId;
 
     if (DENY_LABELS.has(choice)) {
@@ -264,10 +263,8 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
           op: "deny",
           id: req.id,
           scope,
-          cwd: rpcCwd,
-          home: rpcHome,
           ...(sessionId ? { session_id: sessionId } : {}),
-          ...(rpcProjectRoot ? { project_root: rpcProjectRoot } : {}),
+          ...rpcCtx,
         },
         socketPath(),
       );
@@ -293,10 +290,8 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         op: "approve",
         id: req.id,
         scope,
-        cwd: rpcCwd,
-        home: rpcHome,
         ...(sessionId ? { session_id: sessionId } : {}),
-        ...(rpcProjectRoot ? { project_root: rpcProjectRoot } : {}),
+        ...rpcCtx,
       },
       socketPath(),
     );
