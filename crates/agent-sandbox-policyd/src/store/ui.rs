@@ -141,7 +141,7 @@ impl PolicyStore {
         if targets.is_empty() {
             return;
         }
-        let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_line();
+        let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_string();
         let mut dead = Vec::new();
         for (id, writer) in self
             .inner

@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use agent_sandbox_core::{ElevateReply, SandboxPaths, UiPush};
+use agent_sandbox_core::{ElevateReply, UiPush};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
 
 use crate::spawn::maybe_spawn_ui;
-use crate::wire::{ElevationRequest, MergeContext, UiSpawnContext, UiSpawnGate};
+use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 
 use super::types::{Pending, PendingKind, PolicyStore};
 
@@ -87,20 +87,11 @@ impl PolicyStore {
     pub async fn request_elevation(&self, req: ElevationRequest) -> ElevateReply {
         let ElevationRequest { argv, ctx } = req;
         let argv: Vec<String> = argv.into_iter().collect();
-        let (cwd, home, project_root) = self
-            .resolve_context(
-                ctx.paths.cwd_string(),
-                ctx.paths.home_string(),
-                ctx.paths.project_root_string(),
-                ctx.ids.pid(),
-                ctx.ids.uid(),
-            )
-            .await;
-        let wire_ids = ctx.ids;
-        let resolved = MergeContext {
-            paths: SandboxPaths::from_wire(cwd.clone(), home.clone(), project_root.clone()),
-            ids: wire_ids,
-        };
+        let resolved = self.resolve_context(ctx).await;
+        let wire_ids = resolved.ids;
+        let cwd = resolved.paths.cwd_string();
+        let home = resolved.paths.home_string();
+        let project_root = resolved.paths.project_root_string();
         if self.sudo_policy_denied(&argv, resolved.clone()).await
             || self.session_sudo_denied(&argv).await
         {
@@ -153,7 +144,7 @@ impl PolicyStore {
         if self.inner.lock().await.ui_clients.is_empty() {
             let mut spawn_uid = wire_ids.uid();
             if spawn_uid.is_none_or(|u| u == 0)
-                && let Some(ref h) = home
+                && let Some(h) = &home
             {
                 spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
                     .ok()

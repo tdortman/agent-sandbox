@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use agent_sandbox_core::{
-    NetworkRule, SudoRule, atomic_write_policy, load_policy, normalize_host,
-    resolve_project_policy_path,
+    NetworkRule, ProjectPolicyContext, SudoRule, atomic_write_policy, load_policy, normalize_host,
 };
 
 use super::types::PolicyStore;
@@ -128,9 +127,10 @@ impl PolicyStore {
     }
 
     pub(crate) fn project_policy_path_display(project_root: &str) -> Option<String> {
-        resolve_project_policy_path(None, Some(Path::new(project_root)))
+        ProjectPolicyContext::new(None, None, Some(Path::new(project_root)))
+            .resolve_policy_path()
             .ok()
-            .map(|p| p.display().to_string())
+            .map(|path| path.display().to_string())
     }
 
     pub(crate) async fn active_session_ids(&self) -> HashSet<String> {

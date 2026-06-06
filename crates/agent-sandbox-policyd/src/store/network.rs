@@ -32,7 +32,11 @@ impl PolicyStore {
                 continue;
             };
             let merge = MergeContext {
-                paths: SandboxPaths::from_wire(p.cwd.clone(), p.home.clone(), p.project_root.clone()),
+                paths: SandboxPaths::from_wire(
+                    p.cwd.clone(),
+                    p.home.clone(),
+                    p.project_root.clone(),
+                ),
                 ids: ProcessIds::default(),
             };
             let Some(source) = self.allow_source(&host, port, merge).await else {
@@ -74,20 +78,11 @@ impl PolicyStore {
             ctx,
         } = req;
         let policy_host = normalize_host(&host);
-        let (cwd, home, project_root) = self
-            .resolve_context(
-                ctx.paths.cwd_string(),
-                ctx.paths.home_string(),
-                ctx.paths.project_root_string(),
-                ctx.ids.pid(),
-                ctx.ids.uid(),
-            )
-            .await;
-        let wire_ids = ctx.ids;
-        let resolved = MergeContext {
-            paths: SandboxPaths::from_wire(cwd.clone(), home.clone(), project_root.clone()),
-            ids: wire_ids,
-        };
+        let resolved = self.resolve_context(ctx).await;
+        let wire_ids = resolved.ids;
+        let cwd = resolved.paths.cwd_string();
+        let home = resolved.paths.home_string();
+        let project_root = resolved.paths.project_root_string();
         if self.policy_denied(&policy_host, port, resolved).await {
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return CheckReply::denied("deny");
