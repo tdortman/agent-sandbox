@@ -85,7 +85,8 @@ fn project_deny_beats_global_allow() {
         r#"{"network":{"allow":[{"host":"chatgpt.com","port":443}],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
     )
     .unwrap();
-    let layers = vec![
+
+    let mut layers = vec![
         Policy {
             network: crate::policy::NetworkSection {
                 allow: vec![NetworkRule::new("chatgpt.com", 443, "")],
@@ -95,19 +96,10 @@ fn project_deny_beats_global_allow() {
         },
         load_policy(&home.join(".config/agent-sandbox/policy.json")),
     ];
-    let mut all_layers = layers;
-    for path in project_policy_paths(Some(&home), None, None) {
-        all_layers.push(load_policy(&path));
+    for path in ProjectPolicyContext::new(Some(&home), None, None).layer_paths() {
+        layers.push(load_policy(&path));
     }
-    let merged = merge_layers(&all_layers);
+    let merged = merge_layers(&layers);
     assert_eq!(merged.network.deny[0].host, "chatgpt.com");
     assert!(merged.network.allow.is_empty());
-}
-
-#[test]
-fn is_ephemeral_cwd_detects_runner() {
-    let tmp = tempfile::tempdir().unwrap();
-    let p = tmp.path().join("omp-python-runner");
-    fs::create_dir(&p).unwrap();
-    assert!(is_ephemeral_cwd(&p));
 }

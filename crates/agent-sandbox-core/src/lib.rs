@@ -26,16 +26,13 @@ pub use hosts::{
     allow_keys, is_ipv4_literal, normalize_host, parse_tls_sni, policy_host_for_connect,
     reverse_hostname,
 };
-pub use merge_policy::{
-    atomic_write_policy, discover_project_policy, infer_home_from_paths, is_ephemeral_cwd,
-    is_valid_project_root, load_policy, merge_layers, network_rule_key, project_policy_paths,
-    resolve_project_policy_path, sudo_rule_key,
-};
-pub use policy::{NetworkRule, NetworkSection, Policy, SudoRule, SudoSection, sudo_argv_matches};
+pub use merge_policy::{ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers};
+pub use policy::{NetworkRule, NetworkSection, Policy, SudoRule, SudoSection};
 pub use proc_context::{context_from_pid, home_from_uid, peer_cred};
 pub use rpc::{
     ApprovalScope, CheckReply, ElevateReply, ErrorReply, PendingSummary, RegisterUiReply,
-    RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply, UiPush,
+    RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply,
+    UiPush,
 };
 pub use rpc_client::{RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
