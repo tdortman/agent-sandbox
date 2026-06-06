@@ -99,6 +99,11 @@ impl ProjectPolicyContext {
 
         if let Some(home) = self.home.as_deref() {
             add(Some(home.join(".agent-sandbox").join("policy.json")));
+            add(Some(
+                home.join(".config")
+                    .join("agent-sandbox")
+                    .join("policy.json"),
+            ));
             if let Ok(entries) = std::fs::read_dir(home) {
                 for entry in entries.flatten() {
                     add(Some(

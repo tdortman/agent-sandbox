@@ -1,11 +1,12 @@
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-pub(crate) const CLIENT_PEEK_BYTES: usize = 16 * 1024;
-pub(crate) const CLIENT_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CLIENT_READ_SIZE: usize = 16 * 1024;
+pub(crate) const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[allow(unsafe_code)]
 pub(crate) fn original_dst(stream: &TcpStream) -> Option<(String, u16)> {
@@ -30,9 +31,9 @@ pub(crate) fn original_dst(stream: &TcpStream) -> Option<(String, u16)> {
     Some((ip.to_string(), port))
 }
 
-pub(crate) async fn read_client_peek(stream: &TcpStream) -> Vec<u8> {
-    let mut buf = vec![0_u8; CLIENT_PEEK_BYTES];
-    match tokio::time::timeout(CLIENT_PEEK_TIMEOUT, stream.peek(&mut buf)).await {
+pub(crate) async fn read_client_prefix(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = vec![0_u8; CLIENT_READ_SIZE];
+    match tokio::time::timeout(CLIENT_READ_TIMEOUT, stream.read(&mut buf)).await {
         Ok(Ok(n)) => buf[..n].to_vec(),
         _ => Vec::new(),
     }

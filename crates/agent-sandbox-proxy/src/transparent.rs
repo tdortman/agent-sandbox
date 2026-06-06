@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 use crate::error::ProxyClientError;
-use crate::pipe::{pipe_bidirectional, read_client_peek};
+use crate::pipe::{pipe_bidirectional, read_client_prefix};
 use crate::policy::check_destination;
 use crate::state::ProxyState;
 
@@ -16,7 +16,7 @@ pub(crate) async fn handle_transparent(
     ids: ProcessIds,
 ) -> Result<(), ProxyClientError> {
     let scheme = if port == 443 { "https" } else { "http" };
-    let initial = read_client_peek(&stream).await;
+    let initial = read_client_prefix(&mut stream).await;
     let (policy_host, upstream_host) = policy_host_for_connect(&connect_host, Some(&initial), None);
     if policy_host != connect_host {
         info!(
