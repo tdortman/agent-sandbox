@@ -124,6 +124,17 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     };
   }
 
+  function rpcContext(req?: { cwd?: string; home?: string; project_root?: string }) {
+    const { cwd, home, project_root } = sandboxContext(req);
+    return {
+      ctx: {
+        cwd,
+        home,
+        ...(project_root ? { project_root } : {}),
+      },
+    };
+  }
+
   function socketPath(): string {
     return process.env.AGENT_SANDBOX_POLICY_SOCKET ?? DEFAULT_SOCKET;
   }
@@ -156,8 +167,7 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     if (!choice) return;
 
     const scope = SCOPE_BY_LABEL[choice];
-    const { cwd: rpcCwd, home: rpcHome, project_root: rpcProjectRoot } =
-      sandboxContext(req);
+    const rpcCtx = rpcContext(req);
     const sessionId = policySessionId;
 
     if (DENY_LABELS.has(choice)) {
@@ -172,10 +182,8 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
           op: "deny",
           id: req.id,
           scope,
-          cwd: rpcCwd,
-          home: rpcHome,
           ...(sessionId ? { session_id: sessionId } : {}),
-          ...(rpcProjectRoot ? { project_root: rpcProjectRoot } : {}),
+          ...rpcCtx,
         },
         socketPath(),
       );
@@ -201,10 +209,8 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         op: "approve",
         id: req.id,
         scope,
-        cwd: rpcCwd,
-        home: rpcHome,
         ...(sessionId ? { session_id: sessionId } : {}),
-        ...(rpcProjectRoot ? { project_root: rpcProjectRoot } : {}),
+        ...rpcCtx,
       },
       socketPath(),
     );
@@ -353,14 +359,12 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         uiConnectedAnnounced = false;
       });
 
-      const regCtx = sandboxContext();
+      const regCtx = rpcContext();
       socket.write(
         `${JSON.stringify({
           op: "register_ui",
           ui_client: "omp",
-          cwd: regCtx.cwd,
-          home: regCtx.home,
-          ...(regCtx.project_root ? { project_root: regCtx.project_root } : {}),
+          ...regCtx,
         })}\n`,
       );
       const reg = await readOneJsonLine(socket);
@@ -409,15 +413,13 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     description: "Agent sandbox policy status and reload",
     handler: async (args, ctx) => {
       const sub = (args[0] ?? "status").toLowerCase();
-      const { cwd, home: rpcHome, project_root: rpcProjectRoot } = sandboxContext();
+      const rpcCtx = rpcContext();
       try {
         if (sub === "reload") {
           const resp = await policyRpc(
             {
               op: "reload",
-              cwd,
-              home: rpcHome,
-              ...(rpcProjectRoot ? { project_root: rpcProjectRoot } : {}),
+              ...rpcCtx,
             },
             socketPath(),
           );
@@ -429,9 +431,7 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         const resp = await policyRpc(
           {
             op: "status",
-            cwd,
-            home: rpcHome,
-            ...(rpcProjectRoot ? { project_root: rpcProjectRoot } : {}),
+            ...rpcCtx,
           },
           socketPath(),
         );
