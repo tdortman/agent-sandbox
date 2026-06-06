@@ -1,8 +1,8 @@
 //! Resolved sandbox paths and process identity (fewer `Option`s in daemon/proxy hot paths).
 
-use std::path::PathBuf;
+use std::path::Path;
 
-use crate::merge_policy::{discover_project_policy, infer_home_from_paths};
+use crate::merge_policy::ProjectPolicyContext;
 use crate::proc_context::{context_from_pid, home_from_uid};
 use crate::session_context::{SessionContext, read_session_context, write_session_context};
 
@@ -45,6 +45,20 @@ impl SandboxPaths {
         }
     }
 
+    #[must_use]
+    pub fn merged_with(
+        &self,
+        cwd: Option<String>,
+        home: Option<String>,
+        project_root: Option<String>,
+    ) -> Self {
+        Self::from_wire(
+            cwd.or_else(|| self.cwd_string()),
+            home.or_else(|| self.home_string()),
+            project_root.or_else(|| self.project_root_string()),
+        )
+    }
+
     pub fn cwd(&self) -> Option<&str> {
         non_empty(&self.cwd)
     }
@@ -68,13 +82,14 @@ impl SandboxPaths {
     pub fn project_root_string(&self) -> Option<String> {
         self.project_root().map(str::to_owned)
     }
+}
 
-    #[must_use]
-    pub fn to_session_context(&self) -> SessionContext {
-        SessionContext {
-            cwd: self.cwd_string(),
-            home: self.home_string(),
-            project_root: self.project_root_string(),
+impl From<&SandboxPaths> for SessionContext {
+    fn from(paths: &SandboxPaths) -> Self {
+        Self {
+            cwd: paths.cwd_string(),
+            home: paths.home_string(),
+            project_root: paths.project_root_string(),
         }
     }
 }
@@ -99,9 +114,10 @@ impl ProcessIds {
     pub fn uid(&self) -> Option<u32> {
         (self.uid > 0).then_some(self.uid)
     }
+}
 
-    #[must_use]
-    pub fn from_wire(pid: Option<u32>, uid: Option<u32>) -> Self {
+impl From<(Option<u32>, Option<u32>)> for ProcessIds {
+    fn from((pid, uid): (Option<u32>, Option<u32>)) -> Self {
         Self {
             pid: pid.unwrap_or(0),
             uid: uid.unwrap_or(0),
@@ -130,22 +146,20 @@ pub fn resolve_sandbox_paths(
         .or(file.project_root)
         .or_else(|| std::env::var("AGENT_SANDBOX_PROJECT_ROOT").ok());
 
-    if let Some(ref c) = cwd
-        && project_root.is_none()
-        && let Ok(cwd_path) = PathBuf::from(c).canonicalize()
-        && let Some(existing) = discover_project_policy(&cwd_path)
-        && let Some(parent) = existing.parent().and_then(|p| p.parent())
-    {
-        project_root = Some(parent.to_string_lossy().into_owned());
-    }
-
-    if home.is_none() {
-        let path_refs: Vec<&std::path::Path> = [project_root.as_deref(), cwd.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(std::path::Path::new)
-            .collect();
-        home = infer_home_from_paths(path_refs);
+    if project_root.is_none() || home.is_none() {
+        let project = ProjectPolicyContext::new(
+            home.as_deref().map(Path::new),
+            cwd.as_deref().map(Path::new),
+            project_root.as_deref().map(Path::new),
+        );
+        if project_root.is_none() {
+            project_root = project
+                .project_root()
+                .map(|path| path.to_string_lossy().into_owned());
+        }
+        if home.is_none() {
+            home = project.home_hint();
+        }
     }
 
     SandboxPaths::new(
@@ -178,6 +192,38 @@ pub fn resolve_proxy_paths(ids: ProcessIds) -> SandboxPaths {
 /// Persist merged paths for later RPCs in this session.
 pub fn persist_session_paths(paths: &SandboxPaths) {
     if paths.home().is_some() {
-        write_session_context(&paths.to_session_context());
+        let ctx = SessionContext::from(paths);
+        write_session_context(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcessIds, SandboxPaths};
+    use crate::session_context::SessionContext;
+
+    #[test]
+    fn sandbox_paths_merged_with_prefers_explicit_values() {
+        let base = SandboxPaths::new("/cwd", "/home", "/project");
+        let merged = base.merged_with(None, Some("/alt-home".into()), None);
+        assert_eq!(merged.cwd(), Some("/cwd"));
+        assert_eq!(merged.home(), Some("/alt-home"));
+        assert_eq!(merged.project_root(), Some("/project"));
+    }
+
+    #[test]
+    fn process_ids_from_option_tuple_uses_zero_for_unknowns() {
+        let ids = ProcessIds::from((Some(42), None));
+        assert_eq!(ids.pid(), Some(42));
+        assert_eq!(ids.uid(), None);
+    }
+
+    #[test]
+    fn sandbox_paths_convert_to_session_context() {
+        let paths = SandboxPaths::new("/cwd", "", "/project");
+        let ctx = SessionContext::from(&paths);
+        assert_eq!(ctx.cwd.as_deref(), Some("/cwd"));
+        assert_eq!(ctx.home, None);
+        assert_eq!(ctx.project_root.as_deref(), Some("/project"));
     }
 }
