@@ -1,14 +1,13 @@
 //! Resolved approval scope: typestate after validating RPC context.
 //!
-//! Wire format still uses `scope: String` on requests; parse with [`ApprovalScope::parse`]
-//! then call [`ScopeTarget::resolve`] so session/global/project requirements are enforced
-//! once, in one place.
+//! Wire format uses [`ApprovalScope`] directly on requests; call [`ScopeTarget::resolve`]
+//! so session/global/project requirements are enforced once, in one place.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::ScopeResolveError;
-use crate::merge_policy::resolve_project_policy_path;
+use crate::merge_policy::ProjectPolicyContext;
 use crate::rpc::ApprovalScope;
 
 /// Where an approved/denied rule is stored after scope + context validation.
@@ -55,7 +54,8 @@ impl ScopeTarget {
                 let project_root = ctx
                     .project_root
                     .ok_or(ScopeResolveError::ProjectRootRequired)?;
-                let policy_path = resolve_project_policy_path(None, Some(Path::new(project_root)))?;
+                let project = ProjectPolicyContext::new(None, None, Some(Path::new(project_root)));
+                let policy_path = project.resolve_policy_path()?;
                 Ok(Self::Project {
                     policy_path,
                     project_root: project_root.to_string(),

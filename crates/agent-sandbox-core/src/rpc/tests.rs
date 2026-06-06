@@ -1,6 +1,6 @@
 use super::{
-    CheckReply, ElevateReply, RegisterUiReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
-    StatusReply, UiPush,
+    CheckReply, ElevateReply, RegisterUiReply, RpcMessage, RpcReply, RpcRequest, StatusReply,
+    UiPush,
 };
 
 #[test]
@@ -19,7 +19,7 @@ fn register_ui_reply_serializes() {
         role: "ui".into(),
         session_id: "abc".into(),
     })
-    .to_line();
+    .to_string();
     let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["role"], "ui");
@@ -38,7 +38,7 @@ fn ui_push_network_request() {
         home: None,
         project_root: None,
     })
-    .to_line();
+    .to_string();
     let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(v["type"], "network_request");
     assert_eq!(v["id"], "n1");
@@ -73,41 +73,11 @@ fn check_reply_deserializes_as_check_not_simple() {
 
 #[test]
 fn elevate_reply_deserializes_as_elevate_not_simple() {
-    let line = serde_json::to_string(&ElevateReply::executed(
-        0,
-        "root\n".into(),
-        String::new(),
-    ))
-    .unwrap();
+    let line =
+        serde_json::to_string(&ElevateReply::executed(0, "root\n".into(), String::new())).unwrap();
     let reply: RpcReply = serde_json::from_str(&line).unwrap();
     assert!(matches!(
         reply,
         RpcReply::Elevate(e) if e.allowed && e.exit_code == 0 && e.stdout == "root\n"
     ));
-}
-
-#[test]
-fn scope_action_reply_deserializes_as_scope_action() {
-    let line = serde_json::to_string(&ScopeActionReply::ok_network(
-        "example.com".into(),
-        443,
-        "once",
-        None,
-    ))
-    .unwrap();
-    let reply: RpcReply = serde_json::from_str(&line).unwrap();
-    assert!(matches!(reply, RpcReply::ScopeAction(s) if s.host.as_deref() == Some("example.com")));
-}
-
-#[test]
-fn scope_action_reply_optional_fields_omitted() {
-    let json = serde_json::to_value(ScopeActionReply::ok_network(
-        "ex.com".into(),
-        443,
-        "once",
-        None,
-    ))
-    .unwrap();
-    assert!(json.get("argv").is_none());
-    assert_eq!(json["host"], "ex.com");
 }

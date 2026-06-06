@@ -1,10 +1,12 @@
 //! policyd → client response types.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::policy::Policy;
 
-use super::message::RpcMessage;
+use super::{message::RpcMessage, scope::ApprovalScope};
 
 /// policyd → client response line.
 ///
@@ -145,58 +147,96 @@ impl ElevateReply {
     }
 }
 
-/// Approve / deny / approve-host success payloads (shared shape).
+/// Approve / deny / approve-host success payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScopeActionReply {
+#[serde(untagged)]
+pub enum ScopeActionReply {
+    Network(NetworkScopeActionReply),
+    Sudo(SudoScopeActionReply),
+    Elevation(ElevationScopeActionReply),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkScopeActionReply {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub argv: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SudoScopeActionReply {
+    pub ok: bool,
+    pub argv: Vec<String>,
+    pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed: Option<bool>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElevationScopeActionReply {
+    pub ok: bool,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub allowed: bool,
 }
 
 impl ScopeActionReply {
-    pub fn ok_network(host: String, port: u16, scope: &str, path: Option<String>) -> Self {
-        Self {
+    pub fn ok_network(host: String, port: u16, scope: ApprovalScope, path: Option<String>) -> Self {
+        Self::Network(NetworkScopeActionReply {
             ok: true,
-            host: Some(host),
-            port: Some(port),
-            argv: None,
-            scope: Some(scope.to_string()),
+            host,
+            port,
+            scope: scope.to_string(),
             path,
-            allowed: None,
+        })
+    }
+
+    pub fn ok_sudo(argv: Vec<String>, scope: ApprovalScope, path: Option<String>) -> Self {
+        Self::Sudo(SudoScopeActionReply {
+            ok: true,
+            argv,
+            scope: scope.to_string(),
+            path,
+        })
+    }
+
+    pub fn ok_elevation_approve(scope: ApprovalScope, path: Option<String>) -> Self {
+        Self::Elevation(ElevationScopeActionReply {
+            ok: true,
+            scope: scope.to_string(),
+            path,
+            allowed: true,
+        })
+    }
+
+    pub const fn is_ok(&self) -> bool {
+        match self {
+            Self::Network(reply) => reply.ok,
+            Self::Sudo(reply) => reply.ok,
+            Self::Elevation(reply) => reply.ok,
         }
     }
 
-    pub fn ok_sudo(argv: Vec<String>, scope: &str, path: Option<String>) -> Self {
-        Self {
-            ok: true,
-            host: None,
-            port: None,
-            argv: Some(argv),
-            scope: Some(scope.to_string()),
-            path,
-            allowed: None,
+    pub fn scope_label(&self) -> &str {
+        match self {
+            Self::Network(reply) => &reply.scope,
+            Self::Sudo(reply) => &reply.scope,
+            Self::Elevation(reply) => &reply.scope,
         }
     }
 
-    pub fn ok_elevation_approve(scope: &str, path: Option<String>) -> Self {
-        Self {
-            ok: true,
-            host: None,
-            port: None,
-            argv: None,
-            scope: Some(scope.to_string()),
-            path,
-            allowed: Some(true),
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Network(reply) => reply.path.as_deref(),
+            Self::Sudo(reply) => reply.path.as_deref(),
+            Self::Elevation(reply) => reply.path.as_deref(),
         }
     }
 }
@@ -214,24 +254,61 @@ impl RpcReply {
     }
 
     pub const fn scope_succeeded(&self) -> bool {
-        matches!(self, Self::ScopeAction(s) if s.ok)
+        matches!(self, Self::ScopeAction(reply) if reply.is_ok())
     }
 
     pub fn scope_label(&self) -> Option<&str> {
         match self {
-            Self::ScopeAction(s) => s.scope.as_deref(),
+            Self::ScopeAction(reply) => Some(reply.scope_label()),
             _ => None,
         }
     }
 
     pub fn scope_path(&self) -> Option<String> {
         match self {
-            Self::ScopeAction(s) => s.path.clone(),
+            Self::ScopeAction(reply) => reply.path().map(str::to_owned),
             _ => None,
         }
     }
+}
 
-    pub fn to_line(&self) -> String {
-        RpcMessage::Reply(self.clone()).to_line()
+impl fmt::Display for RpcReply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        RpcMessage::Reply(self.clone()).fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApprovalScope, RpcReply, ScopeActionReply};
+
+    #[test]
+    fn scope_action_reply_deserializes_as_scope_action() {
+        let line = serde_json::to_string(&ScopeActionReply::ok_network(
+            "example.com".into(),
+            443,
+            ApprovalScope::Once,
+            None,
+        ))
+        .unwrap();
+        let reply: RpcReply = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            reply,
+            RpcReply::ScopeAction(ScopeActionReply::Network(_))
+        ));
+    }
+
+    #[test]
+    fn scope_action_reply_omits_irrelevant_fields() {
+        let json = serde_json::to_value(ScopeActionReply::ok_network(
+            "ex.com".into(),
+            443,
+            ApprovalScope::Once,
+            None,
+        ))
+        .unwrap();
+        assert!(json.get("argv").is_none());
+        assert!(json.get("allowed").is_none());
+        assert_eq!(json["host"], "ex.com");
     }
 }
