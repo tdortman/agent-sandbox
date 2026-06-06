@@ -14,8 +14,8 @@ use crate::store::PolicyStore;
 pub async fn dispatch(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
-    req: RpcRequest,
+    mut req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
-    let ctx = context::resolve(store, &req).await;
-    handlers::handle(store, client, req, ctx).await
+    context::resolve(store, &mut req).await;
+    handlers::handle(store, client, req).await
 }

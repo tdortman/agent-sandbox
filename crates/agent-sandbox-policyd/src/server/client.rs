@@ -48,7 +48,7 @@ pub async fn handle_client(store: Arc<PolicyStore>, stream: UnixStream) -> std::
 }
 
 async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
-    let line = payload.to_line();
+    let line = payload.to_string();
     let mut w = writer.lock().await;
     if w.write_all(line.as_bytes()).await.is_err() {
         return;

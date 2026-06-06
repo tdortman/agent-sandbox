@@ -3,47 +3,32 @@
 use std::sync::Arc;
 
 use agent_sandbox_core::{
-    RegisterUiReply, RpcReply, RpcRequest, SandboxPaths, SessionContext, SimpleOkReply,
-    write_session_context,
+    RegisterUiReply, RpcReply, RpcRequest, SessionContext, SimpleOkReply, write_session_context,
 };
 
 use crate::error::PolicydError;
 use crate::store::PolicyStore;
 use crate::wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire};
 
-use super::context::Resolved;
-
 pub(crate) async fn handle(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     req: RpcRequest,
-    ctx: Resolved,
 ) -> Result<RpcReply, PolicydError> {
-    let Resolved {
-        cwd,
-        home,
-        project_root,
-    } = ctx;
-
     match req {
-        RpcRequest::RegisterUi {
-            ui_client,
-            cwd: req_cwd,
-            home: req_home,
-            project_root: req_project_root,
-            ..
-        } => {
+        RpcRequest::RegisterUi { ui_client, ctx } => {
             let ui_client = ui_client.as_deref().unwrap_or("standalone");
             if ui_client == "standalone" && store.has_omp_ui().await {
                 return Err(PolicydError::OmpUiActive);
             }
+            let paths = ctx.sandbox_paths();
             let session_id = store
                 .start_ui_session(
                     client,
                     ui_client,
-                    req_cwd.or_else(|| cwd.clone()),
-                    req_home.or_else(|| home.clone()),
-                    req_project_root.or_else(|| project_root.clone()),
+                    paths.cwd_string(),
+                    paths.home_string(),
+                    paths.project_root_string(),
                 )
                 .await;
             if let Some(sess) = store.ui_context_for_session(&session_id).await {
@@ -52,8 +37,8 @@ pub(crate) async fn handle(
                     home: sess.home.clone(),
                     project_root: sess.project_root.clone(),
                 });
-                if let Some(ref pr) = sess.project_root {
-                    tracing::info!(project_root = %pr, "policy UI registered");
+                if let Some(project_root) = &sess.project_root {
+                    tracing::info!(project_root = %project_root, "policy UI registered");
                 }
             }
             Ok(RpcReply::RegisterUi(RegisterUiReply {
@@ -72,41 +57,9 @@ pub(crate) async fn handle(
             port,
             scheme,
             url,
-            cwd: _,
-            home: _,
-            project_root: _,
-            pid,
-            uid,
-            ..
-        } => {
-            super::check::handle_check(
-                store,
-                super::check::CheckParams {
-                    host,
-                    connect_host,
-                    port,
-                    scheme,
-                    url,
-                    pid,
-                    uid,
-                },
-                super::context::Resolved {
-                    cwd,
-                    home,
-                    project_root,
-                },
-            )
-            .await
-        }
-        RpcRequest::Elevate {
-            argv,
-            cwd: _,
-            home: _,
-            project_root: _,
-            pid,
-            uid,
-            ..
-        } => {
+            ctx,
+        } => super::check::handle_check(store, host, connect_host, port, scheme, url, ctx).await,
+        RpcRequest::Elevate { argv, ctx } => {
             if argv.is_empty() {
                 return Err(PolicydError::ArgvRequired);
             }
@@ -114,7 +67,7 @@ pub(crate) async fn handle(
                 store
                     .request_elevation(ElevationRequest {
                         argv,
-                        ctx: MergeContext::from_options(cwd, home, project_root, pid, uid),
+                        ctx: MergeContext::from(&ctx),
                     })
                     .await,
             ))
@@ -123,20 +76,12 @@ pub(crate) async fn handle(
             id,
             scope,
             session_id,
-            cwd: _,
-            home: _,
-            project_root: _,
-            uid,
-            ..
+            ctx,
         } => Ok(store
             .approve(PendingDecision {
                 pending_id: id,
                 scope,
-                wire: ScopeWire {
-                    paths: SandboxPaths::from_wire(cwd, home, project_root),
-                    session_id,
-                    owner_uid: uid,
-                },
+                wire: ScopeWire::from_request(ctx, session_id),
             })
             .await),
         RpcRequest::ApproveHost {
@@ -144,12 +89,7 @@ pub(crate) async fn handle(
             port,
             scope,
             session_id,
-            cwd: _,
-            home: _,
-            project_root: _,
-            pid,
-            uid,
-            ..
+            ctx,
         } => {
             if port == 0 {
                 return Err(PolicydError::PortRequired);
@@ -160,7 +100,7 @@ pub(crate) async fn handle(
                     port,
                     scope,
                     session_id,
-                    ctx: MergeContext::from_options(cwd, home, project_root, pid, uid),
+                    ctx: MergeContext::from(&ctx),
                 })
                 .await)
         }
@@ -168,30 +108,20 @@ pub(crate) async fn handle(
             id,
             scope,
             session_id,
-            cwd: _,
-            home: _,
-            project_root: _,
-            uid,
-            ..
+            ctx,
         } => Ok(store
             .deny(PendingDecision {
                 pending_id: id,
                 scope,
-                wire: ScopeWire {
-                    paths: SandboxPaths::from_wire(cwd, home, project_root),
-                    session_id,
-                    owner_uid: uid,
-                },
+                wire: ScopeWire::from_request(ctx, session_id),
             })
             .await),
-        RpcRequest::Status { .. } => {
-            let paths = SandboxPaths::from_wire(cwd, home, project_root);
-            let body = store.status(paths).await;
+        RpcRequest::Status { ctx } => {
+            let body = store.status(ctx.sandbox_paths()).await;
             Ok(RpcReply::Status(body))
         }
-        RpcRequest::Reload { .. } => {
-            let paths = SandboxPaths::from_wire(cwd, home, project_root);
-            store.export_policy_files(paths).await?;
+        RpcRequest::Reload { ctx } => {
+            store.export_policy_files(ctx.sandbox_paths()).await?;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
     }
