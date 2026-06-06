@@ -1,6 +1,6 @@
-//! Grouped wire/context fields for policyd (keeps function arity down).
+//! Grouped wire/context fields for policyd.
 
-use agent_sandbox_core::{ApprovalScope, ProcessIds, SandboxPaths};
+use agent_sandbox_core::{ApprovalScope, ProcessIds, RequestContext, SandboxPaths};
 
 #[derive(Debug, Clone, Default)]
 pub struct MergeContext {
@@ -8,18 +8,23 @@ pub struct MergeContext {
     pub ids: ProcessIds,
 }
 
-impl MergeContext {
-    #[must_use]
-    pub fn from_options(
-        cwd: Option<String>,
-        home: Option<String>,
-        project_root: Option<String>,
-        pid: Option<u32>,
-        uid: Option<u32>,
-    ) -> Self {
+impl From<&RequestContext> for MergeContext {
+    fn from(ctx: &RequestContext) -> Self {
         Self {
-            paths: SandboxPaths::from_wire(cwd, home, project_root),
-            ids: ProcessIds::from_wire(pid, uid),
+            paths: ctx.sandbox_paths(),
+            ids: ctx.ids(),
+        }
+    }
+}
+
+impl From<MergeContext> for RequestContext {
+    fn from(ctx: MergeContext) -> Self {
+        Self {
+            cwd: ctx.paths.cwd_string(),
+            home: ctx.paths.home_string(),
+            project_root: ctx.paths.project_root_string(),
+            pid: ctx.ids.pid(),
+            uid: ctx.ids.uid(),
         }
     }
 }
@@ -29,6 +34,18 @@ pub struct ScopeWire {
     pub paths: SandboxPaths,
     pub session_id: Option<String>,
     pub owner_uid: Option<u32>,
+}
+
+impl ScopeWire {
+    #[must_use]
+    pub fn from_request(ctx: RequestContext, session_id: Option<String>) -> Self {
+        let owner_uid = ctx.uid;
+        Self {
+            paths: ctx.sandbox_paths(),
+            session_id,
+            owner_uid,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +90,7 @@ pub struct NetworkCheckRequest {
 pub struct HostApproveRequest {
     pub host: String,
     pub port: u16,
-    pub scope: String,
+    pub scope: ApprovalScope,
     pub session_id: Option<String>,
     pub ctx: MergeContext,
 }
@@ -81,7 +98,7 @@ pub struct HostApproveRequest {
 #[derive(Debug, Clone)]
 pub struct PendingDecision {
     pub pending_id: String,
-    pub scope: String,
+    pub scope: ApprovalScope,
     pub wire: ScopeWire,
 }
 

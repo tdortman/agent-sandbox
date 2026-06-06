@@ -1,37 +1,53 @@
-//! Scope wire resolution and helper for pending decisions.
+//! Shared decision helpers for pending approvals.
 
-use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths};
+use agent_sandbox_core::RpcReply;
 
 use crate::wire::{PendingDecision, ScopeWire};
 
 use super::super::types::{Pending, PolicyStore};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionAction {
+    Approve,
+    Deny,
+}
+
+impl DecisionAction {
+    pub const fn audit_verb(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 impl PolicyStore {
     pub(crate) fn scope_wire_for_pending(wire: ScopeWire, pending: &Pending) -> ScopeWire {
+        let ScopeWire {
+            paths,
+            session_id,
+            owner_uid,
+        } = wire;
         ScopeWire {
-            paths: SandboxPaths::from_wire(
-                pending.cwd.clone().or(wire.paths.cwd_string()),
-                pending.home.clone().or(wire.paths.home_string()),
-                pending
-                    .project_root
-                    .clone()
-                    .or(wire.paths.project_root_string()),
+            paths: paths.merged_with(
+                pending.cwd.clone(),
+                pending.home.clone(),
+                pending.project_root.clone(),
             ),
-            session_id: wire.session_id,
-            owner_uid: wire.owner_uid,
+            session_id,
+            owner_uid,
         }
     }
 
     pub(crate) async fn take_pending_decision(
         &self,
         decision: PendingDecision,
-    ) -> Result<(Pending, ApprovalScope, ScopeWire), RpcReply> {
+    ) -> Result<(Pending, ScopeWire, agent_sandbox_core::ApprovalScope), RpcReply> {
         let PendingDecision {
             pending_id,
             scope,
             wire,
         } = decision;
-        let scope = scope.parse::<ApprovalScope>().map_err(RpcReply::from)?;
         let pending = {
             let mut inner = self.inner.lock().await;
             inner.pending.remove(&pending_id)
@@ -40,6 +56,6 @@ impl PolicyStore {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
             err
         })?;
-        Ok((pending, scope, wire))
+        Ok((pending, wire, scope))
     }
 }
