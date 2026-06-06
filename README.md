@@ -60,7 +60,7 @@ See `nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for mount paths, declara
 
 ## Home Manager (OMP extension)
 
-Policy prompts inside [oh-my-pi](https://github.com/can1357/oh-my-pi) sessions use a TypeScript extension shipped with this flake. OMP also auto-discovers `~/.omp/agent/extensions/*/index.ts`; the Home Manager module installs this tree for you.
+Policy prompts inside [oh-my-pi](https://github.com/can1357/oh-my-pi) sessions use a TypeScript extension shipped with this flake. OMP also auto-discovers `~/.omp/agent/extensions/*/index.ts`, the Home Manager module installs this tree for you.
 
 ```nix
 {
@@ -79,13 +79,6 @@ homes.modules = [
 ```nix
 # home.nix
 programs.agent-sandbox.ompExtension.enable = true;
-```
-
-Make sure to add the following to your `config.yml` to enable the OMP extension:
-
-```yaml
-extensions:
-    ./extensions/agent-sandbox
 ```
 
 Source lives in `extensions/agent-sandbox/` (`index.ts`, `policy-client.ts`). With the extension enabled, policyd treats OMP as the primary UI (`ui_client: "omp"`) and `agent-sandbox-ui` exits when OMP is already connected.
