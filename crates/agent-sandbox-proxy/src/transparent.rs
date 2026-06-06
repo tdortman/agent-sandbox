@@ -17,8 +17,7 @@ pub(crate) async fn handle_transparent(
 ) -> Result<(), ProxyClientError> {
     let scheme = if port == 443 { "https" } else { "http" };
     let initial = read_client_peek(&stream).await;
-    let (policy_host, upstream_host) =
-        policy_host_for_connect(&connect_host, Some(&initial), None);
+    let (policy_host, upstream_host) = policy_host_for_connect(&connect_host, Some(&initial), None);
     if policy_host != connect_host {
         info!(
             policy_host = %policy_host,

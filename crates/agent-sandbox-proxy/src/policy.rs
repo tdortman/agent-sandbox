@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use agent_sandbox_core::{
-    ProcessIds, RpcReply, RpcRequest, persist_session_paths, policy_rpc, resolve_proxy_paths,
+    ProcessIds, RequestContext, RpcReply, RpcRequest, persist_session_paths, policy_rpc,
+    resolve_proxy_paths,
 };
 use tracing::{info, warn};
 
@@ -25,11 +26,7 @@ pub(crate) async fn check_destination(
         port: Some(port),
         scheme: scheme.to_string(),
         url: Some(url),
-        cwd: paths.cwd_string(),
-        home: paths.home_string(),
-        project_root: paths.project_root_string(),
-        pid: ids.pid(),
-        uid: ids.uid(),
+        ctx: RequestContext::from((paths, ids)),
     };
     let timeout = Duration::from_secs_f64(state.args.policy_timeout.max(1.0));
     let resp = policy_rpc(&state.args.policy_socket, req, timeout).await?;
