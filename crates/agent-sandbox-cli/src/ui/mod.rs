@@ -27,11 +27,11 @@ struct Cli {
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     socket: PathBuf,
-    #[arg(long)]
+    #[arg(long, env = "AGENT_SANDBOX_CWD")]
     cwd: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "AGENT_SANDBOX_HOME")]
     home: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<String>,
 }
 
@@ -81,12 +81,6 @@ impl UiClient {
                 RpcMessage::Reply(RpcReply::RegisterUi(r)) if r.ok => {
                     *self.session_id.lock().await = Some(r.session_id);
                     info!("connected to policyd");
-                }
-                RpcMessage::Reply(RpcReply::Error(e))
-                    if e.error.contains("OMP policy UI is active") =>
-                {
-                    info!("OMP extension owns prompts; exiting");
-                    std::process::exit(0);
                 }
                 RpcMessage::Reply(RpcReply::Error(e)) => {
                     return Err(UiCliError::Register(e.error));
