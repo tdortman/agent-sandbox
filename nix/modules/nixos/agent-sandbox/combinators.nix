@@ -140,7 +140,7 @@ let
 
   # Shared bash: mount path at $hostPath, follow symlinks (chezmoi → dotfiles),
   # exposing each resolved target at its real path (read-only).
-  mountHomePathFn = flag: ''
+  mountHomePathFn = ''
     mount_home_path() {
       local hostPath="$1"
       local bindFlag="$2"
@@ -185,7 +185,7 @@ in
       add-runtime ''
         realHome=$(readlink -f "$HOME")
         declare -A _agent_sandbox_canon=()
-        ${mountHomePathFn "--ro-bind"}
+        ${mountHomePathFn}
         ${lib.concatMapStringsSep "\n" (rel: ''
           mount_home_path "$realHome/${rel}" --ro-bind
         '') rels}
@@ -199,7 +199,7 @@ in
       add-runtime ''
         realHome=$(readlink -f "$HOME")
         declare -A _agent_sandbox_canon=()
-        ${mountHomePathFn "--bind"}
+        ${mountHomePathFn}
         ${lib.concatMapStringsSep "\n" (rel: ''
           mount_home_path "$realHome/${rel}" --bind
         '') rels}

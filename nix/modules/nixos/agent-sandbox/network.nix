@@ -168,6 +168,12 @@ lib.mkIf policyEnabled (
               "${policyPkg}/bin/agent-sandbox-policyd"
               "--socket"
               config.agent-sandbox.policy.socketPath
+            ]
+            ++ lib.optionals cfg.enable [
+              "--sandbox-netns"
+              "/run/netns/${cfg.netnsName}"
+            ]
+            ++ [
               "--declarative"
               "/etc/agent-sandbox/declarative.json"
               "--export-json"
