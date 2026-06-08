@@ -19,9 +19,10 @@ let
   proxyHost = builtins.elemAt proxyParts 0;
   proxyPort = builtins.elemAt proxyParts 1;
 
-  dnsTargetHost = let
-    parts = lib.splitString ":" cfg.dnsForwardTarget;
-  in
+  dnsTargetHost =
+    let
+      parts = lib.splitString ":" cfg.dnsForwardTarget;
+    in
     if builtins.length parts > 1 then builtins.elemAt parts 0 else cfg.dnsForwardTarget;
 
   # Sandboxes cannot reach 127.0.0.53 (host stub). They query the veth gateway;
@@ -132,14 +133,8 @@ lib.mkIf policyEnabled (
     {
       environment.etc."agent-sandbox/declarative.json".text = builtins.toJSON {
         network = {
-          allow = map (r: {
-            host = r.host;
-            port = r.port;
-          }) cfg.declarativeAllow;
-          deny = map (r: {
-            host = r.host;
-            port = r.port;
-          }) cfg.declarativeDeny;
+          allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
+          deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
         };
         sudo = {
           allow = [ ];
@@ -238,86 +233,84 @@ lib.mkIf policyEnabled (
         setgid = false;
       };
 
-      systemd.services.agent-sandbox-netns = {
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-pre.target" ];
-        before = [
-          "agent-sandbox-dns.service"
-          "agent-sandbox-policy.service"
-          "agent-sandbox-proxy.service"
-        ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          ExecStart = "${netnsUpPkg}/bin/agent-sandbox-netns-up";
-          ExecStop = "${netnsDownPkg}/bin/agent-sandbox-netns-down";
-        };
-      };
-
-      systemd.services.agent-sandbox-dns = {
-        description = "DNS proxy for agent-sandbox (records A/AAAA → hostname cache)";
-        bindsTo = [ "agent-sandbox-netns.service" ];
-        wantedBy = [ "multi-user.target" ];
-        after = [
-          "agent-sandbox-netns.service"
-          "network.target"
-          "systemd-resolved.service"
-        ];
-        before = [
-          "agent-sandbox-policy.service"
-          "agent-sandbox-proxy.service"
-        ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = lib.escapeShellArgs [
-            "${policyPkg}/bin/agent-sandbox-dns-proxy"
-            "--listen-host"
-            cfg.hostIp
-            "--listen-port"
-            "53"
-            "--upstream"
-            cfg.dnsForwardTarget
-            "--cache-path"
-            "/run/agent-sandbox/dns-cache.json"
+      systemd.services = {
+        agent-sandbox-netns = {
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network-pre.target" ];
+          before = [
+            "agent-sandbox-dns.service"
+            "agent-sandbox-policy.service"
+            "agent-sandbox-proxy.service"
           ];
-          Restart = "on-failure";
-          KillMode = "control-group";
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${netnsUpPkg}/bin/agent-sandbox-netns-up";
+            ExecStop = "${netnsDownPkg}/bin/agent-sandbox-netns-down";
+          };
         };
-      };
 
-      systemd.services.agent-sandbox-proxy = {
-        description = "Policy proxy inside agent-sandbox netns";
-        wantedBy = [ "multi-user.target" ];
-        requires = [
-          "agent-sandbox-policy.service"
-          "agent-sandbox-netns.service"
-          "agent-sandbox-dns.service"
-        ];
-        after = [
-          "agent-sandbox-policy.service"
-          "agent-sandbox-netns.service"
-          "agent-sandbox-dns.service"
-        ];
-        serviceConfig = {
-          Type = "simple";
-          NetworkNamespacePath = "/run/netns/${cfg.netnsName}";
-          ExecStart = lib.escapeShellArgs [
-            "${policyPkg}/bin/agent-sandbox-proxy"
-            "--listen-host"
-            proxyHost
-            "--listen-port"
-            proxyPort
-            "--policy-socket"
-            config.agent-sandbox.policy.socketPath
-            "--policy-timeout"
-            (
-              toString (
-                lib.max cfg.policyTimeout config.agent-sandbox.policy.approvalTimeout
-              )
-            )
+        agent-sandbox-dns = {
+          description = "DNS proxy for agent-sandbox (records A/AAAA → hostname cache)";
+          bindsTo = [ "agent-sandbox-netns.service" ];
+          wantedBy = [ "multi-user.target" ];
+          after = [
+            "agent-sandbox-netns.service"
+            "network.target"
+            "systemd-resolved.service"
           ];
-          Environment = "AGENT_SANDBOX_DNS_CACHE=/run/agent-sandbox/dns-cache.json";
-          Restart = "on-failure";
+          before = [
+            "agent-sandbox-policy.service"
+            "agent-sandbox-proxy.service"
+          ];
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = lib.escapeShellArgs [
+              "${policyPkg}/bin/agent-sandbox-dns-proxy"
+              "--listen-host"
+              cfg.hostIp
+              "--listen-port"
+              "53"
+              "--upstream"
+              cfg.dnsForwardTarget
+              "--cache-path"
+              "/run/agent-sandbox/dns-cache.json"
+            ];
+            Restart = "on-failure";
+            KillMode = "control-group";
+          };
+        };
+
+        agent-sandbox-proxy = {
+          description = "Policy proxy inside agent-sandbox netns";
+          wantedBy = [ "multi-user.target" ];
+          requires = [
+            "agent-sandbox-policy.service"
+            "agent-sandbox-netns.service"
+            "agent-sandbox-dns.service"
+          ];
+          after = [
+            "agent-sandbox-policy.service"
+            "agent-sandbox-netns.service"
+            "agent-sandbox-dns.service"
+          ];
+          serviceConfig = {
+            Type = "simple";
+            NetworkNamespacePath = "/run/netns/${cfg.netnsName}";
+            ExecStart = lib.escapeShellArgs [
+              "${policyPkg}/bin/agent-sandbox-proxy"
+              "--listen-host"
+              proxyHost
+              "--listen-port"
+              proxyPort
+              "--policy-socket"
+              config.agent-sandbox.policy.socketPath
+              "--policy-timeout"
+              (toString (lib.max cfg.policyTimeout config.agent-sandbox.policy.approvalTimeout))
+            ];
+            Environment = "AGENT_SANDBOX_DNS_CACHE=/run/agent-sandbox/dns-cache.json";
+            Restart = "on-failure";
+          };
         };
       };
     })

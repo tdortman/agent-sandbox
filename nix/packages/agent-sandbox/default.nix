@@ -17,7 +17,7 @@ rustPlatform.buildRustPackage (
   in
   {
     pname = "agent-sandbox";
-    version = workspacePackage.version;
+    inherit (workspacePackage) version;
     inherit src;
 
     cargoLock.lockFile = "${src}/Cargo.lock";

@@ -10,7 +10,7 @@ let
 
   agentSandboxLib = import ./lib.nix {
     inherit lib;
-    jail-nix = flake.jail-nix;
+    inherit (flake) jail-nix;
   };
 
   policyPkg = flake.package "agent-sandbox";
@@ -86,7 +86,10 @@ let
       type = lib.types.listOf lib.types.str;
       default = agentSandboxLib.defaultBlockEnvVars;
     };
-    exposeWorkingDirectory = lib.mkOption { type = lib.types.bool; default = true; };
+    exposeWorkingDirectory = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+    };
     extraBwrapArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -99,7 +102,8 @@ let
     lib.optional cfg.network.enable "/run/agent-sandbox"
     ++ lib.optional cfg.network.enable "/run/netns";
 
-  mergePackageMounts = pkgCfg:
+  mergePackageMounts =
+    pkgCfg:
     pkgCfg
     // {
       readonlyDirs = lib.unique (cfg.readonlyDirs ++ sharedRuntimeReadonly ++ pkgCfg.readonlyDirs);
@@ -124,7 +128,8 @@ let
     policy = cfg.sudoPolicy;
   };
 
-  wrapOne = value:
+  wrapOne =
+    value:
     agentSandboxLib.mkWrapPackage pkgs (
       mergePackageMounts value
       // {
@@ -160,7 +165,10 @@ in
     };
 
     sudoPolicy = lib.mkOption {
-      type = lib.types.enum [ "deny" "approve" ];
+      type = lib.types.enum [
+        "deny"
+        "approve"
+      ];
       default = "approve";
       description = ''
         How sandboxed agents may invoke sudo. ``deny`` blocks elevation.
@@ -233,62 +241,206 @@ in
         '';
       };
 
-      hostIp = lib.mkOption { type = lib.types.str; default = "169.254.100.1"; };
-      netnsIp = lib.mkOption { type = lib.types.str; default = "169.254.100.2"; };
-      vethHost = lib.mkOption { type = lib.types.str; default = "asbx-host"; };
-      vethNetns = lib.mkOption { type = lib.types.str; default = "asbx-ns"; };
+      hostIp = lib.mkOption {
+        type = lib.types.str;
+        default = "169.254.100.1";
+      };
+      netnsIp = lib.mkOption {
+        type = lib.types.str;
+        default = "169.254.100.2";
+      };
+      vethHost = lib.mkOption {
+        type = lib.types.str;
+        default = "asbx-host";
+      };
+      vethNetns = lib.mkOption {
+        type = lib.types.str;
+        default = "asbx-ns";
+      };
 
       declarativeAllow = lib.mkOption {
         type = lib.types.listOf ruleType;
         default = [
           # LLM / agent APIs
-          { host = "api.openai.com"; port = 443; }
-          { host = "chatgpt.com"; port = 443; }
-          { host = "api.deepseek.com"; port = 443; }
-          { host = "*.anthropic.com"; port = 443; }
-          { host = "api.githubcopilot.com"; port = 443; }
-          { host = "*.githubcopilot.com"; port = 443; }
-          { host = "generativelanguage.googleapis.com"; port = 443; }
-          { host = "api.mistral.ai"; port = 443; }
-          { host = "api.cohere.ai"; port = 443; }
-          { host = "api.together.xyz"; port = 443; }
-          { host = "openrouter.ai"; port = 443; }
-          { host = "api.morphllm.com"; port = 443; }
-          { host = "*.amazonaws.com"; port = 443; }
-          { host = "opencode.ai"; port = 443; }
-          { host = "api.opencode.ai"; port = 443; }
-          { host = "ampcode.com"; port = 443; }
-          { host = "*.ampcode.com"; port = 443; }
-          { host = "*.factory.ai"; port = 443; }
-          { host = "api.workos.com"; port = 443; }
-          { host = "*.cursor.sh"; port = 443; }
-          { host = "*.cursor.com"; port = 443; }
-          { host = "*.cursorapi.com"; port = 443; }
-          { host = "data.charm.land"; port = 443; }
-          { host = "catwalk.charm.sh"; port = 443; }
-          { host = "models.dev"; port = 443; }
+          {
+            host = "api.openai.com";
+            port = 443;
+          }
+          {
+            host = "chatgpt.com";
+            port = 443;
+          }
+          {
+            host = "api.deepseek.com";
+            port = 443;
+          }
+          {
+            host = "*.anthropic.com";
+            port = 443;
+          }
+          {
+            host = "api.githubcopilot.com";
+            port = 443;
+          }
+          {
+            host = "*.githubcopilot.com";
+            port = 443;
+          }
+          {
+            host = "generativelanguage.googleapis.com";
+            port = 443;
+          }
+          {
+            host = "api.mistral.ai";
+            port = 443;
+          }
+          {
+            host = "api.cohere.ai";
+            port = 443;
+          }
+          {
+            host = "api.together.xyz";
+            port = 443;
+          }
+          {
+            host = "openrouter.ai";
+            port = 443;
+          }
+          {
+            host = "api.morphllm.com";
+            port = 443;
+          }
+          {
+            host = "*.amazonaws.com";
+            port = 443;
+          }
+          {
+            host = "opencode.ai";
+            port = 443;
+          }
+          {
+            host = "api.opencode.ai";
+            port = 443;
+          }
+          {
+            host = "ampcode.com";
+            port = 443;
+          }
+          {
+            host = "*.ampcode.com";
+            port = 443;
+          }
+          {
+            host = "*.factory.ai";
+            port = 443;
+          }
+          {
+            host = "api.workos.com";
+            port = 443;
+          }
+          {
+            host = "*.cursor.sh";
+            port = 443;
+          }
+          {
+            host = "*.cursor.com";
+            port = 443;
+          }
+          {
+            host = "*.cursorapi.com";
+            port = 443;
+          }
+          {
+            host = "data.charm.land";
+            port = 443;
+          }
+          {
+            host = "catwalk.charm.sh";
+            port = 443;
+          }
+          {
+            host = "models.dev";
+            port = 443;
+          }
           # Git / source hosts
-          { host = "github.com"; port = 443; }
-          { host = "api.github.com"; port = 443; }
-          { host = "raw.githubusercontent.com"; port = 443; }
-          { host = "codeload.github.com"; port = 443; }
-          { host = "objects.githubusercontent.com"; port = 443; }
-          { host = "release-assets.githubusercontent.com"; port = 443; }
-          { host = "gitlab.com"; port = 443; }
+          {
+            host = "github.com";
+            port = 443;
+          }
+          {
+            host = "api.github.com";
+            port = 443;
+          }
+          {
+            host = "raw.githubusercontent.com";
+            port = 443;
+          }
+          {
+            host = "codeload.github.com";
+            port = 443;
+          }
+          {
+            host = "objects.githubusercontent.com";
+            port = 443;
+          }
+          {
+            host = "release-assets.githubusercontent.com";
+            port = 443;
+          }
+          {
+            host = "gitlab.com";
+            port = 443;
+          }
           # Package registries
-          { host = "registry.npmjs.org"; port = 443; }
-          { host = "*.npmjs.org"; port = 443; }
-          { host = "registry.yarnpkg.com"; port = 443; }
-          { host = "pypi.org"; port = 443; }
-          { host = "files.pythonhosted.org"; port = 443; }
-          { host = "crates.io"; port = 443; }
-          { host = "static.crates.io"; port = 443; }
-          { host = "index.crates.io"; port = 443; }
-          { host = "proxy.golang.org"; port = 443; }
-          { host = "sum.golang.org"; port = 443; }
-          { host = "formulae.brew.sh"; port = 443; }
+          {
+            host = "registry.npmjs.org";
+            port = 443;
+          }
+          {
+            host = "*.npmjs.org";
+            port = 443;
+          }
+          {
+            host = "registry.yarnpkg.com";
+            port = 443;
+          }
+          {
+            host = "pypi.org";
+            port = 443;
+          }
+          {
+            host = "files.pythonhosted.org";
+            port = 443;
+          }
+          {
+            host = "crates.io";
+            port = 443;
+          }
+          {
+            host = "static.crates.io";
+            port = 443;
+          }
+          {
+            host = "index.crates.io";
+            port = 443;
+          }
+          {
+            host = "proxy.golang.org";
+            port = 443;
+          }
+          {
+            host = "sum.golang.org";
+            port = 443;
+          }
+          {
+            host = "formulae.brew.sh";
+            port = 443;
+          }
           # Nix
-          { host = "cache.nixos.org"; port = 443; }
+          {
+            host = "cache.nixos.org";
+            port = 443;
+          }
         ];
         description = "Hosts allowed without interactive approval (merged under user/project policy).";
       };
@@ -337,17 +489,16 @@ in
         '';
       };
     };
-  } // mountOptions;
+  }
+  // mountOptions;
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages =
-      (map wrapOne cfg.packages)
-      ++ [
-        policyPkg
-      ];
+    environment.systemPackages = (map wrapOne cfg.packages) ++ [
+      policyPkg
+    ];
 
     nixpkgs.overlays = lib.mkAfter [
-      (final: prev: {
+      (final: _: {
         agentSandbox = {
           inherit (agentSandboxLib)
             mkWrapPackage

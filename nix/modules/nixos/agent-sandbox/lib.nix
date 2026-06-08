@@ -49,9 +49,7 @@ let
 
   isHostMountPath = path: lib.hasPrefix "/" path;
 
-  homeMountRel =
-    path:
-    if path == "~" then "" else lib.removePrefix "~/" path;
+  homeMountRel = path: if path == "~" then "" else lib.removePrefix "~/" path;
 
   splitMountPaths =
     paths:
@@ -72,7 +70,6 @@ let
   buildPermissions =
     c:
     {
-      package,
       readonlyDirs ? [ ],
       readwriteDirs ? [ ],
       readonlyFiles ? [ ],
@@ -104,18 +101,18 @@ let
       # sudoGuard must be in sandboxPkgs (add-pkg-deps), not only add-runtime PATH:
       # omp ! shells build PATH from package deps, not the jail launcher exports.
       sandboxPkgs = lib.unique (
-        [ cfg.package ] ++ commonPkgs ++ extraPkgs
-        ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
+        [ cfg.package ] ++ commonPkgs ++ extraPkgs ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
     in
-    with c; [
+    with c;
+    [
       (block-env-vars blockEnvVars)
       inherit-shell-env
       (add-pkg-deps sandboxPkgs)
     ]
     ++ lib.optionals exposeWorkingDirectory [ mount-cwd ]
-    ++ map (p: try-readonly p) (lib.unique (runtimeReadonlyDirs ++ absReadonly))
-    ++ map (p: try-readwrite p) absReadwrite
+    ++ map try-readonly (lib.unique (runtimeReadonlyDirs ++ absReadonly))
+    ++ map try-readwrite absReadwrite
     ++ [
       (home-readonly-mounts homeReadonly)
       (home-readwrite-mounts homeReadwrite)
@@ -132,11 +129,11 @@ let
     ++ lib.optionals (sudoGuard != null) [
       (agent-sandbox-sudo-guard sudoGuard)
     ]
-    ++ map (arg: unsafe-add-raw-args arg) extraBwrapArgs
+    ++ map unsafe-add-raw-args extraBwrapArgs
     ++ [
       agent-sandbox-nvidia-gpu
     ]
-    ++ map (p: try-dev-bind p) devicePaths;
+    ++ map try-dev-bind devicePaths;
 
 in
 rec {
@@ -170,11 +167,7 @@ rec {
       sudoGuard ? null,
     }:
     let
-      binName =
-        if binary != null then
-          binary
-        else
-          lib.baseNameOf (lib.getExe package);
+      binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
 
       sandboxedName = "sandboxed-${binName}";
 
@@ -185,11 +178,12 @@ rec {
       jailFn = jail-nix.lib.extend {
         inherit pkgs;
         additionalCombinators = _: agentCombinators;
-        basePermissions = c: with c; [
-          agent-sandbox-base
-          bind-nix-store-runtime-closure
-          fake-passwd
-        ];
+        basePermissions =
+          c: with c; [
+            agent-sandbox-base
+            bind-nix-store-runtime-closure
+            fake-passwd
+          ];
       };
 
       permissions = buildPermissions (builtinCombinators // agentCombinators) {
@@ -209,7 +203,7 @@ rec {
           network
           sudoGuard
           ;
-        commonPkgs = commonPkgs;
+        inherit commonPkgs;
       };
 
       jailedDrv = jailFn sandboxedName package permissions;

@@ -216,14 +216,13 @@ in
 
   # Inherit the invoking shell env (opt-out: block-env-vars unsets secrets before this runs).
   # fwd-env PATH must precede add-pkg-deps so sandbox bins are prepended, not replaced.
-  inherit-shell-env = include-once "agent-sandbox-inherit-shell-env" (
-    compose [
-      (fwd-env "PATH")
-      (add-runtime inheritShellEnvRuntime)
-    ]
-  );
+  inherit-shell-env = include-once "agent-sandbox-inherit-shell-env" (compose [
+    (fwd-env "PATH")
+    (add-runtime inheritShellEnvRuntime)
+  ]);
 
-  agent-sandbox-context-env = policySocket:
+  agent-sandbox-context-env =
+    policySocket:
     compose [
       (set-env "AGENT_SANDBOX_POLICY_SOCKET" policySocket)
       (add-runtime ''
@@ -287,11 +286,13 @@ in
     fi
   '';
 
-  agent-sandbox-sudo-guard = sudoPkg: compose [
-    (add-runtime ''
-      export PATH="${sudoPkg}/bin:$PATH"
-    '')
-  ];
+  agent-sandbox-sudo-guard =
+    sudoPkg:
+    compose [
+      (add-runtime ''
+        export PATH="${sudoPkg}/bin:$PATH"
+      '')
+    ];
 
   agent-sandbox-restricted-net = include-once "agent-sandbox-restricted-net" (compose [
     time-zone
