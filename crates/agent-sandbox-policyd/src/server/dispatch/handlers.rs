@@ -76,11 +76,13 @@ pub(crate) async fn handle(
             id,
             scope,
             session_id,
+            target,
             ctx,
         } => Ok(store
             .approve(PendingDecision {
                 pending_id: id,
                 scope,
+                target,
                 wire: ScopeWire::from_request(&ctx, session_id),
             })
             .await),
@@ -108,11 +110,13 @@ pub(crate) async fn handle(
             id,
             scope,
             session_id,
+            target,
             ctx,
         } => Ok(store
             .deny(PendingDecision {
                 pending_id: id,
                 scope,
+                target,
                 wire: ScopeWire::from_request(&ctx, session_id),
             })
             .await),

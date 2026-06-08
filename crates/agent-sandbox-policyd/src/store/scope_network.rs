@@ -10,6 +10,14 @@ use crate::wire::{NetworkScopeOp, ScopeWire};
 use super::decisions::DecisionAction;
 use super::types::PolicyStore;
 
+fn session_network_entries(host: &str, port: u16) -> Vec<(String, u16)> {
+    if host.starts_with("*.") {
+        vec![(host.to_string(), port)]
+    } else {
+        allow_keys(host, port)
+    }
+}
+
 impl PolicyStore {
     pub(crate) async fn apply_network_scope(
         &self,
@@ -30,7 +38,7 @@ impl PolicyStore {
         let cwd = paths.cwd_string();
         let home = paths.home_string();
         let project_root = paths.project_root_string();
-        let keys = allow_keys(&host, port);
+        let session_entries = session_network_entries(&host, port);
         let target = match self
             .resolve_scope_target(
                 scope,
@@ -48,7 +56,7 @@ impl PolicyStore {
             ScopeTarget::Ephemeral => {
                 if action == DecisionAction::Approve {
                     let mut inner = self.inner.lock().await;
-                    for key in keys {
+                    for key in allow_keys(&host, port) {
                         inner.once_allow.insert(key);
                     }
                 }
@@ -58,23 +66,23 @@ impl PolicyStore {
                 match action {
                     DecisionAction::Approve => {
                         let bucket = inner.session_allow.entry(session_id.clone()).or_default();
-                        for key in &keys {
-                            bucket.insert(key.clone());
+                        for entry in &session_entries {
+                            bucket.insert(entry.clone());
                         }
                         if let Some(deny_bucket) = inner.session_deny.get_mut(&session_id) {
-                            for key in keys {
-                                deny_bucket.remove(&key);
+                            for entry in session_entries {
+                                deny_bucket.remove(&entry);
                             }
                         }
                     }
                     DecisionAction::Deny => {
                         let bucket = inner.session_deny.entry(session_id.clone()).or_default();
-                        for key in &keys {
-                            bucket.insert(key.clone());
+                        for entry in &session_entries {
+                            bucket.insert(entry.clone());
                         }
                         if let Some(allow_bucket) = inner.session_allow.get_mut(&session_id) {
-                            for key in keys {
-                                allow_bucket.remove(&key);
+                            for entry in session_entries {
+                                allow_bucket.remove(&entry);
                             }
                         }
                     }
@@ -162,5 +170,18 @@ impl PolicyStore {
             active_session_ids: &active,
         };
         ScopeTarget::resolve(&ctx).map_err(RpcReply::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_network_entries;
+
+    #[test]
+    fn wildcard_session_entry_is_kept_as_pattern() {
+        assert_eq!(
+            session_network_entries("*.baz.com", 443),
+            vec![(String::from("*.baz.com"), 443)]
+        );
     }
 }

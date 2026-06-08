@@ -1,6 +1,6 @@
 //! Shared decision helpers for pending approvals.
 
-use agent_sandbox_core::RpcReply;
+use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 
 use crate::wire::{PendingDecision, ScopeWire};
 
@@ -42,10 +42,11 @@ impl PolicyStore {
     pub(crate) async fn take_pending_decision(
         &self,
         decision: PendingDecision,
-    ) -> Result<(Pending, ScopeWire, agent_sandbox_core::ApprovalScope), RpcReply> {
+    ) -> Result<(Pending, ScopeWire, ApprovalScope, Option<ApprovalTarget>), RpcReply> {
         let PendingDecision {
             pending_id,
             scope,
+            target,
             wire,
         } = decision;
         let pending = {
@@ -56,6 +57,6 @@ impl PolicyStore {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
             err
         })?;
-        Ok((pending, wire, scope))
+        Ok((pending, wire, scope, target))
     }
 }

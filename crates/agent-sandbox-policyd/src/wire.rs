@@ -1,6 +1,6 @@
 //! Grouped wire/context fields for policyd.
 
-use agent_sandbox_core::{ApprovalScope, ProcessIds, RequestContext, SandboxPaths};
+use agent_sandbox_core::{ApprovalScope, ApprovalTarget, ProcessIds, RequestContext, SandboxPaths};
 
 #[derive(Debug, Clone, Default)]
 pub struct MergeContext {
@@ -99,6 +99,7 @@ pub struct HostApproveRequest {
 pub struct PendingDecision {
     pub pending_id: String,
     pub scope: ApprovalScope,
+    pub target: Option<ApprovalTarget>,
     pub wire: ScopeWire,
 }
 
