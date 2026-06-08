@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::spawn::maybe_spawn_ui;
 use crate::wire::{MergeContext, NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
+use super::ui_route::UiRoute;
 use super::types::{Pending, PendingKind, PolicyStore};
 
 impl PolicyStore {
@@ -112,47 +113,68 @@ impl PolicyStore {
                     cwd: cwd.clone(),
                     home: home.clone(),
                     project_root: project_root.clone(),
+                    request_pid: wire_ids.pid().filter(|&p| p != 0),
                 },
             );
         }
         Self::audit("pending", Some(&policy_host), Some(port), &scheme);
 
-        self.notify_ui(&UiPush::NetworkRequest {
-            id: pending_id.clone(),
-            host: Some(policy_host.clone()),
-            port: Some(port),
-            scheme: Some(scheme.clone()),
-            url: Some(url.clone()),
-            cwd: cwd.clone(),
-            home: home.clone(),
-            project_root: project_root.clone(),
-        })
+        let route = UiRoute::new(
+            wire_ids.pid().filter(|&p| p != 0),
+            cwd.clone(),
+            home.clone(),
+            project_root.clone(),
+        );
+        self.notify_ui(
+            &route,
+            &UiPush::NetworkRequest {
+                id: pending_id.clone(),
+                host: Some(policy_host.clone()),
+                port: Some(port),
+                scheme: Some(scheme.clone()),
+                url: Some(url.clone()),
+                cwd: cwd.clone(),
+                home: home.clone(),
+                project_root: project_root.clone(),
+            },
+        )
         .await;
 
-        let uid = wire_ids.uid();
-        let has_ui = !self.inner.lock().await.ui_clients.is_empty();
-        if !has_ui {
-            let has_omp = self.has_omp_ui().await;
+        let route = UiRoute::new(
+            wire_ids.pid().filter(|&p| p != 0),
+            cwd.clone(),
+            home.clone(),
+            project_root.clone(),
+        );
+        if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
+            let mut spawn_uid = wire_ids.uid();
+            if spawn_uid.is_none_or(|u| u == 0)
+                && let Some(h) = &home
+            {
+                spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.uid.as_raw());
+            }
             let spawn = UiSpawnContext {
                 gate: UiSpawnGate {
-                    has_ui_clients: false,
-                    has_omp_ui: has_omp,
+                    has_matching_ui: false,
                 },
-                uid,
+                uid: spawn_uid,
                 home: home.as_deref(),
                 cwd: cwd.as_deref(),
                 project_root: project_root.as_deref(),
             };
             maybe_spawn_ui(
                 &self.args,
-                &mut self.inner.lock().await.ui_spawn_last_by_uid,
+                &mut self.inner.lock().await.ui_spawn_last,
                 &spawn,
             );
         }
 
-        if self.inner.lock().await.ui_clients.is_empty() {
+        if !self.has_ui_for_route(&route).await {
             let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-            if !self.wait_for_ui_client(ui_wait).await {
+            if !self.wait_for_matching_ui_client(&route, ui_wait).await {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.network_futures.remove(&pending_id);

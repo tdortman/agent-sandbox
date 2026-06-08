@@ -36,6 +36,7 @@ pub struct Pending {
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
+    pub request_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,7 @@ pub(crate) struct StoreInner {
     pub network_futures: HashMap<String, oneshot::Sender<CheckReply>>,
     pub ui_clients: HashMap<u64, UiClient>,
     pub ui_context_by_session: HashMap<String, UiSessionContext>,
-    pub ui_spawn_last_by_uid: HashMap<u32, Instant>,
+    pub ui_spawn_last: HashMap<String, Instant>,
     pub session_deny: HashMap<String, HashSet<(String, u16)>>,
     pub session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
     pub session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,

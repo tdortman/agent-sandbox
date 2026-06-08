@@ -4,9 +4,26 @@ use std::collections::HashSet;
 
 use agent_sandbox_core::{allow_keys, normalize_host};
 
+use crate::store::ui_route::UiRoute;
 use crate::wire::MergeContext;
 
 use super::types::PolicyStore;
+
+fn session_network_matches(bucket: &HashSet<(String, u16)>, host: &str, port: u16) -> bool {
+    let keys = allow_keys(host, port);
+    bucket.iter().any(|(pattern, rule_port)| {
+        *rule_port == port
+            && keys
+                .iter()
+                .any(|(key_host, _)| PolicyStore::host_matches(pattern, key_host))
+    })
+}
+
+fn session_sudo_matches(bucket: &HashSet<Vec<String>>, argv: &[String]) -> bool {
+    bucket
+        .iter()
+        .any(|rule| !rule.is_empty() && argv.starts_with(rule))
+}
 
 impl PolicyStore {
     pub(crate) async fn once_allowed(&self, host: &str, port: u16, consume: bool) -> bool {
@@ -21,38 +38,56 @@ impl PolicyStore {
         matched
     }
 
-    pub(crate) async fn session_allowed(&self, host: &str, port: u16) -> bool {
-        let keys = allow_keys(host, port);
-        let inner = self.inner.lock().await;
-        let active: HashSet<_> = inner.ui_clients.values().map(|c| &c.session_id).collect();
-        if active.is_empty() {
+    pub(crate) async fn session_allowed(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx).await;
+        let route = UiRoute::new(
+            resolved.ids.pid().filter(|&p| p != 0),
+            resolved.paths.cwd_string(),
+            resolved.paths.home_string(),
+            resolved.paths.project_root_string(),
+        );
+        let session_ids = self.session_ids_for_route(&route).await;
+        if session_ids.is_empty() {
             return false;
         }
-        for session_id in active {
-            if let Some(bucket) = inner.session_allow.get(session_id)
-                && keys.iter().any(|k| bucket.contains(k))
-            {
-                return true;
-            }
-        }
-        false
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|session_id| {
+            inner
+                .session_allow
+                .get(session_id)
+                .is_some_and(|bucket| session_network_matches(bucket, host, port))
+        })
     }
 
-    pub(crate) async fn session_denied(&self, host: &str, port: u16) -> bool {
-        let keys = allow_keys(host, port);
-        let inner = self.inner.lock().await;
-        let active: HashSet<_> = inner.ui_clients.values().map(|c| &c.session_id).collect();
-        if active.is_empty() {
+    pub(crate) async fn session_denied(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx).await;
+        let route = UiRoute::new(
+            resolved.ids.pid().filter(|&p| p != 0),
+            resolved.paths.cwd_string(),
+            resolved.paths.home_string(),
+            resolved.paths.project_root_string(),
+        );
+        let session_ids = self.session_ids_for_route(&route).await;
+        if session_ids.is_empty() {
             return false;
         }
-        for session_id in active {
-            if let Some(bucket) = inner.session_deny.get(session_id)
-                && keys.iter().any(|k| bucket.contains(k))
-            {
-                return true;
-            }
-        }
-        false
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|session_id| {
+            inner
+                .session_deny
+                .get(session_id)
+                .is_some_and(|bucket| session_network_matches(bucket, host, port))
+        })
     }
 
     pub(crate) async fn policy_denied(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
@@ -75,27 +110,47 @@ impl PolicyStore {
         merged.sudo.allow.iter().any(|rule| rule.matches(argv))
     }
 
-    pub(crate) async fn session_sudo_denied(&self, argv: &[String]) -> bool {
-        let key: Vec<String> = argv.to_vec();
-        let active = self.active_session_ids().await;
+    pub(crate) async fn session_sudo_denied(
+        &self,
+        argv: &[String],
+        ctx: MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx).await;
+        let route = UiRoute::new(
+            resolved.ids.pid().filter(|&p| p != 0),
+            resolved.paths.cwd_string(),
+            resolved.paths.home_string(),
+            resolved.paths.project_root_string(),
+        );
+        let session_ids = self.session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
-        active.iter().any(|sid| {
+        session_ids.iter().any(|sid| {
             inner
                 .session_sudo_deny
                 .get(sid)
-                .is_some_and(|b| b.contains(&key))
+                .is_some_and(|bucket| session_sudo_matches(bucket, argv))
         })
     }
 
-    pub(crate) async fn session_sudo_allowed(&self, argv: &[String]) -> bool {
-        let key: Vec<String> = argv.to_vec();
-        let active = self.active_session_ids().await;
+    pub(crate) async fn session_sudo_allowed(
+        &self,
+        argv: &[String],
+        ctx: MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx).await;
+        let route = UiRoute::new(
+            resolved.ids.pid().filter(|&p| p != 0),
+            resolved.paths.cwd_string(),
+            resolved.paths.home_string(),
+            resolved.paths.project_root_string(),
+        );
+        let session_ids = self.session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
-        active.iter().any(|sid| {
+        session_ids.iter().any(|sid| {
             inner
                 .session_sudo_allow
                 .get(sid)
-                .is_some_and(|b| b.contains(&key))
+                .is_some_and(|bucket| session_sudo_matches(bucket, argv))
         })
     }
 
@@ -105,13 +160,13 @@ impl PolicyStore {
         if self.policy_denied(&host, port, resolved.clone()).await {
             return Some("deny".into());
         }
-        if self.session_denied(&host, port).await {
+        if self.session_denied(&host, port, resolved.clone()).await {
             return Some("deny".into());
         }
         if self.once_allowed(&host, port, false).await {
             return Some("once".into());
         }
-        if self.session_allowed(&host, port).await {
+        if self.session_allowed(&host, port, resolved.clone()).await {
             return Some("session".into());
         }
         let merged = self.merged_for(resolved).await;
@@ -140,13 +195,13 @@ impl PolicyStore {
         if self.policy_denied(&host, port, resolved.clone()).await {
             return false;
         }
-        if self.session_denied(&host, port).await {
+        if self.session_denied(&host, port, resolved.clone()).await {
             return false;
         }
         if self.once_allowed(&host, port, consume_once).await {
             return true;
         }
-        if self.session_allowed(&host, port).await {
+        if self.session_allowed(&host, port, resolved.clone()).await {
             return true;
         }
         let merged = self.merged_for(resolved).await;
@@ -155,5 +210,30 @@ impl PolicyStore {
             .allow
             .iter()
             .any(|rule| Self::host_matches(&rule.host, &host) && rule.port == port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{session_network_matches, session_sudo_matches};
+
+    #[test]
+    fn session_network_matches_wildcard_hosts() {
+        let bucket = HashSet::from([(String::from("*.baz.com"), 443_u16)]);
+        assert!(session_network_matches(&bucket, "foo.bar.baz.com", 443));
+        assert!(!session_network_matches(&bucket, "foo.bar.baz.com", 80));
+    }
+
+    #[test]
+    fn session_sudo_matches_prefixes() {
+        let bucket = HashSet::from([vec![String::from("sudo"), String::from("apt")]]);
+        let argv = vec![
+            String::from("sudo"),
+            String::from("apt"),
+            String::from("update"),
+        ];
+        assert!(session_sudo_matches(&bucket, &argv));
     }
 }

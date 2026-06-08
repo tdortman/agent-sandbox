@@ -65,8 +65,7 @@ pub struct SudoScopeOp {
 
 #[derive(Debug, Clone, Copy)]
 pub struct UiSpawnGate {
-    pub has_ui_clients: bool,
-    pub has_omp_ui: bool,
+    pub has_matching_ui: bool,
 }
 
 pub struct UiSpawnContext<'a> {

@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use agent_sandbox_core::{
-    CheckReply, RequestContext, RpcReply, SessionContext, is_ipv4_literal, normalize_host,
-    policy_host_for_connect, write_session_context,
+    CheckReply, RequestContext, RpcReply, is_ipv4_literal, normalize_host, policy_host_for_connect,
 };
 
 use crate::error::PolicydError;
@@ -27,10 +26,6 @@ pub(crate) async fn handle_check(
         policy_host = policy_host_for_connect(&connect_host, None, None).0;
     }
     let url = url.unwrap_or_else(|| format!("{scheme}://{policy_host}:{port}"));
-    let paths = ctx.sandbox_paths();
-    if paths.home().is_some() {
-        write_session_context(&SessionContext::from(&paths));
-    }
     let merge = MergeContext::from(&ctx);
     if let Some(source) = store.allow_source(&policy_host, port, merge.clone()).await {
         if source == "deny" {

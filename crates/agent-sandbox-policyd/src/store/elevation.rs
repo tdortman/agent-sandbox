@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::spawn::maybe_spawn_ui;
 use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 
+use super::ui_route::UiRoute;
 use super::types::{Pending, PendingKind, PolicyStore};
 
 impl PolicyStore {
@@ -93,12 +94,13 @@ impl PolicyStore {
         let home = resolved.paths.home_string();
         let project_root = resolved.paths.project_root_string();
         if self.sudo_policy_denied(&argv, resolved.clone()).await
-            || self.session_sudo_denied(&argv).await
+            || self.session_sudo_denied(&argv, resolved.clone()).await
         {
             tracing::info!(argv = %argv.join(" "), "sudo deny (policy)");
             return ElevateReply::denied();
         }
-        if self.sudo_policy_allowed(&argv, resolved).await || self.session_sudo_allowed(&argv).await
+        if self.sudo_policy_allowed(&argv, resolved.clone()).await
+            || self.session_sudo_allowed(&argv, resolved).await
         {
             return self
                 .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
@@ -126,22 +128,38 @@ impl PolicyStore {
                     cwd: cwd.clone(),
                     home: home.clone(),
                     project_root: project_root.clone(),
+                    request_pid: wire_ids.pid().filter(|&p| p != 0),
                 },
             );
         }
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
 
-        self.notify_ui(&UiPush::ElevationRequest {
-            id: pending_id.clone(),
-            argv: Some(argv.clone()),
-            cwd: cwd.clone(),
-            home: home.clone(),
-            project_root: project_root.clone(),
-        })
+        let route = UiRoute::new(
+            wire_ids.pid().filter(|&p| p != 0),
+            cwd.clone(),
+            home.clone(),
+            project_root.clone(),
+        );
+        self.notify_ui(
+            &route,
+            &UiPush::ElevationRequest {
+                id: pending_id.clone(),
+                argv: Some(argv.clone()),
+                cwd: cwd.clone(),
+                home: home.clone(),
+                project_root: project_root.clone(),
+            },
+        )
         .await;
 
-        if self.inner.lock().await.ui_clients.is_empty() {
+        let route = UiRoute::new(
+            wire_ids.pid().filter(|&p| p != 0),
+            cwd.clone(),
+            home.clone(),
+            project_root.clone(),
+        );
+        if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
             let mut spawn_uid = wire_ids.uid();
             if spawn_uid.is_none_or(|u| u == 0)
                 && let Some(h) = &home
@@ -151,11 +169,9 @@ impl PolicyStore {
                     .flatten()
                     .map(|u| u.uid.as_raw());
             }
-            let has_omp = self.has_omp_ui().await;
             let spawn = UiSpawnContext {
                 gate: UiSpawnGate {
-                    has_ui_clients: false,
-                    has_omp_ui: has_omp,
+                    has_matching_ui: false,
                 },
                 uid: spawn_uid,
                 home: home.as_deref(),
@@ -164,18 +180,14 @@ impl PolicyStore {
             };
             maybe_spawn_ui(
                 &self.args,
-                &mut self.inner.lock().await.ui_spawn_last_by_uid,
+                &mut self.inner.lock().await.ui_spawn_last,
                 &spawn,
             );
         }
 
-        let ui_clients_empty = {
-            let inner = self.inner.lock().await;
-            inner.ui_clients.is_empty()
-        };
-        if ui_clients_empty {
+        if !self.has_ui_for_route(&route).await {
             let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-            if !self.wait_for_ui_client(ui_wait).await {
+            if !self.wait_for_matching_ui_client(&route, ui_wait).await {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.elevation_futures.remove(&pending_id);

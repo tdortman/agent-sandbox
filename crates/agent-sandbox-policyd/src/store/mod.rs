@@ -11,11 +11,14 @@ mod scope_sudo;
 mod status;
 mod types;
 mod ui;
+mod ui_route;
 mod util;
 
+pub(crate) use types::UiSessionOwner;
 pub use types::{Pending, PendingKind, PolicyStore, PolicydArgs, UiClientHandle};
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use types::StoreInner;
 
 impl PolicyStore {
@@ -30,7 +33,7 @@ impl PolicyStore {
                 network_futures: HashMap::new(),
                 ui_clients: HashMap::new(),
                 ui_context_by_session: HashMap::new(),
-                ui_spawn_last_by_uid: HashMap::new(),
+                ui_spawn_last: HashMap::<String, Instant>::new(),
                 session_deny: HashMap::new(),
                 session_sudo_allow: HashMap::new(),
                 session_sudo_deny: HashMap::new(),

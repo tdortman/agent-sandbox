@@ -4,7 +4,7 @@ use std::path::Path;
 
 use agent_sandbox_core::{
     Policy, ProcessIds, ProjectPolicyContext, SandboxPaths, context_from_pid, home_from_uid,
-    load_policy, merge_layers, read_session_context,
+    load_policy, merge_layers,
 };
 
 use crate::wire::MergeContext;
@@ -13,10 +13,7 @@ use super::types::PolicyStore;
 
 impl PolicyStore {
     pub async fn resolve_context(&self, ctx: MergeContext) -> MergeContext {
-        let file_ctx = read_session_context();
-        let file_paths =
-            SandboxPaths::from_wire(file_ctx.cwd, file_ctx.home, file_ctx.project_root);
-        let mut paths = file_paths.merged_with(
+        let mut paths = SandboxPaths::from_wire(
             ctx.paths.cwd_string(),
             ctx.paths.home_string(),
             ctx.paths.project_root_string(),
@@ -34,29 +31,6 @@ impl PolicyStore {
 
         let mut home = paths.home_string().or_else(|| home_from_uid(ctx.ids.uid()));
         let mut project_root = paths.project_root_string();
-
-        if paths.cwd().is_none() || home.is_none() || project_root.is_none() {
-            let inner = self.inner.lock().await;
-            for session in inner.ui_clients.values() {
-                if let Some(session_ctx) = inner.ui_context_by_session.get(&session.session_id) {
-                    let session_paths = SandboxPaths::from_wire(
-                        session_ctx.cwd.clone(),
-                        session_ctx.home.clone(),
-                        session_ctx.project_root.clone(),
-                    );
-                    paths = session_paths.merged_with(
-                        paths.cwd_string(),
-                        home.clone(),
-                        project_root.clone(),
-                    );
-                    home = paths.home_string().or(home);
-                    project_root = paths.project_root_string().or(project_root);
-                    if paths.cwd().is_some() && home.is_some() && project_root.is_some() {
-                        break;
-                    }
-                }
-            }
-        }
 
         let project = ProjectPolicyContext::new(
             home.as_deref().map(Path::new),

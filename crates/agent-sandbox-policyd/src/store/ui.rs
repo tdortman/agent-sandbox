@@ -1,5 +1,6 @@
 //! Policy store — ui.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -10,9 +11,14 @@ use tokio::sync::Mutex;
 use tokio::time;
 use uuid::Uuid;
 
+use crate::spawn::maybe_spawn_ui;
+use crate::wire::{UiSpawnContext, UiSpawnGate};
+
 use super::types::{
     CLIENT_ID, Pending, PendingKind, PolicyStore, UiClient, UiClientHandle, UiSessionContext,
+    UiSessionOwner,
 };
+use super::ui_route::{UiRoute, request_owned_by_omp, ui_client_matches};
 
 impl PolicyStore {
     pub async fn has_omp_ui(&self) -> bool {
@@ -24,51 +30,79 @@ impl PolicyStore {
             .any(|c| c.ui_client == "omp")
     }
 
-    async fn ui_notification_targets(&self) -> Vec<std::sync::Arc<Mutex<OwnedWriteHalf>>> {
-        let inner = self.inner.lock().await;
-        let omp: Vec<_> = inner
+    pub async fn is_registered_sandbox_omp_ui(&self, uid: u32, pid: u32) -> bool {
+        self.inner
+            .lock()
+            .await
             .ui_clients
             .values()
-            .filter(|c| c.ui_client == "omp")
-            .map(|c| c.writer.clone())
-            .collect();
-        if !omp.is_empty() {
-            return omp;
-        }
+            .any(|c| c.ui_client == "omp" && c.owner_uid == uid && c.owner_pid == pid)
+    }
+
+
+    fn omp_clients(inner: &super::types::StoreInner) -> Vec<&UiClient> {
         inner
             .ui_clients
             .values()
-            .filter(|c| c.ui_client != "omp")
+            .filter(|c| c.ui_client == "omp")
+            .collect()
+    }
+
+    pub(crate) async fn route_owned_by_omp_ui(&self, route: &UiRoute) -> bool {
+        let inner = self.inner.lock().await;
+        request_owned_by_omp(route, &Self::omp_clients(&inner))
+    }
+
+    fn matching_ui_session_ids(
+        inner: &super::types::StoreInner,
+        route: &UiRoute,
+    ) -> HashSet<String> {
+        let omp_clients = Self::omp_clients(inner);
+        inner
+            .ui_clients
+            .values()
+            .filter(|client| {
+                inner
+                    .ui_context_by_session
+                    .get(&client.session_id)
+                    .is_some_and(|ctx| ui_client_matches(client, ctx, route, &omp_clients))
+            })
+            .map(|c| c.session_id.clone())
+            .collect()
+    }
+
+    pub(crate) async fn session_ids_for_route(&self, route: &UiRoute) -> HashSet<String> {
+        let inner = self.inner.lock().await;
+        Self::matching_ui_session_ids(&inner, route)
+    }
+
+    pub(crate) async fn has_ui_for_route(&self, route: &UiRoute) -> bool {
+        !self.session_ids_for_route(route).await.is_empty()
+    }
+
+    async fn ui_notification_targets_for(
+        &self,
+        route: &UiRoute,
+    ) -> Vec<std::sync::Arc<Mutex<OwnedWriteHalf>>> {
+        let inner = self.inner.lock().await;
+        let session_ids = Self::matching_ui_session_ids(&inner, route);
+        inner
+            .ui_clients
+            .values()
+            .filter(|c| session_ids.contains(&c.session_id))
             .map(|c| c.writer.clone())
             .collect()
     }
 
-    async fn disconnect_standalone_clients(&self) {
-        let to_disconnect: Vec<u64> = {
-            let inner = self.inner.lock().await;
-            inner
-                .ui_clients
-                .iter()
-                .filter(|(_, c)| c.ui_client != "omp")
-                .map(|(id, _)| *id)
-                .collect()
-        };
-        for id in to_disconnect {
-            self.end_ui_session_by_id(id).await;
-        }
-    }
-
-    pub async fn start_ui_session(
+    pub(crate) async fn start_ui_session(
         &self,
         handle: &UiClientHandle,
         ui_client: &str,
+        owner: Option<UiSessionOwner>,
         cwd: Option<String>,
         home: Option<String>,
         project_root: Option<String>,
     ) -> String {
-        if ui_client == "omp" {
-            self.disconnect_standalone_clients().await;
-        }
         let session_id = Uuid::new_v4().simple().to_string();
         let mut inner = self.inner.lock().await;
         inner.ui_clients.insert(
@@ -77,6 +111,8 @@ impl PolicyStore {
                 session_id: session_id.clone(),
                 ui_client: ui_client.to_string(),
                 writer: handle.writer.clone(),
+                owner_uid: owner.map_or(0, |o| o.uid),
+                owner_pid: owner.map_or(0, |o| o.pid),
             },
         );
         inner.ui_context_by_session.insert(
@@ -95,13 +131,96 @@ impl PolicyStore {
     }
 
     async fn end_ui_session_by_id(&self, client_id: u64) {
-        let mut inner = self.inner.lock().await;
-        if let Some(client) = inner.ui_clients.remove(&client_id) {
-            inner.session_allow.remove(&client.session_id);
-            inner.session_deny.remove(&client.session_id);
-            inner.session_sudo_allow.remove(&client.session_id);
-            inner.session_sudo_deny.remove(&client.session_id);
-            inner.ui_context_by_session.remove(&client.session_id);
+        self.remove_ui_client(client_id, true).await;
+    }
+
+    async fn remove_ui_client(&self, client_id: u64, reroute_pending: bool) {
+        let removed = {
+            let mut inner = self.inner.lock().await;
+            inner.ui_clients.remove(&client_id).map(|client| {
+                inner.session_allow.remove(&client.session_id);
+                inner.session_deny.remove(&client.session_id);
+                inner.session_sudo_allow.remove(&client.session_id);
+                inner.session_sudo_deny.remove(&client.session_id);
+                inner.ui_context_by_session.remove(&client.session_id);
+            })
+        };
+        if removed.is_some() && reroute_pending {
+            self.reroute_orphaned_pending().await;
+        }
+    }
+
+    /// Re-notify pending requests that lost their UI, and spawn standalone UI when needed.
+    pub(crate) async fn reroute_orphaned_pending(&self) {
+        let pending: Vec<Pending> = self.inner.lock().await.pending.values().cloned().collect();
+        for p in pending {
+            let route = UiRoute::new(
+                p.request_pid,
+                p.cwd.clone(),
+                p.home.clone(),
+                p.project_root.clone(),
+            );
+            if !self.has_ui_for_route(&route).await
+                && !self.route_owned_by_omp_ui(&route).await
+            {
+                let spawn_uid =
+                    nix::unistd::User::from_name(&Self::user_for_home(p.home.as_deref()))
+                        .ok()
+                        .flatten()
+                        .map(|u| u.uid.as_raw());
+                let spawn = UiSpawnContext {
+                    gate: UiSpawnGate {
+                        has_matching_ui: false,
+                    },
+                    uid: spawn_uid,
+                    home: p.home.as_deref(),
+                    cwd: p.cwd.as_deref(),
+                    project_root: p.project_root.as_deref(),
+                };
+                maybe_spawn_ui(
+                    &self.args,
+                    &mut self.inner.lock().await.ui_spawn_last,
+                    &spawn,
+                );
+            }
+            self.notify_pending(&p).await;
+        }
+    }
+
+    async fn notify_pending(&self, p: &Pending) {
+        let route = UiRoute::new(
+            p.request_pid,
+            p.cwd.clone(),
+            p.home.clone(),
+            p.project_root.clone(),
+        );
+        if p.kind == PendingKind::Network {
+            self.notify_ui(
+                &route,
+                &UiPush::NetworkRequest {
+                    id: p.id.clone(),
+                    host: p.host.clone(),
+                    port: p.port,
+                    scheme: p.scheme.clone(),
+                    url: p.url.clone(),
+                    cwd: p.cwd.clone(),
+                    home: p.home.clone(),
+                    project_root: p.project_root.clone(),
+                },
+            )
+            .await;
+        } else {
+            self.notify_ui(
+                &route,
+                &UiPush::ElevationRequest {
+                    id: p.id.clone(),
+                    argv: p.argv.clone(),
+                    cwd: p.cwd.clone(),
+                    home: p.home.clone(),
+                    project_root: p.project_root.clone(),
+                },
+            )
+            .await;
         }
     }
 
@@ -125,10 +244,14 @@ impl PolicyStore {
             })
     }
 
-    pub(crate) async fn wait_for_ui_client(&self, timeout: Duration) -> bool {
+    pub(crate) async fn wait_for_matching_ui_client(
+        &self,
+        route: &UiRoute,
+        timeout: Duration,
+    ) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if !self.inner.lock().await.ui_clients.is_empty() {
+            if self.has_ui_for_route(route).await {
                 return true;
             }
             time::sleep(Duration::from_millis(50)).await;
@@ -136,8 +259,8 @@ impl PolicyStore {
         false
     }
 
-    pub async fn notify_ui(&self, payload: &UiPush) {
-        let targets = self.ui_notification_targets().await;
+    pub(crate) async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) {
+        let targets = self.ui_notification_targets_for(route).await;
         if targets.is_empty() {
             return;
         }
@@ -159,36 +282,24 @@ impl PolicyStore {
                 dead.push(id);
             }
         }
-        for id in dead {
-            self.end_ui_session(id).await;
+        if !dead.is_empty() {
+            let mut inner = self.inner.lock().await;
+            for id in dead {
+                if let Some(client) = inner.ui_clients.remove(&id) {
+                    inner.session_allow.remove(&client.session_id);
+                    inner.session_deny.remove(&client.session_id);
+                    inner.session_sudo_allow.remove(&client.session_id);
+                    inner.session_sudo_deny.remove(&client.session_id);
+                    inner.ui_context_by_session.remove(&client.session_id);
+                }
+            }
         }
     }
 
     pub async fn flush_pending_to_ui(&self) {
         let pending: Vec<Pending> = self.inner.lock().await.pending.values().cloned().collect();
         for p in pending {
-            if p.kind == PendingKind::Network {
-                self.notify_ui(&UiPush::NetworkRequest {
-                    id: p.id.clone(),
-                    host: p.host.clone(),
-                    port: p.port,
-                    scheme: p.scheme.clone(),
-                    url: p.url.clone(),
-                    cwd: p.cwd.clone(),
-                    home: p.home.clone(),
-                    project_root: p.project_root.clone(),
-                })
-                .await;
-            } else {
-                self.notify_ui(&UiPush::ElevationRequest {
-                    id: p.id.clone(),
-                    argv: p.argv.clone(),
-                    cwd: p.cwd.clone(),
-                    home: p.home.clone(),
-                    project_root: p.project_root.clone(),
-                })
-                .await;
-            }
+            self.notify_pending(&p).await;
         }
     }
 }

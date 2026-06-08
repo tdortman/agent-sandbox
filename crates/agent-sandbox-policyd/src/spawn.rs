@@ -30,6 +30,9 @@ pub fn ui_spawn_env(
             args.socket.display().to_string(),
         ),
     ]);
+    if let Some(home) = home {
+        env.insert("AGENT_SANDBOX_HOME".into(), home.to_string());
+    }
     if let Some(cwd) = cwd {
         env.insert("AGENT_SANDBOX_CWD".into(), cwd.to_string());
     }
@@ -62,7 +65,7 @@ pub fn ui_spawn_env(
 
 pub fn maybe_spawn_ui<S: BuildHasher>(
     args: &PolicydArgs,
-    ui_spawn_last_by_uid: &mut HashMap<u32, Instant, S>,
+    ui_spawn_last: &mut HashMap<String, Instant, S>,
     spawn: &UiSpawnContext<'_>,
 ) {
     let Some(cmd) = args
@@ -72,20 +75,31 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     else {
         return;
     };
-    if spawn.gate.has_ui_clients || spawn.gate.has_omp_ui {
+    if spawn.gate.has_matching_ui {
         return;
     }
     let Some(uid) = spawn.uid.filter(|u| *u > 0) else {
+        tracing::warn!(
+            cwd = spawn.cwd.unwrap_or(""),
+            project_root = spawn.project_root.unwrap_or(""),
+            "cannot spawn policy UI (missing uid)"
+        );
         return;
     };
+    let spawn_key = format!(
+        "{}:{}:{}",
+        uid,
+        spawn.cwd.unwrap_or(""),
+        spawn.project_root.unwrap_or("")
+    );
     let now = Instant::now();
-    if ui_spawn_last_by_uid
-        .get(&uid)
+    if ui_spawn_last
+        .get(&spawn_key)
         .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(10))
     {
         return;
     }
-    ui_spawn_last_by_uid.insert(uid, now);
+    ui_spawn_last.insert(spawn_key.clone(), now);
 
     let Ok(Some(user)) = User::from_uid(nix::unistd::Uid::from_raw(uid)) else {
         return;
@@ -97,7 +111,6 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     };
 
     let env = ui_spawn_env(args, &user, uid, spawn.home, spawn.cwd, spawn.project_root);
-    let spawn_cmd = [runuser.as_str(), "-p", "-u", &user.name, "--", cmd.as_str()];
     let ui_log_path = format!("/run/user/{uid}/agent-sandbox-ui.log");
     let stderr = std::fs::OpenOptions::new()
         .create(true)
@@ -105,9 +118,23 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         .open(&ui_log_path)
         .map_or_else(|_| Stdio::null(), Stdio::from);
 
-    let mut command = Command::new(spawn_cmd[0]);
+    let mut command = Command::new(&runuser);
     command
-        .args(&spawn_cmd[1..])
+        .arg("-p")
+        .arg("-u")
+        .arg(&user.name)
+        .arg("--")
+        .arg(&cmd);
+    if let Some(cwd) = spawn.cwd {
+        command.arg("--cwd").arg(cwd);
+    }
+    if let Some(home) = spawn.home {
+        command.arg("--home").arg(home);
+    }
+    if let Some(project_root) = spawn.project_root {
+        command.arg("--project-root").arg(project_root);
+    }
+    command
         .envs(&env)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -130,6 +157,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     std::thread::sleep(Duration::from_millis(250));
     match child.try_wait() {
         Ok(Some(status)) => {
+            ui_spawn_last.remove(&spawn_key);
             tracing::warn!(
                 uid,
                 exit_code = ?status.code(),
