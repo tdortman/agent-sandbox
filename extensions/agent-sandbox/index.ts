@@ -1,6 +1,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import * as net from "node:net";
-import { policyRpc } from "./policy-client";
+import { type ApprovalScope, policyRpc } from "./policy-client";
+
+type ApprovalTarget =
+  | { kind: "network_host"; host: string }
+  | { kind: "sudo_command"; argv: string[] };
+
+type ScopeOption = {
+  label: string;
+  scope: ApprovalScope;
+  target?: ApprovalTarget;
+};
+
+type PromptAction = "approve" | "deny";
 
 type NetworkRequest = {
   type: "network_request";
@@ -23,44 +35,7 @@ type ElevationRequest = {
   project_root?: string;
 };
 
-const NETWORK_APPROVAL_OPTIONS = [
-  "Allow once (this connection only)",
-  "Allow for this session",
-  "Allow for this project",
-  "Allow globally (user config)",
-  "Deny once (this connection only)",
-  "Deny for this session",
-  "Deny for this project",
-  "Deny globally (user config)",
-] as const;
-
-const SUDO_APPROVAL_OPTIONS = [
-  "Allow once (this command only)",
-  "Allow for this session",
-  "Allow for this project",
-  "Allow globally (user config)",
-  "Deny once (this command only)",
-  "Deny for this session",
-  "Deny for this project",
-  "Deny globally (user config)",
-] as const;
-
-const SCOPE_BY_LABEL: Record<string, string> = {
-  "Allow once (this connection only)": "once",
-  "Allow once (this command only)": "once",
-  "Allow for this session": "session",
-  "Allow for this project": "project",
-  "Allow globally (user config)": "global",
-  "Deny once (this connection only)": "once",
-  "Deny once (this command only)": "once",
-  "Deny for this session": "session",
-  "Deny for this project": "project",
-  "Deny globally (user config)": "global",
-};
-
-const DENY_LABELS = new Set(
-  Object.keys(SCOPE_BY_LABEL).filter((k) => k.startsWith("Deny ")),
-);
+const ACTION_OPTIONS = ["Allow", "Deny"] as const;
 
 const DEFAULT_SOCKET = "/run/agent-sandbox/policy.sock";
 
@@ -136,7 +111,10 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
   }
 
   function socketPath(): string {
-    return process.env.AGENT_SANDBOX_POLICY_SOCKET ?? DEFAULT_SOCKET;
+    return (
+      process.env.AGENT_SANDBOX_POLICY_SOCKET ??
+      DEFAULT_SOCKET
+    );
   }
 
   function disconnectPolicyUi(): void {
@@ -155,81 +133,177 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     socket.destroy();
   }
 
+  function approvalHostPatterns(host: string): string[] {
+    const normalized = host.trim().toLowerCase().replace(/\.+$/, "");
+    if (!normalized) return [];
+    const labels = normalized.split(".");
+    const patterns = [normalized];
+    for (let index = 1; index < labels.length; index += 1) {
+      const suffix = labels.slice(index).join(".");
+      if (suffix.includes(".")) {
+        patterns.push(`*.${suffix}`);
+      }
+    }
+    return patterns;
+  }
+
+  function sudoApprovalPrefixes(argv: string[]): string[][] {
+    const prefixes: string[][] = [];
+    for (let length = argv.length; length >= 1; length -= 1) {
+      prefixes.push(argv.slice(0, length));
+    }
+    return prefixes;
+  }
+
+  function formatSudoCommand(argv: string[]): string {
+    return argv.length > 0 ? `sudo ${argv.join(" ")}` : "sudo";
+  }
+
+  function scopeLabel(scope: ApprovalScope): string {
+    switch (scope) {
+      case "once":
+        return "Once";
+      case "session":
+        return "This session";
+      case "project":
+        return "This project";
+      case "global":
+        return "Globally";
+    }
+  }
+
+  function networkScopeOptions(
+    host: string,
+    sessionAvailable: boolean,
+  ): ScopeOption[] {
+    const options: ScopeOption[] = [
+      { label: "This connection only", scope: "once" },
+    ];
+    const hosts = approvalHostPatterns(host);
+    const pushOptions = (scope: ApprovalScope) => {
+      for (const candidate of hosts) {
+        options.push({
+          label: `${scopeLabel(scope)} — ${candidate}`,
+          scope,
+          target: { kind: "network_host", host: candidate },
+        });
+      }
+    };
+    if (sessionAvailable) {
+      pushOptions("session");
+    }
+    pushOptions("project");
+    pushOptions("global");
+    return options;
+  }
+
+  function sudoScopeOptions(
+    argv: string[],
+    sessionAvailable: boolean,
+  ): ScopeOption[] {
+    const options: ScopeOption[] = [{ label: "This command only", scope: "once" }];
+    const prefixes = sudoApprovalPrefixes(argv);
+    const pushOptions = (scope: ApprovalScope) => {
+      for (const prefix of prefixes) {
+        options.push({
+          label: `${scopeLabel(scope)} — ${formatSudoCommand(prefix)}`,
+          scope,
+          target: { kind: "sudo_command", argv: prefix },
+        });
+      }
+    };
+    if (sessionAvailable) {
+      pushOptions("session");
+    }
+    pushOptions("project");
+    pushOptions("global");
+    return options;
+  }
+
+  async function chooseAction(
+    title: string,
+    ctx: ExtensionContext,
+  ): Promise<PromptAction | undefined> {
+    const choice = await ctx.ui.select(title, [...ACTION_OPTIONS]);
+    if (choice === "Allow") return "approve";
+    if (choice === "Deny") return "deny";
+    return undefined;
+  }
+
+  async function chooseScopeOption(
+    title: string,
+    options: ScopeOption[],
+    ctx: ExtensionContext,
+  ): Promise<ScopeOption | undefined> {
+    const choice = await ctx.ui.select(
+      title,
+      options.map((option) => option.label),
+    );
+    return options.find((option) => option.label === choice);
+  }
+
+  async function submitDecision(
+    req: NetworkRequest | ElevationRequest,
+    action: PromptAction,
+    choice: ScopeOption,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const sessionId = policySessionId;
+    if (choice.scope === "session" && !sessionId) {
+      const noun = action === "approve" ? "approval" : "deny";
+      ctx.ui.notify?.(
+        `agent-sandbox: session ${noun} unavailable (policy UI not connected).`,
+      );
+      return;
+    }
+    const resp = await policyRpc(
+      {
+        op: action,
+        id: req.id,
+        scope: choice.scope,
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...(choice.target ? { target: choice.target } : {}),
+        ...rpcContext(req),
+      },
+      socketPath(),
+    );
+    if (!resp.ok) {
+      const label =
+        action === "approve"
+          ? req.type === "elevation_request"
+            ? "elevation approval"
+            : "approval"
+          : req.type === "elevation_request"
+            ? "elevation deny"
+            : "deny";
+      ctx.ui.notify?.(
+        `agent-sandbox: ${label} failed (${String(resp.error ?? "unknown")}).`,
+      );
+      return;
+    }
+    if (choice.scope === "project" && resp.path) {
+      ctx.ui.notify?.(`Project policy saved to ${String(resp.path)}.`);
+    }
+  }
+
   async function handleNetworkRequest(
     req: NetworkRequest,
     ctx: ExtensionContext,
   ): Promise<void> {
     const url = req.url ?? `${req.scheme ?? "https"}://${req.host}:${req.port}`;
-    const choice = await ctx.ui.select(
-      `agent-sandbox: allow ${url}?`,
-      [...NETWORK_APPROVAL_OPTIONS],
+    const action = await chooseAction(`agent-sandbox: ${url}`, ctx);
+    if (!action) return;
+    const choice = await chooseScopeOption(
+      `agent-sandbox: ${action} ${url}?`,
+      networkScopeOptions(req.host, policySessionId !== null),
+      ctx,
     );
     if (!choice) return;
-
-    const scope = SCOPE_BY_LABEL[choice];
-    const rpcCtx = rpcContext(req);
-    const sessionId = policySessionId;
-
-    if (DENY_LABELS.has(choice)) {
-      if (scope === "session" && !sessionId) {
-        ctx.ui.notify?.(
-          "agent-sandbox: session deny unavailable (policy UI not connected).",
-        );
-        return;
-      }
-      const resp = await policyRpc(
-        {
-          op: "deny",
-          id: req.id,
-          scope,
-          ...(sessionId ? { session_id: sessionId } : {}),
-          ...rpcCtx,
-        },
-        socketPath(),
-      );
-      if (!resp.ok) {
-        ctx.ui.notify?.(
-          `agent-sandbox: deny failed (${String(resp.error ?? "unknown")}).`,
-        );
-      } else if (scope === "project" && resp.path) {
-        ctx.ui.notify?.(`Project policy saved to ${String(resp.path)}.`);
-      }
-      return;
-    }
-
-    if (scope === "session" && !sessionId) {
-      ctx.ui.notify?.(
-        "agent-sandbox: session approval unavailable (policy UI not connected).",
-      );
-      return;
-    }
-
-    const resp = await policyRpc(
-      {
-        op: "approve",
-        id: req.id,
-        scope,
-        ...(sessionId ? { session_id: sessionId } : {}),
-        ...rpcCtx,
-      },
-      socketPath(),
-    );
-
-    if (!resp.ok) {
-      ctx.ui.notify?.(
-        `agent-sandbox: approval failed (${String(resp.error ?? "unknown")}).`,
-      );
-      return;
-    }
-
-    if (scope === "project" && resp.path) {
-      ctx.ui.notify?.(`Project policy saved to ${String(resp.path)}.`);
-    }
+    await submitDecision(req, action, choice, ctx);
   }
 
   function elevationPrompt(req: ElevationRequest): string {
-    const cmd =
-      req.argv.length > 0 ? `sudo ${req.argv.join(" ")}` : "sudo";
+    const cmd = formatSudoCommand(req.argv);
     const cwd = req.cwd?.trim();
     const lines = [cmd, "", "Allow this command to run as root on the host?"];
     if (cwd) {
@@ -242,67 +316,15 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     req: ElevationRequest,
     ctx: ExtensionContext,
   ): Promise<void> {
-    const choice = await ctx.ui.select(elevationPrompt(req), [
-      ...SUDO_APPROVAL_OPTIONS,
-    ]);
-    if (!choice) return;
-
-    const scope = SCOPE_BY_LABEL[choice];
-    const rpcCtx = rpcContext(req);
-    const sessionId = policySessionId;
-
-    if (DENY_LABELS.has(choice)) {
-      if (scope === "session" && !sessionId) {
-        ctx.ui.notify?.(
-          "agent-sandbox: session deny unavailable (policy UI not connected).",
-        );
-        return;
-      }
-      const resp = await policyRpc(
-        {
-          op: "deny",
-          id: req.id,
-          scope,
-          ...(sessionId ? { session_id: sessionId } : {}),
-          ...rpcCtx,
-        },
-        socketPath(),
-      );
-      if (!resp.ok) {
-        ctx.ui.notify?.(
-          `agent-sandbox: elevation deny failed (${String(resp.error ?? "unknown")}).`,
-        );
-      } else if (scope === "project" && resp.path) {
-        ctx.ui.notify?.(`Project policy saved to ${String(resp.path)}.`);
-      }
-      return;
-    }
-
-    if (scope === "session" && !sessionId) {
-      ctx.ui.notify?.(
-        "agent-sandbox: session approval unavailable (policy UI not connected).",
-      );
-      return;
-    }
-
-    const resp = await policyRpc(
-      {
-        op: "approve",
-        id: req.id,
-        scope,
-        ...(sessionId ? { session_id: sessionId } : {}),
-        ...rpcCtx,
-      },
-      socketPath(),
+    const action = await chooseAction(elevationPrompt(req), ctx);
+    if (!action) return;
+    const choice = await chooseScopeOption(
+      `agent-sandbox: ${action} sudo scope?`,
+      sudoScopeOptions(req.argv, policySessionId !== null),
+      ctx,
     );
-
-    if (!resp.ok) {
-      ctx.ui.notify?.(
-        `agent-sandbox: elevation approval failed (${String(resp.error ?? "unknown")}).`,
-      );
-    } else if (scope === "project" && resp.path) {
-      ctx.ui.notify?.(`Project policy saved to ${String(resp.path)}.`);
-    }
+    if (!choice) return;
+    await submitDecision(req, action, choice, ctx);
   }
 
   function onPolicyMessage(line: string, ctx: ExtensionContext): void {
@@ -339,7 +361,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         socket.once("error", reject);
         socket.once("connect", () => resolve());
       });
-
       socket.setEncoding("utf8");
       socket.on("data", (chunk: string) => {
         const parsed = parseLines(lineBuf, chunk);

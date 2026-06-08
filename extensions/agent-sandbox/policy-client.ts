@@ -6,12 +6,19 @@ export type ApprovalScope = "once" | "session" | "project" | "global";
 
 const DEFAULT_SOCKET = "/run/agent-sandbox/policy.sock";
 
+function socketPath(): string {
+  return (
+    process.env.AGENT_SANDBOX_POLICY_SOCKET ??
+    DEFAULT_SOCKET
+  );
+}
+
 export async function policyRpc(
   req: PolicyRequest,
-  socketPath = process.env.AGENT_SANDBOX_POLICY_SOCKET ?? DEFAULT_SOCKET,
+  socket = socketPath(),
 ): Promise<PolicyResponse> {
   return await new Promise((resolve, reject) => {
-    const client = net.createConnection(socketPath);
+    const client = net.createConnection(socket);
     let buf = "";
     client.setEncoding("utf8");
     client.on("error", reject);
