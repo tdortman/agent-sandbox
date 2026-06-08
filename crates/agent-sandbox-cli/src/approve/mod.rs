@@ -118,6 +118,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
                 id,
                 scope,
                 session_id,
+                target: None,
                 ctx: RequestContext::from(&p),
             };
             let resp = rpc(&cli.socket, req).await?;
@@ -156,6 +157,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
                 id,
                 scope,
                 session_id,
+                target: None,
                 ctx: RequestContext::from(&p),
             };
             let resp = rpc(&cli.socket, req).await?;

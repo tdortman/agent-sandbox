@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
+use agent_sandbox_core::{RequestContext, RpcReply, RpcRequest, SandboxPaths};
 use tracing::info;
 
 use super::error::UiCliError;
+use super::options::{PromptAction, ScopeOption};
 
 pub(crate) fn format_elevation_title(argv: &[String], cwd: &str) -> String {
     let cmd = if argv.is_empty() {
@@ -26,63 +27,51 @@ pub(crate) async fn resolve_choice(
     paths: &SandboxPaths,
     session_id: Option<&str>,
     id: &str,
-    choice: Option<&str>,
+    action: PromptAction,
+    choice: Option<ScopeOption>,
 ) -> Result<(), UiCliError> {
     let Some(choice) = choice else {
         info!("no prompt available; request left pending");
         return Ok(());
     };
-    let (deny, scope) = scope_for_label(choice);
-    if deny {
-        if scope == ApprovalScope::Session && session_id.is_none() {
-            eprintln!("agent-sandbox: session deny unavailable (policy UI not connected).");
-            return Ok(());
-        }
-        let req = RpcRequest::Deny {
-            id: id.to_string(),
-            scope,
-            session_id: session_id.map(str::to_owned),
-            ctx: RequestContext::from(paths),
+    if choice.scope == agent_sandbox_core::ApprovalScope::Session && session_id.is_none() {
+        let noun = match action {
+            PromptAction::Allow => "approval",
+            PromptAction::Deny => "deny",
         };
-        let resp = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await?;
-        if let RpcReply::Error(e) = resp {
-            eprintln!("agent-sandbox: deny failed ({})", e.error);
-        }
-    } else {
-        if scope == ApprovalScope::Session && session_id.is_none() {
-            eprintln!("agent-sandbox: session approval unavailable (policy UI not connected).");
-            return Ok(());
-        }
-        let req = RpcRequest::Approve {
+        eprintln!("agent-sandbox: session {noun} unavailable (policy UI not connected).");
+        return Ok(());
+    }
+
+    let req = match action {
+        PromptAction::Allow => RpcRequest::Approve {
             id: id.to_string(),
-            scope,
+            scope: choice.scope,
             session_id: session_id.map(str::to_owned),
+            target: choice.target,
             ctx: RequestContext::from(paths),
-        };
-        let resp = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await?;
-        match resp {
-            RpcReply::Error(e) => {
-                eprintln!("agent-sandbox: approval failed ({})", e.error);
-            }
-            RpcReply::ScopeAction(s) if s.path().is_some() => {
-                eprintln!("Project policy saved to {}.", s.path().unwrap_or_default());
-            }
-            _ => {}
+        },
+        PromptAction::Deny => RpcRequest::Deny {
+            id: id.to_string(),
+            scope: choice.scope,
+            session_id: session_id.map(str::to_owned),
+            target: choice.target,
+            ctx: RequestContext::from(paths),
+        },
+    };
+    let resp = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await?;
+    match resp {
+        RpcReply::Error(e) => {
+            let verb = match action {
+                PromptAction::Allow => "approval",
+                PromptAction::Deny => "deny",
+            };
+            eprintln!("agent-sandbox: {verb} failed ({})", e.error);
         }
+        RpcReply::ScopeAction(s) if s.path().is_some() => {
+            eprintln!("Project policy saved to {}.", s.path().unwrap_or_default());
+        }
+        _ => {}
     }
     Ok(())
-}
-
-fn scope_for_label(label: &str) -> (bool, ApprovalScope) {
-    let deny = label.starts_with("Deny ");
-    let scope = if label.contains("once") {
-        ApprovalScope::Once
-    } else if label.contains("session") {
-        ApprovalScope::Session
-    } else if label.contains("project") {
-        ApprovalScope::Project
-    } else {
-        ApprovalScope::Global
-    };
-    (deny, scope)
 }
