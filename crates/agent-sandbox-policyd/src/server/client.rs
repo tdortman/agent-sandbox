@@ -5,12 +5,14 @@ use std::sync::Arc;
 use agent_sandbox_core::{RpcReply, RpcRequest};
 
 use crate::error::PolicydError;
+use crate::server::peer::ClientPeer;
 use crate::store::PolicyStore;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::Mutex;
 
 pub async fn handle_client(store: Arc<PolicyStore>, stream: UnixStream) -> std::io::Result<()> {
+    let peer = ClientPeer::from_stream(&stream);
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let client = PolicyStore::new_client_handle(writer.clone());
@@ -28,7 +30,7 @@ pub async fn handle_client(store: Arc<PolicyStore>, stream: UnixStream) -> std::
         };
         let flush_pending = matches!(req, RpcRequest::RegisterUi { .. });
 
-        let resp = match super::dispatch::dispatch(&store, &client, req).await {
+        let resp = match super::dispatch::dispatch(&store, &client, peer, req).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(error = %err, "policyd dispatch error");

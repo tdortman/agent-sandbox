@@ -1,7 +1,10 @@
-//! JSON-line RPC server over a Unix domain socket.
+//! JSON-line RPC server over Unix domain sockets.
 
 mod client;
 mod dispatch;
+mod peer;
+
+pub use peer::ClientPeer;
 
 use std::sync::Arc;
 

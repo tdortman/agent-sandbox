@@ -2,44 +2,41 @@
 
 use std::sync::Arc;
 
-use agent_sandbox_core::{
-    RegisterUiReply, RpcReply, RpcRequest, SessionContext, SimpleOkReply, write_session_context,
-};
+use agent_sandbox_core::{RegisterUiReply, RpcReply, RpcRequest, SimpleOkReply};
 
 use crate::error::PolicydError;
-use crate::store::PolicyStore;
+use crate::server::peer::ClientPeer;
+use crate::store::{PolicyStore, UiSessionOwner};
 use crate::wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire};
 
 pub(crate) async fn handle(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
+    peer: ClientPeer,
     req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     match req {
         RpcRequest::RegisterUi { ui_client, ctx } => {
             let ui_client = ui_client.as_deref().unwrap_or("standalone");
-            if ui_client == "standalone" && store.has_omp_ui().await {
-                return Err(PolicydError::OmpUiActive);
-            }
             let paths = ctx.sandbox_paths();
+            let owner = (ui_client == "omp").then_some(UiSessionOwner {
+                uid: peer.uid,
+                pid: peer.pid,
+            });
             let session_id = store
                 .start_ui_session(
                     client,
                     ui_client,
+                    owner,
                     paths.cwd_string(),
                     paths.home_string(),
                     paths.project_root_string(),
                 )
                 .await;
-            if let Some(sess) = store.ui_context_for_session(&session_id).await {
-                write_session_context(&SessionContext {
-                    cwd: sess.cwd.clone(),
-                    home: sess.home.clone(),
-                    project_root: sess.project_root.clone(),
-                });
-                if let Some(project_root) = &sess.project_root {
-                    tracing::info!(project_root = %project_root, "policy UI registered");
-                }
+            if let Some(sess) = store.ui_context_for_session(&session_id).await
+                && let Some(project_root) = &sess.project_root
+            {
+                tracing::info!(project_root = %project_root, "policy UI registered");
             }
             Ok(RpcReply::RegisterUi(RegisterUiReply {
                 ok: true,

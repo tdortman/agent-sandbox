@@ -14,6 +14,7 @@ pub(crate) static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone)]
 pub struct PolicydArgs {
     pub socket: PathBuf,
+    pub sandbox_netns: Option<PathBuf>,
     pub declarative: PathBuf,
     pub export_json: PathBuf,
     pub export_nix: Option<PathBuf>,
@@ -43,6 +44,12 @@ pub enum PendingKind {
     Network,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UiSessionOwner {
+    pub uid: u32,
+    pub pid: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UiSessionContext {
     pub cwd: Option<String>,
@@ -59,6 +66,8 @@ pub(crate) struct UiClient {
     pub session_id: String,
     pub ui_client: String,
     pub writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
+    pub owner_uid: u32,
+    pub owner_pid: u32,
 }
 
 pub struct PolicyStore {

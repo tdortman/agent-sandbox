@@ -25,8 +25,10 @@ pub enum PolicydError {
     UnknownPendingId,
     #[error("host denied by policy deny rules")]
     HostDeniedByPolicy,
-    #[error("OMP policy UI is active (use OMP prompts only)")]
-    OmpUiActive,
+#[error("invalid approval target")]
+    InvalidDecisionTarget,
+    #[error("request not allowed from sandboxed client")]
+    UnauthorizedRequest,
 }
 
 impl From<PolicydError> for RpcReply {
