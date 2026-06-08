@@ -28,7 +28,11 @@ pub use hosts::{
 };
 pub use merge_policy::{ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers};
 pub use policy::{NetworkRule, NetworkSection, Policy, SudoRule, SudoSection};
-pub use proc_context::{context_from_pid, home_from_uid, peer_cred};
+pub use proc_context::{
+    context_from_pid, home_from_uid, is_blocked_sandbox_policy_tool, is_descendant_of,
+    looks_like_omp_ui_process, namespace_inode, omp_ui_owner_for_pid, peer_cred, peer_cred_unix,
+    peer_in_different_mount_ns, peer_in_netns, read_proc_cmdline, read_proc_exe,
+};
 pub use rpc::{
     ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply, PendingSummary,
     RegisterUiReply, RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
