@@ -68,6 +68,13 @@ impl From<(SandboxPaths, ProcessIds)> for RequestContext {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalTarget {
+    NetworkHost { host: String },
+    SudoCommand { argv: Vec<String> },
+}
+
 /// Incoming RPC request (`op` tag).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -102,6 +109,8 @@ pub enum RpcRequest {
         scope: ApprovalScope,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<ApprovalTarget>,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -120,6 +129,8 @@ pub enum RpcRequest {
         scope: ApprovalScope,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<ApprovalTarget>,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -173,7 +184,7 @@ fn default_once_scope() -> ApprovalScope {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestContext, RpcRequest};
+    use super::{ApprovalTarget, RequestContext, RpcRequest};
     use crate::{ProcessIds, SandboxPaths};
 
     #[test]
@@ -183,6 +194,21 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(req, RpcRequest::Check { .. }));
+    }
+
+    #[test]
+    fn approve_request_deserializes_with_target_override() {
+        let req: RpcRequest = serde_json::from_str(
+            r#"{"op":"approve","id":"p1","scope":"project","target":{"kind":"network_host","host":"*.baz.com"},"ctx":{"cwd":"/tmp"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            RpcRequest::Approve {
+                target: Some(ApprovalTarget::NetworkHost { .. }),
+                ..
+            }
+        ));
     }
 
     #[test]

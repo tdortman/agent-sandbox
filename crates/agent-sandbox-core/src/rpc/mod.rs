@@ -15,5 +15,5 @@ pub use reply::{
     CheckReply, ElevateReply, ErrorReply, RegisterUiReply, RpcReply, ScopeActionReply,
     SimpleOkReply, StatusReply,
 };
-pub use request::{RequestContext, RpcRequest};
+pub use request::{ApprovalTarget, RequestContext, RpcRequest};
 pub use scope::ApprovalScope;

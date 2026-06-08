@@ -23,16 +23,16 @@ pub use dns_wire::mappings_from_response;
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 pub use hosts::{
-    allow_keys, is_ipv4_literal, normalize_host, parse_tls_sni, policy_host_for_connect,
-    reverse_hostname,
+    allow_keys, approval_host_patterns, is_ipv4_literal, normalize_host, parse_tls_sni,
+    policy_host_for_connect, reverse_hostname,
 };
 pub use merge_policy::{ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers};
 pub use policy::{NetworkRule, NetworkSection, Policy, SudoRule, SudoSection};
 pub use proc_context::{context_from_pid, home_from_uid, peer_cred};
 pub use rpc::{
-    ApprovalScope, CheckReply, ElevateReply, ErrorReply, PendingSummary, RegisterUiReply,
-    RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply,
-    UiPush,
+    ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply, PendingSummary,
+    RegisterUiReply, RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
+    SimpleOkReply, StatusReply, UiPush,
 };
 pub use rpc_client::{RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

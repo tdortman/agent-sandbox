@@ -20,6 +20,21 @@ pub fn is_ipv4_literal(host: &str) -> bool {
 pub fn normalize_host(host: &str) -> String {
     host.trim().to_lowercase().trim_end_matches('.').to_string()
 }
+pub fn approval_host_patterns(host: &str) -> Vec<String> {
+    let host = normalize_host(host);
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let labels: Vec<_> = host.split('.').collect();
+    let mut patterns = vec![host.clone()];
+    for idx in 1..labels.len() {
+        let suffix = labels[idx..].join(".");
+        if suffix.contains('.') {
+            patterns.push(format!("*.{suffix}"));
+        }
+    }
+    patterns
+}
 
 pub fn reverse_hostname(ip: &str) -> Option<String> {
     if !is_ipv4_literal(ip) {
@@ -217,6 +232,17 @@ mod tests {
         assert_eq!(connect, "52.54.28.178");
     }
 
+    #[test]
+    fn approval_host_patterns_include_parent_domains() {
+        assert_eq!(
+            approval_host_patterns("Foo.Bar.Baz.com."),
+            vec![
+                "foo.bar.baz.com".to_string(),
+                "*.bar.baz.com".to_string(),
+                "*.baz.com".to_string(),
+            ]
+        );
+    }
     #[test]
     fn policy_host_uses_sni_when_cache_miss() {
         let pkt = client_hello_with_sni("cached-miss.example");
