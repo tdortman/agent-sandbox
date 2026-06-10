@@ -4,7 +4,7 @@ use agent_sandbox_core::{PendingSummary, ProcessIds, SandboxPaths, StatusReply};
 
 use crate::wire::MergeContext;
 
-use super::types::{PendingKind, PolicyStore};
+use super::types::{Pending, PolicyStore};
 
 impl PolicyStore {
     pub async fn status(&self, paths: SandboxPaths) -> StatusReply {
@@ -20,25 +20,22 @@ impl PolicyStore {
             .await
             .pending
             .values()
-            .map(|p| {
-                if p.kind == PendingKind::Network {
-                    PendingSummary::Network {
-                        id: p.id.clone(),
-                        host: p.host.clone(),
-                        port: p.port,
-                        scheme: p.scheme.clone(),
-                        url: p.url.clone(),
-                        cwd: p.cwd.clone(),
-                        home: p.home.clone(),
-                    }
-                } else {
-                    PendingSummary::Elevation {
-                        id: p.id.clone(),
-                        argv: p.argv.clone(),
-                        cwd: p.cwd.clone(),
-                        home: p.home.clone(),
-                    }
-                }
+            .map(|p| match p {
+                Pending::Network(net) => PendingSummary::Network {
+                    id: net.id.clone(),
+                    host: Some(net.host.clone()),
+                    port: Some(net.port),
+                    scheme: Some(net.scheme.clone()),
+                    url: Some(net.url.clone()),
+                    cwd: net.cwd.clone(),
+                    home: net.home.clone(),
+                },
+                Pending::Elevation(elev) => PendingSummary::Elevation {
+                    id: elev.id.clone(),
+                    argv: Some(elev.argv.clone()),
+                    cwd: elev.cwd.clone(),
+                    home: elev.home.clone(),
+                },
             })
             .collect();
         StatusReply {
