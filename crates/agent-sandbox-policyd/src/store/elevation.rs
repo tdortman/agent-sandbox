@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::spawn::maybe_spawn_ui;
 use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 
+use super::types::{Pending, PendingElevation, PolicyStore};
 use super::ui_route::UiRoute;
-use super::types::{Pending, PendingKind, PolicyStore};
 
 impl PolicyStore {
     pub(crate) fn user_for_home(home: Option<&str>) -> String {
@@ -114,22 +114,17 @@ impl PolicyStore {
             inner.elevation_futures.insert(pending_id.clone(), tx);
             inner.pending.insert(
                 pending_id.clone(),
-                Pending {
+                Pending::Elevation(PendingElevation {
                     id: pending_id.clone(),
                     created_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0.0, |d| d.as_secs_f64()),
-                    kind: PendingKind::Elevation,
-                    argv: Some(argv.clone()),
-                    host: None,
-                    port: None,
-                    scheme: None,
-                    url: None,
+                    argv: argv.clone(),
                     cwd: cwd.clone(),
                     home: home.clone(),
                     project_root: project_root.clone(),
                     request_pid: wire_ids.pid().filter(|&p| p != 0),
-                },
+                }),
             );
         }
         let detail = format!("id={pending_id} argv={argv:?}");
@@ -152,13 +147,6 @@ impl PolicyStore {
             },
         )
         .await;
-
-        let route = UiRoute::new(
-            wire_ids.pid().filter(|&p| p != 0),
-            cwd.clone(),
-            home.clone(),
-            project_root.clone(),
-        );
         if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
             let mut spawn_uid = wire_ids.uid();
             if spawn_uid.is_none_or(|u| u == 0)
