@@ -8,7 +8,7 @@ use agent_sandbox_core::{
 use crate::error::PolicydError;
 use crate::wire::{NetworkScopeOp, PendingDecision, SudoScopeOp};
 
-use super::super::types::{Pending, PendingKind, PolicyStore};
+use super::super::types::{Pending, PendingElevation, PendingNetwork, PolicyStore};
 use super::DecisionAction;
 
 impl PolicyStore {
@@ -26,13 +26,13 @@ impl PolicyStore {
             Ok(value) => value,
             Err(err) => return err,
         };
-        match pending.kind {
-            PendingKind::Network => {
-                self.apply_pending_network_decision(pending, wire, scope, target.as_ref(), action)
+        match pending {
+            Pending::Network(net) => {
+                self.apply_pending_network_decision(net, wire, scope, target.as_ref(), action)
                     .await
             }
-            PendingKind::Elevation => {
-                self.apply_pending_sudo_decision(pending, wire, scope, target.as_ref(), action)
+            Pending::Elevation(elev) => {
+                self.apply_pending_sudo_decision(elev, wire, scope, target.as_ref(), action)
                     .await
             }
         }
@@ -40,17 +40,21 @@ impl PolicyStore {
 
     async fn apply_pending_network_decision(
         &self,
-        pending: Pending,
+        net: PendingNetwork,
         wire: crate::wire::ScopeWire,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
         action: DecisionAction,
     ) -> RpcReply {
-        let pending_id = pending.id.clone();
-        let (host, port) = match Self::resolve_pending_network_target(&pending, scope, target) {
+        let pending_id = net.id.clone();
+        let (host, port) = match Self::resolve_pending_network_target(&net, scope, target) {
             Ok(value) => value,
             Err(err) => {
-                self.inner.lock().await.pending.insert(pending_id, pending);
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(pending_id.clone(), Pending::Network(net));
                 return err.into();
             }
         };
@@ -67,7 +71,7 @@ impl PolicyStore {
                     host: host.clone(),
                     port,
                     scope,
-                    wire: Self::scope_wire_for_pending(wire, &pending),
+                    wire: Self::scope_wire_for_pending_network(wire, &net),
                 },
                 action,
             )
@@ -86,28 +90,36 @@ impl PolicyStore {
         } else if action == DecisionAction::Approve {
             self.finish_network(&pending_id, false, "blocked").await;
         } else {
-            self.inner.lock().await.pending.insert(pending_id, pending);
+            self.inner
+                .lock()
+                .await
+                .pending
+                .insert(pending_id, Pending::Network(net));
         }
         result
     }
 
     async fn apply_pending_sudo_decision(
         &self,
-        pending: Pending,
+        elev: PendingElevation,
         wire: crate::wire::ScopeWire,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
         action: DecisionAction,
     ) -> RpcReply {
-        let pending_id = pending.id.clone();
-        let argv = match Self::resolve_pending_sudo_target(&pending, scope, target) {
+        let pending_id = elev.id.clone();
+        let argv = match Self::resolve_pending_sudo_target(&elev, scope, target) {
             Ok(value) => value,
             Err(err) => {
-                self.inner.lock().await.pending.insert(pending_id, pending);
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(pending_id.clone(), Pending::Elevation(elev));
                 return err.into();
             }
         };
-        let scope_wire = Self::scope_wire_for_pending(wire, &pending);
+        let scope_wire = Self::scope_wire_for_pending_elevation(wire, &elev);
 
         if action == DecisionAction::Deny {
             if scope == ApprovalScope::Once {
@@ -131,7 +143,11 @@ impl PolicyStore {
                 self.finish_elevation(&pending_id, ElevateReply::denied())
                     .await;
             } else {
-                self.inner.lock().await.pending.insert(pending_id, pending);
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(pending_id, Pending::Elevation(elev));
             }
             return result;
         }
@@ -150,7 +166,11 @@ impl PolicyStore {
                 )
                 .await;
             if !scope_result.scope_succeeded() {
-                self.inner.lock().await.pending.insert(pending_id, pending);
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(pending_id, Pending::Elevation(elev));
                 return scope_result;
             }
             scope_result.scope_path()
@@ -161,8 +181,8 @@ impl PolicyStore {
         let elevation = self
             .exec_elevation(
                 &argv,
-                pending.cwd.as_deref().or(scope_wire.paths.cwd()),
-                pending.home.as_deref().or(scope_wire.paths.home()),
+                elev.cwd.as_deref().or(scope_wire.paths.cwd()),
+                elev.home.as_deref().or(scope_wire.paths.home()),
             )
             .await;
         self.finish_elevation(&pending_id, elevation).await;
@@ -170,12 +190,12 @@ impl PolicyStore {
     }
 
     fn resolve_pending_network_target(
-        pending: &Pending,
+        pending: &PendingNetwork,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
     ) -> Result<(String, u16), PolicydError> {
-        let pending_host = pending.host.clone().unwrap_or_default();
-        let pending_port = pending.port.unwrap_or(0);
+        let pending_host = &pending.host;
+        let pending_port = pending.port;
         let host = match target {
             None => pending_host.clone(),
             Some(ApprovalTarget::NetworkHost { host }) => host.clone(),
@@ -183,24 +203,24 @@ impl PolicyStore {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
         };
-        let valid_host = approval_host_patterns(&pending_host)
+        let valid_host = approval_host_patterns(pending_host)
             .into_iter()
             .any(|candidate| candidate == host);
         if !valid_host {
             return Err(PolicydError::InvalidDecisionTarget);
         }
-        if scope == ApprovalScope::Once && host != pending_host {
+        if scope == ApprovalScope::Once && host != *pending_host {
             return Err(PolicydError::InvalidDecisionTarget);
         }
         Ok((host, pending_port))
     }
 
     fn resolve_pending_sudo_target(
-        pending: &Pending,
+        pending: &PendingElevation,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
     ) -> Result<Vec<String>, PolicydError> {
-        let pending_argv = pending.argv.clone().unwrap_or_default();
+        let pending_argv = &pending.argv;
         let argv = match target {
             None => pending_argv.clone(),
             Some(ApprovalTarget::SudoCommand { argv }) => argv.clone(),
@@ -208,13 +228,13 @@ impl PolicyStore {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
         };
-        let valid_argv = SudoRule::approval_prefixes(&pending_argv)
+        let valid_argv = SudoRule::approval_prefixes(pending_argv)
             .into_iter()
             .any(|candidate| candidate == argv);
         if !valid_argv {
             return Err(PolicydError::InvalidDecisionTarget);
         }
-        if scope == ApprovalScope::Once && argv != pending_argv {
+        if scope == ApprovalScope::Once && argv != *pending_argv {
             return Err(PolicydError::InvalidDecisionTarget);
         }
         Ok(argv)
@@ -225,30 +245,31 @@ impl PolicyStore {
 mod tests {
     use agent_sandbox_core::{ApprovalScope, ApprovalTarget};
 
-    use crate::store::{Pending, PendingKind, PolicyStore};
+    use crate::store::{Pending, PendingElevation, PendingNetwork, PolicyStore};
 
     #[test]
     fn network_target_accepts_parent_domain_patterns() {
-        let pending = Pending {
+        let pending = Pending::Network(PendingNetwork {
             id: "p1".into(),
             created_at: 0.0,
-            kind: PendingKind::Network,
-            argv: None,
-            host: Some("foo.bar.baz.com".into()),
-            port: Some(443),
-            scheme: None,
-            url: None,
+            host: "foo.bar.baz.com".into(),
+            port: 443,
+            scheme: "https".into(),
+            url: "https://foo.bar.baz.com".into(),
             cwd: None,
             home: None,
             project_root: None,
             request_pid: None,
-        };
+        });
         let target = ApprovalTarget::NetworkHost {
             host: "*.baz.com".into(),
         };
         assert_eq!(
             PolicyStore::resolve_pending_network_target(
-                &pending,
+                match &pending {
+                    Pending::Network(net) => net,
+                    Pending::Elevation(_) => panic!("expected Network"),
+                },
                 ApprovalScope::Project,
                 Some(&target),
             )
@@ -259,26 +280,24 @@ mod tests {
 
     #[test]
     fn sudo_target_accepts_command_prefixes() {
-        let pending = Pending {
+        let pending = Pending::Elevation(PendingElevation {
             id: "p1".into(),
             created_at: 0.0,
-            kind: PendingKind::Elevation,
-            argv: Some(vec!["foo".into(), "bar".into(), "baz".into()]),
-            host: None,
-            port: None,
-            scheme: None,
-            url: None,
+            argv: vec!["foo".into(), "bar".into(), "baz".into()],
             cwd: None,
             home: None,
             project_root: None,
             request_pid: None,
-        };
+        });
         let target = ApprovalTarget::SudoCommand {
             argv: vec!["foo".into(), "bar".into()],
         };
         assert_eq!(
             PolicyStore::resolve_pending_sudo_target(
-                &pending,
+                match &pending {
+                    Pending::Elevation(elev) => elev,
+                    Pending::Network(_) => panic!("expected Elevation"),
+                },
                 ApprovalScope::Session,
                 Some(&target),
             )
