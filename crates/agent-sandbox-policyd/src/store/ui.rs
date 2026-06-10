@@ -15,8 +15,7 @@ use crate::spawn::maybe_spawn_ui;
 use crate::wire::{UiSpawnContext, UiSpawnGate};
 
 use super::types::{
-    CLIENT_ID, Pending, PendingKind, PolicyStore, UiClient, UiClientHandle, UiSessionContext,
-    UiSessionOwner,
+    CLIENT_ID, Pending, PolicyStore, UiClient, UiClientHandle, UiSessionContext, UiSessionOwner,
 };
 use super::ui_route::{UiRoute, request_owned_by_omp, ui_client_matches};
 
@@ -38,7 +37,6 @@ impl PolicyStore {
             .values()
             .any(|c| c.ui_client == "omp" && c.owner_uid == uid && c.owner_pid == pid)
     }
-
 
     fn omp_clients(inner: &super::types::StoreInner) -> Vec<&UiClient> {
         inner
@@ -155,27 +153,24 @@ impl PolicyStore {
         let pending: Vec<Pending> = self.inner.lock().await.pending.values().cloned().collect();
         for p in pending {
             let route = UiRoute::new(
-                p.request_pid,
-                p.cwd.clone(),
-                p.home.clone(),
-                p.project_root.clone(),
+                p.request_pid(),
+                p.cwd().map(str::to_owned),
+                p.home().map(str::to_owned),
+                p.project_root().map(str::to_owned),
             );
-            if !self.has_ui_for_route(&route).await
-                && !self.route_owned_by_omp_ui(&route).await
-            {
-                let spawn_uid =
-                    nix::unistd::User::from_name(&Self::user_for_home(p.home.as_deref()))
-                        .ok()
-                        .flatten()
-                        .map(|u| u.uid.as_raw());
+            if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
+                let spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(p.home()))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.uid.as_raw());
                 let spawn = UiSpawnContext {
                     gate: UiSpawnGate {
                         has_matching_ui: false,
                     },
                     uid: spawn_uid,
-                    home: p.home.as_deref(),
-                    cwd: p.cwd.as_deref(),
-                    project_root: p.project_root.as_deref(),
+                    home: p.home(),
+                    cwd: p.cwd(),
+                    project_root: p.project_root(),
                 };
                 maybe_spawn_ui(
                     &self.args,
@@ -189,38 +184,41 @@ impl PolicyStore {
 
     async fn notify_pending(&self, p: &Pending) {
         let route = UiRoute::new(
-            p.request_pid,
-            p.cwd.clone(),
-            p.home.clone(),
-            p.project_root.clone(),
+            p.request_pid(),
+            p.cwd().map(str::to_owned),
+            p.home().map(str::to_owned),
+            p.project_root().map(str::to_owned),
         );
-        if p.kind == PendingKind::Network {
-            self.notify_ui(
-                &route,
-                &UiPush::NetworkRequest {
-                    id: p.id.clone(),
-                    host: p.host.clone(),
-                    port: p.port,
-                    scheme: p.scheme.clone(),
-                    url: p.url.clone(),
-                    cwd: p.cwd.clone(),
-                    home: p.home.clone(),
-                    project_root: p.project_root.clone(),
-                },
-            )
-            .await;
-        } else {
-            self.notify_ui(
-                &route,
-                &UiPush::ElevationRequest {
-                    id: p.id.clone(),
-                    argv: p.argv.clone(),
-                    cwd: p.cwd.clone(),
-                    home: p.home.clone(),
-                    project_root: p.project_root.clone(),
-                },
-            )
-            .await;
+        match p {
+            Pending::Network(net) => {
+                self.notify_ui(
+                    &route,
+                    &UiPush::NetworkRequest {
+                        id: net.id.clone(),
+                        host: Some(net.host.clone()),
+                        port: Some(net.port),
+                        scheme: Some(net.scheme.clone()),
+                        url: Some(net.url.clone()),
+                        cwd: net.cwd.clone(),
+                        home: net.home.clone(),
+                        project_root: net.project_root.clone(),
+                    },
+                )
+                .await;
+            }
+            Pending::Elevation(elev) => {
+                self.notify_ui(
+                    &route,
+                    &UiPush::ElevationRequest {
+                        id: elev.id.clone(),
+                        argv: Some(elev.argv.clone()),
+                        cwd: elev.cwd.clone(),
+                        home: elev.home.clone(),
+                        project_root: elev.project_root.clone(),
+                    },
+                )
+                .await;
+            }
         }
     }
 
