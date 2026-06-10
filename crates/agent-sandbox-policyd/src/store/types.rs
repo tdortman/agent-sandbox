@@ -24,15 +24,24 @@ pub struct PolicydArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct Pending {
+pub struct PendingElevation {
     pub id: String,
     pub created_at: f64,
-    pub kind: PendingKind,
-    pub argv: Option<Vec<String>>,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub scheme: Option<String>,
-    pub url: Option<String>,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub home: Option<String>,
+    pub project_root: Option<String>,
+    pub request_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingNetwork {
+    pub id: String,
+    pub created_at: f64,
+    pub host: String,
+    pub port: u16,
+    pub scheme: String,
+    pub url: String,
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
@@ -43,6 +52,68 @@ pub struct Pending {
 pub enum PendingKind {
     Elevation,
     Network,
+}
+
+/// Discriminated union of pending approval requests.
+///
+/// The variant determines which fields are meaningful:
+/// - `Elevation`: `argv` is required; `host`/`port`/`scheme`/`url` absent.
+/// - `Network`: `host`/`port`/`scheme`/`url` required; `argv` absent.
+#[derive(Debug, Clone)]
+pub enum Pending {
+    Elevation(PendingElevation),
+    Network(PendingNetwork),
+}
+
+impl Pending {
+    pub fn kind(&self) -> PendingKind {
+        match self {
+            Self::Elevation(_) => PendingKind::Elevation,
+            Self::Network(_) => PendingKind::Network,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Elevation(p) => &p.id,
+            Self::Network(p) => &p.id,
+        }
+    }
+
+    pub fn created_at(&self) -> f64 {
+        match self {
+            Self::Elevation(p) => p.created_at,
+            Self::Network(p) => p.created_at,
+        }
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        match self {
+            Self::Elevation(p) => p.cwd.as_deref(),
+            Self::Network(p) => p.cwd.as_deref(),
+        }
+    }
+
+    pub fn home(&self) -> Option<&str> {
+        match self {
+            Self::Elevation(p) => p.home.as_deref(),
+            Self::Network(p) => p.home.as_deref(),
+        }
+    }
+
+    pub fn project_root(&self) -> Option<&str> {
+        match self {
+            Self::Elevation(p) => p.project_root.as_deref(),
+            Self::Network(p) => p.project_root.as_deref(),
+        }
+    }
+
+    pub fn request_pid(&self) -> Option<u32> {
+        match self {
+            Self::Elevation(p) => p.request_pid,
+            Self::Network(p) => p.request_pid,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

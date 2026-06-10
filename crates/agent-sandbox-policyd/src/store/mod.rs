@@ -15,7 +15,10 @@ mod ui_route;
 mod util;
 
 pub(crate) use types::UiSessionOwner;
-pub use types::{Pending, PendingKind, PolicyStore, PolicydArgs, UiClientHandle};
+pub use types::{
+    Pending, PendingElevation, PendingKind, PendingNetwork, PolicyStore, PolicydArgs,
+    UiClientHandle,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
