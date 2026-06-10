@@ -4,7 +4,7 @@ use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 
 use crate::wire::{PendingDecision, ScopeWire};
 
-use super::super::types::{Pending, PolicyStore};
+use super::super::types::{Pending, PendingElevation, PendingNetwork, PolicyStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecisionAction {
@@ -22,7 +22,26 @@ impl DecisionAction {
 }
 
 impl PolicyStore {
-    pub(crate) fn scope_wire_for_pending(wire: ScopeWire, pending: &Pending) -> ScopeWire {
+    pub(crate) fn scope_wire_for_pending_network(
+        wire: ScopeWire,
+        net: &PendingNetwork,
+    ) -> ScopeWire {
+        let ScopeWire {
+            paths,
+            session_id,
+            owner_uid,
+        } = wire;
+        ScopeWire {
+            paths: paths.merged_with(net.cwd.clone(), net.home.clone(), net.project_root.clone()),
+            session_id,
+            owner_uid,
+        }
+    }
+
+    pub(crate) fn scope_wire_for_pending_elevation(
+        wire: ScopeWire,
+        elev: &PendingElevation,
+    ) -> ScopeWire {
         let ScopeWire {
             paths,
             session_id,
@@ -30,9 +49,9 @@ impl PolicyStore {
         } = wire;
         ScopeWire {
             paths: paths.merged_with(
-                pending.cwd.clone(),
-                pending.home.clone(),
-                pending.project_root.clone(),
+                elev.cwd.clone(),
+                elev.home.clone(),
+                elev.project_root.clone(),
             ),
             session_id,
             owner_uid,
