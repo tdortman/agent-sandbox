@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::spawn::maybe_spawn_ui;
 use crate::wire::{MergeContext, NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
+use super::types::{Pending, PendingKind, PendingNetwork, PolicyStore};
 use super::ui_route::UiRoute;
-use super::types::{Pending, PendingKind, PolicyStore};
 
 impl PolicyStore {
     /// Finish pending network checks that declarative/session policy already allows (e.g. after OMP registers).
@@ -22,21 +22,24 @@ impl PolicyStore {
             .await
             .pending
             .values()
-            .filter(|p| p.kind == PendingKind::Network)
+            .filter(|p| p.kind() == PendingKind::Network)
             .cloned()
             .collect();
         for p in pending {
-            let Some(host) = p.host.clone() else {
+            let Pending::Network(net) = &p else {
                 continue;
             };
-            let Some(port) = p.port.filter(|&p| p > 0) else {
+            let host = net.host.clone();
+            let port = if net.port > 0 {
+                net.port
+            } else {
                 continue;
             };
             let merge = MergeContext {
                 paths: SandboxPaths::from_wire(
-                    p.cwd.clone(),
-                    p.home.clone(),
-                    p.project_root.clone(),
+                    net.cwd.clone(),
+                    net.home.clone(),
+                    net.project_root.clone(),
                 ),
                 ids: ProcessIds::default(),
             };
@@ -50,11 +53,10 @@ impl PolicyStore {
                 %host,
                 port,
                 %source,
-                pending_id = %p.id,
-                "auto-allow pending (policy already allows)"
+                pending_id = %p.id(),
             );
-            self.finish_network(&p.id, true, &source).await;
-            self.inner.lock().await.pending.remove(&p.id);
+            self.finish_network(p.id(), true, &source).await;
+            self.inner.lock().await.pending.remove(p.id());
         }
     }
 
@@ -99,22 +101,20 @@ impl PolicyStore {
             inner.network_futures.insert(pending_id.clone(), tx);
             inner.pending.insert(
                 pending_id.clone(),
-                Pending {
+                Pending::Network(PendingNetwork {
                     id: pending_id.clone(),
                     created_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0.0, |d| d.as_secs_f64()),
-                    kind: PendingKind::Network,
-                    argv: None,
-                    host: Some(policy_host.clone()),
-                    port: Some(port),
-                    scheme: Some(scheme.clone()),
-                    url: Some(url.clone()),
+                    host: policy_host.clone(),
+                    port,
+                    scheme: scheme.clone(),
+                    url: url.clone(),
                     cwd: cwd.clone(),
                     home: home.clone(),
                     project_root: project_root.clone(),
                     request_pid: wire_ids.pid().filter(|&p| p != 0),
-                },
+                }),
             );
         }
         Self::audit("pending", Some(&policy_host), Some(port), &scheme);
@@ -139,13 +139,6 @@ impl PolicyStore {
             },
         )
         .await;
-
-        let route = UiRoute::new(
-            wire_ids.pid().filter(|&p| p != 0),
-            cwd.clone(),
-            home.clone(),
-            project_root.clone(),
-        );
         if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
             let mut spawn_uid = wire_ids.uid();
             if spawn_uid.is_none_or(|u| u == 0)
