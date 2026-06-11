@@ -182,7 +182,7 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       process.env.AGENT_SANDBOX_NOTIFY_SEND ?? "notify-send";
     execFile(
       notifyBin,
-      ["--urgency=critical", "--expire-time=0", title, body],
+      [title, body],
       (err) => {
         if (err) {
           ctx.ui.notify?.(
