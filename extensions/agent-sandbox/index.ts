@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { execFile } from "node:child_process";
 import * as net from "node:net";
 import { type ApprovalScope, policyRpc } from "./policy-client";
 
@@ -172,6 +173,26 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     }
   }
 
+  function notifyPrompt(ctx: ExtensionContext, title: string, body: string): void {
+    const hasDisplay =
+      process.env.DISPLAY !== undefined ||
+      process.env.WAYLAND_DISPLAY !== undefined;
+    if (!hasDisplay) return;
+    const notifyBin =
+      process.env.AGENT_SANDBOX_NOTIFY_SEND ?? "notify-send";
+    execFile(
+      notifyBin,
+      ["--urgency=critical", "--expire-time=0", title, body],
+      (err) => {
+        if (err) {
+          ctx.ui.notify?.(
+            `agent-sandbox: notify-send failed (${err.message}); prompt still works via OMP.`,
+          );
+        }
+      },
+    );
+  }
+
   function networkScopeOptions(
     host: string,
     sessionAvailable: boolean,
@@ -291,6 +312,11 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ): Promise<void> {
     const url = req.url ?? `${req.scheme ?? "https"}://${req.host}:${req.port}`;
+    notifyPrompt(
+      ctx,
+      "agent-sandbox: Network request",
+      `Allow connection to ${url}?`,
+    );
     const action = await chooseAction(`agent-sandbox: ${url}`, ctx);
     if (!action) return;
     const choice = await chooseScopeOption(
@@ -316,6 +342,12 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     req: ElevationRequest,
     ctx: ExtensionContext,
   ): Promise<void> {
+    const cmd = formatSudoCommand(req.argv);
+    notifyPrompt(
+      ctx,
+      "agent-sandbox: Elevation request",
+      `Allow "${cmd}" to run as root?`,
+    );
     const action = await chooseAction(elevationPrompt(req), ctx);
     if (!action) return;
     const choice = await chooseScopeOption(
