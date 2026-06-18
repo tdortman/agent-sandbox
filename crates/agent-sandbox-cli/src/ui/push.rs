@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 
-use agent_sandbox_core::UiPush;
+use agent_sandbox_core::{
+    ApprovalScope, ApprovalTarget, FileAccess, UiPush, approval_host_patterns,
+    filesystem_approval_paths,
+};
 
 use super::choice::{format_elevation_title, resolve_choice};
 use super::dialog::pick_option;
 use super::error::UiCliError;
 use super::options::{
-    ACTION_OPTIONS, PromptAction, ScopeOption, network_scope_options, sudo_scope_options,
+    ACTION_OPTIONS, PromptAction, ScopeOption, scope_only_options, sudo_scope_options,
 };
 
 pub(crate) async fn handle_push(
@@ -31,15 +34,39 @@ pub(crate) async fn handle_push(
             let scheme = scheme.unwrap_or_else(|| "https".into());
             let url = url.unwrap_or_else(|| format!("{scheme}://{host}:{port}"));
             let paths = paths.merged_with(cwd, home, project_root);
+
+            // Step 1: choose action
             let Some(action) = choose_action(&format!("agent-sandbox: {url}")).await? else {
                 return Ok(());
             };
-            let choice = choose_scope(
-                &format!("agent-sandbox: {} {url}?", action.verb()),
-                network_scope_options(&host, session_id.is_some()),
+
+            // Step 2: choose scope
+            let Some(scope) = choose_scope_only(
+                &format!("agent-sandbox: {} {url} scope?", action.verb()),
+                session_id.is_some(),
             )
-            .await?;
-            resolve_choice(socket, &paths, session_id, &id, action, choice).await?;
+            .await?
+            else {
+                return Ok(());
+            };
+
+            // Step 3: for non-Once scopes, choose target level
+            let target = if scope == ApprovalScope::Once {
+                None
+            } else {
+                choose_target_level(
+                    &format!("agent-sandbox: {} {url} target?", action.verb()),
+                    network_target_options(&host, scope),
+                )
+                .await?
+            };
+
+            let choice = ScopeOption {
+                label: String::new(),
+                scope,
+                target,
+            };
+            resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await?;
         }
         UiPush::ElevationRequest {
             id,
@@ -63,6 +90,51 @@ pub(crate) async fn handle_push(
             )
             .await?;
             resolve_choice(socket, &paths, session_id, &id, action, choice).await?;
+        }
+        UiPush::FilesystemRequest {
+            id,
+            path,
+            access,
+            cwd,
+            home,
+            project_root,
+        } => {
+            let paths = paths.merged_with(cwd, home, project_root);
+            let title = format!("agent-sandbox: filesystem {access} {path}");
+
+            // Step 1: choose action
+            let Some(action) = choose_action(&title).await? else {
+                return Ok(());
+            };
+
+            // Step 2: choose scope
+            let Some(scope) = choose_scope_only(
+                &format!("agent-sandbox: {} filesystem scope?", action.verb()),
+                session_id.is_some(),
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+
+            // Step 3: for non-Once scopes, choose target level
+            let home_str = paths.home_string();
+            let target = if scope == ApprovalScope::Once {
+                None
+            } else {
+                choose_target_level(
+                    &format!("agent-sandbox: {} filesystem target?", action.verb()),
+                    filesystem_target_options(&path, access, home_str.as_deref(), scope),
+                )
+                .await?
+            };
+
+            let choice = ScopeOption {
+                label: String::new(),
+                scope,
+                target,
+            };
+            resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await?;
         }
     }
     Ok(())
@@ -92,4 +164,52 @@ async fn choose_scope(
     .await
     .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
     Ok(choice.and_then(|label| options.into_iter().find(|option| option.label == label)))
+}
+
+async fn choose_scope_only(
+    title: &str,
+    session_available: bool,
+) -> Result<Option<ApprovalScope>, UiCliError> {
+    let options = scope_only_options(session_available);
+    let choice = choose_scope(title, options).await?;
+    Ok(choice.map(|opt| opt.scope))
+}
+
+async fn choose_target_level(
+    title: &str,
+    options: Vec<ScopeOption>,
+) -> Result<Option<ApprovalTarget>, UiCliError> {
+    let choice = choose_scope(title, options).await?;
+    Ok(choice.and_then(|opt| opt.target))
+}
+
+fn network_target_options(host: &str, scope: ApprovalScope) -> Vec<ScopeOption> {
+    let hosts = approval_host_patterns(host);
+    let mut options = Vec::with_capacity(hosts.len());
+    for host_pattern in hosts {
+        options.push(ScopeOption {
+            label: host_pattern.clone(),
+            scope,
+            target: Some(ApprovalTarget::NetworkHost { host: host_pattern }),
+        });
+    }
+    options
+}
+
+fn filesystem_target_options(
+    path: &str,
+    access: FileAccess,
+    home: Option<&str>,
+    scope: ApprovalScope,
+) -> Vec<ScopeOption> {
+    let levels = filesystem_approval_paths(path, home);
+    let mut options = Vec::with_capacity(levels.len());
+    for level in levels {
+        options.push(ScopeOption {
+            label: format!("{level} ({access})"),
+            scope,
+            target: Some(ApprovalTarget::FilesystemPath { path: level }),
+        });
+    }
+    options
 }

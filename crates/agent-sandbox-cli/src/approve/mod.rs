@@ -102,6 +102,14 @@ pub async fn run() -> Result<(), ApproveCliError> {
                         let port = port.unwrap_or(0);
                         println!("{id}\tnetwork\t{host}:{port}");
                     }
+                    PendingSummary::Filesystem {
+                        id, path, access, ..
+                    } => {
+                        let path = path.unwrap_or_default();
+                        let access =
+                            access.map_or_else(|| "?".to_string(), |value| value.to_string());
+                        println!("{id}\tfilesystem\t{access}\t{path}");
+                    }
                 }
             }
         }

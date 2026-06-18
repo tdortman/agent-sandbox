@@ -1,4 +1,4 @@
-use agent_sandbox_core::{ApprovalScope, ApprovalTarget, SudoRule, approval_host_patterns};
+use agent_sandbox_core::{ApprovalScope, ApprovalTarget, SudoRule};
 
 pub(crate) const ACTION_OPTIONS: &[&str] = &["Allow", "Deny"];
 
@@ -32,18 +32,29 @@ pub(crate) struct ScopeOption {
     pub(crate) target: Option<ApprovalTarget>,
 }
 
-pub(crate) fn network_scope_options(host: &str, session_available: bool) -> Vec<ScopeOption> {
+pub(crate) fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
     let mut options = vec![ScopeOption {
-        label: "This connection only".into(),
+        label: "Once".into(),
         scope: ApprovalScope::Once,
         target: None,
     }];
-    let hosts = approval_host_patterns(host);
     if session_available {
-        push_network_options(&mut options, ApprovalScope::Session, &hosts);
+        options.push(ScopeOption {
+            label: "This session".into(),
+            scope: ApprovalScope::Session,
+            target: None,
+        });
     }
-    push_network_options(&mut options, ApprovalScope::Project, &hosts);
-    push_network_options(&mut options, ApprovalScope::Global, &hosts);
+    options.push(ScopeOption {
+        label: "This project".into(),
+        scope: ApprovalScope::Project,
+        target: None,
+    });
+    options.push(ScopeOption {
+        label: "Globally".into(),
+        scope: ApprovalScope::Global,
+        target: None,
+    });
     options
 }
 
@@ -60,16 +71,6 @@ pub(crate) fn sudo_scope_options(argv: &[String], session_available: bool) -> Ve
     push_sudo_options(&mut options, ApprovalScope::Project, &prefixes);
     push_sudo_options(&mut options, ApprovalScope::Global, &prefixes);
     options
-}
-
-fn push_network_options(options: &mut Vec<ScopeOption>, scope: ApprovalScope, hosts: &[String]) {
-    for host in hosts {
-        options.push(ScopeOption {
-            label: format!("{} — {host}", scope_label(scope)),
-            scope,
-            target: Some(ApprovalTarget::NetworkHost { host: host.clone() }),
-        });
-    }
 }
 
 fn push_sudo_options(

@@ -5,7 +5,8 @@ import { type ApprovalScope, policyRpc } from "./policy-client";
 
 type ApprovalTarget =
   | { kind: "network_host"; host: string }
-  | { kind: "sudo_command"; argv: string[] };
+  | { kind: "sudo_command"; argv: string[] }
+  | { kind: "filesystem_path"; path: string };
 
 type ScopeOption = {
   label: string;
@@ -31,6 +32,16 @@ type ElevationRequest = {
   type: "elevation_request";
   id: string;
   argv: string[];
+  cwd?: string;
+  home?: string;
+  project_root?: string;
+};
+
+type FilesystemRequest = {
+  type: "filesystem_request";
+  id: string;
+  path: string;
+  access: "read" | "write" | "read_write" | "execute" | "all";
   cwd?: string;
   home?: string;
   project_root?: string;
@@ -80,6 +91,8 @@ function readOneJsonLine(socket: net.Socket): Promise<Record<string, unknown>> {
     socket.on("error", onError);
   });
 }
+
+
 
 export default function agentSandboxExtension(pi: ExtensionAPI) {
   pi.setLabel("Agent sandbox");
@@ -148,6 +161,39 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     return patterns;
   }
 
+  function filesystemApprovalPaths(path: string, home?: string): string[] {
+    const norm = path.replace(/\/+$/, "");
+    if (!norm) return ["/"];
+    const seen = new Set<string>();
+    const result: string[] = [];
+    let current = norm;
+    while (current) {
+      if (!seen.has(current)) {
+        seen.add(current);
+        result.push(current);
+      }
+      if (home && current === home.replace(/\/+$/, "")) break;
+      const slashIdx = current.lastIndexOf("/");
+      if (slashIdx <= 0) {
+        // Reached root
+        if (slashIdx === 0 && !seen.has("/")) {
+          result.push("/");
+          seen.add("/");
+        }
+        break;
+      }
+      const parent = current.substring(0, slashIdx);
+      if (seen.has(parent)) break;
+      // Stop at home (include it)
+      if (home && parent === home.replace(/\/+$/, "")) {
+        result.push(parent);
+        break;
+      }
+      current = parent;
+    }
+    return result;
+  }
+
   function sudoApprovalPrefixes(argv: string[]): string[][] {
     const prefixes: string[][] = [];
     for (let length = argv.length; length >= 1; length -= 1) {
@@ -158,6 +204,15 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
 
   function formatSudoCommand(argv: string[]): string {
     return argv.length > 0 ? `sudo ${argv.join(" ")}` : "sudo";
+  }
+
+  function formatAccess(access: string): string {
+    switch (access) {
+      case "read_write":
+        return "read/write";
+      default:
+        return access;
+    }
   }
 
   function scopeLabel(scope: ApprovalScope): string {
@@ -171,6 +226,38 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       case "global":
         return "Globally";
     }
+  }
+  function scopeOnlyOptions(sessionAvailable: boolean): ScopeOption[] {
+    const options: ScopeOption[] = [{ label: "Once", scope: "once" }];
+    if (sessionAvailable) {
+      options.push({ label: "This session", scope: "session" });
+    }
+    options.push({ label: "This project", scope: "project" });
+    options.push({ label: "Globally", scope: "global" });
+    return options;
+  }
+
+  function networkTargetOptions(host: string, scope: ApprovalScope): ScopeOption[] {
+    const hosts = approvalHostPatterns(host);
+    return hosts.map((candidate) => ({
+      label: candidate,
+      scope,
+      target: { kind: "network_host" as const, host: candidate },
+    }));
+  }
+
+  function filesystemTargetOptions(
+    path: string,
+    access: FilesystemRequest["access"],
+    home: string | undefined,
+    scope: ApprovalScope,
+  ): ScopeOption[] {
+    const levels = filesystemApprovalPaths(path, home);
+    return levels.map((level) => ({
+      label: `${level} (${access})`,
+      scope,
+      target: { kind: "filesystem_path" as const, path: level },
+    }));
   }
 
   function notifyPrompt(ctx: ExtensionContext, title: string, body: string): void {
@@ -193,30 +280,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     );
   }
 
-  function networkScopeOptions(
-    host: string,
-    sessionAvailable: boolean,
-  ): ScopeOption[] {
-    const options: ScopeOption[] = [
-      { label: "This connection only", scope: "once" },
-    ];
-    const hosts = approvalHostPatterns(host);
-    const pushOptions = (scope: ApprovalScope) => {
-      for (const candidate of hosts) {
-        options.push({
-          label: `${scopeLabel(scope)} — ${candidate}`,
-          scope,
-          target: { kind: "network_host", host: candidate },
-        });
-      }
-    };
-    if (sessionAvailable) {
-      pushOptions("session");
-    }
-    pushOptions("project");
-    pushOptions("global");
-    return options;
-  }
 
   function sudoScopeOptions(
     argv: string[],
@@ -241,11 +304,13 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     return options;
   }
 
+
   async function chooseAction(
     title: string,
     ctx: ExtensionContext,
+    opts?: { signal?: AbortSignal },
   ): Promise<PromptAction | undefined> {
-    const choice = await ctx.ui.select(title, [...ACTION_OPTIONS]);
+    const choice = await ctx.ui.select(title, [...ACTION_OPTIONS], opts);
     if (choice === "Allow") return "approve";
     if (choice === "Deny") return "deny";
     return undefined;
@@ -255,16 +320,19 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     title: string,
     options: ScopeOption[],
     ctx: ExtensionContext,
+    opts?: { signal?: AbortSignal },
   ): Promise<ScopeOption | undefined> {
     const choice = await ctx.ui.select(
       title,
       options.map((option) => option.label),
+      opts,
     );
     return options.find((option) => option.label === choice);
   }
 
+
   async function submitDecision(
-    req: NetworkRequest | ElevationRequest,
+    req: NetworkRequest | ElevationRequest | FilesystemRequest,
     action: PromptAction,
     choice: ScopeOption,
     ctx: ExtensionContext,
@@ -289,6 +357,7 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       socketPath(),
     );
     if (!resp.ok) {
+      const err = String(resp.error ?? "unknown");
       const label =
         action === "approve"
           ? req.type === "elevation_request"
@@ -298,12 +367,13 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
             ? "elevation deny"
             : "deny";
       ctx.ui.notify?.(
-        `agent-sandbox: ${label} failed (${String(resp.error ?? "unknown")}).`,
+        `agent-sandbox: ${label} failed (${err}).`,
       );
       return;
     }
-    if (choice.scope === "project" && resp.path) {
-      ctx.ui.notify?.(`Project policy saved to ${String(resp.path)}.`);
+    const savedPath = resp.path ?? resp.policy_path;
+    if (choice.scope === "project" && savedPath) {
+      ctx.ui.notify?.(`Project policy saved to ${String(savedPath)}.`);
     }
   }
 
@@ -317,14 +387,34 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       "agent-sandbox: Network request",
       `Allow connection to ${url}?`,
     );
+
+    // Step 1: choose action
     const action = await chooseAction(`agent-sandbox: ${url}`, ctx);
     if (!action) return;
-    const choice = await chooseScopeOption(
-      `agent-sandbox: ${action} ${url}?`,
-      networkScopeOptions(req.host, policySessionId !== null),
+
+    // Step 2: choose scope
+    const scope = await chooseScopeOption(
+      `agent-sandbox: ${action} ${url} scope?`,
+      scopeOnlyOptions(policySessionId !== null),
       ctx,
     );
-    if (!choice) return;
+    if (!scope) return;
+
+    // Step 3: for non-Once scopes, choose target level
+    const target = scope.scope === "once"
+      ? undefined
+      : await chooseScopeOption(
+          `agent-sandbox: ${action} ${url} target?`,
+          networkTargetOptions(req.host, scope.scope),
+          ctx,
+        );
+    if (scope.scope !== "once" && !target) return;
+
+    const choice: ScopeOption = {
+      label: "",
+      scope: scope.scope,
+      target: target?.target,
+    };
     await submitDecision(req, action, choice, ctx);
   }
 
@@ -359,6 +449,47 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     await submitDecision(req, action, choice, ctx);
   }
 
+  async function handleFilesystemRequest(
+    req: FilesystemRequest,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    notifyPrompt(
+      ctx,
+      "agent-sandbox: Filesystem request",
+      `Allow ${formatAccess(req.access)} access to ${req.path}?`,
+    );
+
+    const action = await chooseAction(
+      `agent-sandbox: ${formatAccess(req.access)} ${req.path}`,
+      ctx,
+    );
+    if (!action) return;
+
+    const scope = await chooseScopeOption(
+      `agent-sandbox: ${action} filesystem scope?`,
+      scopeOnlyOptions(policySessionId !== null),
+      ctx,
+    );
+    if (!scope) return;
+
+    const target = scope.scope === "once"
+      ? undefined
+      : await chooseScopeOption(
+          `agent-sandbox: ${action} filesystem target?`,
+          filesystemTargetOptions(req.path, req.access, req.home ?? home, scope.scope),
+          ctx,
+        );
+    if (scope.scope !== "once" && !target) return;
+
+    const choice: ScopeOption = {
+      label: "",
+      scope: scope.scope,
+      target: target?.target,
+    };
+    await submitDecision(req, action, choice, ctx);
+  }
+
+
   function onPolicyMessage(line: string, ctx: ExtensionContext): void {
     let msg: Record<string, unknown>;
     try {
@@ -370,6 +501,8 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       void handleNetworkRequest(msg as NetworkRequest, ctx);
     } else if (msg.type === "elevation_request") {
       void handleElevation(msg as ElevationRequest, ctx);
+    } else if (msg.type === "filesystem_request") {
+      void handleFilesystemRequest(msg as FilesystemRequest, ctx);
     }
   }
 
@@ -456,6 +589,7 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     uiConnectedAnnounced = false;
     disconnectPolicyUi();
   });
+
 
   pi.registerCommand("sandbox", {
     description: "Agent sandbox policy status and reload",
