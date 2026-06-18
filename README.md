@@ -2,95 +2,72 @@
 
 `agent-sandbox` is a flake for running AI agent CLIs inside a tighter sandbox on NixOS.
 
-It provides:
+Core pieces:
 
-- wrapped agent binaries launched through `jail.nix`/bubblewrap
-- a policy daemon that decides network and `sudo` access
-- optional deny-by-default outbound networking
-- interactive approval prompts with remembered decisions
-- NixOS and Home Manager modules to install the whole stack
+- NixOS module: wraps agent CLIs with bubblewrap launchers
+- `agent-sandbox-policyd`: merges policy and owns approval state
+- network proxy + DNS cache: gates outbound hosts by policy
+- sudo guard: gates host elevation through the same approval flow
+- optional fanotify monitor: gates filesystem opens from sandboxed processes
+- Home Manager module: installs the Oh My Pi extension for network and sudo prompts
 
-## What this project gives you
+Use the NixOS module for sandboxed packages:
 
-### NixOS module
+```nix
+inputs.agent-sandbox.nixosModules.agent-sandbox
+```
 
-`inputs.agent-sandbox.nixosModules.agent-sandbox`
+Use the Home Manager module when you want Oh My Pi to handle network and sudo approval prompts:
 
-Use this to install sandboxed versions of agent tools on a NixOS system.
+```nix
+inputs.agent-sandbox.homeModules.agent-sandbox
+```
 
-The module can:
+## Runtime model
 
-- wrap agent packages with sandbox launchers
-- run `agent-sandbox-policyd`
-- optionally put agents in a restricted network namespace
-- proxy outbound web traffic through policy checks
-- gate host `sudo` through the same approval flow
+1. You run a wrapped agent binary.
+2. The wrapper enters the sandbox before the agent starts.
+3. Network checks, filesystem opens, and sudo requests go to `policyd`.
+4. `policyd` applies declarative, global, project, session, and once policy.
+5. Unknown requests block until a UI approves or denies them.
 
-### Home Manager module
+Components:
 
-`inputs.agent-sandbox.homeModules.agent-sandbox`
+| Component | Job |
+| --------- | --- |
+| wrapped CLI | Sandboxed entrypoint you run |
+| `policyd` | Policy merge, pending approvals, UI routing, RPC socket |
+| proxy + DNS cache | Hostname-aware network enforcement |
+| `fsmon` | Fanotify monitor scoped to each sandbox mount namespace |
+| OMP extension | In-TUI prompts for network and sudo requests |
+| `agent-sandbox-ui` | Standalone UI for filesystem prompts and non-OMP agents |
 
-Use this if you want approval prompts inside Oh My Pi sessions. It installs the OMP extension from `extensions/agent-sandbox/`.
+All clients share `/run/agent-sandbox/policy.sock`. `policyd` uses `SO_PEERCRED` to identify callers.
 
-## How it works
+- Sandboxed tool processes may only request network, filesystem, or sudo checks.
+- The OMP process may register as UI and approve network/sudo requests from its process tree.
+- Host tools such as `agent-sandbox-ui` and `agent-sandbox-approve` may approve or deny pending requests.
 
-At a high level:
+Filesystem prompt limitation: fanotify blocks the process that opened the file. If OMP or an OMP tool opens the file, OMP may be blocked before its extension can render a prompt. For that reason filesystem approvals use `agent-sandbox-ui` (`kdialog` or `/dev/tty`) instead of the OMP extension. Network and sudo prompts still use the OMP extension.
 
-1. you launch an agent through a wrapped binary
-2. the wrapper enters the sandbox before the agent starts
-3. network access and `sudo` requests are sent to `policyd`
-4. existing policy is applied first
-5. unknown requests can block and prompt for approval
-6. approvals can be remembered once, for the session, for the project, or globally
-
-Main pieces:
-
-- **wrapped CLI** — the sandboxed entrypoint you actually run
-- **policyd** — policy merge, pending approvals, UI fan-out, and RPC endpoint
-- **proxy + DNS cache** — lets network policy use hostnames instead of only raw IPs
-- **UI** — either the OMP extension or `agent-sandbox-ui`
-
-### RPC authorization
-
-All clients share one Unix socket (`/run/agent-sandbox/policy.sock`). Policyd uses `SO_PEERCRED` to identify the connecting process and restricts what sandboxed peers may do:
-
-- **From inside the sandbox** (agent netns when networking is enabled, otherwise a distinct mount namespace): `check` and `elevate` only, enough for the proxy and sudo guard to request policy decisions.
-- **OMP inside the sandbox** can still act as UI after a successful `register_ui`:
-    - the peer cmdline must look like OMP (`.omp/agent`, `oh-my-pi`, etc.)
-    - policyd pins that OMP pid for the user
-    - later `approve` / `deny` calls from the same OMP pid are allowed (including short-lived RPC connections from the extension)
-- **From the host** (standalone `agent-sandbox-ui`, `agent-sandbox-approve`, etc.): full RPC access including `register_ui`, `approve`, and `deny`.
-
-This blocks casual self-approval from tool subprocesses or `agent-sandbox-approve` running inside the sandbox. It is not bulletproof, since a very determined agent could try to mimic OMP but it should add enough friction for typical curious agent scenarios. Host-spawned UI (`agent-sandbox-ui` via `runuser`, or kdialog auto-spawn) remains the fallback when OMP is unavailable.
-
-When networking is enabled, policyd is started with `--sandbox-netns /run/netns/<name>` so netns membership is authoritative. In sudo-only mode (no dedicated netns), mount-namespace comparison is used instead.
-
-### Multiple agents at once
-
-OMP, Codex, and other wrapped agents can run concurrently. They share the same merged **project** and **global** policy files, but each agent gets its own UI session:
-
-- **OMP** registers as `ui_client: "omp"` and receives prompts for tool requests from its process tree only.
-- **Other agents** use `agent-sandbox-ui` (auto-spawned kdialog when needed) matched by cwd/project paths.
-- **Session-scoped** approvals apply only to the agent/UI session that created them, not every connected client.
+OMP, Codex, and other wrapped agents can run at the same time. They share project and global policy files. Session-scoped approvals stay attached to the UI session that created them.
 
 ## Policy model
 
-`agent-sandbox` manages two policy areas:
+`agent-sandbox` manages three policy areas:
 
-- **network** — allow or deny outbound hosts/ports
-- **sudo** — allow or deny command prefixes
+| Area | Rule shape |
+| ---- | ---------- |
+| network | host + port, with exact hosts or wildcard parent domains |
+| filesystem | path + access kind |
+| sudo | command prefix |
 
-Policy is merged from lowest to highest priority:
+Policy merge order, lowest to highest priority:
 
-1. declarative NixOS configuration
-2. per-user global policy file
-3. per-project policy file
-4. in-memory session/once decisions
-
-Useful paths:
-
-- global policy: `~/.config/agent-sandbox/policy.json`
-- project policy: `<repo>/.agent-sandbox/policy.json`
+1. declarative NixOS policy
+2. global user policy: `~/.config/agent-sandbox/policy.json`
+3. project policy: `<repo>/.agent-sandbox/policy.json`
+4. in-memory session and once decisions
 
 Example project policy:
 
@@ -103,35 +80,36 @@ Example project policy:
     "sudo": {
         "allow": [{ "argv": ["systemctl", "restart"] }],
         "deny": []
+    },
+    "filesystem": {
+        "allow": [{ "path": "~/projects/example", "access": "read_write" }],
+        "deny": []
     }
 }
 ```
 
 Notes:
 
-- sudo rules use prefix matching, so `["systemctl"]` matches `systemctl restart nginx`
-- network approvals can be saved at different granularities, including subdomains such as `*.example.com`
-- project policy is intended for repo-local rules that should not become global defaults
+- `~/...` in `policy.json` expands to the invoking user's home. Policy writes also store paths under home in that form.
+- Network approvals can target exact hosts or parent domains such as `*.example.com`.
+- Filesystem rules match the exact path and descendants. Access kinds: `read`, `write`, `read_write`, `execute`, `all`.
+- Sudo rules use prefix matching, so `["systemctl"]` matches `systemctl restart nginx`.
 
 ## Approval flow
 
-When an unknown request is blocked, a UI client can approve or deny it.
+Unknown requests use the same three-step flow:
 
-Available prompt paths:
-
-- **OMP extension** — preferred when running inside Oh My Pi
-- **`agent-sandbox-ui`** — standalone UI for other agent environments, using `kdialog` or `/dev/tty`
-- **`agent-sandbox-approve`** — CLI for scripting or manual approval by pending id
-
-Approvals are two-step:
-
-1. choose approve or deny
-2. choose scope/granularity
+1. approve or deny
+2. choose scope: once, session, project, or global
+3. for session/project/global, choose the target granularity
 
 Examples:
 
-- `foo.bar.baz.com` can be remembered as `foo.bar.baz.com`, `*.bar.baz.com`, or `*.baz.com`
-- `sudo foo bar baz` can be remembered as the exact command, `sudo foo bar`, or `sudo foo`
+- `foo.bar.baz.com`: exact host, `*.bar.baz.com`, or `*.baz.com`
+- `/home/user/projects/foo/data.txt`: exact file or a parent directory
+- `sudo foo bar baz`: exact command, `sudo foo bar`, or `sudo foo`
+
+Use `agent-sandbox-approve pending` to inspect blocked requests and approve them by id from a shell.
 
 ## Minimal NixOS example
 
@@ -167,14 +145,15 @@ When `network.enable = true`, the NixOS module also runs the policy/network help
 
 ### High-value options
 
-| Option                                     | Meaning                                                        |
-| ------------------------------------------ | -------------------------------------------------------------- |
-| `agent-sandbox.enable`                     | Enable wrapped packages and install the policy tooling         |
-| `agent-sandbox.network.enable`             | Enable restricted networking, proxying, and DNS cache support  |
-| `agent-sandbox.sudoPolicy`                 | Either deny `sudo` entirely or gate it through approvals       |
-| `agent-sandbox.policy.interactiveApproval` | Prompt instead of only relying on prewritten policy            |
-| `agent-sandbox.policy.approvalTimeout`     | How long blocked requests wait for a UI decision               |
-| `agent-sandbox.policy.autoSpawnPolicyUi`   | Start `agent-sandbox-ui` automatically when no UI is connected |
+| Option                                            | Meaning                                                              |
+| ------------------------------------------------- | -------------------------------------------------------------------- |
+| `agent-sandbox.enable`                            | Enable wrapped packages and install the policy tooling               |
+| `agent-sandbox.network.enable`                    | Enable restricted networking, proxying, and DNS cache support        |
+| `agent-sandbox.sudoPolicy`                        | Either deny `sudo` entirely or gate it through approvals             |
+| `agent-sandbox.filesystem.dynamicApproval.enable` | Enable fanotify-backed filesystem approval for sandboxed processes   |
+| `agent-sandbox.policy.interactiveApproval`        | Prompt instead of only relying on prewritten policy                  |
+| `agent-sandbox.policy.approvalTimeout`            | How long blocked requests wait for a UI decision                     |
+| `agent-sandbox.policy.autoSpawnPolicyUi`          | Start `agent-sandbox-ui` automatically when no UI is connected       |
 
 For the full module surface, see `nix/modules/nixos/agent-sandbox/agent-sandbox.nix`.
 
@@ -190,7 +169,7 @@ homes.modules = [
 programs.agent-sandbox.ompExtension.enable = true;
 ```
 
-With the extension enabled, OMP becomes the primary approval UI.
+With the extension enabled, OMP becomes the approval UI for network and sudo requests. Filesystem prompts still use `agent-sandbox-ui` because fanotify can block OMP itself.
 
 ## Typical use cases
 
