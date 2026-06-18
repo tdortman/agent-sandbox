@@ -68,11 +68,14 @@ impl From<(SandboxPaths, ProcessIds)> for RequestContext {
     }
 }
 
+use crate::policy::FileAccess;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalTarget {
     NetworkHost { host: String },
     SudoCommand { argv: Vec<String> },
+    FilesystemPath { path: String },
 }
 
 /// Incoming RPC request (`op` tag).
@@ -98,6 +101,19 @@ pub enum RpcRequest {
         url: Option<String>,
         #[serde(default)]
         ctx: RequestContext,
+    },
+    CheckFilesystem {
+        path: String,
+        #[serde(default)]
+        access: FileAccess,
+        #[serde(default)]
+        ctx: RequestContext,
+    },
+    StartFilesystemMonitor {
+        #[serde(default)]
+        ctx: RequestContext,
+        #[serde(default)]
+        static_allow: Vec<crate::policy::FilesystemRule>,
     },
     Elevate {
         argv: Vec<String>,
@@ -149,6 +165,8 @@ impl RpcRequest {
         match self {
             Self::RegisterUi { ctx, .. }
             | Self::Check { ctx, .. }
+            | Self::CheckFilesystem { ctx, .. }
+            | Self::StartFilesystemMonitor { ctx, .. }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }
             | Self::ApproveHost { ctx, .. }
@@ -163,6 +181,8 @@ impl RpcRequest {
         match self {
             Self::RegisterUi { ctx, .. }
             | Self::Check { ctx, .. }
+            | Self::CheckFilesystem { ctx, .. }
+            | Self::StartFilesystemMonitor { ctx, .. }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }
             | Self::ApproveHost { ctx, .. }
@@ -213,11 +233,43 @@ mod tests {
 
     #[test]
     fn request_context_roundtrips_paths_and_ids() {
-        let paths = SandboxPaths::new("/cwd", "/home/tim", "/repo");
+        let paths = SandboxPaths::new("/cwd", "/home/user", "/repo");
         let ctx = RequestContext::from((paths, ProcessIds::new(42, 1000)));
         assert_eq!(ctx.sandbox_paths().cwd(), Some("/cwd"));
-        assert_eq!(ctx.sandbox_paths().home(), Some("/home/tim"));
+        assert_eq!(ctx.sandbox_paths().home(), Some("/home/user"));
         assert_eq!(ctx.ids().pid(), Some(42));
         assert_eq!(ctx.ids().uid(), Some(1000));
+    }
+
+    #[test]
+    fn start_filesystem_monitor_defaults_static_allow_empty() {
+        let req: RpcRequest =
+            serde_json::from_str(r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"}}"#)
+                .unwrap();
+        match req {
+            RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
+                assert!(
+                    static_allow.is_empty(),
+                    "static_allow must default to empty"
+                );
+            }
+            _ => panic!("expected StartFilesystemMonitor"),
+        }
+    }
+
+    #[test]
+    fn start_filesystem_monitor_with_static_allow() {
+        let req: RpcRequest = serde_json::from_str(
+            r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"},"static_allow":[{"path":"/home/user","access":"all"}]}"#,
+        )
+        .unwrap();
+        match req {
+            RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
+                assert_eq!(static_allow.len(), 1);
+                assert_eq!(static_allow[0].path, "/home/user");
+                assert_eq!(static_allow[0].access, crate::policy::FileAccess::All);
+            }
+            _ => panic!("expected StartFilesystemMonitor"),
+        }
     }
 }

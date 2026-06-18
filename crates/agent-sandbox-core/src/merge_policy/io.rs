@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::policy::Policy;
+use crate::policy::{Policy, contract_home_path, expand_home_path};
 
-pub fn load_policy(path: &Path) -> Policy {
+pub fn load_policy(path: &Path, home: Option<&str>) -> Policy {
     let read_path = resolve_policy_write_path(path);
     if !read_path.is_file() {
         return Policy::default();
@@ -12,7 +12,18 @@ pub fn load_policy(path: &Path) -> Policy {
     let Ok(data) = std::fs::read_to_string(&read_path) else {
         return Policy::default();
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    let mut policy: Policy = serde_json::from_str(&data).unwrap_or_default();
+    expand_filesystem_paths(&mut policy, home);
+    policy
+}
+
+fn expand_filesystem_paths(policy: &mut Policy, home: Option<&str>) {
+    for rule in &mut policy.filesystem.allow {
+        rule.path = expand_home_path(&rule.path, home);
+    }
+    for rule in &mut policy.filesystem.deny {
+        rule.path = expand_home_path(&rule.path, home);
+    }
 }
 
 pub fn resolve_policy_write_path(path: &Path) -> PathBuf {
@@ -91,7 +102,7 @@ pub fn atomic_write_policy(
             .and_then(|n| n.to_str())
             .unwrap_or("policy.json")
     ));
-    let json = policy_json(data)? + "\n";
+    let json = policy_json(&contracted_policy(data, home))? + "\n";
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &target)?;
     if let Some(uid) = resolve_owner_uid(path, home, owner_uid) {
@@ -110,8 +121,24 @@ pub(crate) fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     push_rules(&mut json, "allow", &policy.sudo.allow)?;
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.sudo.deny)?;
+    json.push_str("\n    },\n    \"filesystem\": {\n");
+    push_rules(&mut json, "allow", &policy.filesystem.allow)?;
+    json.push_str(",\n");
+    push_rules(&mut json, "deny", &policy.filesystem.deny)?;
     json.push_str("\n    }\n}");
     Ok(json)
+}
+/// Return a copy of `policy` with filesystem allow/deny paths under `home`
+/// contracted to the `~/...` shorthand for on-disk serialization.
+fn contracted_policy(policy: &Policy, home: Option<&str>) -> Policy {
+    let mut out = policy.clone();
+    for rule in &mut out.filesystem.allow {
+        rule.path = contract_home_path(&rule.path, home);
+    }
+    for rule in &mut out.filesystem.deny {
+        rule.path = contract_home_path(&rule.path, home);
+    }
+    out
 }
 
 fn push_rules<T: serde::Serialize>(
@@ -165,5 +192,96 @@ fn push_spaced_json(out: &mut String, compact: &str) {
             ',' => out.push_str(", "),
             _ => out.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{FileAccess, FilesystemRule};
+
+    #[test]
+    fn policy_json_writes_home_paths_as_tilde() {
+        let mut policy = crate::policy::Policy::default();
+        policy.filesystem.allow = vec![FilesystemRule::new("/home/user/.omp", FileAccess::All, "")];
+        let path = std::env::temp_dir().join("agent-sandbox-write-home.json");
+        let _ = std::fs::remove_file(&path);
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"~/.omp\""),
+            "home path must serialize as ~/...: {raw}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn policy_json_leaves_non_home_paths_absolute() {
+        let mut policy = crate::policy::Policy::default();
+        policy.filesystem.allow = vec![FilesystemRule::new("/nix/store", FileAccess::All, "")];
+        let path = std::env::temp_dir().join("agent-sandbox-write-nonhome.json");
+        let _ = std::fs::remove_file(&path);
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"/nix/store\""),
+            "non-home path must stay absolute: {raw}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_policy_expands_tilde_to_home() {
+        let home = "/home/user";
+        let raw = r#"{
+            "network": { "allow": [], "deny": [] },
+            "sudo": { "allow": [], "deny": [] },
+            "filesystem": {
+                "allow": [ { "path": "~/.omp", "access": "all" } ],
+                "deny": [ { "path": "~/.cache/secret", "access": "read" } ]
+            }
+        }"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("policy.json");
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_policy(&path, Some(home));
+        assert_eq!(loaded.filesystem.allow[0].path, "/home/user/.omp");
+        assert_eq!(loaded.filesystem.deny[0].path, "/home/user/.cache/secret");
+    }
+
+    #[test]
+    fn load_policy_leaves_other_user_paths_absolute() {
+        let home = "/home/user";
+        let raw = r#"{
+            "network": { "allow": [], "deny": [] },
+            "sudo": { "allow": [], "deny": [] },
+            "filesystem": {
+                "allow": [ { "path": "/home/user2/.cache", "access": "all" } ],
+                "deny": []
+            }
+        }"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("policy.json");
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_policy(&path, Some(home));
+        assert_eq!(loaded.filesystem.allow[0].path, "/home/user2/.cache");
+    }
+
+    #[test]
+    fn load_policy_round_trip_through_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("policy.json");
+        let mut policy = crate::policy::Policy::default();
+        policy.filesystem.allow = vec![
+            FilesystemRule::new("/home/user/.omp", FileAccess::All, ""),
+            FilesystemRule::new("/nix/store", FileAccess::Read, ""),
+        ];
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"~/.omp\""), "raw: {raw}");
+        assert!(raw.contains("\"/nix/store\""), "raw: {raw}");
+        let loaded = load_policy(&path, Some("/home/user"));
+        assert_eq!(loaded.filesystem.allow[0].path, "/home/user/.omp");
+        assert_eq!(loaded.filesystem.allow[1].path, "/nix/store");
     }
 }

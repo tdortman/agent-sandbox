@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::policy::{NetworkRule, NetworkSection, Policy, SudoRule, SudoSection};
+use crate::policy::{
+    FileAccess, FilesystemRule, FilesystemSection, NetworkRule, NetworkSection, Policy, SudoRule,
+    SudoSection,
+};
 
 pub fn merge_layers(layers: &[Policy]) -> Policy {
     if layers.is_empty() {
@@ -11,6 +14,7 @@ pub fn merge_layers(layers: &[Policy]) -> Policy {
     Policy {
         network: merge_network(layers),
         sudo: merge_sudo(layers),
+        filesystem: merge_filesystem(layers),
     }
 }
 
@@ -55,6 +59,31 @@ fn merge_sudo(layers: &[Policy]) -> SudoSection {
         }
     }
     SudoSection {
+        allow: allow.into_values().collect(),
+        deny: deny.into_values().collect(),
+    }
+}
+
+fn filesystem_rule_key(rule: &FilesystemRule) -> (String, FileAccess) {
+    (rule.path.trim_end_matches('/').to_owned(), rule.access)
+}
+
+fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
+    let mut allow: BTreeMap<(String, FileAccess), FilesystemRule> = BTreeMap::new();
+    let mut deny: BTreeMap<(String, FileAccess), FilesystemRule> = BTreeMap::new();
+    for layer in layers {
+        for rule in &layer.filesystem.deny {
+            let key = filesystem_rule_key(rule);
+            allow.remove(&key);
+            deny.insert(key, rule.clone());
+        }
+        for rule in &layer.filesystem.allow {
+            let key = filesystem_rule_key(rule);
+            deny.remove(&key);
+            allow.insert(key, rule.clone());
+        }
+    }
+    FilesystemSection {
         allow: allow.into_values().collect(),
         deny: deny.into_values().collect(),
     }

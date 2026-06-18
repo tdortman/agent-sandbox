@@ -1,7 +1,8 @@
 use super::{
-    CheckReply, ElevateReply, RegisterUiReply, RpcMessage, RpcReply, RpcRequest, StatusReply,
-    UiPush,
+    CheckReply, ElevateReply, FilesystemCheckReply, FilesystemMonitorReply, RegisterUiReply,
+    RpcMessage, RpcReply, RpcRequest, StatusReply, UiPush,
 };
+use crate::policy::FileAccess;
 
 #[test]
 fn check_request_deserializes() {
@@ -80,4 +81,98 @@ fn elevate_reply_deserializes_as_elevate_not_simple() {
         reply,
         RpcReply::Elevate(e) if e.allowed && e.exit_code == 0 && e.stdout == "root\n"
     ));
+}
+
+#[test]
+fn filesystem_check_reply_roundtrip() {
+    let reply = FilesystemCheckReply::blocked(
+        "no matching rule",
+        "/home/user/file.txt".into(),
+        FileAccess::Read,
+    );
+    let json = serde_json::to_value(&reply).unwrap();
+    assert_eq!(json["allowed"], false);
+    assert_eq!(json["source"], "blocked");
+    assert_eq!(json["path"], "/home/user/file.txt");
+    assert_eq!(json["access"], "read");
+    assert_eq!(json["error"], "no matching rule");
+}
+
+#[test]
+fn filesystem_check_reply_allowed() {
+    let reply = FilesystemCheckReply::allowed("deny", "/tmp".into(), FileAccess::ReadWrite);
+    let json = serde_json::to_value(&reply).unwrap();
+    assert_eq!(json["allowed"], true);
+    assert_eq!(json["path"], "/tmp");
+    assert_eq!(json["access"], "read_write");
+}
+
+#[test]
+fn filesystem_monitor_reply_roundtrip() {
+    let reply = FilesystemMonitorReply::active();
+    let json = serde_json::to_value(&reply).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["active"], true);
+}
+
+#[test]
+fn filesystem_check_reply_deserializes_as_filesystem_check() {
+    let line = serde_json::to_string(&FilesystemCheckReply::allowed(
+        "once",
+        "/data".into(),
+        FileAccess::All,
+    ))
+    .unwrap();
+    let reply: RpcReply = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(reply, RpcReply::FilesystemCheck(c) if c.allowed && c.source == "once" && c.path == "/data")
+    );
+}
+
+#[test]
+fn check_filesystem_request_deserializes() {
+    let req: RpcRequest = serde_json::from_str(
+        r#"{"op":"check_filesystem","path":"/home/user/doc.txt","access":"read","cwd":"/home/user"}"#,
+    )
+    .unwrap();
+    assert!(matches!(req, RpcRequest::CheckFilesystem { .. }));
+}
+
+#[test]
+fn start_filesystem_monitor_request_deserializes() {
+    let req: RpcRequest =
+        serde_json::from_str(r#"{"op":"start_filesystem_monitor","cwd":"/home/user"}"#).unwrap();
+    assert!(matches!(req, RpcRequest::StartFilesystemMonitor { .. }));
+}
+
+#[test]
+fn start_filesystem_monitor_with_static_allow() {
+    let req: RpcRequest = serde_json::from_str(
+        r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"},"static_allow":[{"path":"/nix/store","access":"all"}]}"#,
+    )
+    .unwrap();
+    match req {
+        RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
+            assert_eq!(static_allow.len(), 1);
+            assert_eq!(static_allow[0].path, "/nix/store");
+            assert_eq!(static_allow[0].access, FileAccess::All);
+        }
+        _ => panic!("expected StartFilesystemMonitor"),
+    }
+}
+
+#[test]
+fn start_filesystem_monitor_defaults_static_allow_empty() {
+    let req: RpcRequest =
+        serde_json::from_str(r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"}}"#)
+            .unwrap();
+    match req {
+        RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
+            assert!(
+                static_allow.is_empty(),
+                "static_allow must default to empty"
+            );
+        }
+        _ => panic!("expected StartFilesystemMonitor"),
+    }
 }

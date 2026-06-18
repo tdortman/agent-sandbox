@@ -3,7 +3,7 @@ use std::os::unix::fs::MetadataExt;
 
 use super::io::policy_json;
 use super::*;
-use crate::policy::{NetworkRule, Policy, SudoRule};
+use crate::policy::{FileAccess, FilesystemRule, NetworkRule, Policy, SudoRule};
 
 fn empty_policy() -> Policy {
     Policy::default()
@@ -47,7 +47,7 @@ fn atomic_write_preserves_symlink() {
     data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
     atomic_write_policy(&link, &data, None, None).unwrap();
     assert!(link.is_symlink());
-    let loaded = load_policy(&real_policy);
+    let loaded = load_policy(&real_policy, None);
     assert_eq!(loaded.network.allow[0].host, "example.com");
 }
 
@@ -95,10 +95,10 @@ fn project_deny_beats_global_allow() {
             },
             ..empty_policy()
         },
-        load_policy(&home.join(".config/agent-sandbox/policy.json")),
+        load_policy(&home.join(".config/agent-sandbox/policy.json"), None),
     ];
     for path in ProjectPolicyContext::new(Some(&home), None, None).layer_paths() {
-        layers.push(load_policy(&path));
+        layers.push(load_policy(&path, None));
     }
     let merged = merge_layers(&layers);
     assert_eq!(merged.network.deny[0].host, "chatgpt.com");
@@ -137,6 +137,10 @@ fn atomic_write_keeps_each_rule_on_one_line() {
         "deny": [
             { "argv": ["systemctl", "restart", "nginx"], "comment": "restart nginx" }
         ]
+    },
+    "filesystem": {
+        "allow": [],
+        "deny": []
     }
 }
 "#
@@ -193,4 +197,78 @@ fn policy_json_one_rule_per_line_invariant() {
         json.contains("\"allow\": []"),
         "empty allow (sudo) should be []:\n{json}"
     );
+}
+
+#[test]
+fn filesystem_later_deny_overrides_earlier_allow() {
+    let low = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let high = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![],
+            deny: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
+        },
+        ..empty_policy()
+    };
+    let merged = merge_layers(&[low, high]);
+    assert!(merged.filesystem.allow.is_empty());
+    assert_eq!(merged.filesystem.deny.len(), 1);
+}
+
+#[test]
+fn filesystem_trailing_slash_path_merge_deduplicates() {
+    let low = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![FilesystemRule::new("/home/", FileAccess::Read, "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let high = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![FilesystemRule::new("/home", FileAccess::Read, "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let merged = merge_layers(&[low, high]);
+    assert_eq!(merged.filesystem.allow.len(), 1);
+    assert_eq!(merged.filesystem.allow[0].path, "/home");
+}
+
+#[test]
+fn filesystem_deny_wins_over_allow_at_eval_time() {
+    let merged = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![FilesystemRule::new("/tmp", FileAccess::Read, "")],
+            deny: vec![FilesystemRule::new("/tmp", FileAccess::All, "")],
+        },
+        ..Policy::default()
+    };
+    // deny wins: check deny list first
+    let denied = merged
+        .filesystem
+        .deny
+        .iter()
+        .any(|r| r.matches("/tmp", FileAccess::Read));
+    assert!(denied);
+    let allowed = merged
+        .filesystem
+        .allow
+        .iter()
+        .any(|r| r.matches("/tmp", FileAccess::Read));
+    assert!(allowed);
+}
+
+#[test]
+fn old_policy_without_filesystem_still_loads() {
+    let json = r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#;
+    let policy: Policy = serde_json::from_str(json).unwrap();
+    assert!(policy.filesystem.allow.is_empty());
+    assert!(policy.filesystem.deny.is_empty());
 }

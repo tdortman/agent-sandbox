@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::policy::FileAccess;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PendingSummary {
@@ -17,6 +19,13 @@ pub enum PendingSummary {
     Elevation {
         id: String,
         argv: Option<Vec<String>>,
+        cwd: Option<String>,
+        home: Option<String>,
+    },
+    Filesystem {
+        id: String,
+        path: Option<String>,
+        access: Option<FileAccess>,
         cwd: Option<String>,
         home: Option<String>,
     },
@@ -39,6 +48,14 @@ pub enum UiPush {
     ElevationRequest {
         id: String,
         argv: Option<Vec<String>>,
+        cwd: Option<String>,
+        home: Option<String>,
+        project_root: Option<String>,
+    },
+    FilesystemRequest {
+        id: String,
+        path: String,
+        access: FileAccess,
         cwd: Option<String>,
         home: Option<String>,
         project_root: Option<String>,

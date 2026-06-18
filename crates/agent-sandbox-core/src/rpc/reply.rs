@@ -1,10 +1,8 @@
-//! policyd → client response types.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::Policy;
+use crate::policy::{FileAccess, Policy};
 
 use super::{message::RpcMessage, scope::ApprovalScope};
 
@@ -17,6 +15,8 @@ use super::{message::RpcMessage, scope::ApprovalScope};
 pub enum RpcReply {
     Error(ErrorReply),
     RegisterUi(RegisterUiReply),
+    FilesystemCheck(FilesystemCheckReply),
+    FilesystemMonitor(FilesystemMonitorReply),
     Check(CheckReply),
     Elevate(ElevateReply),
     ScopeAction(ScopeActionReply),
@@ -147,6 +147,78 @@ impl ElevateReply {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesystemCheckReply {
+    pub ok: bool,
+    pub allowed: bool,
+    pub source: String,
+    pub path: String,
+    pub access: FileAccess,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl FilesystemCheckReply {
+    pub fn allowed(source: impl Into<String>, path: String, access: FileAccess) -> Self {
+        Self {
+            ok: true,
+            allowed: true,
+            source: source.into(),
+            path,
+            access,
+            error: None,
+        }
+    }
+
+    pub fn denied(source: impl Into<String>, path: String, access: FileAccess) -> Self {
+        Self {
+            ok: true,
+            allowed: false,
+            source: source.into(),
+            path,
+            access,
+            error: None,
+        }
+    }
+
+    pub fn blocked(message: impl Into<String>, path: String, access: FileAccess) -> Self {
+        Self {
+            ok: true,
+            allowed: false,
+            source: "blocked".into(),
+            path,
+            access,
+            error: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesystemMonitorReply {
+    pub ok: bool,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl FilesystemMonitorReply {
+    pub const fn active() -> Self {
+        Self {
+            ok: true,
+            active: true,
+            error: None,
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            active: false,
+            error: Some(message.into()),
+        }
+    }
+}
+
 /// Approve / deny / approve-host success payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -154,6 +226,7 @@ pub enum ScopeActionReply {
     Network(NetworkScopeActionReply),
     Sudo(SudoScopeActionReply),
     Elevation(ElevationScopeActionReply),
+    Filesystem(FilesystemScopeActionReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +260,17 @@ pub struct ElevationScopeActionReply {
     pub allowed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemScopeActionReply {
+    pub ok: bool,
+    pub path: String,
+    pub access: FileAccess,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_path: Option<String>,
+}
+
 impl ScopeActionReply {
     pub fn ok_network(host: String, port: u16, scope: ApprovalScope, path: Option<String>) -> Self {
         Self::Network(NetworkScopeActionReply {
@@ -216,11 +300,27 @@ impl ScopeActionReply {
         })
     }
 
+    pub fn ok_filesystem(
+        path: String,
+        access: FileAccess,
+        scope: ApprovalScope,
+        policy_path: Option<String>,
+    ) -> Self {
+        Self::Filesystem(FilesystemScopeActionReply {
+            ok: true,
+            path,
+            access,
+            scope: scope.to_string(),
+            policy_path,
+        })
+    }
+
     pub const fn is_ok(&self) -> bool {
         match self {
             Self::Network(reply) => reply.ok,
             Self::Sudo(reply) => reply.ok,
             Self::Elevation(reply) => reply.ok,
+            Self::Filesystem(reply) => reply.ok,
         }
     }
 
@@ -229,6 +329,7 @@ impl ScopeActionReply {
             Self::Network(reply) => &reply.scope,
             Self::Sudo(reply) => &reply.scope,
             Self::Elevation(reply) => &reply.scope,
+            Self::Filesystem(reply) => &reply.scope,
         }
     }
 
@@ -237,6 +338,7 @@ impl ScopeActionReply {
             Self::Network(reply) => reply.path.as_deref(),
             Self::Sudo(reply) => reply.path.as_deref(),
             Self::Elevation(reply) => reply.path.as_deref(),
+            Self::Filesystem(reply) => Some(&reply.path),
         }
     }
 }

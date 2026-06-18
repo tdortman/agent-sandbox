@@ -12,8 +12,9 @@ mod tests;
 pub use message::RpcMessage;
 pub use push::{PendingSummary, UiPush};
 pub use reply::{
-    CheckReply, ElevateReply, ErrorReply, RegisterUiReply, RpcReply, ScopeActionReply,
-    SimpleOkReply, StatusReply,
+    CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
+    FilesystemScopeActionReply, RegisterUiReply, RpcReply, ScopeActionReply, SimpleOkReply,
+    StatusReply,
 };
 pub use request::{ApprovalTarget, RequestContext, RpcRequest};
 pub use scope::ApprovalScope;
