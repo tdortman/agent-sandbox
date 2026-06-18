@@ -91,11 +91,79 @@ pub fn atomic_write_policy(
             .and_then(|n| n.to_str())
             .unwrap_or("policy.json")
     ));
-    let json = serde_json::to_string_pretty(data)? + "\n";
+    let json = policy_json(data)? + "\n";
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &target)?;
     if let Some(uid) = resolve_owner_uid(path, home, owner_uid) {
         chown_policy_path(path, uid);
     }
     Ok(())
+}
+
+pub(crate) fn policy_json(policy: &Policy) -> serde_json::Result<String> {
+    let mut json = String::new();
+    json.push_str("{\n    \"network\": {\n");
+    push_rules(&mut json, "allow", &policy.network.allow)?;
+    json.push_str(",\n");
+    push_rules(&mut json, "deny", &policy.network.deny)?;
+    json.push_str("\n    },\n    \"sudo\": {\n");
+    push_rules(&mut json, "allow", &policy.sudo.allow)?;
+    json.push_str(",\n");
+    push_rules(&mut json, "deny", &policy.sudo.deny)?;
+    json.push_str("\n    }\n}");
+    Ok(json)
+}
+
+fn push_rules<T: serde::Serialize>(
+    out: &mut String,
+    name: &str,
+    rules: &[T],
+) -> serde_json::Result<()> {
+    out.push_str("        \"");
+    out.push_str(name);
+    out.push_str("\": ");
+    if rules.is_empty() {
+        out.push_str("[]");
+        return Ok(());
+    }
+    out.push_str("[\n");
+    for (index, rule) in rules.iter().enumerate() {
+        out.push_str("            ");
+        push_spaced_json(out, &serde_json::to_string(rule)?);
+        if index + 1 != rules.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("        ]");
+    Ok(())
+}
+
+fn push_spaced_json(out: &mut String, compact: &str) {
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in compact.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' => out.push_str("{ "),
+            '}' => out.push_str(" }"),
+            ':' => out.push_str(": "),
+            ',' => out.push_str(", "),
+            _ => out.push(c),
+        }
+    }
 }
