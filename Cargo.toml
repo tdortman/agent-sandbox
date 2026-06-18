@@ -6,6 +6,7 @@ members = [
     "crates/agent-sandbox-proxy",
     "crates/agent-sandbox-dns",
     "crates/agent-sandbox-cli",
+    "crates/agent-sandbox-fsmon",
     "crates/agent-sandbox-enter",
 ]
 
