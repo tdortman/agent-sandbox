@@ -10,7 +10,8 @@ let
 
   rootCfg = config.agent-sandbox;
   cfg = config.agent-sandbox.network;
-  policyEnabled = cfg.enable || rootCfg.sudoPolicy == "approve";
+  policyEnabled =
+    cfg.enable || rootCfg.sudoPolicy == "approve" || rootCfg.filesystem.dynamicApproval.enable;
   sandboxPkg = flake.package "agent-sandbox";
   policyPkg = sandboxPkg;
   enterBin = sandboxPkg;
@@ -131,16 +132,29 @@ in
 lib.mkIf policyEnabled (
   lib.mkMerge [
     {
-      environment.etc."agent-sandbox/declarative.json".text = builtins.toJSON {
-        network = {
-          allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
-          deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
-        };
-        sudo = {
-          allow = [ ];
-          deny = [ ];
-        };
-      };
+      environment.etc."agent-sandbox/declarative.json".text = builtins.toJSON (
+        {
+          network = {
+            allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
+            deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+          };
+          sudo = {
+            allow = [ ];
+            deny = [ ];
+          };
+        }
+        // lib.optionalAttrs config.agent-sandbox.filesystem.dynamicApproval.enable {
+          filesystem = {
+            allow = [
+              {
+                path = "/nix/store";
+                access = "read_write";
+              }
+            ];
+            deny = [ ];
+          };
+        }
+      );
 
       systemd.services.agent-sandbox-policy = {
         description = "Policy daemon for agent-sandbox";
@@ -186,6 +200,10 @@ lib.mkIf policyEnabled (
             ++ lib.optionals (config.agent-sandbox.policy.exportedNix != "") [
               "--export-nix"
               config.agent-sandbox.policy.exportedNix
+            ]
+            ++ lib.optionals config.agent-sandbox.filesystem.dynamicApproval.enable [
+              "--fs-monitor-cmd"
+              "${policyPkg}/bin/agent-sandbox-fsmon"
             ]
           );
           StateDirectory = "agent-sandbox";

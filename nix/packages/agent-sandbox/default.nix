@@ -28,6 +28,7 @@ rustPlatform.buildRustPackage (
     ];
 
     doCheck = true;
+    useNextest = true;
 
     postInstall = ''
       wrapProgram $out/bin/agent-sandbox-ui \

@@ -44,6 +44,33 @@ let
     (fwd-env "TERM")
   ];
 
+  # Base combinator for dynamic filesystem-approval mode.
+  # Exposes the full host filesystem via --bind / / so that fanotify (fsmon)
+  # can gate individual opens instead of relying on static bwrap mounts.
+  # Sandbox-private /proc, /dev, and /tmp still overlay the host root.  Host
+  # /bin remains visible; rebinding /bin/sh breaks bwrap root-bind setup.
+  agent-sandbox-dynamic-base = compose [
+    (unsafe-add-raw-args "--bind / /")
+    (unsafe-add-raw-args "--proc /proc")
+    (unsafe-add-raw-args "--tmpfs /dev")
+    (unsafe-add-raw-args "--dev-bind /dev/null /dev/null")
+    (unsafe-add-raw-args "--dev-bind /dev/zero /dev/zero")
+    (unsafe-add-raw-args "--dev-bind /dev/random /dev/random")
+    (unsafe-add-raw-args "--dev-bind /dev/urandom /dev/urandom")
+    (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
+    (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
+    (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
+    (unsafe-add-raw-args "--tmpfs /tmp")
+    (add-pkg-deps [
+      pkgs.coreutils
+      pkgs.bash
+    ])
+    (unsafe-add-raw-args "--clearenv")
+    (fwd-env "LANG")
+    (fwd-env "HOME")
+    (fwd-env "TERM")
+  ];
+
   inheritShellEnvRuntime = ''
     declare -A _asbx_bound=()
     _asbx_wants_store=0
@@ -138,6 +165,27 @@ let
     fi
   '';
 
+  # Dynamic-FS variant: forward env vars via --setenv but skip all --ro-bind
+  # mounts.  The entire host filesystem is already visible via --bind / /,
+  # so scanning env vars for paths and rebinding them is both redundant and
+  # broken (bwrap cannot mkdir through symlinks on a root-bound tree).
+  inheritShellEnvRuntimeDynamic = ''
+    while IFS= read -r -d $'\0' _asbx_line; do
+      case "$_asbx_line" in
+        *=*) ;;
+        *) continue ;;
+      esac
+      _asbx_name="''${_asbx_line%%=*}"
+      _asbx_val="''${_asbx_line#*=}"
+      case "$_asbx_name" in
+        *[!A-Za-z0-9_]*|"") continue ;;
+        TMPDIR|TEMP|TMP) continue ;;
+        PATH) continue ;;
+      esac
+      RUNTIME_ARGS+=(--setenv "$_asbx_name" "$_asbx_val")
+    done < <(env -0)
+  '';
+
   # Shared bash: mount path at $hostPath, follow symlinks (chezmoi → dotfiles),
   # exposing each resolved target at its real path (read-only).
   mountHomePathFn = ''
@@ -175,7 +223,7 @@ let
   '';
 in
 {
-  inherit agent-sandbox-base;
+  inherit agent-sandbox-base agent-sandbox-dynamic-base;
 
   home-readonly-mounts =
     rels:
@@ -219,6 +267,11 @@ in
   inherit-shell-env = include-once "agent-sandbox-inherit-shell-env" (compose [
     (fwd-env "PATH")
     (add-runtime inheritShellEnvRuntime)
+  ]);
+
+  inherit-shell-env-dynamic = include-once "agent-sandbox-inherit-shell-env-dynamic" (compose [
+    (fwd-env "PATH")
+    (add-runtime inheritShellEnvRuntimeDynamic)
   ]);
 
   agent-sandbox-context-env =
@@ -320,6 +373,26 @@ in
     (try-readonly "/run/wrappers")
     (try-readonly "/run/agent-sandbox")
     (try-readonly "/run/netns")
+    (unsafe-add-raw-args "--disable-userns")
+  ]);
+
+  # Dynamic-FS variant: skip all redundant bind mounts since --bind / / exposes
+  # everything.  Keep only namespace sharing, DNS file replacements, and userns
+  # disable.  The try-readonly calls fail on symlinks under a root-bound tree.
+  agent-sandbox-restricted-net-dynamic = include-once "agent-sandbox-restricted-net" (compose [
+    time-zone
+    (share-ns "pid")
+    (share-ns "net")
+    (add-runtime ''
+      if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
+        RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf /etc/nsswitch.conf)
+      fi
+    '')
+    (add-runtime ''
+      if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
+        RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf /etc/resolv.conf)
+      fi
+    '')
     (unsafe-add-raw-args "--disable-userns")
   ]);
 }

@@ -15,6 +15,9 @@ let
 
   policyPkg = flake.package "agent-sandbox";
 
+  # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
+  fsArmPkg = policyPkg;
+
   isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
 
   mountPathType = lib.types.addCheck lib.types.str (
@@ -98,8 +101,11 @@ let
 
   cfg = config.agent-sandbox;
 
+  policyContextEnabled =
+    cfg.network.enable || cfg.filesystem.dynamicApproval.enable || cfg.sudoPolicy == "approve";
+
   sharedRuntimeReadonly =
-    lib.optional cfg.network.enable "/run/agent-sandbox"
+    lib.optional policyContextEnabled "/run/agent-sandbox"
     ++ lib.optional cfg.network.enable "/run/netns";
 
   mergePackageMounts =
@@ -135,8 +141,12 @@ let
       // {
         inherit (cfg.wrapping) replaceOriginalBinary unsafeAliasPrefix;
         policySocket = cfg.policy.socketPath;
+        policyContext = policyContextEnabled;
         network = networkConfig;
         sudoGuard = sudoGuardPkg;
+      }
+      // lib.optionalAttrs cfg.filesystem.dynamicApproval.enable {
+        inherit fsArmPkg;
       }
     );
 
@@ -486,6 +496,20 @@ in
           Host resolver the veth-gateway DNS proxy forwards to.
           Use the systemd-resolved stub (127.0.0.53:53) so sandboxes inherit host
           resolver behavior (split DNS, VPN, NextDNS, etc.). Sandboxes use nameserver 169.254.100.1.
+        '';
+      };
+    };
+
+    filesystem = {
+      dynamicApproval = {
+        enable = lib.mkEnableOption ''
+          kernel-mediated dynamic filesystem access approval via fanotify.
+          Controls filesystem access at runtime using path-based allow/deny rules.
+          The first process inside each sandbox becomes agent-sandbox-fs-arm,
+          which requests a fanotify monitor from policyd before execing the real entry.
+          Static bubblewrap mounts remain the structural write boundary.
+          Disabled by default. When disabled, no fs-arm helper or fsmon process
+          is used and there is no kernel-level filesystem mediation.
         '';
       };
     };
