@@ -1,4 +1,4 @@
-//! Policy store — persist.
+//! Policy store persistence.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;

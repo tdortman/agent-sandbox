@@ -222,7 +222,6 @@ pub fn peer_in_different_mount_ns(peer_pid: u32) -> bool {
     peer_mnt != self_mnt
 }
 
-
 /// Parent pid from `/proc/<pid>/status` (`PPid` field).
 #[must_use]
 pub fn read_proc_ppid(pid: u32) -> Option<u32> {
@@ -285,7 +284,6 @@ pub fn is_descendant_of(ancestor: u32, pid: u32) -> bool {
     false
 }
 
-
 /// NUL-separated `/proc/<pid>/cmdline` rendered as a single string.
 #[must_use]
 pub fn read_proc_cmdline(pid: u32) -> Option<String> {
@@ -338,8 +336,11 @@ pub fn looks_like_omp_ui_process(peer_pid: u32) -> bool {
     {
         return true;
     }
-    read_proc_exe(peer_pid)
-        .is_some_and(|exe| OMP_UI_EXE_SUFFIXES.iter().any(|suffix| exe.ends_with(suffix)))
+    read_proc_exe(peer_pid).is_some_and(|exe| {
+        OMP_UI_EXE_SUFFIXES
+            .iter()
+            .any(|suffix| exe.ends_with(suffix))
+    })
 }
 
 /// Host policy tools that must never act as UI from inside the sandbox.
@@ -354,9 +355,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        cmdline_contains_any, is_blocked_sandbox_policy_tool, is_descendant_of, looks_like_omp_ui_process, omp_ui_owner_for_pid,
-        namespace_inode, peer_in_different_mount_ns, peer_in_netns, read_proc_cmdline,
-        read_proc_exe, OMP_UI_CMDLINE_MARKERS, OMP_UI_EXE_SUFFIXES,
+        OMP_UI_CMDLINE_MARKERS, OMP_UI_EXE_SUFFIXES, cmdline_contains_any,
+        is_blocked_sandbox_policy_tool, is_descendant_of, looks_like_omp_ui_process,
+        namespace_inode, omp_ui_owner_for_pid, peer_in_different_mount_ns, peer_in_netns,
+        read_proc_cmdline, read_proc_exe,
     };
 
     #[test]

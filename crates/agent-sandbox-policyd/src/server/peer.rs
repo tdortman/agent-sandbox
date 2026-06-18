@@ -16,11 +16,7 @@ pub struct ClientPeer {
 impl ClientPeer {
     #[must_use]
     pub fn from_stream(stream: &UnixStream) -> Self {
-        peer_cred_unix(stream).map_or(Self::unknown(), |(pid, uid, gid)| Self {
-            pid,
-            uid,
-            gid,
-        })
+        peer_cred_unix(stream).map_or(Self::unknown(), |(pid, uid, gid)| Self { pid, uid, gid })
     }
 
     #[must_use]

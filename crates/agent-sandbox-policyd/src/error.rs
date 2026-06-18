@@ -25,7 +25,7 @@ pub enum PolicydError {
     UnknownPendingId,
     #[error("host denied by policy deny rules")]
     HostDeniedByPolicy,
-#[error("invalid approval target")]
+    #[error("invalid approval target")]
     InvalidDecisionTarget,
     #[error("request not allowed from sandboxed client")]
     UnauthorizedRequest,

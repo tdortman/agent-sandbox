@@ -38,12 +38,7 @@ impl PolicyStore {
         matched
     }
 
-    pub(crate) async fn session_allowed(
-        &self,
-        host: &str,
-        port: u16,
-        ctx: MergeContext,
-    ) -> bool {
+    pub(crate) async fn session_allowed(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
             resolved.ids.pid().filter(|&p| p != 0),
@@ -64,12 +59,7 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn session_denied(
-        &self,
-        host: &str,
-        port: u16,
-        ctx: MergeContext,
-    ) -> bool {
+    pub(crate) async fn session_denied(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
             resolved.ids.pid().filter(|&p| p != 0),
@@ -110,11 +100,7 @@ impl PolicyStore {
         merged.sudo.allow.iter().any(|rule| rule.matches(argv))
     }
 
-    pub(crate) async fn session_sudo_denied(
-        &self,
-        argv: &[String],
-        ctx: MergeContext,
-    ) -> bool {
+    pub(crate) async fn session_sudo_denied(&self, argv: &[String], ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
             resolved.ids.pid().filter(|&p| p != 0),
@@ -132,11 +118,7 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn session_sudo_allowed(
-        &self,
-        argv: &[String],
-        ctx: MergeContext,
-    ) -> bool {
+    pub(crate) async fn session_sudo_allowed(&self, argv: &[String], ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
             resolved.ids.pid().filter(|&p| p != 0),
