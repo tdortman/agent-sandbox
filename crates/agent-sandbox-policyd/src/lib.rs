@@ -10,6 +10,7 @@ pub use error::PolicydError;
 pub use server::PolicyServer;
 pub use store::{PolicyStore, PolicydArgs};
 pub use wire::{
-    HostApproveRequest, MergeContext, NetworkCheckRequest, NetworkScopeOp, PendingDecision,
-    SudoScopeOp, UiSpawnContext, UiSpawnGate,
+    FilesystemCheckRequest, FilesystemMonitorRequest, FilesystemScopeOp, HostApproveRequest,
+    MergeContext, NetworkCheckRequest, NetworkScopeOp, PendingDecision, SudoScopeOp,
+    UiSpawnContext, UiSpawnGate,
 };

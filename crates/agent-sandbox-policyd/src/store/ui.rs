@@ -17,7 +17,9 @@ use crate::wire::{UiSpawnContext, UiSpawnGate};
 use super::types::{
     CLIENT_ID, Pending, PolicyStore, UiClient, UiClientHandle, UiSessionContext, UiSessionOwner,
 };
-use super::ui_route::{UiRoute, request_owned_by_omp, ui_client_matches};
+use super::ui_route::{
+    UiRoute, request_owned_by_omp, standalone_ui_client_matches, ui_client_matches,
+};
 
 impl PolicyStore {
     pub async fn has_omp_ui(&self) -> bool {
@@ -69,6 +71,24 @@ impl PolicyStore {
             .collect()
     }
 
+    fn matching_standalone_ui_session_ids(
+        inner: &super::types::StoreInner,
+        route: &UiRoute,
+    ) -> HashSet<String> {
+        inner
+            .ui_clients
+            .values()
+            .filter(|client| {
+                client.ui_client != "omp"
+                    && inner
+                        .ui_context_by_session
+                        .get(&client.session_id)
+                        .is_some_and(|ctx| standalone_ui_client_matches(client, ctx, route))
+            })
+            .map(|c| c.session_id.clone())
+            .collect()
+    }
+
     pub(crate) async fn session_ids_for_route(&self, route: &UiRoute) -> HashSet<String> {
         let inner = self.inner.lock().await;
         Self::matching_ui_session_ids(&inner, route)
@@ -78,12 +98,31 @@ impl PolicyStore {
         !self.session_ids_for_route(route).await.is_empty()
     }
 
+    pub(crate) async fn has_standalone_ui_for_route(&self, route: &UiRoute) -> bool {
+        let inner = self.inner.lock().await;
+        !Self::matching_standalone_ui_session_ids(&inner, route).is_empty()
+    }
+
     async fn ui_notification_targets_for(
         &self,
         route: &UiRoute,
     ) -> Vec<std::sync::Arc<Mutex<OwnedWriteHalf>>> {
         let inner = self.inner.lock().await;
         let session_ids = Self::matching_ui_session_ids(&inner, route);
+        inner
+            .ui_clients
+            .values()
+            .filter(|c| session_ids.contains(&c.session_id))
+            .map(|c| c.writer.clone())
+            .collect()
+    }
+
+    async fn standalone_ui_notification_targets_for(
+        &self,
+        route: &UiRoute,
+    ) -> Vec<std::sync::Arc<Mutex<OwnedWriteHalf>>> {
+        let inner = self.inner.lock().await;
+        let session_ids = Self::matching_standalone_ui_session_ids(&inner, route);
         inner
             .ui_clients
             .values()
@@ -140,6 +179,8 @@ impl PolicyStore {
                 inner.session_deny.remove(&client.session_id);
                 inner.session_sudo_allow.remove(&client.session_id);
                 inner.session_sudo_deny.remove(&client.session_id);
+                inner.session_filesystem_allow.remove(&client.session_id);
+                inner.session_filesystem_deny.remove(&client.session_id);
                 inner.ui_context_by_session.remove(&client.session_id);
             })
         };
@@ -158,7 +199,13 @@ impl PolicyStore {
                 p.home().map(str::to_owned),
                 p.project_root().map(str::to_owned),
             );
-            if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
+            let has_ui = match p {
+                Pending::Filesystem(_) => self.has_standalone_ui_for_route(&route).await,
+                _ => self.has_ui_for_route(&route).await,
+            };
+            let route_owned_by_omp =
+                !matches!(p, Pending::Filesystem(_)) && self.route_owned_by_omp_ui(&route).await;
+            if !has_ui && !route_owned_by_omp {
                 let spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(p.home()))
                     .ok()
                     .flatten()
@@ -219,6 +266,20 @@ impl PolicyStore {
                 )
                 .await;
             }
+            Pending::Filesystem(fs) => {
+                self.notify_standalone_ui(
+                    &route,
+                    &UiPush::FilesystemRequest {
+                        id: fs.id.clone(),
+                        path: fs.path.clone(),
+                        access: fs.access,
+                        cwd: fs.cwd.clone(),
+                        home: fs.home.clone(),
+                        project_root: fs.project_root.clone(),
+                    },
+                )
+                .await;
+            }
         }
     }
 
@@ -257,6 +318,21 @@ impl PolicyStore {
         false
     }
 
+    pub(crate) async fn wait_for_standalone_ui_client(
+        &self,
+        route: &UiRoute,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.has_standalone_ui_for_route(route).await {
+                return true;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     pub(crate) async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) {
         let targets = self.ui_notification_targets_for(route).await;
         if targets.is_empty() {
@@ -288,6 +364,47 @@ impl PolicyStore {
                     inner.session_deny.remove(&client.session_id);
                     inner.session_sudo_allow.remove(&client.session_id);
                     inner.session_sudo_deny.remove(&client.session_id);
+                    inner.session_filesystem_allow.remove(&client.session_id);
+                    inner.session_filesystem_deny.remove(&client.session_id);
+                    inner.ui_context_by_session.remove(&client.session_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn notify_standalone_ui(&self, route: &UiRoute, payload: &UiPush) {
+        let targets = self.standalone_ui_notification_targets_for(route).await;
+        if targets.is_empty() {
+            return;
+        }
+        let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_string();
+        let mut dead = Vec::new();
+        for (id, writer) in self
+            .inner
+            .lock()
+            .await
+            .ui_clients
+            .iter()
+            .map(|(id, c)| (*id, c.writer.clone()))
+        {
+            if !targets.iter().any(|t| std::sync::Arc::ptr_eq(t, &writer)) {
+                continue;
+            }
+            let mut w = writer.lock().await;
+            if w.write_all(line.as_bytes()).await.is_err() {
+                dead.push(id);
+            }
+        }
+        if !dead.is_empty() {
+            let mut inner = self.inner.lock().await;
+            for id in dead {
+                if let Some(client) = inner.ui_clients.remove(&id) {
+                    inner.session_allow.remove(&client.session_id);
+                    inner.session_deny.remove(&client.session_id);
+                    inner.session_sudo_allow.remove(&client.session_id);
+                    inner.session_sudo_deny.remove(&client.session_id);
+                    inner.session_filesystem_allow.remove(&client.session_id);
+                    inner.session_filesystem_deny.remove(&client.session_id);
                     inner.ui_context_by_session.remove(&client.session_id);
                 }
             }

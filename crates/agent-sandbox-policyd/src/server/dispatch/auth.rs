@@ -9,7 +9,13 @@ use crate::store::{PolicyStore, PolicydArgs};
 /// Whether the request mutates policy/UI state (host-only from sandboxes).
 #[must_use]
 pub fn is_control_request(req: &RpcRequest) -> bool {
-    !matches!(req, RpcRequest::Check { .. } | RpcRequest::Elevate { .. })
+    !matches!(
+        req,
+        RpcRequest::Check { .. }
+            | RpcRequest::Elevate { .. }
+            | RpcRequest::CheckFilesystem { .. }
+            | RpcRequest::StartFilesystemMonitor { .. }
+    )
 }
 
 pub async fn ensure_allowed(
@@ -67,6 +73,7 @@ mod tests {
             approval_timeout: std::time::Duration::from_mins(5),
             interactive_approval: true,
             ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
         }
     }
 

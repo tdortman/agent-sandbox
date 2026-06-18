@@ -54,15 +54,17 @@ impl PolicyStore {
 
     pub async fn merged_for(&self, ctx: MergeContext) -> Policy {
         let ctx = self.resolve_context(ctx).await;
-        let mut layers = vec![load_policy(&self.args.declarative)];
+        let home_path = ctx.paths.home().map(Path::new);
+        let home_str = home_path.and_then(|p| p.to_str());
+        let mut layers = vec![load_policy(&self.args.declarative, home_str)];
         for path in ProjectPolicyContext::new(
-            ctx.paths.home().map(Path::new),
+            home_path,
             ctx.paths.cwd().map(Path::new),
             ctx.paths.project_root().map(Path::new),
         )
         .layer_paths()
         {
-            layers.push(load_policy(&path));
+            layers.push(load_policy(&path, home_str));
         }
         merge_layers(&layers)
     }

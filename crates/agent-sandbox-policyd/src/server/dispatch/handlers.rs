@@ -56,6 +56,27 @@ pub(crate) async fn handle(
             url,
             ctx,
         } => super::check::handle_check(store, host, connect_host, port, scheme, url, ctx).await,
+        RpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
+            store
+                .check_filesystem(crate::wire::FilesystemCheckRequest {
+                    path,
+                    access,
+                    ctx: MergeContext::from(&ctx),
+                })
+                .await,
+        )),
+        RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
+            let peer_pid = peer.pid;
+            Ok(RpcReply::FilesystemMonitor(
+                store
+                    .start_filesystem_monitor(crate::wire::FilesystemMonitorRequest {
+                        peer_pid,
+                        ctx: MergeContext::from(&ctx),
+                        static_allow,
+                    })
+                    .await,
+            ))
+        }
         RpcRequest::Elevate { argv, ctx } => {
             if argv.is_empty() {
                 return Err(PolicydError::ArgvRequired);

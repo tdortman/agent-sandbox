@@ -4,8 +4,10 @@ mod access;
 mod context;
 mod decisions;
 mod elevation;
+mod filesystem;
 mod network;
 mod persist;
+mod scope_filesystem;
 mod scope_network;
 mod scope_sudo;
 mod status;
@@ -16,8 +18,8 @@ mod util;
 
 pub(crate) use types::UiSessionOwner;
 pub use types::{
-    Pending, PendingElevation, PendingKind, PendingNetwork, PolicyStore, PolicydArgs,
-    UiClientHandle,
+    Pending, PendingElevation, PendingFilesystem, PendingKind, PendingNetwork, PolicyStore,
+    PolicydArgs, UiClientHandle,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -34,12 +36,15 @@ impl PolicyStore {
                 pending: HashMap::new(),
                 elevation_futures: HashMap::new(),
                 network_futures: HashMap::new(),
+                filesystem_futures: HashMap::new(),
                 ui_clients: HashMap::new(),
                 ui_context_by_session: HashMap::new(),
                 ui_spawn_last: HashMap::<String, Instant>::new(),
                 session_deny: HashMap::new(),
                 session_sudo_allow: HashMap::new(),
                 session_sudo_deny: HashMap::new(),
+                session_filesystem_allow: HashMap::new(),
+                session_filesystem_deny: HashMap::new(),
             }),
         }
     }

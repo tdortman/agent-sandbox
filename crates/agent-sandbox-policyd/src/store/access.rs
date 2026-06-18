@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use agent_sandbox_core::{allow_keys, normalize_host};
+use agent_sandbox_core::{FileAccess, allow_keys, normalize_host};
 
 use crate::store::ui_route::UiRoute;
 use crate::wire::MergeContext;
@@ -195,6 +195,122 @@ impl PolicyStore {
     }
 }
 
+fn session_filesystem_matches(
+    bucket: &HashSet<(String, FileAccess)>,
+    path: &str,
+    access: FileAccess,
+) -> bool {
+    bucket.iter().any(|(rule_path, rule_access)| {
+        let rule = agent_sandbox_core::FilesystemRule::new(rule_path.as_str(), *rule_access, "");
+        rule.matches(path, access)
+    })
+}
+
+impl PolicyStore {
+    pub(crate) async fn filesystem_policy_denied(
+        &self,
+        path: &str,
+        access: FileAccess,
+        ctx: MergeContext,
+    ) -> bool {
+        let merged = self.merged_for(ctx).await;
+        merged
+            .filesystem
+            .deny
+            .iter()
+            .any(|rule| rule.matches(path, access))
+    }
+
+    pub(crate) async fn filesystem_policy_allowed(
+        &self,
+        path: &str,
+        access: FileAccess,
+        ctx: MergeContext,
+    ) -> bool {
+        let merged = self.merged_for(ctx).await;
+        merged
+            .filesystem
+            .allow
+            .iter()
+            .any(|rule| rule.matches(path, access))
+    }
+
+    pub(crate) async fn session_filesystem_denied(
+        &self,
+        path: &str,
+        access: FileAccess,
+        ctx: MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx).await;
+        let route = UiRoute::new(
+            resolved.ids.pid().filter(|&p| p != 0),
+            resolved.paths.cwd_string(),
+            resolved.paths.home_string(),
+            resolved.paths.project_root_string(),
+        );
+        let session_ids = self.session_ids_for_route(&route).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_filesystem_deny
+                .get(sid)
+                .is_some_and(|bucket| session_filesystem_matches(bucket, path, access))
+        })
+    }
+
+    pub(crate) async fn session_filesystem_allowed(
+        &self,
+        path: &str,
+        access: FileAccess,
+        ctx: MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx).await;
+        let route = UiRoute::new(
+            resolved.ids.pid().filter(|&p| p != 0),
+            resolved.paths.cwd_string(),
+            resolved.paths.home_string(),
+            resolved.paths.project_root_string(),
+        );
+        let session_ids = self.session_ids_for_route(&route).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_filesystem_allow
+                .get(sid)
+                .is_some_and(|bucket| session_filesystem_matches(bucket, path, access))
+        })
+    }
+
+    pub(crate) async fn filesystem_allow_source(
+        &self,
+        path: &str,
+        access: FileAccess,
+        ctx: MergeContext,
+    ) -> Option<String> {
+        if self
+            .filesystem_policy_denied(path, access, ctx.clone())
+            .await
+        {
+            return Some("deny".into());
+        }
+        if self
+            .session_filesystem_denied(path, access, ctx.clone())
+            .await
+        {
+            return Some("deny".into());
+        }
+        if self
+            .session_filesystem_allowed(path, access, ctx.clone())
+            .await
+        {
+            return Some("session".into());
+        }
+        if self.filesystem_policy_allowed(path, access, ctx).await {
+            return Some("allow".into());
+        }
+        None
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

@@ -58,6 +58,7 @@ mod tests {
             approval_timeout: std::time::Duration::from_mins(5),
             interactive_approval: true,
             ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
         }
     }
 

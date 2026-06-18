@@ -36,6 +36,13 @@ impl PolicyStore {
                     cwd: elev.cwd.clone(),
                     home: elev.home.clone(),
                 },
+                Pending::Filesystem(fs) => PendingSummary::Filesystem {
+                    id: fs.id.clone(),
+                    path: Some(fs.path.clone()),
+                    access: Some(fs.access),
+                    cwd: fs.cwd.clone(),
+                    home: fs.home.clone(),
+                },
             })
             .collect();
         StatusReply {

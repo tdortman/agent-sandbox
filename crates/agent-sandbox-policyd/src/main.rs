@@ -34,6 +34,9 @@ struct Cli {
 
     #[arg(long, env = "AGENT_SANDBOX_UI_SPAWN_CMD")]
     ui_spawn_cmd: Option<PathBuf>,
+
+    #[arg(long, env = "AGENT_SANDBOX_FS_MONITOR_CMD")]
+    fs_monitor_cmd: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -62,6 +65,7 @@ async fn main() -> Result<(), PolicydError> {
         approval_timeout: Duration::from_secs_f64(cli.approval_timeout.max(1.0)),
         interactive_approval: cli.interactive_approval,
         ui_spawn_cmd: cli.ui_spawn_cmd,
+        fs_monitor_cmd: cli.fs_monitor_cmd,
     };
 
     let store = Arc::new(PolicyStore::new(args));

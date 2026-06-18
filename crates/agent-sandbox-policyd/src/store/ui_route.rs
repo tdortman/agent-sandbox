@@ -89,15 +89,24 @@ pub(crate) fn ui_client_matches(
     paths_match(ctx, route)
 }
 
+#[must_use]
+pub(crate) fn standalone_ui_client_matches(
+    client: &UiClient,
+    ctx: &UiSessionContext,
+    route: &UiRoute,
+) -> bool {
+    client.ui_client != "omp" && paths_match(ctx, route)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UiRoute, ui_client_matches};
+    use super::{UiRoute, standalone_ui_client_matches, ui_client_matches};
     use crate::store::types::{UiClient, UiSessionContext};
 
     fn ctx(cwd: &str, project_root: &str) -> UiSessionContext {
         UiSessionContext {
             cwd: Some(cwd.into()),
-            home: Some("/home/tim".into()),
+            home: Some("/home/user".into()),
             project_root: Some(project_root.into()),
         }
     }
@@ -127,7 +136,7 @@ mod tests {
     async fn omp_does_not_match_unrelated_project_paths() {
         let pid = std::process::id();
         let omp = omp_client(pid);
-        let omp_ctx = ctx("/dotfiles", "/home/tim/dotfiles");
+        let omp_ctx = ctx("/dotfiles", "/home/userdotfiles");
         let route = UiRoute::new(None, Some("/other".into()), None, Some("/other".into()));
         assert!(!ui_client_matches(&omp, &omp_ctx, &route, &[&omp]));
     }
@@ -187,6 +196,27 @@ mod tests {
             &standalone_ctx,
             &route,
             &[&omp],
+        ));
+    }
+
+    #[tokio::test]
+    async fn standalone_filesystem_route_can_match_omp_owned_request_by_path() {
+        let pid = std::process::id();
+        let standalone = UiClient {
+            session_id: "ui1".into(),
+            ui_client: "standalone".into(),
+            writer: std::sync::Arc::new(tokio::sync::Mutex::new(
+                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+            )),
+            owner_uid: 1000,
+            owner_pid: 0,
+        };
+        let standalone_ctx = ctx("/repo", "/repo");
+        let route = UiRoute::new(Some(pid), Some("/repo".into()), None, Some("/repo".into()));
+        assert!(standalone_ui_client_matches(
+            &standalone,
+            &standalone_ctx,
+            &route,
         ));
     }
 

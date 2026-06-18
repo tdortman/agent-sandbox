@@ -1,6 +1,9 @@
 //! Grouped wire/context fields for policyd.
 
-use agent_sandbox_core::{ApprovalScope, ApprovalTarget, ProcessIds, RequestContext, SandboxPaths};
+use agent_sandbox_core::{
+    ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, ProcessIds, RequestContext,
+    SandboxPaths,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct MergeContext {
@@ -63,6 +66,14 @@ pub struct SudoScopeOp {
     pub wire: ScopeWire,
 }
 
+#[derive(Debug, Clone)]
+pub struct FilesystemScopeOp {
+    pub path: String,
+    pub access: FileAccess,
+    pub scope: ApprovalScope,
+    pub wire: ScopeWire,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UiSpawnGate {
     pub has_matching_ui: bool,
@@ -83,6 +94,20 @@ pub struct NetworkCheckRequest {
     pub scheme: String,
     pub url: String,
     pub ctx: MergeContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesystemCheckRequest {
+    pub path: String,
+    pub access: FileAccess,
+    pub ctx: MergeContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesystemMonitorRequest {
+    pub peer_pid: u32,
+    pub ctx: MergeContext,
+    pub static_allow: Vec<FilesystemRule>,
 }
 
 #[derive(Debug, Clone)]

@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use agent_sandbox_core::{
-    NetworkRule, ProjectPolicyContext, SudoRule, atomic_write_policy, load_policy, normalize_host,
+    FileAccess, FilesystemRule, NetworkRule, ProjectPolicyContext, SudoRule, atomic_write_policy,
+    load_policy, normalize_host,
 };
 
 use super::types::PolicyStore;
@@ -29,7 +30,7 @@ impl PolicyStore {
         home: Option<&str>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
-        let mut current = load_policy(path);
+        let mut current = load_policy(path, home);
         let host_norm = normalize_host(host);
         let key = network_sort_key(&host_norm, port);
         let mut allow: BTreeMap<(Vec<String>, u16), NetworkRule> = current
@@ -88,7 +89,7 @@ impl PolicyStore {
         home: Option<&str>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
-        let mut current = load_policy(path);
+        let mut current = load_policy(path, home);
         let key: Vec<String> = argv.to_vec();
         let mut allow: BTreeMap<Vec<String>, SudoRule> = current
             .sudo
@@ -134,6 +135,51 @@ impl PolicyStore {
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         Self::persist_sudo_rule(path, argv, label, false, home, owner_uid)
+    }
+
+    pub(crate) fn persist_filesystem_rule(
+        path: &Path,
+        rule_path: &str,
+        access: FileAccess,
+        label: &str,
+        allow_rule: bool,
+        home: Option<&str>,
+        owner_uid: Option<u32>,
+    ) -> std::io::Result<()> {
+        let mut policy = load_policy(path, home);
+        let key = (rule_path.trim_end_matches('/').to_owned(), access);
+        let mut allow: BTreeMap<(String, FileAccess), FilesystemRule> = policy
+            .filesystem
+            .allow
+            .iter()
+            .map(|rule| {
+                (
+                    (rule.path.trim_end_matches('/').to_owned(), rule.access),
+                    rule.clone(),
+                )
+            })
+            .collect();
+        let mut deny: BTreeMap<(String, FileAccess), FilesystemRule> = policy
+            .filesystem
+            .deny
+            .iter()
+            .map(|rule| {
+                (
+                    (rule.path.trim_end_matches('/').to_owned(), rule.access),
+                    rule.clone(),
+                )
+            })
+            .collect();
+        if allow_rule {
+            allow.insert(key.clone(), FilesystemRule::new(rule_path, access, label));
+            deny.remove(&key);
+        } else {
+            deny.insert(key.clone(), FilesystemRule::new(rule_path, access, label));
+            allow.remove(&key);
+        }
+        policy.filesystem.allow = allow.into_values().collect();
+        policy.filesystem.deny = deny.into_values().collect();
+        atomic_write_policy(path, &policy, home, owner_uid)
     }
 
     pub(crate) fn project_policy_path_display(project_root: &str) -> Option<String> {
@@ -206,7 +252,7 @@ mod tests {
         )
         .unwrap();
 
-        let policy = load_policy(&policy_path);
+        let policy = load_policy(&policy_path, None);
         let hosts: Vec<&str> = policy
             .network
             .allow
@@ -259,7 +305,7 @@ mod tests {
         )
         .unwrap();
 
-        let policy = load_policy(&policy_path);
+        let policy = load_policy(&policy_path, None);
         let argv: Vec<&[String]> = policy
             .sudo
             .allow

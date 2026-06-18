@@ -4,8 +4,9 @@ use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 
 use crate::wire::{PendingDecision, ScopeWire};
 
-use super::super::types::{Pending, PendingElevation, PendingNetwork, PolicyStore};
-
+use super::super::types::{
+    Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore,
+};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecisionAction {
     Approve,
@@ -53,6 +54,22 @@ impl PolicyStore {
                 elev.home.clone(),
                 elev.project_root.clone(),
             ),
+            session_id,
+            owner_uid,
+        }
+    }
+
+    pub(crate) fn scope_wire_for_pending_filesystem(
+        wire: ScopeWire,
+        fs: &PendingFilesystem,
+    ) -> ScopeWire {
+        let ScopeWire {
+            paths,
+            session_id,
+            owner_uid,
+        } = wire;
+        ScopeWire {
+            paths: paths.merged_with(fs.cwd.clone(), fs.home.clone(), fs.project_root.clone()),
             session_id,
             owner_uid,
         }

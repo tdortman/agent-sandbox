@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{CheckReply, ElevateReply};
+use agent_sandbox_core::{CheckReply, ElevateReply, FileAccess, FilesystemCheckReply};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
 
@@ -21,6 +21,8 @@ pub struct PolicydArgs {
     pub approval_timeout: Duration,
     pub interactive_approval: bool,
     pub ui_spawn_cmd: Option<PathBuf>,
+    /// Path to the agent-sandbox-fsmon binary.
+    pub fs_monitor_cmd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,21 +50,34 @@ pub struct PendingNetwork {
     pub request_pid: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingFilesystem {
+    pub id: String,
+    pub created_at: f64,
+    pub path: String,
+    pub access: FileAccess,
+    pub cwd: Option<String>,
+    pub home: Option<String>,
+    pub project_root: Option<String>,
+    pub request_pid: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
     Elevation,
     Network,
+    Filesystem,
 }
 
 /// Discriminated union of pending approval requests.
 ///
 /// The variant determines which fields are meaningful:
 /// - `Elevation`: `argv` is required; `host`/`port`/`scheme`/`url` absent.
-/// - `Network`: `host`/`port`/`scheme`/`url` required; `argv` absent.
 #[derive(Debug, Clone)]
 pub enum Pending {
     Elevation(PendingElevation),
     Network(PendingNetwork),
+    Filesystem(PendingFilesystem),
 }
 
 impl Pending {
@@ -70,6 +85,7 @@ impl Pending {
         match self {
             Self::Elevation(_) => PendingKind::Elevation,
             Self::Network(_) => PendingKind::Network,
+            Self::Filesystem(_) => PendingKind::Filesystem,
         }
     }
 
@@ -77,6 +93,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => &p.id,
             Self::Network(p) => &p.id,
+            Self::Filesystem(p) => &p.id,
         }
     }
 
@@ -84,6 +101,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.created_at,
             Self::Network(p) => p.created_at,
+            Self::Filesystem(p) => p.created_at,
         }
     }
 
@@ -91,6 +109,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.cwd.as_deref(),
             Self::Network(p) => p.cwd.as_deref(),
+            Self::Filesystem(p) => p.cwd.as_deref(),
         }
     }
 
@@ -98,6 +117,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.home.as_deref(),
             Self::Network(p) => p.home.as_deref(),
+            Self::Filesystem(p) => p.home.as_deref(),
         }
     }
 
@@ -105,6 +125,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.project_root.as_deref(),
             Self::Network(p) => p.project_root.as_deref(),
+            Self::Filesystem(p) => p.project_root.as_deref(),
         }
     }
 
@@ -112,6 +133,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.request_pid,
             Self::Network(p) => p.request_pid,
+            Self::Filesystem(p) => p.request_pid,
         }
     }
 }
@@ -153,10 +175,13 @@ pub(crate) struct StoreInner {
     pub pending: HashMap<String, Pending>,
     pub elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
     pub network_futures: HashMap<String, oneshot::Sender<CheckReply>>,
+    pub filesystem_futures: HashMap<String, oneshot::Sender<FilesystemCheckReply>>,
     pub ui_clients: HashMap<u64, UiClient>,
     pub ui_context_by_session: HashMap<String, UiSessionContext>,
     pub ui_spawn_last: HashMap<String, Instant>,
     pub session_deny: HashMap<String, HashSet<(String, u16)>>,
     pub session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
     pub session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,
+    pub session_filesystem_allow: HashMap<String, HashSet<(String, FileAccess)>>,
+    pub session_filesystem_deny: HashMap<String, HashSet<(String, FileAccess)>>,
 }
