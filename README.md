@@ -50,7 +50,7 @@ All clients share `/run/agent-sandbox/policy.sock`. `policyd` uses `SO_PEERCRED`
 
 Filesystem prompt limitation: fanotify blocks the process that opened the file. If OMP or an OMP tool opens the file, OMP may be blocked before its extension can render a prompt. For that reason filesystem approvals use `agent-sandbox-ui` (`kdialog` or `/dev/tty`) instead of the OMP extension. Network and sudo prompts still use the OMP extension.
 
-OMP, Codex, and other wrapped agents can run at the same time. They share project and global policy files. Session-scoped approvals stay attached to the UI session that created them.
+OMP, Codex, and other wrapped agents can run at the same time. They share project and global policy files. Session-scoped approvals stay attached to the sandbox instance that created them, even when two agents run in the same project.
 
 ## Policy model
 
@@ -92,7 +92,10 @@ Notes:
 
 - `~/...` in `policy.json` expands to the invoking user's home. Policy writes also store paths under home in that form.
 - Network approvals can target exact hosts or parent domains such as `*.example.com`.
-- Filesystem rules match the exact path and descendants. Access kinds: `read`, `write`, `read_write`, `execute`, `all`.
+- Filesystem prompts use the most specific access fanotify can prove: `read`, `write`, `read_write`, or `execute`. `read_write` covers both read and write. `all` also covers execute.
+  Older kernels without `FAN_PRE_ACCESS` fall back to conservative open checks, which appear as `read_write`.
+- Dynamic filesystem mode grants `all` access to the detected project root (`git rev-parse --show-toplevel`, falling back to `$PWD`).
+  Agent work inside the current project should not prompt.
 - Sudo rules use prefix matching, so `["systemctl"]` matches `systemctl restart nginx`.
 
 ## Approval flow
