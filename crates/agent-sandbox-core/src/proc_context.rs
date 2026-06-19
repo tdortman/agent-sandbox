@@ -62,6 +62,16 @@ pub fn context_from_pid(pid: u32) -> (Option<String>, Option<String>, Option<Str
     (cwd, home, project_root)
 }
 
+pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    read_proc_environ(pid)
+        .get("AGENT_SANDBOX_SESSION_ID")
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
 fn tcp_addr_field(ip: &str, port: u16) -> String {
     let octets = ip.parse::<Ipv4Addr>().expect("ipv4").octets();
     let reversed = octets

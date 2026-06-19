@@ -18,6 +18,8 @@ pub struct RequestContext {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_session_id: Option<String>,
 }
 
 impl RequestContext {
@@ -52,6 +54,7 @@ impl From<&SandboxPaths> for RequestContext {
             project_root: paths.project_root_string(),
             pid: None,
             uid: None,
+            sandbox_session_id: None,
         }
     }
 }
@@ -64,6 +67,7 @@ impl From<(SandboxPaths, ProcessIds)> for RequestContext {
             project_root: paths.project_root_string(),
             pid: ids.pid(),
             uid: ids.uid(),
+            sandbox_session_id: None,
         }
     }
 }
