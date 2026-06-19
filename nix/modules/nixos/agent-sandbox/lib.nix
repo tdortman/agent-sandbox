@@ -253,14 +253,6 @@ rec {
               RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
             '')
           ])
-        ]
-        ++ lib.optionals (fsArmPkg != null && exposeWorkingDirectory) [
-          (builtinCombinators.compose [
-            (builtinCombinators.set-env "AGENT_SANDBOX_FS_ALLOW_CWD" "1")
-            (builtinCombinators.add-runtime ''
-              RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_ALLOW_CWD "1")
-            '')
-          ])
         ];
 
       jailedDrv = jailFn sandboxedName entryPackage permissions;
@@ -317,9 +309,6 @@ rec {
       '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
-        ${lib.optionalString exposeWorkingDirectory ''
-          RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_ALLOW_CWD "1")
-        ''}
       '';
       deviceBindScript = lib.concatMapStringsSep "\n" (path: ''
         if [[ -e "${path}" ]]; then

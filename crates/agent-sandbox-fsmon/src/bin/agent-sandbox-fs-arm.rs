@@ -5,12 +5,35 @@
 
 #![allow(unsafe_code)]
 
-use agent_sandbox_core::{FilesystemRule, RequestContext};
+use agent_sandbox_core::{FileAccess, FilesystemRule, RequestContext};
 use agent_sandbox_fsmon::rpc_client;
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process;
+
+fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&str>) {
+    let Some(home) = home else {
+        return;
+    };
+    for rule in static_allow {
+        if let Some(rest) = rule.path.strip_prefix("~/") {
+            rule.path = format!("{}/{}", home.trim_end_matches('/'), rest);
+        } else if rule.path == "~" {
+            home.clone_into(&mut rule.path);
+        }
+    }
+}
+
+fn add_project_static_allow(static_allow: &mut Vec<FilesystemRule>, project_root: Option<&str>) {
+    if let Some(project_root) = project_root.map(str::trim).filter(|path| !path.is_empty()) {
+        static_allow.push(FilesystemRule::new(
+            project_root,
+            FileAccess::All,
+            "project",
+        ));
+    }
+}
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -50,31 +73,8 @@ fn main() {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    // Expand ~/... paths using AGENT_SANDBOX_HOME.
-    if let Some(home) = &home {
-        for rule in &mut static_allow {
-            if let Some(rest) = rule.path.strip_prefix("~/") {
-                rule.path = format!("{}/{}", home.trim_end_matches('/'), rest);
-            } else if rule.path == "~" {
-                rule.path.clone_from(home);
-            }
-        }
-    }
-
-    // Add cwd rule when AGENT_SANDBOX_FS_ALLOW_CWD is set.
-    let static_allow = if std::env::var("AGENT_SANDBOX_FS_ALLOW_CWD").as_deref() == Ok("1") {
-        let mut rules = static_allow;
-        if let Some(cwd) = &cwd {
-            rules.push(FilesystemRule {
-                path: cwd.clone(),
-                access: agent_sandbox_core::FileAccess::All,
-                comment: None,
-            });
-        }
-        rules
-    } else {
-        static_allow
-    };
+    expand_home_static_allow(&mut static_allow, home.as_deref());
+    add_project_static_allow(&mut static_allow, project_root.as_deref());
 
     // Connect to policyd and request monitor startup.
     let reply = rpc_client::start_monitor(Path::new(&socket_path), ctx, static_allow)
@@ -87,7 +87,6 @@ fn main() {
     // keys before exec cannot race another Rust thread reading environment.
     unsafe {
         std::env::remove_var("AGENT_SANDBOX_FS_STATIC_ALLOW");
-        std::env::remove_var("AGENT_SANDBOX_FS_ALLOW_CWD");
     }
 
     if !reply.active {
@@ -117,4 +116,35 @@ fn main() {
         std::io::Error::last_os_error()
     );
     process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_home_static_allow_rules() {
+        let mut rules = vec![
+            FilesystemRule::new("~/dotfiles", FileAccess::Read, ""),
+            FilesystemRule::new("~", FileAccess::Read, ""),
+        ];
+
+        expand_home_static_allow(&mut rules, Some("/home/user"));
+
+        assert_eq!(rules[0].path, "/home/user/dotfiles");
+        assert_eq!(rules[1].path, "/home/user");
+    }
+
+    #[test]
+    fn adds_project_root_as_full_static_allow() {
+        let mut rules = vec![FilesystemRule::new("/home/user/.omp", FileAccess::Read, "")];
+
+        add_project_static_allow(&mut rules, Some("/home/user/project"));
+
+        assert!(
+            rules.iter().any(|rule| {
+                rule.path == "/home/user/project" && rule.access == FileAccess::All
+            })
+        );
+    }
 }
