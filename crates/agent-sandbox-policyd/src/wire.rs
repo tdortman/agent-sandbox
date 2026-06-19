@@ -9,6 +9,7 @@ use agent_sandbox_core::{
 pub struct MergeContext {
     pub paths: SandboxPaths,
     pub ids: ProcessIds,
+    pub sandbox_session_id: Option<String>,
 }
 
 impl From<&RequestContext> for MergeContext {
@@ -16,6 +17,7 @@ impl From<&RequestContext> for MergeContext {
         Self {
             paths: ctx.sandbox_paths(),
             ids: ctx.ids(),
+            sandbox_session_id: ctx.sandbox_session_id.clone(),
         }
     }
 }
@@ -28,6 +30,7 @@ impl From<MergeContext> for RequestContext {
             project_root: ctx.paths.project_root_string(),
             pid: ctx.ids.pid(),
             uid: ctx.ids.uid(),
+            sandbox_session_id: ctx.sandbox_session_id,
         }
     }
 }
@@ -37,6 +40,7 @@ pub struct ScopeWire {
     pub paths: SandboxPaths,
     pub session_id: Option<String>,
     pub owner_uid: Option<u32>,
+    pub sandbox_session_id: Option<String>,
 }
 
 impl ScopeWire {
@@ -47,6 +51,7 @@ impl ScopeWire {
             paths: ctx.sandbox_paths(),
             session_id,
             owner_uid,
+            sandbox_session_id: ctx.sandbox_session_id.clone(),
         }
     }
 }
@@ -81,6 +86,7 @@ pub struct UiSpawnGate {
 
 pub struct UiSpawnContext<'a> {
     pub gate: UiSpawnGate,
+    pub sandbox_session_id: Option<&'a str>,
     pub uid: Option<u32>,
     pub home: Option<&'a str>,
     pub cwd: Option<&'a str>,

@@ -16,11 +16,11 @@ mod ui;
 mod ui_route;
 mod util;
 
-pub(crate) use types::UiSessionOwner;
 pub use types::{
     Pending, PendingElevation, PendingFilesystem, PendingKind, PendingNetwork, PolicyStore,
     PolicydArgs, UiClientHandle,
 };
+pub(crate) use types::{UiSessionContext, UiSessionOwner};
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;

@@ -34,6 +34,7 @@ impl PolicyStore {
                 MergeContext {
                     paths: paths.clone(),
                     ids: wire_ids,
+                    sandbox_session_id: resolved.sandbox_session_id.clone(),
                 },
             )
             .await
@@ -49,6 +50,7 @@ impl PolicyStore {
                     paths,
                     session_id,
                     owner_uid: wire_ids.uid(),
+                    sandbox_session_id: resolved.sandbox_session_id,
                 },
             },
             DecisionAction::Approve,

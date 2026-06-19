@@ -136,9 +136,7 @@ impl PolicyStore {
         handle: &UiClientHandle,
         ui_client: &str,
         owner: Option<UiSessionOwner>,
-        cwd: Option<String>,
-        home: Option<String>,
-        project_root: Option<String>,
+        context: UiSessionContext,
     ) -> String {
         let session_id = Uuid::new_v4().simple().to_string();
         let mut inner = self.inner.lock().await;
@@ -152,14 +150,9 @@ impl PolicyStore {
                 owner_pid: owner.map_or(0, |o| o.pid),
             },
         );
-        inner.ui_context_by_session.insert(
-            session_id.clone(),
-            UiSessionContext {
-                cwd,
-                home,
-                project_root,
-            },
-        );
+        inner
+            .ui_context_by_session
+            .insert(session_id.clone(), context);
         session_id
     }
 
@@ -198,7 +191,8 @@ impl PolicyStore {
                 p.cwd().map(str::to_owned),
                 p.home().map(str::to_owned),
                 p.project_root().map(str::to_owned),
-            );
+            )
+            .with_sandbox_session(p.sandbox_session_id().map(str::to_owned));
             let has_ui = match p {
                 Pending::Filesystem(_) => self.has_standalone_ui_for_route(&route).await,
                 _ => self.has_ui_for_route(&route).await,
@@ -218,6 +212,7 @@ impl PolicyStore {
                     home: p.home(),
                     cwd: p.cwd(),
                     project_root: p.project_root(),
+                    sandbox_session_id: p.sandbox_session_id(),
                 };
                 maybe_spawn_ui(
                     &self.args,
@@ -235,7 +230,8 @@ impl PolicyStore {
             p.cwd().map(str::to_owned),
             p.home().map(str::to_owned),
             p.project_root().map(str::to_owned),
-        );
+        )
+        .with_sandbox_session(p.sandbox_session_id().map(str::to_owned));
         match p {
             Pending::Network(net) => {
                 self.notify_ui(

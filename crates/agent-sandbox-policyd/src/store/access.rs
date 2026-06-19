@@ -45,7 +45,8 @@ impl PolicyStore {
             resolved.paths.cwd_string(),
             resolved.paths.home_string(),
             resolved.paths.project_root_string(),
-        );
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
         if session_ids.is_empty() {
             return false;
@@ -66,7 +67,8 @@ impl PolicyStore {
             resolved.paths.cwd_string(),
             resolved.paths.home_string(),
             resolved.paths.project_root_string(),
-        );
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
         if session_ids.is_empty() {
             return false;
@@ -107,7 +109,8 @@ impl PolicyStore {
             resolved.paths.cwd_string(),
             resolved.paths.home_string(),
             resolved.paths.project_root_string(),
-        );
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
@@ -125,7 +128,8 @@ impl PolicyStore {
             resolved.paths.cwd_string(),
             resolved.paths.home_string(),
             resolved.paths.project_root_string(),
-        );
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
@@ -247,7 +251,8 @@ impl PolicyStore {
             resolved.paths.cwd_string(),
             resolved.paths.home_string(),
             resolved.paths.project_root_string(),
-        );
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
@@ -270,7 +275,8 @@ impl PolicyStore {
             resolved.paths.cwd_string(),
             resolved.paths.home_string(),
             resolved.paths.project_root_string(),
-        );
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {

@@ -34,6 +34,7 @@ impl PolicyStore {
             paths,
             session_id,
             owner_uid,
+            sandbox_session_id: _,
         } = wire;
         let cwd = paths.cwd_string();
         let home = paths.home_string();

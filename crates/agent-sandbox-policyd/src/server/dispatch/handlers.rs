@@ -28,9 +28,12 @@ pub(crate) async fn handle(
                     client,
                     ui_client,
                     owner,
-                    paths.cwd_string(),
-                    paths.home_string(),
-                    paths.project_root_string(),
+                    crate::store::UiSessionContext {
+                        cwd: paths.cwd_string(),
+                        home: paths.home_string(),
+                        project_root: paths.project_root_string(),
+                        sandbox_session_id: ctx.sandbox_session_id,
+                    },
                 )
                 .await;
             if let Some(sess) = store.ui_context_for_session(&session_id).await

@@ -36,6 +36,7 @@ impl PolicyStore {
         let home = ctx.paths.home_string();
         let project_root = ctx.paths.project_root_string();
 
+        let sandbox_session_id = ctx.sandbox_session_id.clone();
         let socket_str = self.args.socket.to_string_lossy().to_string();
 
         let mut command = Command::new(&cmd);
@@ -62,6 +63,9 @@ impl PolicyStore {
             && let Ok(json) = serde_json::to_string(&req.static_allow)
         {
             command.env("AGENT_SANDBOX_FS_STATIC_ALLOW", &json);
+        }
+        if let Some(sandbox_session_id) = &sandbox_session_id {
+            command.env("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
         }
 
         let mut child = match command.spawn() {
@@ -148,6 +152,7 @@ impl PolicyStore {
         let cwd = resolved.paths.cwd_string();
         let home = resolved.paths.home_string();
         let project_root = resolved.paths.project_root_string();
+        let sandbox_session_id = resolved.sandbox_session_id.clone();
         if self
             .filesystem_policy_denied(&path, access, resolved.clone())
             .await
@@ -176,6 +181,7 @@ impl PolicyStore {
                     home: home.clone(),
                     project_root: project_root.clone(),
                     request_pid: wire_ids.pid().filter(|&p| p != 0),
+                    sandbox_session_id: sandbox_session_id.clone(),
                 }),
             );
         }
@@ -185,7 +191,8 @@ impl PolicyStore {
             cwd.clone(),
             home.clone(),
             project_root.clone(),
-        );
+        )
+        .with_sandbox_session(sandbox_session_id.clone());
         let push = UiPush::FilesystemRequest {
             id: pending_id.clone(),
             path: path.clone(),
@@ -214,6 +221,7 @@ impl PolicyStore {
                 home: home.as_deref(),
                 cwd: cwd.as_deref(),
                 project_root: project_root.as_deref(),
+                sandbox_session_id: sandbox_session_id.as_deref(),
             };
             maybe_spawn_ui(
                 &self.args,

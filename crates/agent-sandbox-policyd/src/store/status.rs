@@ -12,6 +12,7 @@ impl PolicyStore {
             .merged_for(MergeContext {
                 paths,
                 ids: ProcessIds::default(),
+                sandbox_session_id: None,
             })
             .await;
         let pending: Vec<PendingSummary> = self

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use agent_sandbox_core::{
     Policy, ProcessIds, ProjectPolicyContext, SandboxPaths, context_from_pid, home_from_uid,
-    load_policy, merge_layers,
+    load_policy, merge_layers, sandbox_session_id_from_pid,
 };
 
 use crate::wire::MergeContext;
@@ -19,6 +19,7 @@ impl PolicyStore {
             ctx.paths.project_root_string(),
         );
 
+        let mut sandbox_session_id = ctx.sandbox_session_id.clone();
         if let Some(pid) = ctx.ids.pid() {
             let (cwd, home, project_root) = context_from_pid(pid);
             let proc_paths = SandboxPaths::from_wire(cwd, home, project_root);
@@ -27,6 +28,9 @@ impl PolicyStore {
                 paths.home_string(),
                 paths.project_root_string(),
             );
+            if sandbox_session_id.is_none() {
+                sandbox_session_id = sandbox_session_id_from_pid(pid);
+            }
         }
 
         let mut home = paths.home_string().or_else(|| home_from_uid(ctx.ids.uid()));
@@ -49,6 +53,7 @@ impl PolicyStore {
         MergeContext {
             paths: SandboxPaths::from_wire(paths.cwd_string(), home, project_root),
             ids: ctx.ids,
+            sandbox_session_id,
         }
     }
 
@@ -74,6 +79,7 @@ impl PolicyStore {
             .merged_for(MergeContext {
                 paths,
                 ids: ProcessIds::default(),
+                sandbox_session_id: None,
             })
             .await;
         if let Some(parent) = self.args.export_json.parent() {

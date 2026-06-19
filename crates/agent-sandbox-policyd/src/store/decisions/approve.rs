@@ -6,6 +6,7 @@ use agent_sandbox_core::{
 };
 
 use crate::error::PolicydError;
+use crate::store::ui_route::UiRoute;
 use crate::wire::{NetworkScopeOp, PendingDecision, SudoScopeOp};
 
 use super::super::types::{
@@ -226,7 +227,9 @@ impl PolicyStore {
             ));
         }
 
-        let scope_wire = Self::scope_wire_for_pending_filesystem(wire, &fs);
+        let scope_wire = self
+            .filesystem_scope_wire_for_pending(wire, &fs, scope)
+            .await;
 
         if action == DecisionAction::Deny && scope == ApprovalScope::Once {
             let detail = format!("id={pending_id} path={path}");
@@ -271,6 +274,38 @@ impl PolicyStore {
                 .insert(pending_id, Pending::Filesystem(fs));
         }
         result
+    }
+
+    async fn filesystem_scope_wire_for_pending(
+        &self,
+        wire: crate::wire::ScopeWire,
+        fs: &PendingFilesystem,
+        scope: ApprovalScope,
+    ) -> crate::wire::ScopeWire {
+        let mut scope_wire = Self::scope_wire_for_pending_filesystem(wire, fs);
+        if scope != ApprovalScope::Session {
+            return scope_wire;
+        }
+
+        let route = UiRoute::new(
+            fs.request_pid,
+            fs.cwd.clone(),
+            fs.home.clone(),
+            fs.project_root.clone(),
+        )
+        .with_sandbox_session(fs.sandbox_session_id.clone());
+        let session_ids = self.session_ids_for_route(&route).await;
+        if scope_wire
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_ids.contains(session_id))
+        {
+            return scope_wire;
+        }
+        if let Some(session_id) = session_ids.into_iter().min() {
+            scope_wire.session_id = Some(session_id);
+        }
+        scope_wire
     }
 
     fn resolve_pending_filesystem_target(
@@ -359,9 +394,18 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use agent_sandbox_core::{ApprovalScope, ApprovalTarget, FileAccess};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    use crate::store::{Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore};
+    use agent_sandbox_core::{ApprovalScope, ApprovalTarget, FileAccess, ProcessIds, SandboxPaths};
+    use tokio::net::UnixStream;
+    use tokio::sync::Mutex;
+
+    use crate::store::types::{UiClient, UiSessionContext};
+    use crate::store::{
+        Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore, PolicydArgs,
+    };
+    use crate::wire::{MergeContext, PendingDecision, ScopeWire};
 
     #[test]
     fn network_target_accepts_parent_domain_patterns() {
@@ -376,6 +420,7 @@ mod tests {
             home: None,
             project_root: None,
             request_pid: None,
+            sandbox_session_id: None,
         });
         let target = ApprovalTarget::NetworkHost {
             host: "*.baz.com".into(),
@@ -404,6 +449,7 @@ mod tests {
             home: None,
             project_root: None,
             request_pid: None,
+            sandbox_session_id: None,
         });
         let target = ApprovalTarget::SudoCommand {
             argv: vec!["foo".into(), "bar".into()],
@@ -433,6 +479,7 @@ mod tests {
             home: None,
             project_root: None,
             request_pid: None,
+            sandbox_session_id: None,
         });
         let target = ApprovalTarget::FilesystemPath {
             path: "/other/path".into(),
@@ -462,6 +509,7 @@ mod tests {
             home: None,
             project_root: None,
             request_pid: None,
+            sandbox_session_id: None,
         });
         let target = ApprovalTarget::FilesystemPath {
             path: "/home/user/projects/foo".into(),
@@ -491,6 +539,7 @@ mod tests {
             home: None,
             project_root: None,
             request_pid: None,
+            sandbox_session_id: None,
         });
         // Once scope: exact match is valid
         assert!(
@@ -520,6 +569,255 @@ mod tests {
             )
             .is_err(),
             "ancestor target should be rejected for Once scope"
+        );
+    }
+
+    fn test_store(name: &str) -> PolicyStore {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-sandbox-fs-session-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        PolicyStore::new(PolicydArgs {
+            socket: dir.join("policy.sock"),
+            sandbox_netns: None,
+            declarative: dir.join("declarative.json"),
+            export_json: dir.join("exported-policy.json"),
+            export_nix: None,
+            approval_timeout: Duration::from_mins(1),
+            interactive_approval: true,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+        })
+    }
+
+    fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {
+        Arc::new(Mutex::new(UnixStream::pair().unwrap().0.into_split().1))
+    }
+
+    fn ui_session_context() -> UiSessionContext {
+        UiSessionContext {
+            cwd: Some("/repo".into()),
+            home: Some("/home/user".into()),
+            project_root: Some("/repo".into()),
+            sandbox_session_id: None,
+        }
+    }
+
+    async fn add_ui_sessions(store: &PolicyStore) {
+        let mut inner = store.inner.lock().await;
+        inner.ui_clients.insert(
+            1,
+            UiClient {
+                session_id: "omp-session".into(),
+                ui_client: "omp".into(),
+                writer: writer(),
+                owner_uid: 1000,
+                owner_pid: std::process::id(),
+            },
+        );
+        inner
+            .ui_context_by_session
+            .insert("omp-session".into(), ui_session_context());
+        inner.ui_clients.insert(
+            2,
+            UiClient {
+                session_id: "standalone-session".into(),
+                ui_client: "standalone".into(),
+                writer: writer(),
+                owner_uid: 1000,
+                owner_pid: 0,
+            },
+        );
+        inner
+            .ui_context_by_session
+            .insert("standalone-session".into(), ui_session_context());
+    }
+
+    fn pending_filesystem(request_pid: Option<u32>) -> PendingFilesystem {
+        PendingFilesystem {
+            id: "fs1".into(),
+            created_at: 0.0,
+            path: "/home/user/projects/foo/src/main.rs".into(),
+            access: FileAccess::Read,
+            cwd: Some("/repo".into()),
+            home: Some("/home/user".into()),
+            project_root: Some("/repo".into()),
+            request_pid,
+            sandbox_session_id: None,
+        }
+    }
+
+    fn scope_wire(session_id: &str) -> ScopeWire {
+        ScopeWire {
+            paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+            session_id: Some(session_id.into()),
+            owner_uid: Some(1000),
+            sandbox_session_id: None,
+        }
+    }
+
+    async fn approve_filesystem_session(
+        store: &PolicyStore,
+        pending: PendingFilesystem,
+        submitting_session_id: &str,
+    ) {
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Session,
+                target: Some(ApprovalTarget::FilesystemPath {
+                    path: "/home/user/projects/foo".into(),
+                }),
+                wire: scope_wire(submitting_session_id),
+            })
+            .await;
+        assert!(reply.scope_succeeded());
+    }
+
+    fn merge_context(pid: Option<u32>) -> MergeContext {
+        MergeContext {
+            paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+            ids: ProcessIds::from((pid, None)),
+            sandbox_session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_session_approval_uses_omp_owner_session() {
+        let store = test_store("omp-owner");
+        add_ui_sessions(&store).await;
+        approve_filesystem_session(
+            &store,
+            pending_filesystem(Some(std::process::id())),
+            "standalone-session",
+        )
+        .await;
+
+        {
+            let inner = store.inner.lock().await;
+            assert!(inner.session_filesystem_allow.contains_key("omp-session"));
+            assert!(
+                !inner
+                    .session_filesystem_allow
+                    .contains_key("standalone-session")
+            );
+        }
+
+        assert!(
+            store
+                .session_filesystem_allowed(
+                    "/home/user/projects/foo/src/lib.rs",
+                    FileAccess::Read,
+                    merge_context(Some(std::process::id())),
+                )
+                .await
+        );
+        assert!(
+            !store
+                .session_filesystem_allowed(
+                    "/home/user/projects/foo/src/lib.rs",
+                    FileAccess::Read,
+                    merge_context(None),
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_session_approval_keeps_standalone_session() {
+        let store = test_store("standalone");
+        add_ui_sessions(&store).await;
+        approve_filesystem_session(&store, pending_filesystem(None), "standalone-session").await;
+
+        {
+            let inner = store.inner.lock().await;
+            assert!(
+                inner
+                    .session_filesystem_allow
+                    .contains_key("standalone-session")
+            );
+        }
+
+        assert!(
+            store
+                .session_filesystem_allowed(
+                    "/home/user/projects/foo/src/lib.rs",
+                    FileAccess::Read,
+                    merge_context(None),
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn session_network_rules_do_not_cross_sandbox_sessions_in_same_project() {
+        let store = test_store("sandbox-session-isolation");
+        {
+            let mut inner = store.inner.lock().await;
+            for (client_id, ui_session_id, sandbox_session_id) in
+                [(10_u64, "ui-a", "sandbox-a"), (11_u64, "ui-b", "sandbox-b")]
+            {
+                inner.ui_clients.insert(
+                    client_id,
+                    UiClient {
+                        session_id: ui_session_id.into(),
+                        ui_client: "standalone".into(),
+                        writer: writer(),
+                        owner_uid: 1000,
+                        owner_pid: 0,
+                    },
+                );
+                inner.ui_context_by_session.insert(
+                    ui_session_id.into(),
+                    UiSessionContext {
+                        cwd: Some("/repo".into()),
+                        home: Some("/home/user".into()),
+                        project_root: Some("/repo".into()),
+                        sandbox_session_id: Some(sandbox_session_id.into()),
+                    },
+                );
+            }
+            inner
+                .session_allow
+                .entry("ui-a".into())
+                .or_default()
+                .insert(("api.example.com".into(), 443));
+        }
+
+        assert!(
+            store
+                .session_allowed(
+                    "api.example.com",
+                    443,
+                    MergeContext {
+                        paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                        ids: ProcessIds::default(),
+                        sandbox_session_id: Some("sandbox-a".into()),
+                    },
+                )
+                .await
+        );
+        assert!(
+            !store
+                .session_allowed(
+                    "api.example.com",
+                    443,
+                    MergeContext {
+                        paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                        ids: ProcessIds::default(),
+                        sandbox_session_id: Some("sandbox-b".into()),
+                    },
+                )
+                .await
         );
     }
 }

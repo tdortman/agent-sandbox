@@ -34,6 +34,7 @@ pub struct PendingElevation {
     pub home: Option<String>,
     pub project_root: Option<String>,
     pub request_pid: Option<u32>,
+    pub sandbox_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ pub struct PendingNetwork {
     pub home: Option<String>,
     pub project_root: Option<String>,
     pub request_pid: Option<u32>,
+    pub sandbox_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +62,7 @@ pub struct PendingFilesystem {
     pub home: Option<String>,
     pub project_root: Option<String>,
     pub request_pid: Option<u32>,
+    pub sandbox_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +139,14 @@ impl Pending {
             Self::Filesystem(p) => p.request_pid,
         }
     }
+
+    pub fn sandbox_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Elevation(p) => p.sandbox_session_id.as_deref(),
+            Self::Network(p) => p.sandbox_session_id.as_deref(),
+            Self::Filesystem(p) => p.sandbox_session_id.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +160,7 @@ pub(crate) struct UiSessionContext {
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
+    pub sandbox_session_id: Option<String>,
 }
 
 pub struct UiClientHandle {

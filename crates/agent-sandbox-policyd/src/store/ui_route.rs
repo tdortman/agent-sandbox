@@ -11,6 +11,7 @@ pub(crate) struct UiRoute {
     #[allow(dead_code)]
     pub home: Option<String>,
     pub project_root: Option<String>,
+    pub sandbox_session_id: Option<String>,
 }
 
 impl UiRoute {
@@ -26,11 +27,24 @@ impl UiRoute {
             cwd,
             home,
             project_root,
+            sandbox_session_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_sandbox_session(mut self, sandbox_session_id: Option<String>) -> Self {
+        self.sandbox_session_id = sandbox_session_id;
+        self
     }
 }
 
 fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
+    if let Some(route_session) = &route.sandbox_session_id {
+        return ui
+            .sandbox_session_id
+            .as_ref()
+            .is_some_and(|ui_session| ui_session == route_session);
+    }
     if let (Some(a), Some(b)) = (&ui.project_root, &route.project_root)
         && a == b
     {
@@ -108,6 +122,7 @@ mod tests {
             cwd: Some(cwd.into()),
             home: Some("/home/user".into()),
             project_root: Some(project_root.into()),
+            sandbox_session_id: None,
         }
     }
 
@@ -218,6 +233,32 @@ mod tests {
             &standalone_ctx,
             &route,
         ));
+    }
+
+    #[tokio::test]
+    async fn standalone_requires_matching_sandbox_session_when_present() {
+        let standalone = UiClient {
+            session_id: "ui1".into(),
+            ui_client: "standalone".into(),
+            writer: std::sync::Arc::new(tokio::sync::Mutex::new(
+                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+            )),
+            owner_uid: 1000,
+            owner_pid: 0,
+        };
+        let mut standalone_ctx = ctx("/repo", "/repo");
+        standalone_ctx.sandbox_session_id = Some("sandbox-a".into());
+        let route = UiRoute::new(None, Some("/repo".into()), None, Some("/repo".into()))
+            .with_sandbox_session(Some("sandbox-b".into()));
+        assert!(!ui_client_matches(
+            &standalone,
+            &standalone_ctx,
+            &route,
+            &[]
+        ));
+        let route = UiRoute::new(None, Some("/repo".into()), None, Some("/repo".into()))
+            .with_sandbox_session(Some("sandbox-a".into()));
+        assert!(ui_client_matches(&standalone, &standalone_ctx, &route, &[]));
     }
 
     #[tokio::test]

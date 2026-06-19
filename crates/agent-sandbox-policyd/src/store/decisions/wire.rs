@@ -31,11 +31,13 @@ impl PolicyStore {
             paths,
             session_id,
             owner_uid,
+            sandbox_session_id,
         } = wire;
         ScopeWire {
             paths: paths.merged_with(net.cwd.clone(), net.home.clone(), net.project_root.clone()),
             session_id,
             owner_uid,
+            sandbox_session_id: sandbox_session_id.or_else(|| net.sandbox_session_id.clone()),
         }
     }
 
@@ -47,6 +49,7 @@ impl PolicyStore {
             paths,
             session_id,
             owner_uid,
+            sandbox_session_id,
         } = wire;
         ScopeWire {
             paths: paths.merged_with(
@@ -56,6 +59,7 @@ impl PolicyStore {
             ),
             session_id,
             owner_uid,
+            sandbox_session_id: sandbox_session_id.or_else(|| elev.sandbox_session_id.clone()),
         }
     }
 
@@ -67,11 +71,13 @@ impl PolicyStore {
             paths,
             session_id,
             owner_uid,
+            sandbox_session_id,
         } = wire;
         ScopeWire {
             paths: paths.merged_with(fs.cwd.clone(), fs.home.clone(), fs.project_root.clone()),
             session_id,
             owner_uid,
+            sandbox_session_id: sandbox_session_id.or_else(|| fs.sandbox_session_id.clone()),
         }
     }
 

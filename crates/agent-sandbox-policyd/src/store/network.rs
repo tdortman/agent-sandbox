@@ -42,6 +42,7 @@ impl PolicyStore {
                     net.project_root.clone(),
                 ),
                 ids: ProcessIds::default(),
+                sandbox_session_id: net.sandbox_session_id.clone(),
             };
             let Some(source) = self.allow_source(&host, port, merge).await else {
                 continue;
@@ -86,6 +87,7 @@ impl PolicyStore {
         let cwd = resolved.paths.cwd_string();
         let home = resolved.paths.home_string();
         let project_root = resolved.paths.project_root_string();
+        let sandbox_session_id = resolved.sandbox_session_id.clone();
         if self.policy_denied(&policy_host, port, resolved).await {
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return CheckReply::denied("deny");
@@ -114,6 +116,7 @@ impl PolicyStore {
                     home: home.clone(),
                     project_root: project_root.clone(),
                     request_pid: wire_ids.pid().filter(|&p| p != 0),
+                    sandbox_session_id: sandbox_session_id.clone(),
                 }),
             );
         }
@@ -124,7 +127,8 @@ impl PolicyStore {
             cwd.clone(),
             home.clone(),
             project_root.clone(),
-        );
+        )
+        .with_sandbox_session(sandbox_session_id.clone());
         self.notify_ui(
             &route,
             &UiPush::NetworkRequest {
@@ -157,6 +161,7 @@ impl PolicyStore {
                 home: home.as_deref(),
                 cwd: cwd.as_deref(),
                 project_root: project_root.as_deref(),
+                sandbox_session_id: sandbox_session_id.as_deref(),
             };
             maybe_spawn_ui(
                 &self.args,

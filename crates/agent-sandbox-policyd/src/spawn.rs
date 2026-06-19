@@ -19,6 +19,7 @@ pub fn ui_spawn_env(
     home: Option<&str>,
     cwd: Option<&str>,
     project_root: Option<&str>,
+    sandbox_session_id: Option<&str>,
 ) -> HashMap<String, String> {
     let home_dir = home.map_or_else(|| user.dir.to_string_lossy().into_owned(), str::to_string);
     let mut env = HashMap::from([
@@ -40,6 +41,12 @@ pub fn ui_spawn_env(
         env.insert(
             "AGENT_SANDBOX_PROJECT_ROOT".into(),
             project_root.to_string(),
+        );
+    }
+    if let Some(sandbox_session_id) = sandbox_session_id {
+        env.insert(
+            "AGENT_SANDBOX_SESSION_ID".into(),
+            sandbox_session_id.to_string(),
         );
     }
     env.extend(graphical_session_env(uid, Some(&home_dir)));
@@ -87,8 +94,9 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     };
     let spawn_key = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         uid,
+        spawn.sandbox_session_id.unwrap_or(""),
         spawn.cwd.unwrap_or(""),
         spawn.project_root.unwrap_or("")
     );
@@ -110,7 +118,15 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     };
 
-    let env = ui_spawn_env(args, &user, uid, spawn.home, spawn.cwd, spawn.project_root);
+    let env = ui_spawn_env(
+        args,
+        &user,
+        uid,
+        spawn.home,
+        spawn.cwd,
+        spawn.project_root,
+        spawn.sandbox_session_id,
+    );
     let ui_log_path = format!("/run/user/{uid}/agent-sandbox-ui.log");
     let stderr = std::fs::OpenOptions::new()
         .create(true)
