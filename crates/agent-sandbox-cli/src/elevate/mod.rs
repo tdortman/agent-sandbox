@@ -38,9 +38,12 @@ pub async fn run() -> Result<(), ElevateCliError> {
     let pid = std::process::id();
     let uid = nix::unistd::getuid().as_raw();
 
+    let mut ctx = RequestContext::from((paths, ProcessIds::new(pid, uid)));
+    ctx.sandbox_session_id = std::env::var("AGENT_SANDBOX_SESSION_ID").ok();
+
     let req = RpcRequest::Elevate {
         argv: cli.argv,
-        ctx: RequestContext::from((paths, ProcessIds::new(pid, uid))),
+        ctx,
     };
 
     let resp = policy_rpc(&cli.socket, req, Duration::from_mins(2))

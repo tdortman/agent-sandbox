@@ -120,6 +120,9 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         cwd,
         home,
         ...(project_root ? { project_root } : {}),
+        ...(process.env.AGENT_SANDBOX_SESSION_ID
+          ? { sandbox_session_id: process.env.AGENT_SANDBOX_SESSION_ID }
+          : {}),
       },
     };
   }

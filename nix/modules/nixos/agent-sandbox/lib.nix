@@ -302,10 +302,12 @@ rec {
           _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
           [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
         fi
+        IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET "${policySocket}")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$PWD")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
       '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})

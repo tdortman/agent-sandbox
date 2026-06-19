@@ -33,25 +33,37 @@ struct Cli {
     home: Option<String>,
     #[arg(long, env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<String>,
+    #[arg(long, env = "AGENT_SANDBOX_SESSION_ID")]
+    sandbox_session_id: Option<String>,
 }
 
 pub async fn run() -> Result<(), UiCliError> {
     let cli = Cli::parse();
-    let paths = SandboxPaths::from_wire(cli.cwd, cli.home, cli.project_root);
-    UiClient::new(cli.socket, paths).run().await
+    let mut ctx = RequestContext::from(&SandboxPaths::from_wire(
+        cli.cwd,
+        cli.home,
+        cli.project_root,
+    ));
+    ctx.sandbox_session_id = cli.sandbox_session_id;
+    let paths = ctx.sandbox_paths();
+    UiClient::new(cli.socket, paths, ctx.sandbox_session_id)
+        .run()
+        .await
 }
 
 struct UiClient {
     socket: PathBuf,
     paths: SandboxPaths,
+    sandbox_session_id: Option<String>,
     session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl UiClient {
-    fn new(socket: PathBuf, paths: SandboxPaths) -> Self {
+    fn new(socket: PathBuf, paths: SandboxPaths, sandbox_session_id: Option<String>) -> Self {
         Self {
             socket,
             paths,
+            sandbox_session_id,
             session_id: Arc::new(Mutex::new(None)),
         }
     }
@@ -67,9 +79,11 @@ impl UiClient {
 
     async fn session(&self) -> Result<(), UiCliError> {
         let mut conn = RpcConnection::connect(&self.socket).await?;
+        let mut ctx = RequestContext::from(&self.paths);
+        ctx.sandbox_session_id.clone_from(&self.sandbox_session_id);
         conn.write_request(&RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
-            ctx: RequestContext::from(&self.paths),
+            ctx,
         })
         .await?;
 

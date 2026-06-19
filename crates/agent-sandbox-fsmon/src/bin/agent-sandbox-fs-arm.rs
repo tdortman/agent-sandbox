@@ -56,15 +56,17 @@ fn main() {
     let cwd = std::env::var("AGENT_SANDBOX_CWD").ok();
     let home = std::env::var("AGENT_SANDBOX_HOME").ok();
     let project_root = std::env::var("AGENT_SANDBOX_PROJECT_ROOT").ok();
+    let sandbox_session_id = std::env::var("AGENT_SANDBOX_SESSION_ID").ok();
     let socket_path = std::env::var("AGENT_SANDBOX_POLICY_SOCKET")
         .unwrap_or_else(|_| "/run/agent-sandbox/policy.sock".to_owned());
 
     let ctx = RequestContext {
-        cwd: cwd.clone(),
+        cwd,
         home: home.clone(),
-        project_root,
+        project_root: project_root.clone(),
         pid: None,
         uid: None,
+        sandbox_session_id,
     };
 
     // Parse static allow rules from environment (set by Nix wrapper).

@@ -451,6 +451,7 @@ fn main() {
         project_root: cli.project_root,
         pid: None,
         uid: None,
+        sandbox_session_id: std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
     };
 
     // Read static allow rules from environment (set by policyd).
