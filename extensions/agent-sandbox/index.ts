@@ -5,9 +5,7 @@ import { type ApprovalScope, policyRpc } from "./policy-client";
 
 type ApprovalTarget =
   | { kind: "network_host"; host: string }
-  | { kind: "sudo_command"; argv: string[] }
-  | { kind: "filesystem_path"; path: string };
-
+  | { kind: "sudo_command"; argv: string[] };
 type ScopeOption = {
   label: string;
   scope: ApprovalScope;
@@ -36,17 +34,6 @@ type ElevationRequest = {
   home?: string;
   project_root?: string;
 };
-
-type FilesystemRequest = {
-  type: "filesystem_request";
-  id: string;
-  path: string;
-  access: "read" | "write" | "read_write" | "execute" | "all";
-  cwd?: string;
-  home?: string;
-  project_root?: string;
-};
-
 const ACTION_OPTIONS = ["Allow", "Deny"] as const;
 
 const DEFAULT_SOCKET = "/run/agent-sandbox/policy.sock";
@@ -163,40 +150,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     }
     return patterns;
   }
-
-  function filesystemApprovalPaths(path: string, home?: string): string[] {
-    const norm = path.replace(/\/+$/, "");
-    if (!norm) return ["/"];
-    const seen = new Set<string>();
-    const result: string[] = [];
-    let current = norm;
-    while (current) {
-      if (!seen.has(current)) {
-        seen.add(current);
-        result.push(current);
-      }
-      if (home && current === home.replace(/\/+$/, "")) break;
-      const slashIdx = current.lastIndexOf("/");
-      if (slashIdx <= 0) {
-        // Reached root
-        if (slashIdx === 0 && !seen.has("/")) {
-          result.push("/");
-          seen.add("/");
-        }
-        break;
-      }
-      const parent = current.substring(0, slashIdx);
-      if (seen.has(parent)) break;
-      // Stop at home (include it)
-      if (home && parent === home.replace(/\/+$/, "")) {
-        result.push(parent);
-        break;
-      }
-      current = parent;
-    }
-    return result;
-  }
-
   function sudoApprovalPrefixes(argv: string[]): string[][] {
     const prefixes: string[][] = [];
     for (let length = argv.length; length >= 1; length -= 1) {
@@ -208,16 +161,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
   function formatSudoCommand(argv: string[]): string {
     return argv.length > 0 ? `sudo ${argv.join(" ")}` : "sudo";
   }
-
-  function formatAccess(access: string): string {
-    switch (access) {
-      case "read_write":
-        return "read/write";
-      default:
-        return access;
-    }
-  }
-
   function scopeLabel(scope: ApprovalScope): string {
     switch (scope) {
       case "once":
@@ -249,20 +192,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     }));
   }
 
-  function filesystemTargetOptions(
-    path: string,
-    access: FilesystemRequest["access"],
-    home: string | undefined,
-    scope: ApprovalScope,
-  ): ScopeOption[] {
-    const levels = filesystemApprovalPaths(path, home);
-    return levels.map((level) => ({
-      label: `${level} (${access})`,
-      scope,
-      target: { kind: "filesystem_path" as const, path: level },
-    }));
-  }
-
   function notifyPrompt(ctx: ExtensionContext, title: string, body: string): void {
     const hasDisplay =
       process.env.DISPLAY !== undefined ||
@@ -282,8 +211,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       },
     );
   }
-
-
   function sudoScopeOptions(
     argv: string[],
     sessionAvailable: boolean,
@@ -332,10 +259,8 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     );
     return options.find((option) => option.label === choice);
   }
-
-
   async function submitDecision(
-    req: NetworkRequest | ElevationRequest | FilesystemRequest,
+    req: NetworkRequest | ElevationRequest,
     action: PromptAction,
     choice: ScopeOption,
     ctx: ExtensionContext,
@@ -451,48 +376,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     if (!choice) return;
     await submitDecision(req, action, choice, ctx);
   }
-
-  async function handleFilesystemRequest(
-    req: FilesystemRequest,
-    ctx: ExtensionContext,
-  ): Promise<void> {
-    notifyPrompt(
-      ctx,
-      "agent-sandbox: Filesystem request",
-      `Allow ${formatAccess(req.access)} access to ${req.path}?`,
-    );
-
-    const action = await chooseAction(
-      `agent-sandbox: ${formatAccess(req.access)} ${req.path}`,
-      ctx,
-    );
-    if (!action) return;
-
-    const scope = await chooseScopeOption(
-      `agent-sandbox: ${action} filesystem scope?`,
-      scopeOnlyOptions(policySessionId !== null),
-      ctx,
-    );
-    if (!scope) return;
-
-    const target = scope.scope === "once"
-      ? undefined
-      : await chooseScopeOption(
-          `agent-sandbox: ${action} filesystem target?`,
-          filesystemTargetOptions(req.path, req.access, req.home ?? home, scope.scope),
-          ctx,
-        );
-    if (scope.scope !== "once" && !target) return;
-
-    const choice: ScopeOption = {
-      label: "",
-      scope: scope.scope,
-      target: target?.target,
-    };
-    await submitDecision(req, action, choice, ctx);
-  }
-
-
   function onPolicyMessage(line: string, ctx: ExtensionContext): void {
     let msg: Record<string, unknown>;
     try {
@@ -504,8 +387,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       void handleNetworkRequest(msg as NetworkRequest, ctx);
     } else if (msg.type === "elevation_request") {
       void handleElevation(msg as ElevationRequest, ctx);
-    } else if (msg.type === "filesystem_request") {
-      void handleFilesystemRequest(msg as FilesystemRequest, ctx);
     }
   }
 
