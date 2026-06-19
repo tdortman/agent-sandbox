@@ -196,11 +196,14 @@ rec {
       dynamicFs = fsArmPkg != null;
 
       staticAllowRules =
-        lib.lists.forEach (readonlyDirs ++ readwriteDirs ++ readonlyFiles ++ readwriteFiles)
-          (path: {
-            inherit path;
-            access = "all";
-          });
+        (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
+          inherit path;
+          access = "read";
+        }))
+        ++ (lib.lists.forEach (readwriteDirs ++ readwriteFiles) (path: {
+          inherit path;
+          access = "read_write";
+        }));
       staticAllowJson = builtins.toJSON staticAllowRules;
       staticAllowJsonArg = lib.escapeShellArg staticAllowJson;
 

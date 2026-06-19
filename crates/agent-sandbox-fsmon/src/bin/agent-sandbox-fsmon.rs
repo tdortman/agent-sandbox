@@ -7,6 +7,7 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::{fs, io, process};
 
@@ -135,13 +136,16 @@ fn fanotify_init() -> io::Result<i32> {
 
 /// Add a fanotify mark on a mount point path.
 ///
-/// Returns the mask that was actually applied (may be trimmed if the kernel
-/// does not support FAN_PRE_ACCESS).
+/// Returns the mask that was actually applied. Kernels with
+/// `FAN_PRE_ACCESS` support can classify regular file content access from
+/// the target process fd. Older kernels fall back to conservative open
+/// permission events.
 fn fanotify_mark(fan_fd: i32, path: &CStr, try_pre_access: bool) -> io::Result<u64> {
-    let mut mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
-    if try_pre_access {
-        mask |= FAN_PRE_ACCESS;
-    }
+    let mask = if try_pre_access {
+        FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM | FAN_PRE_ACCESS
+    } else {
+        FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM
+    };
 
     let ret = unsafe {
         libc::syscall(
@@ -222,15 +226,89 @@ fn resolve_event_path(event_fd: i32) -> io::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+fn open_flags_to_access(flags: i32) -> FileAccess {
+    match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => FileAccess::Read,
+        libc::O_WRONLY => FileAccess::Write,
+        _ => FileAccess::ReadWrite,
+    }
+}
+
+fn combine_access(left: FileAccess, right: FileAccess) -> FileAccess {
+    if left == right {
+        return left;
+    }
+    if left == FileAccess::All || right == FileAccess::All {
+        return FileAccess::All;
+    }
+    if left == FileAccess::ReadWrite || right == FileAccess::ReadWrite {
+        return FileAccess::ReadWrite;
+    }
+    if matches!(
+        (left, right),
+        (FileAccess::Read, FileAccess::Write) | (FileAccess::Write, FileAccess::Read)
+    ) {
+        return FileAccess::ReadWrite;
+    }
+    FileAccess::All
+}
+
+fn fdinfo_flags(pid: i32, fd_name: &str) -> io::Result<i32> {
+    let content = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd_name}"))?;
+    let flags = content
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing fdinfo flags"))?
+        .trim();
+    i32::from_str_radix(flags, 8).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn process_fd_access(pid: i32, event_fd: i32) -> Option<FileAccess> {
+    if pid <= 0 {
+        return None;
+    }
+    let event_meta = fs::metadata(format!("/proc/self/fd/{event_fd}")).ok()?;
+    let dir = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let mut access = None;
+    for entry in dir.flatten() {
+        let fd_name = entry.file_name();
+        let Some(fd_name) = fd_name.to_str() else {
+            continue;
+        };
+        let Ok(meta) = fs::metadata(entry.path()) else {
+            continue;
+        };
+        if meta.dev() != event_meta.dev() || meta.ino() != event_meta.ino() {
+            continue;
+        }
+        let Ok(flags) = fdinfo_flags(pid, fd_name) else {
+            continue;
+        };
+        let fd_access = open_flags_to_access(flags);
+        access = Some(access.map_or(fd_access, |current| combine_access(current, fd_access)));
+        if access == Some(FileAccess::ReadWrite) {
+            return access;
+        }
+    }
+    access
+}
+
+fn event_fd_is_regular_file(event_fd: i32) -> bool {
+    fs::metadata(format!("/proc/self/fd/{event_fd}")).is_ok_and(|meta| meta.is_file())
+}
+
 /// Translate a fanotify event mask to the corresponding `FileAccess`.
-fn mask_to_access(mask: u64) -> FileAccess {
+fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
     if mask & FAN_OPEN_EXEC_PERM != 0 {
         return FileAccess::Execute;
     }
-    // FAN_OPEN_PERM covers both read and write intends.
-    // fanotify does not expose the original open flags, so we are
-    // conservative and treat it as ReadWrite.
-    if mask & (FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_ACCESS_PERM) != 0 {
+    if mask & FAN_PRE_ACCESS != 0 {
+        return process_fd_access(pid, event_fd).unwrap_or(FileAccess::ReadWrite);
+    }
+    if mask & FAN_ACCESS_PERM != 0 {
+        return FileAccess::Read;
+    }
+    if mask & FAN_OPEN_PERM != 0 {
         return FileAccess::ReadWrite;
     }
     FileAccess::All
@@ -289,7 +367,7 @@ fn main() {
         .map(Path::to_path_buf);
 
     // Mark each mount point, skipping synthetic filesystem types.
-    let mut pre_access_supported = true;
+    let mut saw_pre_access_mark = false;
     let mut home_covered = false;
 
     for mount in &mounts {
@@ -316,13 +394,13 @@ fn main() {
 
         let mp_cstr =
             CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
-        match fanotify_mark(fan_fd, &mp_cstr, pre_access_supported) {
+        match fanotify_mark(fan_fd, &mp_cstr, true) {
             Ok(actual_mask) => {
-                pre_access_supported = actual_mask & FAN_PRE_ACCESS != 0;
+                saw_pre_access_mark |= actual_mask & FAN_PRE_ACCESS != 0;
                 if home_covering_mount.as_deref() == Some(mount.mount_point.as_path()) {
                     home_covered = true;
                 }
-                tracing::debug!(path = %mount.mount_point.display(), "marked mountpoint");
+                tracing::debug!(path = %mount.mount_point.display(), mask = %format_args!("{actual_mask:x}"), "marked mountpoint");
             }
             Err(e) => {
                 // Non-synthetic mounts at or under --home must be successfully
@@ -423,6 +501,14 @@ fn main() {
                     offset += event_len;
                     continue;
                 }
+                if saw_pre_access_mark
+                    && meta.mask & FAN_ACCESS_PERM != 0
+                    && event_fd_is_regular_file(meta.fd)
+                {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
                 // Resolve the path from the event fd.
                 let Ok(path) = resolve_event_path(meta.fd) else {
                     // Cannot resolve, allow by default.
@@ -430,7 +516,7 @@ fn main() {
                     offset += event_len;
                     continue;
                 };
-                let access = mask_to_access(meta.mask);
+                let access = mask_to_access(meta.mask, meta.fd, meta.pid);
 
                 // Auto-allow events outside the home directory.
                 if let Some(home) = &home {
@@ -485,5 +571,51 @@ fn respond(fan_fd: i32, event_fd: i32, response: u32) {
         let resp_ptr = (&raw const resp).cast::<libc::c_void>();
         libc::write(fan_fd, resp_ptr, size_of::<FanotifyResponse>());
         libc::close(event_fd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_flags_map_to_granular_access() {
+        assert_eq!(open_flags_to_access(libc::O_RDONLY), FileAccess::Read);
+        assert_eq!(open_flags_to_access(libc::O_WRONLY), FileAccess::Write);
+        assert_eq!(open_flags_to_access(libc::O_RDWR), FileAccess::ReadWrite);
+        assert_eq!(
+            open_flags_to_access(libc::O_RDWR | libc::O_APPEND),
+            FileAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn mask_to_access_prefers_exec_and_read_events() {
+        assert_eq!(
+            mask_to_access(FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM, -1, -1),
+            FileAccess::Execute
+        );
+        assert_eq!(mask_to_access(FAN_ACCESS_PERM, -1, -1), FileAccess::Read);
+        assert_eq!(mask_to_access(FAN_OPEN_PERM, -1, -1), FileAccess::ReadWrite);
+    }
+
+    #[test]
+    fn pre_access_without_fd_flags_stays_conservative() {
+        assert_eq!(
+            mask_to_access(FAN_PRE_ACCESS, -1, -1),
+            FileAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn combine_read_and_write_becomes_read_write() {
+        assert_eq!(
+            combine_access(FileAccess::Read, FileAccess::Write),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            combine_access(FileAccess::Read, FileAccess::Execute),
+            FileAccess::All
+        );
     }
 }
