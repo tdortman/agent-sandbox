@@ -36,6 +36,23 @@ impl FileAccess {
             _ => self == requested,
         }
     }
+
+    /// Smallest policy access that covers both access levels.
+    #[must_use]
+    pub fn union(self, other: FileAccess) -> Self {
+        if self.covers(other) {
+            self
+        } else if other.covers(self) {
+            other
+        } else if matches!(
+            (self, other),
+            (Self::Read, Self::Write) | (Self::Write, Self::Read)
+        ) {
+            Self::ReadWrite
+        } else {
+            Self::All
+        }
+    }
 }
 
 impl std::fmt::Display for FileAccess {
@@ -333,6 +350,23 @@ mod tests {
         assert!(FileAccess::Read.covers(FileAccess::Read));
     }
 
+    #[test]
+    fn file_access_union_uses_smallest_covering_access() {
+        assert_eq!(FileAccess::Read.union(FileAccess::Read), FileAccess::Read);
+        assert_eq!(
+            FileAccess::Read.union(FileAccess::Write),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            FileAccess::ReadWrite.union(FileAccess::Read),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            FileAccess::ReadWrite.union(FileAccess::Execute),
+            FileAccess::All
+        );
+        assert_eq!(FileAccess::All.union(FileAccess::Read), FileAccess::All);
+    }
     #[test]
     fn filesystem_rule_matches_exact_path() {
         let rule = FilesystemRule::new("/home", FileAccess::Read, "");
