@@ -5,7 +5,7 @@ use std::path::Path;
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, NetworkRule, ProjectPolicyContext, SudoRule, atomic_write_policy,
-    load_policy, normalize_host,
+    contract_home_path, load_policy, normalize_host,
 };
 
 use super::types::PolicyStore;
@@ -18,6 +18,60 @@ fn network_sort_key(host: &str, port: u16) -> (Vec<String>, u16) {
     let mut labels: Vec<String> = host.split('.').map(str::to_lowercase).collect();
     labels.reverse();
     (labels, port)
+}
+
+fn filesystem_path_key(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && path.starts_with('/') {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn upsert_filesystem_rule(
+    rules: &mut Vec<FilesystemRule>,
+    rule_path: &str,
+    access: FileAccess,
+    label: &str,
+) {
+    let key = filesystem_path_key(rule_path);
+    let mut merged_access = access;
+    let mut insert_index = None;
+    let mut retained = Vec::with_capacity(rules.len() + 1);
+
+    for rule in rules.drain(..) {
+        if filesystem_path_key(&rule.path) == key {
+            merged_access = merged_access.union(rule.access);
+            insert_index.get_or_insert(retained.len());
+        } else {
+            retained.push(rule);
+        }
+    }
+
+    let rule = FilesystemRule::new(rule_path, merged_access, label);
+    if let Some(index) = insert_index {
+        retained.insert(index, rule);
+    } else {
+        retained.push(rule);
+    }
+    *rules = retained;
+}
+
+fn remove_filesystem_rule(rules: &mut Vec<FilesystemRule>, rule_path: &str, access: FileAccess) {
+    let key = filesystem_path_key(rule_path);
+    rules.retain(|rule| filesystem_path_key(&rule.path) != key || rule.access != access);
+}
+
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&str>) -> (String, FileAccess) {
+    (
+        contract_home_path(&filesystem_path_key(&rule.path), home),
+        rule.access,
+    )
+}
+
+fn sort_filesystem_rules(rules: &mut [FilesystemRule], home: Option<&str>) {
+    rules.sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
 }
 
 impl PolicyStore {
@@ -147,38 +201,15 @@ impl PolicyStore {
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         let mut policy = load_policy(path, home);
-        let key = (rule_path.trim_end_matches('/').to_owned(), access);
-        let mut allow: BTreeMap<(String, FileAccess), FilesystemRule> = policy
-            .filesystem
-            .allow
-            .iter()
-            .map(|rule| {
-                (
-                    (rule.path.trim_end_matches('/').to_owned(), rule.access),
-                    rule.clone(),
-                )
-            })
-            .collect();
-        let mut deny: BTreeMap<(String, FileAccess), FilesystemRule> = policy
-            .filesystem
-            .deny
-            .iter()
-            .map(|rule| {
-                (
-                    (rule.path.trim_end_matches('/').to_owned(), rule.access),
-                    rule.clone(),
-                )
-            })
-            .collect();
         if allow_rule {
-            allow.insert(key.clone(), FilesystemRule::new(rule_path, access, label));
-            deny.remove(&key);
+            upsert_filesystem_rule(&mut policy.filesystem.allow, rule_path, access, label);
+            remove_filesystem_rule(&mut policy.filesystem.deny, rule_path, access);
         } else {
-            deny.insert(key.clone(), FilesystemRule::new(rule_path, access, label));
-            allow.remove(&key);
+            upsert_filesystem_rule(&mut policy.filesystem.deny, rule_path, access, label);
+            remove_filesystem_rule(&mut policy.filesystem.allow, rule_path, access);
         }
-        policy.filesystem.allow = allow.into_values().collect();
-        policy.filesystem.deny = deny.into_values().collect();
+        sort_filesystem_rules(&mut policy.filesystem.allow, home);
+        sort_filesystem_rules(&mut policy.filesystem.deny, home);
         atomic_write_policy(path, &policy, home, owner_uid)
     }
 
@@ -203,7 +234,7 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
-    use agent_sandbox_core::load_policy;
+    use agent_sandbox_core::{FileAccess, load_policy};
 
     #[test]
     fn persisted_network_rules_are_sorted_by_domain_hierarchy() {
@@ -326,6 +357,161 @@ mod tests {
                     "restart".to_string(),
                     "nginx".to_string()
                 ][..]
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_allow_upgrades_existing_path_access_in_place() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-sandbox-fs-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+
+        PolicyStore::persist_filesystem_rule(
+            &policy_path,
+            "/home/user/.gtkrc-2.0",
+            FileAccess::Read,
+            "project",
+            true,
+            Some("/home/user"),
+            None,
+        )
+        .unwrap();
+        PolicyStore::persist_filesystem_rule(
+            &policy_path,
+            "/home/user/.gtkrc-2.0",
+            FileAccess::Write,
+            "project",
+            true,
+            Some("/home/user"),
+            None,
+        )
+        .unwrap();
+
+        let policy = load_policy(&policy_path, Some("/home/user"));
+        assert_eq!(policy.filesystem.allow.len(), 1);
+        assert_eq!(policy.filesystem.allow[0].path, "/home/user/.gtkrc-2.0");
+        assert_eq!(policy.filesystem.allow[0].access, FileAccess::ReadWrite);
+        let raw = std::fs::read_to_string(&policy_path).unwrap();
+        assert_eq!(raw.matches("\"path\"").count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_allow_upgrades_read_write_and_execute_to_all() {
+        let dir = std::env::temp_dir().join(format!("agent-sandbox-fs-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+
+        PolicyStore::persist_filesystem_rule(
+            &policy_path,
+            "/home/user/bin/tool",
+            FileAccess::ReadWrite,
+            "project",
+            true,
+            Some("/home/user"),
+            None,
+        )
+        .unwrap();
+        PolicyStore::persist_filesystem_rule(
+            &policy_path,
+            "/home/user/bin/tool",
+            FileAccess::Execute,
+            "project",
+            true,
+            Some("/home/user"),
+            None,
+        )
+        .unwrap();
+
+        let policy = load_policy(&policy_path, Some("/home/user"));
+        assert_eq!(policy.filesystem.allow.len(), 1);
+        assert_eq!(policy.filesystem.allow[0].access, FileAccess::All);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_deny_upgrades_existing_path_access_in_place() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-sandbox-fs-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+
+        PolicyStore::persist_filesystem_rule(
+            &policy_path,
+            "/home/user/secrets.txt",
+            FileAccess::Read,
+            "project",
+            false,
+            Some("/home/user"),
+            None,
+        )
+        .unwrap();
+        PolicyStore::persist_filesystem_rule(
+            &policy_path,
+            "/home/user/secrets.txt",
+            FileAccess::Write,
+            "project",
+            false,
+            Some("/home/user"),
+            None,
+        )
+        .unwrap();
+
+        let policy = load_policy(&policy_path, Some("/home/user"));
+        assert_eq!(policy.filesystem.deny.len(), 1);
+        assert_eq!(policy.filesystem.deny[0].path, "/home/user/secrets.txt");
+        assert_eq!(policy.filesystem.deny[0].access, FileAccess::ReadWrite);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_filesystem_rules_are_sorted_by_home_relative_path() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-sandbox-fs-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+
+        for path in [
+            "/home/user/dotfiles/home/dot_omp/private_agent/config.yml",
+            "/home/user/.codex/config.toml",
+            "/home/user/dotfiles/home/dot_config/opencode/opencode.json",
+            "/home/user/dotfiles/.gitignore",
+            "/home/user/.cache/bun",
+        ] {
+            PolicyStore::persist_filesystem_rule(
+                &policy_path,
+                path,
+                FileAccess::Read,
+                "global",
+                true,
+                Some("/home/user"),
+                None,
+            )
+            .unwrap();
+        }
+
+        let policy = load_policy(&policy_path, Some("/home/user"));
+        let paths: Vec<&str> = policy
+            .filesystem
+            .allow
+            .iter()
+            .map(|rule| rule.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/home/user/.cache/bun",
+                "/home/user/.codex/config.toml",
+                "/home/user/dotfiles/.gitignore",
+                "/home/user/dotfiles/home/dot_config/opencode/opencode.json",
+                "/home/user/dotfiles/home/dot_omp/private_agent/config.yml",
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
