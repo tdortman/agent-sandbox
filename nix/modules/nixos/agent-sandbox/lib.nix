@@ -130,9 +130,6 @@ let
     ++ lib.optionals (network != null) [
       (if dynamicFs then c.agent-sandbox-restricted-net-dynamic else agent-sandbox-restricted-net)
     ]
-    ++ lib.optionals (network != null && (network.injectProxyEnv or false)) [
-      (agent-sandbox-proxy network.proxyUrl)
-    ]
     ++ lib.optionals (sudoGuard != null) [
       (agent-sandbox-sudo-guard sudoGuard)
     ]
@@ -278,9 +275,6 @@ rec {
           "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
         else
           "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
-      proxyFlags =
-        lib.optionalString (hasNetwork && (network.injectProxyEnv or false))
-          "--setenv HTTP_PROXY ${network.proxyUrl} --setenv HTTPS_PROXY ${network.proxyUrl} --setenv ALL_PROXY ${network.proxyUrl} --setenv http_proxy ${network.proxyUrl} --setenv https_proxy ${network.proxyUrl} --setenv NO_PROXY 127.0.0.1,169.254.100.1,localhost,::1";
       dnsScript = lib.optionalString hasNetwork ''
         if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
           _real_ns=$(readlink -f /etc/nsswitch.conf 2>/dev/null) || _real_ns=""
@@ -289,12 +283,22 @@ rec {
           fi
         fi
         if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
+          # The resolved symlink target may be inside /run (tmpfs in bwrap).
+          # Write a temp file and bind-mount to the resolved path, creating
+          # the parent directory first so the mount point exists.
+          _asbx_resolv_tmp=$(mktemp)
+          cp /etc/agent-sandbox/resolv.conf "$_asbx_resolv_tmp"
           _real_resolv=$(readlink -f /etc/resolv.conf 2>/dev/null) || _real_resolv=""
           if [[ -n "$_real_resolv" ]]; then
-            RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf "$_real_resolv")
+            mkdir -p "$(dirname "$_real_resolv")"
+            RUNTIME_ARGS+=(--ro-bind "$_asbx_resolv_tmp" "$_real_resolv")
           fi
         fi
+        if [[ -d /run/nscd ]]; then
+          RUNTIME_ARGS+=(--tmpfs /run/nscd)
+        fi
       '';
+
       policyScript = lib.optionalString (policyContext && policySocket != null) ''
         _agent_sandbox_home=$(readlink -f "$HOME")
         _agent_sandbox_project_root="$PWD"
@@ -396,7 +400,6 @@ rec {
             ${namespaceFlags} \
             --new-session --die-with-parent \
             ${extraBwrapStr} \
-            ${proxyFlags} \
             --setenv TERM "''${TERM:-xterm}" \
             --setenv PATH "${sandboxPathStr}:$PATH" \
             --setenv LANG "''${LANG:-C.UTF-8}" \

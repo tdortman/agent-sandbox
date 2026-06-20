@@ -122,9 +122,7 @@ let
     if cfg.network.enable then
       {
         netnsName = cfg.network.netnsName;
-        proxyUrl = cfg.network.proxyUrl;
         netnsEnter = "${config.security.wrapperDir}/agent-sandbox-enter";
-        injectProxyEnv = cfg.network.injectProxyEnv;
       }
     else
       null;
@@ -229,26 +227,17 @@ in
     };
 
     network = {
-      enable = lib.mkEnableOption "deny-by-default network via netns + policy proxy";
+      enable = lib.mkEnableOption "deny-by-default network via netns + NFQUEUE policy enforcement";
 
       netnsName = lib.mkOption {
         type = lib.types.str;
         default = "agent-sandbox";
       };
 
-      proxyUrl = lib.mkOption {
-        type = lib.types.str;
-        default = "http://127.0.0.1:17888";
-        description = "Forced HTTP CONNECT proxy URL injected into wrapped agents.";
-      };
-
-      proxyAddress = lib.mkOption {
-        type = lib.types.str;
-        default = "127.0.0.1:17888";
-        description = ''
-          host:port where the policy proxy listens inside the ``agent-sandbox`` netns.
-          Loopback keeps nftables DNAT and ``SO_ORIGINAL_DST`` in the same namespace.
-        '';
+      queueNumber = lib.mkOption {
+        type = lib.types.int;
+        default = 0;
+        description = "NFQUEUE number used by nftables and agent-sandbox-nfq.";
       };
 
       hostIp = lib.mkOption {
@@ -266,6 +255,21 @@ in
       vethNetns = lib.mkOption {
         type = lib.types.str;
         default = "asbx-ns";
+      };
+      hostIp6 = lib.mkOption {
+        type = lib.types.str;
+        default = "fd00:dead:beef::1";
+        description = "IPv6 host-side veth address (stable ULA).";
+      };
+      netnsIp6 = lib.mkOption {
+        type = lib.types.str;
+        default = "fd00:dead:beef::2";
+        description = "IPv6 netns-side veth address (stable ULA).";
+      };
+      netnsIp6Prefix = lib.mkOption {
+        type = lib.types.int;
+        default = 64;
+        description = "IPv6 prefix length for the veth link (ULA /64 for SLAAC compatibility).";
       };
 
       declarativeAllow = lib.mkOption {
@@ -460,32 +464,14 @@ in
         default = [ ];
       };
 
-      transparentRedirect = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          DNAT outbound TCP 80/443 in the sandbox netns to the policy proxy.
-          Apps do not need to honor HTTP_PROXY; the proxy learns the real destination
-          via SO_ORIGINAL_DST and tunnels after policy approval.
-        '';
-      };
-
-      injectProxyEnv = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          Set HTTP_PROXY/HTTPS_PROXY for clients that support explicit proxies.
-          Transparent redirect remains the enforcement path when enabled.
-        '';
-      };
-
       policyTimeout = lib.mkOption {
         type = lib.types.float;
-        default = 35.0;
+        default = 305.0;
         description = ''
-          Max seconds the policy proxy waits for policyd per connection check.
-          When interactive approval is enabled, the proxy uses at least
-          ``agent-sandbox.policy.approvalTimeout`` so blocking prompts can complete.
+          Max seconds the NFQUEUE daemon waits for policyd per transport-layer
+          connection check. Should exceed ``agent-sandbox.policy.approvalTimeout``
+          so that policyd's own timeout fires first. When interactive approval
+          is enabled, the NFQUEUE daemon uses at least ``approvalTimeout``.
         '';
       };
 
@@ -493,9 +479,8 @@ in
         type = lib.types.str;
         default = "127.0.0.53:53";
         description = ''
-          Host resolver the veth-gateway DNS proxy forwards to.
-          Use the systemd-resolved stub (127.0.0.53:53) so sandboxes inherit host
-          resolver behavior (split DNS, VPN, NextDNS, etc.). Sandboxes use nameserver 169.254.100.1.
+          DNS target for the host NAT route_localnet check. The DNS forwarder
+          runs inside the netns on 127.0.0.53:53 and forwards to 1.1.1.1:53.
         '';
       };
     };

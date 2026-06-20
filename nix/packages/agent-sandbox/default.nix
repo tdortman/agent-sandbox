@@ -37,7 +37,7 @@ rustPlatform.buildRustPackage (
     '';
 
     meta = with lib; {
-      description = "Policy daemon, proxy, DNS cache, CLIs, netns enter helper, and kdialog-wrapped UI";
+      description = "Policy daemon, NFQUEUE enforcer, DNS cache, CLIs, netns enter helper, and kdialog-wrapped UI";
       license = licenses.mit;
     };
   }

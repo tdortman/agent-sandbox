@@ -15,10 +15,6 @@ let
   sandboxPkg = flake.package "agent-sandbox";
   policyPkg = sandboxPkg;
   enterBin = sandboxPkg;
-  proxy = cfg.proxyAddress;
-  proxyParts = lib.splitString ":" proxy;
-  proxyHost = builtins.elemAt proxyParts 0;
-  proxyPort = builtins.elemAt proxyParts 1;
 
   dnsTargetHost =
     let
@@ -26,8 +22,8 @@ let
     in
     if builtins.length parts > 1 then builtins.elemAt parts 0 else cfg.dnsForwardTarget;
 
-  # Sandboxes cannot reach 127.0.0.53 (host stub). They query the veth gateway;
-  # agent-sandbox-dns-proxy forwards to dnsForwardTarget (systemd-resolved on NixOS).
+  # Sandboxes query the veth gateway for DNS. The forwarder resolves via
+  # getaddrinfo (libc resolver), inheriting all host DNS config.
   resolvConfText = ''
     nameserver ${cfg.hostIp}
     options edns0 trust-ad
@@ -39,24 +35,62 @@ let
     networks: files
   '';
 
-  # agent-sandbox-proxy runs as root in the netns; exclude root from DNAT and allow egress.
+  # The DNS forwarder runs on the host and listens on the veth gateway. It
+  # resolves via libc (inheriting host DNS, including DoT) and writes IP to
+  # hostname mappings to a shared cache file before responding.
+  #
+  # DNS responses must NOT be queued to NFQUEUE. NFQUEUE is single-threaded
+  # and blocks during policy checks (up to approval_timeout). If DNS
+  # responses were queued on the output hook, they would stall behind any
+  # pending policy check, breaking name resolution for every new hostname.
+  #
+  # There is no allow fast-path. NFQUEUE handles policy-bound TCP SYN and
+  # UDP packets. Denied destinations get a short reject-set entry only so
+  # client calls fail quickly instead of retrying until TCP timeout.
+  # Loopback, established/related conntrack entries, DNS traffic to the
+  # forwarder, and transient reject entries bypass NFQUEUE.
   nftRules = ''
     table inet agent_sandbox {
-      ${lib.optionalString cfg.transparentRedirect ''
-        chain prerouting {
-          type nat hook output priority -100; policy accept;
-          tcp dport { 80, 443 } ip daddr != ${proxyHost} meta skuid != 0 dnat ip to ${proxyHost}:${proxyPort}
-        }
-      ''}
+      # Transient reject sets for denied destinations.
+      # NFQ adds these on deny verdicts (dynamic, auto-expire).
+      set reject_v4 {
+        type ipv4_addr . inet_service;
+        flags dynamic, timeout;
+        size 65535;
+        policy performance;
+        timeout 10s;
+      }
+      set reject_v6 {
+        type ipv6_addr . inet_service;
+        flags dynamic, timeout;
+        size 65535;
+        policy performance;
+        timeout 10s;
+      }
+
       chain output {
         type filter hook output priority 0; policy drop;
         ct state established,related accept
-        meta skuid 0 accept
-        ip daddr ${proxyHost} tcp dport ${proxyPort} accept
+        # Loopback and DNS traffic to the forwarder bypass NFQUEUE
         ip daddr 127.0.0.0/8 accept
-        ip daddr ${cfg.hostIp} tcp dport 53 accept
         ip daddr ${cfg.hostIp} udp dport 53 accept
-        udp dport 443 drop
+        ip daddr ${cfg.hostIp} tcp dport 53 accept
+        ip6 daddr ::1 accept
+        ip6 daddr ${cfg.hostIp6} udp dport 53 accept
+        ip6 daddr ${cfg.hostIp6} tcp dport 53 accept
+        # ICMPv6 is required for NDP (neighbor discovery). Without it,
+        # IPv6 packets cannot reach the host veth gateway.
+        ip6 nexthdr icmpv6 accept
+        # Reject denied destinations from transient reject sets
+        ip daddr . tcp dport @reject_v4 reject with tcp reset
+        ip daddr . udp dport @reject_v4 reject
+        ip6 daddr . tcp dport @reject_v6 reject with tcp reset
+        ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
+        # Queue TCP SYN and UDP for policy enforcement
+        ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
+        ip protocol udp queue num ${toString cfg.queueNumber}
+        ip6 nexthdr tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
+        ip6 nexthdr udp queue num ${toString cfg.queueNumber}
       }
     }
   '';
@@ -96,6 +130,9 @@ let
           "@netnsIp@"
           "@hostIp@"
           "@hostIpCidr@"
+          "@hostIp6@"
+          "@hostIp6Cidr@"
+          "@netnsIp6Cidr@"
           "@nftRules@"
           "@hostNatBin@"
         ]
@@ -106,6 +143,9 @@ let
           cfg.netnsIp
           cfg.hostIp
           "${cfg.hostIp}/30"
+          cfg.hostIp6
+          "${cfg.hostIp6}/${toString cfg.netnsIp6Prefix}"
+          "${cfg.netnsIp6}/${toString cfg.netnsIp6Prefix}"
           nftRules
           "${hostNatPkg}/bin/agent-sandbox-host-nat"
         ]
@@ -169,7 +209,7 @@ lib.mkIf policyEnabled (
             "agent-sandbox-dns.service"
           ]
           ++ [ "network.target" ];
-        before = lib.optionals cfg.enable [ "agent-sandbox-proxy.service" ];
+        before = lib.optionals cfg.enable [ "agent-sandbox-nfq.service" ];
         serviceConfig = {
           Type = "simple";
           ExecStart = lib.escapeShellArgs (
@@ -229,6 +269,7 @@ lib.mkIf policyEnabled (
         "net.ipv4.ip_forward" = 1;
         "net.ipv4.conf.all.rp_filter" = 0;
         "net.ipv4.conf.default.rp_filter" = 0;
+        "net.ipv6.conf.all.forwarding" = 1;
       };
 
       # Runtime nft INPUT accepts are not enough when the host firewall has its own
@@ -258,7 +299,7 @@ lib.mkIf policyEnabled (
           before = [
             "agent-sandbox-dns.service"
             "agent-sandbox-policy.service"
-            "agent-sandbox-proxy.service"
+            "agent-sandbox-nfq.service"
           ];
           serviceConfig = {
             Type = "oneshot";
@@ -269,7 +310,7 @@ lib.mkIf policyEnabled (
         };
 
         agent-sandbox-dns = {
-          description = "DNS proxy for agent-sandbox (records A/AAAA → hostname cache)";
+          description = "DNS forwarder for agent-sandbox (records A/AAAA → hostname cache)";
           bindsTo = [ "agent-sandbox-netns.service" ];
           wantedBy = [ "multi-user.target" ];
           after = [
@@ -279,18 +320,16 @@ lib.mkIf policyEnabled (
           ];
           before = [
             "agent-sandbox-policy.service"
-            "agent-sandbox-proxy.service"
+            "agent-sandbox-nfq.service"
           ];
           serviceConfig = {
             Type = "simple";
             ExecStart = lib.escapeShellArgs [
-              "${policyPkg}/bin/agent-sandbox-dns-proxy"
+              "${policyPkg}/bin/agent-sandbox-dns-forwarder"
               "--listen-host"
               cfg.hostIp
               "--listen-port"
               "53"
-              "--upstream"
-              cfg.dnsForwardTarget
               "--cache-path"
               "/run/agent-sandbox/dns-cache.json"
             ];
@@ -299,8 +338,8 @@ lib.mkIf policyEnabled (
           };
         };
 
-        agent-sandbox-proxy = {
-          description = "Policy proxy inside agent-sandbox netns";
+        agent-sandbox-nfq = {
+          description = "Transport-layer policy enforcer inside agent-sandbox netns";
           wantedBy = [ "multi-user.target" ];
           requires = [
             "agent-sandbox-policy.service"
@@ -316,18 +355,21 @@ lib.mkIf policyEnabled (
             Type = "simple";
             NetworkNamespacePath = "/run/netns/${cfg.netnsName}";
             ExecStart = lib.escapeShellArgs [
-              "${policyPkg}/bin/agent-sandbox-proxy"
-              "--listen-host"
-              proxyHost
-              "--listen-port"
-              proxyPort
+              "${policyPkg}/bin/agent-sandbox-nfq"
+              "--queue"
+              (toString cfg.queueNumber)
               "--policy-socket"
               config.agent-sandbox.policy.socketPath
               "--policy-timeout"
               (toString (lib.max cfg.policyTimeout config.agent-sandbox.policy.approvalTimeout))
+              "--nft-binary"
+              "${pkgs.nftables}/bin/nft"
+              "--dns-server-ip"
+              cfg.hostIp
             ];
-            Environment = "AGENT_SANDBOX_DNS_CACHE=/run/agent-sandbox/dns-cache.json";
-            Restart = "on-failure";
+          };
+          environment = {
+            AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
           };
         };
       };

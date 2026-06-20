@@ -1,4 +1,4 @@
-# Additional jail.nix combinators for agent-sandbox (home mounts, proxy, restricted net).
+# Additional jail.nix combinators for agent-sandbox (home mounts, restricted net).
 { pkgs, lib, ... }:
 builtin:
 let
@@ -280,7 +280,7 @@ in
       (set-env "AGENT_SANDBOX_POLICY_SOCKET" policySocket)
       (add-runtime ''
         # jail.nix base uses --clearenv; only --setenv survives into the jail.
-        # policyd/proxy read these from /proc/<pid>/environ.
+        # policyd and enforcement daemons read these from /proc/<pid>/environ.
         _agent_sandbox_home=$(readlink -f "$HOME")
         _agent_sandbox_project_root="$PWD"
         if command -v git >/dev/null 2>&1; then
@@ -294,17 +294,6 @@ in
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
       '')
-    ];
-
-  agent-sandbox-proxy =
-    proxyUrl:
-    compose [
-      (set-env "HTTP_PROXY" proxyUrl)
-      (set-env "HTTPS_PROXY" proxyUrl)
-      (set-env "ALL_PROXY" proxyUrl)
-      (set-env "http_proxy" proxyUrl)
-      (set-env "https_proxy" proxyUrl)
-      (set-env "NO_PROXY" "127.0.0.1,169.254.100.1,localhost,::1")
     ];
 
   # GPU device nodes need --dev-bind (rw). try-readonly breaks NVML/CUDA ioctls.
@@ -363,9 +352,14 @@ in
     '')
     (runtime-deep-ro-bind "/etc/ssl")
     (add-runtime ''
-      # Points at veth gateway; agent-sandbox-dns socat-bridges to host systemd-resolved.
+      # Points at the veth gateway. agent-sandbox-dns-forwarder sends to host systemd-resolved.
       if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
         RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf /etc/resolv.conf)
+      fi
+    '')
+    (add-runtime ''
+      if [[ -d /run/nscd ]]; then
+        RUNTIME_ARGS+=(--tmpfs /run/nscd)
       fi
     '')
     (try-readonly "/etc/static/ssl")
@@ -393,6 +387,11 @@ in
     (add-runtime ''
       if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
         RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf /etc/resolv.conf)
+      fi
+    '')
+    (add-runtime ''
+      if [[ -d /run/nscd ]]; then
+        RUNTIME_ARGS+=(--tmpfs /run/nscd)
       fi
     '')
     (unsafe-add-raw-args "--disable-userns")
