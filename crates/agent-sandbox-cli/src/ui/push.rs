@@ -32,7 +32,7 @@ pub(crate) async fn handle_push(
             let host = host.unwrap_or_default();
             let port = port.unwrap_or(0);
             let scheme = scheme.unwrap_or_else(|| "https".into());
-            let url = url.unwrap_or_else(|| format!("{scheme}://{host}:{port}"));
+            let url = network_prompt_url(&host, port, &scheme, url);
             let paths = paths.merged_with(cwd, home, project_root);
 
             // Step 1: choose action
@@ -183,6 +183,14 @@ async fn choose_target_level(
     Ok(choice.and_then(|opt| opt.target))
 }
 
+fn network_prompt_url(host: &str, port: u16, scheme: &str, fallback_url: Option<String>) -> String {
+    if host.trim().is_empty() {
+        fallback_url.unwrap_or_else(|| format!("{scheme}://{host}:{port}"))
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
+}
+
 fn network_target_options(host: &str, scope: ApprovalScope) -> Vec<ScopeOption> {
     let hosts = approval_host_patterns(host);
     let mut options = Vec::with_capacity(hosts.len());
@@ -212,4 +220,26 @@ fn filesystem_target_options(
         });
     }
     options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::network_prompt_url;
+
+    #[test]
+    fn network_prompt_url_prefers_policy_host_over_raw_ip_url() {
+        let url = network_prompt_url(
+            "example.com",
+            443,
+            "tcp",
+            Some("tcp://104.18.32.47:443".to_string()),
+        );
+        assert_eq!(url, "tcp://example.com:443");
+    }
+
+    #[test]
+    fn network_prompt_url_falls_back_when_host_missing() {
+        let url = network_prompt_url("", 443, "tcp", Some("tcp://104.18.32.47:443".to_string()));
+        assert_eq!(url, "tcp://104.18.32.47:443");
+    }
 }
