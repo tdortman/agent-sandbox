@@ -1,8 +1,8 @@
 //! Apply pending network or elevation decisions.
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, RpcReply,
-    ScopeActionReply, SudoRule, approval_host_patterns,
+    ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
+    RpcReply, ScopeActionReply, SudoRule, approval_host_patterns,
 };
 
 use crate::error::PolicydError;
@@ -25,22 +25,40 @@ impl PolicyStore {
         decision: PendingDecision,
         action: DecisionAction,
     ) -> RpcReply {
-        let (pending, wire, scope, target) = match self.take_pending_decision(decision).await {
+        let decision = match self.take_pending_decision(decision).await {
             Ok(value) => value,
             Err(err) => return err,
         };
-        match pending {
+        match decision.pending {
             Pending::Network(net) => {
-                self.apply_pending_network_decision(net, wire, scope, target.as_ref(), action)
-                    .await
+                self.apply_pending_network_decision(
+                    net,
+                    decision.wire,
+                    decision.scope,
+                    decision.target.as_ref(),
+                    action,
+                )
+                .await
             }
             Pending::Elevation(elev) => {
-                self.apply_pending_sudo_decision(elev, wire, scope, target.as_ref(), action)
-                    .await
+                self.apply_pending_sudo_decision(
+                    elev,
+                    decision.wire,
+                    decision.scope,
+                    decision.target.as_ref(),
+                    action,
+                )
+                .await
             }
             Pending::Filesystem(fs) => {
-                self.apply_pending_filesystem_decision(fs, wire, scope, target.as_ref(), action)
-                    .await
+                self.apply_pending_filesystem_decision(
+                    fs,
+                    decision.wire,
+                    decision.scope,
+                    decision.target.as_ref(),
+                    action,
+                )
+                .await
             }
         }
     }
@@ -54,7 +72,7 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = net.id.clone();
-        let (host, port) = match Self::resolve_pending_network_target(&net, scope, target) {
+        let resolved = match Self::resolve_pending_network_target(&net, scope, target) {
             Ok(value) => value,
             Err(err) => {
                 self.inner
@@ -67,16 +85,32 @@ impl PolicyStore {
         };
 
         if action == DecisionAction::Approve && scope == ApprovalScope::Once {
-            Self::audit(action.audit_verb(), Some(&host), Some(port), scope.as_str());
-            self.finish_network(&pending_id, true, "once").await;
-            return RpcReply::ScopeAction(ScopeActionReply::ok_network(host, port, scope, None));
+            Self::audit(
+                action.audit_verb(),
+                Some(&resolved.host),
+                Some(resolved.port),
+                scope.as_str(),
+            );
+            self.finish_network(
+                &pending_id,
+                true,
+                "once",
+                Some((resolved.host.clone(), resolved.port)),
+            )
+            .await;
+            return RpcReply::ScopeAction(ScopeActionReply::ok_network(
+                resolved.host,
+                resolved.port,
+                scope,
+                None,
+            ));
         }
 
         let result = self
             .apply_network_scope(
                 NetworkScopeOp {
-                    host: host.clone(),
-                    port,
+                    host: resolved.host.clone(),
+                    port: resolved.port,
                     scope,
                     wire: Self::scope_wire_for_pending_network(wire, &net),
                 },
@@ -88,14 +122,32 @@ impl PolicyStore {
             match action {
                 DecisionAction::Approve => {
                     let source = result.scope_label().unwrap_or(scope.as_str());
-                    self.finish_network(&pending_id, true, source).await;
+                    self.finish_network(
+                        &pending_id,
+                        true,
+                        source,
+                        Some((resolved.host.clone(), resolved.port)),
+                    )
+                    .await;
                 }
                 DecisionAction::Deny => {
-                    self.finish_network(&pending_id, false, "denied").await;
+                    self.finish_network(
+                        &pending_id,
+                        false,
+                        "denied",
+                        Some((resolved.host.clone(), resolved.port)),
+                    )
+                    .await;
                 }
             }
         } else if action == DecisionAction::Approve {
-            self.finish_network(&pending_id, false, "blocked").await;
+            self.finish_network(
+                &pending_id,
+                false,
+                "blocked",
+                Some((resolved.host.clone(), resolved.port)),
+            )
+            .await;
         } else {
             self.inner
                 .lock()
@@ -294,7 +346,7 @@ impl PolicyStore {
             fs.project_root.clone(),
         )
         .with_sandbox_session(fs.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
         if scope_wire
             .session_id
             .as_ref()
@@ -344,7 +396,7 @@ impl PolicyStore {
         pending: &PendingNetwork,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
-    ) -> Result<(String, u16), PolicydError> {
+    ) -> Result<NetworkRuleKey, PolicydError> {
         let pending_host = &pending.host;
         let pending_port = pending.port;
         let host = match target {
@@ -363,7 +415,7 @@ impl PolicyStore {
         if scope == ApprovalScope::Once && host != *pending_host {
             return Err(PolicydError::InvalidDecisionTarget);
         }
-        Ok((host, pending_port))
+        Ok(NetworkRuleKey::new(host, pending_port))
     }
 
     fn resolve_pending_sudo_target(
@@ -397,7 +449,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use agent_sandbox_core::{ApprovalScope, ApprovalTarget, FileAccess, ProcessIds, SandboxPaths};
+    use agent_sandbox_core::{
+        ApprovalScope, ApprovalTarget, FileAccess, NetworkRuleKey, ProcessIds, SandboxPaths,
+    };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
 
@@ -435,7 +489,7 @@ mod tests {
                 Some(&target),
             )
             .unwrap(),
-            ("*.baz.com".to_string(), 443)
+            NetworkRuleKey::new("*.baz.com", 443)
         );
     }
 
@@ -686,7 +740,7 @@ mod tests {
     fn merge_context(pid: Option<u32>) -> MergeContext {
         MergeContext {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
-            ids: ProcessIds::from((pid, None)),
+            ids: ProcessIds::from_options(pid, None),
             sandbox_session_id: None,
         }
     }
@@ -790,7 +844,7 @@ mod tests {
                 .session_allow
                 .entry("ui-a".into())
                 .or_default()
-                .insert(("api.example.com".into(), 443));
+                .insert(NetworkRuleKey::new("api.example.com", 443));
         }
 
         assert!(

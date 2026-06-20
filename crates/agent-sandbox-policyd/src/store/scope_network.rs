@@ -1,7 +1,8 @@
 //! Policy store — network scope application.
 
 use agent_sandbox_core::{
-    ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext, ScopeTarget, allow_keys,
+    ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,
+    ScopeTarget, allow_keys,
 };
 
 use crate::error::PolicydError;
@@ -10,9 +11,9 @@ use crate::wire::{NetworkScopeOp, ScopeWire};
 use super::decisions::DecisionAction;
 use super::types::PolicyStore;
 
-fn session_network_entries(host: &str, port: u16) -> Vec<(String, u16)> {
+fn session_network_entries(host: &str, port: u16) -> Vec<NetworkRuleKey> {
     if host.starts_with("*.") {
-        vec![(host.to_string(), port)]
+        vec![NetworkRuleKey::new(host, port)]
     } else {
         allow_keys(host, port)
     }
@@ -177,12 +178,13 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::session_network_entries;
+    use agent_sandbox_core::NetworkRuleKey;
 
     #[test]
     fn wildcard_session_entry_is_kept_as_pattern() {
         assert_eq!(
             session_network_entries("*.baz.com", 443),
-            vec![(String::from("*.baz.com"), 443)]
+            vec![NetworkRuleKey::new("*.baz.com", 443)]
         );
     }
 }

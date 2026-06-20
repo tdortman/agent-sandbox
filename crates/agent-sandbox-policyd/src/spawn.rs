@@ -170,7 +170,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     };
 
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(Duration::from_millis(100));
     match child.try_wait() {
         Ok(Some(status)) => {
             ui_spawn_last.remove(&spawn_key);
@@ -205,7 +205,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
                 "--",
                 &notify,
                 "agent-sandbox",
-                "Network approval needed — respond to the KDE prompt.",
+                "Network approval needed. Respond to the KDE prompt.",
             ])
             .envs(&env)
             .stdin(Stdio::null())

@@ -22,6 +22,13 @@ impl DecisionAction {
     }
 }
 
+pub(crate) struct TakenPendingDecision {
+    pub pending: Pending,
+    pub wire: ScopeWire,
+    pub scope: ApprovalScope,
+    pub target: Option<ApprovalTarget>,
+}
+
 impl PolicyStore {
     pub(crate) fn scope_wire_for_pending_network(
         wire: ScopeWire,
@@ -84,7 +91,7 @@ impl PolicyStore {
     pub(crate) async fn take_pending_decision(
         &self,
         decision: PendingDecision,
-    ) -> Result<(Pending, ScopeWire, ApprovalScope, Option<ApprovalTarget>), RpcReply> {
+    ) -> Result<TakenPendingDecision, RpcReply> {
         let PendingDecision {
             pending_id,
             scope,
@@ -99,6 +106,11 @@ impl PolicyStore {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
             err
         })?;
-        Ok((pending, wire, scope, target))
+        Ok(TakenPendingDecision {
+            pending,
+            wire,
+            scope,
+            target,
+        })
     }
 }

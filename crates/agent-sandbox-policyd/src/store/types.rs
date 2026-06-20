@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{CheckReply, ElevateReply, FileAccess, FilesystemCheckReply};
+use agent_sandbox_core::{
+    CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRuleKey, NetworkRuleKey,
+};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
 
@@ -182,18 +184,21 @@ pub struct PolicyStore {
 }
 
 pub(crate) struct StoreInner {
-    pub session_allow: HashMap<String, HashSet<(String, u16)>>,
-    pub once_allow: HashSet<(String, u16)>,
+    pub session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
+    pub once_allow: HashSet<NetworkRuleKey>,
     pub pending: HashMap<String, Pending>,
     pub elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
-    pub network_futures: HashMap<String, oneshot::Sender<CheckReply>>,
-    pub filesystem_futures: HashMap<String, oneshot::Sender<FilesystemCheckReply>>,
+    pub network_futures: HashMap<String, Vec<oneshot::Sender<CheckReply>>>,
+    pub filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
     pub ui_clients: HashMap<u64, UiClient>,
     pub ui_context_by_session: HashMap<String, UiSessionContext>,
+    pub network_verdict_cache: HashMap<(String, u16), (bool, String, Instant)>,
+    pub filesystem_verdict_cache: HashMap<(String, FileAccess), (bool, String, Instant)>,
     pub ui_spawn_last: HashMap<String, Instant>,
-    pub session_deny: HashMap<String, HashSet<(String, u16)>>,
+    pub session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
     pub session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
     pub session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,
-    pub session_filesystem_allow: HashMap<String, HashSet<(String, FileAccess)>>,
-    pub session_filesystem_deny: HashMap<String, HashSet<(String, FileAccess)>>,
+    pub session_filesystem_allow: HashMap<String, HashSet<FilesystemRuleKey>>,
+    pub session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
+    pub network_pending_delivered_to_standalone: HashSet<String>,
 }

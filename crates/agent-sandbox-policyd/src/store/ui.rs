@@ -18,7 +18,8 @@ use super::types::{
     CLIENT_ID, Pending, PolicyStore, UiClient, UiClientHandle, UiSessionContext, UiSessionOwner,
 };
 use super::ui_route::{
-    UiRoute, request_owned_by_omp, standalone_ui_client_matches, ui_client_matches,
+    UiRoute, omp_ui_client_owns_by_pid, request_owned_by_omp, standalone_ui_client_matches,
+    ui_client_matches_with_contexts,
 };
 
 impl PolicyStore {
@@ -50,7 +51,11 @@ impl PolicyStore {
 
     pub(crate) async fn route_owned_by_omp_ui(&self, route: &UiRoute) -> bool {
         let inner = self.inner.lock().await;
-        request_owned_by_omp(route, &Self::omp_clients(&inner))
+        request_owned_by_omp(
+            route,
+            &Self::omp_clients(&inner),
+            &inner.ui_context_by_session,
+        )
     }
 
     fn matching_ui_session_ids(
@@ -65,7 +70,15 @@ impl PolicyStore {
                 inner
                     .ui_context_by_session
                     .get(&client.session_id)
-                    .is_some_and(|ctx| ui_client_matches(client, ctx, route, &omp_clients))
+                    .is_some_and(|ctx| {
+                        ui_client_matches_with_contexts(
+                            client,
+                            ctx,
+                            route,
+                            &omp_clients,
+                            &inner.ui_context_by_session,
+                        )
+                    })
             })
             .map(|c| c.session_id.clone())
             .collect()
@@ -89,11 +102,34 @@ impl PolicyStore {
             .collect()
     }
 
+    fn matching_filesystem_session_ids(
+        inner: &super::types::StoreInner,
+        route: &UiRoute,
+    ) -> HashSet<String> {
+        let omp_pid_sessions: HashSet<String> = inner
+            .ui_clients
+            .values()
+            .filter(|client| omp_ui_client_owns_by_pid(client, route))
+            .map(|client| client.session_id.clone())
+            .collect();
+        if !omp_pid_sessions.is_empty() {
+            return omp_pid_sessions;
+        }
+        Self::matching_standalone_ui_session_ids(inner, route)
+    }
+
     pub(crate) async fn session_ids_for_route(&self, route: &UiRoute) -> HashSet<String> {
         let inner = self.inner.lock().await;
         Self::matching_ui_session_ids(&inner, route)
     }
 
+    pub(crate) async fn filesystem_session_ids_for_route(
+        &self,
+        route: &UiRoute,
+    ) -> HashSet<String> {
+        let inner = self.inner.lock().await;
+        Self::matching_filesystem_session_ids(&inner, route)
+    }
     pub(crate) async fn has_ui_for_route(&self, route: &UiRoute) -> bool {
         !self.session_ids_for_route(route).await.is_empty()
     }
@@ -234,7 +270,7 @@ impl PolicyStore {
         .with_sandbox_session(p.sandbox_session_id().map(str::to_owned));
         match p {
             Pending::Network(net) => {
-                self.notify_ui(
+                self.notify_network_ui(
                     &route,
                     &UiPush::NetworkRequest {
                         id: net.id.clone(),
@@ -314,6 +350,17 @@ impl PolicyStore {
         false
     }
 
+    pub(crate) async fn wait_for_omp_ui_client(&self, route: &UiRoute, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.route_owned_by_omp_ui(route).await {
+                return true;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     pub(crate) async fn wait_for_standalone_ui_client(
         &self,
         route: &UiRoute,
@@ -334,6 +381,122 @@ impl PolicyStore {
         if targets.is_empty() {
             return;
         }
+        let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_string();
+        let mut dead = Vec::new();
+        for (id, writer) in self
+            .inner
+            .lock()
+            .await
+            .ui_clients
+            .iter()
+            .map(|(id, c)| (*id, c.writer.clone()))
+        {
+            if !targets.iter().any(|t| std::sync::Arc::ptr_eq(t, &writer)) {
+                continue;
+            }
+            let mut w = writer.lock().await;
+            if w.write_all(line.as_bytes()).await.is_err() {
+                dead.push(id);
+            }
+        }
+        if !dead.is_empty() {
+            let mut inner = self.inner.lock().await;
+            for id in dead {
+                if let Some(client) = inner.ui_clients.remove(&id) {
+                    inner.session_allow.remove(&client.session_id);
+                    inner.session_deny.remove(&client.session_id);
+                    inner.session_sudo_allow.remove(&client.session_id);
+                    inner.session_sudo_deny.remove(&client.session_id);
+                    inner.session_filesystem_allow.remove(&client.session_id);
+                    inner.session_filesystem_deny.remove(&client.session_id);
+                    inner.ui_context_by_session.remove(&client.session_id);
+                }
+            }
+        }
+    }
+
+    /// Send a network prompt to OMP if registered, otherwise to standalone UI only.
+    /// Never falls back to generic `notify_ui`. Tracks standalone-delivered ids so
+    /// late OMP registration cannot produce a duplicate prompt.
+    pub(crate) async fn notify_network_ui(&self, route: &UiRoute, payload: &UiPush) {
+        let net_id = match payload {
+            UiPush::NetworkRequest { id, .. } => Some(id.as_str()),
+            _ => None,
+        };
+
+        // OMP-first: if OMP owns the route, deliver there
+        if self.route_owned_by_omp_ui(route).await {
+            // But skip if this pending was already delivered to standalone (late OMP registration)
+            if let Some(id) = net_id
+                && self
+                    .inner
+                    .lock()
+                    .await
+                    .network_pending_delivered_to_standalone
+                    .contains(id)
+            {
+                return;
+            }
+            let targets = self.omp_ui_notification_targets_for(route).await;
+            if !targets.is_empty() {
+                self.send_to_targets(payload, &targets).await;
+                return;
+            }
+        }
+
+        // Fallback: standalone-only, never `notify_ui`
+        let targets = self.standalone_ui_notification_targets_for(route).await;
+        if !targets.is_empty() {
+            if let Some(id) = net_id {
+                self.inner
+                    .lock()
+                    .await
+                    .network_pending_delivered_to_standalone
+                    .insert(id.to_string());
+            }
+            self.send_to_targets(payload, &targets).await;
+        }
+    }
+
+    async fn omp_ui_notification_targets_for(
+        &self,
+        route: &UiRoute,
+    ) -> Vec<std::sync::Arc<Mutex<OwnedWriteHalf>>> {
+        let inner = self.inner.lock().await;
+        let omp_clients = Self::omp_clients(&inner);
+        let matching_omps: HashSet<String> = inner
+            .ui_clients
+            .values()
+            .filter(|client| {
+                client.ui_client == "omp"
+                    && inner
+                        .ui_context_by_session
+                        .get(&client.session_id)
+                        .is_some_and(|ctx| {
+                            ui_client_matches_with_contexts(
+                                client,
+                                ctx,
+                                route,
+                                &omp_clients,
+                                &inner.ui_context_by_session,
+                            )
+                        })
+            })
+            .map(|c| c.session_id.clone())
+            .collect();
+        inner
+            .ui_clients
+            .values()
+            .filter(|c| matching_omps.contains(&c.session_id))
+            .map(|c| c.writer.clone())
+            .collect()
+    }
+
+    async fn send_to_targets(
+        &self,
+        payload: &UiPush,
+        targets: &[std::sync::Arc<Mutex<OwnedWriteHalf>>],
+    ) {
         let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_string();
         let mut dead = Vec::new();
         for (id, writer) in self

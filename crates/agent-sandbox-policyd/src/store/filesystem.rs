@@ -2,7 +2,7 @@
 
 use std::io::BufRead;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, FilesystemMonitorReply, UiPush};
 use tokio::sync::oneshot;
@@ -163,27 +163,68 @@ impl PolicyStore {
             return FilesystemCheckReply::denied("blocked", path, access);
         }
 
-        let pending_id = format!("fs:{}", Uuid::new_v4().simple());
+        // Check the short-lived verdict cache before creating a new prompt.
+        {
+            let inner = self.inner.lock().await;
+            if let Some(&(cached_allowed, ref cached_source, ref time)) =
+                inner.filesystem_verdict_cache.get(&(path.clone(), access))
+                && time.elapsed() < Duration::from_secs(2)
+            {
+                return if cached_allowed {
+                    FilesystemCheckReply::allowed(cached_source.clone(), path, access)
+                } else {
+                    FilesystemCheckReply::denied(cached_source.clone(), path, access)
+                };
+            }
+        }
+
+        let pending_id;
         let (tx, rx) = oneshot::channel();
+        let created_prompt;
         {
             let mut inner = self.inner.lock().await;
-            inner.filesystem_futures.insert(pending_id.clone(), tx);
-            inner.pending.insert(
-                pending_id.clone(),
-                super::types::Pending::Filesystem(super::types::PendingFilesystem {
-                    id: pending_id.clone(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0.0, |d| d.as_secs_f64()),
-                    path: path.clone(),
-                    access,
-                    cwd: cwd.clone(),
-                    home: home.clone(),
-                    project_root: project_root.clone(),
-                    request_pid: wire_ids.pid().filter(|&p| p != 0),
-                    sandbox_session_id: sandbox_session_id.clone(),
-                }),
-            );
+            // Deduplicate: if a pending already exists for the same file and
+            // access type, join its waiters instead of creating a new prompt.
+            if let Some(existing_id) = inner.pending.values().find_map(|p| {
+                let super::types::Pending::Filesystem(fs) = p else {
+                    return None;
+                };
+                if fs.path == path && fs.access == access {
+                    Some(fs.id.clone())
+                } else {
+                    None
+                }
+            }) {
+                inner
+                    .filesystem_futures
+                    .entry(existing_id.clone())
+                    .or_default()
+                    .push(tx);
+                pending_id = existing_id;
+                created_prompt = false;
+            } else {
+                pending_id = format!("fs:{}", Uuid::new_v4().simple());
+                inner
+                    .filesystem_futures
+                    .insert(pending_id.clone(), vec![tx]);
+                inner.pending.insert(
+                    pending_id.clone(),
+                    super::types::Pending::Filesystem(super::types::PendingFilesystem {
+                        id: pending_id.clone(),
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0.0, |d| d.as_secs_f64()),
+                        path: path.clone(),
+                        access,
+                        cwd: cwd.clone(),
+                        home: home.clone(),
+                        project_root: project_root.clone(),
+                        request_pid: wire_ids.pid().filter(|&p| p != 0),
+                        sandbox_session_id: sandbox_session_id.clone(),
+                    }),
+                );
+                created_prompt = true;
+            }
         }
 
         let route = UiRoute::new(
@@ -193,41 +234,44 @@ impl PolicyStore {
             project_root.clone(),
         )
         .with_sandbox_session(sandbox_session_id.clone());
-        let push = UiPush::FilesystemRequest {
-            id: pending_id.clone(),
-            path: path.clone(),
-            access,
-            cwd: cwd.clone(),
-            home: home.clone(),
-            project_root: project_root.clone(),
-        };
-        self.notify_standalone_ui(&route, &push).await;
 
-        if !self.has_standalone_ui_for_route(&route).await {
-            let mut spawn_uid = wire_ids.uid();
-            if spawn_uid.is_none_or(|u| u == 0)
-                && let Some(h) = &home
-            {
-                spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.uid.as_raw());
-            }
-            let spawn = UiSpawnContext {
-                gate: UiSpawnGate {
-                    has_matching_ui: false,
-                },
-                uid: spawn_uid,
-                home: home.as_deref(),
-                cwd: cwd.as_deref(),
-                project_root: project_root.as_deref(),
-                sandbox_session_id: sandbox_session_id.as_deref(),
+        if created_prompt {
+            let push = UiPush::FilesystemRequest {
+                id: pending_id.clone(),
+                path: path.clone(),
+                access,
+                cwd: cwd.clone(),
+                home: home.clone(),
+                project_root: project_root.clone(),
             };
-            maybe_spawn_ui(
-                &self.args,
-                &mut self.inner.lock().await.ui_spawn_last,
-                &spawn,
-            );
+            self.notify_standalone_ui(&route, &push).await;
+
+            if !self.has_standalone_ui_for_route(&route).await {
+                let mut spawn_uid = wire_ids.uid();
+                if spawn_uid.is_none_or(|u| u == 0)
+                    && let Some(h) = &home
+                {
+                    spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
+                        .ok()
+                        .flatten()
+                        .map(|u| u.uid.as_raw());
+                }
+                let spawn = UiSpawnContext {
+                    gate: UiSpawnGate {
+                        has_matching_ui: false,
+                    },
+                    uid: spawn_uid,
+                    home: home.as_deref(),
+                    cwd: cwd.as_deref(),
+                    project_root: project_root.as_deref(),
+                    sandbox_session_id: sandbox_session_id.as_deref(),
+                };
+                maybe_spawn_ui(
+                    &self.args,
+                    &mut self.inner.lock().await.ui_spawn_last,
+                    &spawn,
+                );
+            }
         }
 
         if !self.has_standalone_ui_for_route(&route).await {
@@ -269,13 +313,20 @@ impl PolicyStore {
         source: &str,
     ) {
         let mut inner = self.inner.lock().await;
-        if let Some(tx) = inner.filesystem_futures.remove(pending_id) {
+        if let Some(waiters) = inner.filesystem_futures.remove(pending_id) {
             let reply = if allowed {
-                FilesystemCheckReply::allowed(source, path, access)
+                FilesystemCheckReply::allowed(source, path.clone(), access)
             } else {
-                FilesystemCheckReply::denied(source, path, access)
+                FilesystemCheckReply::denied(source, path.clone(), access)
             };
-            let _ = tx.send(reply);
+            for tx in waiters {
+                let _ = tx.send(reply.clone());
+            }
         }
+        // Cache the verdict for deduplication.
+        inner.filesystem_verdict_cache.insert(
+            (path, access),
+            (allowed, source.to_string(), Instant::now()),
+        );
     }
 }

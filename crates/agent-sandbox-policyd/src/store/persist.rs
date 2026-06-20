@@ -4,20 +4,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, NetworkRule, ProjectPolicyContext, SudoRule, atomic_write_policy,
-    contract_home_path, load_policy, normalize_host,
+    FileAccess, FilesystemRule, FilesystemSortKey, NetworkRule, NetworkSortKey,
+    ProjectPolicyContext, SudoRule, atomic_write_policy, contract_home_path, load_policy,
+    normalize_host,
 };
 
 use super::types::PolicyStore;
 
-fn network_rule_sort_key(rule: &NetworkRule) -> (Vec<String>, u16) {
-    network_sort_key(&rule.host, rule.port)
+fn network_rule_sort_key(rule: &NetworkRule) -> NetworkSortKey {
+    NetworkSortKey::new(&rule.host, rule.port)
 }
 
-fn network_sort_key(host: &str, port: u16) -> (Vec<String>, u16) {
-    let mut labels: Vec<String> = host.split('.').map(str::to_lowercase).collect();
-    labels.reverse();
-    (labels, port)
+fn network_sort_key(host: &str, port: u16) -> NetworkSortKey {
+    NetworkSortKey::new(host, port)
 }
 
 fn filesystem_path_key(path: &str) -> String {
@@ -63,8 +62,8 @@ fn remove_filesystem_rule(rules: &mut Vec<FilesystemRule>, rule_path: &str, acce
     rules.retain(|rule| filesystem_path_key(&rule.path) != key || rule.access != access);
 }
 
-fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&str>) -> (String, FileAccess) {
-    (
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&str>) -> FilesystemSortKey {
+    FilesystemSortKey::new(
         contract_home_path(&filesystem_path_key(&rule.path), home),
         rule.access,
     )
@@ -87,13 +86,13 @@ impl PolicyStore {
         let mut current = load_policy(path, home);
         let host_norm = normalize_host(host);
         let key = network_sort_key(&host_norm, port);
-        let mut allow: BTreeMap<(Vec<String>, u16), NetworkRule> = current
+        let mut allow: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network
             .allow
             .iter()
             .map(|r| (network_rule_sort_key(r), r.clone()))
             .collect();
-        let mut deny: BTreeMap<(Vec<String>, u16), NetworkRule> = current
+        let mut deny: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network
             .deny
             .iter()

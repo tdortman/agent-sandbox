@@ -1,6 +1,8 @@
 //! Policy store — filesystem scope application.
 
-use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
+use agent_sandbox_core::{
+    ApprovalScope, FilesystemRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget,
+};
 
 use crate::error::PolicydError;
 use crate::wire::{FilesystemScopeOp, ScopeWire};
@@ -46,7 +48,7 @@ impl PolicyStore {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
-                let entry = (path.clone(), access);
+                let entry = FilesystemRuleKey::new(path.clone(), access);
                 match action {
                     DecisionAction::Approve => {
                         inner

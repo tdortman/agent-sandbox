@@ -45,6 +45,9 @@ impl PolicyStore {
                 session_sudo_deny: HashMap::new(),
                 session_filesystem_allow: HashMap::new(),
                 session_filesystem_deny: HashMap::new(),
+                network_pending_delivered_to_standalone: HashSet::new(),
+                network_verdict_cache: HashMap::new(),
+                filesystem_verdict_cache: HashMap::new(),
             }),
         }
     }

@@ -2,20 +2,22 @@
 
 use std::collections::HashSet;
 
-use agent_sandbox_core::{FileAccess, allow_keys, normalize_host};
+use agent_sandbox_core::{
+    FileAccess, FilesystemRule, FilesystemRuleKey, NetworkRuleKey, allow_keys, normalize_host,
+};
 
 use crate::store::ui_route::UiRoute;
 use crate::wire::MergeContext;
 
 use super::types::PolicyStore;
 
-fn session_network_matches(bucket: &HashSet<(String, u16)>, host: &str, port: u16) -> bool {
+fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u16) -> bool {
     let keys = allow_keys(host, port);
-    bucket.iter().any(|(pattern, rule_port)| {
-        *rule_port == port
+    bucket.iter().any(|rule| {
+        rule.port == port
             && keys
                 .iter()
-                .any(|(key_host, _)| PolicyStore::host_matches(pattern, key_host))
+                .any(|key| PolicyStore::host_matches(&rule.host, &key.host))
     })
 }
 
@@ -200,12 +202,12 @@ impl PolicyStore {
 }
 
 fn session_filesystem_matches(
-    bucket: &HashSet<(String, FileAccess)>,
+    bucket: &HashSet<FilesystemRuleKey>,
     path: &str,
     access: FileAccess,
 ) -> bool {
-    bucket.iter().any(|(rule_path, rule_access)| {
-        let rule = agent_sandbox_core::FilesystemRule::new(rule_path.as_str(), *rule_access, "");
+    bucket.iter().any(|entry| {
+        let rule = FilesystemRule::new(entry.path.as_str(), entry.access, "");
         rule.matches(path, access)
     })
 }
@@ -253,7 +255,7 @@ impl PolicyStore {
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -277,7 +279,7 @@ impl PolicyStore {
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -322,10 +324,11 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{session_network_matches, session_sudo_matches};
+    use agent_sandbox_core::NetworkRuleKey;
 
     #[test]
     fn session_network_matches_wildcard_hosts() {
-        let bucket = HashSet::from([(String::from("*.baz.com"), 443_u16)]);
+        let bucket = HashSet::from([NetworkRuleKey::new("*.baz.com", 443)]);
         assert!(session_network_matches(&bucket, "foo.bar.baz.com", 443));
         assert!(!session_network_matches(&bucket, "foo.bar.baz.com", 80));
     }
@@ -339,5 +342,110 @@ mod tests {
             String::from("update"),
         ];
         assert!(session_sudo_matches(&bucket, &argv));
+    }
+
+    #[tokio::test]
+    async fn project_policy_is_re_read_after_manual_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let policy_path = project_root.join(".agent-sandbox/policy.json");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .network
+            .allow
+            .push(agent_sandbox_core::NetworkRule::new(
+                "example.com",
+                443,
+                "test",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            socket: dir.path().join("sock"),
+            sandbox_netns: None,
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+        });
+
+        let project_root = project_root.to_string_lossy().into_owned();
+        let home = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert!(
+            store
+                .is_allowed("example.com", 443, ctx.clone(), false)
+                .await
+        );
+
+        let empty = agent_sandbox_core::Policy::default();
+        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None).unwrap();
+
+        assert!(!store.is_allowed("example.com", 443, ctx, false).await);
+    }
+
+    #[tokio::test]
+    async fn global_policy_is_re_read_after_manual_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let policy_path = policy_dir.join("policy.json");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .network
+            .allow
+            .push(agent_sandbox_core::NetworkRule::new(
+                "example.com",
+                443,
+                "test",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            socket: dir.path().join("sock"),
+            sandbox_netns: None,
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+        });
+
+        let project_root = project_root.to_string_lossy().into_owned();
+        let home = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert!(
+            store
+                .is_allowed("example.com", 443, ctx.clone(), false)
+                .await
+        );
+
+        let empty = agent_sandbox_core::Policy::default();
+        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None).unwrap();
+
+        assert!(!store.is_allowed("example.com", 443, ctx, false).await);
     }
 }
