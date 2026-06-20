@@ -305,11 +305,20 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     }
   }
 
+  function networkPromptUrl(req: NetworkRequest): string {
+    const scheme = req.scheme ?? "tcp";
+    const host = req.host?.trim();
+    if (host) {
+      return `${scheme}://${host}:${req.port}`;
+    }
+    return req.url ?? `${scheme}://${req.host}:${req.port}`;
+  }
+
   async function handleNetworkRequest(
     req: NetworkRequest,
     ctx: ExtensionContext,
   ): Promise<void> {
-    const url = req.url ?? `${req.scheme ?? "https"}://${req.host}:${req.port}`;
+    const url = networkPromptUrl(req);
     notifyPrompt(
       ctx,
       "agent-sandbox: Network request",

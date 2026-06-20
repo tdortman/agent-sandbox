@@ -6,7 +6,7 @@ Core pieces:
 
 - NixOS module: wraps agent CLIs with bubblewrap launchers
 - `agent-sandbox-policyd`: merges policy and owns approval state
-- network proxy + DNS cache: gates outbound hosts by policy
+- NFQUEUE + DNS cache: gates outbound TCP/UDP destinations by policy
 - sudo guard: gates host elevation through the same approval flow
 - optional fanotify monitor: gates filesystem opens from sandboxed processes
 - Home Manager module: installs the Oh My Pi extension for network and sudo prompts
@@ -37,7 +37,7 @@ Components:
 | --------- | --- |
 | wrapped CLI | Sandboxed entrypoint you run |
 | `policyd` | Policy merge, pending approvals, UI routing, RPC socket |
-| proxy + DNS cache | Hostname-aware network enforcement |
+| NFQUEUE + DNS cache | Transport-layer network enforcement for arbitrary TCP/UDP ports |
 | `fsmon` | Fanotify monitor scoped to each sandbox mount namespace |
 | OMP extension | In-TUI prompts for network and sudo requests |
 | `agent-sandbox-ui` | Standalone UI for filesystem prompts and non-OMP agents |
@@ -114,6 +114,8 @@ Examples:
 
 Use `agent-sandbox-approve pending` to inspect blocked requests and approve them by id from a shell.
 
+Network prompts are enforced at the transport layer. nftables queues outbound TCP SYN packets and UDP datagrams into `agent-sandbox-nfq`; the kernel holds the packet until policyd returns allow/deny. This is application-layer agnostic: HTTP(S), SSH, Git, package managers, and arbitrary ports use the same path. Plain DNS port 53 goes through `agent-sandbox-dns-forwarder`, which forwards to the system resolver and only records IP→hostname mappings for prompts. A tool with a short overall operation timeout may still give up if approval takes longer than that timeout.
+
 ## Minimal NixOS example
 
 ```nix
@@ -151,7 +153,7 @@ When `network.enable = true`, the NixOS module also runs the policy/network help
 | Option                                            | Meaning                                                              |
 | ------------------------------------------------- | -------------------------------------------------------------------- |
 | `agent-sandbox.enable`                            | Enable wrapped packages and install the policy tooling               |
-| `agent-sandbox.network.enable`                    | Enable restricted networking, proxying, and DNS cache support        |
+| `agent-sandbox.network.enable`                    | Enable restricted networking, NFQUEUE enforcement, and DNS cache support |
 | `agent-sandbox.sudoPolicy`                        | Either deny `sudo` entirely or gate it through approvals             |
 | `agent-sandbox.filesystem.dynamicApproval.enable` | Enable fanotify-backed filesystem approval for sandboxed processes   |
 | `agent-sandbox.policy.interactiveApproval`        | Prompt instead of only relying on prewritten policy                  |
@@ -185,8 +187,8 @@ With the extension enabled, OMP becomes the approval UI for network and sudo req
 
 - `crates/agent-sandbox-core` — shared policy, RPC, host matching, context types
 - `crates/agent-sandbox-policyd` — approval and policy daemon
-- `crates/agent-sandbox-proxy` — network enforcement proxy
-- `crates/agent-sandbox-dns` — DNS cache/proxy support
+- `crates/agent-sandbox-nfq` — transport-layer NFQUEUE network enforcer
+- `crates/agent-sandbox-dns` — DNS forwarder and IP→hostname cache support
 - `crates/agent-sandbox-cli` — user-facing CLI tools
 - `extensions/agent-sandbox` — OMP extension
 - `nix/modules` — NixOS and Home Manager modules
