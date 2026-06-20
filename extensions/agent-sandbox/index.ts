@@ -137,15 +137,26 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     socket.destroy();
   }
 
+  function isIpv4(host: string): boolean {
+    const parts = host.split(".");
+    if (parts.length !== 4) return false;
+    return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+  }
   function approvalHostPatterns(host: string): string[] {
     const normalized = host.trim().toLowerCase().replace(/\.+$/, "");
     if (!normalized) return [];
     const labels = normalized.split(".");
     const patterns = [normalized];
-    for (let index = 1; index < labels.length; index += 1) {
-      const suffix = labels.slice(index).join(".");
-      if (suffix.includes(".")) {
-        patterns.push(`*.${suffix}`);
+    if (isIpv4(normalized)) {
+      for (let len = labels.length - 1; len >= 1; len -= 1) {
+        patterns.push(`${labels.slice(0, len).join(".")}.*`);
+      }
+    } else {
+      for (let index = 1; index < labels.length; index += 1) {
+        const suffix = labels.slice(index).join(".");
+        if (suffix.includes(".")) {
+          patterns.push(`*.${suffix}`);
+        }
       }
     }
     return patterns;
