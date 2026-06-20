@@ -3,6 +3,13 @@
 use hickory_proto::op::{Message, MessageType};
 use hickory_proto::rr::RData;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsMapping {
+    pub ip: String,
+    pub hostname: String,
+    pub ttl: u32,
+}
+
 fn query_name(message: &Message) -> Option<String> {
     let query = message.queries().first()?;
     let name = query.name().to_ascii();
@@ -17,9 +24,9 @@ fn ip_from_rdata(rdata: &RData) -> Option<String> {
     }
 }
 
-/// Return `(ip, hostname, ttl)` tuples from a DNS response.
+/// DNS response mapping used to correlate transport-layer destinations with hostnames.
 #[must_use]
-pub fn mappings_from_response(data: &[u8]) -> Vec<(String, String, u32)> {
+pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     let Ok(message) = Message::from_vec(data) else {
         return Vec::new();
     };
@@ -35,7 +42,11 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<(String, String, u32)> {
         .filter_map(|record| {
             let rdata = record.data()?;
             let ip = ip_from_rdata(rdata)?;
-            Some((ip, qname.clone(), record.ttl()))
+            Some(DnsMapping {
+                ip,
+                hostname: qname.clone(),
+                ttl: record.ttl(),
+            })
         })
         .collect()
 }
@@ -49,7 +60,7 @@ pub fn question_name(data: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mappings_from_response, question_name};
+    use super::{DnsMapping, mappings_from_response, question_name};
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -74,11 +85,48 @@ mod tests {
         let pkt = build_a_response("api.openai.com", (52, 54, 28, 178), 120);
         assert_eq!(
             mappings_from_response(&pkt),
-            vec![(
-                "52.54.28.178".to_string(),
-                "api.openai.com".to_string(),
-                120
-            )]
+            vec![DnsMapping {
+                ip: "52.54.28.178".to_string(),
+                hostname: "api.openai.com".to_string(),
+                ttl: 120,
+            }]
+        );
+    }
+
+    #[test]
+    fn mappings_from_response_keeps_every_address_for_question() {
+        let name = Name::from_ascii("example.com.").expect("valid name");
+        let mut message = Message::new();
+        message
+            .set_id(0xBEEF)
+            .set_message_type(hickory_proto::op::MessageType::Response)
+            .add_query(Query::query(name.clone(), RecordType::A))
+            .add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(A::new(172, 66, 147, 243)),
+            ))
+            .add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::A(A::new(104, 20, 23, 154)),
+            ));
+        let pkt = message.to_vec().expect("encode");
+
+        assert_eq!(
+            mappings_from_response(&pkt),
+            vec![
+                DnsMapping {
+                    ip: "172.66.147.243".to_string(),
+                    hostname: "example.com".to_string(),
+                    ttl: 300,
+                },
+                DnsMapping {
+                    ip: "104.20.23.154".to_string(),
+                    hostname: "example.com".to_string(),
+                    ttl: 300,
+                },
+            ]
         );
     }
 

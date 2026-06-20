@@ -1,8 +1,8 @@
-//! Shared IP→hostname cache populated by the DNS proxy.
+//! Shared IP→hostname cache populated by the DNS forwarder.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,10 +21,15 @@ struct CacheEntry {
     expires: f64,
 }
 
+struct LiveCacheEntry {
+    host: String,
+    expires: Instant,
+}
+
 pub struct DnsCache {
     path: Option<PathBuf>,
     max_ttl: u32,
-    entries: HashMap<String, (String, Instant)>,
+    entries: HashMap<String, LiveCacheEntry>,
 }
 
 impl DnsCache {
@@ -36,7 +41,20 @@ impl DnsCache {
         }
     }
 
+    /// Remember a hostname mapping in memory only: never writes to disk.
+    pub fn remember_ephemeral(&mut self, ip: &str, hostname: &str, ttl: u32) {
+        self.insert_entry(ip, hostname, ttl);
+    }
+
     pub fn remember(&mut self, ip: &str, hostname: &str, ttl: u32) {
+        self.insert_entry(ip, hostname, ttl);
+        if self.path.is_some() {
+            let _ = self.persist();
+        }
+    }
+
+    /// Shared validation, normalization, and insertion logic.
+    fn insert_entry(&mut self, ip: &str, hostname: &str, ttl: u32) {
         let host = hostname
             .trim()
             .to_lowercase()
@@ -48,29 +66,19 @@ impl DnsCache {
         let ttl = ttl.clamp(1, self.max_ttl);
         self.entries.insert(
             ip.to_string(),
-            (
+            LiveCacheEntry {
                 host,
-                Instant::now() + std::time::Duration::from_secs(ttl as u64),
-            ),
+                expires: Instant::now() + Duration::from_secs(u64::from(ttl)),
+            },
         );
-        if self.path.is_some() {
-            let _ = self.persist();
-        }
     }
 
-    pub fn lookup(&mut self, ip: &str) -> Option<String> {
-        if self.path.as_ref().is_some_and(|p| p.is_file()) {
-            self.load();
-        }
-        let (host, expires) = self.entries.get(ip)?;
-        if Instant::now() >= *expires {
-            self.entries.remove(ip);
-            if self.path.is_some() {
-                let _ = self.persist();
-            }
+    pub fn lookup(&self, ip: &str) -> Option<String> {
+        let entry = self.entries.get(ip)?;
+        if Instant::now() >= entry.expires {
             return None;
         }
-        Some(host.clone())
+        Some(entry.host.clone())
     }
 
     fn persist(&self) -> std::io::Result<()> {
@@ -81,20 +89,38 @@ impl DnsCache {
             std::fs::create_dir_all(parent)?;
         }
         let now = Instant::now();
-        let mut entries = HashMap::new();
-        for (ip, (host, expires)) in &self.entries {
-            if *expires <= now {
+
+        // Build live entries (live → wall-clock expiry).
+        let mut entries: HashMap<String, CacheEntry> = HashMap::new();
+        for (ip, entry) in &self.entries {
+            if entry.expires <= now {
                 continue;
             }
-            let mono = expires.duration_since(now).as_secs_f64();
+            let remaining = entry.expires.duration_since(now).as_secs_f64();
             entries.insert(
                 ip.clone(),
                 CacheEntry {
-                    host: host.clone(),
-                    expires: mono_now() + mono,
+                    host: entry.host.clone(),
+                    expires: unix_now() + remaining,
                 },
             );
         }
+
+        // Merge existing unexpired disk entries so a writer with a partial
+        // in-memory view does not drop unrelated mappings.
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(file) = serde_json::from_str::<CacheFile>(&raw)
+        {
+            let wall_now = unix_now();
+            for (ip, item) in file.entries {
+                if item.expires <= wall_now {
+                    continue;
+                }
+                // Live entries take precedence for the same IP.
+                entries.entry(ip).or_insert(item);
+            }
+        }
+
         let snapshot = CacheFile {
             version: 1,
             entries,
@@ -106,7 +132,8 @@ impl DnsCache {
         Ok(())
     }
 
-    fn load(&mut self) {
+    /// Reload entries from disk, replacing the in-memory cache.
+    pub fn reload(&mut self) {
         let Some(path) = &self.path else {
             return;
         };
@@ -119,7 +146,8 @@ impl DnsCache {
         if file.version != 1 {
             return;
         }
-        let now = mono_now();
+        let now = unix_now();
+        self.entries.clear();
         for (ip, item) in file.entries {
             if item.expires <= now {
                 continue;
@@ -127,19 +155,19 @@ impl DnsCache {
             let remaining = item.expires - now;
             self.entries.insert(
                 ip,
-                (
-                    item.host,
-                    Instant::now() + std::time::Duration::from_secs_f64(remaining),
-                ),
+                LiveCacheEntry {
+                    host: item.host,
+                    expires: Instant::now() + Duration::from_secs_f64(remaining),
+                },
             );
         }
     }
 }
 
-fn mono_now() -> f64 {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let start = START.get_or_init(Instant::now);
-    start.elapsed().as_secs_f64()
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
 pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
@@ -152,5 +180,133 @@ pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
         })
         .or_else(|| Some(PathBuf::from(DEFAULT_CACHE_PATH)));
     let mut cache = DnsCache::new(path, DEFAULT_MAX_TTL);
+    cache.reload();
     cache.lookup(ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheFile, DnsCache, unix_now};
+
+    #[test]
+    fn persisted_cache_uses_wall_clock_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dns-cache.json");
+        let before = unix_now();
+
+        let mut cache = DnsCache::new(Some(&path), 300);
+        cache.remember("104.18.32.47", "example.com", 60);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let file: CacheFile = serde_json::from_str(&raw).unwrap();
+        let entry = file.entries.get("104.18.32.47").unwrap();
+        assert_eq!(entry.host, "example.com");
+        assert!(entry.expires > before + 1.0);
+    }
+
+    #[test]
+    fn lookup_reads_hostname_from_persisted_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dns-cache.json");
+
+        let mut writer = DnsCache::new(Some(&path), 300);
+        writer.remember("104.18.32.47", "Example.COM.", 60);
+
+        let mut reader = DnsCache::new(Some(&path), 300);
+        reader.reload();
+        assert_eq!(
+            reader.lookup("104.18.32.47"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn reload_picks_up_new_entries_without_recreating_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dns-cache.json");
+
+        let mut writer = DnsCache::new(Some(&path), 300);
+        writer.remember("10.0.0.1", "first.example", 60);
+
+        let mut reader = DnsCache::new(Some(&path), 300);
+        reader.reload();
+        assert_eq!(reader.lookup("10.0.0.1"), Some("first.example".to_string()));
+        assert!(reader.lookup("10.0.0.2").is_none());
+
+        writer.remember("10.0.0.2", "second.example", 60);
+
+        reader.reload();
+        assert_eq!(reader.lookup("10.0.0.1"), Some("first.example".to_string()));
+        assert_eq!(
+            reader.lookup("10.0.0.2"),
+            Some("second.example".to_string())
+        );
+    }
+
+    #[test]
+    fn lookup_without_reload_returns_none_for_disk_only_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dns-cache.json");
+
+        let mut writer = DnsCache::new(Some(&path), 300);
+        writer.remember("10.0.0.3", "disk-only.example", 60);
+
+        let reader = DnsCache::new(Some(&path), 300);
+        // Without reload(), lookup() only sees in-memory entries.
+        assert!(reader.lookup("10.0.0.3").is_none());
+    }
+
+    #[test]
+    fn remember_ephemeral_does_not_touch_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dns-cache.json");
+
+        let mut cache = DnsCache::new(Some(&path), 300);
+        assert!(!path.exists());
+
+        cache.remember_ephemeral("10.0.0.1", "ephemeral.example", 60);
+
+        // Memory-only: no file should exist.
+        assert!(!path.exists(), "ephemeral remember created a cache file");
+
+        // The mapping IS usable from this instance.
+        assert_eq!(
+            cache.lookup("10.0.0.1"),
+            Some("ephemeral.example".to_string())
+        );
+
+        // A second instance cannot see it (never persisted).
+        let mut reader = DnsCache::new(Some(&path), 300);
+        reader.reload();
+        assert!(reader.lookup("10.0.0.1").is_none());
+    }
+
+    #[test]
+    fn two_writers_preserve_both_mappings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dns-cache.json");
+
+        // Writer A knows about IP 1.
+        let mut writer_a = DnsCache::new(Some(&path), 300);
+        writer_a.remember("192.168.1.1", "host-a.example", 60);
+
+        // Writer B knows only about IP 2.  Without merge, its persist would
+        // drop the host-a mapping.
+        let mut writer_b = DnsCache::new(Some(&path), 300);
+        writer_b.reload();
+        writer_b.remember("192.168.1.2", "host-b.example", 60);
+
+        // Both mappings survive on disk.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let file: CacheFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(file.entries.len(), 2, "expected both IPs in cache file");
+        assert_eq!(
+            file.entries.get("192.168.1.1").map(|e| &*e.host),
+            Some("host-a.example")
+        );
+        assert_eq!(
+            file.entries.get("192.168.1.2").map(|e| &*e.host),
+            Some("host-b.example")
+        );
+    }
 }

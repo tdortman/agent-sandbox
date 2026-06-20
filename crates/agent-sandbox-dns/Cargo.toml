@@ -8,12 +8,13 @@ license.workspace = true
 workspace = true
 
 [[bin]]
-name = "agent-sandbox-dns-proxy"
+name = "agent-sandbox-dns-forwarder"
 path = "src/main.rs"
 
 [dependencies]
 agent-sandbox-core = { path = "../agent-sandbox-core" }
 clap = { version = "4", features = ["derive"] }
+hickory-proto = "0.24"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
