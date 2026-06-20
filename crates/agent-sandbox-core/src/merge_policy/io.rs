@@ -2,7 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::policy::{Policy, contract_home_path, expand_home_path};
+use crate::hosts::NetworkSortKey;
+use crate::policy::{
+    FilesystemRule, FilesystemSortKey, NetworkRule, Policy, SudoRule, contract_home_path,
+    expand_home_path,
+};
 
 pub fn load_policy(path: &Path, home: Option<&str>) -> Policy {
     let read_path = resolve_policy_write_path(path);
@@ -17,6 +21,33 @@ pub fn load_policy(path: &Path, home: Option<&str>) -> Policy {
     policy
 }
 
+fn network_rule_sort_key(rule: &NetworkRule) -> NetworkSortKey {
+    NetworkSortKey::new(&rule.host, rule.port)
+}
+
+fn sudo_rule_sort_key(rule: &SudoRule) -> Vec<String> {
+    rule.argv.clone()
+}
+
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&str>) -> FilesystemSortKey {
+    FilesystemSortKey::new(contract_home_path(&rule.path, home), rule.access)
+}
+
+fn sorted_policy(policy: &Policy, home: Option<&str>) -> Policy {
+    let mut out = policy.clone();
+    out.network.allow.sort_by_key(network_rule_sort_key);
+    out.network.deny.sort_by_key(network_rule_sort_key);
+    out.sudo.allow.sort_by_key(sudo_rule_sort_key);
+    out.sudo.deny.sort_by_key(sudo_rule_sort_key);
+    out.filesystem
+        .allow
+        .sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
+    out.filesystem
+        .deny
+        .sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
+    out
+}
+
 fn expand_filesystem_paths(policy: &mut Policy, home: Option<&str>) {
     for rule in &mut policy.filesystem.allow {
         rule.path = expand_home_path(&rule.path, home);
@@ -27,11 +58,23 @@ fn expand_filesystem_paths(policy: &mut Policy, home: Option<&str>) {
 }
 
 pub fn resolve_policy_write_path(path: &Path) -> PathBuf {
-    if path.is_symlink() {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return path.to_path_buf();
+    };
+    if !meta.file_type().is_symlink() {
+        return path.to_path_buf();
     }
+    let Ok(link_target) = std::fs::read_link(path) else {
+        return path.to_path_buf();
+    };
+    let resolved = if link_target.is_absolute() {
+        link_target
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(link_target)
+    };
+    resolved.canonicalize().unwrap_or(resolved)
 }
 
 pub fn resolve_owner_uid(path: &Path, home: Option<&str>, uid: Option<u32>) -> Option<u32> {
@@ -102,7 +145,7 @@ pub fn atomic_write_policy(
             .and_then(|n| n.to_str())
             .unwrap_or("policy.json")
     ));
-    let json = policy_json(&contracted_policy(data, home))? + "\n";
+    let json = policy_json(&sorted_policy(&contracted_policy(data, home), home))? + "\n";
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &target)?;
     if let Some(uid) = resolve_owner_uid(path, home, owner_uid) {
@@ -198,7 +241,7 @@ fn push_spaced_json(out: &mut String, compact: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{FileAccess, FilesystemRule};
+    use crate::policy::{FileAccess, FilesystemRule, NetworkRule};
 
     #[test]
     fn policy_json_writes_home_paths_as_tilde() {
@@ -226,6 +269,41 @@ mod tests {
         assert!(
             raw.contains("\"/nix/store\""),
             "non-home path must stay absolute: {raw}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn policy_json_sorts_network_by_domain_hierarchy() {
+        let mut policy = crate::policy::Policy::default();
+        policy.network.allow = vec![
+            NetworkRule::new("docs.developer.apple.com", 443, "global"),
+            NetworkRule::new("api.z.ai", 443, "global"),
+            NetworkRule::new("developer.apple.com", 443, "global"),
+            NetworkRule::new("example.com", 443, "global"),
+            NetworkRule::new("r.jina.ai", 443, "global"),
+            NetworkRule::new("api.example.com", 443, "global"),
+        ];
+        let path = std::env::temp_dir().join("agent-sandbox-write-network-order.json");
+        let _ = std::fs::remove_file(&path);
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
+        let loaded = load_policy(&path, Some("/home/user"));
+        let hosts: Vec<&str> = loaded
+            .network
+            .allow
+            .iter()
+            .map(|rule| rule.host.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                "developer.apple.com",
+                "docs.developer.apple.com",
+                "example.com",
+                "api.example.com",
+                "r.jina.ai",
+                "api.z.ai",
+            ]
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -281,7 +359,7 @@ mod tests {
         assert!(raw.contains("\"~/.omp\""), "raw: {raw}");
         assert!(raw.contains("\"/nix/store\""), "raw: {raw}");
         let loaded = load_policy(&path, Some("/home/user"));
-        assert_eq!(loaded.filesystem.allow[0].path, "/home/user/.omp");
-        assert_eq!(loaded.filesystem.allow[1].path, "/nix/store");
+        assert_eq!(loaded.filesystem.allow[0].path, "/nix/store");
+        assert_eq!(loaded.filesystem.allow[1].path, "/home/user/.omp");
     }
 }

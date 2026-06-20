@@ -7,7 +7,7 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials as NixPeerCredentials};
 
 const TCP_ESTABLISHED: &str = "01";
 
@@ -45,9 +45,36 @@ pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
         .map(|u| u.dir.to_string_lossy().into_owned())
 }
 
-pub fn context_from_pid(pid: u32) -> (Option<String>, Option<String>, Option<String>) {
+/// UID and socket inode from a `/proc/net/tcp` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpSocketEntry {
+    uid: u32,
+    inode: String,
+}
+
+/// Process credentials for an RPC peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: i32,
+}
+
+/// Cwd / home / project_root resolved from a process's environment and `/proc`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcContext {
+    pub cwd: Option<String>,
+    pub home: Option<String>,
+    pub project_root: Option<String>,
+}
+
+pub fn context_from_pid(pid: u32) -> ProcContext {
     if pid == 0 {
-        return (None, None, None);
+        return ProcContext {
+            cwd: None,
+            home: None,
+            project_root: None,
+        };
     }
     let env = read_proc_environ(pid);
     let cwd = env
@@ -59,7 +86,11 @@ pub fn context_from_pid(pid: u32) -> (Option<String>, Option<String>, Option<Str
         .cloned()
         .or_else(|| env.get("HOME").cloned());
     let project_root = env.get("AGENT_SANDBOX_PROJECT_ROOT").cloned();
-    (cwd, home, project_root)
+    ProcContext {
+        cwd,
+        home,
+        project_root,
+    }
 }
 
 pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
@@ -85,7 +116,7 @@ fn tcp_addr_field(ip: &str, port: u16) -> String {
     format!("{reversed}:{port:04X}")
 }
 
-fn find_tcp_entry(local: SocketAddr, peer: SocketAddr) -> Option<(u32, String)> {
+fn find_tcp_entry(local: SocketAddr, peer: SocketAddr) -> Option<TcpSocketEntry> {
     let local_field = tcp_addr_field(&local.ip().to_string(), local.port());
     let peer_field = tcp_addr_field(&peer.ip().to_string(), peer.port());
     let lines = std::fs::read_to_string("/proc/net/tcp").ok()?;
@@ -99,7 +130,10 @@ fn find_tcp_entry(local: SocketAddr, peer: SocketAddr) -> Option<(u32, String)> 
         }
         if parts[1] == local_field && parts[2] == peer_field {
             let uid = parts[7].parse().ok()?;
-            return Some((uid, parts[9].to_string()));
+            return Some(TcpSocketEntry {
+                uid,
+                inode: parts[9].to_string(),
+            });
         }
     }
     None
@@ -130,34 +164,42 @@ fn pid_for_socket_inode(inode: &str) -> Option<u32> {
     None
 }
 
-/// Return `(pid, uid, gid)` for the peer of a connected Unix domain socket.
+/// Return process credentials for the peer of a connected Unix domain socket.
 #[allow(unsafe_code)]
-pub fn peer_cred_unix(stream: &tokio::net::UnixStream) -> Option<(u32, u32, i32)> {
+pub fn peer_cred_unix(stream: &tokio::net::UnixStream) -> Option<PeerCredentials> {
     let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(stream.as_raw_fd()) };
     peer_cred_fd(fd)
 }
 
-/// Return `(pid, uid, gid)` for the peer of a connected socket.
+/// Return process credentials for the peer of a connected socket.
 ///
-/// For accepted TCP connections (e.g. `agent-sandbox-proxy`), the local endpoint's
-/// `/proc/net/tcp` row belongs to this process. Look up the inverse quad first so we
-/// resolve the connecting client's pid for policy UI routing.
+/// For accepted TCP connections, the local endpoint's `/proc/net/tcp` row
+/// belongs to this process. Look up the inverse quad first so we resolve the
+/// connecting client's pid for policy UI routing.
 #[allow(unsafe_code)]
-pub fn peer_cred(stream: &tokio::net::TcpStream) -> Option<(u32, u32, i32)> {
+pub fn peer_cred(stream: &tokio::net::TcpStream) -> Option<PeerCredentials> {
     let local = stream.local_addr().ok()?;
     let peer = stream.peer_addr().ok()?;
     if local.is_ipv4() && peer.is_ipv4() {
         // Server-side accept: peer's socket row is (peer, local).
-        if let Some((uid, inode)) = find_tcp_entry(peer, local) {
-            let pid = pid_for_socket_inode(&inode).unwrap_or(0);
+        if let Some(entry) = find_tcp_entry(peer, local) {
+            let pid = pid_for_socket_inode(&entry.inode).unwrap_or(0);
             if pid > 0 {
-                return Some((pid, uid, -1));
+                return Some(PeerCredentials {
+                    pid,
+                    uid: entry.uid,
+                    gid: -1,
+                });
             }
         }
         // Client-side connect: our socket row is (local, peer).
-        if let Some((uid, inode)) = find_tcp_entry(local, peer) {
-            let pid = pid_for_socket_inode(&inode).unwrap_or(0);
-            return Some((pid, uid, -1));
+        if let Some(entry) = find_tcp_entry(local, peer) {
+            let pid = pid_for_socket_inode(&entry.inode).unwrap_or(0);
+            return Some(PeerCredentials {
+                pid,
+                uid: entry.uid,
+                gid: -1,
+            });
         }
     }
     let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(stream.as_raw_fd()) };
@@ -165,15 +207,15 @@ pub fn peer_cred(stream: &tokio::net::TcpStream) -> Option<(u32, u32, i32)> {
 }
 
 #[allow(unsafe_code)]
-fn peer_cred_fd(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u32, u32, i32)> {
-    let cred = getsockopt(&fd, PeerCredentials).ok()?;
+fn peer_cred_fd(fd: std::os::fd::BorrowedFd<'_>) -> Option<PeerCredentials> {
+    let cred = getsockopt(&fd, NixPeerCredentials).ok()?;
     let pid = u32::try_from(cred.pid()).ok()?;
     let uid = cred.uid();
     let gid = i32::try_from(cred.gid()).ok()?;
     if pid == 0 && i32::try_from(uid).is_err() {
         return None;
     }
-    Some((pid, uid, gid))
+    Some(PeerCredentials { pid, uid, gid })
 }
 
 /// Inode of a process namespace link (`/proc/<pid>/ns/<kind>`).

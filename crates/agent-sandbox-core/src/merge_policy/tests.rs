@@ -52,6 +52,25 @@ fn atomic_write_preserves_symlink() {
 }
 
 #[test]
+fn atomic_write_preserves_relative_symlink_to_missing_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real_dir = tmp.path().join("home/dot_config/agent-sandbox");
+    let link_dir = tmp.path().join("home/.config/agent-sandbox");
+    fs::create_dir_all(&real_dir).unwrap();
+    fs::create_dir_all(&link_dir).unwrap();
+    let link = link_dir.join("policy.json");
+    std::os::unix::fs::symlink("../../dot_config/agent-sandbox/policy.json", &link).unwrap();
+    let mut data = empty_policy();
+    data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
+
+    atomic_write_policy(&link, &data, None, None).unwrap();
+
+    assert!(link.is_symlink());
+    let loaded = load_policy(&real_dir.join("policy.json"), None);
+    assert_eq!(loaded.network.allow[0].host, "example.com");
+}
+
+#[test]
 fn atomic_write_chowns_to_owner() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");

@@ -34,7 +34,7 @@ impl RequestContext {
 
     #[must_use]
     pub fn ids(&self) -> ProcessIds {
-        (self.pid, self.uid).into()
+        ProcessIds::from_options(self.pid, self.uid)
     }
 
     #[must_use]
@@ -43,6 +43,18 @@ impl RequestContext {
         self.home = paths.home_string();
         self.project_root = paths.project_root_string();
         self
+    }
+
+    #[must_use]
+    pub fn from_paths_and_ids(paths: &SandboxPaths, ids: ProcessIds) -> Self {
+        Self {
+            cwd: paths.cwd_string(),
+            home: paths.home_string(),
+            project_root: paths.project_root_string(),
+            pid: ids.pid(),
+            uid: ids.uid(),
+            sandbox_session_id: None,
+        }
     }
 }
 
@@ -54,19 +66,6 @@ impl From<&SandboxPaths> for RequestContext {
             project_root: paths.project_root_string(),
             pid: None,
             uid: None,
-            sandbox_session_id: None,
-        }
-    }
-}
-
-impl From<(SandboxPaths, ProcessIds)> for RequestContext {
-    fn from((paths, ids): (SandboxPaths, ProcessIds)) -> Self {
-        Self {
-            cwd: paths.cwd_string(),
-            home: paths.home_string(),
-            project_root: paths.project_root_string(),
-            pid: ids.pid(),
-            uid: ids.uid(),
             sandbox_session_id: None,
         }
     }
@@ -238,7 +237,7 @@ mod tests {
     #[test]
     fn request_context_roundtrips_paths_and_ids() {
         let paths = SandboxPaths::new("/cwd", "/home/user", "/repo");
-        let ctx = RequestContext::from((paths, ProcessIds::new(42, 1000)));
+        let ctx = RequestContext::from_paths_and_ids(&paths, ProcessIds::new(42, 1000));
         assert_eq!(ctx.sandbox_paths().cwd(), Some("/cwd"));
         assert_eq!(ctx.sandbox_paths().home(), Some("/home/user"));
         assert_eq!(ctx.ids().pid(), Some(42));

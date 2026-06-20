@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hosts::NetworkRuleKey;
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -58,6 +60,43 @@ impl FileAccess {
 impl std::fmt::Display for FileAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FilesystemRuleKey {
+    pub path: String,
+    pub access: FileAccess,
+}
+
+impl FilesystemRuleKey {
+    #[must_use]
+    pub fn new(path: impl Into<String>, access: FileAccess) -> Self {
+        Self {
+            path: path.into(),
+            access,
+        }
+    }
+
+    #[must_use]
+    pub fn from_rule(rule: &FilesystemRule) -> Self {
+        Self::new(rule.path.trim_end_matches('/'), rule.access)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FilesystemSortKey {
+    pub path: String,
+    pub access: FileAccess,
+}
+
+impl FilesystemSortKey {
+    #[must_use]
+    pub fn new(path: impl Into<String>, access: FileAccess) -> Self {
+        Self {
+            path: path.into(),
+            access,
+        }
     }
 }
 
@@ -270,8 +309,8 @@ impl NetworkRule {
         }
     }
 
-    pub fn key(&self) -> (String, u16) {
-        (self.host.to_lowercase(), self.port)
+    pub fn key(&self) -> NetworkRuleKey {
+        NetworkRuleKey::new(&self.host, self.port)
     }
 }
 

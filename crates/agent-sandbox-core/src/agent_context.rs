@@ -1,9 +1,9 @@
-//! Resolved sandbox paths and process identity (fewer `Option`s in daemon/proxy hot paths).
+//! Resolved sandbox paths and process identity (fewer `Option`s in daemon hot paths).
 
 use std::path::Path;
 
 use crate::merge_policy::ProjectPolicyContext;
-use crate::proc_context::{context_from_pid, home_from_uid};
+use crate::proc_context::{ProcContext, context_from_pid, home_from_uid};
 use crate::session_context::{SessionContext, read_session_context, write_session_context};
 
 const fn non_empty(s: &str) -> Option<&str> {
@@ -107,21 +107,26 @@ impl ProcessIds {
         Self { pid, uid }
     }
 
+    #[must_use]
+    pub const fn from_options(pid: Option<u32>, uid: Option<u32>) -> Self {
+        Self {
+            pid: match pid {
+                Some(pid) => pid,
+                None => 0,
+            },
+            uid: match uid {
+                Some(uid) => uid,
+                None => 0,
+            },
+        }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         (self.pid > 0).then_some(self.pid)
     }
 
     pub fn uid(&self) -> Option<u32> {
         (self.uid > 0).then_some(self.uid)
-    }
-}
-
-impl From<(Option<u32>, Option<u32>)> for ProcessIds {
-    fn from((pid, uid): (Option<u32>, Option<u32>)) -> Self {
-        Self {
-            pid: pid.unwrap_or(0),
-            uid: uid.unwrap_or(0),
-        }
     }
 }
 
@@ -172,14 +177,17 @@ pub fn resolve_sandbox_paths(
 /// Peer process paths from `SO_PEERCRED` + `/proc`.
 #[must_use]
 pub fn peer_sandbox_paths(ids: ProcessIds) -> SandboxPaths {
-    let (cwd, home, project_root) = ids.pid().map_or((None, None, None), context_from_pid);
-    let home = home.or_else(|| ids.uid().and_then(|u| home_from_uid(Some(u))));
-    SandboxPaths::from_wire(cwd, home, project_root)
+    let ctx = ids.pid().map_or(ProcContext::default(), context_from_pid);
+    let home = ctx
+        .home
+        .clone()
+        .or_else(|| ids.uid().and_then(|u| home_from_uid(Some(u))));
+    SandboxPaths::from_wire(ctx.cwd, home, ctx.project_root)
 }
 
-/// Full proxy-side resolution (peer + file + env).
+/// Full daemon-side resolution (peer + file + env).
 #[must_use]
-pub fn resolve_proxy_paths(ids: ProcessIds) -> SandboxPaths {
+pub fn resolve_daemon_paths(ids: ProcessIds) -> SandboxPaths {
     let peer = peer_sandbox_paths(ids);
     resolve_sandbox_paths(
         peer.cwd_string(),
@@ -212,8 +220,8 @@ mod tests {
     }
 
     #[test]
-    fn process_ids_from_option_tuple_uses_zero_for_unknowns() {
-        let ids = ProcessIds::from((Some(42), None));
+    fn process_ids_from_options_uses_zero_for_unknowns() {
+        let ids = ProcessIds::from_options(Some(42), None);
         assert_eq!(ids.pid(), Some(42));
         assert_eq!(ids.uid(), None);
     }

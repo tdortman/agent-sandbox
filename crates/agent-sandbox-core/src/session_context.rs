@@ -1,4 +1,4 @@
-//! Shared OMP session paths for policyd and the proxy.
+//! Shared OMP session paths for policyd and enforcement daemons.
 
 use std::env;
 use std::path::PathBuf;
