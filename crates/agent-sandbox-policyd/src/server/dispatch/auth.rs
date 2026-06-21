@@ -1,153 +1,298 @@
-//! Restrict control-plane RPCs to host-side clients and pinned OMP UI peers.
+//! Gate sandbox vs host socket requests by RPC variant.
 
-use agent_sandbox_core::{RpcRequest, is_blocked_sandbox_policy_tool, looks_like_omp_ui_process};
+use agent_sandbox_core::RpcRequest;
 
 use crate::error::PolicydError;
-use crate::server::peer::ClientPeer;
-use crate::store::{PolicyStore, PolicydArgs};
 
-/// Whether the request mutates policy/UI state (host-only from sandboxes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketRole {
+    Host,
+    Sandbox,
+    UiFd,
+}
+
+/// Whether the request is allowed on the sandbox socket.
 #[must_use]
-pub fn is_control_request(req: &RpcRequest) -> bool {
-    !matches!(
-        req,
+pub fn is_sandbox_request(req: &RpcRequest) -> bool {
+    match req {
+        RpcRequest::RegisterUi {
+            ui_client: Some(c), ..
+        } => c == "omp",
         RpcRequest::Check { .. }
-            | RpcRequest::Elevate { .. }
-            | RpcRequest::CheckFilesystem { .. }
-            | RpcRequest::StartFilesystemMonitor { .. }
+        | RpcRequest::Elevate { .. }
+        | RpcRequest::CheckFilesystem { .. }
+        | RpcRequest::StartFilesystemMonitor { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether the request is allowed on an inherited UI fd (already-registered OMP connection).
+#[must_use]
+pub fn is_uifd_request(req: &RpcRequest) -> bool {
+    matches!(
+        req,
+        RpcRequest::Approve { .. }
+            | RpcRequest::ApproveHost { .. }
+            | RpcRequest::Deny { .. }
+            | RpcRequest::Status { .. }
+            | RpcRequest::Reload { .. }
+            | RpcRequest::UnregisterUi
     )
 }
 
-pub async fn ensure_allowed(
-    store: &PolicyStore,
-    args: &PolicydArgs,
-    peer: &ClientPeer,
-    req: &RpcRequest,
-) -> Result<(), PolicydError> {
-    if !peer.is_sandboxed(args) {
-        return Ok(());
-    }
-    if !is_control_request(req) {
-        return Ok(());
-    }
-    if peer.pid != 0 && is_blocked_sandbox_policy_tool(peer.pid) {
-        return Err(PolicydError::UnauthorizedRequest);
-    }
-
-    if let RpcRequest::RegisterUi { ui_client, .. } = req {
-        if ui_client.as_deref() != Some("omp") {
-            return Err(PolicydError::UnauthorizedRequest);
-        }
-        if !looks_like_omp_ui_process(peer.pid) {
-            return Err(PolicydError::UnauthorizedRequest);
-        }
-        return Ok(());
-    }
-
-    if !looks_like_omp_ui_process(peer.pid) {
-        return Err(PolicydError::UnauthorizedRequest);
-    }
-    if store.is_registered_sandbox_omp_ui(peer.uid, peer.pid).await {
-        Ok(())
-    } else {
-        Err(PolicydError::UnauthorizedRequest)
+pub fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), PolicydError> {
+    match role {
+        SocketRole::Sandbox if !is_sandbox_request(req) => Err(PolicydError::UnauthorizedRequest),
+        SocketRole::UiFd if !is_uifd_request(req) => Err(PolicydError::UnauthorizedUiFdRequest),
+        _ => Ok(()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use agent_sandbox_core::{ApprovalScope, RequestContext, RpcRequest};
-
-    use super::{ensure_allowed, is_control_request};
+    use super::{SocketRole, ensure_allowed};
     use crate::error::PolicydError;
-    use crate::server::peer::ClientPeer;
-    use crate::store::{PolicyStore, PolicydArgs};
-
-    fn test_args() -> PolicydArgs {
-        PolicydArgs {
-            sandbox_netns: None,
-            socket: "/run/agent-sandbox/policy.sock".into(),
-            declarative: "/etc/agent-sandbox/declarative.json".into(),
-            export_json: "/var/lib/agent-sandbox/exported-policy.json".into(),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(5),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-        }
-    }
+    use agent_sandbox_core::{ApprovalScope, FileAccess, RequestContext, RpcRequest};
 
     #[test]
-    fn check_and_elevate_are_not_control_requests() {
-        assert!(!is_control_request(&RpcRequest::Check {
-            host: None,
-            connect_host: None,
-            port: None,
-            scheme: "https".into(),
-            url: None,
-            ctx: RequestContext::default(),
-        }));
-        assert!(!is_control_request(&RpcRequest::Elevate {
-            argv: vec!["id".into()],
-            ctx: RequestContext::default(),
-        }));
-    }
-
-    #[test]
-    fn approve_is_control_request() {
-        assert!(is_control_request(&RpcRequest::Approve {
-            id: "p1".into(),
-            scope: ApprovalScope::Once,
-            session_id: None,
-            target: None,
-            ctx: RequestContext::default(),
-        }));
-    }
-
-    #[tokio::test]
-    async fn unknown_peer_may_call_control_requests() {
-        let args = test_args();
-        let store = PolicyStore::new(args.clone());
-        let peer = ClientPeer::unknown();
-        ensure_allowed(
-            &store,
-            &args,
-            &peer,
-            &RpcRequest::RegisterUi {
+    fn sandbox_socket_allows_request_ops() {
+        for req in [
+            RpcRequest::Check {
+                host: None,
+                connect_host: None,
+                port: None,
+                scheme: "https".into(),
+                url: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Elevate {
+                argv: vec!["id".into()],
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::CheckFilesystem {
+                path: "/tmp/test".into(),
+                access: FileAccess::ReadWrite,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::StartFilesystemMonitor {
+                ctx: RequestContext::default(),
+                static_allow: vec![],
+            },
+            RpcRequest::RegisterUi {
                 ui_client: Some("omp".into()),
                 ctx: RequestContext::default(),
             },
-        )
-        .await
-        .expect("unknown peer cred should not be treated as sandboxed");
+        ] {
+            assert!(
+                ensure_allowed(SocketRole::Sandbox, &req).is_ok(),
+                "sandbox socket should allow request ops, got error for {:?}",
+                std::mem::discriminant(&req)
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn sandboxed_peer_cannot_approve_before_register() {
-        let args = test_args();
-        let store = PolicyStore::new(args.clone());
-        let peer = ClientPeer {
-            pid: std::process::id(),
-            uid: 0,
-            gid: 0,
-        };
-        if !peer.is_sandboxed(&args) {
-            return;
-        }
-        let err = ensure_allowed(
-            &store,
-            &args,
-            &peer,
-            &RpcRequest::Approve {
+    #[test]
+    fn sandbox_socket_rejects_control_ops() {
+        for req in [
+            RpcRequest::RegisterUi {
+                ui_client: Some("standalone".into()),
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::RegisterUi {
+                ui_client: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::UnregisterUi,
+            RpcRequest::Approve {
                 id: "p1".into(),
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
                 ctx: RequestContext::default(),
             },
-        )
-        .await
-        .expect_err("sandboxed peer should be blocked until OMP registers");
-        assert!(matches!(err, PolicydError::UnauthorizedRequest));
+            RpcRequest::ApproveHost {
+                host: "example.com".into(),
+                port: 443,
+                scope: ApprovalScope::Once,
+                session_id: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Deny {
+                id: "p1".into(),
+                scope: ApprovalScope::Once,
+                session_id: None,
+                target: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Status {
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Reload {
+                ctx: RequestContext::default(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    ensure_allowed(SocketRole::Sandbox, &req),
+                    Err(PolicydError::UnauthorizedRequest)
+                ),
+                "sandbox socket should reject control ops"
+            );
+        }
+    }
+
+    #[test]
+    fn host_socket_allows_every_rpc_variant() {
+        let all = vec![
+            RpcRequest::Check {
+                host: None,
+                connect_host: None,
+                port: None,
+                scheme: "https".into(),
+                url: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Elevate {
+                argv: vec!["id".into()],
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::CheckFilesystem {
+                path: "/tmp/test".into(),
+                access: FileAccess::ReadWrite,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::StartFilesystemMonitor {
+                ctx: RequestContext::default(),
+                static_allow: vec![],
+            },
+            RpcRequest::RegisterUi {
+                ui_client: Some("omp".into()),
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::UnregisterUi,
+            RpcRequest::Approve {
+                id: "p1".into(),
+                scope: ApprovalScope::Once,
+                session_id: None,
+                target: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::ApproveHost {
+                host: "example.com".into(),
+                port: 443,
+                scope: ApprovalScope::Once,
+                session_id: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Deny {
+                id: "p1".into(),
+                scope: ApprovalScope::Once,
+                session_id: None,
+                target: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Status {
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Reload {
+                ctx: RequestContext::default(),
+            },
+        ];
+        for req in &all {
+            assert!(
+                ensure_allowed(SocketRole::Host, req).is_ok(),
+                "host socket should allow all RPC variants, got error for {:?}",
+                std::mem::discriminant(req)
+            );
+        }
+    }
+
+    #[test]
+    fn uifd_allows_approval_ops() {
+        for req in [
+            RpcRequest::Approve {
+                id: "p1".into(),
+                scope: ApprovalScope::Once,
+                session_id: None,
+                target: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::ApproveHost {
+                host: "example.com".into(),
+                port: 443,
+                scope: ApprovalScope::Once,
+                session_id: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Deny {
+                id: "p1".into(),
+                scope: ApprovalScope::Once,
+                session_id: None,
+                target: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Status {
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Reload {
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::UnregisterUi,
+        ] {
+            assert!(
+                ensure_allowed(SocketRole::UiFd, &req).is_ok(),
+                "UiFd socket should allow approval ops"
+            );
+        }
+    }
+
+    #[test]
+    fn uifd_rejects_sandbox_ops() {
+        for req in [
+            RpcRequest::Check {
+                host: None,
+                connect_host: None,
+                port: None,
+                scheme: "https".into(),
+                url: None,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::Elevate {
+                argv: vec!["id".into()],
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::CheckFilesystem {
+                path: "/tmp/test".into(),
+                access: FileAccess::ReadWrite,
+                ctx: RequestContext::default(),
+            },
+            RpcRequest::StartFilesystemMonitor {
+                ctx: RequestContext::default(),
+                static_allow: vec![],
+            },
+        ] {
+            assert!(
+                matches!(
+                    ensure_allowed(SocketRole::UiFd, &req),
+                    Err(PolicydError::UnauthorizedUiFdRequest)
+                ),
+                "UiFd socket should reject sandbox request ops"
+            );
+        }
+    }
+
+    #[test]
+    fn uifd_rejects_register_ui() {
+        let req = RpcRequest::RegisterUi {
+            ui_client: Some("omp".into()),
+            ctx: RequestContext::default(),
+        };
+        assert!(
+            matches!(
+                ensure_allowed(SocketRole::UiFd, &req),
+                Err(PolicydError::UnauthorizedUiFdRequest)
+            ),
+            "UiFd socket should reject RegisterUi after transition"
+        );
     }
 }

@@ -28,7 +28,7 @@ pub fn ui_spawn_env(
         ("LOGNAME".into(), user.name.clone()),
         (
             "AGENT_SANDBOX_POLICY_SOCKET".into(),
-            args.socket.display().to_string(),
+            args.host_socket.display().to_string(),
         ),
     ]);
     if let Some(home) = home {

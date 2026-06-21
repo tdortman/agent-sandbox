@@ -392,8 +392,8 @@ mod tests {
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
-            socket: "/tmp/test.sock".into(),
-            sandbox_netns: None,
+            host_socket: "/tmp/test.sock".into(),
+            sandbox_socket: "/tmp/test-sandbox.sock".into(),
             declarative: "/tmp/declarative.json".into(),
             export_json: "/tmp/export.json".into(),
             export_nix: None,

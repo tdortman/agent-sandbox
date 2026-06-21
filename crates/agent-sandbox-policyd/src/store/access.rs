@@ -376,8 +376,8 @@ mod tests {
         agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            socket: dir.path().join("sock"),
-            sandbox_netns: None,
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
             declarative: dir.path().join("declarative.json"),
             export_json: dir.path().join("export.json"),
             export_nix: None,
@@ -440,8 +440,8 @@ mod tests {
         agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            socket: dir.path().join("sock"),
-            sandbox_netns: None,
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
             declarative: dir.path().join("declarative.json"),
             export_json: dir.path().join("export.json"),
             export_nix: None,
@@ -499,8 +499,8 @@ mod tests {
         agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            socket: dir.path().join("sock"),
-            sandbox_netns: None,
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
             declarative: dir.path().join("declarative.json"),
             export_json: dir.path().join("export.json"),
             export_nix: None,
@@ -552,8 +552,8 @@ mod tests {
         agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            socket: dir.path().join("sock"),
-            sandbox_netns: None,
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
             declarative: dir.path().join("declarative.json"),
             export_json: dir.path().join("export.json"),
             export_nix: None,

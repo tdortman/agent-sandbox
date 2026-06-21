@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use agent_sandbox_core::{RpcReply, RpcRequest};
 
+use super::dispatch::SocketRole;
 use crate::error::PolicydError;
 use crate::server::peer::ClientPeer;
 use crate::store::PolicyStore;
@@ -11,7 +12,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::Mutex;
 
-pub async fn handle_client(store: Arc<PolicyStore>, stream: UnixStream) -> std::io::Result<()> {
+pub async fn handle_client(
+    store: Arc<PolicyStore>,
+    stream: UnixStream,
+    mut role: SocketRole,
+) -> std::io::Result<()> {
     let peer = ClientPeer::from_stream(&stream);
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -29,8 +34,9 @@ pub async fn handle_client(store: Arc<PolicyStore>, stream: UnixStream) -> std::
             continue;
         };
         let flush_pending = matches!(req, RpcRequest::RegisterUi { .. });
+        let is_omp_register = matches!(&req, RpcRequest::RegisterUi { ui_client, .. } if ui_client.as_deref() == Some("omp"));
 
-        let resp = match super::dispatch::dispatch(&store, &client, peer, req).await {
+        let resp = match super::dispatch::dispatch(&store, &client, peer, role, req).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(error = %err, "policyd dispatch error");

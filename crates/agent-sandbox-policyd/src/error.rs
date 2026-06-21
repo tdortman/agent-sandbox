@@ -27,8 +27,10 @@ pub enum PolicydError {
     HostDeniedByPolicy,
     #[error("invalid approval target")]
     InvalidDecisionTarget,
-    #[error("request not allowed from sandboxed client")]
+    #[error("request not allowed on sandbox policy socket")]
     UnauthorizedRequest,
+    #[error("request not allowed on inherited UI policy fd")]
+    UnauthorizedUiFdRequest,
 }
 
 impl From<PolicydError> for RpcReply {

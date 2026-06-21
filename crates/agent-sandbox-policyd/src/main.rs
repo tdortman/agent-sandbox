@@ -13,9 +13,8 @@ struct Cli {
     #[arg(long, default_value = "/run/agent-sandbox/policy.sock")]
     socket: PathBuf,
 
-    /// When set, peers in this network namespace may only call `check` / `elevate`.
-    #[arg(long, env = "AGENT_SANDBOX_SANDBOX_NETNS")]
-    sandbox_netns: Option<PathBuf>,
+    #[arg(long, default_value = "/run/agent-sandbox/sandbox-policy.sock")]
+    sandbox_socket: PathBuf,
 
     #[arg(long, default_value = "/etc/agent-sandbox/declarative.json")]
     declarative: PathBuf,
@@ -53,8 +52,8 @@ async fn main() -> Result<(), PolicydError> {
 
     let cli = Cli::parse();
     let args = PolicydArgs {
-        socket: cli.socket,
-        sandbox_netns: cli.sandbox_netns,
+        host_socket: cli.socket,
+        sandbox_socket: cli.sandbox_socket,
         declarative: cli.declarative,
         export_json: cli.export_json,
         export_nix: if cli.export_nix.is_empty() {
@@ -73,7 +72,9 @@ async fn main() -> Result<(), PolicydError> {
         .export_policy_files(agent_sandbox_core::SandboxPaths::default())
         .await?;
 
-    let server = PolicyServer::new(store.clone(), store.args().socket.clone());
+    let host_socket = store.args().host_socket.clone();
+    let sandbox_socket = store.args().sandbox_socket.clone();
+    let server = PolicyServer::new(store.clone(), host_socket, sandbox_socket);
     server.run().await?;
     Ok(())
 }

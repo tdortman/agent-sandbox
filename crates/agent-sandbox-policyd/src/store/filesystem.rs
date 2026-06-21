@@ -37,7 +37,7 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root_string();
 
         let sandbox_session_id = ctx.sandbox_session_id.clone();
-        let socket_str = self.args.socket.to_string_lossy().to_string();
+        let socket_str = self.args.sandbox_socket.to_string_lossy().to_string();
 
         let mut command = Command::new(&cmd);
         command

@@ -1,6 +1,7 @@
 //! Route incoming RPC requests to store methods.
 
 mod auth;
+pub(crate) use auth::SocketRole;
 mod check;
 mod context;
 mod handlers;
@@ -17,9 +18,10 @@ pub async fn dispatch(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,
+    role: SocketRole,
     mut req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
-    auth::ensure_allowed(store, store.args(), &peer, &req).await?;
+    auth::ensure_allowed(role, &req)?;
     context::resolve(store, &mut req).await;
     handlers::handle(store, client, peer, req).await
 }

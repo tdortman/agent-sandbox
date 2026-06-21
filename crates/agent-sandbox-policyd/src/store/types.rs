@@ -36,8 +36,8 @@ pub(crate) static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct PolicydArgs {
-    pub socket: PathBuf,
-    pub sandbox_netns: Option<PathBuf>,
+    pub host_socket: PathBuf,
+    pub sandbox_socket: PathBuf,
     pub declarative: PathBuf,
     pub export_json: PathBuf,
     pub export_nix: Option<PathBuf>,
@@ -195,6 +195,7 @@ pub(crate) struct UiClient {
     pub session_id: String,
     pub ui_client: String,
     pub writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
+    #[allow(dead_code)]
     pub owner_uid: u32,
     pub owner_pid: u32,
 }

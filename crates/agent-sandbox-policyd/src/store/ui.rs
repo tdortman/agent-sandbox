@@ -32,13 +32,7 @@ impl PolicyStore {
             .any(|c| c.ui_client == "omp")
     }
 
-    pub async fn is_registered_sandbox_omp_ui(&self, uid: u32, pid: u32) -> bool {
-        self.inner
-            .lock()
-            .await
-            .ui_clients
-            .values()
-            .any(|c| c.ui_client == "omp" && c.owner_uid == uid && c.owner_pid == pid)
+    /// Whether an OMP UI is already registered for a given sandbox session.
     }
 
     fn omp_clients(inner: &super::types::StoreInner) -> Vec<&UiClient> {

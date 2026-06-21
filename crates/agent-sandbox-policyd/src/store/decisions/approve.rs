@@ -646,8 +646,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         PolicyStore::new(PolicydArgs {
-            socket: dir.join("policy.sock"),
-            sandbox_netns: None,
+            host_socket: dir.join("policy.sock"),
+            sandbox_socket: dir.join("sandbox-policy.sock"),
             declarative: dir.join("declarative.json"),
             export_json: dir.join("exported-policy.json"),
             export_nix: None,
