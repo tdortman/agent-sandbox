@@ -9,7 +9,7 @@ use super::choice::{format_elevation_title, resolve_choice};
 use super::dialog::pick_option;
 use super::error::UiCliError;
 use super::options::{
-    ACTION_OPTIONS, PromptAction, ScopeOption, scope_only_options, sudo_scope_options,
+    ACTION_OPTIONS, PromptAction, ScopeOption, scope_only_options, sudo_target_options,
 };
 
 pub(crate) async fn handle_push(
@@ -76,20 +76,41 @@ pub(crate) async fn handle_push(
             project_root,
         } => {
             let argv = argv.unwrap_or_default();
-            let cwd = cwd
-                .or_else(|| paths.cwd_string())
-                .unwrap_or_else(|| "?".to_string());
-            let title = format_elevation_title(&argv, &cwd);
-            let paths = paths.merged_with(Some(cwd), home, project_root);
+            let paths = paths.merged_with(cwd, home, project_root);
+
+            // Step 1: choose action
+            let title = format_elevation_title(&argv, paths.cwd().unwrap_or("?"));
             let Some(action) = choose_action(&title).await? else {
                 return Ok(());
             };
-            let choice = choose_scope(
+
+            // Step 2: choose scope
+            let Some(scope) = choose_scope_only(
                 &format!("agent-sandbox: {} sudo scope?", action.verb()),
-                sudo_scope_options(&argv, session_id.is_some()),
+                session_id.is_some(),
             )
-            .await?;
-            resolve_choice(socket, &paths, session_id, &id, action, choice).await?;
+            .await?
+            else {
+                return Ok(());
+            };
+
+            // Step 3: for non-Once scopes, choose command prefix
+            let target = if scope == ApprovalScope::Once {
+                None
+            } else {
+                choose_target_level(
+                    &format!("agent-sandbox: {} sudo target?", action.verb()),
+                    sudo_target_options(&argv, scope),
+                )
+                .await?
+            };
+
+            let choice = ScopeOption {
+                label: String::new(),
+                scope,
+                target,
+            };
+            resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await?;
         }
         UiPush::FilesystemRequest {
             id,

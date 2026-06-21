@@ -58,42 +58,18 @@ pub(crate) fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
     options
 }
 
-pub(crate) fn sudo_scope_options(argv: &[String], session_available: bool) -> Vec<ScopeOption> {
-    let mut options = vec![ScopeOption {
-        label: "This command only".into(),
-        scope: ApprovalScope::Once,
-        target: None,
-    }];
+/// Command prefix options for a single scope (step 3 of 3-step flow).
+pub(crate) fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOption> {
     let prefixes = SudoRule::approval_prefixes(argv);
-    if session_available {
-        push_sudo_options(&mut options, ApprovalScope::Session, &prefixes);
-    }
-    push_sudo_options(&mut options, ApprovalScope::Project, &prefixes);
-    push_sudo_options(&mut options, ApprovalScope::Global, &prefixes);
-    options
-}
-
-fn push_sudo_options(
-    options: &mut Vec<ScopeOption>,
-    scope: ApprovalScope,
-    prefixes: &[Vec<String>],
-) {
-    for argv in prefixes {
+    let mut options = Vec::with_capacity(prefixes.len());
+    for argv in &prefixes {
         options.push(ScopeOption {
-            label: format!("{} — {}", scope_label(scope), format_command(argv)),
+            label: format_command(argv),
             scope,
             target: Some(ApprovalTarget::SudoCommand { argv: argv.clone() }),
         });
     }
-}
-
-fn scope_label(scope: ApprovalScope) -> &'static str {
-    match scope {
-        ApprovalScope::Once => "Once",
-        ApprovalScope::Session => "This session",
-        ApprovalScope::Project => "This project",
-        ApprovalScope::Global => "Globally",
-    }
+    options
 }
 
 fn format_command(argv: &[String]) -> String {

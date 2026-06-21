@@ -7,18 +7,13 @@ use tracing::info;
 use super::error::UiCliError;
 use super::options::{PromptAction, ScopeOption};
 
-pub(crate) fn format_elevation_title(argv: &[String], cwd: &str) -> String {
-    let cmd = if argv.is_empty() {
-        "sudo".to_string()
-    } else {
-        format!("sudo {}", argv.join(" "))
-    };
-    let mut title = format!("agent-sandbox — sudo: {cmd}");
+pub(crate) fn format_elevation_title(argv: &[String], _cwd: &str) -> String {
+    let cmd = argv.join(" ");
+    let mut title = format!("agent-sandbox: sudo {cmd}");
     if title.len() > 72 {
         title.truncate(69);
         title.push_str("...");
     }
-    let _ = cwd;
     title
 }
 
