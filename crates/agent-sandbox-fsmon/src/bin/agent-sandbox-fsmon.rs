@@ -137,12 +137,14 @@ fn fanotify_init() -> io::Result<i32> {
 /// Add a fanotify mark on a mount point path.
 ///
 /// Returns the mask that was actually applied. Kernels with
-/// `FAN_PRE_ACCESS` support can classify regular file content access from
-/// the target process fd. Older kernels fall back to conservative open
-/// permission events.
+/// `FAN_PRE_ACCESS` support can also receive pre-content notification
+/// events for content reads. Unlike the old behavior, `FAN_OPEN_PERM` is
+/// always included so that file opens produce deniable permission events.
+/// `FAN_PRE_ACCESS` is supplementary and provides fd-level visibility for
+/// content classification but cannot deny access.
 fn fanotify_mark(fan_fd: i32, path: &CStr, try_pre_access: bool) -> io::Result<u64> {
     let mask = if try_pre_access {
-        FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM | FAN_PRE_ACCESS
+        FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM | FAN_PRE_ACCESS
     } else {
         FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM
     };
@@ -263,6 +265,19 @@ fn fdinfo_flags(pid: i32, fd_name: &str) -> io::Result<i32> {
     i32::from_str_radix(flags, 8).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+fn event_fd_access(event_fd: i32) -> Option<FileAccess> {
+    if event_fd < 0 {
+        return None;
+    }
+    fdinfo_flags(self_pid_i32(), &event_fd.to_string())
+        .ok()
+        .map(open_flags_to_access)
+}
+
+fn self_pid_i32() -> i32 {
+    i32::try_from(process::id()).unwrap_or(i32::MAX)
+}
+
 fn process_fd_access(pid: i32, event_fd: i32) -> Option<FileAccess> {
     if pid <= 0 {
         return None;
@@ -309,7 +324,9 @@ fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
         return FileAccess::Read;
     }
     if mask & FAN_OPEN_PERM != 0 {
-        return FileAccess::ReadWrite;
+        return event_fd_access(event_fd)
+            .or_else(|| process_fd_access(pid, event_fd))
+            .unwrap_or(FileAccess::ReadWrite);
     }
     FileAccess::All
 }
@@ -510,6 +527,15 @@ fn main() {
                     offset += event_len;
                     continue;
                 }
+                // FAN_PRE_ACCESS is a pre-content notification event, not a
+                // permission event. The kernel does not wait for or honor a
+                // deny response. Auto-allow these events and rely on
+                // FAN_OPEN_PERM for deniable open permission checks.
+                if meta.mask & FAN_PRE_ACCESS != 0 {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
                 // Resolve the path from the event fd.
                 let Ok(path) = resolve_event_path(meta.fd) else {
                     // Cannot resolve, allow by default.
@@ -568,6 +594,9 @@ fn respond(fan_fd: i32, event_fd: i32, response: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn open_flags_map_to_granular_access() {
@@ -588,6 +617,34 @@ mod tests {
         );
         assert_eq!(mask_to_access(FAN_ACCESS_PERM, -1, -1), FileAccess::Read);
         assert_eq!(mask_to_access(FAN_OPEN_PERM, -1, -1), FileAccess::ReadWrite);
+    }
+
+    #[test]
+    fn open_perm_uses_event_fd_flags_when_available() {
+        let path =
+            std::env::temp_dir().join(format!("agent-sandbox-fsmon-test-{}", std::process::id()));
+        {
+            let mut file = File::create(&path).expect("create temp file");
+            file.write_all(b"x").expect("write temp file");
+        }
+
+        let read_file = File::open(&path).expect("open read-only temp file");
+        assert_eq!(
+            mask_to_access(FAN_OPEN_PERM, read_file.as_raw_fd(), -1),
+            FileAccess::Read
+        );
+
+        let read_write_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open read-write temp file");
+        assert_eq!(
+            mask_to_access(FAN_OPEN_PERM, read_write_file.as_raw_fd(), -1),
+            FileAccess::ReadWrite
+        );
+
+        std::fs::remove_file(path).expect("remove temp file");
     }
 
     #[test]
