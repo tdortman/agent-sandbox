@@ -33,6 +33,20 @@ impl PolicyStore {
     }
 
     /// Whether an OMP UI is already registered for a given sandbox session.
+    /// Used to prevent duplicate registrations from sandboxed processes.
+    pub async fn has_omp_ui_for_sandbox_session(&self, sandbox_session_id: Option<&str>) -> bool {
+        let Some(sid) = sandbox_session_id else {
+            return false;
+        };
+        let inner = self.inner.lock().await;
+        let omp_clients = Self::omp_clients(&inner);
+        omp_clients.iter().any(|c| {
+            inner
+                .ui_context_by_session
+                .get(&c.session_id)
+                .and_then(|ctx| ctx.sandbox_session_id.as_deref())
+                .is_some_and(|ctx_sid| ctx_sid == sid)
+        })
     }
 
     fn omp_clients(inner: &super::types::StoreInner) -> Vec<&UiClient> {
@@ -373,6 +387,10 @@ impl PolicyStore {
     pub(crate) async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) {
         let targets = self.ui_notification_targets_for(route).await;
         if targets.is_empty() {
+            tracing::warn!(
+                kind = ?payload,
+                "policy push dropped: no matching OMP or standalone UI for route"
+            );
             return;
         }
         let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_string();
@@ -440,7 +458,12 @@ impl PolicyStore {
 
         // Fallback: standalone-only, never `notify_ui`
         let targets = self.standalone_ui_notification_targets_for(route).await;
-        if !targets.is_empty() {
+        if targets.is_empty() {
+            tracing::warn!(
+                kind = ?payload,
+                "network push dropped: no matching OMP or standalone UI for route"
+            );
+        } else {
             if let Some(id) = net_id {
                 self.inner
                     .lock()

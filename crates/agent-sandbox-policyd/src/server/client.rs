@@ -45,6 +45,16 @@ pub async fn handle_client(
         };
 
         reply(writer.clone(), &resp).await;
+
+        // Transition Host/Sandbox → UiFd after successful OMP RegisterUi.
+        // Future requests on this connection are UI-only (Approve, Deny, etc).
+        if (role == SocketRole::Host || role == SocketRole::Sandbox)
+            && is_omp_register
+            && resp.is_ok()
+        {
+            role = SocketRole::UiFd;
+        }
+
         if flush_pending && resp.is_ok() {
             store.resolve_pending_declarative_allow().await;
             store.flush_pending_to_ui().await;

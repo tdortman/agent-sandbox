@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agent_sandbox_core::{RegisterUiReply, RpcReply, RpcRequest, SimpleOkReply};
+use agent_sandbox_core::{ErrorReply, RegisterUiReply, RpcReply, RpcRequest, SimpleOkReply};
 
 use crate::error::PolicydError;
 use crate::server::peer::ClientPeer;
@@ -18,6 +18,22 @@ pub(crate) async fn handle(
     match req {
         RpcRequest::RegisterUi { ui_client, ctx } => {
             let ui_client = ui_client.as_deref().unwrap_or("standalone");
+
+            // Only one OMP UI may be registered per sandbox session.
+            // The sandbox socket allows RegisterUi(omp); an agent process
+            // could attempt to impersonate the extension, but the real
+            // extension registers first during session_start. Reject
+            // duplicates so a malicious agent cannot hijack the UI channel.
+            if ui_client == "omp"
+                && store
+                    .has_omp_ui_for_sandbox_session(ctx.sandbox_session_id.as_deref())
+                    .await
+            {
+                return Ok(RpcReply::Error(ErrorReply {
+                    ok: false,
+                    error: "an OMP policy UI is already registered for this sandbox session".into(),
+                }));
+            }
             let paths = ctx.sandbox_paths();
             let owner = (ui_client == "omp").then_some(UiSessionOwner {
                 uid: peer.uid,
