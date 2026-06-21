@@ -48,7 +48,7 @@ All clients share `/run/agent-sandbox/policy.sock`. `policyd` uses `SO_PEERCRED`
 - The OMP process may register as UI and approve network/sudo requests from its process tree.
 - Host tools such as `agent-sandbox-ui` and `agent-sandbox-approve` may approve or deny pending requests.
 
-Filesystem prompt limitation: fanotify blocks the process that opened the file. If OMP or an OMP tool opens the file, OMP may be blocked before its extension can render a prompt. For that reason filesystem approvals use `agent-sandbox-ui` (`kdialog` or `/dev/tty`) instead of the OMP extension. Network and sudo prompts still use the OMP extension.
+Filesystem prompt limitation: fanotify blocks the process that opened the file. If OMP or an OMP tool opens the file, OMP may be blocked before its extension can render a prompt. For that reason filesystem approvals use `agent-sandbox-ui` (configurable via `agent-sandbox.policy.uiBackend`, defaults to the packaged Qt6 helper) instead of the OMP extension. Network and sudo prompts still use the OMP extension.
 
 OMP, Codex, and other wrapped agents can run at the same time. They share project and global policy files. Session-scoped approvals stay attached to the sandbox instance that created them, even when two agents run in the same project.
 
@@ -158,7 +158,10 @@ When `network.enable = true`, the NixOS module also runs the policy/network help
 | `agent-sandbox.filesystem.dynamicApproval.enable` | Enable fanotify-backed filesystem approval for sandboxed processes   |
 | `agent-sandbox.policy.interactiveApproval`        | Prompt instead of only relying on prewritten policy                  |
 | `agent-sandbox.policy.approvalTimeout`            | How long blocked requests wait for a UI decision                     |
-| `agent-sandbox.policy.autoSpawnPolicyUi`          | Start `agent-sandbox-ui` automatically when no UI is connected       |
+| `agent-sandbox.policy.uiBackend`                  | Dialog backend: `qt-dialog` (default), `zenity`, or `none` |
+
+Set ``uiBackend = "none"`` to skip auto-spawn entirely; use ``agent-sandbox-approve``
+from a terminal to approve or deny manually.
 
 For the full module surface, see `nix/modules/nixos/agent-sandbox/agent-sandbox.nix`.
 

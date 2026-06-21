@@ -2,13 +2,22 @@
   lib,
   inputs,
   pkg-config,
+  cmake,
   rustPlatform,
   makeWrapper,
   pkgs,
   ...
 }:
 let
-  kdialog = pkgs.kdePackages.kdialog;
+  qtDialog = pkgs.stdenv.mkDerivation {
+    name = "agent-sandbox-qt-dialog";
+    src = ./qt-helper;
+    nativeBuildInputs = [
+      cmake
+      pkgs.qt6.wrapQtAppsHook
+    ];
+    buildInputs = [ pkgs.qt6.qtbase ];
+  };
 in
 rustPlatform.buildRustPackage (
   let
@@ -31,13 +40,18 @@ rustPlatform.buildRustPackage (
     useNextest = true;
 
     postInstall = ''
+      # Copy the Qt dialog helper into the package.
+      cp ${qtDialog}/bin/agent-sandbox-qt-dialog $out/bin/
+
+      # Wrap the UI: expose the packaged Qt6 helper as the default
+      # `qt-dialog` backend. Zenity remains module-selected, not bundled here.
       wrapProgram $out/bin/agent-sandbox-ui \
-        --prefix PATH : ${lib.makeBinPath [ kdialog ]} \
-        --set-default AGENT_SANDBOX_KDIALOG ${kdialog}/bin/kdialog
+        --prefix PATH : $out/bin \
+        --set-default AGENT_SANDBOX_QT_DIALOG $out/bin/agent-sandbox-qt-dialog
     '';
 
     meta = with lib; {
-      description = "Policy daemon, NFQUEUE enforcer, DNS cache, CLIs, netns enter helper, and kdialog-wrapped UI";
+      description = "Policy daemon, NFQUEUE enforcer, DNS cache, CLIs, netns enter helper, and Qt-wrapped UI";
       license = licenses.mit;
     };
   }

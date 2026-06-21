@@ -49,6 +49,19 @@ pub fn ui_spawn_env(
             sandbox_session_id.to_string(),
         );
     }
+
+    // Forward UI backend configuration from the policyd environment.
+    // This lets the system administrator control which dialog backend
+    // the auto-spawned UI uses via the Nix module option.
+    for key in &[
+        "AGENT_SANDBOX_UI_BACKEND",
+        "AGENT_SANDBOX_QT_DIALOG",
+        "AGENT_SANDBOX_ZENITY",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            env.insert(key.to_string(), val);
+        }
+    }
     env.extend(graphical_session_env(uid, Some(&home_dir)));
     env.insert("AGENT_SANDBOX_UI_PREFER_GRAPHICAL".into(), "1".into());
 
@@ -56,16 +69,6 @@ pub fn ui_spawn_env(
     if Path::new(&profile_bin).is_dir() {
         let path = env.get("PATH").cloned().unwrap_or_default();
         env.insert("PATH".into(), format!("{profile_bin}:{path}"));
-    }
-    if let Some(kdialog) = tool_path("AGENT_SANDBOX_KDIALOG", "kdialog") {
-        env.insert("AGENT_SANDBOX_KDIALOG".into(), kdialog.clone());
-        if let Some(parent) = Path::new(&kdialog).parent() {
-            let parent = parent.to_string_lossy();
-            let path = env.get("PATH").cloned().unwrap_or_default();
-            if !path.split(':').any(|d| d == parent.as_ref()) {
-                env.insert("PATH".into(), format!("{parent}:{path}"));
-            }
-        }
     }
     env
 }
@@ -205,7 +208,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
                 "--",
                 &notify,
                 "agent-sandbox",
-                "Network approval needed. Respond to the KDE prompt.",
+                "Network approval needed. Respond to the policy prompt.",
             ])
             .envs(&env)
             .stdin(Stdio::null())

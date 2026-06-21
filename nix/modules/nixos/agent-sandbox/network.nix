@@ -231,10 +231,13 @@ lib.mkIf policyEnabled (
             ++ lib.optionals (!config.agent-sandbox.policy.interactiveApproval) [
               "--no-interactive-approval"
             ]
-            ++ lib.optionals config.agent-sandbox.policy.autoSpawnPolicyUi [
-              "--ui-spawn-cmd"
-              "${policyPkg}/bin/agent-sandbox-ui"
-            ]
+            ++
+              lib.optionals
+                (config.agent-sandbox.policy.autoSpawnPolicyUi && config.agent-sandbox.policy.uiBackend != "none")
+                [
+                  "--ui-spawn-cmd"
+                  "${policyPkg}/bin/agent-sandbox-ui"
+                ]
             ++ lib.optionals (config.agent-sandbox.policy.exportedNix != "") [
               "--export-nix"
               config.agent-sandbox.policy.exportedNix
@@ -251,13 +254,19 @@ lib.mkIf policyEnabled (
           pkgs.util-linux
           pkgs.systemd
           pkgs.libnotify
+        ]
+        ++ lib.optionals (config.agent-sandbox.policy.uiBackend == "zenity") [
+          pkgs.zenity
         ];
         environment = {
           AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
           AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
           AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
-          AGENT_SANDBOX_KDIALOG = "${pkgs.kdePackages.kdialog}/bin/kdialog";
+          AGENT_SANDBOX_UI_BACKEND = config.agent-sandbox.policy.uiBackend;
           AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
+        }
+        // lib.optionalAttrs (config.agent-sandbox.policy.uiBackend == "zenity") {
+          AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
         };
       };
     }

@@ -222,6 +222,22 @@ in
         description = ''
           When no policy UI is connected, policyd spawns ``agent-sandbox-ui`` as the
           requesting user (via runuser) so non-OMP agents still get prompts.
+          Set ``uiBackend = "none"`` instead for a cleaner headless setup.
+        '';
+      };
+      uiBackend = lib.mkOption {
+        type = lib.types.enum [
+          "qt-dialog"
+          "zenity"
+          "none"
+        ];
+        default = "qt-dialog";
+        description = ''
+          Which dialog backend to use for approval prompts.
+          ``qt-dialog`` uses the packaged Qt6 helper (default).
+          ``zenity`` uses the GTK dialog tool.
+          ``none`` disables auto-spawned prompts entirely; approve and deny
+          manually with ``agent-sandbox-approve`` from a terminal.
         '';
       };
     };
@@ -505,6 +521,12 @@ in
     environment.systemPackages = (map wrapOne cfg.packages) ++ [
       policyPkg
     ];
+
+    # Propagate UI backend choice to session so manually run agent-sandbox-ui
+    # picks up the configured backend without needing the service environment.
+    environment.sessionVariables = {
+      AGENT_SANDBOX_UI_BACKEND = cfg.policy.uiBackend;
+    };
 
     nixpkgs.overlays = lib.mkAfter [
       (final: _: {

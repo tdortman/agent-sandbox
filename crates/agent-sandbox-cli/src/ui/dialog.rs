@@ -1,21 +1,21 @@
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
 
-static KDIALOG_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+/// Mutex serialising graphical prompts: only one prompt UI at a time.
+static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
 pub(crate) fn pick_option(title: &str, options: &[&str]) -> Option<String> {
     if prefer_graphical() {
         if let Some(c) = graphical_select(title, options) {
             return Some(c);
         }
-        info!("kdialog unavailable; trying /dev/tty");
+        info!("no graphical backend available; use agent-sandbox-approve");
     }
-    tty_select(title, options).ok().flatten()
+    None
 }
 
 fn prefer_graphical() -> bool {
@@ -25,6 +25,9 @@ fn prefer_graphical() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok()
 }
 
+/// Try each graphical backend in priority order. Returns the selected label on success.
+/// If AGENT_SANDBOX_UI_BACKEND is set to a specific backend, only that backend
+/// is tried. Unset or unrecognised values use the auto fallback: qt-dialog, zenity.
 fn graphical_select(title: &str, options: &[&str]) -> Option<String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     let uid = nix::unistd::getuid().as_raw();
@@ -34,95 +37,134 @@ fn graphical_select(title: &str, options: &[&str]) -> Option<String> {
             env.get("HOME").map(String::as_str),
         ));
     }
-    let kdialog = resolve_kdialog(&env)?;
-    let geometry = kdialog_menu_geometry(options.len());
+
+    match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {
+        Some("qt-dialog") => {
+            let qt = resolve_qt_dialog(&env)?;
+            return qt_dialog_select(&qt, title, options, &env);
+        }
+        Some("zenity") => {
+            let z = resolve_zenity(&env)?;
+            return zenity_select(&z, title, options, &env);
+        }
+        Some("none") => return None,
+        Some(_) | None => {}
+    }
+
+    // No explicit backend, try in priority order.
+    if let Some(qt_dialog) = resolve_qt_dialog(&env)
+        && let Some(choice) = qt_dialog_select(&qt_dialog, title, options, &env)
+    {
+        return Some(choice);
+    }
+
+    if let Some(zenity) = resolve_zenity(&env)
+        && let Some(choice) = zenity_select(&zenity, title, options, &env)
+    {
+        return Some(choice);
+    }
+
+    // No graphical backend available.
+    None
+}
+
+fn resolve_qt_dialog(env: &HashMap<String, String>) -> Option<String> {
+    if let Some(p) = env.get("AGENT_SANDBOX_QT_DIALOG") {
+        let path = std::path::Path::new(p);
+        if path.is_file() {
+            return Some(p.clone());
+        }
+    }
+    tool_path("AGENT_SANDBOX_QT_DIALOG", "agent-sandbox-qt-dialog")
+}
+
+fn qt_dialog_select(
+    binary: &str,
+    title: &str,
+    options: &[&str],
+    env: &HashMap<String, String>,
+) -> Option<String> {
     let mut args = vec![
-        kdialog,
+        binary.to_string(),
         "--title".into(),
         "agent-sandbox".into(),
-        "--menu".into(),
+        "--text".into(),
         title.to_string(),
     ];
-    if let Some(g) = geometry {
-        args.push("--geometry".into());
-        args.push(g);
-    }
-    for (i, label) in options.iter().enumerate() {
-        args.push((i + 1).to_string());
+    for label in options {
+        args.push("--option".into());
         args.push((*label).to_string());
     }
-    let out_file = tempfile::NamedTempFile::new().ok()?;
-    let out_path = out_file.path().to_path_buf();
-    let _lock = KDIALOG_LOCK.lock().ok()?;
-    let status = Command::new(&args[0])
+
+    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let output = Command::new(&args[0])
         .args(&args[1..])
-        .envs(&env)
-        .stdout(Stdio::from(std::fs::File::create(&out_path).ok()?))
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .ok()?;
-    if !status.success() {
+
+    if !output.status.success() {
         return None;
     }
-    let raw = std::fs::read_to_string(out_path).ok()?;
-    let num: usize = raw.trim().parse().ok()?;
-    options.get(num.saturating_sub(1)).map(|s| (*s).to_string())
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if options.contains(&trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
-fn kdialog_menu_geometry(num_options: usize) -> Option<String> {
-    if let Ok(explicit) = std::env::var("AGENT_SANDBOX_KDIALOG_GEOMETRY") {
-        let explicit = explicit.trim();
-        if !explicit.is_empty() {
-            return Some(explicit.to_string());
+fn resolve_zenity(env: &HashMap<String, String>) -> Option<String> {
+    if let Some(p) = env.get("AGENT_SANDBOX_ZENITY") {
+        let path = std::path::Path::new(p);
+        if path.is_file() {
+            return Some(p.clone());
         }
     }
-    if num_options == 0 {
+    tool_path("AGENT_SANDBOX_ZENITY", "zenity")
+}
+
+fn zenity_select(
+    binary: &str,
+    title: &str,
+    options: &[&str],
+    env: &HashMap<String, String>,
+) -> Option<String> {
+    // zenity --list --title "agent-sandbox" --text "..." --column "Options" <opt1> <opt2> ...
+    let mut args = vec![
+        binary.to_string(),
+        "--list".into(),
+        "--title".into(),
+        "agent-sandbox".into(),
+        "--text".into(),
+        title.to_string(),
+        "--column".into(),
+        "Options".into(),
+    ];
+    args.extend(options.iter().map(|s| (*s).to_string()));
+
+    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
         return None;
     }
-    let height = 110 + num_options * 34;
-    Some(format!("580x{height}"))
-}
-
-fn resolve_kdialog(env: &HashMap<String, String>) -> Option<String> {
-    if let Ok(explicit) = std::env::var("AGENT_SANDBOX_KDIALOG") {
-        let p = std::path::Path::new(&explicit);
-        if p.is_file() {
-            return Some(explicit);
-        }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if options.contains(&trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
     }
-    if let Some(p) = env.get("AGENT_SANDBOX_KDIALOG") {
-        return Some(p.clone());
-    }
-    tool_path("AGENT_SANDBOX_KDIALOG", "kdialog")
-}
-
-fn tty_select(title: &str, options: &[&str]) -> Result<Option<String>, ()> {
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| ())?;
-    let lines: String = options
-        .iter()
-        .enumerate()
-        .map(|(i, l)| format!("  {}) {l}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut tty_w = tty.try_clone().map_err(|_| ())?;
-    write!(
-        tty_w,
-        "\n\x1b[1m{title}\x1b[0m\n{lines}\n\nChoice [1-{}], Enter=Deny: ",
-        options.len()
-    )
-    .map_err(|_| ())?;
-    let mut raw = String::new();
-    std::io::BufReader::new(tty)
-        .read_line(&mut raw)
-        .map_err(|_| ())?;
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let num: usize = raw.parse().map_err(|_| ())?;
-    Ok(options.get(num.saturating_sub(1)).map(|s| (*s).to_string()))
 }
