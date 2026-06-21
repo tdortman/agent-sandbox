@@ -78,10 +78,29 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
     }
     let labels: Vec<_> = host.split('.').collect();
     let mut patterns = vec![host.clone()];
-    for idx in 1..labels.len() {
-        let suffix = labels[idx..].join(".");
-        if suffix.contains('.') {
-            patterns.push(format!("*.{suffix}"));
+
+    // IPv4 literals: generate prefix wildcards on octet boundaries.
+    // "34.230.40.69" -> ["34.230.40.69", "34.230.40.*", "34.230.*", "34.*"]
+    if labels.len() == 4 && labels.iter().all(|l| l.parse::<u8>().is_ok()) {
+        for idx in (0..labels.len() - 1).rev() {
+            let prefix = labels[..=idx].join(".");
+            patterns.push(format!("{prefix}.*"));
+        }
+    } else if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
+        // IPv6 literals: generate hextet-prefix wildcards using trailing ":*".
+        // "2001:db8::1" -> ["2001:db8::1", "2001:db8:0:0:0:0:0:*", "2001:db8:0:0:0:0:*", ..., "2001:*"]
+        let segments: Vec<String> = ipv6.segments().iter().map(|s| format!("{s:x}")).collect();
+        for len in (1..=7).rev() {
+            let prefix = segments[..len].join(":");
+            patterns.push(format!("{prefix}:*"));
+        }
+    } else {
+        // DNS hostname: suffix wildcards.
+        for idx in 1..labels.len() {
+            let suffix = labels[idx..].join(".");
+            if suffix.contains('.') {
+                patterns.push(format!("*.{suffix}"));
+            }
         }
     }
     patterns
@@ -154,6 +173,56 @@ mod tests {
         assert_eq!(result.connect_host, "104.18.32.47");
     }
 
+    #[test]
+    fn approval_host_patterns_ipv4_prefix_wildcards() {
+        assert_eq!(
+            approval_host_patterns("34.230.40.69"),
+            vec![
+                "34.230.40.69".to_string(),
+                "34.230.40.*".to_string(),
+                "34.230.*".to_string(),
+                "34.*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_host_patterns_ipv6_prefix_wildcards() {
+        let patterns = approval_host_patterns("2001:db8::1");
+        assert_eq!(patterns[0], "2001:db8::1");
+        assert!(patterns.contains(&"2001:db8:0:0:0:0:0:*".to_string()));
+        assert!(patterns.contains(&"2001:db8:*".to_string()));
+        assert!(patterns.contains(&"2001:*".to_string()));
+        assert_eq!(patterns.len(), 8);
+    }
+
+    #[test]
+    fn approval_host_patterns_ipv6_loopback() {
+        let patterns = approval_host_patterns("::1");
+        assert_eq!(patterns[0], "::1");
+        assert!(patterns.contains(&"0:0:0:0:0:0:0:*".to_string()));
+        assert!(patterns.contains(&"0:*".to_string()));
+        assert_eq!(patterns.len(), 8);
+    }
+
+    #[test]
+    fn approval_host_patterns_ipv6_bracketed_normalizes() {
+        let patterns = approval_host_patterns("[::1]");
+        assert_eq!(patterns[0], "::1");
+        assert_eq!(patterns.len(), 8);
+    }
+    #[test]
+    fn approval_host_patterns_ipv4_loopback_prefix_wildcards() {
+        assert_eq!(
+            approval_host_patterns("127.0.0.1"),
+            vec![
+                "127.0.0.1".to_string(),
+                "127.0.0.*".to_string(),
+                "127.0.*".to_string(),
+                "127.*".to_string(),
+            ]
+        );
+    }
     #[test]
     fn approval_host_patterns_include_parent_domains() {
         assert_eq!(

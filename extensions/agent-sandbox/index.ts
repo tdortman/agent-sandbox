@@ -142,6 +142,11 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     if (parts.length !== 4) return false;
     return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
   }
+  function isIpv6(host: string): boolean {
+    // Heuristic: contains a colon and looks like an IPv6 address.
+    // Avoid matching DNS names with colons (none exist).
+    return host.includes(":") || /^\[[^\]]+\]$/.test(host);
+  }
   function approvalHostPatterns(host: string): string[] {
     const normalized = host.trim().toLowerCase().replace(/\.+$/, "");
     if (!normalized) return [];
@@ -150,6 +155,15 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     if (isIpv4(normalized)) {
       for (let len = labels.length - 1; len >= 1; len -= 1) {
         patterns.push(`${labels.slice(0, len).join(".")}.*`);
+      }
+    } else if (normalized.includes(":")) {
+      // IPv6 literal: generate hextet-prefix wildcards.
+      const cleaned = normalized.replace(/^\[|\]$/g, "");
+      const segments = expandIpv6Segments(cleaned);
+      if (segments) {
+        for (let len = 7; len >= 1; len -= 1) {
+          patterns.push(`${segments.slice(0, len).join(":")}:*`);
+        }
       }
     } else {
       for (let index = 1; index < labels.length; index += 1) {
@@ -160,6 +174,29 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
       }
     }
     return patterns;
+  }
+  function expandIpv6Segments(addr: string): string[] | null {
+    // Expand :: notation to 8 full hex segments without leading zeroes.
+    const parts = addr.split("::");
+    if (parts.length > 2) return null;
+    let left: string[];
+    let right: string[];
+    if (parts.length === 2) {
+      left = parts[0] ? parts[0].split(":") : [];
+      right = parts[1] ? parts[1].split(":") : [];
+    } else {
+      left = addr.split(":");
+      right = [];
+    }
+    if (left.length + right.length > 8) return null;
+    for (const p of [...left, ...right]) {
+      if (p.length > 4 || !/^[0-9a-f]*$/i.test(p)) return null;
+    }
+    const expanded: string[] = [];
+    for (const s of left) expanded.push(s === "" ? "0" : s.replace(/^0+(?!$)/, "") || "0");
+    while (expanded.length < 8 - right.length) expanded.push("0");
+    for (const s of right) expanded.push(s === "" ? "0" : s.replace(/^0+(?!$)/, "") || "0");
+    return expanded;
   }
   function sudoApprovalPrefixes(argv: string[]): string[][] {
     const prefixes: string[][] = [];

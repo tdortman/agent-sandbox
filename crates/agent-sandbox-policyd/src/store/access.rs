@@ -334,6 +334,140 @@ mod tests {
     }
 
     #[test]
+    fn session_network_matches_ipv4_prefix_wildcard() {
+        let bucket = HashSet::from([NetworkRuleKey::new("34.230.40.*", 443)]);
+        // Exact match within the prefix range
+        assert!(session_network_matches(&bucket, "34.230.40.69", 443));
+        assert!(session_network_matches(&bucket, "34.230.40.1", 443));
+        // Different subnet: must NOT match
+        assert!(!session_network_matches(&bucket, "34.230.41.69", 443));
+        // Wrong port
+        assert!(!session_network_matches(&bucket, "34.230.40.69", 80));
+        // Partial octet match rejected
+        assert!(!session_network_matches(&bucket, "34.230.4.1", 443));
+    }
+
+    #[test]
+    fn session_network_matches_ipv4_broader_prefix_wildcards() {
+        let bucket = HashSet::from([NetworkRuleKey::new("34.*", 443)]);
+        assert!(session_network_matches(&bucket, "34.230.40.69", 443));
+        assert!(session_network_matches(&bucket, "34.0.0.1", 443));
+        assert!(!session_network_matches(&bucket, "35.0.0.1", 443));
+    }
+
+    #[tokio::test]
+    async fn project_policy_matches_ipv4_prefix_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let policy_path = project_root.join(".agent-sandbox/policy.json");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .network
+            .allow
+            .push(agent_sandbox_core::NetworkRule::new(
+                "34.230.40.*",
+                443,
+                "test",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            socket: dir.path().join("sock"),
+            sandbox_netns: None,
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+        });
+
+        let project_root = project_root.to_string_lossy().into_owned();
+        let home = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert!(
+            store
+                .is_allowed("34.230.40.69", 443, ctx.clone(), false)
+                .await
+        );
+        assert!(!store.is_allowed("34.230.41.69", 443, ctx, false).await);
+    }
+
+    #[test]
+    fn session_network_matches_ipv6_prefix_wildcard() {
+        let bucket = HashSet::from([NetworkRuleKey::new("2001:db8:*", 443)]);
+        // Exact match within the prefix range
+        assert!(session_network_matches(&bucket, "2001:db8::1", 443));
+        assert!(session_network_matches(
+            &bucket,
+            "2001:db8:0:0:0:0:0:1",
+            443
+        ));
+        // Different subnet: must NOT match
+        assert!(!session_network_matches(&bucket, "2001:db9::1", 443));
+        // Wrong port
+        assert!(!session_network_matches(&bucket, "2001:db8::1", 80));
+    }
+
+    #[tokio::test]
+    async fn project_policy_matches_ipv6_prefix_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let policy_path = project_root.join(".agent-sandbox/policy.json");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .network
+            .allow
+            .push(agent_sandbox_core::NetworkRule::new(
+                "2001:db8:*",
+                443,
+                "test",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            socket: dir.path().join("sock"),
+            sandbox_netns: None,
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+        });
+
+        let project_root = project_root.to_string_lossy().into_owned();
+        let home = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert!(
+            store
+                .is_allowed("2001:db8::1", 443, ctx.clone(), false)
+                .await
+        );
+        assert!(!store.is_allowed("2001:db9::1", 443, ctx, false).await);
+    }
+
+    #[test]
     fn session_sudo_matches_prefixes() {
         let bucket = HashSet::from([vec![String::from("sudo"), String::from("apt")]]);
         let argv = vec![

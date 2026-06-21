@@ -224,7 +224,8 @@ fn filesystem_target_options(
 
 #[cfg(test)]
 mod tests {
-    use super::network_prompt_url;
+    use super::{network_prompt_url, network_target_options};
+    use agent_sandbox_core::{ApprovalScope, ApprovalTarget};
 
     #[test]
     fn network_prompt_url_prefers_policy_host_over_raw_ip_url() {
@@ -241,5 +242,30 @@ mod tests {
     fn network_prompt_url_falls_back_when_host_missing() {
         let url = network_prompt_url("", 443, "tcp", Some("tcp://104.18.32.47:443".to_string()));
         assert_eq!(url, "tcp://104.18.32.47:443");
+    }
+
+    #[test]
+    fn network_target_options_use_ipv4_prefix_wildcards() {
+        let options = network_target_options("34.230.40.69", ApprovalScope::Session);
+        let labels: Vec<_> = options.iter().map(|option| option.label.as_str()).collect();
+        assert_eq!(labels, ["34.230.40.69", "34.230.40.*", "34.230.*", "34.*"]);
+        assert!(matches!(
+            options.get(1).and_then(|option| option.target.as_ref()),
+            Some(ApprovalTarget::NetworkHost { host }) if host == "34.230.40.*"
+        ));
+    }
+    #[test]
+    fn network_target_options_use_ipv6_prefix_wildcards() {
+        let options = network_target_options("2001:db8::1", ApprovalScope::Session);
+        let labels: Vec<_> = options.iter().map(|option| option.label.as_str()).collect();
+        assert_eq!(labels[0], "2001:db8::1");
+        assert!(labels.contains(&"2001:db8:0:0:0:0:0:*"));
+        assert!(labels.contains(&"2001:db8:*"));
+        assert!(labels.contains(&"2001:*"));
+        assert_eq!(labels.len(), 8);
+        assert!(matches!(
+            options.iter().find(|o| o.label == "2001:db8:*").and_then(|option| option.target.as_ref()),
+            Some(ApprovalTarget::NetworkHost { host }) if host == "2001:db8:*"
+        ));
     }
 }
