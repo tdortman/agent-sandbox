@@ -34,6 +34,23 @@ type ElevationRequest = {
   home?: string;
   project_root?: string;
 };
+
+type FilesystemRequest = {
+  type: "filesystem_request";
+  id: string;
+  path: string;
+  access: string;
+  cwd?: string;
+  home?: string;
+  project_root?: string;
+};
+
+type PolicyMessage =
+  | NetworkRequest
+  | ElevationRequest
+  | FilesystemRequest
+  | Record<string, unknown>;
+
 const ACTION_OPTIONS = ["Allow", "Deny"] as const;
 
 const DEFAULT_SOCKET = "/run/agent-sandbox/policy.sock";
@@ -79,8 +96,6 @@ function readOneJsonLine(socket: net.Socket): Promise<Record<string, unknown>> {
   });
 }
 
-
-
 export default function agentSandboxExtension(pi: ExtensionAPI) {
   pi.setLabel("Agent sandbox");
 
@@ -88,9 +103,29 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
   let policySessionId: string | null = null;
   let lineBuf = "";
   let reconnectTimer: ReturnType<typeof setInterval> | null = null;
-  let uiConnectedAnnounced = false;
+  let currentContext: ExtensionContext | null = null;
   const home = process.env.HOME ?? "";
   const projectRoot = process.env.AGENT_SANDBOX_PROJECT_ROOT ?? "";
+
+  // Resolver queue for sendPolicyRpc: each entry is a [resolve, reject] pair.
+  type RpcResolver = [(value: Record<string, unknown>) => void, (err: Error) => void];
+  const rpcQueue: RpcResolver[] = [];
+
+  function notify(message: string): void {
+    currentContext?.ui.notify?.(message);
+  }
+
+  function commandArgs(input: unknown): string[] {
+    if (Array.isArray(input)) return input.map(String);
+    if (
+      input &&
+      typeof input === "object" &&
+      Array.isArray((input as { args?: unknown }).args)
+    ) {
+      return (input as { args: unknown[] }).args.map(String);
+    }
+    return [];
+  }
 
   function sandboxContext(req?: { cwd?: string; home?: string; project_root?: string }) {
     return {
@@ -114,26 +149,12 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     };
   }
 
-  function socketPath(): string {
-    return (
-      process.env.AGENT_SANDBOX_POLICY_SOCKET ??
-      DEFAULT_SOCKET
-    );
-  }
-
   function disconnectPolicyUi(): void {
     const socket = uiSocket;
     uiSocket = null;
     policySessionId = null;
     lineBuf = "";
     if (!socket) return;
-    try {
-      if (!socket.destroyed) {
-        socket.write(`${JSON.stringify({ op: "unregister_ui" })}\n`);
-      }
-    } catch {
-      // ignore
-    }
     socket.destroy();
   }
 
@@ -143,8 +164,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
   }
   function isIpv6(host: string): boolean {
-    // Heuristic: contains a colon and looks like an IPv6 address.
-    // Avoid matching DNS names with colons (none exist).
     return host.includes(":") || /^\[[^\]]+\]$/.test(host);
   }
   function approvalHostPatterns(host: string): string[] {
@@ -157,7 +176,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
         patterns.push(`${labels.slice(0, len).join(".")}.*`);
       }
     } else if (normalized.includes(":")) {
-      // IPv6 literal: generate hextet-prefix wildcards.
       const cleaned = normalized.replace(/^\[|\]$/g, "");
       const segments = expandIpv6Segments(cleaned);
       if (segments) {
@@ -176,7 +194,6 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     return patterns;
   }
   function expandIpv6Segments(addr: string): string[] | null {
-    // Expand :: notation to 8 full hex segments without leading zeroes.
     const parts = addr.split("::");
     if (parts.length > 2) return null;
     let left: string[];
@@ -209,18 +226,17 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
   function formatSudoCommand(argv: string[]): string {
     return argv.length > 0 ? `sudo ${argv.join(" ")}` : "sudo";
   }
+  // ---- Label helpers (matching qt-dialog) ----
+
   function scopeLabel(scope: ApprovalScope): string {
     switch (scope) {
-      case "once":
-        return "Once";
-      case "session":
-        return "This session";
-      case "project":
-        return "This project";
-      case "global":
-        return "Globally";
+      case "once":    return "Once";
+      case "session": return "This session";
+      case "project": return "This project";
+      case "global":  return "Globally";
     }
   }
+
   function scopeOnlyOptions(sessionAvailable: boolean): ScopeOption[] {
     const options: ScopeOption[] = [{ label: "Once", scope: "once" }];
     if (sessionAvailable) {
@@ -232,56 +248,47 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
   }
 
   function networkTargetOptions(host: string, scope: ApprovalScope): ScopeOption[] {
-    const hosts = approvalHostPatterns(host);
-    return hosts.map((candidate) => ({
+    return approvalHostPatterns(host).map((candidate) => ({
       label: candidate,
       scope,
       target: { kind: "network_host" as const, host: candidate },
     }));
   }
 
-  function notifyPrompt(ctx: ExtensionContext, title: string, body: string): void {
-    const hasDisplay =
-      process.env.DISPLAY !== undefined ||
-      process.env.WAYLAND_DISPLAY !== undefined;
-    if (!hasDisplay) return;
-    const notifyBin =
-      process.env.AGENT_SANDBOX_NOTIFY_SEND ?? "notify-send";
-    execFile(
-      notifyBin,
-      [title, body],
-      (err) => {
-        if (err) {
-          ctx.ui.notify?.(
-            `agent-sandbox: notify-send failed (${err.message}); prompt still works via OMP.`,
-          );
-        }
-      },
-    );
-  }
-  function sudoScopeOptions(
+  function sudoTargetOptions(
     argv: string[],
-    sessionAvailable: boolean,
+    scope: ApprovalScope,
   ): ScopeOption[] {
-    const options: ScopeOption[] = [{ label: "This command only", scope: "once" }];
-    const prefixes = sudoApprovalPrefixes(argv);
-    const pushOptions = (scope: ApprovalScope) => {
-      for (const prefix of prefixes) {
-        options.push({
-          label: `${scopeLabel(scope)} — ${formatSudoCommand(prefix)}`,
-          scope,
-          target: { kind: "sudo_command", argv: prefix },
-        });
-      }
-    };
-    if (sessionAvailable) {
-      pushOptions("session");
-    }
-    pushOptions("project");
-    pushOptions("global");
-    return options;
+    return sudoApprovalPrefixes(argv).map((prefix) => {
+      const cmd = formatSudoCommand(prefix);
+      return {
+        label: cmd,
+        scope,
+        target: { kind: "sudo_command" as const, argv: prefix },
+      };
+    });
   }
 
+  function filesystemTargetOptions(
+    path: string,
+    homeDir: string,
+    scope: ApprovalScope,
+  ): ScopeOption[] {
+    const parts = path.replace(/\/+$/, "").split("/").filter(Boolean);
+    const candidates: string[] = [];
+    let current = "";
+    for (const part of parts) {
+      current += "/" + part;
+      candidates.push(current);
+    }
+    if (homeDir && path.startsWith(homeDir)) candidates.push(homeDir);
+    candidates.push("/");
+    return candidates.reverse().map((c) => ({ label: c, scope }));
+  }
+
+  function verb(action: PromptAction): string {
+    return action === "approve" ? "allow" : "deny";
+  }
 
   async function chooseAction(
     title: string,
@@ -294,279 +301,447 @@ export default function agentSandboxExtension(pi: ExtensionAPI) {
     return undefined;
   }
 
-  async function chooseScopeOption(
+  async function chooseOption(
     title: string,
     options: ScopeOption[],
     ctx: ExtensionContext,
     opts?: { signal?: AbortSignal },
   ): Promise<ScopeOption | undefined> {
-    const choice = await ctx.ui.select(
-      title,
-      options.map((option) => option.label),
-      opts,
-    );
-    return options.find((option) => option.label === choice);
+    const labels = options.map((o) => o.label);
+    const choice = await ctx.ui.select(title, labels, opts);
+    if (choice === undefined) return undefined;
+    const idx = labels.indexOf(choice);
+    if (idx === -1) return undefined;
+    return options[idx];
   }
-  async function submitDecision(
-    req: NetworkRequest | ElevationRequest,
-    action: PromptAction,
-    choice: ScopeOption,
-    ctx: ExtensionContext,
-  ): Promise<void> {
-    const sessionId = policySessionId;
-    if (choice.scope === "session" && !sessionId) {
-      const noun = action === "approve" ? "approval" : "deny";
-      ctx.ui.notify?.(
-        `agent-sandbox: session ${noun} unavailable (policy UI not connected).`,
-      );
+
+  // ---- Policy RPC on the active connection ----
+
+  /** Send a JSON-line RPC and resolve with the next non-`type` reply. */
+  function sendPolicyRpc(req: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      if (!uiSocket || uiSocket.destroyed) {
+        reject(new Error("not connected to policy UI"));
+        return;
+      }
+      rpcQueue.push([resolve, reject]);
+      uiSocket.write(`${JSON.stringify(req)}\n`);
+    });
+  }
+
+  function onPolicyMessage(msg: PolicyMessage): void {
+    // Messages with `type` are pushes (network_request, elevation_request, filesystem_request).
+    if ("type" in msg && typeof msg.type === "string") {
+      void handlePolicyPush(msg.type, msg as Record<string, unknown>).catch((err: unknown) => {
+        notify(`agent-sandbox: prompt handler failed: ${(err as Error).message}`);
+      });
       return;
     }
-    const resp = await policyRpc(
-      {
-        op: action,
-        id: req.id,
-        scope: choice.scope,
-        ...(sessionId ? { session_id: sessionId } : {}),
-        ...(choice.target ? { target: choice.target } : {}),
-        ...rpcContext(req),
-      },
-      socketPath(),
-    );
-    if (!resp.ok) {
-      const err = String(resp.error ?? "unknown");
-      const label =
-        action === "approve"
-          ? req.type === "elevation_request"
-            ? "elevation approval"
-            : "approval"
-          : req.type === "elevation_request"
-            ? "elevation deny"
-            : "deny";
-      ctx.ui.notify?.(
-        `agent-sandbox: ${label} failed (${err}).`,
-      );
-      return;
-    }
-    const savedPath = resp.path ?? resp.policy_path;
-    if (choice.scope === "project" && savedPath) {
-      ctx.ui.notify?.(`Project policy saved to ${String(savedPath)}.`);
+    // Messages without `type` are RPC replies.
+    const entry = rpcQueue.shift();
+    if (entry) {
+      entry[0](msg as Record<string, unknown>);
+    } else if ("error" in msg && typeof msg.error === "string") {
+      notify(`agent-sandbox: policy socket error: ${msg.error}`);
     }
   }
 
-  function networkPromptUrl(req: NetworkRequest): string {
-    const scheme = req.scheme ?? "tcp";
-    const host = req.host?.trim();
-    if (host) {
-      return `${scheme}://${host}:${req.port}`;
+  // ---- Policy push handlers ----
+
+  async function handlePolicyPush(
+    msgType: string,
+    msg: Record<string, unknown>,
+  ): Promise<void> {
+    const ctx = currentContext;
+    if (!ctx) {
+      notify(`agent-sandbox: policy prompt (${msgType}) arrived before session context`);
+      return;
     }
-    return req.url ?? `${scheme}://${req.host}:${req.port}`;
+    switch (msgType) {
+      case "network_request": {
+        const req = msg as unknown as NetworkRequest;
+        await handleNetworkRequest(req, ctx);
+        break;
+      }
+      case "elevation_request": {
+        const req = msg as unknown as ElevationRequest;
+        await handleElevationRequest(req, ctx);
+        break;
+      }
+      case "filesystem_request": {
+        const req = msg as unknown as FilesystemRequest;
+        await handleFilesystemRequest(req, ctx);
+        break;
+      }
+    }
   }
 
   async function handleNetworkRequest(
     req: NetworkRequest,
     ctx: ExtensionContext,
   ): Promise<void> {
-    const url = networkPromptUrl(req);
-    notifyPrompt(
-      ctx,
-      "agent-sandbox: Network request",
-      `Allow connection to ${url}?`,
-    );
+    const host = req.host;
+    const port = req.port;
+    const scheme = req.scheme ?? "tcp";
+    const url = `${scheme}://${host}:${port}`;
 
-    // Step 1: choose action
-    const action = await chooseAction(`agent-sandbox: ${url}`, ctx);
+    // Step 1: Allow or Deny
+    let action: PromptAction | undefined;
+    try {
+      action = await chooseAction(`agent-sandbox: ${url}`, ctx);
+    } catch (err) {
+      ctx.ui.notify?.(`agent-sandbox: network prompt failed: ${(err as Error).message}`);
+      return;
+    }
     if (!action) return;
 
-    // Step 2: choose scope
-    const scope = await chooseScopeOption(
-      `agent-sandbox: ${action} ${url} scope?`,
-      scopeOnlyOptions(policySessionId !== null),
-      ctx,
-    );
-    if (!scope) return;
-
-    // Step 3: for non-Once scopes, choose target level
-    const target = scope.scope === "once"
-      ? undefined
-      : await chooseScopeOption(
-          `agent-sandbox: ${action} ${url} target?`,
-          networkTargetOptions(req.host, scope.scope),
-          ctx,
-        );
-    if (scope.scope !== "once" && !target) return;
-
-    const choice: ScopeOption = {
-      label: "",
-      scope: scope.scope,
-      target: target?.target,
-    };
-    await submitDecision(req, action, choice, ctx);
-  }
-
-  function elevationPrompt(req: ElevationRequest): string {
-    const cmd = formatSudoCommand(req.argv);
-    const cwd = req.cwd?.trim();
-    const lines = [cmd, "", "Allow this command to run as root on the host?"];
-    if (cwd) {
-      lines.push("", `Working directory:\n${cwd}`);
+    // Step 2: Choose scope
+    let choice: ScopeOption | undefined;
+    try {
+      choice = await chooseOption(
+        `agent-sandbox: ${verb(action)} ${url} scope?`,
+        scopeOnlyOptions(true),
+        ctx,
+      );
+    } catch (err) {
+      ctx.ui.notify?.(`agent-sandbox: network scope prompt failed: ${(err as Error).message}`);
+      return;
     }
-    return lines.join("\n");
+    if (!choice) return;
+
+    // Step 3: For non-Once, choose target domain pattern
+    if (choice.scope !== "once") {
+      try {
+        const targets = networkTargetOptions(host, choice.scope);
+        if (targets.length > 1) {
+          const targetChoice = await chooseOption(
+            `agent-sandbox: ${verb(action)} ${url} target?`,
+            targets,
+            ctx,
+          );
+          if (targetChoice) choice = targetChoice;
+        }
+      } catch (err) {
+        ctx.ui.notify?.(
+          `agent-sandbox: network target prompt failed: ${(err as Error).message}`,
+        );
+        return;
+      }
+    }
+
+    try {
+      await submitDecision({ approve: action === "approve", id: req.id }, choice, req);
+    } catch (err) {
+      ctx.ui.notify?.(
+        `agent-sandbox: network ${verb(action)} failed: ${(err as Error).message}`,
+      );
+    }
   }
 
-  async function handleElevation(
+  async function handleElevationRequest(
     req: ElevationRequest,
     ctx: ExtensionContext,
   ): Promise<void> {
-    const cmd = formatSudoCommand(req.argv);
-    notifyPrompt(
-      ctx,
-      "agent-sandbox: Elevation request",
-      `Allow "${cmd}" to run as root?`,
-    );
-    const action = await chooseAction(elevationPrompt(req), ctx);
-    if (!action) return;
-    const choice = await chooseScopeOption(
-      `agent-sandbox: ${action} sudo scope?`,
-      sudoScopeOptions(req.argv, policySessionId !== null),
-      ctx,
-    );
-    if (!choice) return;
-    await submitDecision(req, action, choice, ctx);
-  }
-  function onPolicyMessage(line: string, ctx: ExtensionContext): void {
-    let msg: Record<string, unknown>;
+    const argv = req.argv;
+    const title = `agent-sandbox: sudo ${argv.join(" ")}`;
+
+    // Step 1: Allow or Deny
+    let action: PromptAction | undefined;
     try {
-      msg = JSON.parse(line) as Record<string, unknown>;
-    } catch {
+      action = await chooseAction(title, ctx);
+    } catch (err) {
+      ctx.ui.notify?.(`agent-sandbox: elevation prompt failed: ${(err as Error).message}`);
       return;
     }
-    if (msg.type === "network_request") {
-      void handleNetworkRequest(msg as NetworkRequest, ctx);
-    } else if (msg.type === "elevation_request") {
-      void handleElevation(msg as ElevationRequest, ctx);
+    if (!action) return;
+
+    // Step 2: Choose scope
+    let choice: ScopeOption | undefined;
+    try {
+      choice = await chooseOption(
+        `agent-sandbox: ${verb(action)} sudo scope?`,
+        scopeOnlyOptions(true),
+        ctx,
+      );
+    } catch (err) {
+      ctx.ui.notify?.(
+        `agent-sandbox: elevation scope prompt failed: ${(err as Error).message}`,
+      );
+      return;
     }
-  }
+    if (!choice) return;
 
-  function stopPolicyUiReconnect(): void {
-    if (reconnectTimer !== null) {
-      clearInterval(reconnectTimer);
-      reconnectTimer = null;
+    // Step 3: For non-Once, choose command prefix
+    if (choice.scope !== "once") {
+      try {
+        const targets = sudoTargetOptions(argv, choice.scope);
+        if (targets.length > 1) {
+          const targetChoice = await chooseOption(
+            `agent-sandbox: ${verb(action)} sudo target?`,
+            targets,
+            ctx,
+          );
+          if (targetChoice) choice = targetChoice;
+        }
+      } catch (err) {
+        ctx.ui.notify?.(
+          `agent-sandbox: elevation target prompt failed: ${(err as Error).message}`,
+        );
+        return;
+      }
     }
-  }
-
-  async function connectPolicyUi(ctx: ExtensionContext): Promise<void> {
-    if (uiSocket && !uiSocket.destroyed) return;
-
-    disconnectPolicyUi();
 
     try {
-      const socket = net.createConnection(socketPath());
-      uiSocket = socket;
-
-      await new Promise<void>((resolve, reject) => {
-        socket.once("error", reject);
-        socket.once("connect", () => resolve());
-      });
-      socket.setEncoding("utf8");
-      socket.on("data", (chunk: string) => {
-        const parsed = parseLines(lineBuf, chunk);
-        lineBuf = parsed.rest;
-        for (const line of parsed.lines) {
-          onPolicyMessage(line, ctx);
-        }
-      });
-      socket.on("close", () => {
-        uiSocket = null;
-        policySessionId = null;
-        uiConnectedAnnounced = false;
-      });
-
-      const regCtx = rpcContext();
-      socket.write(
-        `${JSON.stringify({
-          op: "register_ui",
-          ui_client: "omp",
-          ...regCtx,
-        })}\n`,
-      );
-      const reg = await readOneJsonLine(socket);
-      if (reg.ok && typeof reg.session_id === "string") {
-        policySessionId = reg.session_id;
-        if (!uiConnectedAnnounced) {
-          ctx.ui.notify?.("agent-sandbox: policy UI connected.");
-          uiConnectedAnnounced = true;
-        }
-      } else {
-        ctx.ui.notify?.(
-          `agent-sandbox: policy UI register failed (${String(reg.error ?? "no session_id")}).`,
-        );
-        disconnectPolicyUi();
-      }
+      await submitDecision({ approve: action === "approve", id: req.id }, choice, req);
     } catch (err) {
-      disconnectPolicyUi();
-      if (!uiConnectedAnnounced) {
-        ctx.ui.notify?.(
-          `agent-sandbox: cannot connect to policyd (${String(err)}); retrying…`,
-        );
-      }
+      ctx.ui.notify?.(
+        `agent-sandbox: elevation ${verb(action)} failed: ${(err as Error).message}`,
+      );
     }
   }
 
-  function startPolicyUiReconnect(ctx: ExtensionContext): void {
-    stopPolicyUiReconnect();
-    void connectPolicyUi(ctx);
-    reconnectTimer = setInterval(() => {
-      void connectPolicyUi(ctx);
-    }, 2000);
+  async function handleFilesystemRequest(
+    req: FilesystemRequest,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const path = req.path;
+    const access = req.access;
+
+    // Step 1: Allow or Deny
+    let action: PromptAction | undefined;
+    try {
+      action = await chooseAction(
+        `agent-sandbox: filesystem ${access} ${path}`,
+        ctx,
+      );
+    } catch (err) {
+      ctx.ui.notify?.(`agent-sandbox: filesystem prompt failed: ${(err as Error).message}`);
+      return;
+    }
+    if (!action) return;
+
+    // Step 2: Choose scope
+    let choice: ScopeOption | undefined;
+    try {
+      choice = await chooseOption(
+        `agent-sandbox: ${verb(action)} filesystem scope?`,
+        scopeOnlyOptions(true),
+        ctx,
+      );
+    } catch (err) {
+      ctx.ui.notify?.(
+        `agent-sandbox: filesystem scope prompt failed: ${(err as Error).message}`,
+      );
+      return;
+    }
+    if (!choice) return;
+
+    // Step 3: For non-Once, choose target path
+    if (choice.scope !== "once") {
+      try {
+        const targets = filesystemTargetOptions(path, home, choice.scope);
+        if (targets.length > 1) {
+          const targetChoice = await chooseOption(
+            `agent-sandbox: ${verb(action)} filesystem target?`,
+            targets,
+            ctx,
+          );
+          if (targetChoice) choice = targetChoice;
+        }
+      } catch (err) {
+        ctx.ui.notify?.(
+          `agent-sandbox: filesystem target prompt failed: ${(err as Error).message}`,
+        );
+        return;
+      }
+    }
+
+    try {
+      await submitDecision({ approve: action === "approve", id: req.id }, choice, req);
+    } catch (err) {
+      ctx.ui.notify?.(
+        `agent-sandbox: filesystem ${verb(action)} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+  // ---- Submit decision ----
+
+  async function submitDecision(
+    decision: { approve: boolean; id: string },
+    choice: ScopeOption,
+    reqCtx?: { cwd?: string; home?: string; project_root?: string },
+  ): Promise<void> {
+    const op = decision.approve ? "approve" : "deny";
+    try {
+      await sendPolicyRpc({
+        op,
+        id: decision.id,
+        scope: choice.scope,
+        ...(policySessionId ? { session_id: policySessionId } : {}),
+        ...(choice.target ? { target: choice.target } : {}),
+        ...rpcContext(reqCtx),
+      });
+    } catch (err) {
+      const ctx = currentContext;
+      ctx?.ui.notify?.(`agent-sandbox: ${op} failed: ${(err as Error).message}`);
+    }
   }
 
-  pi.on("session_start", async (_event, ctx) => {
-    uiConnectedAnnounced = false;
-    startPolicyUiReconnect(ctx);
-  });
-
-  pi.on("session_end", () => {
-    stopPolicyUiReconnect();
-    uiConnectedAnnounced = false;
-    disconnectPolicyUi();
-  });
-
-
-  pi.registerCommand("sandbox", {
-    description: "Agent sandbox policy status and reload",
-    handler: async (args, ctx) => {
-      const sub = (args[0] ?? "status").toLowerCase();
-      const rpcCtx = rpcContext();
-      try {
-        if (sub === "reload") {
-          const resp = await policyRpc(
-            {
-              op: "reload",
-              ...rpcCtx,
-            },
-            socketPath(),
-          );
+  function connectPolicyUi(ctx: ExtensionContext): void {
+    const path = process.env.AGENT_SANDBOX_POLICY_SOCKET ?? DEFAULT_SOCKET;
+    uiSocket = net.createConnection(path);
+    uiSocket.setEncoding("utf8");
+    uiSocket.on("connect", () => {
+      const registerReq = {
+        op: "register_ui",
+        ui_client: "omp",
+        ...rpcContext(),
+      };
+      sendPolicyRpc(registerReq)
+        .then((reply) => {
+          if (reply.session_id && typeof reply.session_id === "string") {
+            policySessionId = reply.session_id;
+          }
+        })
+        .catch((err: Error) => {
           ctx.ui.notify?.(
-            resp.ok ? "Policy reloaded." : `Reload failed: ${resp.error}`,
+            `agent-sandbox: register_ui failed: ${err.message}`,
           );
-          return;
+        });
+    });
+
+    uiSocket.on("error", (err: Error) => {
+      ctx.ui.notify?.(
+        `agent-sandbox: cannot connect to policy socket ${path}: ${err.message}`,
+      );
+    });
+
+    setupSocketHandlers(ctx);
+  }
+
+  function setupSocketHandlers(ctx: ExtensionContext): void {
+    if (!uiSocket) return;
+
+    uiSocket.on("data", (chunk: string) => {
+      const { rest, lines } = parseLines(lineBuf, chunk);
+      lineBuf = rest;
+      for (const line of lines) {
+        try {
+          const msg = JSON.parse(line) as PolicyMessage;
+          onPolicyMessage(msg);
+        } catch {
+          // ignore malformed lines
         }
-        const resp = await policyRpc(
-          {
-            op: "status",
-            ...rpcCtx,
-          },
-          socketPath(),
-        );
-        const pending = (resp.pending as unknown[]) ?? [];
-        const merged = resp.merged as { allow?: unknown[] } | undefined;
-        const allow = merged?.allow ?? [];
-        ctx.ui.notify?.(
-          `Sandbox policy: ${allow.length} host rules, ${pending.length} pending.`,
-        );
+      }
+    });
+
+    uiSocket.on("close", () => {
+      if (uiSocket) {
+        ctx.ui.notify?.("agent-sandbox: policy UI connection closed");
+        uiSocket = null;
+        policySessionId = null;
+        lineBuf = "";
+      }
+    });
+  }
+
+  // ---- Commands ----
+
+  pi.registerCommand("sandbox approve", {
+    description: "Approve a pending sandbox request by id",
+    async handler(input: unknown) {
+      const args = commandArgs(input);
+      if (args.length < 1) return "Usage: /sandbox approve <id> [scope=once]";
+      const id = args[0];
+      const scope = (args[1] ?? "once") as ApprovalScope;
+      await submitDecision(
+        { approve: true, id },
+        { label: scope, scope: scope as ApprovalScope },
+      );
+      return `Approved ${id}`;
+    },
+  });
+
+  pi.registerCommand("sandbox deny", {
+    description: "Deny a pending sandbox request by id",
+    async handler(input: unknown) {
+      const args = commandArgs(input);
+      if (args.length < 1) return "Usage: /sandbox deny <id>";
+      const id = args[0];
+      await submitDecision(
+        { approve: false, id },
+        { label: "Once", scope: "once" },
+      );
+      return `Denied ${id}`;
+    },
+  });
+
+  pi.registerCommand("sandbox reload", {
+    description: "Reload sandbox policy from declarative config",
+    async handler() {
+      try {
+        const reply = await sendPolicyRpc({ op: "reload", ...rpcContext() });
+        return `Policy reloaded: ${JSON.stringify(reply)}`;
       } catch (err) {
-        ctx.ui.notify?.(`agent-sandbox: ${String(err)}`);
+        return `Reload failed: ${(err as Error).message}`;
       }
     },
+  });
+
+  pi.registerCommand("sandbox status", {
+    description: "Show sandbox policy daemon status",
+    async handler() {
+      try {
+        const reply = await sendPolicyRpc({ op: "status", ...rpcContext() });
+        const r = reply as Record<string, unknown>;
+        const lines: string[] = [];
+        if (r.ui_connected !== undefined) {
+          lines.push(`UI connected: ${r.ui_connected}`);
+        }
+        if (r.pending !== undefined) {
+          const pending = r.pending as Array<Record<string, unknown>>;
+          lines.push(`Pending: ${pending.length}`);
+          for (const p of pending) {
+            lines.push(`  ${JSON.stringify(p)}`);
+          }
+        }
+        if (r.declarative_rules !== undefined) {
+          lines.push(`Declarative rules: ${r.declarative_rules}`);
+        }
+        return lines.join("\n") || JSON.stringify(reply);
+      } catch (err) {
+        return `Status failed: ${(err as Error).message}`;
+      }
+    },
+  });
+
+  pi.registerCommand("sandbox disconnect", {
+    description: "Disconnect and reconnect the policy UI",
+    handler(_input: unknown, ctx: ExtensionContext) {
+      disconnectPolicyUi();
+      if (reconnectTimer) clearInterval(reconnectTimer);
+      reconnectTimer = setInterval(() => {
+        if (uiSocket) {
+          clearInterval(reconnectTimer!);
+          reconnectTimer = null;
+          return;
+        }
+        connectPolicyUi(ctx);
+      }, 2000);
+      return "Disconnected; reconnecting...";
+    },
+  });
+
+  // ---- Lifecycle ----
+
+  pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
+    currentContext = ctx;
+    connectPolicyUi(ctx);
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (reconnectTimer) clearInterval(reconnectTimer);
+    disconnectPolicyUi();
+    currentContext = null;
   });
 }
