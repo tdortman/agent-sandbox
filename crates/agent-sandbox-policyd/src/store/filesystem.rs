@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
 
-use super::types::PolicyStore;
+use super::types::{FilesystemVerdictKey, PolicyStore, VerdictEntry};
 use crate::spawn::maybe_spawn_ui;
 use crate::store::ui_route::UiRoute;
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext, UiSpawnGate};
@@ -166,14 +166,15 @@ impl PolicyStore {
         // Check the short-lived verdict cache before creating a new prompt.
         {
             let inner = self.inner.lock().await;
-            if let Some(&(cached_allowed, ref cached_source, ref time)) =
-                inner.filesystem_verdict_cache.get(&(path.clone(), access))
-                && time.elapsed() < Duration::from_secs(2)
+            if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemVerdictKey {
+                path: path.clone(),
+                access,
+            }) && entry.time.elapsed() < Duration::from_secs(2)
             {
-                return if cached_allowed {
-                    FilesystemCheckReply::allowed(cached_source.clone(), path, access)
+                return if entry.allowed {
+                    FilesystemCheckReply::allowed(entry.source.clone(), path, access)
                 } else {
-                    FilesystemCheckReply::denied(cached_source.clone(), path, access)
+                    FilesystemCheckReply::denied(entry.source.clone(), path, access)
                 };
             }
         }
@@ -325,8 +326,12 @@ impl PolicyStore {
         }
         // Cache the verdict for deduplication.
         inner.filesystem_verdict_cache.insert(
-            (path, access),
-            (allowed, source.to_string(), Instant::now()),
+            FilesystemVerdictKey { path, access },
+            VerdictEntry {
+                allowed,
+                source: source.to_string(),
+                time: Instant::now(),
+            },
         );
     }
 }

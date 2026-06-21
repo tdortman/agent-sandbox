@@ -10,7 +10,7 @@ use crate::store::ui_route::UiRoute;
 use crate::wire::{NetworkScopeOp, PendingDecision, SudoScopeOp};
 
 use super::super::types::{
-    Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore,
+    NetworkVerdictKey, Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore,
 };
 use super::DecisionAction;
 
@@ -95,7 +95,10 @@ impl PolicyStore {
                 &pending_id,
                 true,
                 "once",
-                Some((resolved.host.clone(), resolved.port)),
+                Some(NetworkVerdictKey {
+                    host: resolved.host.clone(),
+                    port: resolved.port,
+                }),
             )
             .await;
             return RpcReply::ScopeAction(ScopeActionReply::ok_network(
@@ -126,7 +129,10 @@ impl PolicyStore {
                         &pending_id,
                         true,
                         source,
-                        Some((resolved.host.clone(), resolved.port)),
+                        Some(NetworkVerdictKey {
+                            host: resolved.host.clone(),
+                            port: resolved.port,
+                        }),
                     )
                     .await;
                 }
@@ -135,7 +141,10 @@ impl PolicyStore {
                         &pending_id,
                         false,
                         "denied",
-                        Some((resolved.host.clone(), resolved.port)),
+                        Some(NetworkVerdictKey {
+                            host: resolved.host.clone(),
+                            port: resolved.port,
+                        }),
                     )
                     .await;
                 }
@@ -145,7 +154,10 @@ impl PolicyStore {
                 &pending_id,
                 false,
                 "blocked",
-                Some((resolved.host.clone(), resolved.port)),
+                Some(NetworkVerdictKey {
+                    host: resolved.host.clone(),
+                    port: resolved.port,
+                }),
             )
             .await;
         } else {

@@ -10,7 +10,9 @@ use uuid::Uuid;
 use crate::spawn::maybe_spawn_ui;
 use crate::wire::{MergeContext, NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
-use super::types::{Pending, PendingKind, PendingNetwork, PolicyStore};
+use super::types::{
+    NetworkVerdictKey, Pending, PendingKind, PendingNetwork, PolicyStore, VerdictEntry,
+};
 use super::ui_route::UiRoute;
 
 /// How long a network verdict is cached after the first policy check for the
@@ -82,8 +84,16 @@ impl PolicyStore {
                 %source,
                 pending_id = %p.id(),
             );
-            self.finish_network(p.id(), true, &source, Some((host.clone(), port)))
-                .await;
+            self.finish_network(
+                p.id(),
+                true,
+                &source,
+                Some(NetworkVerdictKey {
+                    host: host.clone(),
+                    port,
+                }),
+            )
+            .await;
             self.inner.lock().await.pending.remove(p.id());
         }
     }
@@ -93,7 +103,7 @@ impl PolicyStore {
         pending_id: &str,
         allowed: bool,
         source: &str,
-        verdict_cache_key: Option<(String, u16)>,
+        verdict_cache_key: Option<NetworkVerdictKey>,
     ) {
         let mut inner = self.inner.lock().await;
         inner
@@ -111,10 +121,15 @@ impl PolicyStore {
         }
         // Cache the verdict for deduplication of multiple IPs from the same
         // DNS response (e.g. curl trying 6 IPv4 + 4 IPv6 for google.com).
-        if let Some((host, port)) = verdict_cache_key {
-            inner
-                .network_verdict_cache
-                .insert((host, port), (allowed, source.to_string(), Instant::now()));
+        if let Some(key) = verdict_cache_key {
+            inner.network_verdict_cache.insert(
+                key,
+                VerdictEntry {
+                    allowed,
+                    source: source.to_string(),
+                    time: Instant::now(),
+                },
+            );
         }
     }
 
@@ -147,15 +162,15 @@ impl PolicyStore {
         // same hostname from the DNS cache).
         {
             let inner = self.inner.lock().await;
-            if let Some(&(cached_allowed, ref cached_source, ref time)) = inner
-                .network_verdict_cache
-                .get(&(policy_host.clone(), port))
-                && time.elapsed() < NETWORK_VERDICT_CACHE_TTL
+            if let Some(entry) = inner.network_verdict_cache.get(&NetworkVerdictKey {
+                host: policy_host.clone(),
+                port,
+            }) && entry.time.elapsed() < NETWORK_VERDICT_CACHE_TTL
             {
-                return if cached_allowed {
-                    CheckReply::allowed(cached_source.clone())
+                return if entry.allowed {
+                    CheckReply::allowed(entry.source.clone())
                 } else {
-                    CheckReply::denied(cached_source.clone())
+                    CheckReply::denied(entry.source.clone())
                 };
             }
         }
@@ -277,8 +292,15 @@ impl PolicyStore {
                     .network_pending_delivered_to_standalone
                     .remove(&pending_id);
                 inner.network_verdict_cache.insert(
-                    (policy_host.clone(), port),
-                    (false, "blocked".to_string(), Instant::now()),
+                    NetworkVerdictKey {
+                        host: policy_host.clone(),
+                        port,
+                    },
+                    VerdictEntry {
+                        allowed: false,
+                        source: "blocked".to_string(),
+                        time: Instant::now(),
+                    },
                 );
                 tracing::warn!(%policy_host, port, "network approval blocked (no policy UI)");
                 return CheckReply::blocked(
@@ -298,8 +320,15 @@ impl PolicyStore {
                     .network_pending_delivered_to_standalone
                     .remove(&pending_id);
                 inner.network_verdict_cache.insert(
-                    (policy_host.clone(), port),
-                    (false, "blocked".to_string(), Instant::now()),
+                    NetworkVerdictKey {
+                        host: policy_host.clone(),
+                        port,
+                    },
+                    VerdictEntry {
+                        allowed: false,
+                        source: "blocked".to_string(),
+                        time: Instant::now(),
+                    },
                 );
                 Self::audit("timeout", Some(&policy_host), Some(port), &scheme);
                 tracing::warn!(%policy_host, port, "network approval timed out");

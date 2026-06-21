@@ -10,6 +10,27 @@ use agent_sandbox_core::{
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
+/// Key for the network verdict cache: hostname and port.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct NetworkVerdictKey {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Key for the filesystem verdict cache: path and access type.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct FilesystemVerdictKey {
+    pub path: String,
+    pub access: FileAccess,
+}
+
+/// A cached verdict: whether it was allowed, from which source, and when.
+#[derive(Debug, Clone)]
+pub(crate) struct VerdictEntry {
+    pub allowed: bool,
+    pub source: String,
+    pub time: Instant,
+}
 
 pub(crate) static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -192,8 +213,8 @@ pub(crate) struct StoreInner {
     pub filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
     pub ui_clients: HashMap<u64, UiClient>,
     pub ui_context_by_session: HashMap<String, UiSessionContext>,
-    pub network_verdict_cache: HashMap<(String, u16), (bool, String, Instant)>,
-    pub filesystem_verdict_cache: HashMap<(String, FileAccess), (bool, String, Instant)>,
+    pub network_verdict_cache: HashMap<NetworkVerdictKey, VerdictEntry>,
+    pub filesystem_verdict_cache: HashMap<FilesystemVerdictKey, VerdictEntry>,
     pub ui_spawn_last: HashMap<String, Instant>,
     pub session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
     pub session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
