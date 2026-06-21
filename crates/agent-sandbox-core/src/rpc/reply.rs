@@ -8,12 +8,13 @@ use super::{message::RpcMessage, scope::ApprovalScope};
 
 /// policyd → client response line.
 ///
-/// `Simple` must be last: it only has `ok`, so untagged serde would otherwise
-/// accept any `{"ok": true, ...}` object as `SimpleOkReply` and drop fields.
+/// Variants with optional `error` fields come before `Error` so untagged
+/// serde does not greedily match them as `Error`. `Simple` must be last:
+/// it only has `ok`, so it would otherwise accept any `{"ok": true, ...}`
+/// object and drop fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RpcReply {
-    Error(ErrorReply),
     RegisterUi(RegisterUiReply),
     FilesystemCheck(FilesystemCheckReply),
     FilesystemMonitor(FilesystemMonitorReply),
@@ -21,6 +22,7 @@ pub enum RpcReply {
     Elevate(ElevateReply),
     ScopeAction(ScopeActionReply),
     Status(StatusReply),
+    Error(ErrorReply),
     Simple(SimpleOkReply),
 }
 
