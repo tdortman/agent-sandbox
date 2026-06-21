@@ -65,7 +65,7 @@ mod tests {
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-    fn build_a_response(qname: &str, ip: (u8, u8, u8, u8), ttl: u32) -> Vec<u8> {
+    fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");
         let mut message = Message::new();
         message
@@ -75,14 +75,14 @@ mod tests {
             .add_answer(Record::from_rdata(
                 name,
                 ttl,
-                RData::A(A::new(ip.0, ip.1, ip.2, ip.3)),
+                RData::A(A::new(ip[0], ip[1], ip[2], ip[3])),
             ));
         message.to_vec().expect("encode")
     }
 
     #[test]
     fn mappings_from_a_response() {
-        let pkt = build_a_response("api.openai.com", (52, 54, 28, 178), 120);
+        let pkt = build_a_response("api.openai.com", [52, 54, 28, 178], 120);
         assert_eq!(
             mappings_from_response(&pkt),
             vec![DnsMapping {
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn question_name_normalizes_case() {
-        let pkt = build_a_response("Example.COM", (1, 2, 3, 4), 300);
+        let pkt = build_a_response("Example.COM", [1, 2, 3, 4], 300);
         assert_eq!(question_name(&pkt), Some("example.com".to_string()));
     }
 
