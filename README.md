@@ -13,7 +13,7 @@ sequenceDiagram
     participant Daemon as Policy Daemon (policyd)
     participant UI as Policy UI (OMP / Dialog)
 
-    Agent->>NFQ: Network Request (TCP SYN)
+    Agent->>NFQ: Network Request (TCP SYN / UDP)
     activate NFQ
     Note over NFQ: Packet held
     NFQ->>Daemon: Check(host, port)
@@ -32,7 +32,7 @@ Sudo elevation and filesystem mediation follow the same flow, except they swap o
 
 ### Network isolation
 
-Each sandbox runs in a dedicated network namespace (netns). A veth pair connects the netns to the host. The NFQUEUE enforcer captures outbound TCP SYN packets, consults policyd for each (host, port) pair, and holds the packet until policyd returns an allow or deny verdict. A DNS forwarder inside the netns caches IP-to-hostname mappings so the policy daemon can match rules by hostname rather than raw IP.
+Each sandbox runs in a dedicated network namespace (netns). A veth pair connects the netns to the host. The NFQUEUE enforcer captures outbound TCP SYN and UDP packets, consults policyd for each (host, port) pair, and holds the packet until policyd returns an allow or deny verdict. A DNS forwarder inside the netns caches IP-to-hostname mappings so the policy daemon can match rules by hostname rather than raw IP.
 
 ### Filesystem isolation
 
