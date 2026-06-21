@@ -1,18 +1,26 @@
 # OMP (oh-my-pi) extension: policy UI client for agent-sandbox policyd.
 {
   lib,
-  stdenvNoCC,
+  stdenv,
+  nodejs,
   inputs,
   ...
 }:
 
-stdenvNoCC.mkDerivation {
+stdenv.mkDerivation {
   pname = "agent-sandbox-omp-extension";
   version = "0.1.0";
 
   src = "${inputs.self}/extensions/agent-sandbox";
 
-  dontUnpack = false;
+  nativeBuildInputs = [ nodejs ];
+
+  buildPhase = ''
+    runHook preBuild
+    cc -shared -fPIC -o fdctl.node fdctl.c \
+      -I"${nodejs}/include/node"
+    runHook postBuild
+  '';
 
   installPhase = ''
     runHook preInstall
