@@ -447,7 +447,7 @@ fn main() {
     // Build the request context for RPC checks.
     let ctx = agent_sandbox_core::RequestContext {
         cwd: cli.cwd,
-        home: home.clone(),
+        home,
         project_root: cli.project_root,
         pid: None,
         uid: None,
@@ -518,16 +518,6 @@ fn main() {
                     continue;
                 };
                 let access = mask_to_access(meta.mask, meta.fd, meta.pid);
-
-                // Auto-allow events outside the home directory.
-                if let Some(home) = &home {
-                    let home = home.trim_end_matches('/');
-                    if path != home && !path.starts_with(&format!("{home}/")) {
-                        respond(fan_fd, meta.fd, FAN_ALLOW);
-                        offset += event_len;
-                        continue;
-                    }
-                }
 
                 // Auto-allow events matching a static allow rule.
                 if static_allow.iter().any(|rule| rule.matches(&path, access)) {
