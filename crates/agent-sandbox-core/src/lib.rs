@@ -35,10 +35,8 @@ pub use policy::{
     expand_home_path, filesystem_approval_paths,
 };
 pub use proc_context::{
-    PeerCredentials, ProcContext, context_from_pid, home_from_uid, is_blocked_sandbox_policy_tool,
-    is_descendant_of, looks_like_omp_ui_process, namespace_inode, omp_ui_owner_for_pid, peer_cred,
-    peer_cred_unix, peer_in_different_mount_ns, peer_in_netns, read_proc_cmdline, read_proc_exe,
-    sandbox_session_id_from_pid,
+    PeerCredentials, ProcContext, context_from_pid, home_from_uid, is_descendant_of, peer_cred,
+    peer_cred_unix, sandbox_session_id_from_pid,
 };
 pub use rpc::{
     ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply,

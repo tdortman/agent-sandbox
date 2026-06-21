@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use agent_sandbox_core::{is_descendant_of, omp_ui_owner_for_pid};
+use agent_sandbox_core::is_descendant_of;
 
 use super::types::{UiClient, UiSessionContext};
 
@@ -73,10 +73,9 @@ fn omp_session_owns_request(client: &UiClient, ctx: &UiSessionContext, route: &U
 fn omp_pid_owns_request(client: &UiClient, route: &UiRoute) -> bool {
     client.ui_client == "omp"
         && client.owner_pid != 0
-        && route.request_pid.is_some_and(|pid| {
-            is_descendant_of(client.owner_pid, pid)
-                || omp_ui_owner_for_pid(pid) == Some(client.owner_pid)
-        })
+        && route
+            .request_pid
+            .is_some_and(|pid| is_descendant_of(client.owner_pid, pid))
 }
 
 pub(crate) fn omp_ui_client_owns_by_pid(client: &UiClient, route: &UiRoute) -> bool {
@@ -95,11 +94,9 @@ fn omp_path_matches_client(ctx: &UiSessionContext, route: &UiRoute) -> bool {
 
 fn request_owned_by_omp_pid(route: &UiRoute, omp_clients: &[&UiClient]) -> bool {
     route.request_pid.is_some_and(|pid| {
-        let owner = omp_ui_owner_for_pid(pid);
-        omp_clients.iter().any(|omp| {
-            omp.owner_pid != 0
-                && (is_descendant_of(omp.owner_pid, pid) || owner == Some(omp.owner_pid))
-        })
+        omp_clients
+            .iter()
+            .any(|omp| omp.owner_pid != 0 && is_descendant_of(omp.owner_pid, pid))
     })
 }
 
@@ -254,9 +251,7 @@ mod tests {
         );
         let matches = ui_client_matches(&omp, &omp_ctx, &route, &[&omp]);
         let _ = child.wait();
-        if agent_sandbox_core::looks_like_omp_ui_process(owner_pid) {
-            assert!(matches);
-        }
+        assert!(matches);
     }
 
     #[tokio::test]
