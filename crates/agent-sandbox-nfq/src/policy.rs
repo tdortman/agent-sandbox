@@ -40,7 +40,11 @@ pub async fn check_destination(
         port: Some(dst_port),
         scheme: scheme.to_string(),
         url: Some(url),
-        ctx: RequestContext::from_paths_and_ids(&ctx.paths, ctx.ids),
+        ctx: request_context(
+            &ctx.paths,
+            ctx.ids,
+            std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
+        ),
     };
 
     let resp = policy_rpc(socket, req, timeout)
@@ -62,6 +66,16 @@ fn resolve_context(pid: Option<u32>) -> PolicyContext {
     PolicyContext { paths, ids }
 }
 
+fn request_context(
+    paths: &SandboxPaths,
+    ids: ProcessIds,
+    sandbox_session_id: Option<String>,
+) -> RequestContext {
+    let mut ctx = RequestContext::from_paths_and_ids(paths, ids);
+    ctx.sandbox_session_id = sandbox_session_id;
+    ctx
+}
+
 /// Read the UID of a process from `/proc/<pid>/status`.
 fn pid_uid(pid: u32) -> Option<u32> {
     if pid == 0 {
@@ -75,4 +89,22 @@ fn pid_uid(pid: u32) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_sandbox_core::{ProcessIds, SandboxPaths};
+
+    use super::request_context;
+
+    #[test]
+    fn request_context_preserves_sandbox_session_id() {
+        let paths = SandboxPaths::new("/work", "/home/tim", "/work");
+        let ctx = request_context(&paths, ProcessIds::new(0, 1000), Some("s1".into()));
+
+        assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
+        assert_eq!(ctx.cwd.as_deref(), Some("/work"));
+        assert_eq!(ctx.home.as_deref(), Some("/home/tim"));
+        assert_eq!(ctx.project_root.as_deref(), Some("/work"));
+    }
 }
