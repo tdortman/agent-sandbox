@@ -63,7 +63,10 @@ let
   };
 
   packageOptions = mountOptions // {
-    package = lib.mkPackageOption pkgs "llm-agents" { };
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "The package to wrap.";
+    };
     binary = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -104,9 +107,7 @@ let
   policyContextEnabled =
     cfg.network.enable || cfg.filesystem.dynamicApproval.enable || cfg.sudoPolicy == "approve";
 
-  sharedRuntimeReadonly =
-    lib.optional policyContextEnabled "/run/agent-sandbox"
-    ++ lib.optional cfg.network.enable "/run/netns";
+  sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
 
   mergePackageMounts =
     pkgCfg:
@@ -139,6 +140,7 @@ let
       // {
         inherit (cfg.wrapping) replaceOriginalBinary unsafeAliasPrefix;
         policySocket = cfg.policy.socketPath;
+        sandboxPolicySocket = cfg.policy.sandboxSocketPath;
         policyContext = policyContextEnabled;
         network = networkConfig;
         sudoGuard = sudoGuardPkg;
@@ -182,7 +184,7 @@ in
         How sandboxed agents may invoke sudo. ``deny`` blocks elevation.
         ``approve`` replaces sudo with a shim that requests policy UI approval via policyd,
         then runs the approved command as root on the host (not inside bubblewrap).
-        OMP extension or ``agent-sandbox-ui``. v1: ``sudo <cmd> [args…]``
+        Host-side OMP extension or ``agent-sandbox-ui`` may approve. v1: ``sudo <cmd> [args…]``
         only; ``-u`` / ``-E`` and similar flags are not supported.
       '';
     };
@@ -191,6 +193,11 @@ in
       socketPath = lib.mkOption {
         type = lib.types.str;
         default = "/run/agent-sandbox/policy.sock";
+      };
+      sandboxSocketPath = lib.mkOption {
+        type = lib.types.str;
+        default = "/run/agent-sandbox/sandbox-policy.sock";
+        description = "Sandbox-facing policyd socket. Bound over policy.socketPath inside sandboxes.";
       };
       exportedJson = lib.mkOption {
         type = lib.types.str;
@@ -206,7 +213,8 @@ in
         default = true;
         description = ''
           When true, unknown hosts block in policyd until the UI allows or denies
-          (same flow as elevation). OMP extension and/or ``agent-sandbox-ui``.
+          (same flow as elevation). Host-side OMP extension, ``agent-sandbox-ui``,
+          or ``agent-sandbox-approve`` may approve from the host policy socket.
         '';
       };
       approvalTimeout = lib.mkOption {
@@ -290,188 +298,7 @@ in
 
       declarativeAllow = lib.mkOption {
         type = lib.types.listOf ruleType;
-        default = [
-          # LLM / agent APIs
-          {
-            host = "api.openai.com";
-            port = 443;
-          }
-          {
-            host = "chatgpt.com";
-            port = 443;
-          }
-          {
-            host = "api.deepseek.com";
-            port = 443;
-          }
-          {
-            host = "*.anthropic.com";
-            port = 443;
-          }
-          {
-            host = "api.githubcopilot.com";
-            port = 443;
-          }
-          {
-            host = "*.githubcopilot.com";
-            port = 443;
-          }
-          {
-            host = "generativelanguage.googleapis.com";
-            port = 443;
-          }
-          {
-            host = "api.mistral.ai";
-            port = 443;
-          }
-          {
-            host = "api.cohere.ai";
-            port = 443;
-          }
-          {
-            host = "api.together.xyz";
-            port = 443;
-          }
-          {
-            host = "openrouter.ai";
-            port = 443;
-          }
-          {
-            host = "api.morphllm.com";
-            port = 443;
-          }
-          {
-            host = "*.amazonaws.com";
-            port = 443;
-          }
-          {
-            host = "opencode.ai";
-            port = 443;
-          }
-          {
-            host = "api.opencode.ai";
-            port = 443;
-          }
-          {
-            host = "ampcode.com";
-            port = 443;
-          }
-          {
-            host = "*.ampcode.com";
-            port = 443;
-          }
-          {
-            host = "*.factory.ai";
-            port = 443;
-          }
-          {
-            host = "api.workos.com";
-            port = 443;
-          }
-          {
-            host = "*.cursor.sh";
-            port = 443;
-          }
-          {
-            host = "*.cursor.com";
-            port = 443;
-          }
-          {
-            host = "*.cursorapi.com";
-            port = 443;
-          }
-          {
-            host = "data.charm.land";
-            port = 443;
-          }
-          {
-            host = "catwalk.charm.sh";
-            port = 443;
-          }
-          {
-            host = "models.dev";
-            port = 443;
-          }
-          # Git / source hosts
-          {
-            host = "github.com";
-            port = 443;
-          }
-          {
-            host = "api.github.com";
-            port = 443;
-          }
-          {
-            host = "raw.githubusercontent.com";
-            port = 443;
-          }
-          {
-            host = "codeload.github.com";
-            port = 443;
-          }
-          {
-            host = "objects.githubusercontent.com";
-            port = 443;
-          }
-          {
-            host = "release-assets.githubusercontent.com";
-            port = 443;
-          }
-          {
-            host = "gitlab.com";
-            port = 443;
-          }
-          # Package registries
-          {
-            host = "registry.npmjs.org";
-            port = 443;
-          }
-          {
-            host = "*.npmjs.org";
-            port = 443;
-          }
-          {
-            host = "registry.yarnpkg.com";
-            port = 443;
-          }
-          {
-            host = "pypi.org";
-            port = 443;
-          }
-          {
-            host = "files.pythonhosted.org";
-            port = 443;
-          }
-          {
-            host = "crates.io";
-            port = 443;
-          }
-          {
-            host = "static.crates.io";
-            port = 443;
-          }
-          {
-            host = "index.crates.io";
-            port = 443;
-          }
-          {
-            host = "proxy.golang.org";
-            port = 443;
-          }
-          {
-            host = "sum.golang.org";
-            port = 443;
-          }
-          {
-            host = "formulae.brew.sh";
-            port = 443;
-          }
-          # Nix
-          {
-            host = "cache.nixos.org";
-            port = 443;
-          }
-        ];
+        default = [ ];
         description = "Hosts allowed without interactive approval (merged under user/project policy).";
       };
 
@@ -518,6 +345,12 @@ in
   // mountOptions;
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = policyContextEnabled -> cfg.policy.socketPath != cfg.policy.sandboxSocketPath;
+        message = "agent-sandbox.policy.socketPath and sandboxSocketPath must differ when policy is enabled";
+      }
+    ];
     environment.systemPackages = (map wrapOne cfg.packages) ++ [
       policyPkg
     ];

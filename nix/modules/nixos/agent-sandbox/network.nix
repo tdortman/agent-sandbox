@@ -186,7 +186,7 @@ lib.mkIf policyEnabled (
             allow = [
               {
                 path = "/nix/store";
-                access = "read_write";
+                access = "all";
               }
             ];
             deny = [ ];
@@ -215,12 +215,8 @@ lib.mkIf policyEnabled (
               "${policyPkg}/bin/agent-sandbox-policyd"
               "--socket"
               config.agent-sandbox.policy.socketPath
-            ]
-            ++ lib.optionals cfg.enable [
-              "--sandbox-netns"
-              "/run/netns/${cfg.netnsName}"
-            ]
-            ++ [
+              "--sandbox-socket"
+              config.agent-sandbox.policy.sandboxSocketPath
               "--declarative"
               "/etc/agent-sandbox/declarative.json"
               "--export-json"
@@ -366,7 +362,7 @@ lib.mkIf policyEnabled (
               "--queue"
               (toString cfg.queueNumber)
               "--policy-socket"
-              config.agent-sandbox.policy.socketPath
+              config.agent-sandbox.policy.sandboxSocketPath
               "--policy-timeout"
               (toString (lib.max cfg.policyTimeout config.agent-sandbox.policy.approvalTimeout))
               "--nft-binary"

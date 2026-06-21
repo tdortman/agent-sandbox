@@ -275,25 +275,45 @@ in
   ]);
 
   agent-sandbox-context-env =
-    policySocket:
+    { sandboxPolicySocket, ... }:
     compose [
-      (set-env "AGENT_SANDBOX_POLICY_SOCKET" policySocket)
+      (set-env "AGENT_SANDBOX_POLICY_SOCKET" sandboxPolicySocket)
       (add-runtime ''
         # jail.nix base uses --clearenv; only --setenv survives into the jail.
         # policyd and enforcement daemons read these from /proc/<pid>/environ.
-        _agent_sandbox_home=$(readlink -f "$HOME")
-        _agent_sandbox_project_root="$PWD"
-        if command -v git >/dev/null 2>&1; then
-          _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
-          [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
+        # Reuse outer context if already set (e.g. by agent-sandbox-open-ui-fd).
+        if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
+          _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
+        else
+          IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
         fi
-        IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET "${policySocket}")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$PWD")
+        if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
+          _agent_sandbox_home="$AGENT_SANDBOX_HOME"
+        else
+          _agent_sandbox_home=$(readlink -f "$HOME")
+        fi
+        if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
+          _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
+        else
+          _agent_sandbox_cwd="$PWD"
+        fi
+        if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
+          _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
+        else
+          _agent_sandbox_project_root="$PWD"
+          if command -v git >/dev/null 2>&1; then
+            _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
+            [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
+          fi
+        fi
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET "''${sandboxPolicySocket}")
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
+        RUNTIME_ARGS+=(--ro-bind "''${sandboxPolicySocket}" "''${sandboxPolicySocket}")
       '')
+      (lib.id sandboxPolicySocket)
     ];
 
   # GPU device nodes need --dev-bind (rw). try-readonly breaks NVML/CUDA ioctls.

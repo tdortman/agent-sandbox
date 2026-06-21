@@ -83,6 +83,7 @@ let
       exposeWorkingDirectory ? true,
       extraBwrapArgs ? [ ],
       policySocket ? null,
+      sandboxPolicySocket ? null,
       policyContext ? false,
       network ? null,
       sudoGuard ? null,
@@ -124,8 +125,8 @@ let
       (home-readonly-mounts homeReadonly)
       (home-readwrite-mounts homeReadwrite)
     ]
-    ++ lib.optionals (policyContext && policySocket != null) [
-      (agent-sandbox-context-env policySocket)
+    ++ lib.optionals (policyContext && policySocket != null && sandboxPolicySocket != null) [
+      (agent-sandbox-context-env { inherit policySocket sandboxPolicySocket; })
     ]
     ++ lib.optionals (network != null) [
       (if dynamicFs then c.agent-sandbox-restricted-net-dynamic else agent-sandbox-restricted-net)
@@ -167,6 +168,7 @@ rec {
       replaceOriginalBinary ? true,
       unsafeAliasPrefix ? "unsafe-",
       policySocket ? null,
+      sandboxPolicySocket ? null,
       policyContext ? false,
       network ? null,
       sudoGuard ? null,
@@ -192,15 +194,20 @@ rec {
       extraPkgs' = extraPkgs ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ];
       dynamicFs = fsArmPkg != null;
 
-      staticAllowRules =
-        (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
-          inherit path;
-          access = "read";
-        }))
-        ++ (lib.lists.forEach (readwriteDirs ++ readwriteFiles) (path: {
-          inherit path;
-          access = "read_write";
-        }));
+      staticAllowRules = [
+        {
+          path = "/nix/store";
+          access = "all";
+        }
+      ]
+      ++ (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
+        inherit path;
+        access = "read";
+      }))
+      ++ (lib.lists.forEach (readwriteDirs ++ readwriteFiles) (path: {
+        inherit path;
+        access = "read_write";
+      }));
       staticAllowJson = builtins.toJSON staticAllowRules;
       staticAllowJsonArg = lib.escapeShellArg staticAllowJson;
 
@@ -235,6 +242,7 @@ rec {
             extraBwrapArgs
             policySocket
             policyContext
+            sandboxPolicySocket
             network
             sudoGuard
             runtimeReadonlyDirs
@@ -299,20 +307,53 @@ rec {
         fi
       '';
 
-      policyScript = lib.optionalString (policyContext && policySocket != null) ''
-        _agent_sandbox_home=$(readlink -f "$HOME")
-        _agent_sandbox_project_root="$PWD"
-        if command -v git >/dev/null 2>&1; then
-          _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
-          [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
-        fi
-        IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET "${policySocket}")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$PWD")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
-      '';
+      policyScript =
+        lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
+          ''
+            # Reuse outer context if already set (e.g. by agent-sandbox-open-ui-fd).
+            if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
+              _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
+            else
+              IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
+            fi
+            if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
+              _agent_sandbox_home="$AGENT_SANDBOX_HOME"
+            else
+              _agent_sandbox_home=$(readlink -f "$HOME")
+            fi
+            if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
+              _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
+            else
+              _agent_sandbox_cwd="$PWD"
+            fi
+            if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
+              _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
+            else
+              _agent_sandbox_project_root="$PWD"
+              if command -v git >/dev/null 2>&1; then
+                _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
+                [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
+              fi
+            fi
+            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
+            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
+            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
+            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
+            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
+            # Mount a clean tmpfs over /run/agent-sandbox to hide
+            # the host policy socket from sandboxed processes.
+            # This must precede the file-level ro-binds below.
+            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
+            if [[ -f /run/agent-sandbox/dns-cache.json ]]; then
+              RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/dns-cache.json /run/agent-sandbox/dns-cache.json)
+            fi
+            if [[ -f /run/agent-sandbox/session-context.json ]]; then
+              RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/session-context.json /run/agent-sandbox/session-context.json)
+            fi
+            # Expose only the restricted sandbox request socket. The host
+            # control socket stays hidden by tmpfs and is not renamed.
+            RUNTIME_ARGS+=(--ro-bind ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
+          '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
@@ -436,6 +477,8 @@ rec {
           }
         else
           jailedDrv;
+      finalLauncher = launcher;
+
     in
     pkgs.symlinkJoin {
       name = "${lib.getName package}-agent-sandbox";
@@ -443,9 +486,9 @@ rec {
       postBuild = ''
         if [ "${if replaceOriginalBinary then "1" else "0"}" = "1" ]; then
           mv $out/bin/${binName} $out/bin/${unsafeAliasPrefix}${binName}
-          ln -s ${launcher}/bin/${sandboxedName} $out/bin/${binName}
+          ln -s ${finalLauncher}/bin/${sandboxedName} $out/bin/${binName}
         fi
-        ln -s ${launcher}/bin/${sandboxedName} $out/bin/${sandboxedName}
+        ln -s ${finalLauncher}/bin/${sandboxedName} $out/bin/${sandboxedName}
       '';
     };
 }

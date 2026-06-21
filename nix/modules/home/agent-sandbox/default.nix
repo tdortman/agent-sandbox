@@ -20,9 +20,10 @@ in
       Install the oh-my-pi agent-sandbox extension under the OMP agent directory.
 
       The extension registers as policy UI client ``omp`` with policyd and handles
-      network and elevation approval prompts inside OMP sessions. Requires the
-      NixOS ``agent-sandbox`` module (policy socket at
-      ``/run/agent-sandbox/policy.sock`` by default).
+      network and elevation approval prompts inside OMP sessions. The OMP process
+      must run outside the sandbox to approve; the sandbox policy socket rejects
+      UI registration. Requires the NixOS ``agent-sandbox`` module (host policy
+      socket at ``/run/agent-sandbox/policy.sock`` by default).
     '';
 
     agentDir = lib.mkOption {
