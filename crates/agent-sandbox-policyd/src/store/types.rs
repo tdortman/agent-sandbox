@@ -77,7 +77,7 @@ pub enum PendingKind {
 /// Discriminated union of pending approval requests.
 ///
 /// The variant determines which fields are meaningful:
-/// - `Elevation`: `argv` is required; `host`/`port`/`scheme`/`url` absent.
+/// - `Elevation`: `argv` is required. `host`/`port`/`scheme`/`url` absent.
 #[derive(Debug, Clone)]
 pub enum Pending {
     Elevation(PendingElevation),

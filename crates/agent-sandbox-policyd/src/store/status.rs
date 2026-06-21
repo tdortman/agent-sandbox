@@ -1,4 +1,4 @@
-//! Policy store — status.
+//! Policy store: status.
 
 use agent_sandbox_core::{PendingSummary, ProcessIds, SandboxPaths, StatusReply};
 

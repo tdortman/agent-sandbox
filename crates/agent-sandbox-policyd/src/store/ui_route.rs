@@ -103,7 +103,7 @@ fn request_owned_by_omp_pid(route: &UiRoute, omp_clients: &[&UiClient]) -> bool 
     })
 }
 
-/// Whether a pending request should be handled by a registered OMP UI (skip kdialog spawn).
+/// Whether a pending request should be handled by a registered OMP UI (skip standalone UI spawn).
 #[must_use]
 pub(crate) fn request_owned_by_omp(
     route: &UiRoute,

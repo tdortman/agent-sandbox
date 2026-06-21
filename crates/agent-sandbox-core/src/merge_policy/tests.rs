@@ -189,7 +189,7 @@ fn policy_json_one_rule_per_line_invariant() {
         json
     );
 
-    // Each rule line is a complete JSON object; commas belong to the parent array.
+    // Each rule line is a complete JSON object. Commas belong to the parent array.
     for line in &rule_lines {
         let object = line.trim_end_matches(',');
         let v: serde_json::Value = serde_json::from_str(object).unwrap();

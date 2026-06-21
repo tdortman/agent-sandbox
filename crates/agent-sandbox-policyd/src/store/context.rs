@@ -1,4 +1,4 @@
-//! Policy store — context.
+//! Policy store: context.
 
 use std::path::Path;
 

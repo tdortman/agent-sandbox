@@ -438,7 +438,6 @@ mod tests {
 
     #[test]
     fn no_bypass_dns_server_non_dns_port() {
-        // DNS server IP on port other than 53 still needs policy
         assert!(!is_bypass_traffic(DNS_IP, 443, DNS_IP));
     }
 

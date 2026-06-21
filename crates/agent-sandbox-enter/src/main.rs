@@ -24,13 +24,13 @@ fn die(msg: &str, err: &io::Error) -> ! {
 /// Drop caps granted to this wrapper so bubblewrap does not inherit them across exec.
 ///
 /// The NixOS wrapper uses file capabilities (`setuid = false`), so we only have
-/// `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` in the effective set — not `CAP_SETPCAP`.
-/// Clearing permitted/inheritable/bounding (`PR_CAPBSET_DROP`) would fail with EPERM;
+/// `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` in the effective set, not `CAP_SETPCAP`.
+/// Clearing permitted/inheritable/bounding (`PR_CAPBSET_DROP`) would fail with EPERM.
 /// exec replaces the image anyway. Ambient + effective must be cleared before execvp.
 fn drop_capabilities() -> io::Result<()> {
     caps::clear(None, CapSet::Effective).map_err(io::Error::other)?;
 
-    // SAFETY: `PR_CAP_AMBIENT` + `PR_CAP_AMBIENT_LOWER`; stop when the kernel returns EINVAL.
+    // SAFETY: `PR_CAP_AMBIENT` + `PR_CAP_AMBIENT_LOWER`. Stop when the kernel returns EINVAL.
     unsafe {
         for cap in 0_i32.. {
             if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_LOWER, cap, 0, 0) < 0 {

@@ -1,6 +1,6 @@
 //! Resolved approval scope: typestate after validating RPC context.
 //!
-//! Wire format uses [`ApprovalScope`] directly on requests; call [`ScopeTarget::resolve`]
+//! Wire format uses [`ApprovalScope`] directly on requests. Call [`ScopeTarget::resolve`]
 //! so session/global/project requirements are enforced once, in one place.
 
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ use crate::rpc::ApprovalScope;
 /// Where an approved/denied rule is stored after scope + context validation.
 #[derive(Debug, Clone)]
 pub enum ScopeTarget {
-    /// `once` — in-memory only for this policyd process.
+    /// `once`: in-memory only for this policyd process.
     Ephemeral,
     Session {
         session_id: String,

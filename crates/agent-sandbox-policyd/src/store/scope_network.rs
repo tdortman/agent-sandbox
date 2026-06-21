@@ -1,4 +1,4 @@
-//! Policy store — network scope application.
+//! Policy store: network scope application.
 
 use agent_sandbox_core::{
     ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,

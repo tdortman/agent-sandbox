@@ -1,4 +1,4 @@
-//! Policy store — filesystem scope application.
+//! Policy store: filesystem scope application.
 
 use agent_sandbox_core::{
     ApprovalScope, FilesystemRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget,

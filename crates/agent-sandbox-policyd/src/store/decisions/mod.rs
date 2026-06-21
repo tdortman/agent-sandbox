@@ -1,4 +1,4 @@
-//! Policy store — approve/deny pending decisions.
+//! Policy store: approve/deny pending decisions.
 
 mod approve;
 mod approve_host;

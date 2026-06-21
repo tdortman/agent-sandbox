@@ -1,4 +1,4 @@
-//! Policy store — ui.
+//! Policy store: ui.
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;

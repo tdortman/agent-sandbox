@@ -38,7 +38,7 @@ fn add_project_static_allow(static_allow: &mut Vec<FilesystemRule>, project_root
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
 
-    // Find the `--` separator; everything after is the real command.
+    // Find the `--` separator. Everything after is the real command.
     let sep_pos = args.iter().position(|a| a == "--");
     let real_args = if let Some(pos) = sep_pos {
         &args[pos + 1..]
@@ -85,7 +85,7 @@ fn main() {
             process::exit(1);
         });
 
-    // SAFETY: fs-arm is still single-threaded here; removing private environment
+    // SAFETY: fs-arm is still single-threaded here. Removing private environment
     // keys before exec cannot race another Rust thread reading environment.
     unsafe {
         std::env::remove_var("AGENT_SANDBOX_FS_STATIC_ALLOW");

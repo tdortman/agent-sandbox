@@ -1,4 +1,4 @@
-//! Policy store — access.
+//! Policy store: access.
 
 use std::collections::HashSet;
 

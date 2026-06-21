@@ -94,7 +94,7 @@ impl From<&SandboxPaths> for SessionContext {
     }
 }
 
-/// `pid` / `uid` from the wire or peer cred; `0` means unknown.
+/// `pid` / `uid` from the wire or peer cred. `0` means unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessIds {
     pub pid: u32,

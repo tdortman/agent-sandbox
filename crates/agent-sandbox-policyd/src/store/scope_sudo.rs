@@ -1,4 +1,4 @@
-//! Policy store — sudo scope application.
+//! Policy store: sudo scope application.
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 
