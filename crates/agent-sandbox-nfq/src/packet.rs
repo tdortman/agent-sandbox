@@ -4,6 +4,14 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Result of walking IPv6 extension headers: the transport protocol number
+/// and its offset within the packet (total extension header length + 40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6ExtResult {
+    pub protocol: u8,
+    pub transport_offset: usize,
+}
+
 /// Transport protocols enforced by the network policy daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportProtocol {
@@ -93,6 +101,69 @@ pub fn parse_ipv4(payload: &[u8]) -> Option<PacketMeta> {
         _ => None,
     }
 }
+/// Walk IPv6 extension headers to find the transport protocol and its total offset.
+///
+/// Recognised extension headers: Hop-by-Hop (0), Routing (43), Destination Options (60),
+/// Fragment (44, first-fragment only), Authentication Header (51).
+/// Returns `None` for No Next Header (59), ESP (50), unknown headers, truncated
+/// extension headers, and non-first fragments.
+fn walk_ipv6_ext_headers(payload: &[u8], packet_len: usize) -> Option<Ipv6ExtResult> {
+    let mut next_header = payload[6];
+    let mut offset = 40;
+
+    loop {
+        match next_header {
+            0 | 43 | 60 => {
+                // Hop-by-Hop (0), Routing (43), Destination Options (60)
+                // Format: Next Header (1) + Hdr Ext Len (1) + content
+                if offset + 2 > packet_len {
+                    return None;
+                }
+                let hdr_ext_len = usize::from(payload[offset + 1]);
+                let hdr_len = 8 + hdr_ext_len * 8;
+                if offset + hdr_len > packet_len {
+                    return None;
+                }
+                next_header = payload[offset];
+                offset += hdr_len;
+            }
+            44 => {
+                // Fragment header: fixed 8 bytes
+                if offset + 8 > packet_len {
+                    return None;
+                }
+                let frag_field = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+                let frag_offset = frag_field >> 3;
+                if frag_offset != 0 {
+                    return None; // Non-first fragment
+                }
+                next_header = payload[offset];
+                offset += 8;
+            }
+            51 => {
+                // Authentication Header
+                if offset + 2 > packet_len {
+                    return None;
+                }
+                let ah_len = usize::from(payload[offset + 1]);
+                let hdr_len = (ah_len + 2) * 4;
+                if offset + hdr_len > packet_len {
+                    return None;
+                }
+                next_header = payload[offset];
+                offset += hdr_len;
+            }
+            6 | 17 => {
+                return Some(Ipv6ExtResult {
+                    protocol: next_header,
+                    transport_offset: offset,
+                });
+            }
+            // No Next Header (59), ESP (50), or unknown
+            _ => return None,
+        }
+    }
+}
 
 /// Parse an IPv6 packet payload into source/destination IPs, ports, and TCP SYN flag.
 ///
@@ -113,19 +184,26 @@ pub fn parse_ipv6(payload: &[u8]) -> Option<PacketMeta> {
         return None;
     }
 
-    let next_header = payload[6];
-    let mut src_bytes = [0u8; 16];
-    let mut dst_bytes = [0u8; 16];
-    src_bytes.copy_from_slice(&payload[8..24]);
-    dst_bytes.copy_from_slice(&payload[24..40]);
+    let src_bytes = {
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&payload[8..24]);
+        b
+    };
+    let dst_bytes = {
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&payload[24..40]);
+        b
+    };
     let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
     let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
 
-    let ip_hdr_len = 40; // Fixed-length IPv6 header.
-    match next_header {
+    let ext = walk_ipv6_ext_headers(payload, packet_len)?;
+    let protocol = ext.protocol;
+    let ip_hdr_len = ext.transport_offset;
+    match protocol {
         6 => parse_tcp(&payload[..packet_len], ip_hdr_len, src_ip, dst_ip),
         17 => parse_udp(&payload[..packet_len], ip_hdr_len, src_ip, dst_ip),
-        _ => None,
+        _ => unreachable!(),
     }
 }
 
@@ -191,7 +269,12 @@ pub fn udp_payload<'a>(payload: &'a [u8], meta: &PacketMeta) -> Option<&'a [u8]>
         return None;
     }
     let ip_hdr_len = if meta.ip_version() == 6 {
-        40
+        if payload.len() < 40 {
+            return None;
+        }
+        let plen = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
+        let pkt_len = (40 + plen).min(payload.len());
+        walk_ipv6_ext_headers(payload, pkt_len).map(|ext| ext.transport_offset)?
     } else {
         if payload.len() < 20 {
             return None;
@@ -294,6 +377,70 @@ mod tests {
         pkt[24..40].copy_from_slice(&dst_ip);
         pkt[40..42].copy_from_slice(&src_port.to_be_bytes());
         pkt[42..44].copy_from_slice(&dst_port.to_be_bytes());
+        pkt
+    }
+
+    fn build_tcp_syn_v6_with_dest_opts(dst_ip: [u8; 16], dst_port: u16, src_port: u16) -> Vec<u8> {
+        // 40 IPv6 + 8 DestOpts + 20 TCP = 68 bytes
+        let mut pkt = vec![0_u8; 68];
+        pkt[0] = 0x60;
+        // Payload length = 8 DestOpts + 20 TCP = 28
+        pkt[4..6].copy_from_slice(&28_u16.to_be_bytes());
+        pkt[6] = 60; // Next header: Destination Options
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt[24..40].copy_from_slice(&dst_ip);
+        // Destination Options header at byte 40 (hdr_ext_len = 0 -> 8 bytes)
+        pkt[40] = 6; // Next header: TCP
+        pkt[41] = 0; // Hdr Ext Len
+        // TCP header at byte 48
+        pkt[48..50].copy_from_slice(&src_port.to_be_bytes());
+        pkt[50..52].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[60] = 0x50; // data offset = 5 words
+        pkt[61] = 0x02; // SYN flag
+        pkt
+    }
+
+    fn build_udp_v6_with_dest_opts_and_payload(
+        dst_ip: [u8; 16],
+        dst_port: u16,
+        src_port: u16,
+        udp_payload: &[u8],
+    ) -> Vec<u8> {
+        // 40 IPv6 + 8 DestOpts + 8 UDP + payload
+        let total = 56 + udp_payload.len();
+        let mut pkt = vec![0_u8; total];
+        let plen = 16 + udp_payload.len(); // 8 DestOpts + 8 UDP + payload
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&u16::try_from(plen).unwrap().to_be_bytes());
+        pkt[6] = 60; // Next header: Destination Options
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        pkt[24..40].copy_from_slice(&dst_ip);
+        // Destination Options header at byte 40
+        pkt[40] = 17; // Next header: UDP
+        pkt[41] = 0; // Hdr Ext Len
+        // UDP header at byte 48
+        pkt[48..50].copy_from_slice(&src_port.to_be_bytes());
+        pkt[50..52].copy_from_slice(&dst_port.to_be_bytes());
+        let udp_len = 8 + udp_payload.len();
+        pkt[52..54].copy_from_slice(&u16::try_from(udp_len).unwrap().to_be_bytes());
+        pkt[56..56 + udp_payload.len()].copy_from_slice(udp_payload);
+        pkt
+    }
+
+    fn build_ipv6_fragment(next_header: u8, frag_offset: u16, more_frags: bool) -> Vec<u8> {
+        // 40 IPv6 + 8 Fragment header = 48 bytes
+        let mut pkt = vec![0_u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8_u16.to_be_bytes()); // payload = 8 (fragment header only)
+        pkt[6] = 44; // Next header: Fragment
+        pkt[7] = 64;
+        // Fragment header at byte 40
+        pkt[40] = next_header;
+        // Fragment offset (13 bits) + More Fragments flag
+        let frag_field = (frag_offset << 3) | u16::from(more_frags);
+        pkt[42..44].copy_from_slice(&frag_field.to_be_bytes());
         pkt
     }
 
@@ -412,6 +559,43 @@ mod tests {
     fn parse_ipv6_non_tcp_udp_returns_none() {
         let mut pkt = build_tcp_syn_v6([0; 16], 80, 5000);
         pkt[6] = 58; // ICMPv6
+        assert!(parse_ipv6(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_ipv6_tcp_syn_behind_dest_opts_is_policy_boundary() {
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
+        ];
+        let pkt = build_tcp_syn_v6_with_dest_opts(dst, 443, 54321);
+        let meta = parse_ipv6(&pkt).expect("parse IPv6 with DestOpts");
+        assert_eq!(
+            meta.src_ip,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+        );
+        assert_eq!(
+            meta.dst_ip,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x20))
+        );
+        assert_eq!(meta.dst_port, 443);
+        assert_eq!(meta.src_port, 54321);
+        assert_eq!(meta.protocol, TransportProtocol::Tcp);
+        assert!(meta.tcp_syn);
+        assert!(meta.is_policy_boundary());
+    }
+
+    #[test]
+    fn parse_ipv6_udp_behind_dest_opts_returns_udp_payload() {
+        let dst = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let pkt = build_udp_v6_with_dest_opts_and_payload(dst, 53, 53000, b"testdata");
+        let meta = parse_ipv6(&pkt).expect("parse IPv6 UDP with DestOpts");
+        let data = udp_payload(&pkt, &meta).expect("udp_payload with DestOpts");
+        assert_eq!(data, b"testdata");
+    }
+
+    #[test]
+    fn parse_ipv6_non_first_fragment_returns_none() {
+        let pkt = build_ipv6_fragment(6, 1, false);
         assert!(parse_ipv6(&pkt).is_none());
     }
 

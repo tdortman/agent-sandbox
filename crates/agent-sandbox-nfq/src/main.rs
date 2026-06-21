@@ -13,7 +13,7 @@ use agent_sandbox_core::{
 };
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -158,17 +158,8 @@ fn open_queue(queue_num: u16, queue_len: u32) -> std::io::Result<Queue> {
 
 /// Whether a packet to the given destination should bypass policy checks entirely.
 fn is_bypass_traffic(dst_ip: IpAddr, dst_port: u16, dns_server_ip: IpAddr) -> bool {
-    // Loopback: 127.0.0.0/8 and ::1
-    match dst_ip {
-        IpAddr::V4(v4) if v4.octets()[0] == 127 => return true,
-        IpAddr::V6(v6) if v6 == Ipv6Addr::LOCALHOST => return true,
-        _ => {}
-    }
-    // DNS forwarder traffic on port 53
-    if dst_ip == dns_server_ip && dst_port == 53 {
-        return true;
-    }
-    false
+    // DNS forwarder traffic on port 53 only
+    dst_ip == dns_server_ip && dst_port == 53
 }
 
 /// Run the configured `nft` binary with the given args, returning the output.
@@ -376,7 +367,7 @@ fn handle_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -396,8 +387,8 @@ mod tests {
     }
 
     #[test]
-    fn bypass_loopback_127_0_0_1() {
-        assert!(is_bypass_traffic(
+    fn loopback_127_0_0_1_is_policy_bound() {
+        assert!(!is_bypass_traffic(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             80,
             DNS_IP
@@ -405,8 +396,8 @@ mod tests {
     }
 
     #[test]
-    fn bypass_loopback_any_port() {
-        assert!(is_bypass_traffic(
+    fn loopback_any_port_is_policy_bound() {
+        assert!(!is_bypass_traffic(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             8080,
             DNS_IP
@@ -414,8 +405,8 @@ mod tests {
     }
 
     #[test]
-    fn bypass_loopback_range_127_255_255_255() {
-        assert!(is_bypass_traffic(
+    fn loopback_range_127_255_255_255_is_policy_bound() {
+        assert!(!is_bypass_traffic(
             IpAddr::V4(Ipv4Addr::new(127, 255, 255, 255)),
             53,
             DNS_IP
@@ -423,12 +414,70 @@ mod tests {
     }
 
     #[test]
-    fn bypass_ipv6_loopback() {
-        assert!(is_bypass_traffic(
+    fn loopback_ipv6_is_policy_bound() {
+        assert!(!is_bypass_traffic(
             IpAddr::V6(Ipv6Addr::LOCALHOST),
             80,
             DNS_IP
         ));
+    }
+
+    #[test]
+    fn loopback_tcp_syn_invokes_policy_check() {
+        let mut state = state_for_tests();
+        state
+            .dns_cache
+            .remember_ephemeral("127.0.0.1", "localhost", 300);
+
+        let pkt = build_loopback_tcp_syn_packet();
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            1,
+            "loopback must go through policy check, not bypass"
+        );
+    }
+
+    #[test]
+    fn loopback_ipv6_tcp_syn_invokes_policy_check() {
+        let mut state = state_for_tests();
+        state.dns_cache.remember_ephemeral("::1", "localhost", 300);
+
+        let pkt = build_ipv6_loopback_tcp_syn_packet();
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            1,
+            "loopback IPv6 must go through policy check, not bypass"
+        );
     }
 
     #[test]
@@ -618,6 +667,41 @@ mod tests {
         pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
         pkt[24..26].copy_from_slice(&u16::try_from(udp_len).expect("udp length").to_be_bytes());
         pkt[28..28 + payload.len()].copy_from_slice(payload);
+        pkt
+    }
+
+    fn build_loopback_tcp_syn_packet() -> Vec<u8> {
+        let total_len: u16 = 40; // 20 IP + 20 TCP
+        let mut pkt = vec![0_u8; usize::from(total_len)];
+        pkt[0] = 0x45; // IPv4, IHL=5
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // src_ip
+        pkt[16..20].copy_from_slice(&[127, 0, 0, 1]); // dst_ip = loopback
+        pkt[20..22].copy_from_slice(&50000_u16.to_be_bytes()); // src_port
+        pkt[22..24].copy_from_slice(&80_u16.to_be_bytes()); // dst_port
+        pkt[32] = 0x50; // data offset = 5 (20 bytes) << 4
+        pkt[33] = 0x02; // SYN flag
+        pkt
+    }
+
+    fn build_ipv6_loopback_tcp_syn_packet() -> Vec<u8> {
+        // IPv6 header (40 bytes) + TCP header (20 bytes) = 60 bytes
+        let total_len: u16 = 60;
+        let mut pkt = vec![0_u8; usize::from(total_len)];
+        pkt[0] = 0x60; // IPv6, version=6, traffic class=0, flow label=0
+        // payload length: TCP header 20 bytes
+        pkt[4..6].copy_from_slice(&20_u16.to_be_bytes());
+        pkt[6] = 6; // next header = TCP
+        pkt[7] = 64; // hop limit
+        // src_ip = ::1 (loopback)
+        pkt[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        // dst_ip = ::1 (loopback)
+        pkt[24..40].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt[40..42].copy_from_slice(&50001_u16.to_be_bytes()); // src_port
+        pkt[42..44].copy_from_slice(&443_u16.to_be_bytes()); // dst_port
+        pkt[52] = 0x50; // data offset = 5
+        pkt[53] = 0x02; // SYN flag
         pkt
     }
 

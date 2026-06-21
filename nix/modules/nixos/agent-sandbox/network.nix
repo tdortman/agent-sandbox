@@ -47,8 +47,8 @@ let
   # There is no allow fast-path. NFQUEUE handles policy-bound TCP SYN and
   # UDP packets. Denied destinations get a short reject-set entry only so
   # client calls fail quickly instead of retrying until TCP timeout.
-  # Loopback, established/related conntrack entries, DNS traffic to the
-  # forwarder, and transient reject entries bypass NFQUEUE.
+  # Established/related conntrack entries, DNS traffic to the forwarder,
+  # and transient reject entries bypass NFQUEUE.
   nftRules = ''
     table inet agent_sandbox {
       # Transient reject sets for denied destinations.
@@ -71,11 +71,9 @@ let
       chain output {
         type filter hook output priority 0; policy drop;
         ct state established,related accept
-        # Loopback and DNS traffic to the forwarder bypass NFQUEUE
-        ip daddr 127.0.0.0/8 accept
+        # DNS traffic to the forwarder bypasses NFQUEUE
         ip daddr ${cfg.hostIp} udp dport 53 accept
         ip daddr ${cfg.hostIp} tcp dport 53 accept
-        ip6 daddr ::1 accept
         ip6 daddr ${cfg.hostIp6} udp dport 53 accept
         ip6 daddr ${cfg.hostIp6} tcp dport 53 accept
         # ICMPv6 is required for NDP (neighbor discovery). Without it,
@@ -89,8 +87,8 @@ let
         # Queue TCP SYN and UDP for policy enforcement
         ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
         ip protocol udp queue num ${toString cfg.queueNumber}
-        ip6 nexthdr tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
-        ip6 nexthdr udp queue num ${toString cfg.queueNumber}
+        meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
+        meta nfproto ipv6 meta l4proto udp queue num ${toString cfg.queueNumber}
       }
     }
   '';
