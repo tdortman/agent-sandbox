@@ -19,6 +19,11 @@ pkgs.mkShell {
   ];
 
   env = {
-    CPATH = "${pkgs.qt6.qtbase.out}/include:${pkgs.qt6.qtbase.out}/include/QtWidgets";
+    CPATH =
+      "${pkgs.qt6.qtbase.out}/include"
+      + ":"
+      + "${pkgs.qt6.qtbase.out}/include/QtWidgets"
+      + ":"
+      + "${pkgs.nodejs}/include/node";
   };
 }
