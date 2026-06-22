@@ -94,10 +94,12 @@ Rules merge from lowest to highest priority:
 
 1. **NixOS configuration:** `agent-sandbox.network.declarativeAllow` and `agent-sandbox.network.declarativeDeny` options.
 2. **User policy:** `~/.config/agent-sandbox/policy.json`.
-3. **Project policy:** `.agent-sandbox/policy.json` discovered by climbing parent directories from the current working directory.
+3. **Trusted project policy:** `~/.config/agent-sandbox/projects/<encoded-project-root>/policy.json`.
 4. **Runtime session decisions:** approvals and denials recorded in memory (scopes `once` and `session`).
 
-Later layers win on duplicate keys.
+`<encoded-project-root>` keeps simple roots readable (`/home/user/dotfiles` becomes `home-user-dotfiles`). Spaces become `-`. Literal `-` and uncommon bytes are escaped as `~xx`. Ambiguous roots get a stable hash suffix to avoid practical slug collisions.
+
+Denies win across all layers: a deny rule removes any matching allow rule, so a higher-priority policy cannot re-allow a previously denied target.
 
 ## NixOS setup
 
@@ -145,12 +147,12 @@ agent-sandbox-approve deny <id> [scope]                        deny a request (d
 
 Scopes control how long the decision persists.
 
-| Scope     | Persistence                                                  |
-| --------- | ------------------------------------------------------------ |
-| `once`    | In-memory only for this policyd process.                     |
-| `session` | Bound to the sandbox session ID. Stored in policyd memory.   |
-| `project` | Written to `.agent-sandbox/policy.json` in the project root. |
-| `global`  | Written to `~/.config/agent-sandbox/policy.json`.            |
+| Scope     | Persistence                                                                       |
+| --------- | --------------------------------------------------------------------------------- |
+| `once`    | In-memory only for this policyd process.                                          |
+| `session` | Bound to the sandbox session ID. Stored in policyd memory.                        |
+| `project` | Written to `~/.config/agent-sandbox/projects/<encoded-project-root>/policy.json`. |
+| `global`  | Written to `~/.config/agent-sandbox/policy.json`.                                 |
 
 Each subcommand accepts `--home`, `--cwd`, and `--project-root` to override path resolution. `approve` and `approve-host` also accept `--session-id`.
 
