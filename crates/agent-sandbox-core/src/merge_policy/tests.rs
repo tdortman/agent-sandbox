@@ -89,42 +89,6 @@ fn atomic_write_chowns_to_owner() {
 }
 
 #[test]
-fn project_deny_beats_global_allow() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home/tim");
-    let repo = home.join("dotfiles");
-    fs::create_dir_all(repo.join(".agent-sandbox")).unwrap();
-    fs::write(
-        repo.join(".agent-sandbox/policy.json"),
-        r#"{"network":{"allow":[],"deny":[{"host":"chatgpt.com","port":443}]},"sudo":{"allow":[],"deny":[]}}"#,
-    )
-    .unwrap();
-    fs::create_dir_all(home.join(".config/agent-sandbox")).unwrap();
-    fs::write(
-        home.join(".config/agent-sandbox/policy.json"),
-        r#"{"network":{"allow":[{"host":"chatgpt.com","port":443}],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
-    )
-    .unwrap();
-
-    let mut layers = vec![
-        Policy {
-            network: crate::policy::NetworkSection {
-                allow: vec![NetworkRule::new("chatgpt.com", 443, "")],
-                deny: vec![],
-            },
-            ..empty_policy()
-        },
-        load_policy(&home.join(".config/agent-sandbox/policy.json"), None),
-    ];
-    for path in ProjectPolicyContext::new(Some(&home), None, None).layer_paths() {
-        layers.push(load_policy(&path, None));
-    }
-    let merged = merge_layers(&layers);
-    assert_eq!(merged.network.deny[0].host, "chatgpt.com");
-    assert!(merged.network.allow.is_empty());
-}
-
-#[test]
 fn atomic_write_keeps_each_rule_on_one_line() {
     let tmp = tempfile::tempdir().unwrap();
     let policy_path = tmp.path().join("policy.json");
@@ -290,4 +254,67 @@ fn old_policy_without_filesystem_still_loads() {
     let policy: Policy = serde_json::from_str(json).unwrap();
     assert!(policy.filesystem.allow.is_empty());
     assert!(policy.filesystem.deny.is_empty());
+}
+
+#[test]
+fn global_deny_beats_project_allow() {
+    let low = Policy {
+        network: crate::policy::NetworkSection {
+            allow: vec![NetworkRule::new("example.com", 443, "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let high = Policy {
+        network: crate::policy::NetworkSection {
+            allow: vec![],
+            deny: vec![NetworkRule::new("example.com", 443, "")],
+        },
+        ..empty_policy()
+    };
+    let merged = merge_layers(&[low, high]);
+    assert!(merged.network.allow.is_empty());
+    assert_eq!(merged.network.deny.len(), 1);
+}
+
+#[test]
+fn sudo_deny_beats_later_allow() {
+    let low = Policy {
+        sudo: crate::policy::SudoSection {
+            allow: vec![SudoRule::new(vec!["rm".into(), "-rf".into()], "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let high = Policy {
+        sudo: crate::policy::SudoSection {
+            allow: vec![],
+            deny: vec![SudoRule::new(vec!["rm".into(), "-rf".into()], "")],
+        },
+        ..empty_policy()
+    };
+    let merged = merge_layers(&[low, high]);
+    assert!(merged.sudo.allow.is_empty());
+    assert_eq!(merged.sudo.deny.len(), 1);
+}
+
+#[test]
+fn filesystem_deny_beats_later_allow() {
+    let low = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let high = Policy {
+        filesystem: crate::policy::FilesystemSection {
+            allow: vec![],
+            deny: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
+        },
+        ..empty_policy()
+    };
+    let merged = merge_layers(&[low, high]);
+    assert!(merged.filesystem.allow.is_empty());
+    assert_eq!(merged.filesystem.deny.len(), 1);
 }

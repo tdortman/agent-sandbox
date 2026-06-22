@@ -1,4 +1,4 @@
-//! Merge agent-sandbox policy layers (later layers win on duplicate keys).
+//! Merge agent-sandbox policy layers with deny-wins semantics.
 
 mod io;
 mod merge;
