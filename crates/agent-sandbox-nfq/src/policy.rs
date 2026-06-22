@@ -99,12 +99,12 @@ mod tests {
 
     #[test]
     fn request_context_preserves_sandbox_session_id() {
-        let paths = SandboxPaths::new("/work", "/home/tim", "/work");
+        let paths = SandboxPaths::new("/work", "/home/user", "/work");
         let ctx = request_context(&paths, ProcessIds::new(0, 1000), Some("s1".into()));
 
         assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
         assert_eq!(ctx.cwd.as_deref(), Some("/work"));
-        assert_eq!(ctx.home.as_deref(), Some("/home/tim"));
+        assert_eq!(ctx.home.as_deref(), Some("/home/user"));
         assert_eq!(ctx.project_root.as_deref(), Some("/work"));
     }
 }

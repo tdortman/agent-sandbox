@@ -298,7 +298,7 @@ mod tests {
                 ui_client: Some("omp".into()),
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
-                    home: Some("/home/tim".into()),
+                    home: Some("/home/user".into()),
                     project_root: Some("/workspace".into()),
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
@@ -320,7 +320,7 @@ mod tests {
                 url: Some("tcp://example.com:443".into()),
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
-                    home: Some("/home/tim".into()),
+                    home: Some("/home/user".into()),
                     project_root: Some("/workspace".into()),
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
@@ -373,7 +373,7 @@ mod tests {
                 ui_client: Some("omp".into()),
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
-                    home: Some("/home/tim".into()),
+                    home: Some("/home/user".into()),
                     project_root: Some("/workspace".into()),
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
@@ -391,7 +391,7 @@ mod tests {
                 argv: vec!["whoami".into()],
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
-                    home: Some("/home/tim".into()),
+                    home: Some("/home/user".into()),
                     project_root: Some("/workspace".into()),
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
