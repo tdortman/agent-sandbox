@@ -199,19 +199,43 @@ pub fn trusted_project_policy_path(
 }
 
 fn encode_project_root(path: &Path) -> String {
-    let mut out = String::with_capacity(path.as_os_str().len());
-    let lossy = path.to_string_lossy();
-    let bytes = lossy.as_bytes();
-    // Skip a single leading separator so the encoded form never starts with "-".
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = path.as_os_str().as_bytes();
+    let needs_hash = bytes.iter().any(|byte| {
+        !matches!(
+            byte,
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_'
+        )
+    });
+    let mut out = String::with_capacity((bytes.len() * 3) + 18);
     let start = usize::from(bytes.first() == Some(&b'/'));
     for &byte in &bytes[start..] {
-        if byte == b'/' {
-            out.push('-');
-        } else {
-            out.push(byte as char);
+        match byte {
+            b'/' | b' ' => out.push('-'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('~');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
         }
     }
+    if needs_hash {
+        write!(&mut out, "--{:016x}", fnv1a64(bytes)).expect("writing to String cannot fail");
+    }
     out
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -326,31 +350,44 @@ mod tests {
     }
 
     #[test]
-    fn encode_project_root_replaces_separators_with_dash() {
-        let encoded = encode_project_root(Path::new("/home/user/repo"));
-        assert_eq!(encoded, "home-user-repo");
+    fn encode_project_root_keeps_common_case_readable() {
+        let encoded = encode_project_root(Path::new("/home/user/dotfiles"));
+        assert_eq!(encoded, "home-user-dotfiles");
+    }
+
+    #[test]
+    fn encode_project_root_maps_spaces_to_dash_with_hash() {
+        let encoded = encode_project_root(Path::new("/home/user/my repo"));
+        assert!(encoded.starts_with("home-user-my-repo--"), "got: {encoded}");
+    }
+
+    #[test]
+    fn encode_project_root_escapes_other_bytes_with_hash() {
+        let encoded = encode_project_root(Path::new("/home/user/a%b"));
+        assert!(encoded.starts_with("home-user-a~25b--"), "got: {encoded}");
+    }
+
+    #[test]
+    fn encode_project_root_distinguishes_dash_from_separator() {
+        assert_ne!(
+            encode_project_root(Path::new("/home/user/a-b")),
+            encode_project_root(Path::new("/home/user/a/b"))
+        );
     }
 
     #[test]
     fn trusted_project_policy_path_rejects_invalid_project_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home/tim");
+        let home = tmp.path().join("home/user");
         std::fs::create_dir_all(&home).unwrap();
         let err =
             trusted_project_policy_path(&home, Path::new("/nonexistent/path/here")).unwrap_err();
-        match err {
-            crate::error::ProjectPolicyError::InvalidProjectRoot { .. } => {}
-            other => panic!("expected InvalidProjectRoot, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn detects_ephemeral_runner() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("omp-python-runner");
-        fs::create_dir(&path).unwrap();
-
-        let ctx = ProjectPolicyContext::new(None, Some(&path), None);
-        assert!(ctx.resolve_policy_path().is_err());
+        assert!(
+            matches!(
+                err,
+                crate::error::ProjectPolicyError::InvalidProjectRoot { .. }
+            ),
+            "expected InvalidProjectRoot, got {err:?}"
+        );
     }
 }

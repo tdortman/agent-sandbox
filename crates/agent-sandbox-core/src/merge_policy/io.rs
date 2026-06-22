@@ -260,15 +260,15 @@ mod tests {
     #[test]
     fn project_policy_chown_includes_projects_directory() {
         let path =
-            Path::new("/home/user/.config/agent-sandbox/projects/-home-user-repo/policy.json");
+            Path::new("/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json");
         let paths = policy_chown_paths(path);
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/home/user/.config/agent-sandbox/projects/-home-user-repo"),
+                PathBuf::from("/home/user/.config/agent-sandbox/projects/home-user-repo"),
                 PathBuf::from("/home/user/.config/agent-sandbox/projects"),
                 PathBuf::from(
-                    "/home/user/.config/agent-sandbox/projects/-home-user-repo/policy.json",
+                    "/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json",
                 ),
             ]
         );
