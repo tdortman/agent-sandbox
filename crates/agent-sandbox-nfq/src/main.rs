@@ -257,24 +257,25 @@ where
         return Verdict::Drop;
     };
 
-    // UDP DNS responses: cache hostname mappings from the response and accept.
-    if meta.protocol == packet::TransportProtocol::Udp && meta.src_port == 53 {
-        if let Some(udp_data) = packet::udp_payload(payload, &meta) {
-            let mappings = mappings_from_response(udp_data);
-            for m in &mappings {
-                state
-                    .dns_cache
-                    .remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
-            }
-            if !mappings.is_empty() {
-                debug!(count = mappings.len(), "cached DNS response mappings");
-            }
+    // UDP DNS responses: cache hostname mappings from the response and accept
+    // only when the source is the configured forwarder. Responses from any
+    // other source fall through to the policy-boundary path. A forged UDP/53
+    // response from a non-forwarder source must not poison the IP->hostname
+    // cache.
+    if meta.protocol == packet::TransportProtocol::Udp
+        && meta.src_port == 53
+        && meta.src_ip == state.dns_server_ip
+        && let Some(udp_data) = packet::udp_payload(payload, &meta)
+    {
+        let mappings = mappings_from_response(udp_data);
+        for m in &mappings {
+            state
+                .dns_cache
+                .remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
         }
-        return Verdict::Accept;
-    }
-
-    // DNS queries: accept without prompting.
-    if meta.protocol == packet::TransportProtocol::Udp && meta.dst_port == 53 {
+        if !mappings.is_empty() {
+            debug!(count = mappings.len(), "cached DNS response mappings");
+        }
         return Verdict::Accept;
     }
 
@@ -590,7 +591,7 @@ mod tests {
         assert_eq!(v, Verdict::Drop);
     }
 
-    fn build_dns_response_packet() -> Vec<u8> {
+    fn build_dns_response_packet(src_ip: [u8; 4]) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new();
         message
@@ -613,7 +614,7 @@ mod tests {
                 .to_be_bytes(),
         );
         pkt[9] = 17; // UDP
-        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // src_ip
+        pkt[12..16].copy_from_slice(&src_ip); // src_ip
         pkt[16..20].copy_from_slice(&[10, 0, 0, 1]); // dst_ip
         pkt[20..22].copy_from_slice(&53_u16.to_be_bytes()); // src_port=53 (DNS response)
         pkt[22..24].copy_from_slice(&53000_u16.to_be_bytes()); // dst_port
@@ -622,7 +623,7 @@ mod tests {
         pkt
     }
 
-    fn build_dns_query_packet() -> Vec<u8> {
+    fn build_dns_query_packet(dst_ip: [u8; 4]) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new();
         message
@@ -641,7 +642,7 @@ mod tests {
         );
         pkt[9] = 17; // UDP
         pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // src_ip
-        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]); // dst_ip=8.8.8.8
+        pkt[16..20].copy_from_slice(&dst_ip); // dst_ip
         pkt[20..22].copy_from_slice(&43000_u16.to_be_bytes()); // src_port
         pkt[22..24].copy_from_slice(&53_u16.to_be_bytes()); // dst_port=53 (DNS query)
         pkt[24..26].copy_from_slice(&u16::try_from(udp_len).expect("udp length").to_be_bytes());
@@ -708,7 +709,7 @@ mod tests {
     #[test]
     fn dns_response_caches_hostname_mapping() {
         let mut state = state_for_tests();
-        let pkt = build_dns_response_packet();
+        let pkt = build_dns_response_packet([169, 254, 100, 1]);
 
         let meta = packet::parse_ipv4(&pkt).expect("parse IPv4");
         assert_eq!(meta.protocol, packet::TransportProtocol::Udp);
@@ -773,7 +774,7 @@ mod tests {
                 .to_be_bytes(),
         );
         pkt[9] = 17; // UDP
-        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // src_ip
+        pkt[12..16].copy_from_slice(&[169, 254, 100, 1]); // src_ip
         pkt[16..20].copy_from_slice(&[10, 0, 0, 1]); // dst_ip
         pkt[20..22].copy_from_slice(&53_u16.to_be_bytes()); // src_port=53 (DNS response)
         pkt[22..24].copy_from_slice(&53000_u16.to_be_bytes()); // dst_port
@@ -793,7 +794,7 @@ mod tests {
 
     #[test]
     fn dns_dst_port_53_is_parseable_as_dns_query() {
-        let pkt = build_dns_query_packet();
+        let pkt = build_dns_query_packet([8, 8, 8, 8]);
         let meta = packet::parse_ipv4(&pkt).expect("parse IPv4");
         assert_eq!(meta.protocol, packet::TransportProtocol::Udp);
         assert_eq!(meta.dst_port, 53);
@@ -855,5 +856,143 @@ mod tests {
             Some("example.com")
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn forged_dns_response_from_wrong_src_ip_does_not_cache_mapping() {
+        let mut state = state_for_tests();
+        let pkt = build_dns_response_packet([10, 0, 0, 2]);
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            1,
+            "forged DNS response must invoke the policy check"
+        );
+        assert!(
+            state.dns_cache.lookup("93.184.216.34").is_none(),
+            "forged DNS response must not populate the cache"
+        );
+    }
+
+    #[test]
+    fn dns_response_from_forwarder_caches_mapping() {
+        let mut state = state_for_tests();
+        let pkt = build_dns_response_packet([169, 254, 100, 1]);
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            0,
+            "legitimate forwarder response must not invoke policy check"
+        );
+        assert_eq!(
+            state.dns_cache.lookup("93.184.216.34").as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn udp_53_to_non_forwarder_invokes_policy_check() {
+        let mut state = state_for_tests();
+        let pkt = build_dns_query_packet([8, 8, 8, 8]);
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            1,
+            "UDP/53 to non-forwarder must invoke policy check"
+        );
+    }
+
+    #[test]
+    fn udp_53_to_forwarder_bypasses_policy_check() {
+        let mut state = state_for_tests();
+        let pkt = build_dns_query_packet([169, 254, 100, 1]);
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            0,
+            "UDP/53 to forwarder must bypass policy check"
+        );
+    }
+
+    #[test]
+    fn loopback_udp_53_invokes_policy_check() {
+        let mut state = state_for_tests();
+        let pkt = build_dns_query_packet([127, 0, 0, 1]);
+
+        let call_count = std::cell::Cell::new(0u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: Duration| {
+            call_count.set(call_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            call_count.get(),
+            1,
+            "UDP/53 to loopback must invoke policy check"
+        );
     }
 }

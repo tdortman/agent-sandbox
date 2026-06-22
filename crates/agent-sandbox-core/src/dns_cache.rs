@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
-pub const DEFAULT_MAX_TTL: u32 = 600;
+pub const DEFAULT_MAX_TTL: u32 = 60;
+pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
@@ -29,14 +30,29 @@ struct LiveCacheEntry {
 pub struct DnsCache {
     path: Option<PathBuf>,
     max_ttl: u32,
+    max_entries: usize,
     entries: HashMap<String, LiveCacheEntry>,
 }
-
 impl DnsCache {
     pub fn new(path: Option<impl AsRef<Path>>, max_ttl: u32) -> Self {
         Self {
             path: path.map(|p| p.as_ref().to_path_buf()),
             max_ttl: max_ttl.max(1),
+            max_entries: DEFAULT_MAX_ENTRIES.max(1),
+            entries: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_max_entries(
+        path: Option<impl AsRef<Path>>,
+        max_ttl: u32,
+        max_entries: usize,
+    ) -> Self {
+        Self {
+            path: path.map(|p| p.as_ref().to_path_buf()),
+            max_ttl: max_ttl.max(1),
+            max_entries: max_entries.max(1),
             entries: HashMap::new(),
         }
     }
@@ -64,13 +80,34 @@ impl DnsCache {
             return;
         }
         let ttl = ttl.clamp(1, self.max_ttl);
+        let now = Instant::now();
+        self.prune_expired(now);
         self.entries.insert(
             ip.to_string(),
             LiveCacheEntry {
                 host,
-                expires: Instant::now() + Duration::from_secs(u64::from(ttl)),
+                expires: now + Duration::from_secs(u64::from(ttl)),
             },
         );
+        self.enforce_max_entries();
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| entry.expires > now);
+    }
+
+    fn enforce_max_entries(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some(oldest_ip) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(ip, _)| ip.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest_ip);
+        }
     }
 
     pub fn lookup(&self, ip: &str) -> Option<String> {
@@ -187,6 +224,7 @@ pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{CacheFile, DnsCache, unix_now};
+    use std::time::Duration;
 
     #[test]
     fn persisted_cache_uses_wall_clock_expiry() {
@@ -308,5 +346,34 @@ mod tests {
             file.entries.get("192.168.1.2").map(|e| &*e.host),
             Some("host-b.example")
         );
+    }
+
+    #[test]
+    fn default_max_ttl_is_short_for_rebinding() {
+        assert_eq!(super::DEFAULT_MAX_TTL, 60);
+    }
+
+    #[test]
+    fn expired_entries_removed_on_next_insert() {
+        let mut cache = DnsCache::new_with_max_entries(None::<std::path::PathBuf>, 1, 10);
+        cache.remember_ephemeral("10.0.0.1", "first.example", 1);
+        cache.remember_ephemeral("10.0.0.2", "second.example", 1);
+        assert_eq!(cache.entries.len(), 2);
+        std::thread::sleep(Duration::from_millis(1_100));
+        cache.remember_ephemeral("10.0.0.3", "third.example", 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.lookup("10.0.0.3").is_some());
+    }
+
+    #[test]
+    fn bounded_cache_evicts_earliest_expiring_entries() {
+        let mut cache = DnsCache::new_with_max_entries(None::<std::path::PathBuf>, 300, 3);
+        cache.remember_ephemeral("10.0.0.1", "first.example", 60);
+        cache.remember_ephemeral("10.0.0.2", "second.example", 120);
+        cache.remember_ephemeral("10.0.0.3", "third.example", 180);
+        cache.remember_ephemeral("10.0.0.4", "fourth.example", 240);
+        assert_eq!(cache.entries.len(), 3);
+        assert!(cache.lookup("10.0.0.1").is_none());
+        assert!(cache.lookup("10.0.0.4").is_some());
     }
 }
