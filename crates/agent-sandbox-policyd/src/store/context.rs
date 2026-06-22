@@ -83,9 +83,9 @@ impl PolicyStore {
     /// 3. The trusted per-project policy file under
     ///    `home/.config/agent-sandbox/projects/<encoded>/policy.json`
     ///    when both `home` and `project_root` are known.
-    /// 4. Repo-local `.agent-sandbox/policy.json` files. These are treated
-    ///    as untrusted: their `allow` arrays are cleared before merging so
-    ///    they can only narrow the visible policy via their `deny` arrays.
+    ///
+    /// Layers are merged with deny-wins semantics: any non-empty `deny`
+    /// rule shadows the corresponding `allow` rule across the merged set.
     pub async fn merged_for(&self, ctx: MergeContext) -> Policy {
         let ctx = self.resolve_context(ctx).await;
         let home_path = ctx.paths.home().map(Path::new);
@@ -104,17 +104,6 @@ impl PolicyStore {
             {
                 layers.push(load_policy(&trusted, home_str));
             }
-        }
-        let project_ctx =
-            ProjectPolicyContext::new(home_path, ctx.paths.cwd().map(Path::new), project_root_path);
-        for path in project_ctx.layer_paths() {
-            let mut policy = load_policy(&path, home_str);
-            // Repo-local policies are untrusted. Clear allow lists so they
-            // can only constrain via deny rules.
-            policy.network.allow.clear();
-            policy.sudo.allow.clear();
-            policy.filesystem.allow.clear();
-            layers.push(policy);
         }
         merge_layers(&layers)
     }

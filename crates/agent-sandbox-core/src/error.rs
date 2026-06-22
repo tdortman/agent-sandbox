@@ -8,16 +8,6 @@ use thiserror::Error;
 pub enum ProjectPolicyError {
     #[error("invalid project_root ({path:?}); set AGENT_SANDBOX_PROJECT_ROOT to the git root")]
     InvalidProjectRoot { path: PathBuf },
-    #[error("cannot resolve project policy from cwd ({path:?}); set AGENT_SANDBOX_PROJECT_ROOT")]
-    InvalidCwd { path: PathBuf },
-    #[error(
-        "cannot resolve project policy path from ephemeral cwd ({path:?}); set AGENT_SANDBOX_PROJECT_ROOT"
-    )]
-    EphemeralCwd { path: PathBuf },
-    #[error(
-        "cannot resolve project policy path (set AGENT_SANDBOX_PROJECT_ROOT or run the agent from a git checkout)"
-    )]
-    MissingContext,
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

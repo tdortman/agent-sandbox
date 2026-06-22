@@ -356,15 +356,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_policy_allow_is_ignored_deny_still_applies() {
-        // Repo-local allow rules are no longer honored: a sandboxed process cannot
-        // grant itself network access. A repo-local deny rule still applies.
+    async fn trusted_project_policy_deny_applies() {
+        // The trusted per-project policy file lives under
+        // `home/.config/agent-sandbox/projects/<encoded>/policy.json`. A deny
+        // rule there is honored by the merged policy.
         let dir = tempfile::tempdir().unwrap();
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
-        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
-        let policy_path = project_root.join(".agent-sandbox/policy.json");
+        let policy_path =
+            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).unwrap();
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -397,11 +399,8 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(
-            !store
-                .is_allowed("34.230.40.69", 443, ctx.clone(), false)
-                .await
-        );
+        assert!(store.policy_denied("34.230.40.69", 443, ctx.clone()).await);
+        assert!(!store.is_allowed("34.230.40.69", 443, ctx, false).await);
     }
 
     #[test]
@@ -421,14 +420,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_policy_ipv6_deny_still_applies() {
-        // Repo-local allow rules are ignored. The deny rule still applies.
+    async fn trusted_project_policy_ipv6_deny_applies() {
+        // IPv6 deny rules in the trusted per-project policy file apply.
         let dir = tempfile::tempdir().unwrap();
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
-        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
-        let policy_path = project_root.join(".agent-sandbox/policy.json");
+        let policy_path =
+            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).unwrap();
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -461,11 +461,8 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(
-            !store
-                .is_allowed("2001:db8::1", 443, ctx.clone(), false)
-                .await
-        );
+        assert!(store.policy_denied("2001:db8::1", 443, ctx.clone()).await);
+        assert!(!store.is_allowed("2001:db8::1", 443, ctx, false).await);
     }
 
     #[test]
@@ -480,16 +477,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_policy_deny_persists_after_reload() {
-        // Repo-local deny rules are read into the merged policy. Removing the
-        // deny rule (replacing with an empty policy) should re-allow the
-        // destination the next time the policy is merged.
+    async fn trusted_project_policy_deny_persists_after_reload() {
+        // Deny rules in the trusted per-project policy file are picked up on
+        // every merge. Rewriting the file with an empty policy removes the
+        // deny rule the next time the policy is merged.
         let dir = tempfile::tempdir().unwrap();
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
-        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
-        let policy_path = project_root.join(".agent-sandbox/policy.json");
+        let policy_path =
+            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).unwrap();
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -522,6 +520,7 @@ mod tests {
             sandbox_session_id: None,
         };
 
+        assert!(store.policy_denied("example.com", 443, ctx.clone()).await);
         assert!(
             !store
                 .is_allowed("example.com", 443, ctx.clone(), false)
@@ -534,6 +533,63 @@ mod tests {
         // The merged policy is computed on every call, so removing the deny rule
         // from disk takes effect immediately.
         assert!(!store.policy_denied("example.com", 443, ctx).await);
+    }
+
+    #[tokio::test]
+    async fn repo_local_policy_deny_is_ignored() {
+        // A repo-local `.agent-sandbox/policy.json` file is not loaded by the
+        // policy daemon, even when it contains a deny rule. The trusted
+        // per-project policy file under
+        // `home/.config/agent-sandbox/projects/<encoded>/policy.json` is the
+        // only project-scoped policy input; when it is absent, the deny rule
+        // must not affect the merged policy.
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let policy_path = project_root.join(".agent-sandbox/policy.json");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .network
+            .deny
+            .push(agent_sandbox_core::NetworkRule::new(
+                "34.230.40.*",
+                443,
+                "test",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).unwrap();
+
+        // Sanity check: the trusted project policy file does not exist, so
+        // the deny rule from the repo-local file is the only candidate.
+        let trusted_path =
+            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).unwrap();
+        assert!(!trusted_path.exists());
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+        });
+
+        let project_root = project_root.to_string_lossy().into_owned();
+        let home = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        // The repo-local deny rule must not be applied: policy_denied returns
+        // false because the merged policy has no deny entries.
+        assert!(!store.policy_denied("34.230.40.69", 443, ctx.clone()).await);
     }
 
     #[tokio::test]
