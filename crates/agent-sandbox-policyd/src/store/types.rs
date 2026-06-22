@@ -10,6 +10,23 @@ use agent_sandbox_core::{
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
+
+/// Hard cap on the number of pending approval requests held in memory.
+/// Beyond this cap new prompts are blocked instead of being added.
+pub(crate) const MAX_PENDING_APPROVALS: usize = 512;
+
+/// Hard cap on the number of waiters that may join a single pending request.
+/// Beyond this cap extra waiters are blocked instead of being queued.
+pub(crate) const MAX_WAITERS_PER_PENDING: usize = 64;
+
+/// Hard cap on the size of the verdict caches. Older entries are evicted
+/// (by `time` for the verdict cache, by `Instant` for the spawn throttle
+/// map) when the cap is exceeded.
+pub(crate) const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
+
+/// Cap on the number of static filesystem allow rules accepted by fsmon.
+pub(crate) const MAX_STATIC_ALLOW_RULES: usize = 4096;
+
 /// Key for the network verdict cache: hostname and port.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct NetworkVerdictKey {
@@ -30,6 +47,23 @@ pub(crate) struct VerdictEntry {
     pub allowed: bool,
     pub source: String,
     pub time: Instant,
+}
+
+/// Evict the oldest entries (by `VerdictEntry.time`) from a verdict cache
+/// until the map is within the global cap.
+pub(crate) fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
+    map: &mut HashMap<K, VerdictEntry>,
+) {
+    while map.len() > MAX_VERDICT_CACHE_ENTRIES {
+        let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, entry)| entry.time)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest_key);
+    }
 }
 
 pub(crate) static CLIENT_ID: AtomicU64 = AtomicU64::new(1);

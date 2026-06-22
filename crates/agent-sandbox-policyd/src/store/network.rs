@@ -11,7 +11,8 @@ use crate::spawn::maybe_spawn_ui;
 use crate::wire::{MergeContext, NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
 use super::types::{
-    NetworkVerdictKey, Pending, PendingKind, PendingNetwork, PolicyStore, VerdictEntry,
+    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkVerdictKey, Pending, PendingKind,
+    PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
 use super::ui_route::UiRoute;
 
@@ -130,6 +131,7 @@ impl PolicyStore {
                     time: Instant::now(),
                 },
             );
+            enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
         }
     }
 
@@ -184,6 +186,7 @@ impl PolicyStore {
             project_root: &project_root,
             sandbox_session_id: &sandbox_session_id,
         };
+
         let (pending_id, created_prompt) = {
             let mut inner = self.inner.lock().await;
             if let Some(existing_id) = inner.pending.values().find_map(|pending| {
@@ -192,6 +195,18 @@ impl PolicyStore {
                 };
                 identity.matches(net).then(|| net.id.clone())
             }) {
+                let waiter_count = inner.network_futures.get(&existing_id).map_or(0, Vec::len);
+                tracing::error!(waiter_count, MAX_WAITERS_PER_PENDING, host = %identity.host, "dedup found existing pending, waiter count");
+                if waiter_count >= MAX_WAITERS_PER_PENDING {
+                    return CheckReply::blocked(
+                        "agent-sandbox: too many waiters for one network approval",
+                    );
+                }
+                tracing::error!(
+                    waiter_count,
+                    MAX_WAITERS_PER_PENDING,
+                    "waiter count check failed"
+                );
                 inner
                     .network_futures
                     .entry(existing_id.clone())
@@ -199,6 +214,13 @@ impl PolicyStore {
                     .push(tx);
                 (existing_id, false)
             } else {
+                if inner.pending.len() >= MAX_PENDING_APPROVALS {
+                    tracing::warn!(
+                        pending_count = inner.pending.len(),
+                        "network approval blocked (too many pending approvals)"
+                    );
+                    return CheckReply::blocked("agent-sandbox: too many pending approvals");
+                }
                 let pending_id = format!("net:{}", Uuid::new_v4().simple());
                 inner.network_futures.insert(pending_id.clone(), vec![tx]);
                 inner.pending.insert(
@@ -302,6 +324,7 @@ impl PolicyStore {
                         time: Instant::now(),
                     },
                 );
+                enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
                 tracing::warn!(%policy_host, port, "network approval blocked (no policy UI)");
                 return CheckReply::blocked(
                     "agent-sandbox: no policy UI registered (OMP extension, agent-sandbox-ui, or auto-spawn)",
@@ -330,6 +353,7 @@ impl PolicyStore {
                         time: Instant::now(),
                     },
                 );
+                enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
                 Self::audit("timeout", Some(&policy_host), Some(port), &scheme);
                 tracing::warn!(%policy_host, port, "network approval timed out");
                 CheckReply::blocked(
@@ -388,7 +412,8 @@ mod tests {
 
     use crate::store::types::{Pending, PolicyStore, PolicydArgs, UiClient, UiSessionContext};
     use crate::store::ui_route::UiRoute;
-    use agent_sandbox_core::{FileAccess, UiPush};
+    use crate::wire::{MergeContext, NetworkCheckRequest};
+    use agent_sandbox_core::{FileAccess, ProcessIds, SandboxPaths, UiPush};
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
@@ -402,6 +427,99 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
         })
+    }
+
+    fn unique_request(host: &str, port: u16) -> NetworkCheckRequest {
+        NetworkCheckRequest {
+            host: host.into(),
+            port,
+            scheme: "tcp".into(),
+            url: format!("tcp://{host}:{port}"),
+            ctx: MergeContext {
+                paths: SandboxPaths::from_wire(
+                    Some("/repo".into()),
+                    Some("/home/user".into()),
+                    Some("/repo".into()),
+                ),
+                // pid 0 short-circuits resolve_context, so the explicit
+                // paths are preserved verbatim.
+                ids: ProcessIds::from_options(Some(0), Some(1000)),
+                sandbox_session_id: Some("sandbox-cap".into()),
+            },
+        }
+    }
+
+    fn pending_network_owned(host: String) -> PendingNetwork {
+        PendingNetwork {
+            id: format!("net:{host}"),
+            created_at: 0.0,
+            host,
+            port: 443,
+            scheme: "tcp".into(),
+            url: "tcp://seed".into(),
+            cwd: Some("/repo".into()),
+            home: Some("/home/user".into()),
+            project_root: Some("/repo".into()),
+            request_pid: Some(42),
+            sandbox_session_id: Some("sandbox-cap".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn network_pending_cap_blocks_new_prompts() {
+        let store = test_store();
+        {
+            let mut inner = store.inner.lock().await;
+            for i in 0..super::MAX_PENDING_APPROVALS {
+                let id = format!("net:seed{i}");
+                inner.pending.insert(
+                    id.clone(),
+                    Pending::Network(pending_network_owned(format!("host{i}.example"))),
+                );
+            }
+        }
+
+        let reply = store
+            .request_network_approval(unique_request("overflow.example", 443))
+            .await;
+        assert!(!reply.allowed);
+        assert_eq!(reply.source, "blocked");
+        let err = reply.error.unwrap_or_default();
+        assert!(err.contains("too many pending"), "got: {err}");
+
+        let pending_count = store.inner.lock().await.pending.len();
+        assert_eq!(
+            pending_count,
+            super::MAX_PENDING_APPROVALS,
+            "pending cap must not grow on block"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_waiter_cap_blocks_extra_waiter() {
+        let store = test_store();
+        {
+            let mut inner = store.inner.lock().await;
+            let mut net = pending_network("example.com", Some("sandbox-cap"));
+            let open_id = "net:open".to_string();
+            net.id = open_id.clone();
+            inner.pending.insert(open_id, Pending::Network(net));
+            for _ in 0..super::MAX_WAITERS_PER_PENDING {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                inner
+                    .network_futures
+                    .entry("net:open".into())
+                    .or_default()
+                    .push(tx);
+            }
+        }
+        let reply = store
+            .request_network_approval(unique_request("example.com", 443))
+            .await;
+        assert!(!reply.allowed);
+        assert_eq!(reply.source, "blocked");
+        let err = reply.error.unwrap_or_default();
+        assert!(err.contains("too many waiters"), "got: {err}");
     }
 
     #[tokio::test]

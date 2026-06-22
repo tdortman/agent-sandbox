@@ -9,7 +9,10 @@ use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
 
-use super::types::{FilesystemVerdictKey, PolicyStore, VerdictEntry};
+use super::types::{
+    FilesystemVerdictKey, MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING,
+    PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+};
 use crate::spawn::maybe_spawn_ui;
 use crate::store::ui_route::UiRoute;
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext, UiSpawnGate};
@@ -30,6 +33,10 @@ impl PolicyStore {
                 return FilesystemMonitorReply::failed("fs_monitor_cmd not configured");
             }
         };
+
+        if req.static_allow.len() > MAX_STATIC_ALLOW_RULES {
+            return FilesystemMonitorReply::failed("too many filesystem static allow rules");
+        }
 
         let ctx = self.resolve_context(req.ctx).await;
         let cwd = ctx.paths.cwd_string();
@@ -70,56 +77,38 @@ impl PolicyStore {
 
         let mut child = match command.spawn() {
             Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to spawn fsmon");
-                return FilesystemMonitorReply::failed(format!("spawn failed: {e}"));
+            Err(err) => {
+                tracing::error!(error = %err, "failed to spawn fsmon");
+                return FilesystemMonitorReply::failed(format!("spawn failed: {err}"));
             }
         };
 
         let Some(stdout) = child.stdout.take() else {
             tracing::error!("fsmon stdout not captured");
-            let _ = child.kill();
             return FilesystemMonitorReply::failed("stdout not captured");
         };
 
         // Wait for the "ready" line.
         let result = tokio::time::timeout(FSMON_READY_TIMEOUT, async {
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) if l.trim() == "ready" => return Ok(()),
-                    Ok(l) if l.trim().is_empty() => {}
-                    Ok(l) => {
-                        tracing::debug!(line = %l, "fsmon stdout");
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("fsmon closed stdout before ready".to_string());
+                }
+                if line.trim() == "ready" {
+                    return Ok::<_, String>(());
                 }
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "fsmon stdout closed before ready",
-            ))
         })
         .await;
 
         match result {
-            Ok(Ok(())) => {
-                // Detach the child - it continues running as the monitor.
-                let _ = child.id();
-                FilesystemMonitorReply::active()
-            }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "fsmon ready wait failed");
-                let _ = child.kill();
-                FilesystemMonitorReply::failed(format!("ready wait failed: {e}"))
-            }
-            Err(_) => {
-                tracing::error!("fsmon ready timed out");
-                let _ = child.kill();
-                FilesystemMonitorReply::failed("fsmon ready timeout")
-            }
+            Ok(Ok(())) => FilesystemMonitorReply::active(),
+            Ok(Err(err)) => FilesystemMonitorReply::failed(format!("ready wait failed: {err}")),
+            Err(_) => FilesystemMonitorReply::failed("fsmon ready timeout"),
         }
     }
 
@@ -196,6 +185,22 @@ impl PolicyStore {
                     None
                 }
             }) {
+                let waiter_count = inner
+                    .filesystem_futures
+                    .get(&existing_id)
+                    .map_or(0, Vec::len);
+                if waiter_count >= MAX_WAITERS_PER_PENDING {
+                    tracing::warn!(
+                        pending_id = %existing_id,
+                        waiter_count,
+                        "filesystem approval blocked (too many waiters)"
+                    );
+                    return FilesystemCheckReply::blocked(
+                        "agent-sandbox: too many waiters for one filesystem approval",
+                        path,
+                        access,
+                    );
+                }
                 inner
                     .filesystem_futures
                     .entry(existing_id.clone())
@@ -204,6 +209,17 @@ impl PolicyStore {
                 pending_id = existing_id;
                 created_prompt = false;
             } else {
+                if inner.pending.len() >= MAX_PENDING_APPROVALS {
+                    tracing::warn!(
+                        pending_count = inner.pending.len(),
+                        "filesystem approval blocked (too many pending approvals)"
+                    );
+                    return FilesystemCheckReply::blocked(
+                        "agent-sandbox: too many pending approvals",
+                        path,
+                        access,
+                    );
+                }
                 pending_id = format!("fs:{}", Uuid::new_v4().simple());
                 inner
                     .filesystem_futures
@@ -333,5 +349,6 @@ impl PolicyStore {
                 time: Instant::now(),
             },
         );
+        enforce_verdict_cache_limit(&mut inner.filesystem_verdict_cache);
     }
 }

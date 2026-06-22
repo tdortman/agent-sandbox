@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::spawn::maybe_spawn_ui;
 use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 
-use super::types::{Pending, PendingElevation, PolicyStore};
+use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
 use super::ui_route::UiRoute;
 
 impl PolicyStore {
@@ -22,9 +22,18 @@ impl PolicyStore {
         };
         if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
             for line in passwd.lines() {
-                let parts: Vec<_> = line.split(':').collect();
-                if parts.len() >= 7 && parts[5] == home {
-                    return parts[0].to_string();
+                let mut parts = line.splitn(7, ':');
+                let _ = parts.next();
+                let _ = parts.next();
+                let _ = parts.next();
+                let _ = parts.next();
+                let _ = parts.next();
+                let dir = parts.next().unwrap_or("");
+                if dir == home
+                    && let Some(user) = line.split(':').next()
+                    && !user.is_empty()
+                {
+                    return user.to_string();
                 }
             }
         }
@@ -38,15 +47,7 @@ impl PolicyStore {
 
     pub(crate) fn elevation_env(home: Option<&str>) -> HashMap<String, String> {
         let user = Self::user_for_home(home);
-        HashMap::from([
-            ("HOME".into(), home.unwrap_or("/root").to_string()),
-            ("USER".into(), user.clone()),
-            ("LOGNAME".into(), user),
-            (
-                "PATH".into(),
-                "/run/wrappers:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/bin:/bin".into(),
-            ),
-        ])
+        HashMap::from([("AGENT_SANDBOX_ELEVATE_USER".into(), user)])
     }
 
     pub(crate) async fn exec_elevation(
@@ -112,6 +113,19 @@ impl PolicyStore {
         let (tx, rx) = oneshot::channel();
         {
             let mut inner = self.inner.lock().await;
+            if inner.pending.len() >= MAX_PENDING_APPROVALS {
+                tracing::warn!(
+                    pending_count = inner.pending.len(),
+                    "elevation approval blocked (too many pending approvals)"
+                );
+                return ElevateReply {
+                    ok: true,
+                    allowed: false,
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "agent-sandbox: too many pending approvals".into(),
+                };
+            }
             inner.elevation_futures.insert(pending_id.clone(), tx);
             inner.pending.insert(
                 pending_id.clone(),

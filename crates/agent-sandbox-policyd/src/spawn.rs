@@ -12,6 +12,23 @@ use nix::unistd::User;
 use crate::store::PolicydArgs;
 use crate::wire::UiSpawnContext;
 
+const MAX_UI_SPAWN_THROTTLES: usize = 1024;
+
+/// Evict the oldest entries (by `Instant`) from a UI spawn throttle map
+/// until the map is within the global cap.
+fn enforce_ui_spawn_last_limit<S: BuildHasher>(map: &mut HashMap<String, Instant, S>) {
+    while map.len() > MAX_UI_SPAWN_THROTTLES {
+        let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, instant)| *instant)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest_key);
+    }
+}
+
 pub fn ui_spawn_env(
     args: &PolicydArgs,
     user: &User,
@@ -111,6 +128,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     }
     ui_spawn_last.insert(spawn_key.clone(), now);
+    enforce_ui_spawn_last_limit(ui_spawn_last);
 
     let Ok(Some(user)) = User::from_uid(nix::unistd::Uid::from_raw(uid)) else {
         return;
