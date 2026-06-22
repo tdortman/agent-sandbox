@@ -5,6 +5,7 @@ use std::path::Path;
 use agent_sandbox_core::{
     Policy, ProcessIds, ProjectPolicyContext, SandboxPaths, context_from_pid, home_from_uid,
     load_policy, merge_layers, resolve_policy_write_path, sandbox_session_id_from_pid,
+    trusted_project_policy_path,
 };
 
 use crate::wire::MergeContext;
@@ -74,19 +75,46 @@ impl PolicyStore {
         }
     }
 
+    /// Merge every policy layer visible to this request.
+    ///
+    /// Layer order, lowest priority first:
+    /// 1. `self.args.declarative` (NixOS configuration).
+    /// 2. `home/.config/agent-sandbox/policy.json` (trusted user policy).
+    /// 3. The trusted per-project policy file under
+    ///    `home/.config/agent-sandbox/projects/<encoded>/policy.json`
+    ///    when both `home` and `project_root` are known.
+    /// 4. Repo-local `.agent-sandbox/policy.json` files. These are treated
+    ///    as untrusted: their `allow` arrays are cleared before merging so
+    ///    they can only narrow the visible policy via their `deny` arrays.
     pub async fn merged_for(&self, ctx: MergeContext) -> Policy {
         let ctx = self.resolve_context(ctx).await;
         let home_path = ctx.paths.home().map(Path::new);
         let home_str = home_path.and_then(|p| p.to_str());
-        let mut layers = vec![load_policy(&self.args.declarative, home_str)];
-        for path in ProjectPolicyContext::new(
-            home_path,
-            ctx.paths.cwd().map(Path::new),
-            ctx.paths.project_root().map(Path::new),
-        )
-        .layer_paths()
-        {
-            layers.push(load_policy(&path, home_str));
+        let project_root_path = ctx.paths.project_root().map(Path::new);
+        let mut layers: Vec<Policy> = Vec::new();
+        layers.push(load_policy(&self.args.declarative, home_str));
+        if let Some(home) = home_path {
+            let home_policy = home
+                .join(".config")
+                .join("agent-sandbox")
+                .join("policy.json");
+            layers.push(load_policy(&home_policy, home_str));
+            if let Some(root) = project_root_path
+                && let Ok(trusted) = trusted_project_policy_path(home, root)
+            {
+                layers.push(load_policy(&trusted, home_str));
+            }
+        }
+        let project_ctx =
+            ProjectPolicyContext::new(home_path, ctx.paths.cwd().map(Path::new), project_root_path);
+        for path in project_ctx.layer_paths() {
+            let mut policy = load_policy(&path, home_str);
+            // Repo-local policies are untrusted. Clear allow lists so they
+            // can only constrain via deny rules.
+            policy.network.allow.clear();
+            policy.sudo.allow.clear();
+            policy.filesystem.allow.clear();
+            layers.push(policy);
         }
         merge_layers(&layers)
     }

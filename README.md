@@ -36,9 +36,28 @@ Each sandbox runs in a dedicated network namespace (netns). A veth pair connects
 
 DNS responses are only honored when they arrive from the configured forwarder IP on port 53. A forged UDP/53 response from any other source falls through to the policy-boundary path and is not allowed to populate the IP-to-hostname cache. UDP/53 to any destination other than the configured forwarder is consulted against policy; only traffic to the forwarder on port 53 is treated as bypass. Loopback (`127.0.0.1`, `::1`) is also policy-bound, never bypassed.
 
+### Local policy and host IPC boundary
+
+The trusted user and per-project policy files live under `~/.config/agent-sandbox/` on the host so the user can track them with a dotfiles manager. In dynamic filesystem mode the wrapper bind-mounts the entire host root, so by default that directory is writable from inside the sandbox. The wrapper rebinds `~/.config/agent-sandbox/` read-only on top of the broad bind, so the sandboxed agent cannot rewrite the trusted policy files even though they live in the user's home. Policyd (running on the host) and the user's `agent-sandbox-approve` CLI are the only writers.
+
+To let the agent read its trusted config without prompting on every access, add the path to the package `readonlyDirs` so it is auto-allowed by fanotify:
+
+```nix
+agent-sandbox = {
+  packages = [ {
+    package = pkgs.hello;
+    readonlyDirs = [ "~/.config/agent-sandbox" ];
+  } ];
+};
+```
+
+The bwrap read-only rebind still blocks writes regardless of the fanotify decision.
+
 ### Filesystem isolation
 
 Static bubblewrap mounts define the structural write boundary: directories and files are mounted read-only or read-write per package configuration. When `filesystem.dynamicApproval.enable` is true, fanotify mediates filesystem access at the kernel level. The first process inside each sandbox becomes `agent-sandbox-fs-arm`, which requests a fanotify monitor from policyd before execing the real entry point.
+
+In dynamic mode the wrapper mounts a fresh `tmpfs` over the entire host `/run` so unrelated host IPC sockets are invisible to the sandboxed process. The sandbox policy socket and any narrow `/run/...` mounts declared in the package configuration are rebound on top. Abstract Unix sockets are not filesystem paths: with `network.enable = true` they are isolated by the sandbox network namespace, not by fanotify. Host `/tmp` is similarly masked.
 
 ### Sudo elevation
 

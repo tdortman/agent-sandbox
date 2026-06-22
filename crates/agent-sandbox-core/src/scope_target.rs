@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::ScopeResolveError;
-use crate::merge_policy::ProjectPolicyContext;
+use crate::merge_policy::trusted_project_policy_path;
 use crate::rpc::ApprovalScope;
 
 /// Where an approved/denied rule is stored after scope + context validation.
@@ -54,8 +54,9 @@ impl ScopeTarget {
                 let project_root = ctx
                     .project_root
                     .ok_or(ScopeResolveError::ProjectRootRequired)?;
-                let project = ProjectPolicyContext::new(None, None, Some(Path::new(project_root)));
-                let policy_path = project.resolve_policy_path()?;
+                let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
+                let policy_path =
+                    trusted_project_policy_path(Path::new(home), Path::new(project_root))?;
                 Ok(Self::Project {
                     policy_path,
                     project_root: project_root.to_string(),

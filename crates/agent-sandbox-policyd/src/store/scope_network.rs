@@ -149,10 +149,12 @@ impl PolicyStore {
             ))
             .await;
         Self::audit(action.audit_verb(), Some(&host), Some(port), scope_label);
-        let path = project_root
-            .as_deref()
-            .filter(|_| scope == ApprovalScope::Project)
-            .and_then(Self::project_policy_path_display);
+        let path = match (home.as_deref(), project_root.as_deref()) {
+            (Some(h), Some(p)) if scope == ApprovalScope::Project => {
+                Self::project_policy_path_display(h, p)
+            }
+            _ => None,
+        };
         RpcReply::ScopeAction(ScopeActionReply::ok_network(host, port, scope, path))
     }
 

@@ -44,21 +44,21 @@ impl PolicyStore {
                 let mut inner = self.inner.lock().await;
                 match action {
                     DecisionAction::Approve => {
-                        inner
+                        let bucket = inner
                             .session_sudo_allow
                             .entry(session_id.clone())
-                            .or_default()
-                            .insert(key.clone());
+                            .or_default();
+                        bucket.insert(key.clone());
                         if let Some(deny_bucket) = inner.session_sudo_deny.get_mut(&session_id) {
                             deny_bucket.remove(&key);
                         }
                     }
                     DecisionAction::Deny => {
-                        inner
+                        let bucket = inner
                             .session_sudo_deny
                             .entry(session_id.clone())
-                            .or_default()
-                            .insert(key.clone());
+                            .or_default();
+                        bucket.insert(key.clone());
                         if let Some(allow_bucket) = inner.session_sudo_allow.get_mut(&session_id) {
                             allow_bucket.remove(&key);
                         }
@@ -109,7 +109,7 @@ impl PolicyStore {
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
-                tracing::info!(path = ?policy_path, "project policy saved");
+                tracing::info!(path = ?policy_path, "project sudo policy saved");
             }
         }
         let _ = self
@@ -121,10 +121,12 @@ impl PolicyStore {
             .await;
         let detail = format!("argv={argv:?} scope={scope_label}");
         Self::audit(action.audit_verb(), None, None, &detail);
-        let path = project_root
-            .as_deref()
-            .filter(|_| scope == ApprovalScope::Project)
-            .and_then(Self::project_policy_path_display);
+        let path = match (home.as_deref(), project_root.as_deref()) {
+            (Some(h), Some(p)) if scope == ApprovalScope::Project => {
+                Self::project_policy_path_display(h, p)
+            }
+            _ => None,
+        };
         RpcReply::ScopeAction(ScopeActionReply::ok_sudo(argv, scope, path))
     }
 }

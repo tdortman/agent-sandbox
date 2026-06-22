@@ -12,4 +12,4 @@ pub use io::{
     resolve_policy_write_path,
 };
 pub use merge::merge_layers;
-pub use project::ProjectPolicyContext;
+pub use project::{ProjectPolicyContext, trusted_project_policy_path};

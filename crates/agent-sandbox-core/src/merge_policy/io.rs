@@ -108,6 +108,24 @@ pub fn resolve_owner_uid(path: &Path, home: Option<&str>, uid: Option<u32>) -> O
     None
 }
 
+fn policy_chown_paths(target: &Path) -> Vec<PathBuf> {
+    let target = resolve_policy_write_path(target);
+    let mut paths = Vec::with_capacity(3);
+    if let Some(parent) = target.parent() {
+        paths.push(parent.to_path_buf());
+        if parent.file_name().is_some_and(|name| name != "projects")
+            && let Some(projects_dir) = parent.parent()
+            && projects_dir
+                .file_name()
+                .is_some_and(|name| name == "projects")
+        {
+            paths.push(projects_dir.to_path_buf());
+        }
+    }
+    paths.push(target);
+    paths
+}
+
 pub fn chown_policy_path(path: &Path, uid: u32) {
     if uid == 0 {
         return;
@@ -116,14 +134,10 @@ pub fn chown_policy_path(path: &Path, uid: u32) {
         return;
     };
     let gid = pw.gid;
-    let target = resolve_policy_write_path(path);
-    for entry in [
-        target.parent().map(std::path::Path::to_path_buf),
-        Some(target),
-    ] {
-        let Some(entry) = entry.filter(|e| e.exists()) else {
+    for entry in policy_chown_paths(path) {
+        if !entry.exists() {
             continue;
-        };
+        }
         let _ = nix::unistd::chown(&entry, Some(nix::unistd::Uid::from_raw(uid)), Some(gid));
     }
 }
@@ -242,6 +256,23 @@ fn push_spaced_json(out: &mut String, compact: &str) {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FilesystemRule, NetworkRule};
+
+    #[test]
+    fn project_policy_chown_includes_projects_directory() {
+        let path =
+            Path::new("/home/user/.config/agent-sandbox/projects/-home-user-repo/policy.json");
+        let paths = policy_chown_paths(path);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/home/user/.config/agent-sandbox/projects/-home-user-repo"),
+                PathBuf::from("/home/user/.config/agent-sandbox/projects"),
+                PathBuf::from(
+                    "/home/user/.config/agent-sandbox/projects/-home-user-repo/policy.json",
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn policy_json_writes_home_paths_as_tilde() {

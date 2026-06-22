@@ -40,51 +40,64 @@ impl PolicyStore {
             )
             .await
         {
-            Ok(t) => t,
-            Err(err) => return err,
+            Ok(target) => target,
+            Err(reply) => return reply,
         };
         let scope_label = scope.as_str();
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
+                let key = FilesystemRuleKey::new(&path, access);
                 let mut inner = self.inner.lock().await;
-                let entry = FilesystemRuleKey::new(path.clone(), access);
                 match action {
                     DecisionAction::Approve => {
-                        inner
+                        let bucket = inner
                             .session_filesystem_allow
                             .entry(session_id.clone())
-                            .or_default()
-                            .insert(entry.clone());
-                        if let Some(deny) = inner.session_filesystem_deny.get_mut(&session_id) {
-                            deny.remove(&entry);
+                            .or_default();
+                        bucket.insert(key.clone());
+                        if let Some(deny_bucket) =
+                            inner.session_filesystem_deny.get_mut(&session_id)
+                        {
+                            deny_bucket.remove(&key);
                         }
                     }
                     DecisionAction::Deny => {
-                        inner
+                        let bucket = inner
                             .session_filesystem_deny
                             .entry(session_id.clone())
-                            .or_default()
-                            .insert(entry.clone());
-                        if let Some(allow) = inner.session_filesystem_allow.get_mut(&session_id) {
-                            allow.remove(&entry);
+                            .or_default();
+                        bucket.insert(key.clone());
+                        if let Some(allow_bucket) =
+                            inner.session_filesystem_allow.get_mut(&session_id)
+                        {
+                            allow_bucket.remove(&key);
                         }
                     }
                 }
             }
-            ScopeTarget::Global {
-                policy_path,
-                home: target_home,
-            } => {
-                if let Err(err) = Self::persist_filesystem_rule(
-                    &policy_path,
-                    &path,
-                    access,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    Some(&target_home),
-                    owner_uid,
-                ) {
+            ScopeTarget::Global { policy_path, home } => {
+                let persist = match action {
+                    DecisionAction::Approve => Self::persist_filesystem_rule(
+                        &policy_path,
+                        &path,
+                        access,
+                        scope_label,
+                        true,
+                        Some(&home),
+                        owner_uid,
+                    ),
+                    DecisionAction::Deny => Self::persist_filesystem_rule(
+                        &policy_path,
+                        &path,
+                        access,
+                        scope_label,
+                        false,
+                        Some(&home),
+                        owner_uid,
+                    ),
+                };
+                if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
             }
@@ -92,18 +105,30 @@ impl PolicyStore {
                 policy_path,
                 project_root: _,
             } => {
-                if let Err(err) = Self::persist_filesystem_rule(
-                    &policy_path,
-                    &path,
-                    access,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    home.as_deref(),
-                    owner_uid,
-                ) {
+                let persist = match action {
+                    DecisionAction::Approve => Self::persist_filesystem_rule(
+                        &policy_path,
+                        &path,
+                        access,
+                        scope_label,
+                        true,
+                        home.as_deref(),
+                        owner_uid,
+                    ),
+                    DecisionAction::Deny => Self::persist_filesystem_rule(
+                        &policy_path,
+                        &path,
+                        access,
+                        scope_label,
+                        false,
+                        home.as_deref(),
+                        owner_uid,
+                    ),
+                };
+                if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
-                tracing::info!(path = ?policy_path, "project policy saved");
+                tracing::info!(path = ?policy_path, "project filesystem policy saved");
             }
         }
         let _ = self
@@ -115,10 +140,12 @@ impl PolicyStore {
             .await;
         let detail = format!("path={path} access={access:?} scope={scope_label}");
         Self::audit(action.audit_verb(), None, None, &detail);
-        let policy_path = project_root
-            .as_deref()
-            .filter(|_| scope == ApprovalScope::Project)
-            .and_then(Self::project_policy_path_display);
+        let policy_path = match (home.as_deref(), project_root.as_deref()) {
+            (Some(h), Some(p)) if scope == ApprovalScope::Project => {
+                Self::project_policy_path_display(h, p)
+            }
+            _ => None,
+        };
         RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
             path,
             access,

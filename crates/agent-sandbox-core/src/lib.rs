@@ -27,7 +27,8 @@ pub use hosts::{
     is_ip_literal, normalize_host, policy_host_for_connect, reverse_hostname,
 };
 pub use merge_policy::{
-    ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers, resolve_policy_write_path,
+    ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers,
+    resolve_policy_write_path, trusted_project_policy_path,
 };
 pub use policy::{
     FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection, FilesystemSortKey,

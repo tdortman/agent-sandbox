@@ -307,6 +307,33 @@ rec {
         fi
       '';
 
+      # Rebind explicit narrow /run/* mounts configured by the package
+      # definition. Skip the broad /run path so the host's runtime sockets
+      # stay hidden by the surrounding tmpfs.
+      runReadonlyBindScript = lib.concatMapStringsSep "\n" (
+        path:
+        if path == "/run" then
+          ""
+        else
+          ''
+            if [[ -e "${path}" ]]; then
+              RUNTIME_ARGS+=(--ro-bind "${path}" "${path}")
+            fi
+          ''
+      ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique (readonlyDirs ++ readonlyFiles)));
+
+      runReadwriteBindScript = lib.concatMapStringsSep "\n" (
+        path:
+        if path == "/run" then
+          ""
+        else
+          ''
+            if [[ -e "${path}" ]]; then
+              RUNTIME_ARGS+=(--bind "${path}" "${path}")
+            fi
+          ''
+      ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique (readwriteDirs ++ readwriteFiles)));
+
       policyScript =
         lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
           ''
@@ -340,18 +367,102 @@ rec {
             RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
             RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
             RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
-            # Mount a clean tmpfs over /run/agent-sandbox to hide
-            # the host policy socket from sandboxed processes.
-            # This must precede the file-level ro-binds below.
-            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
+
+            # Mask the entire host /run so unrelated host IPC sockets are
+            # invisible. The sandbox policy socket is rebound below from a
+            # known clean location, not from the host /run tree.
+            RUNTIME_ARGS+=(--tmpfs /run)
+            for _asbx_safe_runtime in /run/current-system /run/wrappers /run/opengl-driver /run/opengl-driver-32 /run/netns; do
+              if [[ -e "$_asbx_safe_runtime" ]]; then
+                RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
+              fi
+            done
+            RUNTIME_ARGS+=(--dir /run/agent-sandbox)
+
+            # The dynamic path bind-mounts the host root with --bind / /, so
+            # the user's $HOME (including ~/.config/agent-sandbox) is fully
+            # writable inside the sandbox by default. That breaks the trust
+            # model: a compromised agent could rewrite trusted policy files to
+            # add allow rules for itself. Rebind the logical config directory
+            # read-only, and also rebind resolved policy symlink targets (or
+            # their existing parents) read-only. A read-only bind on only the
+            # symlink directory is not enough: writes through the symlink land
+            # on the target path under the broad writable host-root bind.
+            _asbx_user_config="$_agent_sandbox_home/.config/agent-sandbox"
+            _asbx_policy_ro_binds=()
+            _asbx_policy_candidates=()
+
+            _asbx_ro_bind_once() {
+              local _asbx_path="$1"
+              local _asbx_bound
+              [[ -n "$_asbx_path" && -e "$_asbx_path" ]] || return 0
+              for _asbx_bound in "''${_asbx_policy_ro_binds[@]}"; do
+                [[ "$_asbx_bound" == "$_asbx_path" ]] && return 0
+              done
+              _asbx_policy_ro_binds+=("$_asbx_path")
+              RUNTIME_ARGS+=(--ro-bind "$_asbx_path" "$_asbx_path")
+            }
+
+            _asbx_existing_parent() {
+              local _asbx_path="$1"
+              while [[ "$_asbx_path" != "/" && ! -e "$_asbx_path" ]]; do
+                _asbx_path="$(dirname "$_asbx_path")"
+              done
+              if [[ -e "$_asbx_path" ]]; then
+                readlink -f "$_asbx_path" 2>/dev/null || true
+              fi
+            }
+
+            _asbx_policy_target_parent() {
+              local _asbx_policy_path="$1"
+              local _asbx_policy_dir
+              local _asbx_link_target
+              local _asbx_target
+              _asbx_policy_dir="$(dirname "$_asbx_policy_path")"
+              if [[ -L "$_asbx_policy_path" ]]; then
+                _asbx_link_target="$(readlink "$_asbx_policy_path")" || return 0
+                case "$_asbx_link_target" in
+                  /*) _asbx_target="$_asbx_link_target" ;;
+                  *) _asbx_target="$_asbx_policy_dir/$_asbx_link_target" ;;
+                esac
+              else
+                _asbx_target="$_asbx_policy_path"
+              fi
+              _asbx_existing_parent "$(dirname "$_asbx_target")"
+            }
+
+            if [[ -d "$_asbx_user_config" ]]; then
+              _asbx_ro_bind_once "$_asbx_user_config"
+            fi
+            if [[ -e "$_asbx_user_config/policy.json" || -L "$_asbx_user_config/policy.json" ]]; then
+              _asbx_policy_candidates+=("$_asbx_user_config/policy.json")
+            fi
+            if [[ -d "$_asbx_user_config/projects" ]]; then
+              shopt -s nullglob
+              for _asbx_policy_candidate in "$_asbx_user_config"/projects/*/policy.json; do
+                _asbx_policy_candidates+=("$_asbx_policy_candidate")
+              done
+              shopt -u nullglob
+            fi
+            for _asbx_policy_candidate in "''${_asbx_policy_candidates[@]}"; do
+              _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_policy_candidate")"
+              _asbx_ro_bind_once "$_asbx_policy_parent"
+              if [[ -e "$_asbx_policy_candidate" ]]; then
+                _asbx_policy_real="$(readlink -f "$_asbx_policy_candidate" 2>/dev/null)" || _asbx_policy_real=""
+                _asbx_ro_bind_once "$_asbx_policy_real"
+              fi
+            done
             if [[ -f /run/agent-sandbox/dns-cache.json ]]; then
               RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/dns-cache.json /run/agent-sandbox/dns-cache.json)
             fi
             if [[ -f /run/agent-sandbox/session-context.json ]]; then
               RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/session-context.json /run/agent-sandbox/session-context.json)
             fi
+            ${runReadonlyBindScript}
+            ${runReadwriteBindScript}
+
             # Expose only the restricted sandbox request socket. The host
-            # control socket stays hidden by tmpfs and is not renamed.
+            # control socket stays hidden by tmpfs.
             RUNTIME_ARGS+=(--ro-bind ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
           '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''

@@ -356,7 +356,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_policy_matches_ipv4_prefix_wildcard() {
+    async fn project_policy_allow_is_ignored_deny_still_applies() {
+        // Repo-local allow rules are no longer honored: a sandboxed process cannot
+        // grant itself network access. A repo-local deny rule still applies.
         let dir = tempfile::tempdir().unwrap();
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
@@ -367,7 +369,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
-            .allow
+            .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "34.230.40.*",
                 443,
@@ -396,11 +398,10 @@ mod tests {
         };
 
         assert!(
-            store
+            !store
                 .is_allowed("34.230.40.69", 443, ctx.clone(), false)
                 .await
         );
-        assert!(!store.is_allowed("34.230.41.69", 443, ctx, false).await);
     }
 
     #[test]
@@ -420,7 +421,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_policy_matches_ipv6_prefix_wildcard() {
+    async fn project_policy_ipv6_deny_still_applies() {
+        // Repo-local allow rules are ignored. The deny rule still applies.
         let dir = tempfile::tempdir().unwrap();
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
@@ -431,7 +433,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
-            .allow
+            .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "2001:db8:*",
                 443,
@@ -460,11 +462,10 @@ mod tests {
         };
 
         assert!(
-            store
+            !store
                 .is_allowed("2001:db8::1", 443, ctx.clone(), false)
                 .await
         );
-        assert!(!store.is_allowed("2001:db9::1", 443, ctx, false).await);
     }
 
     #[test]
@@ -479,7 +480,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_policy_is_re_read_after_manual_edit() {
+    async fn project_policy_deny_persists_after_reload() {
+        // Repo-local deny rules are read into the merged policy. Removing the
+        // deny rule (replacing with an empty policy) should re-allow the
+        // destination the next time the policy is merged.
         let dir = tempfile::tempdir().unwrap();
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
@@ -490,7 +494,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
-            .allow
+            .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "example.com",
                 443,
@@ -519,7 +523,7 @@ mod tests {
         };
 
         assert!(
-            store
+            !store
                 .is_allowed("example.com", 443, ctx.clone(), false)
                 .await
         );
@@ -527,7 +531,9 @@ mod tests {
         let empty = agent_sandbox_core::Policy::default();
         agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None).unwrap();
 
-        assert!(!store.is_allowed("example.com", 443, ctx, false).await);
+        // The merged policy is computed on every call, so removing the deny rule
+        // from disk takes effect immediately.
+        assert!(!store.policy_denied("example.com", 443, ctx).await);
     }
 
     #[tokio::test]

@@ -97,22 +97,6 @@ impl ProjectPolicyContext {
         add(self.valid_project_root().map(project_policy_path));
         add(self.discovered_policy.clone());
 
-        if let Some(home) = self.home.as_deref() {
-            add(Some(home.join(".agent-sandbox").join("policy.json")));
-            add(Some(
-                home.join(".config")
-                    .join("agent-sandbox")
-                    .join("policy.json"),
-            ));
-            if let Ok(entries) = std::fs::read_dir(home) {
-                for entry in entries.flatten() {
-                    add(Some(
-                        entry.path().join(".agent-sandbox").join("policy.json"),
-                    ));
-                }
-            }
-        }
-
         paths
     }
 
@@ -186,12 +170,56 @@ fn project_policy_path(root: &Path) -> PathBuf {
     root.join(".agent-sandbox").join("policy.json")
 }
 
+/// Build the path to the trusted per-project policy file under the user's
+/// `~/.config/agent-sandbox/projects/<encoded-project-root>/policy.json`.
+///
+/// The encoded project root replaces every path separator with `-` so the
+/// resulting path lives outside the writable project tree. The sandboxed
+/// process cannot tamper with its own persistent approvals.
+pub fn trusted_project_policy_path(
+    home: &Path,
+    project_root: &Path,
+) -> Result<PathBuf, ProjectPolicyError> {
+    let canonical =
+        project_root
+            .canonicalize()
+            .map_err(|_| ProjectPolicyError::InvalidProjectRoot {
+                path: project_root.to_path_buf(),
+            })?;
+    if !is_valid_project_root(&canonical) {
+        return Err(ProjectPolicyError::InvalidProjectRoot { path: canonical });
+    }
+    let encoded = encode_project_root(&canonical);
+    Ok(home
+        .join(".config")
+        .join("agent-sandbox")
+        .join("projects")
+        .join(encoded)
+        .join("policy.json"))
+}
+
+fn encode_project_root(path: &Path) -> String {
+    let mut out = String::with_capacity(path.as_os_str().len());
+    let lossy = path.to_string_lossy();
+    let bytes = lossy.as_bytes();
+    // Skip a single leading separator so the encoded form never starts with "-".
+    let start = usize::from(bytes.first() == Some(&b'/'));
+    for &byte in &bytes[start..] {
+        if byte == b'/' {
+            out.push('-');
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::ProjectPolicyContext;
+    use super::{ProjectPolicyContext, encode_project_root, trusted_project_policy_path};
 
     #[test]
     fn explicit_project_root_beats_ephemeral_cwd() {
@@ -257,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_paths_include_existing_project_and_home_policy() {
+    fn layer_paths_only_includes_repo_local_policies() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home/tim");
         let repo = home.join("dotfiles");
@@ -276,17 +304,44 @@ mod tests {
 
         let ctx = ProjectPolicyContext::new(Some(&home), Some(&repo), None);
         let paths = ctx.layer_paths();
-        assert_eq!(paths.len(), 2);
-        assert!(
-            paths
-                .iter()
-                .any(|path| path.ends_with("home/tim/.agent-sandbox/policy.json"))
-        );
+        assert_eq!(paths.len(), 1);
         assert!(
             paths
                 .iter()
                 .any(|path| path.ends_with("home/tim/dotfiles/.agent-sandbox/policy.json"))
         );
+    }
+
+    #[test]
+    fn trusted_project_policy_path_lives_outside_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home/tim");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = trusted_project_policy_path(&home, &repo).unwrap();
+        let s = path.to_string_lossy();
+        assert!(s.contains(".config/agent-sandbox/projects/"), "got: {s}");
+        assert!(s.ends_with("/policy.json"), "got: {s}");
+        assert!(!s.contains("/repo/policy.json"));
+    }
+
+    #[test]
+    fn encode_project_root_replaces_separators_with_dash() {
+        let encoded = encode_project_root(Path::new("/home/user/repo"));
+        assert_eq!(encoded, "home-user-repo");
+    }
+
+    #[test]
+    fn trusted_project_policy_path_rejects_invalid_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home/tim");
+        std::fs::create_dir_all(&home).unwrap();
+        let err =
+            trusted_project_policy_path(&home, Path::new("/nonexistent/path/here")).unwrap_err();
+        match err {
+            crate::error::ProjectPolicyError::InvalidProjectRoot { .. } => {}
+            other => panic!("expected InvalidProjectRoot, got {other:?}"),
+        }
     }
 
     #[test]
