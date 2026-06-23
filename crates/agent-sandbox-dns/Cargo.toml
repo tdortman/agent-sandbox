@@ -15,6 +15,7 @@ path = "src/main.rs"
 agent-sandbox-core = { path = "../agent-sandbox-core" }
 clap = { version = "4", features = ["derive"] }
 hickory-proto = "0.24"
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"

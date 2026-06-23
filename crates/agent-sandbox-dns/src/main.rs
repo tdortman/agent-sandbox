@@ -16,7 +16,7 @@ use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_TTL: u32 = 300;
 
@@ -31,6 +31,8 @@ struct Args {
     cache_path: PathBuf,
     #[arg(long, default_value_t = DEFAULT_MAX_TTL)]
     max_ttl: u32,
+    #[arg(long, default_value = "/run/agent-sandbox/dns-push.sock")]
+    push_socket: PathBuf,
     #[arg(long)]
     verbose: bool,
 }
@@ -40,6 +42,8 @@ struct DnsForwarder {
     cache: Arc<std::sync::Mutex<DnsCache>>,
     max_ttl: u32,
     verbose: bool,
+    push_socket: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixDatagram>>>,
+    push_socket_path: PathBuf,
 }
 
 #[tokio::main]
@@ -58,10 +62,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dns_cache = DnsCache::new(Some(&args.cache_path), args.max_ttl);
     dns_cache.reload();
     let cache = Arc::new(std::sync::Mutex::new(dns_cache));
+    if let Some(parent) = args.push_socket.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let push_socket = match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(s) => Some(s),
+        Err(err) => {
+            warn!(error = %err, "failed to create unbound push datagram socket");
+            None
+        }
+    };
+    let push_socket = Arc::new(std::sync::Mutex::new(push_socket));
     let forwarder = DnsForwarder {
         cache,
         max_ttl: args.max_ttl,
         verbose: args.verbose,
+        push_socket: push_socket.clone(),
+        push_socket_path: args.push_socket.clone(),
     };
 
     let bind = format!("{}:{}", args.listen_host, args.listen_port);
@@ -165,14 +184,44 @@ impl DnsForwarder {
             }
         };
 
+        let ttl = self.max_ttl;
         {
-            let ttl = self.max_ttl;
             let mut cache = self.cache.lock().expect("dns cache lock");
             for addr in &addrs {
                 cache.remember(&addr.to_string(), &hostname, ttl);
             }
         }
-
+        // Push each mapping to the nfq daemon over a Unix datagram socket so
+        // its in-memory cache stays current. Failures are non-fatal: the
+        // on-disk cache remains the fallback for any misses.
+        if let Some(push_path) = self.push_socket_path.to_str() {
+            for addr in &addrs {
+                let payload = serde_json::json!({
+                    "ip": addr.to_string(),
+                    "host": &hostname,
+                    "ttl": ttl,
+                });
+                if let Ok(mut line) = serde_json::to_string(&payload) {
+                    line.push('\n');
+                    let send_result = self.push_socket.lock().ok().and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|s| s.send_to(line.as_bytes(), push_path))
+                    });
+                    if let Some(Err(err)) = send_result {
+                        match err.kind() {
+                            std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused => {
+                                debug!(error = %err, "no nfq listener for push socket");
+                            }
+                            _ => {
+                                warn!(error = %err, "push socket send failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if self.verbose {
             info!(
                 %hostname,

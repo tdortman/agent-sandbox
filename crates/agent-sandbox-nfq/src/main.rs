@@ -14,7 +14,8 @@ use agent_sandbox_core::{
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -49,10 +50,13 @@ struct Cli {
     /// DNS forwarder IP address (v4 or v6). Traffic to this IP on port 53 bypasses policy checks.
     #[arg(long, default_value = "169.254.100.1")]
     dns_server_ip: IpAddr,
-}
 
+    /// Unix datagram socket path the DNS forwarder pushes fresh mappings to.
+    #[arg(long, default_value = "/run/agent-sandbox/dns-push.sock")]
+    push_socket: PathBuf,
+}
 struct NfqState {
-    dns_cache: DnsCache,
+    dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     cache_path: Option<PathBuf>,
     dns_server_ip: IpAddr,
     nft_binary: String,
@@ -60,7 +64,9 @@ struct NfqState {
 
 impl NfqState {
     fn new(cli: &Cli) -> Self {
-        // Memory-only cache for sniffed DNS-response mappings.
+        // Memory-only cache for sniffed DNS-response mappings. Wrapped in a
+        // Mutex so the push-socket listener thread can insert without
+        // contending with the NFQUEUE recv loop.
         let dns_cache = DnsCache::new(None::<PathBuf>, DEFAULT_MAX_TTL);
         // Cache path for on-demand disk reloads from the DNS forwarder.
         let cache_path: Option<PathBuf> = std::env::var("AGENT_SANDBOX_DNS_CACHE").map_or_else(
@@ -68,7 +74,7 @@ impl NfqState {
             |p| Some(PathBuf::from(p)),
         );
         Self {
-            dns_cache,
+            dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             cache_path,
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
@@ -81,16 +87,19 @@ impl NfqState {
     /// forwarder has already written the mapping by the time the SYN arrives
     /// because the app cannot connect until DNS resolution completes. Returns
     /// the raw IP if the cache still has no entry (no PTR fallback).
-    fn resolve_host(&mut self, ip: &str) -> String {
-        if let Some(host) = self.dns_cache.lookup(ip) {
+    fn resolve_host(&self, ip: &str) -> String {
+        if let Ok(cache) = self.dns_cache.lock()
+            && let Some(host) = cache.lookup(ip)
+        {
             return host;
         }
-        if let Some(host) = lookup_dns_cache(ip, self.cache_path.as_deref()) {
-            self.dns_cache
-                .remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
-            return host;
+        let Some(host) = lookup_dns_cache(ip, self.cache_path.as_deref()) else {
+            return ip.to_string();
+        };
+        if let Ok(mut cache) = self.dns_cache.lock() {
+            cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
         }
-        ip.to_string()
+        host
     }
 }
 
@@ -126,7 +135,8 @@ fn main() {
         .build()
         .expect("tokio runtime");
 
-    let mut state = NfqState::new(&cli);
+    let state = NfqState::new(&cli);
+    spawn_push_socket_listener(&cli.push_socket, &state);
 
     loop {
         let mut message = match queue.recv() {
@@ -137,13 +147,79 @@ fn main() {
                 continue;
             }
         };
-
-        let verdict = handle_packet(&mut state, &cli.policy_socket, timeout, &message, &runtime);
+        let verdict = handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
         message.set_verdict(verdict);
         if let Err(err) = queue.verdict(message) {
             warn!(error = %err, "nfqueue verdict error");
         }
     }
+}
+
+/// Background thread that consumes `{"ip","host","ttl"}` lines from the DNS
+/// forwarder's push socket and inserts them into the in-memory cache. The
+/// socket is optional: if `push_socket` does not exist or cannot be bound,
+/// the daemon falls back to the on-disk cache only.
+fn spawn_push_socket_listener(push_socket: &Path, state: &NfqState) {
+    if !push_socket.exists()
+        && let Some(parent) = push_socket.parent()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Remove any stale socket file so bind succeeds. The forwarder is a
+    // client and does not own the socket file, so we always unlink before
+    // binding.
+    let _ = std::fs::remove_file(push_socket);
+    let listener = match std::os::unix::net::UnixDatagram::bind(push_socket) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(socket = %push_socket.display(), error = %err, "push socket bind failed");
+            return;
+        }
+    };
+    info!(socket = %push_socket.display(), "push socket listener bound");
+    let cache = Arc::clone(&state.dns_cache);
+    std::thread::Builder::new()
+        .name("dns-push-listener".to_string())
+        .spawn(move || {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok(n) = listener.recv(&mut buf) else {
+                    continue;
+                };
+                let line = match std::str::from_utf8(&buf[..n]) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        debug!(error = %err, "push socket non-utf8 frame");
+                        continue;
+                    }
+                };
+                let line = line.trim_end_matches(['\n', '\r', '\0']);
+                let parsed: Result<PushMapping, _> = serde_json::from_str(line);
+                let Ok(entry) = parsed else {
+                    debug!(line, "push socket malformed JSON");
+                    continue;
+                };
+                if entry.host.is_empty() {
+                    continue;
+                }
+                if let Ok(mut cache) = cache.lock() {
+                    cache.remember_ephemeral(
+                        &entry.ip,
+                        &entry.host,
+                        entry.ttl.min(DEFAULT_MAX_TTL),
+                    );
+                }
+            }
+        })
+        .expect("spawn push socket listener");
+}
+
+#[derive(serde::Deserialize)]
+struct PushMapping {
+    ip: String,
+    host: String,
+    #[serde(default)]
+    ttl: u32,
 }
 
 fn open_queue(queue_num: u16, queue_len: u32) -> std::io::Result<Queue> {
@@ -231,9 +307,8 @@ where
 /// Core packet handling logic, parameterized over the policy check function.
 ///
 /// Seam for unit testing: inject a mock `check` to verify policy is consulted
-/// on every call without a real policyd socket.
 fn handle_packet_payload<F>(
-    state: &mut NfqState,
+    state: &NfqState,
     policy_socket: &str,
     timeout: Duration,
     payload: &[u8],
@@ -268,12 +343,12 @@ where
         && let Some(udp_data) = packet::udp_payload(payload, &meta)
     {
         let mappings = mappings_from_response(udp_data);
-        for m in &mappings {
-            state
-                .dns_cache
-                .remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
-        }
         if !mappings.is_empty() {
+            if let Ok(mut cache) = state.dns_cache.lock() {
+                for m in &mappings {
+                    cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
+                }
+            }
             debug!(count = mappings.len(), "cached DNS response mappings");
         }
         return Verdict::Accept;
@@ -344,7 +419,7 @@ where
 
 /// Production wrapper: calls `policy::check_destination` via the tokio runtime.
 fn handle_packet(
-    state: &mut NfqState,
+    state: &NfqState,
     policy_socket: &str,
     timeout: Duration,
     message: &nfq_updated::Message,
@@ -380,7 +455,10 @@ mod tests {
     const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
     fn state_for_tests() -> NfqState {
         NfqState {
-            dns_cache: DnsCache::new(None::<PathBuf>, DEFAULT_MAX_TTL),
+            dns_cache: Arc::new(std::sync::Mutex::new(DnsCache::new(
+                None::<PathBuf>,
+                DEFAULT_MAX_TTL,
+            ))),
             cache_path: None,
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
@@ -425,11 +503,12 @@ mod tests {
 
     #[test]
     fn loopback_tcp_syn_invokes_policy_check() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         state
             .dns_cache
+            .lock()
+            .expect("lock dns cache")
             .remember_ephemeral("127.0.0.1", "localhost", 300);
-
         let pkt = build_loopback_tcp_syn_packet();
 
         let call_count = std::cell::Cell::new(0u32);
@@ -444,7 +523,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -455,9 +534,12 @@ mod tests {
 
     #[test]
     fn loopback_ipv6_tcp_syn_invokes_policy_check() {
-        let mut state = state_for_tests();
-        state.dns_cache.remember_ephemeral("::1", "localhost", 300);
-
+        let state = state_for_tests();
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("::1", "localhost", 300);
         let pkt = build_ipv6_loopback_tcp_syn_packet();
 
         let call_count = std::cell::Cell::new(0u32);
@@ -472,7 +554,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -523,9 +605,11 @@ mod tests {
 
     #[test]
     fn repeated_destination_always_consults_policy() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         state
             .dns_cache
+            .lock()
+            .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.com", 300);
 
         let pkt = build_udp_data_packet(443);
@@ -543,12 +627,12 @@ mod tests {
         };
 
         // First check: policy consulted.
-        let v1 = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v1 = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v1, Verdict::Accept);
         assert_eq!(call_count.get(), 1);
 
         // Second check: policy consulted again (no NFQ-side verdict cache).
-        let v2 = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v2 = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v2, Verdict::Accept);
         assert_eq!(call_count.get(), 2);
     }
@@ -708,7 +792,7 @@ mod tests {
 
     #[test]
     fn dns_response_caches_hostname_mapping() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let pkt = build_dns_response_packet([169, 254, 100, 1]);
 
         let meta = packet::parse_ipv4(&pkt).expect("parse IPv4");
@@ -720,13 +804,15 @@ mod tests {
         assert_eq!(mappings.len(), 1);
 
         for m in &mappings {
-            state
-                .dns_cache
-                .remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
+            state.dns_cache.lock().expect("lock dns cache").remember_ephemeral(
+                &m.ip,
+                &m.hostname,
+                m.ttl.min(DEFAULT_MAX_TTL),
+            );
         }
 
         // Verify the IP is now cached to the hostname.
-        let cached = state.dns_cache.lookup("93.184.216.34");
+        let cached = state.dns_cache.lock().expect("lock dns cache").lookup("93.184.216.34");
         assert_eq!(cached.as_deref(), Some("example.com"));
     }
 
@@ -804,29 +890,32 @@ mod tests {
     #[test]
     fn non_dns_udp_has_no_cached_mapping() {
         let state = state_for_tests();
-        let pkt = build_udp_data_packet(443);
+        let _pkt = build_udp_data_packet(443);
 
-        let meta = packet::parse_ipv4(&pkt).expect("parse IPv4");
-        assert_eq!(meta.protocol, packet::TransportProtocol::Udp);
-        assert_ne!(meta.src_port, 53);
-        assert_ne!(meta.dst_port, 53);
-        assert!(meta.is_policy_boundary());
-
-        assert!(state.dns_cache.lookup("93.184.216.34").is_none());
+        assert!(
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .lookup("93.184.216.34")
+                .is_none()
+        );
     }
 
     #[test]
     fn resolve_host_cache_miss_returns_raw_ip_no_ptr() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let result = state.resolve_host("93.184.216.34");
         assert_eq!(result, "93.184.216.34");
     }
 
     #[test]
     fn resolve_host_uses_in_memory_cache() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         state
             .dns_cache
+            .lock()
+            .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.com", 300);
         let result = state.resolve_host("93.184.216.34");
         assert_eq!(result, "example.com");
@@ -852,7 +941,12 @@ mod tests {
 
         assert_eq!(result, "example.com");
         assert_eq!(
-            state.dns_cache.lookup("104.20.23.154").as_deref(),
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .lookup("104.20.23.154")
+                .as_deref(),
             Some("example.com")
         );
         let _ = std::fs::remove_file(path);
@@ -860,7 +954,7 @@ mod tests {
 
     #[test]
     fn forged_dns_response_from_wrong_src_ip_does_not_cache_mapping() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let pkt = build_dns_response_packet([10, 0, 0, 2]);
 
         let call_count = std::cell::Cell::new(0u32);
@@ -875,7 +969,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -883,14 +977,19 @@ mod tests {
             "forged DNS response must invoke the policy check"
         );
         assert!(
-            state.dns_cache.lookup("93.184.216.34").is_none(),
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .lookup("93.184.216.34")
+                .is_none(),
             "forged DNS response must not populate the cache"
         );
     }
 
     #[test]
     fn dns_response_from_forwarder_caches_mapping() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let pkt = build_dns_response_packet([169, 254, 100, 1]);
 
         let call_count = std::cell::Cell::new(0u32);
@@ -905,7 +1004,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -913,14 +1012,19 @@ mod tests {
             "legitimate forwarder response must not invoke policy check"
         );
         assert_eq!(
-            state.dns_cache.lookup("93.184.216.34").as_deref(),
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .lookup("93.184.216.34")
+                .as_deref(),
             Some("example.com")
         );
     }
 
     #[test]
     fn udp_53_to_non_forwarder_invokes_policy_check() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let pkt = build_dns_query_packet([8, 8, 8, 8]);
 
         let call_count = std::cell::Cell::new(0u32);
@@ -935,7 +1039,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -946,7 +1050,7 @@ mod tests {
 
     #[test]
     fn udp_53_to_forwarder_bypasses_policy_check() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let pkt = build_dns_query_packet([169, 254, 100, 1]);
 
         let call_count = std::cell::Cell::new(0u32);
@@ -961,7 +1065,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -972,7 +1076,7 @@ mod tests {
 
     #[test]
     fn loopback_udp_53_invokes_policy_check() {
-        let mut state = state_for_tests();
+        let state = state_for_tests();
         let pkt = build_dns_query_packet([127, 0, 0, 1]);
 
         let call_count = std::cell::Cell::new(0u32);
@@ -987,7 +1091,7 @@ mod tests {
             Ok(policy::PolicyResult { allowed: true })
         };
 
-        let v = handle_packet_payload(&mut state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),

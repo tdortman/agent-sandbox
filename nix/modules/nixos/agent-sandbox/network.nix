@@ -335,9 +335,12 @@ lib.mkIf policyEnabled (
               "53"
               "--cache-path"
               "/run/agent-sandbox/dns-cache.json"
+              "--push-socket"
+              "/run/agent-sandbox/dns-push.sock"
             ];
             Restart = "on-failure";
             KillMode = "control-group";
+            RuntimeDirectory = "agent-sandbox";
           };
         };
 
@@ -369,7 +372,10 @@ lib.mkIf policyEnabled (
               "${pkgs.nftables}/bin/nft"
               "--dns-server-ip"
               cfg.hostIp
+              "--push-socket"
+              "/run/agent-sandbox/dns-push.sock"
             ];
+            RuntimeDirectory = "agent-sandbox";
           };
           environment = {
             AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
