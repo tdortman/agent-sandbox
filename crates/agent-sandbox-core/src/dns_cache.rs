@@ -228,23 +228,23 @@ mod tests {
 
     #[test]
     fn persisted_cache_uses_wall_clock_expiry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
         let path = dir.path().join("dns-cache.json");
         let before = unix_now();
 
         let mut cache = DnsCache::new(Some(&path), 300);
         cache.remember("104.18.32.47", "example.com", 60);
 
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let file: CacheFile = serde_json::from_str(&raw).unwrap();
-        let entry = file.entries.get("104.18.32.47").unwrap();
+        let raw = std::fs::read_to_string(&path).expect("read persisted dns cache file");
+        let file: CacheFile = serde_json::from_str(&raw).expect("parse persisted dns cache json");
+        let entry = file.entries.get("104.18.32.47").expect("cache file should contain 104.18.32.47 entry");
         assert_eq!(entry.host, "example.com");
         assert!(entry.expires > before + 1.0);
     }
 
     #[test]
     fn lookup_reads_hostname_from_persisted_cache() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
         let path = dir.path().join("dns-cache.json");
 
         let mut writer = DnsCache::new(Some(&path), 300);
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn reload_picks_up_new_entries_without_recreating_cache() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
         let path = dir.path().join("dns-cache.json");
 
         let mut writer = DnsCache::new(Some(&path), 300);
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn lookup_without_reload_returns_none_for_disk_only_entries() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
         let path = dir.path().join("dns-cache.json");
 
         let mut writer = DnsCache::new(Some(&path), 300);
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn remember_ephemeral_does_not_touch_disk() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
         let path = dir.path().join("dns-cache.json");
 
         let mut cache = DnsCache::new(Some(&path), 300);
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn two_writers_preserve_both_mappings() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for dns cache test");
         let path = dir.path().join("dns-cache.json");
 
         // Writer A knows about IP 1.
@@ -335,8 +335,8 @@ mod tests {
         writer_b.remember("192.168.1.2", "host-b.example", 60);
 
         // Both mappings survive on disk.
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let file: CacheFile = serde_json::from_str(&raw).unwrap();
+        let raw = std::fs::read_to_string(&path).expect("read persisted dns cache file");
+        let file: CacheFile = serde_json::from_str(&raw).expect("parse persisted dns cache json");
         assert_eq!(file.entries.len(), 2, "expected both IPs in cache file");
         assert_eq!(
             file.entries.get("192.168.1.1").map(|e| &*e.host),

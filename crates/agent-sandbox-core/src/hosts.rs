@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn policy_host_uses_dns_cache() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
 
         let mut cache = DnsCache::new(Some(&path), 300);
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn policy_host_falls_back_to_ip_when_cache_miss() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
         let result = policy_host_for_connect("10.0.0.9", Some(&path));
         assert_eq!(result.policy_host, "10.0.0.9");
@@ -256,7 +256,7 @@ mod tests {
     fn cache_miss_returns_raw_ip_not_ptr() {
         // Even for an IP that would produce a PTR like "lb-*.github.com",
         // the policy host must be the raw IP literal on cache miss.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
 
         let result = policy_host_for_connect("93.184.216.34", Some(&path));
@@ -265,7 +265,7 @@ mod tests {
     }
     #[test]
     fn policy_host_for_ipv6_literal_cache_miss() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
         let result = policy_host_for_connect("::1", Some(&path));
         assert_eq!(result.policy_host, "::1");
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn policy_host_for_ipv6_literal_cache_hit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
         let mut cache = DnsCache::new(Some(&path), 300);
         cache.remember("2001:db8::1", "ipv6.example.com", 300);
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn policy_host_for_bracketed_ipv6_literal_uses_normalized_cache_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
         let mut cache = DnsCache::new(Some(&path), 300);
         cache.remember("2001:db8::1", "ipv6.example.com", 300);

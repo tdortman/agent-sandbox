@@ -280,8 +280,8 @@ mod tests {
         policy.filesystem.allow = vec![FilesystemRule::new("/home/user/.omp", FileAccess::All, "")];
         let path = std::env::temp_dir().join("agent-sandbox-write-home.json");
         let _ = std::fs::remove_file(&path);
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
+        let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(
             raw.contains("\"~/.omp\""),
             "home path must serialize as ~/...: {raw}"
@@ -295,8 +295,8 @@ mod tests {
         policy.filesystem.allow = vec![FilesystemRule::new("/nix/store", FileAccess::All, "")];
         let path = std::env::temp_dir().join("agent-sandbox-write-nonhome.json");
         let _ = std::fs::remove_file(&path);
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
+        let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(
             raw.contains("\"/nix/store\""),
             "non-home path must stay absolute: {raw}"
@@ -317,7 +317,7 @@ mod tests {
         ];
         let path = std::env::temp_dir().join("agent-sandbox-write-network-order.json");
         let _ = std::fs::remove_file(&path);
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
         let loaded = load_policy(&path, Some("/home/user"));
         let hosts: Vec<&str> = loaded
             .network
@@ -350,9 +350,9 @@ mod tests {
                 "deny": [ { "path": "~/.cache/secret", "access": "read" } ]
             }
         }"#;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("policy.json");
-        std::fs::write(&path, raw).unwrap();
+        std::fs::write(&path, raw).expect("write file");
         let loaded = load_policy(&path, Some(home));
         assert_eq!(loaded.filesystem.allow[0].path, "/home/user/.omp");
         assert_eq!(loaded.filesystem.deny[0].path, "/home/user/.cache/secret");
@@ -369,24 +369,24 @@ mod tests {
                 "deny": []
             }
         }"#;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("policy.json");
-        std::fs::write(&path, raw).unwrap();
+        std::fs::write(&path, raw).expect("write file");
         let loaded = load_policy(&path, Some(home));
         assert_eq!(loaded.filesystem.allow[0].path, "/home/user2/.cache");
     }
 
     #[test]
     fn load_policy_round_trip_through_disk() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("policy.json");
         let mut policy = crate::policy::Policy::default();
         policy.filesystem.allow = vec![
             FilesystemRule::new("/home/user/.omp", FileAccess::All, ""),
             FilesystemRule::new("/nix/store", FileAccess::Read, ""),
         ];
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
+        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
+        let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(raw.contains("\"~/.omp\""), "raw: {raw}");
         assert!(raw.contains("\"/nix/store\""), "raw: {raw}");
         let loaded = load_policy(&path, Some("/home/user"));

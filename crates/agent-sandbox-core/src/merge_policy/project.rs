@@ -159,9 +159,9 @@ mod tests {
 
     #[test]
     fn project_root_returns_explicit_value() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let repo = tmp.path().join("dotfiles");
-        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&repo).expect("create dirs");
 
         let ctx = ProjectPolicyContext::new(None, None, Some(&repo));
         assert_eq!(ctx.project_root(), Some(repo.as_path()));
@@ -175,11 +175,11 @@ mod tests {
 
     #[test]
     fn explicit_project_root_beats_ephemeral_cwd() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let repo = tmp.path().join("dotfiles");
-        fs::create_dir_all(repo.join(".agent-sandbox")).unwrap();
+        fs::create_dir_all(repo.join(".agent-sandbox")).expect("create dirs");
         let ephemeral = tmp.path().join("omp-python-runner");
-        fs::create_dir(&ephemeral).unwrap();
+        fs::create_dir(&ephemeral).expect("create dirs");
 
         let ctx = ProjectPolicyContext::new(None, Some(&ephemeral), Some(&repo));
         assert_eq!(ctx.project_root(), Some(repo.as_path()));
@@ -187,14 +187,14 @@ mod tests {
 
     #[test]
     fn cwd_repo_local_policy_does_not_infer_project_root() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let repo = tmp.path().join("proj");
-        fs::create_dir_all(repo.join(".agent-sandbox")).unwrap();
+        fs::create_dir_all(repo.join(".agent-sandbox")).expect("create dirs");
         fs::write(
             repo.join(".agent-sandbox/policy.json"),
             r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
         )
-        .unwrap();
+        .expect("write file");
 
         let ctx = ProjectPolicyContext::new(None, Some(&repo), None);
         assert_eq!(ctx.project_root(), None);
@@ -202,10 +202,10 @@ mod tests {
 
     #[test]
     fn infers_home_from_project_root() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let home = tmp.path().join("home/user");
         let repo = home.join("dotfiles");
-        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&repo).expect("create dirs");
 
         let ctx = ProjectPolicyContext::new(None, None, Some(&repo));
         assert_eq!(ctx.home_hint(), Some(home.to_string_lossy().into_owned()));
@@ -213,10 +213,10 @@ mod tests {
 
     #[test]
     fn infers_home_from_cwd() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let home = tmp.path().join("home/user");
         let cwd = home.join("repo");
-        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&cwd).expect("create dirs");
 
         let ctx = ProjectPolicyContext::new(None, Some(&cwd), None);
         assert_eq!(ctx.home_hint(), Some(home.to_string_lossy().into_owned()));
@@ -224,11 +224,11 @@ mod tests {
 
     #[test]
     fn explicit_home_beats_inference() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let explicit_home = tmp.path().join("explicit-home");
-        fs::create_dir_all(&explicit_home).unwrap();
+        fs::create_dir_all(&explicit_home).expect("create dirs");
         let cwd = tmp.path().join("repo");
-        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&cwd).expect("create dirs");
 
         let ctx = ProjectPolicyContext::new(Some(&explicit_home), Some(&cwd), None);
         assert_eq!(
@@ -239,11 +239,11 @@ mod tests {
 
     #[test]
     fn trusted_project_policy_path_lives_outside_project_root() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let home = tmp.path().join("home/user");
         let repo = home.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let path = trusted_project_policy_path(&home, &repo).unwrap();
+        std::fs::create_dir_all(&repo).expect("create dirs");
+        let path = trusted_project_policy_path(&home, &repo).expect("trusted project policy path");
         let s = path.to_string_lossy();
         assert!(s.contains(".config/agent-sandbox/projects/"), "got: {s}");
         assert!(s.ends_with("/policy.json"), "got: {s}");
@@ -278,9 +278,9 @@ mod tests {
 
     #[test]
     fn trusted_project_policy_path_rejects_invalid_project_root() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let home = tmp.path().join("home/user");
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&home).expect("create dirs");
         let err =
             trusted_project_policy_path(&home, Path::new("/nonexistent/path/here")).unwrap_err();
         assert!(

@@ -140,10 +140,10 @@ mod tests {
     fn non_response_returns_empty() {
         let mut message = Message::new();
         message.add_query(Query::query(
-            Name::from_ascii("test.").unwrap(),
+            Name::from_ascii("test.").expect("valid name"),
             RecordType::A,
         ));
-        let pkt = message.to_vec().unwrap();
+        let pkt = message.to_vec().expect("encode");
         assert!(mappings_from_response(&pkt).is_empty());
     }
 }
