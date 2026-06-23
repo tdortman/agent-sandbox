@@ -156,18 +156,19 @@ mod tests {
 
     #[test]
     fn atomic_write_text_preserves_symlink() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
         let real_dir = tmp.path().join("dotfiles/home/dot_config/agent-sandbox");
         let link_dir = tmp.path().join("home/.config/agent-sandbox");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).expect("create real dir");
+        std::fs::create_dir_all(&link_dir).expect("create link dir");
         let real = real_dir.join("policy.json");
         let link = link_dir.join("policy.json");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
 
-        atomic_write_text(&link, "{}\n").unwrap();
+        atomic_write_text(&link, "{}
+").expect("write policy via symlink");
 
         assert!(link.is_symlink());
-        assert_eq!(std::fs::read_to_string(real).unwrap(), "{}\n");
+        assert_eq!(std::fs::read_to_string(real).expect("read policy file"), "{}\n");
     }
 }

@@ -207,7 +207,7 @@ mod tests {
             session_id: "omp1".into(),
             ui_client: "omp".into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(
-                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+                tokio::net::UnixStream::pair().expect("unix stream pair").0.into_split().1,
             )),
             owner_uid: 1000,
             owner_pid,
@@ -310,7 +310,7 @@ mod tests {
             session_id: "ui1".into(),
             ui_client: "standalone".into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(
-                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+                tokio::net::UnixStream::pair().expect("unix stream pair").0.into_split().1,
             )),
             owner_uid: 1000,
             owner_pid: 0,
@@ -338,7 +338,7 @@ mod tests {
             session_id: "ui1".into(),
             ui_client: "standalone".into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(
-                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+                tokio::net::UnixStream::pair().expect("unix stream pair").0.into_split().1,
             )),
             owner_uid: 1000,
             owner_pid: 0,
@@ -365,7 +365,7 @@ mod tests {
             session_id: "ui1".into(),
             ui_client: "standalone".into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(
-                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+                tokio::net::UnixStream::pair().expect("unix stream pair").0.into_split().1,
             )),
             owner_uid: 1000,
             owner_pid: 0,
@@ -385,7 +385,7 @@ mod tests {
             session_id: "ui1".into(),
             ui_client: "standalone".into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(
-                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+                tokio::net::UnixStream::pair().expect("unix stream pair").0.into_split().1,
             )),
             owner_uid: 1000,
             owner_pid: 0,
@@ -411,7 +411,7 @@ mod tests {
             session_id: "ui1".into(),
             ui_client: "standalone".into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(
-                tokio::net::UnixStream::pair().unwrap().0.into_split().1,
+                tokio::net::UnixStream::pair().expect("unix stream pair").0.into_split().1,
             )),
             owner_uid: 1000,
             owner_pid: 0,

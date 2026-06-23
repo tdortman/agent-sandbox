@@ -500,7 +500,7 @@ mod tests {
                 ApprovalScope::Project,
                 Some(&target),
             )
-            .unwrap(),
+            .expect("resolve pending network target"),
             NetworkRuleKey::new("*.baz.com", 443)
         );
     }
@@ -529,7 +529,7 @@ mod tests {
                 ApprovalScope::Session,
                 Some(&target),
             )
-            .unwrap(),
+            .expect("resolve pending sudo target"),
             vec!["foo".to_string(), "bar".to_string()]
         );
     }
@@ -589,7 +589,7 @@ mod tests {
                 ApprovalScope::Session,
                 Some(&target),
             )
-            .unwrap(),
+            .expect("resolve pending filesystem target"),
             "/home/user/projects/foo"
         );
     }
@@ -644,7 +644,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create test store dir");
         PolicyStore::new(PolicydArgs {
             host_socket: dir.join("policy.sock"),
             sandbox_socket: dir.join("sandbox-policy.sock"),
@@ -659,7 +659,7 @@ mod tests {
     }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {
-        Arc::new(Mutex::new(UnixStream::pair().unwrap().0.into_split().1))
+        Arc::new(Mutex::new(UnixStream::pair().expect("unix stream pair").0.into_split().1))
     }
 
     fn ui_session_context() -> UiSessionContext {

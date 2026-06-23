@@ -525,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn omp_grace_ignores_existing_standalone_ui() {
         let store = test_store();
-        let (a, _) = UnixStream::pair().unwrap();
+        let (a, _) = UnixStream::pair().expect("unix stream pair");
         let (_, standalone_write) = a.into_split();
         {
             let mut inner = store.inner.lock().await;
@@ -568,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn connected_omp_receives_network_prompt_by_path_without_session() {
         let store = test_store();
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
         let (_, omp_write) = a.into_split();
         let (mut omp_read, _) = b.into_split();
         {
@@ -633,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_delivered_network_pending_not_resent_to_omp() {
         let store = test_store();
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
         let (_, omp_write) = a.into_split();
         let (mut omp_read, _) = b.into_split();
 
@@ -686,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn notify_network_ui_sends_to_standalone_and_tracks_id() {
         let store = test_store();
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
         let (_, standalone_write) = a.into_split();
         let (mut standalone_read, _) = b.into_split();
 
@@ -759,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn filesystem_standalone_matching_works() {
         let store = test_store();
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
         let (_, fs_write) = a.into_split();
         let (mut fs_read, _) = b.into_split();
 
