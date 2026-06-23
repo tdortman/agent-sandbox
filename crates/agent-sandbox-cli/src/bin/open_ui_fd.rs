@@ -50,6 +50,10 @@ fn fatal(msg: &str) -> ! {
     process::exit(1);
 }
 
+fn cstring(s: impl AsRef<[u8]>) -> CString {
+    CString::new(s.as_ref()).expect("interior NUL in argv token")
+}
+
 /// Build the child argv from launcher args, inserting --sync-fd and --setenv
 /// lines before the bwrap `--` command separator so the UI stream reaches OMP.
 /// When no `--` separator is present, returns None (caller sets env vars).
@@ -62,22 +66,22 @@ fn build_child_args(
     let bwrap_sep = args.iter().position(|a| a == "--")?;
     let mut v: Vec<CString> = args[..bwrap_sep]
         .iter()
-        .map(|s| CString::new(s.as_bytes()).expect("interior NUL"))
+        .map(|s| cstring(s.as_bytes()))
         .collect();
-    v.push(CString::new("--sync-fd").unwrap());
-    v.push(CString::new(ui_fd.to_string()).unwrap());
-    v.push(CString::new("--setenv").unwrap());
-    v.push(CString::new("AGENT_SANDBOX_UI_FD").unwrap());
-    v.push(CString::new(ui_fd.to_string()).unwrap());
-    v.push(CString::new("--setenv").unwrap());
-    v.push(CString::new("AGENT_SANDBOX_UI_SESSION_ID").unwrap());
-    v.push(CString::new(session_id.as_bytes()).unwrap());
-    v.push(CString::new("--setenv").unwrap());
-    v.push(CString::new("AGENT_SANDBOX_SESSION_ID").unwrap());
-    v.push(CString::new(sandbox_session_id.as_bytes()).unwrap());
-    v.push(CString::new("--").unwrap());
+    v.push(cstring("--sync-fd"));
+    v.push(cstring(ui_fd.to_string()));
+    v.push(cstring("--setenv"));
+    v.push(cstring("AGENT_SANDBOX_UI_FD"));
+    v.push(cstring(ui_fd.to_string()));
+    v.push(cstring("--setenv"));
+    v.push(cstring("AGENT_SANDBOX_UI_SESSION_ID"));
+    v.push(cstring(session_id.as_bytes()));
+    v.push(cstring("--setenv"));
+    v.push(cstring("AGENT_SANDBOX_SESSION_ID"));
+    v.push(cstring(sandbox_session_id.as_bytes()));
+    v.push(cstring("--"));
     for s in &args[(bwrap_sep + 1)..] {
-        v.push(CString::new(s.as_bytes()).expect("interior NUL"));
+        v.push(cstring(s.as_bytes()));
     }
     Some(v)
 }
@@ -108,10 +112,7 @@ fn exec_child(
             std::env::set_var("AGENT_SANDBOX_UI_SESSION_ID", session_id);
             std::env::set_var("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
         }
-        let child_args: Vec<CString> = args
-            .iter()
-            .map(|s| CString::new(s.as_bytes()).expect("interior NUL"))
-            .collect();
+        let child_args: Vec<CString> = args.iter().map(|s| cstring(s.as_bytes())).collect();
         exec_cstrings(&child_args);
     }
 }
@@ -229,7 +230,7 @@ mod tests {
             .expect("should have -- separator");
         let strs: Vec<String> = result
             .iter()
-            .map(|c| c.to_str().unwrap().to_string())
+            .map(|c| c.to_str().expect("valid utf-8 argv token").to_string())
             .collect();
 
         assert!(strs.contains(&"--setenv".to_string()));
@@ -240,7 +241,10 @@ mod tests {
         assert!(strs.contains(&"AGENT_SANDBOX_SESSION_ID".to_string()));
         assert!(strs.contains(&"sandbox-sid-abc".to_string()));
 
-        let sync_pos = strs.iter().position(|s| s == "--sync-fd").unwrap();
+        let sync_pos = strs
+            .iter()
+            .position(|s| s == "--sync-fd")
+            .expect("--sync-fd in argv");
         assert_eq!(strs.get(sync_pos + 1).map(String::as_str), Some("7"));
 
         // bwrap options must appear before the command separator.
@@ -248,8 +252,11 @@ mod tests {
             .windows(2)
             .position(|w| w[0] == "--" && w[1] == "/bin/sh");
         assert!(cmd_sep.is_some(), "command -- separator not found");
-        let cmd_sep = cmd_sep.unwrap();
-        let setenv_pos = strs.iter().position(|s| s == "--setenv").unwrap();
+        let cmd_sep = cmd_sep.expect("command -- separator");
+        let setenv_pos = strs
+            .iter()
+            .position(|s| s == "--setenv")
+            .expect("--setenv in argv");
         assert!(
             sync_pos < cmd_sep,
             "--sync-fd must be before command -- separator"
