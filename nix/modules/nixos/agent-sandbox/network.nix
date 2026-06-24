@@ -242,6 +242,10 @@ lib.mkIf policyEnabled (
               "--fs-monitor-cmd"
               "${policyPkg}/bin/agent-sandbox-fsmon"
             ]
+            ++ lib.optionals (config.agent-sandbox.syscallGate.enable && config.agent-sandbox.network.enable) [
+              "--syscall-broker-cmd"
+              "${policyPkg}/bin/agent-sandbox-syscall-broker"
+            ]
           );
           StateDirectory = "agent-sandbox";
           Restart = "on-failure";

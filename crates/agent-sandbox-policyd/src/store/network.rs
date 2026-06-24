@@ -426,6 +426,7 @@ mod tests {
             interactive_approval: true,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         })
     }
 

@@ -655,11 +655,18 @@ mod tests {
             interactive_approval: true,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         })
     }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {
-        Arc::new(Mutex::new(UnixStream::pair().expect("unix stream pair").0.into_split().1))
+        Arc::new(Mutex::new(
+            UnixStream::pair()
+                .expect("unix stream pair")
+                .0
+                .into_split()
+                .1,
+        ))
     }
 
     fn ui_session_context() -> UiSessionContext {

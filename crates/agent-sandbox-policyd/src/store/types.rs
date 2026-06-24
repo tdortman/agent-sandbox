@@ -80,6 +80,8 @@ pub struct PolicydArgs {
     pub ui_spawn_cmd: Option<PathBuf>,
     /// Path to the agent-sandbox-fsmon binary.
     pub fs_monitor_cmd: Option<PathBuf>,
+    /// Path to the agent-sandbox-syscall-broker binary.
+    pub syscall_broker_cmd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

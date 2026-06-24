@@ -389,6 +389,7 @@ mod tests {
             interactive_approval: false,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -451,6 +452,7 @@ mod tests {
             interactive_approval: false,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -510,6 +512,7 @@ mod tests {
             interactive_approval: false,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -577,6 +580,7 @@ mod tests {
             interactive_approval: false,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -623,6 +627,7 @@ mod tests {
             interactive_approval: false,
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();

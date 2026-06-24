@@ -102,6 +102,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-sandbox-syscall"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seccompiler",
+]
+
+[[package]]
+name = "agent-sandbox-syscall-arm"
+version = "0.1.0"
+dependencies = [
+ "agent-sandbox-syscall",
+ "clap",
+ "libc",
+]
+
+[[package]]
+name = "agent-sandbox-syscall-broker"
+version = "0.1.0"
+dependencies = [
+ "agent-sandbox-core",
+ "agent-sandbox-syscall",
+ "clap",
+ "libc",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,6 +822,14 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "git+https://github.com/rust-vmm/seccompiler.git?rev=08587106340b8e3cb361c7561411510039436857#08587106340b8e3cb361c7561411510039436857"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "serde"

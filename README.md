@@ -36,6 +36,14 @@ Each sandbox runs in a dedicated network namespace (netns). A veth pair connects
 
 DNS responses are only honored when they arrive from the configured forwarder IP on port 53. A forged UDP/53 response from any other source falls through to the policy-boundary path and is not allowed to populate the IP-to-hostname cache. UDP/53 to any destination other than the configured forwarder is consulted against policy; only traffic to the forwarder on port 53 is treated as bypass. Loopback (`127.0.0.1`, `::1`) is also policy-bound, never bypassed.
 
+### Process-level syscall gate (seccomp)
+
+When the policy context is enabled (network, dynamic-FS, or sudo-approve), the wrapper prepends `agent-sandbox-syscall-arm` to the entry chain. The arm helper runs `prctl(PR_SET_NO_NEW_PRIVS)`, installs a seccomp BPF filter built with the `seccompiler` crate, hands the notification listener fd back to its parent via `SCM_RIGHTS` on a `SOCK_STREAM` socket pair, and execs the real agent. The host spawns `agent-sandbox-syscall-broker` to consume the listener.
+
+The broker uses `pidfd_open` + `pidfd_getfd` (Linux 5.6+) to obtain a usable fd for the tracee's socket, then queries `getsockopt(SO_TYPE)` to map the socket to a URL scheme: `SOCK_STREAM` becomes `tcp://`, `SOCK_DGRAM` becomes `udp://`. A failed lookup falls back to the syscall's default scheme. Cancellations from the UI produce a one-time `Deny` so the agent unblocks with `EACCES` rather than waiting for the approval timeout.
+
+The seccomp filter traps `connect`, `sendto`, `sendmsg`, and `sendmmsg`. The `sendmsg` used to bootstrap the `SCM_RIGHTS` handoff is intentionally not trapped. The arm and broker run on both x86_64 and aarch64.
+
 ### Local policy and host IPC boundary
 
 The trusted user and per-project policy files live under `~/.config/agent-sandbox/` on the host so the user can track them with a dotfiles manager. In dynamic filesystem mode the wrapper bind-mounts the entire host root, so by default that directory is writable from inside the sandbox. The wrapper rebinds `~/.config/agent-sandbox/` read-only on top of the broad bind, so the sandboxed agent cannot rewrite the trusted policy files even though they live in the user's home. Policyd (running on the host) and the user's `agent-sandbox-approve` CLI are the only writers.

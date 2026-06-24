@@ -173,6 +173,7 @@ rec {
       network ? null,
       sudoGuard ? null,
       fsArmPkg ? null,
+      syscallArmPkg ? null,
     }:
     let
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
@@ -183,16 +184,33 @@ rec {
 
       agentCombinators = import ./combinators.nix { inherit pkgs lib; } builtinCombinators;
 
-      entryPackage =
+      # Syscall gate: when wired, prepend `agent-sandbox-syscall-arm --` to
+      # the entry chain. The arm helper installs a seccomp filter inside the
+      # sandbox, then execs its argv tail. The chain is composable with the
+      # fs-arm helper so dynamic-FS and syscall-gate can both be active.
+      syscallGate = syscallArmPkg != null;
+      dynamicFs = fsArmPkg != null;
+
+      entryBase =
         if fsArmPkg != null then
+          "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package}"
+        else
+          lib.getExe package;
+      syscallArmPrefix =
+        if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
+
+      entryPackage =
+        if syscallGate || fsArmPkg != null then
           pkgs.writeShellScriptBin binName ''
-            exec ${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package} "$@"
+            exec ${syscallArmPrefix} ${entryBase} "$@"
           ''
         else
           package;
 
-      extraPkgs' = extraPkgs ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ];
-      dynamicFs = fsArmPkg != null;
+      extraPkgs' =
+        extraPkgs
+        ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ]
+        ++ lib.optionals (syscallArmPkg != null) [ syscallArmPkg ];
 
       staticAllowRules = [
         {
@@ -242,14 +260,14 @@ rec {
             extraBwrapArgs
             policySocket
             policyContext
-            sandboxPolicySocket
             network
             sudoGuard
+            fsArmPkg
+            syscallArmPkg
             runtimeReadonlyDirs
             commonPkgs
             devicePaths
             ;
-          extraPkgs = extraPkgs';
         }
         ++ lib.optionals (fsArmPkg != null) [
           (builtinCombinators.compose [
@@ -272,11 +290,7 @@ rec {
         [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
       sandboxPathStr = lib.makeBinPath sandboxPkgsList;
-      entryCmd =
-        if fsArmPkg != null then
-          "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package}"
-        else
-          lib.getExe package;
+      entryCmd = "${syscallArmPrefix} ${entryBase}";
       blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
       namespaceFlags =
         if hasNetwork then

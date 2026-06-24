@@ -18,6 +18,13 @@ let
   # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
   fsArmPkg = policyPkg;
 
+  # The Rust workspace package also installs agent-sandbox-syscall-arm and
+  # agent-sandbox-syscall-broker. We expose both as `syscallArmPkg` so the
+  # sandbox entry chain can prepend the arm helper that installs the seccomp
+  # user-notification filter; the broker is spawned by policyd (see the
+  # `agent-sandbox-nfq` / `agent-sandbox-policyd` systemd units).
+  syscallArmPkg = policyPkg;
+
   isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
 
   mountPathType = lib.types.addCheck lib.types.str (
@@ -148,8 +155,10 @@ let
       // lib.optionalAttrs cfg.filesystem.dynamicApproval.enable {
         inherit fsArmPkg;
       }
+      // lib.optionalAttrs (cfg.syscallGate.enable && cfg.network.enable) {
+        inherit syscallArmPkg;
+      }
     );
-
 in
 {
   options.agent-sandbox = {
@@ -340,6 +349,19 @@ in
           is used and there is no kernel-level filesystem mediation.
         '';
       };
+    };
+
+    syscallGate = {
+      enable = lib.mkEnableOption ''
+        kernel-mediated seccomp user-notification gate for packet-emitting syscalls.
+        The arm helper installs a seccomp filter inside the sandbox, then execs its
+        argv tail. The host-side broker (``agent-sandbox-syscall-broker``) consults policyd
+        before allowing or denying the syscall. The user-visible benefit is that a
+        short-timeout UDP client such as ``dig @1.1.1.1 +time=2`` blocks inside the
+        kernel until the approval prompt is answered, instead of returning before
+        the prompt renders. NFQUEUE remains in place as a backstop. Disabled by
+        default. When disabled, no syscall-arm helper or broker is wired.
+      '';
     };
   }
   // mountOptions;

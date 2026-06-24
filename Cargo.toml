@@ -8,6 +8,9 @@ members = [
     "crates/agent-sandbox-cli",
     "crates/agent-sandbox-fsmon",
     "crates/agent-sandbox-enter",
+    "crates/agent-sandbox-syscall",
+    "crates/agent-sandbox-syscall-broker",
+    "crates/agent-sandbox-syscall-arm",
 ]
 
 [workspace.package]
