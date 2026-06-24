@@ -1,7 +1,10 @@
-//! Extract A/AAAA answers from DNS response packets (`hickory-proto`).
+//! Extract policy-relevant IP→hostname mappings from DNS response packets.
+
+use std::collections::HashSet;
 
 use hickory_proto::op::{Message, MessageType};
-use hickory_proto::rr::RData;
+use hickory_proto::rr::rdata::svcb::SvcParamValue;
+use hickory_proto::rr::{Name, RData};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsMapping {
@@ -12,8 +15,11 @@ pub struct DnsMapping {
 
 fn query_name(message: &Message) -> Option<String> {
     let query = message.queries().first()?;
-    let name = query.name().to_ascii();
-    Some(name.trim_end_matches('.').to_lowercase())
+    Some(normalize_owner(query.name()))
+}
+
+fn normalize_owner(name: &Name) -> String {
+    name.to_ascii().trim_end_matches('.').to_lowercase()
 }
 
 fn ip_from_rdata(rdata: &RData) -> Option<String> {
@@ -22,6 +28,62 @@ fn ip_from_rdata(rdata: &RData) -> Option<String> {
         RData::AAAA(addr) => Some(addr.0.to_string()),
         _ => None,
     }
+}
+
+fn allowed_owner_names(message: &Message, qname: &str) -> HashSet<String> {
+    let mut allowed = HashSet::from([qname.to_string()]);
+    loop {
+        let mut added = false;
+        for record in message.answers() {
+            let owner = normalize_owner(record.name());
+            if !allowed.contains(&owner) {
+                continue;
+            }
+            if let Some(RData::CNAME(cname)) = record.data() {
+                let target = normalize_owner(&cname.0);
+                if allowed.insert(target) {
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    allowed
+}
+
+fn mappings_from_svcb_rdata(rdata: &RData, ttl: u32, qname: &str) -> Vec<DnsMapping> {
+    let svcb = match rdata {
+        RData::HTTPS(https) => &https.0,
+        RData::SVCB(svcb) => svcb,
+        _ => return Vec::new(),
+    };
+    let mut mappings = Vec::new();
+    for (_key, value) in svcb.svc_params() {
+        match value {
+            SvcParamValue::Ipv4Hint(hint) => {
+                for addr in &hint.0 {
+                    mappings.push(DnsMapping {
+                        ip: addr.0.to_string(),
+                        hostname: qname.to_string(),
+                        ttl,
+                    });
+                }
+            }
+            SvcParamValue::Ipv6Hint(hint) => {
+                for addr in &hint.0 {
+                    mappings.push(DnsMapping {
+                        ip: addr.0.to_string(),
+                        hostname: qname.to_string(),
+                        ttl,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    mappings
 }
 
 /// DNS response mapping used to correlate transport-layer destinations with hostnames.
@@ -36,19 +98,27 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     let Some(qname) = query_name(&message) else {
         return Vec::new();
     };
-    message
-        .answers()
-        .iter()
-        .filter_map(|record| {
-            let rdata = record.data()?;
-            let ip = ip_from_rdata(rdata)?;
-            Some(DnsMapping {
-                ip,
-                hostname: qname.clone(),
-                ttl: record.ttl(),
-            })
-        })
-        .collect()
+    let allowed = allowed_owner_names(&message, &qname);
+    let mut mappings = Vec::new();
+    for record in message.answers() {
+        let owner = normalize_owner(record.name());
+        if !allowed.contains(&owner) {
+            continue;
+        }
+        let ttl = record.ttl();
+        if let Some(rdata) = record.data() {
+            if let Some(ip) = ip_from_rdata(rdata) {
+                mappings.push(DnsMapping {
+                    ip,
+                    hostname: qname.clone(),
+                    ttl,
+                });
+            } else {
+                mappings.extend(mappings_from_svcb_rdata(rdata, ttl, &qname));
+            }
+        }
+    }
+    mappings
 }
 
 /// First question name in a packet (lowercase, no trailing dot).
