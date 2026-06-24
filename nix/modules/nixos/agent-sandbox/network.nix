@@ -336,6 +336,8 @@ lib.mkIf policyEnabled (
               cfg.hostIp
               "--listen-port"
               "53"
+              "--forward-target"
+              cfg.dnsForwardTarget
               "--cache-path"
               "/run/agent-sandbox/dns-cache.json"
               "--push-socket"
