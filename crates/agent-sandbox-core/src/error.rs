@@ -31,7 +31,7 @@ impl InvalidScopeError {
 pub enum ScopeResolveError {
     #[error(transparent)]
     InvalidScope(#[from] InvalidScopeError),
-    #[error("session_id required (OMP UI must be connected)")]
+    #[error("session_id required")]
     SessionRequired,
     #[error("home required for global scope")]
     HomeRequired,

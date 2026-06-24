@@ -351,13 +351,8 @@ impl PolicyStore {
             return scope_wire;
         }
 
-        let route = UiRoute::new(
-            fs.request_pid,
-            fs.cwd.clone(),
-            fs.home.clone(),
-            fs.project_root.clone(),
-        )
-        .with_sandbox_session(fs.sandbox_session_id.clone());
+        let route = UiRoute::new(fs.cwd.clone(), fs.project_root.clone())
+            .with_sandbox_session(fs.sandbox_session_id.clone());
         let session_ids = self.filesystem_session_ids_for_route(&route).await;
         if scope_wire
             .session_id
@@ -485,7 +480,6 @@ mod tests {
             cwd: None,
             home: None,
             project_root: None,
-            request_pid: None,
             sandbox_session_id: None,
         });
         let target = ApprovalTarget::NetworkHost {
@@ -514,7 +508,6 @@ mod tests {
             cwd: None,
             home: None,
             project_root: None,
-            request_pid: None,
             sandbox_session_id: None,
         });
         let target = ApprovalTarget::SudoCommand {
@@ -544,7 +537,6 @@ mod tests {
             cwd: None,
             home: None,
             project_root: None,
-            request_pid: None,
             sandbox_session_id: None,
         });
         let target = ApprovalTarget::FilesystemPath {
@@ -574,7 +566,6 @@ mod tests {
             cwd: None,
             home: None,
             project_root: None,
-            request_pid: None,
             sandbox_session_id: None,
         });
         let target = ApprovalTarget::FilesystemPath {
@@ -604,7 +595,6 @@ mod tests {
             cwd: None,
             home: None,
             project_root: None,
-            request_pid: None,
             sandbox_session_id: None,
         });
         // Once scope: exact match is valid
@@ -683,32 +673,16 @@ mod tests {
         inner.ui_clients.insert(
             1,
             UiClient {
-                session_id: "omp-session".into(),
-                ui_client: "omp".into(),
+                session_id: "ui-session".into(),
                 writer: writer(),
-                owner_uid: 1000,
-                owner_pid: std::process::id(),
             },
         );
         inner
             .ui_context_by_session
-            .insert("omp-session".into(), ui_session_context());
-        inner.ui_clients.insert(
-            2,
-            UiClient {
-                session_id: "standalone-session".into(),
-                ui_client: "standalone".into(),
-                writer: writer(),
-                owner_uid: 1000,
-                owner_pid: 0,
-            },
-        );
-        inner
-            .ui_context_by_session
-            .insert("standalone-session".into(), ui_session_context());
+            .insert("ui-session".into(), ui_session_context());
     }
 
-    fn pending_filesystem(request_pid: Option<u32>) -> PendingFilesystem {
+    fn pending_filesystem() -> PendingFilesystem {
         PendingFilesystem {
             id: "fs1".into(),
             created_at: 0.0,
@@ -717,7 +691,6 @@ mod tests {
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
-            request_pid,
             sandbox_session_id: None,
         }
     }
@@ -765,37 +738,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_session_approval_uses_omp_owner_session() {
-        let store = test_store("omp-owner");
+    async fn filesystem_session_approval_binds_to_submitting_session() {
+        let store = test_store("ui-session");
         add_ui_sessions(&store).await;
-        approve_filesystem_session(
-            &store,
-            pending_filesystem(Some(std::process::id())),
-            "standalone-session",
-        )
-        .await;
+        approve_filesystem_session(&store, pending_filesystem(), "ui-session").await;
 
         {
             let inner = store.inner.lock().await;
-            assert!(inner.session_filesystem_allow.contains_key("omp-session"));
-            assert!(
-                !inner
-                    .session_filesystem_allow
-                    .contains_key("standalone-session")
-            );
+            assert!(inner.session_filesystem_allow.contains_key("ui-session"));
         }
 
         assert!(
             store
-                .session_filesystem_allowed(
-                    "/home/user/projects/foo/src/lib.rs",
-                    FileAccess::Read,
-                    merge_context(Some(std::process::id())),
-                )
-                .await
-        );
-        assert!(
-            !store
                 .session_filesystem_allowed(
                     "/home/user/projects/foo/src/lib.rs",
                     FileAccess::Read,
@@ -809,15 +763,11 @@ mod tests {
     async fn filesystem_session_approval_keeps_standalone_session() {
         let store = test_store("standalone");
         add_ui_sessions(&store).await;
-        approve_filesystem_session(&store, pending_filesystem(None), "standalone-session").await;
+        approve_filesystem_session(&store, pending_filesystem(), "ui-session").await;
 
         {
             let inner = store.inner.lock().await;
-            assert!(
-                inner
-                    .session_filesystem_allow
-                    .contains_key("standalone-session")
-            );
+            assert!(inner.session_filesystem_allow.contains_key("ui-session"));
         }
 
         assert!(
@@ -843,10 +793,7 @@ mod tests {
                     client_id,
                     UiClient {
                         session_id: ui_session_id.into(),
-                        ui_client: "standalone".into(),
                         writer: writer(),
-                        owner_uid: 1000,
-                        owner_pid: 0,
                     },
                 );
                 inner.ui_context_by_session.insert(

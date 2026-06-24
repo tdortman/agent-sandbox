@@ -16,11 +16,11 @@ mod ui;
 mod ui_route;
 mod util;
 
+pub(crate) use types::UiSessionContext;
 pub use types::{
     Pending, PendingElevation, PendingFilesystem, PendingKind, PendingNetwork, PolicyStore,
     PolicydArgs, UiClientHandle,
 };
-pub(crate) use types::{UiSessionContext, UiSessionOwner};
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -45,7 +45,6 @@ impl PolicyStore {
                 session_sudo_deny: HashMap::new(),
                 session_filesystem_allow: HashMap::new(),
                 session_filesystem_deny: HashMap::new(),
-                network_pending_delivered_to_standalone: HashSet::new(),
                 network_verdict_cache: HashMap::new(),
                 filesystem_verdict_cache: HashMap::new(),
             }),

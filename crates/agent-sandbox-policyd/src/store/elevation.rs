@@ -138,7 +138,6 @@ impl PolicyStore {
                     cwd: cwd.clone(),
                     home: home.clone(),
                     project_root: project_root.clone(),
-                    request_pid: wire_ids.pid().filter(|&p| p != 0),
                     sandbox_session_id: sandbox_session_id.clone(),
                 }),
             );
@@ -146,13 +145,8 @@ impl PolicyStore {
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
 
-        let route = UiRoute::new(
-            wire_ids.pid().filter(|&p| p != 0),
-            cwd.clone(),
-            home.clone(),
-            project_root.clone(),
-        )
-        .with_sandbox_session(sandbox_session_id.clone());
+        let route = UiRoute::new(cwd.clone(), project_root.clone())
+            .with_sandbox_session(sandbox_session_id.clone());
         self.notify_ui(
             &route,
             &UiPush::ElevationRequest {
@@ -164,7 +158,7 @@ impl PolicyStore {
             },
         )
         .await;
-        if !self.has_ui_for_route(&route).await && !self.route_owned_by_omp_ui(&route).await {
+        if !self.has_ui_for_route(&route).await {
             let mut spawn_uid = wire_ids.uid();
             if spawn_uid.is_none_or(|u| u == 0)
                 && let Some(h) = &home
@@ -203,7 +197,9 @@ impl PolicyStore {
                     allowed: false,
                     exit_code: 1,
                     stdout: String::new(),
-                    stderr: "agent-sandbox: no policy UI registered (OMP extension, agent-sandbox-ui, or auto-spawn)".into(),
+                    stderr:
+                        "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)"
+                            .into(),
                 };
             }
         }

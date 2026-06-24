@@ -43,7 +43,7 @@ impl NetworkRequestIdentity<'_> {
 }
 
 impl PolicyStore {
-    /// Finish pending network checks that declarative/session policy already allows (e.g. after OMP registers).
+    /// Finish pending network checks that declarative/session policy already allows (e.g. after a UI client registers).
     pub async fn resolve_pending_declarative_allow(&self) {
         let pending: Vec<Pending> = self
             .inner
@@ -107,9 +107,6 @@ impl PolicyStore {
         verdict_cache_key: Option<NetworkVerdictKey>,
     ) {
         let mut inner = self.inner.lock().await;
-        inner
-            .network_pending_delivered_to_standalone
-            .remove(pending_id);
         if let Some(waiters) = inner.network_futures.remove(pending_id) {
             let reply = if allowed {
                 CheckReply::allowed(source)
@@ -237,31 +234,18 @@ impl PolicyStore {
                         cwd: cwd.clone(),
                         home: home.clone(),
                         project_root: project_root.clone(),
-                        request_pid: wire_ids.pid().filter(|&p| p != 0),
                         sandbox_session_id: sandbox_session_id.clone(),
                     }),
                 );
                 (pending_id, true)
             }
         };
-
-        let route = UiRoute::new(
-            wire_ids.pid().filter(|&p| p != 0),
-            cwd.clone(),
-            home.clone(),
-            project_root.clone(),
-        )
-        .with_sandbox_session(sandbox_session_id.clone());
+        let route = UiRoute::new(cwd.clone(), project_root.clone())
+            .with_sandbox_session(sandbox_session_id.clone());
         if created_prompt {
             Self::audit("pending", Some(&policy_host), Some(port), &scheme);
-            // OMP grace: give OMP a moment to register for sandbox-scoped requests.
-            // After grace, always notify the UI (OMP-first via notify_network_ui,
-            // falling through to standalone) so existing OMP connections receive
-            // the prompt immediately. No reconnect or flush required.
-            if sandbox_session_id.is_some() {
-                let grace = Duration::from_secs(3);
-                self.wait_for_omp_ui_client(&route, grace).await;
-            }
+            // Notify immediately. Late UI registration is flushed by
+            // `RegisterUi` in `server::client` (see `flush_pending_to_ui`).
             self.notify_network_ui(
                 &route,
                 &UiPush::NetworkRequest {
@@ -310,9 +294,6 @@ impl PolicyStore {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.network_futures.remove(&pending_id);
-                inner
-                    .network_pending_delivered_to_standalone
-                    .remove(&pending_id);
                 inner.network_verdict_cache.insert(
                     NetworkVerdictKey {
                         host: policy_host.clone(),
@@ -327,7 +308,7 @@ impl PolicyStore {
                 enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
                 tracing::warn!(%policy_host, port, "network approval blocked (no policy UI)");
                 return CheckReply::blocked(
-                    "agent-sandbox: no policy UI registered (OMP extension, agent-sandbox-ui, or auto-spawn)",
+                    "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
                 );
             }
         }
@@ -339,9 +320,6 @@ impl PolicyStore {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.network_futures.remove(&pending_id);
-                inner
-                    .network_pending_delivered_to_standalone
-                    .remove(&pending_id);
                 inner.network_verdict_cache.insert(
                     NetworkVerdictKey {
                         host: policy_host.clone(),
@@ -379,7 +357,6 @@ mod tests {
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
-            request_pid: Some(42),
             sandbox_session_id: sandbox_session_id.map(str::to_string),
         }
     }
@@ -461,7 +438,6 @@ mod tests {
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
-            request_pid: Some(42),
             sandbox_session_id: Some("sandbox-cap".into()),
         }
     }
@@ -524,20 +500,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omp_grace_ignores_existing_standalone_ui() {
+    async fn connected_ui_receives_network_prompt_by_path_without_session() {
         let store = test_store();
-        let (a, _) = UnixStream::pair().expect("unix stream pair");
-        let (_, standalone_write) = a.into_split();
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
+        let (_, ui_write) = a.into_split();
+        let (mut ui_read, _) = b.into_split();
         {
             let mut inner = store.inner.lock().await;
             inner.ui_clients.insert(
                 1,
                 UiClient {
                     session_id: "ui1".into(),
-                    ui_client: "standalone".into(),
-                    writer: Arc::new(Mutex::new(standalone_write)),
-                    owner_uid: 1000,
-                    owner_pid: 0,
+                    writer: Arc::new(Mutex::new(ui_write)),
                 },
             );
             inner.ui_context_by_session.insert(
@@ -546,63 +520,13 @@ mod tests {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
-                    sandbox_session_id: Some("sandbox-a".into()),
-                },
-            );
-        }
-        let route = UiRoute::new(
-            None,
-            Some("/repo".into()),
-            Some("/home/user".into()),
-            Some("/repo".into()),
-        )
-        .with_sandbox_session(Some("sandbox-a".into()));
-
-        assert!(
-            !store
-                .wait_for_omp_ui_client(&route, Duration::from_millis(60))
-                .await
-        );
-        assert!(store.has_ui_for_route(&route).await);
-    }
-
-    #[tokio::test]
-    async fn connected_omp_receives_network_prompt_by_path_without_session() {
-        let store = test_store();
-        let (a, b) = UnixStream::pair().expect("unix stream pair");
-        let (_, omp_write) = a.into_split();
-        let (mut omp_read, _) = b.into_split();
-        {
-            let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "omp1".into(),
-                    ui_client: "omp".into(),
-                    writer: Arc::new(Mutex::new(omp_write)),
-                    owner_uid: 1000,
-                    owner_pid: 1000,
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "omp1".into(),
-                UiSessionContext {
-                    cwd: Some("/repo".into()),
-                    home: Some("/home/user".into()),
-                    project_root: Some("/repo".into()),
                     sandbox_session_id: None,
                 },
             );
         }
-        let route = UiRoute::new(
-            None,
-            Some("/repo".into()),
-            Some("/home/user".into()),
-            Some("/repo".into()),
-        )
-        .with_sandbox_session(Some("sandbox-a".into()));
+        let route = UiRoute::new(Some("/repo".into()), Some("/repo".into()));
         let payload = UiPush::NetworkRequest {
-            id: "net:omp".into(),
+            id: "net:ui".into(),
             host: Some("example.com".into()),
             port: Some(443),
             scheme: Some("tcp".into()),
@@ -615,77 +539,16 @@ mod tests {
         store.notify_network_ui(&route, &payload).await;
 
         let mut buf = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(1), omp_read.read(&mut buf))
+        let n = tokio::time::timeout(Duration::from_secs(1), ui_read.read(&mut buf))
             .await
-            .expect("OMP should receive notification")
+            .expect("UI should receive notification")
             .expect("read should succeed");
         let received = String::from_utf8_lossy(&buf[..n]);
-        assert!(received.contains("net:omp"), "got: {received}");
-        assert!(
-            !store
-                .inner
-                .lock()
-                .await
-                .network_pending_delivered_to_standalone
-                .contains("net:omp")
-        );
+        assert!(received.contains("net:ui"), "got: {received}");
     }
 
     #[tokio::test]
-    async fn standalone_delivered_network_pending_not_resent_to_omp() {
-        let store = test_store();
-        let (a, b) = UnixStream::pair().expect("unix stream pair");
-        let (_, omp_write) = a.into_split();
-        let (mut omp_read, _) = b.into_split();
-
-        // Seed a network pending
-        {
-            let mut inner = store.inner.lock().await;
-            inner.pending.insert(
-                "net:1".into(),
-                Pending::Network(pending_network("example.com", Some("sandbox-a"))),
-            );
-            // Mark as already delivered to standalone
-            inner
-                .network_pending_delivered_to_standalone
-                .insert("net:1".into());
-            // Register OMP client that matches the route
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "omp1".into(),
-                    ui_client: "omp".into(),
-                    writer: Arc::new(Mutex::new(omp_write)),
-                    owner_uid: 1000,
-                    owner_pid: std::process::id(),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "omp1".into(),
-                UiSessionContext {
-                    cwd: Some("/repo".into()),
-                    home: Some("/home/user".into()),
-                    project_root: Some("/repo".into()),
-                    sandbox_session_id: Some("sandbox-a".into()),
-                },
-            );
-        }
-
-        // Flush should NOT send to OMP (already standalone-delivered)
-        store.flush_pending_to_ui().await;
-
-        // OMP read side should have nothing (timeout)
-        let mut buf = [0u8; 4];
-        let result =
-            tokio::time::timeout(Duration::from_millis(100), omp_read.read(&mut buf)).await;
-        assert!(
-            result.is_err(),
-            "OMP should not receive a notification for a standalone-delivered pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn notify_network_ui_sends_to_standalone_and_tracks_id() {
+    async fn notify_network_ui_sends_to_standalone() {
         let store = test_store();
         let (a, b) = UnixStream::pair().expect("unix stream pair");
         let (_, standalone_write) = a.into_split();
@@ -698,10 +561,7 @@ mod tests {
                 2,
                 UiClient {
                     session_id: "ui1".into(),
-                    ui_client: "standalone".into(),
                     writer: Arc::new(Mutex::new(standalone_write)),
-                    owner_uid: 1000,
-                    owner_pid: 0,
                 },
             );
             inner.ui_context_by_session.insert(
@@ -715,12 +575,7 @@ mod tests {
             );
         }
 
-        let route = UiRoute::new(
-            Some(42),
-            Some("/repo".into()),
-            Some("/home/user".into()),
-            Some("/repo".into()),
-        );
+        let route = UiRoute::new(Some("/repo".into()), Some("/repo".into()));
         let payload = UiPush::NetworkRequest {
             id: "net:2".into(),
             host: Some("example.com".into()),
@@ -746,15 +601,71 @@ mod tests {
             received.contains("net:2"),
             "standalone should receive network request for net:2, got: {received}"
         );
+    }
 
-        // Pending id should be tracked as standalone-delivered
-        let inner = store.inner.lock().await;
+    #[tokio::test]
+    async fn request_network_approval_prompts_already_registered_standalone_immediately() {
+        // A registered standalone UI must receive the network prompt without delay.
+        // Late UI registration is flushed by `RegisterUi` in `server::client`
+        // (see `flush_pending_to_ui`).
+        let store = Arc::new(test_store());
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
+        let (_, standalone_write) = a.into_split();
+        let (mut standalone_read, _) = b.into_split();
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                UiClient {
+                    session_id: "ui1".into(),
+                    writer: Arc::new(Mutex::new(standalone_write)),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                "ui1".into(),
+                UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-cap".into()),
+                },
+            );
+        }
+
+        let store_for_task = store.clone();
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_network_approval(unique_request("fast.example", 53))
+                .await
+        });
+
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_millis(200), standalone_read.read(&mut buf))
+            .await
+            .expect("standalone UI should receive network prompt within 200ms")
+            .expect("read should succeed");
+        let received = String::from_utf8_lossy(&buf[..n]);
         assert!(
-            inner
-                .network_pending_delivered_to_standalone
-                .contains("net:2"),
-            "net:2 should be tracked as standalone-delivered"
+            received.contains("net:") && received.contains("fast.example"),
+            "expected net: and fast.example in prompt, got: {received}"
         );
+
+        // Approve the pending so the spawned task does not hang on the rx channel.
+        let pending_id = {
+            let inner = store.inner.lock().await;
+            inner
+                .pending
+                .keys()
+                .find(|k| k.starts_with("net:"))
+                .cloned()
+                .expect("pending network request should be tracked")
+        };
+        store.finish_network(&pending_id, true, "test", None).await;
+
+        let reply = task.await.expect("task should not panic");
+        assert!(reply.allowed);
+        assert_eq!(reply.source, "test");
     }
 
     #[tokio::test]
@@ -771,10 +682,7 @@ mod tests {
                 3,
                 UiClient {
                     session_id: "ui2".into(),
-                    ui_client: "standalone".into(),
                     writer: Arc::new(Mutex::new(fs_write)),
-                    owner_uid: 1000,
-                    owner_pid: 0,
                 },
             );
             inner.ui_context_by_session.insert(
@@ -797,7 +705,6 @@ mod tests {
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
-            request_pid: Some(42),
             sandbox_session_id: None,
         });
         store

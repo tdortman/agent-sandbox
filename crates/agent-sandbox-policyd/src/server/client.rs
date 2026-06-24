@@ -33,8 +33,8 @@ pub async fn handle_client(
             reply(writer.clone(), &PolicydError::InvalidJson.into()).await;
             continue;
         };
-        let flush_pending = matches!(req, RpcRequest::RegisterUi { .. });
-        let is_omp_register = matches!(&req, RpcRequest::RegisterUi { ui_client, .. } if ui_client.as_deref() == Some("omp"));
+        let is_register = matches!(req, RpcRequest::RegisterUi { .. });
+        let flush_pending = is_register;
 
         let resp = match super::dispatch::dispatch(&store, &client, peer, role, req).await {
             Ok(v) => v,
@@ -46,12 +46,9 @@ pub async fn handle_client(
 
         reply(writer.clone(), &resp).await;
 
-        // Transition Host/Sandbox → UiFd after successful OMP RegisterUi.
+        // Transition Host/Sandbox → UiFd after a successful RegisterUi.
         // Future requests on this connection are UI-only (Approve, Deny, etc).
-        if (role == SocketRole::Host || role == SocketRole::Sandbox)
-            && is_omp_register
-            && resp.is_ok()
-        {
+        if (role == SocketRole::Host || role == SocketRole::Sandbox) && is_register {
             role = SocketRole::UiFd;
         }
 

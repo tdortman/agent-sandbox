@@ -15,7 +15,6 @@ let
   sandboxPkg = flake.package "agent-sandbox";
   policyPkg = sandboxPkg;
   enterBin = sandboxPkg;
-
   dnsTargetHost =
     let
       parts = lib.splitString ":" cfg.dnsForwardTarget;

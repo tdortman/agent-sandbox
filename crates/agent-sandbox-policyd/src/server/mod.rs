@@ -173,7 +173,8 @@ mod tests {
             "host RegisterUi should succeed, got: {reply:?}"
         );
 
-        // 2. RegisterUi to sandbox socket should be rejected.
+        // 2. RegisterUi to sandbox socket should succeed (any client kind is
+        //    allowed; the connection transitions to UiFd after this reply).
         let reply = send_and_recv(
             &args.sandbox_socket,
             RpcRequest::RegisterUi {
@@ -184,8 +185,8 @@ mod tests {
         .await
         .expect("sandbox RegisterUi");
         assert!(
-            matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
-            "sandbox RegisterUi should be rejected, got: {reply:?}"
+            matches!(&reply, RpcReply::RegisterUi(r) if r.ok),
+            "sandbox RegisterUi should succeed, got: {reply:?}"
         );
 
         // 3. StartFilesystemMonitor to sandbox socket should reach handler.
@@ -207,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_omp_connection_becomes_uifd_only() {
+    async fn registered_connection_becomes_uifd_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
@@ -223,13 +224,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // 1. Open a host socket connection and register as OMP.
+        // 1. Open a host socket connection and register a UI.
         let mut conn = RpcConnection::connect(&args.host_socket)
             .await
             .expect("connect host socket");
         let reply = conn
             .request(RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
+                ui_client: Some("standalone".into()),
                 ctx: RequestContext {
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
@@ -239,7 +240,7 @@ mod tests {
             .expect("RegisterUi");
         assert!(
             matches!(&reply, RpcReply::RegisterUi(r) if r.ok),
-            "OMP RegisterUi should succeed, got: {reply:?}"
+            "RegisterUi should succeed, got: {reply:?}"
         );
 
         // 2. On the same connection, Check should be rejected because
@@ -276,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_omp_receives_sandbox_network_push() {
+    async fn registered_ui_receives_sandbox_network_push() {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
@@ -296,7 +297,7 @@ mod tests {
             .expect("connect host socket");
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
+                ui_client: Some("standalone".into()),
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
                     home: Some("/home/user".into()),
@@ -351,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_omp_receives_sandbox_elevation_push() {
+    async fn registered_ui_receives_sandbox_elevation_push() {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
@@ -371,7 +372,7 @@ mod tests {
             .expect("connect host socket");
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
+                ui_client: Some("standalone".into()),
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
                     home: Some("/home/user".into()),
@@ -417,66 +418,6 @@ mod tests {
             "expected elevation push, got: {pushed:?}"
         );
 
-        server_task.abort();
-    }
-
-    #[tokio::test]
-    async fn sandbox_rejects_duplicate_omp_ui_registration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let args = test_args(&dir);
-        let store = Arc::new(PolicyStore::new(args.clone()));
-        let server = PolicyServer::new(
-            store.clone(),
-            args.host_socket.clone(),
-            args.sandbox_socket.clone(),
-        );
-
-        let server_task = tokio::spawn(async move {
-            let _ = server.run().await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // First registration from sandbox should succeed and the connection
-        // must stay alive (the real OMP extension holds its socket open).
-        let mut first_conn = RpcConnection::connect(&args.sandbox_socket)
-            .await
-            .expect("connect sandbox");
-        let reply = first_conn
-            .request(RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
-                ctx: RequestContext {
-                    sandbox_session_id: Some("s1".into()),
-                    ..Default::default()
-                },
-            })
-            .await
-            .expect("first sandbox omp RegisterUi");
-        assert!(
-            matches!(&reply, RpcReply::RegisterUi(r) if r.ok),
-            "first omp registration should succeed, got: {reply:?}"
-        );
-
-        // Second registration with same sandbox session from a different
-        // connection should be rejected while the first connection is live.
-        let reply = send_and_recv(
-            &args.sandbox_socket,
-            RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
-                ctx: RequestContext {
-                    sandbox_session_id: Some("s1".into()),
-                    ..Default::default()
-                },
-            },
-        )
-        .await
-        .expect("second sandbox omp RegisterUi");
-        assert!(
-            matches!(&reply, RpcReply::Error(e) if e.error.contains("already registered")),
-            "duplicate omp registration should be rejected, got: {reply:?}"
-        );
-
-        // Dropping first_conn closes it, which allows re-registration.
-        drop(first_conn);
         server_task.abort();
     }
 }

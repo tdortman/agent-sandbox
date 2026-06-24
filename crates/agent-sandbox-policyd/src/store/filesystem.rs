@@ -236,7 +236,6 @@ impl PolicyStore {
                         cwd: cwd.clone(),
                         home: home.clone(),
                         project_root: project_root.clone(),
-                        request_pid: wire_ids.pid().filter(|&p| p != 0),
                         sandbox_session_id: sandbox_session_id.clone(),
                     }),
                 );
@@ -244,13 +243,8 @@ impl PolicyStore {
             }
         }
 
-        let route = UiRoute::new(
-            wire_ids.pid().filter(|&p| p != 0),
-            cwd.clone(),
-            home.clone(),
-            project_root.clone(),
-        )
-        .with_sandbox_session(sandbox_session_id.clone());
+        let route = UiRoute::new(cwd.clone(), project_root.clone())
+            .with_sandbox_session(sandbox_session_id.clone());
 
         if created_prompt {
             let push = UiPush::FilesystemRequest {

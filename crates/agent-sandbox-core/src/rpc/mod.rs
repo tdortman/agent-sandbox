@@ -1,4 +1,4 @@
-//! JSON-line RPC types for policyd (OMP extension and CLIs depend on these shapes).
+//! JSON-line RPC types for policyd (UI clients and CLIs depend on these shapes).
 
 mod message;
 mod push;

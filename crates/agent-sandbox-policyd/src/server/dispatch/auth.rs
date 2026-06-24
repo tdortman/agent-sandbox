@@ -14,19 +14,17 @@ pub(crate) enum SocketRole {
 /// Whether the request is allowed on the sandbox socket.
 #[must_use]
 pub fn is_sandbox_request(req: &RpcRequest) -> bool {
-    match req {
-        RpcRequest::RegisterUi {
-            ui_client: Some(c), ..
-        } => c == "omp",
-        RpcRequest::Check { .. }
-        | RpcRequest::Elevate { .. }
-        | RpcRequest::CheckFilesystem { .. }
-        | RpcRequest::StartFilesystemMonitor { .. } => true,
-        _ => false,
-    }
+    matches!(
+        req,
+        RpcRequest::RegisterUi { .. }
+            | RpcRequest::Check { .. }
+            | RpcRequest::Elevate { .. }
+            | RpcRequest::CheckFilesystem { .. }
+            | RpcRequest::StartFilesystemMonitor { .. }
+    )
 }
 
-/// Whether the request is allowed on an inherited UI fd (already-registered OMP connection).
+/// Whether the request is allowed on an inherited UI fd (already-registered UI connection).
 #[must_use]
 pub fn is_uifd_request(req: &RpcRequest) -> bool {
     matches!(
@@ -79,7 +77,7 @@ mod tests {
                 static_allow: vec![],
             },
             RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
+                ui_client: Some("standalone".into()),
                 ctx: RequestContext::default(),
             },
         ] {
@@ -94,14 +92,6 @@ mod tests {
     #[test]
     fn sandbox_socket_rejects_control_ops() {
         for req in [
-            RpcRequest::RegisterUi {
-                ui_client: Some("standalone".into()),
-                ctx: RequestContext::default(),
-            },
-            RpcRequest::RegisterUi {
-                ui_client: None,
-                ctx: RequestContext::default(),
-            },
             RpcRequest::UnregisterUi,
             RpcRequest::Approve {
                 id: "p1".into(),
@@ -166,7 +156,7 @@ mod tests {
                 static_allow: vec![],
             },
             RpcRequest::RegisterUi {
-                ui_client: Some("omp".into()),
+                ui_client: Some("standalone".into()),
                 ctx: RequestContext::default(),
             },
             RpcRequest::UnregisterUi,
@@ -284,7 +274,7 @@ mod tests {
     #[test]
     fn uifd_rejects_register_ui() {
         let req = RpcRequest::RegisterUi {
-            ui_client: Some("omp".into()),
+            ui_client: Some("standalone".into()),
             ctx: RequestContext::default(),
         };
         assert!(

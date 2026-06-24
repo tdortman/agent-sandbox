@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
-//! Pre-register an OMP policy UI connection on the host policy socket,
-//! then exec the sandbox launcher with the connected stream on a
+//! Pre-register a policy UI connection on the host policy socket, then
+//! exec the sandbox launcher with the connected stream on a
 //! kernel-assigned fd communicated via AGENT_SANDBOX_UI_FD.
 //!
 //! The inherited fd is the ONLY approval path into the sandbox.  Future sandbox
@@ -55,8 +55,9 @@ fn cstring(s: impl AsRef<[u8]>) -> CString {
 }
 
 /// Build the child argv from launcher args, inserting --sync-fd and --setenv
-/// lines before the bwrap `--` command separator so the UI stream reaches OMP.
-/// When no `--` separator is present, returns None (caller sets env vars).
+/// lines before the bwrap `--` command separator so the policy UI client
+/// receives the inherited stream. When no `--` separator is present, returns
+/// None (caller sets env vars).
 fn build_child_args(
     args: &[String],
     ui_fd: libc::c_int,
@@ -136,7 +137,7 @@ fn main() {
 
     // 2. Send RegisterUi JSON line.
     let register = RpcRequest::RegisterUi {
-        ui_client: Some("omp".into()),
+        ui_client: Some("standalone".into()),
         ctx: RequestContext {
             cwd: Some(cli.cwd),
             home: Some(cli.home),
@@ -182,7 +183,7 @@ fn main() {
 
     // 5. Duplicate the connected stream to a kernel-assigned fd ≥ 3.
     //    Using F_DUPFD_CLOEXEC gives us a fresh fd with CLOEXEC set;
-    //    we then clear CLOEXEC so it survives exec → bwrap → OMP.
+    //    we then clear CLOEXEC so it survives exec → bwrap → the UI client.
     // SAFETY: fcntl F_DUPFD_CLOEXEC on a valid fd.
     let ui_fd = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if ui_fd < 0 {
@@ -192,7 +193,7 @@ fn main() {
     drop(stream);
 
     // 6. Clear FD_CLOEXEC so the fd survives exec.
-    //    The OMP extension must call fdctl.setCloseOnExec(fd) after wrapping the socket.
+    //    The UI client must clear CLOEXEC on the wrapped socket after receiving the fd.
     // SAFETY: fcntl F_GETFD / F_SETFD on a valid fd.
     let flags = unsafe { libc::fcntl(ui_fd, libc::F_GETFD) };
     if flags < 0 {

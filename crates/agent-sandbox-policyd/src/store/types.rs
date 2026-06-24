@@ -92,7 +92,6 @@ pub struct PendingElevation {
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
-    pub request_pid: Option<u32>,
     pub sandbox_session_id: Option<String>,
 }
 
@@ -107,7 +106,6 @@ pub struct PendingNetwork {
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
-    pub request_pid: Option<u32>,
     pub sandbox_session_id: Option<String>,
 }
 
@@ -120,7 +118,6 @@ pub struct PendingFilesystem {
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
-    pub request_pid: Option<u32>,
     pub sandbox_session_id: Option<String>,
 }
 
@@ -191,14 +188,6 @@ impl Pending {
         }
     }
 
-    pub fn request_pid(&self) -> Option<u32> {
-        match self {
-            Self::Elevation(p) => p.request_pid,
-            Self::Network(p) => p.request_pid,
-            Self::Filesystem(p) => p.request_pid,
-        }
-    }
-
     pub fn sandbox_session_id(&self) -> Option<&str> {
         match self {
             Self::Elevation(p) => p.sandbox_session_id.as_deref(),
@@ -206,12 +195,6 @@ impl Pending {
             Self::Filesystem(p) => p.sandbox_session_id.as_deref(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct UiSessionOwner {
-    pub uid: u32,
-    pub pid: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,11 +212,7 @@ pub struct UiClientHandle {
 
 pub(crate) struct UiClient {
     pub session_id: String,
-    pub ui_client: String,
     pub writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
-    #[allow(dead_code)]
-    pub owner_uid: u32,
-    pub owner_pid: u32,
 }
 
 pub struct PolicyStore {
@@ -258,5 +237,4 @@ pub(crate) struct StoreInner {
     pub session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,
     pub session_filesystem_allow: HashMap<String, HashSet<FilesystemRuleKey>>,
     pub session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
-    pub network_pending_delivered_to_standalone: HashSet<String>,
 }

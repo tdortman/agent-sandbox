@@ -1,32 +1,43 @@
 # agent-sandbox
 
-agent-sandbox wraps AI agent CLIs in a bubblewrap sandbox on NixOS. It intercepts network, filesystem, and sudo requests and prompts the user for approval through the Oh My Pi (OMP) extension or a Qt/zenity dialog.
+agent-sandbox wraps AI agent CLIs in a bubblewrap sandbox on NixOS. It intercepts network, filesystem, and sudo requests and prompts the user for approval through a standalone Qt/tty UI client.
 
 ## How it works
 
-The sandbox runs agent processes inside a bubblewrap jail. A policy daemon (policyd) merges rules from configuration files, holds unknown requests, and routes approval prompts to the user.
+The sandbox runs agent processes inside a bubblewrap jail. A policy daemon (policyd) merges rules from configuration files, holds unknown requests, and routes approval prompts to the user. Three different enforcers mediate access:
+
+- **NFQUEUE** captures outbound TCP SYN and UDP packets and consults policyd before releasing them. Loopback (`127.0.0.1`, `::1`) is policy-bound, never bypassed. DNS to the in-netns forwarder on port 53 always bypasses so name resolution can never be blocked.
+- **seccomp user notification** traps the tracee's `connect`, `sendto`, `sendmsg`, and `sendmmsg` syscalls at the kernel. A host-side broker receives the notification fd via `SCM_RIGHTS`, asks policyd for a verdict, and either continues the syscall or rewrites the return value to `EACCES`. This blocks the process itself, not just the packet, so UDP `sendto` cannot race past a prompt.
+- **fanotify** mediates filesystem access at the kernel level when dynamic approval is enabled. The first process inside each sandbox becomes `agent-sandbox-fs-arm`, which requests a fanotify monitor from policyd before execing the real entry point.
+
+Sudo elevation prepends the agent-sandbox guard to the sandbox PATH so that plain `sudo` inside the agent routes through policyd; an approved command runs as root on the host, not inside the bubblewrap jail. The host's `/run/wrappers/bin/sudo` is left untouched.
 
 ```mermaid
 sequenceDiagram
     participant Agent as Sandboxed Agent
     participant NFQ as NFQUEUE Enforcer
+    participant SEC as Seccomp Broker
     participant Daemon as Policy Daemon (policyd)
-    participant UI as Policy UI (OMP / Dialog)
+    participant UI as Policy UI (agent-sandbox-ui)
 
     Agent->>NFQ: Network Request (TCP SYN / UDP)
     activate NFQ
-    Note over NFQ: Packet held
     NFQ->>Daemon: Check(host, port)
-    activate Daemon
     Daemon->>UI: Prompt User
-    UI-->>Daemon: Verdict (Allow / Deny)
+    UI-->>Daemon: Verdict
     Daemon-->>NFQ: Return Verdict
-    deactivate Daemon
-    NFQ-->>Agent: Action (Release / Drop)
+    NFQ-->>Agent: Release / Drop
     deactivate NFQ
-```
 
-Sudo elevation and filesystem mediation follow the same flow, except they swap out the NFQUEUE enforcer (nfq) for their own respective handlers: a sudo shim for elevation, and fanotify for filesystem access. The OMP extension connects to `sandbox-policy.sock` inside the sandbox, registers once per session, and receives prompts in the OMP session TUI.
+    Agent->>SEC: connect / sendto / sendmsg
+    activate SEC
+    SEC->>Daemon: Check(target)
+    Daemon->>UI: Prompt User
+    UI-->>Daemon: Verdict
+    Daemon-->>SEC: Return Verdict
+    SEC-->>Agent: Continue / EACCES
+    deactivate SEC
+```
 
 ## Capabilities
 
@@ -140,7 +151,20 @@ Add the flake input and enable the module on a NixOS host.
 }
 ```
 
-See `./nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for the full list of NixOS options
+See `./nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for the full list of NixOS options.
+
+## Policy UI
+
+The `agent-sandbox-ui` binary is the long-lived UI client. It connects to the policyd host socket, registers for the current context, and surfaces incoming approval prompts (network, elevation, filesystem) over a Qt dialog or a tty menu.
+
+When a graphical session is detected, the UI tries backends in priority order:
+
+1. `agent-sandbox-qt-dialog` (a standalone Qt Widgets helper, no KDE or GTK dependency).
+2. `zenity` (fallback).
+
+`AGENT_SANDBOX_UI_BACKEND` can pin a specific backend (`qt-dialog`, `zenity`, `none`). `AGENT_SANDBOX_UI_PREFER_GRAPHICAL=1` forces graphical prompts even when no display is detected at startup. If no UI client is registered for a request, policyd spawns one on demand.
+
+`agent-sandbox-open-ui-fd` pre-registers a policyd UI connection on the host and execs the sandbox launcher with the connected stream on a kernel-assigned fd communicated via `AGENT_SANDBOX_UI_FD`. The inherited fd is the only approval path into the sandbox; later connections cannot register a UI or approve pending requests. Cancellations from the UI send a one-time `Deny` so the tracee unblocks with `EACCES` rather than waiting for the approval timeout.
 
 ## CLI
 
@@ -166,33 +190,18 @@ Each subcommand accepts `--home`, `--cwd`, and `--project-root` to override path
 
 `agent-sandbox-elevate` runs inside the sandbox to forward a command to policyd for host-side root execution.
 
-## OMP extension (Home Manager)
-
-The OMP extension registers as the `omp` policy UI client with policyd and handles network and elevation approval prompts inside OMP sessions.
-
-```nix
-{ inputs, ... }:
-{
-  home-manager.users.myuser = { ... }:
-  {
-    imports = [ inputs.agent-sandbox.homeModules.agent-sandbox ];
-    programs.agent-sandbox.ompExtension = {
-      enable = true;
-      agentDir = ".omp/agent";   # default
-    };
-  };
-}
-```
-
 ## Repository
 
-| Crate / directory          | Purpose                                                                          |
-| -------------------------- | -------------------------------------------------------------------------------- |
-| `agent-sandbox-core`       | Shared types, RPC protocol, policy model, host matching, DNS wire format.        |
-| `agent-sandbox-policyd`    | Policy daemon: merge, approval state, UI routing, session tracking.              |
-| `agent-sandbox-nfq`        | NFQUEUE network enforcer and packet interceptor.                                 |
-| `agent-sandbox-dns`        | DNS forwarder with IP-to-hostname caching.                                       |
-| `agent-sandbox-fsmon`      | Fanotify filesystem monitor and fs-arm helper.                                   |
-| `agent-sandbox-cli`        | CLI tools: `agent-sandbox-approve`, `agent-sandbox-elevate`, `agent-sandbox-ui`. |
-| `agent-sandbox-enter`      | `setns` wrapper to join a network namespace as an unprivileged process.          |
-| `extensions/agent-sandbox` | Oh My Pi extension (TypeScript) for approval prompts in the OMP TUI.             |
+| Crate / directory                      | Purpose                                                                                                      |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `agent-sandbox-core`                   | Shared types, RPC protocol, policy model, host matching, DNS wire format.                                    |
+| `agent-sandbox-policyd`                | Policy daemon: merge, approval state, UI routing, session tracking.                                          |
+| `agent-sandbox-nfq`                    | NFQUEUE network enforcer and packet interceptor.                                                             |
+| `agent-sandbox-syscall`                | Seccomp BPF builder (`seccompiler`) and shared policy tables.                                                |
+| `agent-sandbox-syscall-arm`            | In-sandbox child that installs the seccomp filter and hands the listener fd to the broker.                   |
+| `agent-sandbox-syscall-broker`         | Host-side seccomp user-notification broker; consults policyd per syscall.                                    |
+| `agent-sandbox-dns`                    | DNS forwarder with IP-to-hostname caching.                                                                   |
+| `agent-sandbox-fsmon`                  | Fanotify filesystem monitor and fs-arm helper.                                                               |
+| `agent-sandbox-cli`                    | CLI tools: `agent-sandbox-approve`, `agent-sandbox-elevate`, `agent-sandbox-ui`, `agent-sandbox-open-ui-fd`. |
+| `agent-sandbox-enter`                  | `setns` wrapper to join a network namespace as an unprivileged process.                                      |
+| `nix/packages/agent-sandbox/qt-helper` | Standalone Qt dialog helper binary (CMake + Qt6 Widgets).                                                    |
