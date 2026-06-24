@@ -327,62 +327,192 @@ enum DnsForwarderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{Ipv4Addr, SocketAddr};
 
-    use hickory_proto::op::Query;
-    use hickory_proto::rr::Name;
+    use hickory_proto::op::{Message, Query};
+    use hickory_proto::rr::rdata::TXT;
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-    fn example_query(record_type: RecordType) -> Message {
+    fn example_query(record_type: RecordType) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut query = Message::new();
         query
             .set_id(0x1234)
             .set_recursion_desired(true)
             .add_query(Query::query(name, record_type));
-        query
+        query.to_vec().expect("encode query")
+    }
+
+    fn test_forwarder(forward_target: SocketAddr) -> DnsForwarder {
+        DnsForwarder {
+            cache: Arc::new(std::sync::Mutex::new(DnsCache::new(
+                None::<PathBuf>,
+                DEFAULT_MAX_TTL,
+            ))),
+            max_ttl: DEFAULT_MAX_TTL,
+            verbose: false,
+            push_socket: Arc::new(std::sync::Mutex::new(None)),
+            push_socket_path: PathBuf::from("/nonexistent/dns-push.sock"),
+            forward_target,
+            forward_timeout: Duration::from_secs(2),
+        }
+    }
+
+    fn upstream_txt_response() -> Vec<u8> {
+        let name = Name::from_ascii("example.com.").expect("valid name");
+        let mut message = Message::new();
+        message
+            .set_id(0x1234)
+            .set_message_type(MessageType::Response)
+            .set_response_code(ResponseCode::NoError)
+            .add_query(Query::query(name.clone(), RecordType::TXT))
+            .add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::TXT(TXT::new(vec!["sandbox-test".to_string()])),
+            ));
+        message.to_vec().expect("encode response")
+    }
+
+    #[tokio::test]
+    async fn udp_forwarding_preserves_upstream_response() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream addr");
+        let expected = upstream_txt_response();
+        let expected_for_responder = expected.clone();
+
+        let responder = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 65_535];
+            let (len, peer) = upstream.recv_from(&mut buf).await.expect("recv query");
+            upstream
+                .send_to(&expected_for_responder, peer)
+                .await
+                .expect("send response");
+            len
+        });
+
+        let forwarder = test_forwarder(upstream_addr);
+        let query = example_query(RecordType::TXT);
+        let result = forwarder.forward_udp(&query).await.expect("forward udp");
+        assert_eq!(result, expected);
+        responder.await.expect("responder task");
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarding_preserves_upstream_response() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_addr = listener.local_addr().expect("upstream addr");
+        let expected = upstream_txt_response();
+        let expected_for_responder = expected.clone();
+
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let len = stream.read_u16().await.expect("read len");
+            let mut data = vec![0_u8; usize::from(len)];
+            stream.read_exact(&mut data).await.expect("read query");
+            let resp_len = u16::try_from(expected_for_responder.len()).expect("resp len");
+            stream.write_u16(resp_len).await.expect("write len");
+            stream
+                .write_all(&expected_for_responder)
+                .await
+                .expect("write resp");
+        });
+
+        let forwarder = test_forwarder(upstream_addr);
+        let query = example_query(RecordType::TXT);
+        let result = forwarder.forward_tcp(&query).await.expect("forward tcp");
+        assert_eq!(result, expected);
+        responder.await.expect("responder task");
     }
 
     #[test]
-    fn build_dns_response_preserves_query_with_hickory() {
+    fn servfail_preserves_query_id_and_question() {
         let query = example_query(RecordType::A);
-        let resp = build_dns_response(&query, &[]).expect("response");
-        let message = Message::from_vec(&resp).expect("parse response");
-
+        let resp = servfail_response(&query).expect("servfail response");
+        let message = Message::from_vec(&resp).expect("parse servfail");
         assert_eq!(message.id(), 0x1234);
-        assert_eq!(message.header().message_type(), MessageType::Response);
-        assert!(message.recursion_desired());
-        assert!(message.header().recursion_available());
+        assert_eq!(message.header().response_code(), ResponseCode::ServFail);
         assert_eq!(message.queries().len(), 1);
         assert_eq!(message.queries()[0].name().to_ascii(), "example.com.");
         assert_eq!(message.queries()[0].query_type(), RecordType::A);
-        assert!(message.answers().is_empty());
     }
 
-    #[test]
-    fn build_dns_response_filters_answers_by_query_type() {
+    #[tokio::test]
+    async fn handle_udp_sends_servfail_on_upstream_failure() {
+        let recv = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let recv_addr = recv.local_addr().expect("recv addr");
+        let send = UdpSocket::bind("127.0.0.1:0").await.expect("bind send");
+        let forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
         let query = example_query(RecordType::A);
-        let ips = [
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            IpAddr::V6("2606:2800:220:1:248:1893:25c8:1946".parse().expect("ipv6")),
-        ];
-        let resp = build_dns_response(&query, &ips).expect("response");
-        let message = Message::from_vec(&resp).expect("parse response");
 
-        assert_eq!(message.answers().len(), 1);
-        assert_eq!(message.answers()[0].record_type(), RecordType::A);
-        assert!(matches!(message.answers()[0].data(), Some(RData::A(_))));
+        let task = tokio::spawn(async move {
+            forwarder
+                .handle_udp(query, recv_addr, Arc::new(send))
+                .await
+                .expect("handle udp");
+        });
+
+        let mut buf = vec![0_u8; 65_535];
+        let (len, _) = recv.recv_from(&mut buf).await.expect("recv servfail");
+        let message = Message::from_vec(&buf[..len]).expect("parse response");
+        assert_eq!(message.header().response_code(), ResponseCode::ServFail);
+        task.await.expect("udp task");
+    }
+
+    #[tokio::test]
+    async fn handle_tcp_writes_framed_servfail_on_upstream_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind forwarder listener");
+        let listener_addr = listener.local_addr().expect("listener addr");
+        let forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let query = example_query(RecordType::A);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            forwarder.handle_tcp(stream).await.expect("handle tcp");
+        });
+
+        let mut client = TcpStream::connect(listener_addr)
+            .await
+            .expect("connect to forwarder");
+        let query_len = u16::try_from(query.len()).expect("query len");
+        client.write_u16(query_len).await.expect("write query len");
+        client.write_all(&query).await.expect("write query");
+        let resp_len = client.read_u16().await.expect("read resp len");
+        let mut resp = vec![0_u8; usize::from(resp_len)];
+        client.read_exact(&mut resp).await.expect("read resp");
+        let message = Message::from_vec(&resp).expect("parse servfail");
+        assert_eq!(message.header().response_code(), ResponseCode::ServFail);
+        // Close the client side so handle_tcp's read loop sees EOF and
+        // returns, instead of blocking waiting for a second query frame.
+        drop(client);
+        server.await.expect("server task");
     }
 
     #[test]
     fn mappings_from_response_returns_all_addresses_for_example_com() {
-        let query = example_query(RecordType::A);
-        let ips = [
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35)),
-        ];
-        let resp = build_dns_response(&query, &ips).expect("response");
+        let name = Name::from_ascii("example.com.").expect("valid name");
+        let mut message = Message::new();
+        message
+            .set_id(0x1234)
+            .set_message_type(MessageType::Response)
+            .add_query(Query::query(name.clone(), RecordType::A))
+            .add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(93, 184, 216, 34))),
+            ))
+            .add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(93, 184, 216, 35))),
+            ));
+        let resp = message.to_vec().expect("encode response");
 
-        let mappings = agent_sandbox_core::mappings_from_response(&resp);
+        let mappings = mappings_from_response(&resp);
         assert_eq!(mappings.len(), 2);
         for m in &mappings {
             assert_eq!(m.hostname, "example.com");
