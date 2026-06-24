@@ -130,9 +130,12 @@ pub fn question_name(data: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+
     use super::{DnsMapping, mappings_from_response, question_name};
     use hickory_proto::op::{Message, Query};
-    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
+    use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
@@ -195,6 +198,97 @@ mod tests {
                     ip: "104.20.23.154".to_string(),
                     hostname: "example.com".to_string(),
                     ttl: 300,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mappings_follow_cname_but_keep_query_name() {
+        let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
+        let cname_target = Name::from_ascii("edge.cursor-cdn.example.").expect("valid name");
+        let mut message = Message::new();
+        message
+            .set_message_type(hickory_proto::op::MessageType::Response)
+            .add_query(Query::query(qname.clone(), RecordType::A))
+            .add_answer(Record::from_rdata(
+                qname,
+                300,
+                RData::CNAME(CNAME(cname_target.clone())),
+            ))
+            .add_answer(Record::from_rdata(
+                cname_target,
+                300,
+                RData::A(A::new(1, 2, 3, 4)),
+            ));
+        let pkt = message.to_vec().expect("encode");
+
+        assert_eq!(
+            mappings_from_response(&pkt),
+            vec![DnsMapping {
+                ip: "1.2.3.4".to_string(),
+                hostname: "api.cursor.example".to_string(),
+                ttl: 300,
+            }]
+        );
+    }
+
+    #[test]
+    fn mappings_ignore_unrelated_answer_addresses() {
+        let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
+        let unrelated = Name::from_ascii("unrelated.example.").expect("valid name");
+        let mut message = Message::new();
+        message
+            .set_message_type(hickory_proto::op::MessageType::Response)
+            .add_query(Query::query(qname, RecordType::A))
+            .add_answer(Record::from_rdata(
+                unrelated,
+                300,
+                RData::A(A::new(9, 9, 9, 9)),
+            ));
+        let pkt = message.to_vec().expect("encode");
+
+        assert!(mappings_from_response(&pkt).is_empty());
+    }
+
+    #[test]
+    fn mappings_extract_https_ip_hints() {
+        let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                (
+                    SvcParamKey::Ipv4Hint,
+                    SvcParamValue::Ipv4Hint(IpHint(vec![A::new(1, 2, 3, 4)])),
+                ),
+                (
+                    SvcParamKey::Ipv6Hint,
+                    SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(Ipv6Addr::new(
+                        0x2606, 0x4700, 0x7, 0, 0, 0, 0xa29f, 0x874f,
+                    ))])),
+                ),
+            ],
+        );
+        let mut message = Message::new();
+        message
+            .set_message_type(hickory_proto::op::MessageType::Response)
+            .add_query(Query::query(qname.clone(), RecordType::HTTPS))
+            .add_answer(Record::from_rdata(qname, 120, RData::HTTPS(HTTPS(svcb))));
+        let pkt = message.to_vec().expect("encode");
+
+        assert_eq!(
+            mappings_from_response(&pkt),
+            vec![
+                DnsMapping {
+                    ip: "1.2.3.4".to_string(),
+                    hostname: "api.cursor.example".to_string(),
+                    ttl: 120,
+                },
+                DnsMapping {
+                    ip: "2606:4700:7::a29f:874f".to_string(),
+                    hostname: "api.cursor.example".to_string(),
+                    ttl: 120,
                 },
             ]
         );
