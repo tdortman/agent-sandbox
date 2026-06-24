@@ -59,7 +59,8 @@ fn atomic_write_preserves_relative_symlink_to_missing_target() {
     fs::create_dir_all(&real_dir).expect("create dirs");
     fs::create_dir_all(&link_dir).expect("create dirs");
     let link = link_dir.join("policy.json");
-    std::os::unix::fs::symlink("../../dot_config/agent-sandbox/policy.json", &link).expect("symlink");
+    std::os::unix::fs::symlink("../../dot_config/agent-sandbox/policy.json", &link)
+        .expect("symlink");
     let mut data = empty_policy();
     data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
 
@@ -84,8 +85,19 @@ fn atomic_write_chowns_to_owner() {
     )
     .expect("write policy");
     let uid = nix::unistd::getuid().as_raw();
-    assert_eq!(policy_path.metadata().expect("policy path metadata").uid(), uid);
-    assert_eq!(policy_path.parent().expect("policy parent dir").metadata().expect("policy parent metadata").uid(), uid);
+    assert_eq!(
+        policy_path.metadata().expect("policy path metadata").uid(),
+        uid
+    );
+    assert_eq!(
+        policy_path
+            .parent()
+            .expect("policy parent dir")
+            .metadata()
+            .expect("policy parent metadata")
+            .uid(),
+        uid
+    );
 }
 
 #[test]
@@ -164,8 +176,12 @@ fn policy_json_one_rule_per_line_invariant() {
     let net_pos = json.find("\"network\"").expect("locate network section");
     let sudo_pos = json.find("\"sudo\"").expect("locate sudo section");
     assert!(net_pos < sudo_pos, "network section must precede sudo");
-    let allow_pos = json[net_pos..sudo_pos].find("\"allow\"").expect("locate allow section");
-    let deny_pos = json[net_pos..sudo_pos].find("\"deny\"").expect("locate deny section");
+    let allow_pos = json[net_pos..sudo_pos]
+        .find("\"allow\"")
+        .expect("locate allow section");
+    let deny_pos = json[net_pos..sudo_pos]
+        .find("\"deny\"")
+        .expect("locate deny section");
     assert!(
         allow_pos < deny_pos,
         "allow must precede deny within network"

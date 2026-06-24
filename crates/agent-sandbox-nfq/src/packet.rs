@@ -412,7 +412,11 @@ mod tests {
         let mut pkt = vec![0_u8; total];
         let plen = 16 + udp_payload.len(); // 8 DestOpts + 8 UDP + payload
         pkt[0] = 0x60;
-        pkt[4..6].copy_from_slice(&u16::try_from(plen).expect("convert packet length to u16").to_be_bytes());
+        pkt[4..6].copy_from_slice(
+            &u16::try_from(plen)
+                .expect("convert packet length to u16")
+                .to_be_bytes(),
+        );
         pkt[6] = 60; // Next header: Destination Options
         pkt[7] = 64;
         pkt[8..24].copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
@@ -424,7 +428,11 @@ mod tests {
         pkt[48..50].copy_from_slice(&src_port.to_be_bytes());
         pkt[50..52].copy_from_slice(&dst_port.to_be_bytes());
         let udp_len = 8 + udp_payload.len();
-        pkt[52..54].copy_from_slice(&u16::try_from(udp_len).expect("convert udp length to u16").to_be_bytes());
+        pkt[52..54].copy_from_slice(
+            &u16::try_from(udp_len)
+                .expect("convert udp length to u16")
+                .to_be_bytes(),
+        );
         pkt[56..56 + udp_payload.len()].copy_from_slice(udp_payload);
         pkt
     }

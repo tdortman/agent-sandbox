@@ -237,7 +237,10 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("read persisted dns cache file");
         let file: CacheFile = serde_json::from_str(&raw).expect("parse persisted dns cache json");
-        let entry = file.entries.get("104.18.32.47").expect("cache file should contain 104.18.32.47 entry");
+        let entry = file
+            .entries
+            .get("104.18.32.47")
+            .expect("cache file should contain 104.18.32.47 entry");
         assert_eq!(entry.host, "example.com");
         assert!(entry.expires > before + 1.0);
     }

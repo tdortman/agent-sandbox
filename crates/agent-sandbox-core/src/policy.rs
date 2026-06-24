@@ -435,24 +435,22 @@ mod tests {
 
     #[test]
     fn filesystem_approval_paths_exact_path_first() {
-        let paths =
-            filesystem_approval_paths("/home/user/.omp/agent/models.db-wal", Some("/home/user"));
+        let paths = filesystem_approval_paths("/home/user/.local/share/foo", Some("/home/user"));
         assert_eq!(
-            paths[0], "/home/user/.omp/agent/models.db-wal",
+            paths[0], "/home/user/.local/share/foo",
             "exact path must be first"
         );
     }
 
     #[test]
     fn filesystem_approval_paths_under_home_stops_at_home() {
-        let paths =
-            filesystem_approval_paths("/home/user/.omp/agent/models.db-wal", Some("/home/user"));
+        let paths = filesystem_approval_paths("/home/user/.local/share/foo", Some("/home/user"));
         assert_eq!(
             paths,
             vec![
-                "/home/user/.omp/agent/models.db-wal",
-                "/home/user/.omp/agent",
-                "/home/user/.omp",
+                "/home/user/.local/share/foo",
+                "/home/user/.local/share",
+                "/home/user/.local",
                 "/home/user",
             ]
         );
@@ -498,10 +496,9 @@ mod tests {
     #[test]
     fn contract_home_path_converts_under_home() {
         let home = "/home/user";
-        assert_eq!(contract_home_path("/home/user/.omp", Some(home)), "~/.omp");
         assert_eq!(
-            contract_home_path("/home/user/.omp/agent", Some(home)),
-            "~/.omp/agent"
+            contract_home_path("/home/user/.local/share/foo", Some(home)),
+            "~/.local/share/foo"
         );
         assert_eq!(contract_home_path("/home/user", Some(home)), "~");
         assert_eq!(contract_home_path("/home/user/", Some(home)), "~");
@@ -522,18 +519,17 @@ mod tests {
     #[test]
     fn contract_home_path_without_home_is_passthrough() {
         assert_eq!(
-            contract_home_path("/home/user/.omp", None),
-            "/home/user/.omp"
+            contract_home_path("/home/user/.local/share/foo", None),
+            "/home/user/.local/share/foo"
         );
     }
 
     #[test]
     fn expand_home_path_converts_tilde() {
         let home = "/home/user";
-        assert_eq!(expand_home_path("~/.omp", Some(home)), "/home/user/.omp");
         assert_eq!(
-            expand_home_path("~/.omp/agent", Some(home)),
-            "/home/user/.omp/agent"
+            expand_home_path("~/.local/share/foo", Some(home)),
+            "/home/user/.local/share/foo"
         );
         assert_eq!(expand_home_path("~", Some(home)), "/home/user");
     }
@@ -547,15 +543,18 @@ mod tests {
 
     #[test]
     fn expand_home_path_without_home_keeps_tilde() {
-        assert_eq!(expand_home_path("~/.omp", None), "~/.omp");
+        assert_eq!(
+            expand_home_path("~/.local/share/foo", None),
+            "~/.local/share/foo"
+        );
     }
 
     #[test]
     fn contract_expand_round_trip() {
         let home = "/home/user";
-        let original = "/home/user/.omp/agent/models.db-wal";
+        let original = "/home/user/.local/share/foo/agent/models.db-wal";
         let contracted = contract_home_path(original, Some(home));
-        assert_eq!(contracted, "~/.omp/agent/models.db-wal");
+        assert_eq!(contracted, "~/.local/share/foo/agent/models.db-wal");
         let expanded = expand_home_path(&contracted, Some(home));
         assert_eq!(expanded, original);
     }

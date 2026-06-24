@@ -165,10 +165,16 @@ mod tests {
         let link = link_dir.join("policy.json");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
 
-        atomic_write_text(&link, "{}
-").expect("write policy via symlink");
+        atomic_write_text(
+            &link, "{}
+",
+        )
+        .expect("write policy via symlink");
 
         assert!(link.is_symlink());
-        assert_eq!(std::fs::read_to_string(real).expect("read policy file"), "{}\n");
+        assert_eq!(
+            std::fs::read_to_string(real).expect("read policy file"),
+            "{}\n"
+        );
     }
 }

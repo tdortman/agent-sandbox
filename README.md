@@ -49,7 +49,7 @@ DNS responses are only honored when they arrive from the configured forwarder IP
 
 ### Process-level syscall gate (seccomp)
 
-When the policy context is enabled (network, dynamic-FS, or sudo-approve), the wrapper prepends `agent-sandbox-syscall-arm` to the entry chain. The arm helper runs `prctl(PR_SET_NO_NEW_PRIVS)`, installs a seccomp BPF filter built with the `seccompiler` crate, hands the notification listener fd back to its parent via `SCM_RIGHTS` on a `SOCK_STREAM` socket pair, and execs the real agent. The host spawns `agent-sandbox-syscall-broker` to consume the listener.
+When the policy context is enabled (network, dynamic-FS, or sudo-approve), the wrapper prepends `agent-sandbox-syscall-arm` to the entry chain. The arm helper installs a seccomp BPF filter, hands the notification listener fd back to its parent via `SCM_RIGHTS` on a `SOCK_STREAM` socket pair, and execs the real agent. The host spawns `agent-sandbox-syscall-broker` to consume the listener.
 
 The broker uses `pidfd_open` + `pidfd_getfd` (Linux 5.6+) to obtain a usable fd for the tracee's socket, then queries `getsockopt(SO_TYPE)` to map the socket to a URL scheme: `SOCK_STREAM` becomes `tcp://`, `SOCK_DGRAM` becomes `udp://`. A failed lookup falls back to the syscall's default scheme. Cancellations from the UI produce a one-time `Deny` so the agent unblocks with `EACCES` rather than waiting for the approval timeout.
 
@@ -76,14 +76,9 @@ The bwrap read-only rebind still blocks writes regardless of the fanotify decisi
 
 Static bubblewrap mounts define the structural write boundary: directories and files are mounted read-only or read-write per package configuration. When `filesystem.dynamicApproval.enable` is true, fanotify mediates filesystem access at the kernel level. The first process inside each sandbox becomes `agent-sandbox-fs-arm`, which requests a fanotify monitor from policyd before execing the real entry point.
 
-In dynamic mode the wrapper mounts a fresh `tmpfs` over the entire host `/run` so unrelated host IPC sockets are invisible to the sandboxed process. The sandbox policy socket and any narrow `/run/...` mounts declared in the package configuration are rebound on top. Abstract Unix sockets are not filesystem paths: with `network.enable = true` they are isolated by the sandbox network namespace, not by fanotify. Host `/tmp` is similarly masked.
-
-### Sudo elevation
-
-When `sudoPolicy` is `"approve"`, the sandbox replaces `/run/wrappers/bin/sudo` with a shim that sends an elevation request to policyd. The host-side OMP extension or `agent-sandbox-approve` approves or denies the request. The approved command runs as root on the host, not inside the bubblewrap jail.
+Host `/tmp` is similarly masked.
 
 ## Policy
-
 Each policy file is a JSON document with `network`, `sudo`, and `filesystem` sections. Each section has an `allow` and a `deny` array.
 
 ```json

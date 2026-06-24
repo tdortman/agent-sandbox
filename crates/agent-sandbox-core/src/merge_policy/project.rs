@@ -178,7 +178,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo = tmp.path().join("dotfiles");
         fs::create_dir_all(repo.join(".agent-sandbox")).expect("create dirs");
-        let ephemeral = tmp.path().join("omp-python-runner");
+        let ephemeral = tmp.path().join("agent-python-runner");
         fs::create_dir(&ephemeral).expect("create dirs");
 
         let ctx = ProjectPolicyContext::new(None, Some(&ephemeral), Some(&repo));

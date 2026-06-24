@@ -43,9 +43,7 @@ impl PolicyStore {
     pub(crate) async fn session_allowed(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
-            resolved.ids.pid().filter(|&p| p != 0),
             resolved.paths.cwd_string(),
-            resolved.paths.home_string(),
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
@@ -65,9 +63,7 @@ impl PolicyStore {
     pub(crate) async fn session_denied(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
-            resolved.ids.pid().filter(|&p| p != 0),
             resolved.paths.cwd_string(),
-            resolved.paths.home_string(),
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
@@ -107,9 +103,7 @@ impl PolicyStore {
     pub(crate) async fn session_sudo_denied(&self, argv: &[String], ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
-            resolved.ids.pid().filter(|&p| p != 0),
             resolved.paths.cwd_string(),
-            resolved.paths.home_string(),
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
@@ -126,9 +120,7 @@ impl PolicyStore {
     pub(crate) async fn session_sudo_allowed(&self, argv: &[String], ctx: MergeContext) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
-            resolved.ids.pid().filter(|&p| p != 0),
             resolved.paths.cwd_string(),
-            resolved.paths.home_string(),
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
@@ -249,9 +241,7 @@ impl PolicyStore {
     ) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
-            resolved.ids.pid().filter(|&p| p != 0),
             resolved.paths.cwd_string(),
-            resolved.paths.home_string(),
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
@@ -273,9 +263,7 @@ impl PolicyStore {
     ) -> bool {
         let resolved = self.resolve_context(ctx).await;
         let route = UiRoute::new(
-            resolved.ids.pid().filter(|&p| p != 0),
             resolved.paths.cwd_string(),
-            resolved.paths.home_string(),
             resolved.paths.project_root_string(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
@@ -365,8 +353,8 @@ mod tests {
         let home = dir.path().join("home");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path =
-            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).expect("trusted project policy path");
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+            .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -377,7 +365,8 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).expect("write policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+            .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -428,8 +417,8 @@ mod tests {
         let home = dir.path().join("home");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path =
-            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).expect("trusted project policy path");
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+            .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -440,7 +429,8 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).expect("write policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+            .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -488,8 +478,8 @@ mod tests {
         let home = dir.path().join("home");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path =
-            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).expect("trusted project policy path");
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+            .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -500,7 +490,8 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).expect("write policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+            .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -531,7 +522,8 @@ mod tests {
         );
 
         let empty = agent_sandbox_core::Policy::default();
-        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None).expect("clear policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None)
+            .expect("clear policy");
 
         // The merged policy is computed on every call, so removing the deny rule
         // from disk takes effect immediately.
@@ -549,7 +541,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
-        std::fs::create_dir_all(project_root.join(".agent-sandbox")).expect("create .agent-sandbox dir");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox"))
+            .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&home).expect("create home dir");
         let policy_path = project_root.join(".agent-sandbox/policy.json");
 
@@ -562,12 +555,13 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).expect("write policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+            .expect("write policy");
 
         // Sanity check: the trusted project policy file does not exist, so
         // the deny rule from the repo-local file is the only candidate.
-        let trusted_path =
-            agent_sandbox_core::trusted_project_policy_path(&home, &project_root).expect("trusted project policy path");
+        let trusted_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+            .expect("trusted project policy path");
         assert!(!trusted_path.exists());
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
@@ -615,7 +609,8 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None).expect("write policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+            .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -645,7 +640,8 @@ mod tests {
         );
 
         let empty = agent_sandbox_core::Policy::default();
-        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None).expect("clear policy");
+        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None)
+            .expect("clear policy");
 
         assert!(!store.is_allowed("example.com", 443, ctx, false).await);
     }

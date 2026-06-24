@@ -62,10 +62,11 @@ fn status_reply_includes_merged_policy() {
         pending: vec![],
     };
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");
-    assert!(json
-        .get("merged")
-        .expect("merged field present")
-        .is_object());
+    assert!(
+        json.get("merged")
+            .expect("merged field present")
+            .is_object()
+    );
 }
 
 #[test]

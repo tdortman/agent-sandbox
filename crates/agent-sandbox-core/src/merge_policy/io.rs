@@ -277,13 +277,17 @@ mod tests {
     #[test]
     fn policy_json_writes_home_paths_as_tilde() {
         let mut policy = crate::policy::Policy::default();
-        policy.filesystem.allow = vec![FilesystemRule::new("/home/user/.omp", FileAccess::All, "")];
+        policy.filesystem.allow = vec![FilesystemRule::new(
+            "/home/user/.local/share/foo",
+            FileAccess::All,
+            "",
+        )];
         let path = std::env::temp_dir().join("agent-sandbox-write-home.json");
         let _ = std::fs::remove_file(&path);
         atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
         let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(
-            raw.contains("\"~/.omp\""),
+            raw.contains("\"~/.local/share/foo\""),
             "home path must serialize as ~/...: {raw}"
         );
         let _ = std::fs::remove_file(&path);
@@ -346,7 +350,7 @@ mod tests {
             "network": { "allow": [], "deny": [] },
             "sudo": { "allow": [], "deny": [] },
             "filesystem": {
-                "allow": [ { "path": "~/.omp", "access": "all" } ],
+                "allow": [ { "path": "~/.local/share/foo", "access": "all" } ],
                 "deny": [ { "path": "~/.cache/secret", "access": "read" } ]
             }
         }"#;
@@ -354,7 +358,10 @@ mod tests {
         let path = tmp.path().join("policy.json");
         std::fs::write(&path, raw).expect("write file");
         let loaded = load_policy(&path, Some(home));
-        assert_eq!(loaded.filesystem.allow[0].path, "/home/user/.omp");
+        assert_eq!(
+            loaded.filesystem.allow[0].path,
+            "/home/user/.local/share/foo"
+        );
         assert_eq!(loaded.filesystem.deny[0].path, "/home/user/.cache/secret");
     }
 
@@ -382,15 +389,18 @@ mod tests {
         let path = tmp.path().join("policy.json");
         let mut policy = crate::policy::Policy::default();
         policy.filesystem.allow = vec![
-            FilesystemRule::new("/home/user/.omp", FileAccess::All, ""),
+            FilesystemRule::new("/home/user/.local/share/foo", FileAccess::All, ""),
             FilesystemRule::new("/nix/store", FileAccess::Read, ""),
         ];
         atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
         let raw = std::fs::read_to_string(&path).expect("read file");
-        assert!(raw.contains("\"~/.omp\""), "raw: {raw}");
+        assert!(raw.contains("\"~/.local/share/foo\""), "raw: {raw}");
         assert!(raw.contains("\"/nix/store\""), "raw: {raw}");
         let loaded = load_policy(&path, Some("/home/user"));
         assert_eq!(loaded.filesystem.allow[0].path, "/nix/store");
-        assert_eq!(loaded.filesystem.allow[1].path, "/home/user/.omp");
+        assert_eq!(
+            loaded.filesystem.allow[1].path,
+            "/home/user/.local/share/foo"
+        );
     }
 }
