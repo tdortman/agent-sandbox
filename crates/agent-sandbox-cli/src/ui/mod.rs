@@ -19,21 +19,46 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "agent-sandbox-ui")]
+#[command(
+    name = "agent-sandbox-ui",
+    version,
+    about = "Long-lived policyd UI client that surfaces interactive approval prompts",
+    long_about = "Long-lived UI client for policyd. Connects to the policyd host socket, \
+        registers as a UI client for the current context, then loops on the connection to \
+        display incoming approval requests (network/elevation/filesystem) and forward the \
+        user's decisions back to policyd. Typically spawned by \"agent-sandbox-open-ui-fd\" or by \
+        policyd itself when no other UI is registered for a given request.\n\n\
+        EXAMPLES:\n\
+        # Start a UI client with the default policyd socket, sourcing context from env vars.\n\
+        agent-sandbox-ui\n\n\
+        # Pass context explicitly and tag the session for policy routing.\n\
+        agent-sandbox-ui \\\n\
+            --socket /run/agent-sandbox/policy.sock \\\n\
+            --cwd /home/user/project \\\n\
+            --home /home/user \\\n\
+            --project-root /home/user/project \\\n\
+            --sandbox-session-id session-2024-05-01-abc"
+)]
 struct Cli {
+    /// Path to the policyd Unix domain socket the UI registers on. Falls back to the env var "AGENT_SANDBOX_POLICY_SOCKET" if unset.
     #[arg(
         long,
+        value_name = "SOCKET",
         env = "AGENT_SANDBOX_POLICY_SOCKET",
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     socket: PathBuf,
-    #[arg(long, env = "AGENT_SANDBOX_CWD")]
+    /// Working directory inside the sandbox. Forwarded to policyd so per-project rules resolve correctly. Defaults to the env var "AGENT_SANDBOX_CWD".
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
     cwd: Option<String>,
-    #[arg(long, env = "AGENT_SANDBOX_HOME")]
+    /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "AGENT_SANDBOX_HOME".
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<String>,
-    #[arg(long, env = "AGENT_SANDBOX_PROJECT_ROOT")]
+    /// Project root inside the sandbox. Used to scope "project" rules. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT".
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<String>,
-    #[arg(long, env = "AGENT_SANDBOX_SESSION_ID")]
+    /// Sandbox session id. Routes this UI client to a specific sandbox session's pending requests. Defaults to the env var "AGENT_SANDBOX_SESSION_ID".
+    #[arg(long, value_name = "ID", env = "AGENT_SANDBOX_SESSION_ID")]
     sandbox_session_id: Option<String>,
 }
 

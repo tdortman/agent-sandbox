@@ -35,7 +35,7 @@ struct Cli {
     #[arg(long)]
     sandbox_session_id: String,
 
-    /// Everything after `--` is the launcher command.
+    /// Everything after "--" is the launcher command.
     #[arg(last = true)]
     launcher: Vec<String>,
 }

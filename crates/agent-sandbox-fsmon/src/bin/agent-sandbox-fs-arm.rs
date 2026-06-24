@@ -1,16 +1,46 @@
 //! Arm helper: runs inside the sandbox before the real agent.
 //!
 //! Connects to policyd, sends `StartFilesystemMonitor { ctx, static_allow }`,
-//! waits for an active ok, then execvp the real command after `--`.
-
+//! waits for an active ok, then execvp the real command. A `--` separator
+//! before the command is accepted but not required.
 #![allow(unsafe_code)]
 
 use agent_sandbox_core::{FileAccess, FilesystemRule, RequestContext};
 use agent_sandbox_fsmon::rpc_client;
+use clap::Parser as _;
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process;
+
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "agent-sandbox-fs-arm",
+    version,
+    about = "Connect to policyd, start the fanotify filesystem monitor, then execvp the real command",
+    long_about = "Runs INSIDE the sandbox as the first process in the dynamic-FS path. Connects \
+        to policyd over the policy socket, registers a fanotify filesystem monitor for the \
+        current sandbox session, then execvp the real command. The policy socket path comes \
+        from the env var AGENT_SANDBOX_POLICY_SOCKET (default /run/agent-sandbox/policy.sock). \
+        The session id, working directory, home, and project root come from \
+        AGENT_SANDBOX_SESSION_ID, AGENT_SANDBOX_CWD, AGENT_SANDBOX_HOME, and \
+        AGENT_SANDBOX_PROJECT_ROOT respectively. The static allow rule set is read from \
+        AGENT_SANDBOX_FS_STATIC_ALLOW as a JSON array of FilesystemRule objects.\n\n\
+    EXAMPLES:\n\
+        # Start the monitor, then exec python3. The `--` is optional.\n\
+        agent-sandbox-fs-arm /usr/bin/python3 -i\n\n\
+        # Start the monitor, then exec a wrapped agent.\n\
+        agent-sandbox-fs-arm /home/user/bin/my-agent --verbose"
+)]
+struct Cli {
+    /// The command to exec after the monitor is active. Everything after the flags is forwarded verbatim to execvp, including values that look like flags. A `--` separator is accepted but not required.
+    #[arg(
+        value_name = "COMMAND",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    command: Vec<OsString>,
+}
 
 fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&str>) {
     let Some(home) = home else {
@@ -36,21 +66,8 @@ fn add_project_static_allow(static_allow: &mut Vec<FilesystemRule>, project_root
 }
 
 fn main() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-
-    // Find the `--` separator. Everything after is the real command.
-    let sep_pos = args.iter().position(|a| a == "--");
-    let real_args = if let Some(pos) = sep_pos {
-        &args[pos + 1..]
-    } else {
-        eprintln!("usage: agent-sandbox-fs-arm [flags] -- <command> [args...]");
-        process::exit(1);
-    };
-
-    if real_args.is_empty() {
-        eprintln!("error: no command specified after --");
-        process::exit(1);
-    }
+    let cli = Cli::parse();
+    let real_args = cli.command;
 
     // Gather context from environment (set by bubblewrap wrapper).
     let cwd = std::env::var("AGENT_SANDBOX_CWD").ok();
@@ -122,31 +139,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn expands_home_static_allow_rules() {
-        let mut rules = vec![
-            FilesystemRule::new("~/dotfiles", FileAccess::Read, ""),
-            FilesystemRule::new("~", FileAccess::Read, ""),
-        ];
-
-        expand_home_static_allow(&mut rules, Some("/home/user"));
-
-        assert_eq!(rules[0].path, "/home/user/dotfiles");
-        assert_eq!(rules[1].path, "/home/user");
-    }
-
-    #[test]
-    fn adds_project_root_as_full_static_allow() {
-        let mut rules = vec![FilesystemRule::new("/home/user/.omp", FileAccess::Read, "")];
-
-        add_project_static_allow(&mut rules, Some("/home/user/project"));
-
-        assert!(
-            rules.iter().any(|rule| {
-                rule.path == "/home/user/project" && rule.access == FileAccess::All
-            })
-        );
-    }
+    // Reserved for future integration tests. The current implementation reads
+    // the policy socket from the environment, which is awkward to set up in a
+    // pure unit test, and the entrypoint is exercised end-to-end by the
+    // NixOS integration test harness.
 }

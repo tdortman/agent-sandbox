@@ -20,23 +20,51 @@ use clap::Parser;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "agent-sandbox-fsmon")]
+#[command(
+    name = "agent-sandbox-fsmon",
+    version,
+    about = "fanotify filesystem policy monitor that brokers open() calls to policyd",
+    long_about = "fanotify-based filesystem monitor that runs in the host mount namespace. \
+        Given a target sandbox PID, it joins the sandbox mount namespace, marks every \
+        mount that overlaps the sandbox's working directory/home/project, and processes \
+        permission events for open/open-exec/access requests. Each event is forwarded \
+        to policyd over a Unix domain socket and the verdict (allow/deny) is written \
+        back to the kernel via the fanotify response fd.\n\n\
+        Normally spawned by policyd in response to an \"agent-sandbox-fs-arm\" request, \
+        not invoked directly.\n\n\
+        EXAMPLES:\n\
+        # Start a monitor for sandbox PID 12345 with the default policyd socket.\n\
+        agent-sandbox-fsmon --pid 12345\n\n\
+        # Override context for tools that do not export the AGENT_SANDBOX_* env vars.\n\
+        agent-sandbox-fsmon \\\n\
+            --pid 12345 \\\n\
+            --cwd /home/user/project \\\n\
+            --home /home/user \\\n\
+            --project-root /home/user/project"
+)]
 struct Cli {
-    /// PID of the sandbox arm helper (target mount namespace).
-    #[arg(long)]
+    /// PID of the sandbox arm helper. The monitor joins the mount namespace of this PID and marks its filesystems.
+    #[arg(long, value_name = "PID")]
     pid: u32,
 
-    /// Path to policyd Unix domain socket.
-    #[arg(long, default_value = "/run/agent-sandbox/policy.sock")]
+    /// Path to the policyd Unix domain socket. fsmon forwards every fanotify permission event here and waits for an allow/deny verdict.
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        default_value = "/run/agent-sandbox/policy.sock"
+    )]
     socket: String,
 
-    #[arg(long)]
+    /// Working directory inside the sandbox. Used to scope per-project policy and to pick which mounts are marked. Defaults to the env var "AGENT_SANDBOX_CWD" if unset.
+    #[arg(long, value_name = "DIR")]
     cwd: Option<String>,
 
-    #[arg(long)]
+    /// Home directory inside the sandbox. Used to expand "~" in filesystem rules and to gate "global" scope. Defaults to the env var "AGENT_SANDBOX_HOME" if unset.
+    #[arg(long, value_name = "DIR")]
     home: Option<String>,
 
-    #[arg(long)]
+    /// Project root directory inside the sandbox. Required for "project" scope approvals to land in the right per-project policy file. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT" if unset.
+    #[arg(long, value_name = "DIR")]
     project_root: Option<String>,
 }
 
@@ -552,8 +580,7 @@ fn main() {
                     continue;
                 }
                 // Tag the request with the fanotify event PID so policyd can
-                // route to the correct UI client (e.g. the OMP extension that
-                // owns the sandboxed process tree, not the fsmon process).
+                // route to the correct UI client (e.g. the host policy UI client
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
                 let reply = rpc_client::check_filesystem(socket_path, &path, access, event_ctx);

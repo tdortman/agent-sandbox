@@ -26,33 +26,62 @@ use tracing::{debug, info, warn};
 const COPY_RANGE: u16 = u16::MAX;
 
 #[derive(Parser, Debug)]
-#[command(name = "agent-sandbox-nfq")]
+#[command(
+    name = "agent-sandbox-nfq",
+    version,
+    about = "NFQUEUE-based packet policy enforcer for the sandbox network namespace",
+    long_about = "NFQUEUE packet interceptor that runs inside the agent-sandbox network \
+        namespace. nftables queues outbound TCP SYN packets and all UDP packets here. \
+        For each queued packet the daemon resolves the destination hostname from the \
+        DNS forwarder in-memory cache (or the on-disk fallback), asks policyd for a \
+        verdict, and either accepts the packet or actively rejects it via a transient \
+        nftables set. Traffic to the local DNS forwarder on port 53 always bypasses \
+        policyd so name resolution can never be blocked.\n\n\
+        EXAMPLES:\n\
+        # Run inside the sandbox netns with the default nftables queue number.\n\
+        agent-sandbox-nfq\n\n\
+        # Bind to a different NFQUEUE and accept a larger kernel-side queue.\n\
+        agent-sandbox-nfq --queue 1 --queue-len 8192\n\n\
+        # Point at a custom policyd and DNS push socket.\n\
+        agent-sandbox-nfq \\\n\
+            --policy-socket /run/agent-sandbox/policy.sock \\\n\
+            --push-socket /run/agent-sandbox/dns-push.sock"
+)]
 struct Cli {
-    /// NFQUEUE queue number (must match nftables `queue num` rule).
-    #[arg(long, default_value_t = 0)]
+    /// NFQUEUE queue number. Must match the nftables "queue num" rule installed in the sandbox netns. 0 (the default) is the convention used by the NixOS module.
+    #[arg(long, value_name = "NUM", default_value_t = 0)]
     queue: u16,
 
-    /// Policy daemon Unix socket path.
-    #[arg(long, default_value = "/run/agent-sandbox/policy.sock")]
+    /// Unix domain socket path used to ask policyd for a verdict on each queued packet.
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        default_value = "/run/agent-sandbox/policy.sock"
+    )]
     policy_socket: String,
 
-    /// Max seconds to wait for policyd per packet check.
-    #[arg(long, default_value_t = 305.0)]
+    /// Max seconds to wait for a policyd verdict per packet check. Fractional values are accepted. The effective wait is clamped to at least 1 second. Larger values tolerate slow policyd startups but delay packet release.
+    #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
     policy_timeout: f64,
 
-    /// Maximum number of packets the kernel may hold while waiting for verdicts.
-    #[arg(long, default_value_t = 4096)]
+    /// Maximum number of packets the kernel may hold while waiting for verdicts. Increase this if bursts of new outbound connections are getting dropped under load. 4096 is enough for typical agent traffic.
+    #[arg(long, value_name = "PACKETS", default_value_t = 4096)]
     queue_len: u32,
 
-    /// Path to nft binary for transient reject set management.
-    #[arg(long, default_value = "nft")]
+    /// Path to the "nft" binary used to add destination IPs to the transient reject set. Override this for testing or non-standard installations.
+    #[arg(long, value_name = "PATH", default_value = "nft")]
     nft_binary: String,
-    /// DNS forwarder IP address (v4 or v6). Traffic to this IP on port 53 bypasses policy checks.
-    #[arg(long, default_value = "169.254.100.1")]
+
+    /// DNS forwarder IP address (v4 or v6). Packets to this IP on port 53 are passed straight through without consulting policyd so the agent can always resolve names. 169.254.100.1 is the link-local address used by the default NixOS module.
+    #[arg(long, value_name = "IP", default_value = "169.254.100.1")]
     dns_server_ip: IpAddr,
 
-    /// Unix datagram socket path the DNS forwarder pushes fresh mappings to.
-    #[arg(long, default_value = "/run/agent-sandbox/dns-push.sock")]
+    /// Unix datagram socket path the DNS forwarder pushes fresh "{ip,host,ttl}" mappings to. If absent or unbindable the daemon falls back to the on-disk cache only.
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        default_value = "/run/agent-sandbox/dns-push.sock"
+    )]
     push_socket: PathBuf,
 }
 struct NfqState {
@@ -804,15 +833,19 @@ mod tests {
         assert_eq!(mappings.len(), 1);
 
         for m in &mappings {
-            state.dns_cache.lock().expect("lock dns cache").remember_ephemeral(
-                &m.ip,
-                &m.hostname,
-                m.ttl.min(DEFAULT_MAX_TTL),
-            );
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
         }
 
         // Verify the IP is now cached to the hostname.
-        let cached = state.dns_cache.lock().expect("lock dns cache").lookup("93.184.216.34");
+        let cached = state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .lookup("93.184.216.34");
         assert_eq!(cached.as_deref(), Some("example.com"));
     }
 

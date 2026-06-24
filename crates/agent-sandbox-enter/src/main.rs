@@ -5,14 +5,15 @@
 //! Installed as a setuid-root wrapper (`security.wrappers`) so unprivileged sandboxes can
 //! `setns` without keeping ambient/file capabilities (required for bubblewrap).
 
-use std::env;
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process;
 
 use caps::CapSet;
+use clap::Parser as _;
 use nix::sched::{CloneFlags, setns};
 use nix::unistd::execvp;
 
@@ -45,20 +46,46 @@ fn drop_capabilities() -> io::Result<()> {
     Ok(())
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: {} <netns-name> <command> [args...]", args[0]);
-        process::exit(2);
-    }
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "agent-sandbox-enter",
+    version,
+    about = "Join a named network namespace, drop inherited capabilities, then exec the command",
+    long_about = "Setuid-root wrapper (installed via security.wrappers) that joins the network \
+        namespace at /run/netns/<NETNS>, drops the inherited ambient and effective capabilities \
+        so bubblewrap does not inherit CAP_SYS_ADMIN / CAP_NET_ADMIN across exec, then execvp \
+        the command. The remaining caps in the effective set are cleared; permitted, inheritable, \
+        and bounding sets are not touched because the wrapper has no CAP_SETPCAP and dropping \
+        bounding bits would fail with EPERM.\n\n\
+    EXAMPLES:\n\
+        # Join the sandbox netns and exec python3. The `--` is optional.\n\
+        agent-sandbox-enter sandbox-netns-1 /usr/bin/python3 -i\n\n\
+        # Join the default netns and exec a wrapped agent.\n\
+        agent-sandbox-enter default-netns /home/user/bin/my-agent --verbose"
+)]
+struct Cli {
+    /// Name of the network namespace under /run/netns/. Capped at 200 characters by the kernel; rejected here as a friendlier error.
+    #[arg(value_name = "NETNS")]
+    netns: String,
 
-    let nsname = &args[1];
-    if nsname.len() > 200 {
+    /// The command to exec inside the namespace, with its own arguments. Everything after the netns name is forwarded verbatim to execvp, including values that look like flags. A `--` separator is accepted but not required.
+    #[arg(
+        value_name = "COMMAND",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    command: Vec<std::ffi::OsString>,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    if cli.netns.len() > 200 {
         eprintln!("netns name too long");
         process::exit(1);
     }
 
-    let path = PathBuf::from("/run/netns").join(nsname);
+    let path = PathBuf::from("/run/netns").join(&cli.netns);
     let file = OpenOptions::new()
         .read(true)
         .open(&path)
@@ -75,17 +102,19 @@ fn main() {
         die("drop capabilities", &err);
     }
 
-    let cmd = CString::new(args[2].as_bytes()).unwrap_or_else(|_| {
-        eprintln!("command contains interior NUL");
-        process::exit(1);
-    });
-    let argv: Vec<CString> = args[2..]
+    let cargs: Vec<CString> = cli
+        .command
         .iter()
-        .map(|s| CString::new(s.as_bytes()).expect("interior NUL"))
+        .map(|s| CString::new(s.as_os_str().as_bytes()).expect("interior NUL"))
         .collect();
+    let cmd = cargs
+        .first()
+        .expect("clap requires at least one command")
+        .clone();
 
-    match execvp(&cmd, &argv) {
-        Ok(never) => match never {},
-        Err(err) => die("execvp", &io::Error::other(err)),
-    }
+    // execvp returns Result<Infallible, Errno>; the Ok arm is uninhabited
+    // because the process image is replaced. unwrap_err is safe because
+    // the compiler can prove the Ok variant is uninhabited.
+    let err = execvp(&cmd, &cargs).unwrap_err();
+    die("execvp", &io::Error::other(err));
 }
