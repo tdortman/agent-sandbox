@@ -21,8 +21,9 @@ let
     in
     if builtins.length parts > 1 then builtins.elemAt parts 0 else cfg.dnsForwardTarget;
 
-  # Sandboxes query the veth gateway for DNS. The forwarder resolves via
-  # getaddrinfo (libc resolver), inheriting all host DNS config.
+  # Sandboxes query the veth gateway for DNS. The forwarder transparently
+  # forwards raw DNS queries to the configured upstream resolver and writes
+  # IP->hostname mappings to a shared cache for NFQUEUE prompts.
   resolvConfText = ''
     nameserver ${cfg.hostIp}
     options edns0 trust-ad
@@ -35,8 +36,9 @@ let
   '';
 
   # The DNS forwarder runs on the host and listens on the veth gateway. It
-  # resolves via libc (inheriting host DNS, including DoT) and writes IP to
-  # hostname mappings to a shared cache file before responding.
+  # forwards raw DNS queries to the upstream resolver (configured via
+  # `agent-sandbox.network.dnsForwardTarget`) and writes IP->hostname mappings
+  # to a shared cache file before responding.
   #
   # DNS responses must NOT be queued to NFQUEUE. NFQUEUE is single-threaded
   # and blocks during policy checks (up to approval_timeout). If DNS
@@ -316,7 +318,7 @@ lib.mkIf policyEnabled (
         };
 
         agent-sandbox-dns = {
-          description = "DNS forwarder for agent-sandbox (records A/AAAA → hostname cache)";
+          description = "DNS forwarder for agent-sandbox (forwards raw DNS and records IP→hostname cache)";
           bindsTo = [ "agent-sandbox-netns.service" ];
           wantedBy = [ "multi-user.target" ];
           after = [

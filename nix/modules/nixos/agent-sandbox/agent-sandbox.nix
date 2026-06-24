@@ -333,8 +333,8 @@ in
         type = lib.types.str;
         default = "127.0.0.53:53";
         description = ''
-          DNS target for the host NAT route_localnet check. The DNS forwarder
-          runs inside the netns on 127.0.0.53:53 and forwards to 1.1.1.1:53.
+          Upstream DNS server used by agent-sandbox-dns-forwarder for raw DNS
+          forwarding. Defaults to the systemd-resolved stub on the host.
         '';
       };
     };
