@@ -5,7 +5,7 @@ use agent_sandbox_core::{
     filesystem_approval_paths,
 };
 
-use super::choice::{format_elevation_title, resolve_choice};
+use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
 use super::dialog::pick_option;
 use super::error::UiCliError;
 use super::options::{
@@ -37,7 +37,7 @@ pub(crate) async fn handle_push(
 
             // Step 1: choose action
             let Some(action) = choose_action(&format!("agent-sandbox: {url}")).await? else {
-                return Ok(());
+                return deny_cancellation(socket, &paths, session_id, &id).await;
             };
 
             // Step 2: choose scope
@@ -47,20 +47,23 @@ pub(crate) async fn handle_push(
             )
             .await?
             else {
-                return Ok(());
+                return deny_cancellation(socket, &paths, session_id, &id).await;
             };
 
             // Step 3: for non-Once scopes, choose target level
             let target = if scope == ApprovalScope::Once {
                 None
             } else {
-                choose_target_level(
+                match choose_target_level(
                     &format!("agent-sandbox: {} {url} target?", action.verb()),
                     network_target_options(&host, scope),
                 )
                 .await?
+                {
+                    Some(t) => Some(t),
+                    None => return deny_cancellation(socket, &paths, session_id, &id).await,
+                }
             };
-
             let choice = ScopeOption {
                 label: String::new(),
                 scope,
@@ -81,7 +84,7 @@ pub(crate) async fn handle_push(
             // Step 1: choose action
             let title = format_elevation_title(&argv, paths.cwd().unwrap_or("?"));
             let Some(action) = choose_action(&title).await? else {
-                return Ok(());
+                return deny_cancellation(socket, &paths, session_id, &id).await;
             };
 
             // Step 2: choose scope
@@ -91,20 +94,23 @@ pub(crate) async fn handle_push(
             )
             .await?
             else {
-                return Ok(());
+                return deny_cancellation(socket, &paths, session_id, &id).await;
             };
 
             // Step 3: for non-Once scopes, choose command prefix
             let target = if scope == ApprovalScope::Once {
                 None
             } else {
-                choose_target_level(
+                match choose_target_level(
                     &format!("agent-sandbox: {} sudo target?", action.verb()),
                     sudo_target_options(&argv, scope),
                 )
                 .await?
+                {
+                    Some(t) => Some(t),
+                    None => return deny_cancellation(socket, &paths, session_id, &id).await,
+                }
             };
-
             let choice = ScopeOption {
                 label: String::new(),
                 scope,
@@ -125,7 +131,7 @@ pub(crate) async fn handle_push(
 
             // Step 1: choose action
             let Some(action) = choose_action(&title).await? else {
-                return Ok(());
+                return deny_cancellation(socket, &paths, session_id, &id).await;
             };
 
             // Step 2: choose scope
@@ -135,7 +141,7 @@ pub(crate) async fn handle_push(
             )
             .await?
             else {
-                return Ok(());
+                return deny_cancellation(socket, &paths, session_id, &id).await;
             };
 
             // Step 3: for non-Once scopes, choose target level
@@ -143,13 +149,16 @@ pub(crate) async fn handle_push(
             let target = if scope == ApprovalScope::Once {
                 None
             } else {
-                choose_target_level(
+                match choose_target_level(
                     &format!("agent-sandbox: {} filesystem target?", action.verb()),
                     filesystem_target_options(&path, access, home_str.as_deref(), scope),
                 )
                 .await?
+                {
+                    Some(t) => Some(t),
+                    None => return deny_cancellation(socket, &paths, session_id, &id).await,
+                }
             };
-
             let choice = ScopeOption {
                 label: String::new(),
                 scope,

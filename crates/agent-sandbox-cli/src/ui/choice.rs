@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_sandbox_core::{RequestContext, RpcReply, RpcRequest, SandboxPaths};
+use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
 use tracing::info;
 
 use super::error::UiCliError;
@@ -26,10 +26,9 @@ pub(crate) async fn resolve_choice(
     choice: Option<ScopeOption>,
 ) -> Result<(), UiCliError> {
     let Some(choice) = choice else {
-        info!("no prompt available; request left pending");
-        return Ok(());
+        return deny_cancellation(socket, paths, session_id, id).await;
     };
-    if choice.scope == agent_sandbox_core::ApprovalScope::Session && session_id.is_none() {
+    if choice.scope == ApprovalScope::Session && session_id.is_none() {
         let noun = match action {
             PromptAction::Allow => "approval",
             PromptAction::Deny => "deny",
@@ -67,6 +66,29 @@ pub(crate) async fn resolve_choice(
             eprintln!("Project policy saved to {}.", s.path().unwrap_or_default());
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Send a one-time deny to policyd for a prompt the user cancelled so the
+/// agent is unblocked with EACCES instead of waiting for the approval
+/// timeout. The denial is in-memory only: no rule is saved.
+pub(crate) async fn deny_cancellation(
+    socket: &PathBuf,
+    paths: &SandboxPaths,
+    session_id: Option<&str>,
+    id: &str,
+) -> Result<(), UiCliError> {
+    info!(request_id = %id, "prompt cancelled by user; sending one-time deny");
+    let req = RpcRequest::Deny {
+        id: id.to_string(),
+        scope: ApprovalScope::Once,
+        session_id: session_id.map(str::to_owned),
+        target: None,
+        ctx: RequestContext::from(paths),
+    };
+    if let Err(err) = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await {
+        eprintln!("agent-sandbox: cancel-deny failed ({err})");
     }
     Ok(())
 }
