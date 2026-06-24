@@ -99,10 +99,9 @@ let
       homeReadwrite = readwriteDirs'.home ++ readwriteFiles'.home;
 
       absReadonly = readonlyDirs'.abs ++ readonlyFiles'.abs;
-      absReadwrite = readwriteDirs'.abs ++ readwriteFiles'.abs;
-
+      absReadwrite = readonlyDirs'.abs ++ readwriteFiles'.abs;
       # sudoGuard must be in sandboxPkgs (add-pkg-deps), not only add-runtime PATH:
-      # omp ! shells build PATH from package deps, not the jail launcher exports.
+      # policyd-built shells build PATH from package deps, not the jail launcher exports.
       sandboxPkgs = lib.unique (
         [ cfg.package ] ++ commonPkgs ++ extraPkgs ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );

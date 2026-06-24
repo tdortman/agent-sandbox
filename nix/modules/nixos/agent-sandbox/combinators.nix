@@ -350,17 +350,18 @@ in
     fi
   '';
 
+  # Sudo guard combinator. The guard binary is exposed on PATH so that
+  # plain `sudo` inside the sandbox routes through it. No bind-mount at
+  # /run/wrappers/bin/sudo — the host's sudo wrapper is left untouched.
   agent-sandbox-sudo-guard =
     sudoPkg:
     compose [
       (add-runtime ''
-        export PATH="${sudoPkg}/bin:$PATH"
+        export PATH="${sudoPkg}/bin:''${PATH:-/dev/null}"
       '')
     ];
 
   agent-sandbox-restricted-net = include-once "agent-sandbox-restricted-net" (compose [
-    time-zone
-    (share-ns "pid")
     (share-ns "net")
     (runtime-deep-ro-bind "/etc/hosts")
     (add-runtime ''
