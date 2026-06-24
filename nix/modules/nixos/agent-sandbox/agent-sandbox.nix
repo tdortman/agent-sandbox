@@ -188,7 +188,7 @@ in
         "deny"
         "approve"
       ];
-      default = "approve";
+      default = "deny";
       description = ''
         How sandboxed agents may invoke sudo. ``deny`` blocks elevation.
         ``approve`` prepends an agent-sandbox guard to the sandbox PATH so
