@@ -82,6 +82,8 @@ pub enum ApprovalTarget {
 }
 
 /// Incoming RPC request (`op` tag).
+///
+/// `Check` attribution hints are embedded in `url` via [`attach_check_aliases`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RpcRequest {
@@ -197,6 +199,46 @@ impl RpcRequest {
     }
 }
 
+
+const CHECK_ALIASES_MARKER: &str = "#agent-sandbox-aliases=";
+
+/// Attach attribution hints to a check URL for UI display only.
+#[must_use]
+pub fn attach_check_aliases(url: Option<String>, aliases: &[String]) -> Option<String> {
+    if aliases.is_empty() {
+        return url;
+    }
+    let base = url.unwrap_or_default();
+    let payload = serde_json::to_string(aliases).ok()?;
+    Some(format!("{base}{CHECK_ALIASES_MARKER}{payload}"))
+}
+
+/// Split attribution hints from a check URL.
+#[must_use]
+pub fn split_check_aliases(url: Option<String>) -> (Option<String>, Vec<String>) {
+    let Some(url) = url else {
+        return (None, Vec::new());
+    };
+    let Some((base, raw)) = url.split_once(CHECK_ALIASES_MARKER) else {
+        return (Some(url), Vec::new());
+    };
+    let aliases = serde_json::from_str(raw).unwrap_or_default();
+    (Some(base.to_string()), aliases)
+}
+
+
+/// Attach attribution hints to a UI prompt URL.
+#[must_use]
+pub fn attach_ui_aliases(url: Option<String>, aliases: &[String]) -> Option<String> {
+    attach_check_aliases(url, aliases)
+}
+
+/// Split attribution hints from a UI prompt URL.
+#[must_use]
+pub fn split_ui_aliases(url: Option<String>) -> (Option<String>, Vec<String>) {
+    split_check_aliases(url)
+}
+
 fn default_https() -> String {
     "https".into()
 }
@@ -209,6 +251,16 @@ fn default_once_scope() -> ApprovalScope {
 mod tests {
     use super::{ApprovalTarget, RequestContext, RpcRequest};
     use crate::{ProcessIds, SandboxPaths};
+
+    #[test]
+    fn attach_check_aliases_roundtrip() {
+        let (url, aliases) = super::split_check_aliases(super::attach_check_aliases(
+            Some("tcp://104.18.32.47:443".into()),
+            &["chatgpt.com".into()],
+        ));
+        assert_eq!(url.as_deref(), Some("tcp://104.18.32.47:443"));
+        assert_eq!(aliases, vec!["chatgpt.com".to_string()]);
+    }
 
     #[test]
     fn check_request_deserializes() {

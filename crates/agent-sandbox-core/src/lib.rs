@@ -47,7 +47,7 @@ pub use rpc::{
     ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply,
     FilesystemMonitorReply, FilesystemScopeActionReply, PendingSummary, RegisterUiReply,
     RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply,
-    UiPush,
+    UiPush, attach_check_aliases, attach_ui_aliases, split_check_aliases, split_ui_aliases,
 };
 pub use rpc_client::{RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
