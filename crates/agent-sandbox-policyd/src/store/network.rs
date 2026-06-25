@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{CheckReply, ProcessIds, SandboxPaths, UiPush, attach_ui_aliases, normalize_host};
+use agent_sandbox_core::{
+    CheckReply, ProcessIds, SandboxPaths, UiPush, attach_ui_aliases, normalize_host,
+};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
@@ -133,7 +135,8 @@ impl PolicyStore {
     }
 
     pub async fn request_network_approval(&self, req: NetworkCheckRequest) -> CheckReply {
-        self.request_network_approval_with_aliases(req, Vec::new()).await
+        self.request_network_approval_with_aliases(req, Vec::new())
+            .await
     }
 
     pub(crate) async fn request_network_approval_with_aliases(

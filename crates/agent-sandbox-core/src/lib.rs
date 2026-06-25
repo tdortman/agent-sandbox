@@ -19,9 +19,7 @@ pub use agent_context::{
     ProcessIds, SandboxPaths, peer_sandbox_paths, persist_session_paths, resolve_daemon_paths,
     resolve_sandbox_paths,
 };
-pub use approved_bindings::{
-    ApprovedBindings, APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS,
-};
+pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
 pub use dns_cache::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_cache};
 pub use dns_wire::{DnsMapping, mappings_from_response};
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};

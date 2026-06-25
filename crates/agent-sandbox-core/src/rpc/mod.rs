@@ -16,5 +16,8 @@ pub use reply::{
     FilesystemScopeActionReply, RegisterUiReply, RpcReply, ScopeActionReply, SimpleOkReply,
     StatusReply,
 };
-pub use request::{attach_check_aliases, attach_ui_aliases, split_check_aliases, split_ui_aliases, ApprovalTarget, RequestContext, RpcRequest};
+pub use request::{
+    ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases, attach_ui_aliases,
+    split_check_aliases, split_ui_aliases,
+};
 pub use scope::ApprovalScope;

@@ -199,7 +199,6 @@ impl RpcRequest {
     }
 }
 
-
 const CHECK_ALIASES_MARKER: &str = "#agent-sandbox-aliases=";
 
 /// Attach attribution hints to a check URL for UI display only.
@@ -225,7 +224,6 @@ pub fn split_check_aliases(url: Option<String>) -> (Option<String>, Vec<String>)
     let aliases = serde_json::from_str(raw).unwrap_or_default();
     (Some(base.to_string()), aliases)
 }
-
 
 /// Attach attribution hints to a UI prompt URL.
 #[must_use]

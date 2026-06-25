@@ -38,7 +38,11 @@ pub(crate) async fn handle_push(
                 port,
                 &scheme,
                 url,
-                if aliases.is_empty() { None } else { Some(aliases) },
+                if aliases.is_empty() {
+                    None
+                } else {
+                    Some(aliases)
+                },
             );
             let paths = paths.merged_with(cwd, home, project_root);
 
@@ -233,7 +237,7 @@ fn network_prompt_with_aliases(
     port: u16,
     scheme: &str,
     fallback_url: Option<String>,
-    aliases: Option<Vec<String>>,  // parsed from URL fragment when present
+    aliases: Option<Vec<String>>, // parsed from URL fragment when present
 ) -> String {
     let base = network_prompt_url(host, port, scheme, fallback_url);
     if !is_ip_literal(host) {
