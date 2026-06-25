@@ -79,6 +79,7 @@ Static bubblewrap mounts define the structural write boundary: directories and f
 Host `/tmp` is similarly masked.
 
 ## Policy
+
 Each policy file is a JSON document with `network`, `sudo`, and `filesystem` sections. Each section has an `allow` and a `deny` array.
 
 ```json
@@ -194,7 +195,7 @@ Each subcommand accepts `--home`, `--cwd`, and `--project-root` to override path
 | `agent-sandbox-core`                   | Shared types, RPC protocol, policy model, host matching, DNS wire format.                                    |
 | `agent-sandbox-policyd`                | Policy daemon: merge, approval state, UI routing, session tracking.                                          |
 | `agent-sandbox-nfq`                    | NFQUEUE network enforcer and packet interceptor.                                                             |
-| `agent-sandbox-syscall`                | Seccomp BPF builder (`seccompiler`) and shared policy tables.                                                |
+| `agent-sandbox-syscall`                | Seccomp BPF builder and shared policy tables.                                                                |
 | `agent-sandbox-syscall-arm`            | In-sandbox child that installs the seccomp filter and hands the listener fd to the broker.                   |
 | `agent-sandbox-syscall-broker`         | Host-side seccomp user-notification broker; consults policyd per syscall.                                    |
 | `agent-sandbox-dns`                    | DNS forwarder with IP-to-hostname caching.                                                                   |
