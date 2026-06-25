@@ -24,18 +24,18 @@ use tracing::{debug, info, warn};
 /// two-byte length prefix.
 fn servfail_response(query: &[u8]) -> Option<Vec<u8>> {
     let message = Message::from_vec(query).ok()?;
-    if message.header().message_type() != MessageType::Query {
+    if message.metadata.message_type != MessageType::Query {
         return None;
     }
-    let mut response = Message::new();
-    response
-        .set_id(message.id())
-        .set_message_type(MessageType::Response)
-        .set_op_code(message.op_code())
-        .set_recursion_desired(message.recursion_desired())
-        .set_recursion_available(false)
-        .set_response_code(ResponseCode::ServFail);
-    for question in message.queries() {
+    let mut response = Message::new(
+        message.metadata.id,
+        MessageType::Response,
+        message.metadata.op_code,
+    );
+    response.metadata.recursion_desired = message.metadata.recursion_desired;
+    response.metadata.recursion_available = false;
+    response.metadata.response_code = ResponseCode::ServFail;
+    for question in &message.queries {
         response.add_query(question.clone());
     }
     response.to_vec().ok()
@@ -329,17 +329,15 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use hickory_proto::op::{Message, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::rdata::TXT;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     fn example_query(record_type: RecordType) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut query = Message::new();
-        query
-            .set_id(0x1234)
-            .set_recursion_desired(true)
-            .add_query(Query::query(name, record_type));
+        let mut query = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(name, record_type));
         query.to_vec().expect("encode query")
     }
 
@@ -360,11 +358,9 @@ mod tests {
 
     fn upstream_txt_response() -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        message.metadata.response_code = ResponseCode::NoError;
         message
-            .set_id(0x1234)
-            .set_message_type(MessageType::Response)
-            .set_response_code(ResponseCode::NoError)
             .add_query(Query::query(name.clone(), RecordType::TXT))
             .add_answer(Record::from_rdata(
                 name,
@@ -432,11 +428,11 @@ mod tests {
         let query = example_query(RecordType::A);
         let resp = servfail_response(&query).expect("servfail response");
         let message = Message::from_vec(&resp).expect("parse servfail");
-        assert_eq!(message.id(), 0x1234);
-        assert_eq!(message.header().response_code(), ResponseCode::ServFail);
-        assert_eq!(message.queries().len(), 1);
-        assert_eq!(message.queries()[0].name().to_ascii(), "example.com.");
-        assert_eq!(message.queries()[0].query_type(), RecordType::A);
+        assert_eq!(message.metadata.id, 0x1234);
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(message.queries.len(), 1);
+        assert_eq!(message.queries[0].name().to_ascii(), "example.com.");
+        assert_eq!(message.queries[0].query_type(), RecordType::A);
     }
 
     #[tokio::test]
@@ -457,7 +453,7 @@ mod tests {
         let mut buf = vec![0_u8; 65_535];
         let (len, _) = recv.recv_from(&mut buf).await.expect("recv servfail");
         let message = Message::from_vec(&buf[..len]).expect("parse response");
-        assert_eq!(message.header().response_code(), ResponseCode::ServFail);
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
         task.await.expect("udp task");
     }
 
@@ -485,7 +481,7 @@ mod tests {
         let mut resp = vec![0_u8; usize::from(resp_len)];
         client.read_exact(&mut resp).await.expect("read resp");
         let message = Message::from_vec(&resp).expect("parse servfail");
-        assert_eq!(message.header().response_code(), ResponseCode::ServFail);
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
         // Close the client side so handle_tcp's read loop sees EOF and
         // returns, instead of blocking waiting for a second query frame.
         drop(client);
@@ -495,10 +491,8 @@ mod tests {
     #[test]
     fn mappings_from_response_returns_all_addresses_for_example_com() {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message
-            .set_id(0x1234)
-            .set_message_type(MessageType::Response)
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
                 name.clone(),

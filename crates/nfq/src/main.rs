@@ -507,7 +507,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use hickory_proto::op::{Message, MessageType, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
@@ -751,10 +751,8 @@ mod tests {
 
     fn build_dns_response_packet(src_ip: [u8; 4]) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message
-            .set_id(0x1234)
-            .set_message_type(MessageType::Response)
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
                 name,
@@ -783,11 +781,9 @@ mod tests {
 
     fn build_dns_query_packet(dst_ip: [u8; 4]) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut message = Message::new();
-        message
-            .set_id(1)
-            .set_recursion_desired(true)
-            .add_query(Query::query(name, RecordType::A));
+        let mut message = Message::new(1, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(name, RecordType::A));
         let dns_payload = message.to_vec().expect("encode DNS query");
         let udp_len = 8 + dns_payload.len();
         let total_len = 20 + udp_len;
@@ -897,11 +893,8 @@ mod tests {
     #[test]
     fn large_dns_response_over_128_bytes_still_maps_ip_to_hostname() {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut message = Message::new();
-        message
-            .set_id(0x1234)
-            .set_message_type(MessageType::Response)
-            .add_query(Query::query(name.clone(), RecordType::A));
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        message.add_query(Query::query(name.clone(), RecordType::A));
         let ips: [[u8; 4]; 10] = [
             [93, 184, 216, 34],
             [93, 184, 216, 35],

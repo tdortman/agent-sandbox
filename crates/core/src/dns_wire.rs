@@ -14,7 +14,7 @@ pub struct DnsMapping {
 }
 
 fn query_name(message: &Message) -> Option<String> {
-    let query = message.queries().first()?;
+    let query = message.queries.first()?;
     Some(normalize_owner(query.name()))
 }
 
@@ -34,12 +34,12 @@ fn allowed_owner_names(message: &Message, qname: &str) -> HashSet<String> {
     let mut allowed = HashSet::from([qname.to_string()]);
     loop {
         let mut added = false;
-        for record in message.answers() {
-            let owner = normalize_owner(record.name());
+        for record in &message.answers {
+            let owner = normalize_owner(&record.name);
             if !allowed.contains(&owner) {
                 continue;
             }
-            if let Some(RData::CNAME(cname)) = record.data() {
+            if let RData::CNAME(cname) = &record.data {
                 let target = normalize_owner(&cname.0);
                 if allowed.insert(target) {
                     added = true;
@@ -60,7 +60,7 @@ fn mappings_from_svcb_rdata(rdata: &RData, ttl: u32, qname: &str) -> Vec<DnsMapp
         _ => return Vec::new(),
     };
     let mut mappings = Vec::new();
-    for (_key, value) in svcb.svc_params() {
+    for (_key, value) in &svcb.svc_params {
         match value {
             SvcParamValue::Ipv4Hint(hint) => {
                 for addr in &hint.0 {
@@ -92,7 +92,7 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     let Ok(message) = Message::from_vec(data) else {
         return Vec::new();
     };
-    if message.header().message_type() != MessageType::Response {
+    if message.metadata.message_type != MessageType::Response {
         return Vec::new();
     }
     let Some(qname) = query_name(&message) else {
@@ -100,22 +100,21 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     };
     let allowed = allowed_owner_names(&message, &qname);
     let mut mappings = Vec::new();
-    for record in message.answers() {
-        let owner = normalize_owner(record.name());
+    for record in &message.answers {
+        let owner = normalize_owner(&record.name);
         if !allowed.contains(&owner) {
             continue;
         }
-        let ttl = record.ttl();
-        if let Some(rdata) = record.data() {
-            if let Some(ip) = ip_from_rdata(rdata) {
-                mappings.push(DnsMapping {
-                    ip,
-                    hostname: qname.clone(),
-                    ttl,
-                });
-            } else {
-                mappings.extend(mappings_from_svcb_rdata(rdata, ttl, &qname));
-            }
+        let ttl = record.ttl;
+        let rdata = &record.data;
+        if let Some(ip) = ip_from_rdata(rdata) {
+            mappings.push(DnsMapping {
+                ip,
+                hostname: qname.clone(),
+                ttl,
+            });
+        } else {
+            mappings.extend(mappings_from_svcb_rdata(rdata, ttl, &qname));
         }
     }
     mappings
@@ -133,17 +132,15 @@ mod tests {
     use std::net::Ipv6Addr;
 
     use super::{DnsMapping, mappings_from_response, question_name};
-    use hickory_proto::op::{Message, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
         message
-            .set_id(0xBEEF)
-            .set_message_type(hickory_proto::op::MessageType::Response)
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
                 name,
@@ -169,10 +166,8 @@ mod tests {
     #[test]
     fn mappings_from_response_keeps_every_address_for_question() {
         let name = Name::from_ascii("example.com.").expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
         message
-            .set_id(0xBEEF)
-            .set_message_type(hickory_proto::op::MessageType::Response)
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
                 name.clone(),
@@ -207,9 +202,8 @@ mod tests {
     fn mappings_follow_cname_but_keep_query_name() {
         let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
         let cname_target = Name::from_ascii("edge.cursor-cdn.example.").expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message
-            .set_message_type(hickory_proto::op::MessageType::Response)
             .add_query(Query::query(qname.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
                 qname,
@@ -237,9 +231,8 @@ mod tests {
     fn mappings_ignore_unrelated_answer_addresses() {
         let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
         let unrelated = Name::from_ascii("unrelated.example.").expect("valid name");
-        let mut message = Message::new();
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message
-            .set_message_type(hickory_proto::op::MessageType::Response)
             .add_query(Query::query(qname, RecordType::A))
             .add_answer(Record::from_rdata(
                 unrelated,
@@ -270,9 +263,8 @@ mod tests {
                 ),
             ],
         );
-        let mut message = Message::new();
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message
-            .set_message_type(hickory_proto::op::MessageType::Response)
             .add_query(Query::query(qname.clone(), RecordType::HTTPS))
             .add_answer(Record::from_rdata(qname, 120, RData::HTTPS(HTTPS(svcb))));
         let pkt = message.to_vec().expect("encode");
@@ -302,7 +294,7 @@ mod tests {
 
     #[test]
     fn non_response_returns_empty() {
-        let mut message = Message::new();
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
         message.add_query(Query::query(
             Name::from_ascii("test.").expect("valid name"),
             RecordType::A,
