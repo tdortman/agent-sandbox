@@ -18,6 +18,7 @@
 #include <QPalette>
 #include <QPushButton>
 #include <QTextEdit>
+#include <QTextDocument>
 #include <QTextOption>
 #include <QVBoxLayout>
 #include <string>
@@ -37,6 +38,43 @@ static void usage(FILE* fp, const char* argv0) {
 // resized. WrapAtWordBoundaryOrAnywhere prefers word boundaries but breaks
 // inside unbroken tokens (paths, base64 blobs) when a single word is wider
 // than the widget, so nothing overflows even on narrow windows.
+// Text widget sized to exactly fit its content so the dialog is only as tall as
+// the text needs. QTextEdit's sizeHint and minimumSizeHint are content-agnostic
+// (a ~3-line floor), so without these overrides a one-line prompt left the
+// dialog tall with empty space above/below the text and below the buttons.
+// hasHeightForWidth + heightForWidth let the layout size the dialog to the text
+// at any width; minimumSizeHint lifts the built-in floor so a single line is one
+// line tall. QTextEdit already relays the document to the viewport on resize, so
+// wrapped text (long domains/paths/commands) reflows without extra plumbing.
+class FitText : public QTextEdit {
+  public:
+    explicit FitText(const QString& text, QWidget* parent = nullptr)
+        : QTextEdit(text, parent) {
+        // Content always fits, so scrollbars would just steal layout width.
+        setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    }
+
+    bool hasHeightForWidth() const override { return true; }
+
+    // QAbstractScrollArea floors the widget at ~3 lines via minimumSizeHint;
+    // the real minimum is the content height, so report 0 and let
+    // heightForWidth drive the size.
+    QSize minimumSizeHint() const override {
+        return QSize(QTextEdit::minimumSizeHint().width(), 0);
+    }
+
+    int heightForWidth(int w) const override {
+        const int inner = w - 2 * frameWidth();
+        if (inner <= 0) {
+            return -1;
+        }
+        auto* doc = const_cast<QTextDocument*>(document());
+        doc->setTextWidth(qreal(inner));
+        return qCeil(doc->size().height()) + 2 * frameWidth();
+    }
+};
+
 int main(int argc, char* argv[]) {
     std::string title;
     std::string text;
@@ -85,10 +123,8 @@ int main(int argc, char* argv[]) {
 
     auto* mainLayout = new QVBoxLayout(&dialog);
 
-    // Read-only text widget. Sized for typical prompts but expands with the
-    // dialog. Word wrapping happens entirely in the widget so the CLI does
-    // not need to know the dialog width.
-    auto* prompt = new QTextEdit(QString::fromStdString(text), &dialog);
+    // Read-only text widget sized to exactly fit its content (see FitText).
+    auto* prompt = new FitText(QString::fromStdString(text), &dialog);
     prompt->setReadOnly(true);
     prompt->setFrameShape(QFrame::NoFrame);
     prompt->setFocusPolicy(Qt::NoFocus);
