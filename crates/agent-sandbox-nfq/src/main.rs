@@ -9,7 +9,8 @@ mod owner;
 mod packet;
 mod policy;
 use agent_sandbox_core::{
-    DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_cache, mappings_from_response,
+    APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
+    lookup_dns_cache, mappings_from_response,
 };
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
@@ -86,6 +87,9 @@ struct Cli {
 }
 struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
+    approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
+    #[allow(dead_code)]
+    approved_bindings_path: PathBuf,
     cache_path: Option<PathBuf>,
     dns_server_ip: IpAddr,
     nft_binary: String,
@@ -102,8 +106,13 @@ impl NfqState {
             |_| Some(PathBuf::from(DEFAULT_CACHE_PATH)),
             |p| Some(PathBuf::from(p)),
         );
+        let approved_bindings_path = std::env::var("AGENT_SANDBOX_APPROVED_BINDINGS")
+            .map_or_else(|_| PathBuf::from(APPROVED_BINDINGS_PATH), PathBuf::from);
+        let approved_bindings = ApprovedBindings::load(&approved_bindings_path);
         Self {
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
+            approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
+            approved_bindings_path,
             cache_path,
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
@@ -351,6 +360,7 @@ where
         u16,
         packet::TransportProtocol,
         Option<u32>,
+        &[String],
         Duration,
     ) -> std::io::Result<policy::PolicyResult>,
 {
@@ -397,6 +407,11 @@ where
     // on the next connection within the same daemon session.
     let hostname = state.resolve_host(&meta.dst_ip.to_string());
     let dst_ip = meta.dst_ip.to_string();
+    let aliases = state
+        .approved_bindings
+        .lock()
+        .map(|bindings| bindings.aliases(&dst_ip))
+        .unwrap_or_default();
     let src_pid = owner::pid_from_src_port(meta.protocol, meta.src_ip, meta.src_port);
     let result = check(
         policy_socket,
@@ -405,6 +420,7 @@ where
         meta.dst_port,
         meta.protocol,
         src_pid,
+        &aliases,
         timeout,
     );
 
@@ -424,6 +440,10 @@ where
     };
 
     if allowed {
+        if let Ok(mut bindings) = state.approved_bindings.lock() {
+            bindings.record(&hostname, &dst_ip);
+            let _ = bindings.save();
+        }
         info!(
             protocol = meta.protocol.as_str(),
             host = %hostname,
@@ -461,9 +481,19 @@ fn handle_packet(
                      dst_port: u16,
                      protocol: packet::TransportProtocol,
                      src_pid: Option<u32>,
+                     aliases: &[String],
                      to: Duration| {
         runtime.block_on(policy::check_destination(
-            socket, hostname, dst_ip, dst_port, protocol, src_pid, to,
+            socket,
+            policy::CheckDestinationArgs {
+                hostname,
+                dst_ip,
+                dst_port,
+                protocol,
+                src_pid,
+                aliases,
+            },
+            to,
         ))
     };
     handle_packet_payload(state, policy_socket, timeout, payload, &mut check)
@@ -483,11 +513,23 @@ mod tests {
 
     const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
     fn state_for_tests() -> NfqState {
+        let mut approved_bindings_path = std::env::temp_dir();
+        approved_bindings_path.push(format!(
+            "agent-sandbox-nfq-bindings-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
         NfqState {
             dns_cache: Arc::new(std::sync::Mutex::new(DnsCache::new(
                 None::<PathBuf>,
                 DEFAULT_MAX_TTL,
             ))),
+            approved_bindings: Arc::new(std::sync::Mutex::new(ApprovedBindings::load(
+                &approved_bindings_path,
+            ))),
+            approved_bindings_path,
             cache_path: None,
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
@@ -547,6 +589,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -578,6 +621,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -650,6 +694,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -997,6 +1042,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -1032,6 +1078,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -1067,6 +1114,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -1093,6 +1141,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })
@@ -1108,6 +1157,65 @@ mod tests {
     }
 
     #[test]
+    fn approved_binding_aliases_passed_to_policy_check() {
+        let state = state_for_tests();
+        {
+            let mut bindings = state.approved_bindings.lock().expect("lock bindings");
+            bindings.record("chatgpt.com", "93.184.216.34");
+        }
+        let pkt = build_udp_data_packet(443);
+        let aliases_seen = std::cell::RefCell::new(Vec::<String>::new());
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         aliases: &[String],
+                         _: Duration| {
+            *aliases_seen.borrow_mut() = aliases.to_vec();
+            Ok(policy::PolicyResult { allowed: true })
+        };
+
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        assert_eq!(
+            aliases_seen.borrow().as_slice(),
+            &["chatgpt.com".to_string()],
+            "approved bindings aliases should be passed to policy check"
+        );
+    }
+
+    #[test]
+    fn successful_accept_records_approved_binding() {
+        let state = state_for_tests();
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "example.com", 300);
+        let pkt = build_udp_data_packet(443);
+
+        let mut check =
+            |_: &str,
+             _: &str,
+             _: &str,
+             _: u16,
+             _: packet::TransportProtocol,
+             _: Option<u32>,
+             _: &[String],
+             _: Duration| Ok(policy::PolicyResult { allowed: true });
+
+        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        assert_eq!(v, Verdict::Accept);
+        let aliases = state
+            .approved_bindings
+            .lock()
+            .expect("lock bindings")
+            .aliases("93.184.216.34");
+        assert_eq!(aliases, vec!["example.com".to_string()]);
+    }
+    #[test]
     fn loopback_udp_53_invokes_policy_check() {
         let state = state_for_tests();
         let pkt = build_dns_query_packet([127, 0, 0, 1]);
@@ -1119,6 +1227,7 @@ mod tests {
                          _: u16,
                          _: packet::TransportProtocol,
                          _: Option<u32>,
+                         _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
             Ok(policy::PolicyResult { allowed: true })

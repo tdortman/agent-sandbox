@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use agent_sandbox_core::{
-    ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
+    ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths, attach_check_aliases,
+    policy_rpc,
 };
 
 use crate::packet::TransportProtocol;
@@ -18,28 +19,34 @@ struct PolicyContext {
     ids: ProcessIds,
 }
 
+/// Inputs for a single policy check, grouped to keep the call signature small.
+pub struct CheckDestinationArgs<'a> {
+    pub hostname: &'a str,
+    pub dst_ip: &'a str,
+    pub dst_port: u16,
+    pub protocol: TransportProtocol,
+    pub src_pid: Option<u32>,
+    pub aliases: &'a [String],
+}
+
 /// Check whether a destination is allowed by policy.
 ///
 /// `hostname` should be pre-resolved by the caller (DNS cache or PTR).
 /// Blocks until policyd responds (which may wait for user approval).
 pub async fn check_destination(
     socket: &str,
-    hostname: &str,
-    dst_ip: &str,
-    dst_port: u16,
-    protocol: TransportProtocol,
-    src_pid: Option<u32>,
+    args: CheckDestinationArgs<'_>,
     timeout: Duration,
 ) -> std::io::Result<PolicyResult> {
-    let ctx = resolve_context(src_pid);
-    let scheme = protocol.as_str();
-    let url = format!("{scheme}://{hostname}:{dst_port}");
+    let ctx = resolve_context(args.src_pid);
+    let scheme = args.protocol.as_str();
+    let url = format!("{scheme}://{}:{}", args.hostname, args.dst_port);
     let req = RpcRequest::Check {
-        host: Some(hostname.to_string()),
-        connect_host: Some(dst_ip.to_string()),
-        port: Some(dst_port),
+        host: Some(args.hostname.to_string()),
+        connect_host: Some(args.dst_ip.to_string()),
+        port: Some(args.dst_port),
         scheme: scheme.to_string(),
-        url: Some(url),
+        url: attach_check_aliases(Some(url), args.aliases),
         ctx: request_context(
             &ctx.paths,
             ctx.ids,
