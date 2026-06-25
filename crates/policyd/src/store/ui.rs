@@ -76,7 +76,7 @@ impl PolicyStore {
         handle: &UiClientHandle,
         context: UiSessionContext,
     ) -> String {
-        let session_id = Uuid::new_v4().simple().to_string();
+        let session_id = Uuid::now_v7().simple().to_string();
         let mut inner = self.inner.lock().await;
         inner.ui_clients.insert(
             handle.id,

@@ -229,7 +229,7 @@ impl PolicyStore {
                     );
                     return CheckReply::blocked("agent-sandbox: too many pending approvals");
                 }
-                let pending_id = format!("net:{}", Uuid::new_v4().simple());
+                let pending_id = format!("net:{}", Uuid::now_v7().simple());
                 inner.network_futures.insert(pending_id.clone(), vec![tx]);
                 inner.pending.insert(
                     pending_id.clone(),

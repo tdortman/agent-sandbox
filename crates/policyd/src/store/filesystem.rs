@@ -220,7 +220,7 @@ impl PolicyStore {
                         access,
                     );
                 }
-                pending_id = format!("fs:{}", Uuid::new_v4().simple());
+                pending_id = format!("fs:{}", Uuid::now_v7().simple());
                 inner
                     .filesystem_futures
                     .insert(pending_id.clone(), vec![tx]);

@@ -109,7 +109,7 @@ impl PolicyStore {
                 .await;
         }
 
-        let pending_id = format!("elev:{}", Uuid::new_v4().simple());
+        let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
         {
             let mut inner = self.inner.lock().await;
