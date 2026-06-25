@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name              = "agent-sandbox-enter"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-sandbox-enter"
+path = "src/main.rs"
+
+[dependencies]
+caps.workspace = true
+clap.workspace = true
+libc.workspace = true
+nix            = { workspace = true, features = ["sched"] }

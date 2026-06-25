@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name              = "agent-sandbox-syscall-broker"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-sandbox-syscall-broker"
+path = "src/main.rs"
+
+[dependencies]
+agent-sandbox-core.workspace    = true
+agent-sandbox-syscall.workspace = true
+clap.workspace                  = true
+libc.workspace                  = true
+tokio                           = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tracing.workspace               = true
+tracing-subscriber.workspace    = true

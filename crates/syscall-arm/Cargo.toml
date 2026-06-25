@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name              = "agent-sandbox-syscall-arm"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-sandbox-syscall-arm"
+path = "src/main.rs"
+
+[dependencies]
+agent-sandbox-syscall.workspace = true
+clap.workspace                  = true
+libc.workspace                  = true

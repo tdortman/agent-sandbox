@@ -1,0 +1,48 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name              = "agent-sandbox-cli"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "agent_sandbox_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-sandbox-approve"
+path = "src/bin/approve.rs"
+
+[[bin]]
+name = "agent-sandbox-elevate"
+path = "src/bin/elevate.rs"
+
+[[bin]]
+name = "agent-sandbox-ui"
+path = "src/bin/ui.rs"
+
+[[bin]]
+name = "agent-sandbox-open-ui-fd"
+path = "src/bin/open_ui_fd.rs"
+
+[dependencies]
+agent-sandbox-core.workspace = true
+clap = { workspace = true, features = ["env"] }
+libc.workspace = true
+nix = { workspace = true, features = ["fs", "user"] }
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

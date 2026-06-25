@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name              = "agent-sandbox-fsmon"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-sandbox-fs-arm"
+path = "src/bin/agent-sandbox-fs-arm.rs"
+
+[[bin]]
+name = "agent-sandbox-fsmon"
+path = "src/bin/agent-sandbox-fsmon.rs"
+
+[dependencies]
+agent-sandbox-core.workspace = true
+clap.workspace               = true
+libc.workspace               = true
+serde.workspace              = true
+serde_json.workspace         = true
+thiserror.workspace          = true
+tracing.workspace            = true
