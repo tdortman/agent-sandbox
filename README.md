@@ -1,6 +1,6 @@
 # agent-sandbox
 
-agent-sandbox wraps AI agent CLIs in a bubblewrap sandbox on NixOS. It intercepts network, filesystem, and sudo requests and prompts the user for approval through a standalone Qt/tty UI client.
+agent-sandbox wraps AI agent CLIs in a bubblewrap sandbox on NixOS. It intercepts network, filesystem, and sudo requests and prompts the user for approval through `agent-sandbox-ui` (graphical Qt or zenity dialogs) or `agent-sandbox-approve` on the host.
 
 ## How it works
 
@@ -150,7 +150,7 @@ See `./nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for the full list of N
 
 ## Policy UI
 
-The `agent-sandbox-ui` binary is the long-lived UI client. It connects to the policyd host socket, registers for the current context, and surfaces incoming approval prompts (network, elevation, filesystem) over a Qt dialog or a tty menu.
+The `agent-sandbox-ui` binary is the long-lived UI client. It connects to the policyd host socket, registers for the current context, and surfaces incoming approval prompts (network, elevation, filesystem) as graphical dialogs.
 
 When a graphical session is detected, the UI tries backends in priority order:
 
