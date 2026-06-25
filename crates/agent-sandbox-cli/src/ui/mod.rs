@@ -1,4 +1,4 @@
-//! Long-lived policyd UI client (Qt / tty prompts).
+//! Long-lived policyd UI client (graphical Qt / zenity prompts).
 
 mod choice;
 mod dialog;

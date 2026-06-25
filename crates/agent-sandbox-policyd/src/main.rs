@@ -77,7 +77,7 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     interactive_approval: bool,
 
-    /// Path to the "agent-sandbox-ui" binary. If unset, the daemon falls back to the env var "AGENT_SANDBOX_UI_SPAWN_CMD", then to a built-in default. Used when policyd needs to spawn a transient TTY prompt for a request that arrived with no registered UI.
+    /// Path to the "agent-sandbox-ui" binary. If unset, the daemon falls back to the env var "AGENT_SANDBOX_UI_SPAWN_CMD", then to a built-in default. Used when policyd needs to spawn a transient UI client for a request that arrived with no registered UI.
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_UI_SPAWN_CMD")]
     ui_spawn_cmd: Option<PathBuf>,
 
