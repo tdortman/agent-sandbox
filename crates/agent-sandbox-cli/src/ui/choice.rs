@@ -9,12 +9,7 @@ use super::options::{PromptAction, ScopeOption};
 
 pub(crate) fn format_elevation_title(argv: &[String], _cwd: &str) -> String {
     let cmd = argv.join(" ");
-    let mut title = format!("agent-sandbox: sudo {cmd}");
-    if title.len() > 72 {
-        title.truncate(69);
-        title.push_str("...");
-    }
-    title
+    format!("agent-sandbox: sudo {cmd}")
 }
 
 pub(crate) async fn resolve_choice(
@@ -91,4 +86,51 @@ pub(crate) async fn deny_cancellation(
         eprintln!("agent-sandbox: cancel-deny failed ({err})");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_elevation_title;
+
+    #[test]
+    fn format_elevation_title_keeps_full_long_argv() {
+        let argv: Vec<String> = std::iter::once("id".to_string())
+            .chain(std::iter::repeat_n(
+                "adsfsdafsdafdasadsfsdafsdafsadfasd".to_string(),
+                20,
+            ))
+            .collect();
+        let title = format_elevation_title(&argv, "/work");
+        let expected_cmd = argv.join(" ");
+        assert!(
+            title.contains(&expected_cmd),
+            "title must include the full command; got {title}"
+        );
+        assert!(!title.ends_with("..."), "title must not end with ellipsis");
+        assert!(title.len() > 200, "long argv should produce a long title");
+    }
+
+    #[test]
+    fn format_elevation_title_does_not_truncate_or_insert_newlines() {
+        // Wrapping/reflow is the dialog's job (e.g. QTextEdit with
+        // WidgetWidth line wrap on the Qt helper). The CLI must hand off
+        // the full command unmodified so the dialog can reflow as the
+        // window is resized.
+        let argv = vec![
+            "id".to_string(),
+            "adsfsdafsdafdasadsfsdafsdafsadfasd".repeat(20),
+            "BLOB=".to_string() + &"a".repeat(500),
+        ];
+        let title = format_elevation_title(&argv, "/work");
+        assert!(
+            !title.contains('\n'),
+            "CLI must not insert newlines; the dialog reflows. got {title}"
+        );
+        assert!(!title.ends_with("..."), "title must not end with ellipsis");
+        let expected = argv.join(" ");
+        assert!(
+            title.contains(&expected),
+            "title must contain the full command verbatim"
+        );
+    }
 }
