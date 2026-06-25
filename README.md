@@ -159,6 +159,8 @@ When a graphical session is detected, the UI tries backends in priority order:
 
 `AGENT_SANDBOX_UI_BACKEND` can pin a specific backend (`qt-dialog`, `zenity`, `none`). `AGENT_SANDBOX_UI_PREFER_GRAPHICAL=1` forces graphical prompts even when no display is detected at startup. If no UI client is registered for a request, policyd spawns one on demand.
 
+If no graphical backend is available, the prompt is treated as cancelled (denied). For headless or SSH workflows, set `uiBackend = "none"` and use `agent-sandbox-approve` from a terminal instead.
+
 `agent-sandbox-open-ui-fd` pre-registers a policyd UI connection on the host and execs the sandbox launcher with the connected stream on a kernel-assigned fd communicated via `AGENT_SANDBOX_UI_FD`. The inherited fd is the only approval path into the sandbox; later connections cannot register a UI or approve pending requests. Cancellations from the UI send a one-time `Deny` so the tracee unblocks with `EACCES` rather than waiting for the approval timeout.
 
 ## CLI
