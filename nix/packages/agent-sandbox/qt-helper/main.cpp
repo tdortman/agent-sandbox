@@ -1,12 +1,12 @@
 // Standalone Qt dialog helper for agent-sandbox policy prompts.
-// No KDE or GTK dependencies — just Qt Widgets.
+// No KDE or GTK dependencies, just Qt Widgets.
 //
 // Usage:
 //   agent-sandbox-qt-dialog --title <window-title> --text <prompt-text> \
 //       --option <label> [--option <label> ...]
 //
 // On user selection of an option, prints the exact label text to stdout and
-// exits 0.  If the user closes the dialog or presses Cancel/Escape, exits
+// exits 0. If the user closes the dialog or presses Cancel/Escape, exits
 // nonzero with no output.
 
 #include <getopt.h>
@@ -14,8 +14,11 @@
 #include <cstdlib>
 #include <QApplication>
 #include <QDialog>
-#include <QLabel>
+#include <QFrame>
+#include <QPalette>
 #include <QPushButton>
+#include <QTextEdit>
+#include <QTextOption>
 #include <QVBoxLayout>
 #include <string>
 #include <vector>
@@ -30,8 +33,11 @@ static void usage(FILE* fp, const char* argv0) {
     std::exit(fp == stderr ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
+// Build a read-only text widget that reflows dynamically as the dialog is
+// resized. WrapAtWordBoundaryOrAnywhere prefers word boundaries but breaks
+// inside unbroken tokens (paths, base64 blobs) when a single word is wider
+// than the widget, so nothing overflows even on narrow windows.
 int main(int argc, char* argv[]) {
-    // Parse CLI args.
     std::string title;
     std::string text;
     std::vector<std::string> options;
@@ -79,18 +85,37 @@ int main(int argc, char* argv[]) {
 
     auto* mainLayout = new QVBoxLayout(&dialog);
 
-    auto* label = new QLabel(QString::fromStdString(text));
-    label->setWordWrap(true);
-    mainLayout->addWidget(label);
+    // Read-only text widget. Sized for typical prompts but expands with the
+    // dialog. Word wrapping happens entirely in the widget so the CLI does
+    // not need to know the dialog width.
+    auto* prompt = new QTextEdit(QString::fromStdString(text), &dialog);
+    prompt->setReadOnly(true);
+    prompt->setFrameShape(QFrame::NoFrame);
+    prompt->setFocusPolicy(Qt::NoFocus);
+
+    // Use the dialog's default text palette and font so the prompt looks like
+    // a label, not an editable field.
+    QPalette promptPalette = prompt->palette();
+    promptPalette.setColor(QPalette::Base, dialog.palette().color(QPalette::Window));
+    prompt->setPalette(promptPalette);
+    prompt->setFont(dialog.font());
+
+    // Minimum height covers a few lines of text. The widget can grow
+    // beyond it. Maximum height leaves room for the option buttons.
+    prompt->setMinimumHeight(60);
+    prompt->setMaximumHeight(400);
+    prompt->setLineWrapMode(QTextEdit::WidgetWidth);
+    prompt->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    mainLayout->addWidget(prompt);
 
     auto* btnLayout = new QVBoxLayout();
     mainLayout->addLayout(btnLayout);
 
-    // Track which option was selected; captured by lambda.
+    // Track which option was selected. Captured by the click lambda.
     std::string selected;
 
     for (const auto& opt : options) {
-        auto* btn = new QPushButton(QString::fromStdString(opt));
+        auto* btn = new QPushButton(QString::fromStdString(opt), &dialog);
         btn->setStyleSheet("text-align: left; padding: 6px 12px;");
         btnLayout->addWidget(btn);
         QObject::connect(btn, &QPushButton::clicked, [&dialog, &selected, opt]() {
@@ -99,7 +124,14 @@ int main(int argc, char* argv[]) {
         });
     }
 
-    // QDialog::reject is called on window close / Escape key.
+    // Focus the first option so Enter accepts the default.
+    if (btnLayout->itemAt(0) != nullptr) {
+        if (auto* firstBtn = btnLayout->itemAt(0)->widget()) {
+            firstBtn->setFocus();
+        }
+    }
+
+    // QDialog::reject is called on window close or Escape key.
     int ret = dialog.exec();
 
     if (ret != QDialog::Accepted || selected.empty()) {
