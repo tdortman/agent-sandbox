@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, FileAccess, UiPush, approval_host_patterns,
-    filesystem_approval_paths,
+    filesystem_approval_paths, is_ip_literal, split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
@@ -32,7 +32,14 @@ pub(crate) async fn handle_push(
             let host = host.unwrap_or_default();
             let port = port.unwrap_or(0);
             let scheme = scheme.unwrap_or_else(|| "https".into());
-            let url = network_prompt_url(&host, port, &scheme, url);
+            let (url, aliases) = split_check_aliases(url);
+            let url = network_prompt_with_aliases(
+                &host,
+                port,
+                &scheme,
+                url,
+                if aliases.is_empty() { None } else { Some(aliases) },
+            );
             let paths = paths.merged_with(cwd, home, project_root);
 
             // Step 1: choose action
@@ -221,6 +228,31 @@ fn network_prompt_url(host: &str, port: u16, scheme: &str, fallback_url: Option<
     }
 }
 
+fn network_prompt_with_aliases(
+    host: &str,
+    port: u16,
+    scheme: &str,
+    fallback_url: Option<String>,
+    aliases: Option<Vec<String>>,  // parsed from URL fragment when present
+) -> String {
+    let base = network_prompt_url(host, port, scheme, fallback_url);
+    if !is_ip_literal(host) {
+        return base;
+    }
+    let Some(aliases) = aliases else {
+        return base;
+    };
+    let hints: Vec<&str> = aliases
+        .iter()
+        .map(String::as_str)
+        .filter(|alias| !alias.is_empty() && !is_ip_literal(alias))
+        .collect();
+    if hints.is_empty() {
+        return base;
+    }
+    format!("{base} (previously seen as: {})", hints.join(", "))
+}
+
 fn network_target_options(host: &str, scope: ApprovalScope) -> Vec<ScopeOption> {
     let hosts = approval_host_patterns(host);
     let mut options = Vec::with_capacity(hosts.len());
@@ -254,7 +286,7 @@ fn filesystem_target_options(
 
 #[cfg(test)]
 mod tests {
-    use super::{network_prompt_url, network_target_options};
+    use super::{network_prompt_url, network_prompt_with_aliases, network_target_options};
     use agent_sandbox_core::{ApprovalScope, ApprovalTarget};
 
     #[test]
@@ -283,6 +315,51 @@ mod tests {
             options.get(1).and_then(|option| option.target.as_ref()),
             Some(ApprovalTarget::NetworkHost { host }) if host == "34.230.40.*"
         ));
+    }
+
+    #[test]
+    fn network_prompt_with_aliases_appends_hint_for_ip_literal() {
+        let url = network_prompt_with_aliases(
+            "104.18.32.47",
+            443,
+            "tcp",
+            Some("tcp://104.18.32.47:443".to_string()),
+            Some(vec!["chatgpt.com".to_string()]),
+        );
+        assert_eq!(
+            url,
+            "tcp://104.18.32.47:443 (previously seen as: chatgpt.com)"
+        );
+    }
+
+    #[test]
+    fn network_prompt_with_aliases_skips_hint_for_hostname() {
+        let url = network_prompt_with_aliases(
+            "chatgpt.com",
+            443,
+            "tcp",
+            None,
+            Some(vec!["example.com".to_string()]),
+        );
+        assert_eq!(url, "tcp://chatgpt.com:443");
+    }
+
+    #[test]
+    fn network_prompt_with_aliases_joins_multiple_hints() {
+        let url = network_prompt_with_aliases(
+            "104.18.32.47",
+            443,
+            "tcp",
+            None,
+            Some(vec![
+                "chatgpt.com".to_string(),
+                "www.chatgpt.com".to_string(),
+            ]),
+        );
+        assert_eq!(
+            url,
+            "tcp://104.18.32.47:443 (previously seen as: chatgpt.com, www.chatgpt.com)"
+        );
     }
     #[test]
     fn network_target_options_use_ipv6_prefix_wildcards() {
