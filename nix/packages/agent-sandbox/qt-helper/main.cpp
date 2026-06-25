@@ -135,11 +135,6 @@ int main(int argc, char* argv[]) {
     promptPalette.setColor(QPalette::Base, dialog.palette().color(QPalette::Window));
     prompt->setPalette(promptPalette);
     prompt->setFont(dialog.font());
-
-    // Minimum height covers a few lines of text. The widget can grow
-    // beyond it. Maximum height leaves room for the option buttons.
-    prompt->setMinimumHeight(60);
-    prompt->setMaximumHeight(400);
     prompt->setLineWrapMode(QTextEdit::WidgetWidth);
     prompt->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
     mainLayout->addWidget(prompt);
