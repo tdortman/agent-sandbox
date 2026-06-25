@@ -477,6 +477,7 @@ mod tests {
             port: 443,
             scheme: "https".into(),
             url: "https://foo.bar.baz.com".into(),
+            aliases: Vec::new(),
             cwd: None,
             home: None,
             project_root: None,

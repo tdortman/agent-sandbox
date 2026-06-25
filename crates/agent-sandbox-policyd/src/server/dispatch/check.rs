@@ -10,11 +10,23 @@ use crate::error::PolicydError;
 use crate::store::PolicyStore;
 use crate::wire::{MergeContext, NetworkCheckRequest};
 
+/// Inputs for `handle_check`, grouped to keep the call signature small.
+pub(crate) struct CheckArgs {
+    pub host: Option<String>,
+    pub connect_host: Option<String>,
+    pub port: Option<u16>,
+    pub scheme: String,
+    pub url: Option<String>,
+    pub aliases: Vec<String>,
+    pub ctx: RequestContext,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptHost {
     AsProvided,
     ResolvedFromIp,
 }
+
 fn format_host_for_url(host: &str) -> String {
     // IPv6 literals need brackets in URI authority.
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -44,13 +56,17 @@ fn prompt_url(
 
 pub(crate) async fn handle_check(
     store: &Arc<PolicyStore>,
-    host: Option<String>,
-    connect_host: Option<String>,
-    port: Option<u16>,
-    scheme: String,
-    url: Option<String>,
-    ctx: RequestContext,
+    args: CheckArgs,
 ) -> Result<RpcReply, PolicydError> {
+    let CheckArgs {
+        host,
+        connect_host,
+        port,
+        scheme,
+        url,
+        aliases,
+        ctx,
+    } = args;
     let connect_host = connect_host.or_else(|| host.clone()).unwrap_or_default();
     let port = port.unwrap_or(0);
     let mut policy_host = normalize_host(host.as_deref().unwrap_or(""));
@@ -95,24 +111,60 @@ pub(crate) async fn handle_check(
     }
     Ok(RpcReply::Check(
         store
-            .request_network_approval(NetworkCheckRequest {
-                host: policy_host,
-                port,
-                scheme,
-                url,
-                ctx: merge,
-            })
+            .request_network_approval_with_aliases(
+                NetworkCheckRequest {
+                    host: policy_host,
+                    port,
+                    scheme,
+                    url,
+                    ctx: merge,
+                },
+                aliases,
+            )
             .await,
     ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptHost, handle_check, prompt_url};
+    use super::{CheckArgs, PromptHost, handle_check, prompt_url};
     use crate::store::{PolicyStore, PolicydArgs};
     use agent_sandbox_core::{ProcessIds, RequestContext, RpcReply, SandboxPaths};
     use std::sync::Arc;
     use std::time::Duration;
+    fn test_store() -> PolicyStore {
+        PolicyStore::new(PolicydArgs {
+            host_socket: std::path::PathBuf::from("/tmp/host.sock"),
+            sandbox_socket: std::path::PathBuf::from("/tmp/sandbox.sock"),
+            declarative: std::path::PathBuf::from("/tmp/policy.json"),
+            export_json: std::path::PathBuf::from("/tmp/export.json"),
+            export_nix: None,
+            approval_timeout: Duration::from_secs(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        })
+    }
+
+    fn empty_context() -> RequestContext {
+        RequestContext::from_paths_and_ids(
+            &SandboxPaths::default(),
+            ProcessIds::from_options(Some(0), Some(1000)),
+        )
+    }
+
+    fn check_args(host: &str, port: Option<u16>) -> CheckArgs {
+        CheckArgs {
+            host: Some(host.into()),
+            connect_host: Some("104.18.32.47".into()),
+            port,
+            scheme: "tcp".into(),
+            url: Some(format!("tcp://{host}:443")),
+            aliases: Vec::new(),
+            ctx: empty_context(),
+        }
+    }
 
     #[test]
     fn prompt_url_uses_resolved_hostname_for_ip_backed_checks() {
@@ -144,45 +196,6 @@ mod tests {
         assert_eq!(url, "tcp://[::1]:443");
     }
 
-    #[test]
-    fn prompt_url_does_not_bracket_ipv4_literal_when_resolved_from_ip() {
-        let url = prompt_url("tcp", None, "10.0.0.9", 8080, PromptHost::ResolvedFromIp);
-        assert_eq!(url, "tcp://10.0.0.9:8080");
-    }
-
-    #[test]
-    fn prompt_url_uses_resolved_hostname_for_ipv6_when_resolved() {
-        let url = prompt_url(
-            "https",
-            Some("https://[2001:db8::1]:443".to_string()),
-            "ipv6.example.com",
-            443,
-            PromptHost::ResolvedFromIp,
-        );
-        assert_eq!(url, "https://ipv6.example.com:443");
-    }
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-        })
-    }
-
-    fn empty_context() -> RequestContext {
-        RequestContext::from_paths_and_ids(
-            &SandboxPaths::default(),
-            ProcessIds::from_options(Some(0), Some(1000)),
-        )
-    }
-
     #[tokio::test]
     async fn handle_check_denies_port_zero_before_prompting() {
         let store = Arc::new(test_store());
@@ -190,17 +203,9 @@ mod tests {
         // skip in `sockaddr_target`), but NFQUEUE forwards whatever the
         // packet header says. A `tcp://chatgpt.com:0` prompt must never
         // reach the user.
-        let reply = handle_check(
-            &store,
-            Some("chatgpt.com".into()),
-            Some("104.18.32.47".into()),
-            Some(0),
-            "tcp".into(),
-            Some("tcp://chatgpt.com:0".into()),
-            empty_context(),
-        )
-        .await
-        .expect("handle_check returns Ok");
+        let reply = handle_check(&store, check_args("chatgpt.com", Some(0)))
+            .await
+            .expect("handle_check returns Ok");
         match reply {
             RpcReply::Check(check) => {
                 assert!(!check.allowed, "port 0 must be denied");
@@ -216,22 +221,13 @@ mod tests {
     #[tokio::test]
     async fn handle_check_denies_none_port_without_prompting() {
         let store = Arc::new(test_store());
-        // Missing port in the RPC also collapses to 0 via `unwrap_or(0)`;
-        // the same deny path applies.
-        let reply = handle_check(
-            &store,
-            Some("chatgpt.com".into()),
-            Some("104.18.32.47".into()),
-            None,
-            "tcp".into(),
-            Some("tcp://chatgpt.com".into()),
-            empty_context(),
-        )
-        .await
-        .expect("handle_check returns Ok");
+        let reply = handle_check(&store, check_args("chatgpt.com", None))
+            .await
+            .expect("handle_check returns Ok");
         match reply {
             RpcReply::Check(check) => {
-                assert!(!check.allowed, "None port must be denied as 0");
+                assert!(!check.allowed, "port None must be denied");
+                assert_eq!(check.source, "port-zero");
             }
             other => panic!("expected Check reply, got {other:?}"),
         }

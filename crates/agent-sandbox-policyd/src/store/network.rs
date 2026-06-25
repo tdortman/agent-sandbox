@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{CheckReply, ProcessIds, SandboxPaths, UiPush, normalize_host};
+use agent_sandbox_core::{CheckReply, ProcessIds, SandboxPaths, UiPush, attach_ui_aliases, normalize_host};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
@@ -133,6 +133,14 @@ impl PolicyStore {
     }
 
     pub async fn request_network_approval(&self, req: NetworkCheckRequest) -> CheckReply {
+        self.request_network_approval_with_aliases(req, Vec::new()).await
+    }
+
+    pub(crate) async fn request_network_approval_with_aliases(
+        &self,
+        req: NetworkCheckRequest,
+        aliases: Vec<String>,
+    ) -> CheckReply {
         let NetworkCheckRequest {
             host,
             port,
@@ -231,6 +239,7 @@ impl PolicyStore {
                         port,
                         scheme: scheme.clone(),
                         url: url.clone(),
+                        aliases: aliases.clone(),
                         cwd: cwd.clone(),
                         home: home.clone(),
                         project_root: project_root.clone(),
@@ -253,7 +262,7 @@ impl PolicyStore {
                     host: Some(policy_host.clone()),
                     port: Some(port),
                     scheme: Some(scheme.clone()),
-                    url: Some(url.clone()),
+                    url: attach_ui_aliases(Some(url.clone()), &aliases),
                     cwd: cwd.clone(),
                     home: home.clone(),
                     project_root: project_root.clone(),
@@ -354,6 +363,7 @@ mod tests {
             port: 443,
             scheme: "tcp".into(),
             url: format!("tcp://{host}:443"),
+            aliases: Vec::new(),
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
@@ -435,6 +445,7 @@ mod tests {
             port: 443,
             scheme: "tcp".into(),
             url: "tcp://seed".into(),
+            aliases: Vec::new(),
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),

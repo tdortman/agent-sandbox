@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{SessionContext, UiPush};
+use agent_sandbox_core::{SessionContext, UiPush, attach_ui_aliases};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
@@ -167,7 +167,7 @@ impl PolicyStore {
                 host: Some(net.host.clone()),
                 port: Some(net.port),
                 scheme: Some(net.scheme.clone()),
-                url: Some(net.url.clone()),
+                url: attach_ui_aliases(Some(net.url.clone()), &net.aliases),
                 cwd: net.cwd.clone(),
                 home: net.home.clone(),
                 project_root: net.project_root.clone(),

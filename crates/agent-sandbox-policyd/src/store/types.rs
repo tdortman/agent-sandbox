@@ -103,6 +103,7 @@ pub struct PendingNetwork {
     pub port: u16,
     pub scheme: String,
     pub url: String,
+    pub aliases: Vec<String>,
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,

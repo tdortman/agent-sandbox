@@ -2,9 +2,12 @@
 
 use std::sync::Arc;
 
-use agent_sandbox_core::{RegisterUiReply, RpcReply, RpcRequest, SimpleOkReply};
+use agent_sandbox_core::{
+    RegisterUiReply, RpcReply, RpcRequest, SimpleOkReply, split_check_aliases,
+};
 
 use crate::error::PolicydError;
+use crate::server::dispatch::check::{CheckArgs, handle_check};
 use crate::server::peer::ClientPeer;
 use crate::store::PolicyStore;
 use crate::wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire};
@@ -51,7 +54,22 @@ pub(crate) async fn handle(
             scheme,
             url,
             ctx,
-        } => super::check::handle_check(store, host, connect_host, port, scheme, url, ctx).await,
+        } => {
+            let (url, aliases) = split_check_aliases(url);
+            handle_check(
+                store,
+                CheckArgs {
+                    host,
+                    connect_host,
+                    port,
+                    scheme,
+                    url,
+                    aliases,
+                    ctx,
+                },
+            )
+            .await
+        }
         RpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
             store
                 .check_filesystem(crate::wire::FilesystemCheckRequest {

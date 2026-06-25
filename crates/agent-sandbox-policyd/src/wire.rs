@@ -93,6 +93,9 @@ pub struct UiSpawnContext<'a> {
     pub project_root: Option<&'a str>,
 }
 
+/// Network check payload for policyd approval.
+///
+/// Attribution hints travel via `request_network_approval_with_aliases`.
 #[derive(Debug, Clone)]
 pub struct NetworkCheckRequest {
     pub host: String,
