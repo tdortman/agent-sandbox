@@ -17,8 +17,8 @@
 #include <QFrame>
 #include <QPalette>
 #include <QPushButton>
-#include <QTextEdit>
 #include <QTextDocument>
+#include <QTextEdit>
 #include <QTextOption>
 #include <QVBoxLayout>
 #include <string>
