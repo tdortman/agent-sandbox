@@ -47,15 +47,16 @@ static void usage(FILE* fp, const char* argv0) {
 // line tall. QTextEdit already relays the document to the viewport on resize, so
 // wrapped text (long domains/paths/commands) reflows without extra plumbing.
 class FitText : public QTextEdit {
-  public:
-    explicit FitText(const QString& text, QWidget* parent = nullptr)
-        : QTextEdit(text, parent) {
+   public:
+    explicit FitText(const QString& text, QWidget* parent = nullptr) : QTextEdit(text, parent) {
         // Content always fits, so scrollbars would just steal layout width.
         setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     }
 
-    bool hasHeightForWidth() const override { return true; }
+    bool hasHeightForWidth() const override {
+        return true;
+    }
 
     // QAbstractScrollArea floors the widget at ~3 lines via minimumSizeHint;
     // the real minimum is the content height, so report 0 and let
