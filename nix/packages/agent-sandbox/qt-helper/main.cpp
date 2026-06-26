@@ -159,6 +159,26 @@ int main(int argc, char* argv[]) {
         });
     }
 
+    // Pin the prompt's minimum height to its real wrapped height. A top-level
+    // QDialog sizes itself from the layout's sizeHint, which under-counts a
+    // height-for-width child by ~1 wrapped line; that left the dialog a hair
+    // too short, so the layout crushed the inter-button spacing by a different
+    // amount per prompt stage, making the gaps look inconsistent. Measured
+    // with a throwaway QTextDocument at the dialog's actual width; setting the
+    // prompt's minimum (not the dialog's) keeps height-for-width sizing intact.
+    {
+        const int dlgW = qMax(dialog.sizeHint().width(), dialog.minimumWidth());
+        const int contentW =
+            dlgW - mainLayout->contentsMargins().left() - mainLayout->contentsMargins().right();
+        QTextDocument measureDoc(QString::fromStdString(text));
+        measureDoc.setDefaultFont(prompt->font());
+        QTextOption to = measureDoc.defaultTextOption();
+        to.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        measureDoc.setDefaultTextOption(to);
+        measureDoc.setTextWidth(qreal(contentW));
+        prompt->setMinimumHeight(qCeil(measureDoc.size().height()));
+    }
+
     // Focus the first option so Enter accepts the default.
     if (btnLayout->itemAt(0) != nullptr) {
         if (auto* firstBtn = btnLayout->itemAt(0)->widget()) {
