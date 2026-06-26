@@ -149,6 +149,9 @@ int main(int argc, char* argv[]) {
     for (const auto& opt : options) {
         auto* btn = new QPushButton(QString::fromStdString(opt), &dialog);
         btn->setStyleSheet("text-align: left; padding: 6px 12px;");
+        // Comfortable height so the label clears the frame
+        // (12 = stylesheet vertical padding, 8 = frame slack).
+        btn->setMinimumHeight(btn->fontMetrics().height() + 12 + 8);
         btnLayout->addWidget(btn);
         QObject::connect(btn, &QPushButton::clicked, [&dialog, &selected, opt]() {
             selected = opt;
