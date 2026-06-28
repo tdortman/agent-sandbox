@@ -5,11 +5,19 @@ use std::path::{Path, PathBuf};
 use crate::hosts::NetworkSortKey;
 use crate::policy::{
     FilesystemRule, FilesystemSortKey, NetworkRule, Policy, SudoRule, contract_home_path,
-    expand_home_path,
+    expand_policy_path,
 };
-
-pub fn load_policy(path: &Path, home: Option<&str>) -> Policy {
-    let read_path = resolve_policy_write_path(path);
+pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
+    // Containment check: if project_root is given, reject policies outside it.
+    if let Some(root) = project_root
+        && let Ok(canonical_path) = path.canonicalize()
+        && let Ok(canonical_root) = root.canonicalize()
+        && !canonical_path.starts_with(&canonical_root)
+    {
+        return Policy::default();
+    }
+    let read_path =
+        resolve_policy_write_path(path, project_root).unwrap_or_else(|_| path.to_path_buf());
     if !read_path.is_file() {
         return Policy::default();
     }
@@ -17,7 +25,7 @@ pub fn load_policy(path: &Path, home: Option<&str>) -> Policy {
         return Policy::default();
     };
     let mut policy: Policy = serde_json::from_str(&data).unwrap_or_default();
-    expand_filesystem_paths(&mut policy, home);
+    expand_filesystem_paths(&mut policy, home, project_root);
     policy
 }
 
@@ -29,11 +37,10 @@ fn sudo_rule_sort_key(rule: &SudoRule) -> Vec<String> {
     rule.argv.clone()
 }
 
-fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&str>) -> FilesystemSortKey {
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemSortKey {
     FilesystemSortKey::new(contract_home_path(&rule.path, home), rule.access)
 }
-
-fn sorted_policy(policy: &Policy, home: Option<&str>) -> Policy {
+fn sorted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
     out.network.allow.sort_by_key(network_rule_sort_key);
     out.network.deny.sort_by_key(network_rule_sort_key);
@@ -47,26 +54,37 @@ fn sorted_policy(policy: &Policy, home: Option<&str>) -> Policy {
         .sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
     out
 }
-
-fn expand_filesystem_paths(policy: &mut Policy, home: Option<&str>) {
+fn expand_filesystem_paths(policy: &mut Policy, home: Option<&Path>, project_root: Option<&Path>) {
     for rule in &mut policy.filesystem.allow {
-        rule.path = expand_home_path(&rule.path, home);
+        rule.path = expand_policy_path(&rule.path, home, project_root);
     }
     for rule in &mut policy.filesystem.deny {
-        rule.path = expand_home_path(&rule.path, home);
+        rule.path = expand_policy_path(&rule.path, home, project_root);
     }
 }
-
-pub fn resolve_policy_write_path(path: &Path) -> PathBuf {
+pub fn resolve_policy_write_path(
+    path: &Path,
+    expected_root: Option<&Path>,
+) -> std::io::Result<PathBuf> {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     };
     if !meta.file_type().is_symlink() {
-        return path.to_path_buf();
+        // Not a symlink: verify containment if expected_root is given.
+        if let Some(root) = expected_root {
+            let canonical_path = path.canonicalize()?;
+            let canonical_root = root.canonicalize()?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "policy path escapes expected root",
+                ));
+            }
+            return Ok(canonical_path);
+        }
+        return Ok(path.to_path_buf());
     }
-    let Ok(link_target) = std::fs::read_link(path) else {
-        return path.to_path_buf();
-    };
+    let link_target = std::fs::read_link(path)?;
     let resolved = if link_target.is_absolute() {
         link_target
     } else {
@@ -74,10 +92,20 @@ pub fn resolve_policy_write_path(path: &Path) -> PathBuf {
             .unwrap_or_else(|| Path::new(""))
             .join(link_target)
     };
-    resolved.canonicalize().unwrap_or(resolved)
+    let canonical = resolved.canonicalize().unwrap_or(resolved);
+    // Verify symlink target containment.
+    if let Some(root) = expected_root {
+        let canonical_root = root.canonicalize()?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "policy symlink target escapes expected root",
+            ));
+        }
+    }
+    Ok(canonical)
 }
-
-pub fn resolve_owner_uid(path: &Path, home: Option<&str>, uid: Option<u32>) -> Option<u32> {
+pub fn resolve_owner_uid(path: &Path, home: Option<&Path>, uid: Option<u32>) -> Option<u32> {
     if let Some(uid) = uid.filter(|u| *u > 0) {
         return Some(uid);
     }
@@ -109,18 +137,12 @@ pub fn resolve_owner_uid(path: &Path, home: Option<&str>, uid: Option<u32>) -> O
 }
 
 fn policy_chown_paths(target: &Path) -> Vec<PathBuf> {
-    let target = resolve_policy_write_path(target);
-    let mut paths = Vec::with_capacity(3);
+    let Ok(target) = resolve_policy_write_path(target, None) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::with_capacity(2);
     if let Some(parent) = target.parent() {
         paths.push(parent.to_path_buf());
-        if parent.file_name().is_some_and(|name| name != "projects")
-            && let Some(projects_dir) = parent.parent()
-            && projects_dir
-                .file_name()
-                .is_some_and(|name| name == "projects")
-        {
-            paths.push(projects_dir.to_path_buf());
-        }
     }
     paths.push(target);
     paths
@@ -145,10 +167,11 @@ pub fn chown_policy_path(path: &Path, uid: u32) {
 pub fn atomic_write_policy(
     path: &Path,
     data: &Policy,
-    home: Option<&str>,
+    home: Option<&Path>,
     owner_uid: Option<u32>,
+    project_root: Option<&Path>,
 ) -> std::io::Result<()> {
-    let target = resolve_policy_write_path(path);
+    let target = resolve_policy_write_path(path, project_root)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -187,7 +210,7 @@ pub(crate) fn policy_json(policy: &Policy) -> serde_json::Result<String> {
 }
 /// Return a copy of `policy` with filesystem allow/deny paths under `home`
 /// contracted to the `~/...` shorthand for on-disk serialization.
-fn contracted_policy(policy: &Policy, home: Option<&str>) -> Policy {
+fn contracted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
     for rule in &mut out.filesystem.allow {
         rule.path = contract_home_path(&rule.path, home);
@@ -258,7 +281,7 @@ mod tests {
     use crate::policy::{FileAccess, FilesystemRule, NetworkRule};
 
     #[test]
-    fn project_policy_chown_includes_projects_directory() {
+    fn project_policy_chown_includes_parent_directory() {
         let path =
             Path::new("/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json");
         let paths = policy_chown_paths(path);
@@ -266,7 +289,6 @@ mod tests {
             paths,
             vec![
                 PathBuf::from("/home/user/.config/agent-sandbox/projects/home-user-repo"),
-                PathBuf::from("/home/user/.config/agent-sandbox/projects"),
                 PathBuf::from(
                     "/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json",
                 ),
@@ -284,7 +306,8 @@ mod tests {
         )];
         let path = std::env::temp_dir().join("agent-sandbox-write-home.json");
         let _ = std::fs::remove_file(&path);
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
+        atomic_write_policy(&path, &policy, Some(Path::new("/home/user")), None, None)
+            .expect("write policy");
         let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(
             raw.contains("\"~/.local/share/foo\""),
@@ -299,7 +322,8 @@ mod tests {
         policy.filesystem.allow = vec![FilesystemRule::new("/nix/store", FileAccess::All, "")];
         let path = std::env::temp_dir().join("agent-sandbox-write-nonhome.json");
         let _ = std::fs::remove_file(&path);
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
+        atomic_write_policy(&path, &policy, Some(Path::new("/home/user")), None, None)
+            .expect("write policy");
         let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(
             raw.contains("\"/nix/store\""),
@@ -321,8 +345,9 @@ mod tests {
         ];
         let path = std::env::temp_dir().join("agent-sandbox-write-network-order.json");
         let _ = std::fs::remove_file(&path);
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
-        let loaded = load_policy(&path, Some("/home/user"));
+        atomic_write_policy(&path, &policy, Some(Path::new("/home/user")), None, None)
+            .expect("write policy");
+        let loaded = load_policy(&path, Some(Path::new("/home/user")), None);
         let hosts: Vec<&str> = loaded
             .network
             .allow
@@ -345,7 +370,7 @@ mod tests {
 
     #[test]
     fn load_policy_expands_tilde_to_home() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         let raw = r#"{
             "network": { "allow": [], "deny": [] },
             "sudo": { "allow": [], "deny": [] },
@@ -357,7 +382,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("policy.json");
         std::fs::write(&path, raw).expect("write file");
-        let loaded = load_policy(&path, Some(home));
+        let loaded = load_policy(&path, Some(home), None);
         assert_eq!(
             loaded.filesystem.allow[0].path,
             "/home/user/.local/share/foo"
@@ -367,7 +392,7 @@ mod tests {
 
     #[test]
     fn load_policy_leaves_other_user_paths_absolute() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         let raw = r#"{
             "network": { "allow": [], "deny": [] },
             "sudo": { "allow": [], "deny": [] },
@@ -379,7 +404,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("policy.json");
         std::fs::write(&path, raw).expect("write file");
-        let loaded = load_policy(&path, Some(home));
+        let loaded = load_policy(&path, Some(home), None);
         assert_eq!(loaded.filesystem.allow[0].path, "/home/user2/.cache");
     }
 
@@ -392,11 +417,12 @@ mod tests {
             FilesystemRule::new("/home/user/.local/share/foo", FileAccess::All, ""),
             FilesystemRule::new("/nix/store", FileAccess::Read, ""),
         ];
-        atomic_write_policy(&path, &policy, Some("/home/user"), None).expect("write policy");
+        atomic_write_policy(&path, &policy, Some(Path::new("/home/user")), None, None)
+            .expect("write policy");
         let raw = std::fs::read_to_string(&path).expect("read file");
         assert!(raw.contains("\"~/.local/share/foo\""), "raw: {raw}");
         assert!(raw.contains("\"/nix/store\""), "raw: {raw}");
-        let loaded = load_policy(&path, Some("/home/user"));
+        let loaded = load_policy(&path, Some(Path::new("/home/user")), None);
         assert_eq!(loaded.filesystem.allow[0].path, "/nix/store");
         assert_eq!(
             loaded.filesystem.allow[1].path,

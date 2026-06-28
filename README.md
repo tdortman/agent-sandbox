@@ -57,7 +57,7 @@ The seccomp filter traps `connect`, `sendto`, `sendmsg`, and `sendmmsg`. The `se
 
 ### Local policy and host IPC boundary
 
-The trusted user and per-project policy files live under `~/.config/agent-sandbox/` on the host so the user can track them with a dotfiles manager. In dynamic filesystem mode the wrapper bind-mounts the entire host root, so by default that directory is writable from inside the sandbox. The wrapper rebinds `~/.config/agent-sandbox/` read-only on top of the broad bind, so the sandboxed agent cannot rewrite the trusted policy files even though they live in the user's home. Policyd (running on the host) and the user's `agent-sandbox-approve` CLI are the only writers.
+The user policy lives at `~/.config/agent-sandbox/policy.json` on the host so the user can track it with a dotfiles manager. The per-project policy lives at `<project>/.agent-sandbox/policy.json` (repo-local) so the policy stays with the project. In dynamic filesystem mode the wrapper bind-mounts the entire host root, so by default both paths would be writable from inside the sandbox. The wrapper rebinds both `~/.config/agent-sandbox/` and each project's `.agent-sandbox/` directory read-only on top of the broad bind, so the sandboxed agent cannot rewrite the trusted policy files. Policyd (running on the host) and the user's `agent-sandbox-approve` CLI are the only writers.
 
 To let the agent read its trusted config without prompting on every access, add the path to the package `readonlyDirs` so it is auto-allowed by fanotify:
 
@@ -94,12 +94,13 @@ Each policy file is a JSON document with `network`, `sudo`, and `filesystem` sec
     },
     "filesystem": {
         "allow": [{ "path": "~/projects/foo", "access": "read_write" }],
-        "deny": []
+        "deny": [{ "path": "./**/.env", "access": "read_write" }]
     }
 }
 ```
 
 Network rules support wildcard parent domains (`*.example.com`) and IP prefix wildcards (`34.230.40.*`). Sudo rules match by command prefix: `["systemctl"]` allows `systemctl restart nginx`. Filesystem access levels: `read`, `write`, `read_write`, `execute`, `all`.
+Filesystem path patterns support `./` for project-relative paths and `**` for recursive glob matching, so `"./**/.env"` matches any `.env` file under the project root.
 
 Policyd serialises and sorts policy files with one rule per line so that adjacent rules produce clean, minimal git diffs.
 
@@ -109,10 +110,8 @@ Rules merge from lowest to highest priority:
 
 1. **NixOS configuration:** `agent-sandbox.network.declarativeAllow` and `agent-sandbox.network.declarativeDeny` options.
 2. **User policy:** `~/.config/agent-sandbox/policy.json`.
-3. **Trusted project policy:** `~/.config/agent-sandbox/projects/<encoded-project-root>/policy.json`.
+3. **Trusted project policy:** `<project>/.agent-sandbox/policy.json`.
 4. **Runtime session decisions:** approvals and denials recorded in memory (scopes `once` and `session`).
-
-`<encoded-project-root>` keeps simple roots readable (`/home/user/dotfiles` becomes `home-user-dotfiles`). Spaces become `-`. Literal `-` and uncommon bytes are escaped as `~xx`. Ambiguous roots get a stable hash suffix to avoid practical slug collisions.
 
 Denies win across all layers: a deny rule removes any matching allow rule, so a higher-priority policy cannot re-allow a previously denied target.
 
@@ -177,12 +176,12 @@ agent-sandbox-approve deny <id> [scope]                        deny a request (d
 
 Scopes control how long the decision persists.
 
-| Scope     | Persistence                                                                       |
-| --------- | --------------------------------------------------------------------------------- |
-| `once`    | In-memory only for this policyd process.                                          |
-| `session` | Bound to the sandbox session ID. Stored in policyd memory.                        |
-| `project` | Written to `~/.config/agent-sandbox/projects/<encoded-project-root>/policy.json`. |
-| `global`  | Written to `~/.config/agent-sandbox/policy.json`.                                 |
+| Scope     | Persistence                                                |
+| --------- | ---------------------------------------------------------- |
+| `once`    | In-memory only for this policyd process.                   |
+| `session` | Bound to the sandbox session ID. Stored in policyd memory. |
+| `project` | Written to `<project>/.agent-sandbox/policy.json`.         |
+| `global`  | Written to `~/.config/agent-sandbox/policy.json`.          |
 
 Each subcommand accepts `--home`, `--cwd`, and `--project-root` to override path resolution. `approve` and `approve-host` also accept `--session-id`.
 

@@ -13,7 +13,7 @@ use crate::wire::MergeContext;
 use super::types::PolicyStore;
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
-    let target = resolve_policy_write_path(path);
+    let target = resolve_policy_write_path(path, None)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -89,20 +89,19 @@ impl PolicyStore {
     pub async fn merged_for(&self, ctx: MergeContext) -> Policy {
         let ctx = self.resolve_context(ctx).await;
         let home_path = ctx.paths.home().map(Path::new);
-        let home_str = home_path.and_then(|p| p.to_str());
         let project_root_path = ctx.paths.project_root().map(Path::new);
         let mut layers: Vec<Policy> = Vec::new();
-        layers.push(load_policy(&self.args.declarative, home_str));
+        layers.push(load_policy(&self.args.declarative, home_path, None));
         if let Some(home) = home_path {
             let home_policy = home
                 .join(".config")
                 .join("agent-sandbox")
                 .join("policy.json");
-            layers.push(load_policy(&home_policy, home_str));
+            layers.push(load_policy(&home_policy, home_path, None));
             if let Some(root) = project_root_path
-                && let Ok(trusted) = trusted_project_policy_path(home, root)
+                && let Ok(trusted) = trusted_project_policy_path(root)
             {
-                layers.push(load_policy(&trusted, home_str));
+                layers.push(load_policy(&trusted, home_path, project_root_path));
             }
         }
         merge_layers(&layers)

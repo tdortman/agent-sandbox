@@ -76,19 +76,19 @@ pkgs.runCommand "policy-symlink-regression" { } ''
   grep -F -q 'readlink -f "$_asbx_policy_candidate"' wrapper.sh \
     || fail "readlink -f resolution of policy candidate missing"
 
-  # 7. Per-project policy files are walked (also subject to symlink protection).
-  grep -F -q 'projects/*/policy.json' wrapper.sh \
-    || fail "per-project policy candidates not walked"
-
-  # 8. The resolved real path (the symlink target file itself) is ro-bound.
+  # 7. The resolved real path (the symlink target file itself) is ro-bound.
   grep -F -q '_asbx_ro_bind_once "$_asbx_policy_real"' wrapper.sh \
     || fail "ro-bind of resolved real path (symlink target) missing"
 
-  # 9. The resolved target's existing parent (the symlink target's parent) is
+  # 8. The resolved target's existing parent (the symlink target's parent) is
   #    ro-bound. This guards the case where the target's parent is also outside
   #    the protected config tree (e.g. inside a chezmoi dotfiles repo).
   grep -F -q '_asbx_ro_bind_once "$_asbx_policy_parent"' wrapper.sh \
     || fail "ro-bind of resolved target's existing parent missing"
+
+  # 9. The project .agent-sandbox directory is ro-bound when it exists.
+  grep -F -q '_asbx_ro_bind_once "$_asbx_project_agent_sandbox"' wrapper.sh \
+    || fail "project .agent-sandbox ro-bind missing"
 
   echo "PASS: policy-symlink protection regression guard satisfied"
   touch $out

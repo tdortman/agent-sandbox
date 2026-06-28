@@ -54,9 +54,7 @@ impl ScopeTarget {
                 let project_root = ctx
                     .project_root
                     .ok_or(ScopeResolveError::ProjectRootRequired)?;
-                let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
-                let policy_path =
-                    trusted_project_policy_path(Path::new(home), Path::new(project_root))?;
+                let policy_path = trusted_project_policy_path(Path::new(project_root))?;
                 Ok(Self::Project {
                     policy_path,
                     project_root: project_root.to_string(),
@@ -64,7 +62,7 @@ impl ScopeTarget {
             }
             ApprovalScope::Global => {
                 let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
-                let policy_path = global_policy_path(home);
+                let policy_path = global_policy_path(Path::new(home));
                 Ok(Self::Global {
                     policy_path,
                     home: home.to_string(),
@@ -80,7 +78,7 @@ impl ScopeTarget {
         }
     }
 }
-
-fn global_policy_path(home: &str) -> PathBuf {
-    PathBuf::from(home).join(".config/agent-sandbox/policy.json")
+fn global_policy_path(home: &Path) -> PathBuf {
+    let canonical_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    canonical_home.join(".config/agent-sandbox/policy.json")
 }

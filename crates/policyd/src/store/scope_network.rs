@@ -150,8 +150,8 @@ impl PolicyStore {
             .await;
         Self::audit(action.audit_verb(), Some(&host), Some(port), scope_label);
         let path = match (home.as_deref(), project_root.as_deref()) {
-            (Some(h), Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(h, p)
+            (_, Some(p)) if scope == ApprovalScope::Project => {
+                Self::project_policy_path_display(Path::new(p))
             }
             _ => None,
         };

@@ -346,14 +346,16 @@ mod tests {
     #[tokio::test]
     async fn trusted_project_policy_deny_applies() {
         // The trusted per-project policy file lives under
-        // `home/.config/agent-sandbox/projects/<encoded>/policy.json`. A deny
+        // `<project_root>/.agent-sandbox/policy.json`. A deny
         // rule there is honored by the merged policy.
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox"))
+            .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
             .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
@@ -365,7 +367,7 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
             .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
@@ -415,9 +417,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox"))
+            .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
             .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
@@ -429,7 +433,7 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
             .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
@@ -476,9 +480,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox"))
+            .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
             .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
@@ -490,7 +496,7 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
             .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
@@ -522,7 +528,7 @@ mod tests {
         );
 
         let empty = agent_sandbox_core::Policy::default();
-        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None, None)
             .expect("clear policy");
 
         // The merged policy is computed on every call, so removing the deny rule
@@ -531,20 +537,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repo_local_policy_deny_is_ignored() {
-        // A repo-local `.agent-sandbox/policy.json` file is not loaded by the
-        // policy daemon, even when it contains a deny rule. The trusted
-        // per-project policy file under
-        // `home/.config/agent-sandbox/projects/<encoded>/policy.json` is the
-        // only project-scoped policy input; when it is absent, the deny rule
-        // must not affect the merged policy.
+    async fn repo_local_policy_deny_applies() {
+        // The repo-local `.agent-sandbox/policy.json` file is loaded by the
+        // policy daemon. A deny rule there is honored by the merged policy.
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
         std::fs::create_dir_all(project_root.join(".agent-sandbox"))
             .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = project_root.join(".agent-sandbox/policy.json");
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
+            .expect("trusted project policy path");
 
         let mut policy = agent_sandbox_core::Policy::default();
         policy
@@ -555,14 +558,8 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
             .expect("write policy");
-
-        // Sanity check: the trusted project policy file does not exist, so
-        // the deny rule from the repo-local file is the only candidate.
-        let trusted_path = agent_sandbox_core::trusted_project_policy_path(&home, &project_root)
-            .expect("trusted project policy path");
-        assert!(!trusted_path.exists());
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -585,9 +582,9 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        // The repo-local deny rule must not be applied: policy_denied returns
-        // false because the merged policy has no deny entries.
-        assert!(!store.policy_denied("34.230.40.69", 443, ctx.clone()).await);
+        // The repo-local deny rule is applied: policy_denied returns
+        // true because the merged policy includes the deny rule.
+        assert!(store.policy_denied("34.230.40.69", 443, ctx.clone()).await);
     }
 
     #[tokio::test]
@@ -609,7 +606,7 @@ mod tests {
                 443,
                 "test",
             ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
             .expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
@@ -640,7 +637,7 @@ mod tests {
         );
 
         let empty = agent_sandbox_core::Policy::default();
-        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None)
+        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None, None)
             .expect("clear policy");
 
         assert!(!store.is_allowed("example.com", 443, ctx, false).await);

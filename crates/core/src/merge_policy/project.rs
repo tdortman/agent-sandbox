@@ -1,7 +1,5 @@
 //! Explicit project_root handling and home inference for policy resolution.
-use std::fmt::Write as _;
 
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::ProjectPolicyError;
@@ -31,11 +29,8 @@ impl ProjectPolicyContext {
             .or_else(|| infer_home([self.project_root.as_deref(), self.cwd.as_deref()]))
     }
 
+    /// Return the validated project root, if any (not `/`, has a file name).
     pub fn project_root(&self) -> Option<&Path> {
-        self.valid_project_root()
-    }
-
-    fn valid_project_root(&self) -> Option<&Path> {
         self.project_root
             .as_deref()
             .filter(|path| is_valid_project_root(path))
@@ -81,73 +76,35 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Build the path to the trusted per-project policy file under the user's
-/// `~/.config/agent-sandbox/projects/<encoded-project-root>/policy.json`.
+/// Build the path to the trusted per-project policy file inside the project:
+/// `<canonical project_root>/.agent-sandbox/policy.json`.
 ///
-/// Simple project roots stay readable (`/home/user/dotfiles` becomes
-/// `home-user-dotfiles`). Spaces become `-`. Literal `-` and uncommon bytes are
-/// escaped as `~xx`. Ambiguous roots get a stable hash suffix to avoid
-/// practical slug collisions.
-pub fn trusted_project_policy_path(
-    home: &Path,
-    project_root: &Path,
-) -> Result<PathBuf, ProjectPolicyError> {
-    let canonical =
+/// The returned path is canonicalised and verified to be a descendant of the
+/// canonical project root, defeating symlink-escape attacks.
+pub fn trusted_project_policy_path(project_root: &Path) -> Result<PathBuf, ProjectPolicyError> {
+    let canonical_root =
         project_root
             .canonicalize()
             .map_err(|_| ProjectPolicyError::InvalidProjectRoot {
                 path: project_root.to_path_buf(),
             })?;
-    if !is_valid_project_root(&canonical) {
-        return Err(ProjectPolicyError::InvalidProjectRoot { path: canonical });
+    if !is_valid_project_root(&canonical_root) {
+        return Err(ProjectPolicyError::InvalidProjectRoot {
+            path: canonical_root,
+        });
     }
-    let encoded = encode_project_root(&canonical);
-    Ok(home
-        .join(".config")
-        .join("agent-sandbox")
-        .join("projects")
-        .join(encoded)
-        .join("policy.json"))
-}
-
-fn encode_project_root(path: &Path) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let bytes = path.as_os_str().as_bytes();
-    let needs_hash = bytes.iter().any(|byte| {
-        !matches!(
-            byte,
-            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_'
-        )
-    });
-    let mut out = String::with_capacity((bytes.len() * 3) + 18);
-    let start = usize::from(bytes.first() == Some(&b'/'));
-    for &byte in &bytes[start..] {
-        match byte {
-            b'/' | b' ' => out.push('-'),
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('~');
-                out.push(HEX[(byte >> 4) as usize] as char);
-                out.push(HEX[(byte & 0x0f) as usize] as char);
-            }
+    let policy_path = canonical_root.join(".agent-sandbox").join("policy.json");
+    // If the policy file exists, canonicalize and verify containment.
+    if let Ok(canonical_policy) = policy_path.canonicalize() {
+        if !canonical_policy.starts_with(&canonical_root) {
+            return Err(ProjectPolicyError::InvalidProjectRoot {
+                path: canonical_policy,
+            });
         }
+        return Ok(canonical_policy);
     }
-    if needs_hash {
-        write!(&mut out, "--{:016x}", fnv1a64(bytes)).expect("writing to String cannot fail");
-    }
-    out
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    // File does not exist yet — the constructed path cannot be a symlink escape.
+    Ok(policy_path)
 }
 
 #[cfg(test)]
@@ -155,7 +112,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{ProjectPolicyContext, encode_project_root, trusted_project_policy_path};
+    use super::{ProjectPolicyContext, trusted_project_policy_path};
 
     #[test]
     fn project_root_returns_explicit_value() {
@@ -238,51 +195,42 @@ mod tests {
     }
 
     #[test]
-    fn trusted_project_policy_path_lives_outside_project_root() {
+    fn trusted_project_policy_path_is_inside_project_root() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let home = tmp.path().join("home/user");
-        let repo = home.join("repo");
-        std::fs::create_dir_all(&repo).expect("create dirs");
-        let path = trusted_project_policy_path(&home, &repo).expect("trusted project policy path");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".agent-sandbox")).expect("create dirs");
+        let path = trusted_project_policy_path(&repo).expect("trusted project policy path");
         let s = path.to_string_lossy();
-        assert!(s.contains(".config/agent-sandbox/projects/"), "got: {s}");
-        assert!(s.ends_with("/policy.json"), "got: {s}");
-        assert!(!s.contains("/repo/policy.json"));
-    }
-
-    #[test]
-    fn encode_project_root_keeps_common_case_readable() {
-        let encoded = encode_project_root(Path::new("/home/user/dotfiles"));
-        assert_eq!(encoded, "home-user-dotfiles");
-    }
-
-    #[test]
-    fn encode_project_root_maps_spaces_to_dash_with_hash() {
-        let encoded = encode_project_root(Path::new("/home/user/my repo"));
-        assert!(encoded.starts_with("home-user-my-repo--"), "got: {encoded}");
-    }
-
-    #[test]
-    fn encode_project_root_escapes_other_bytes_with_hash() {
-        let encoded = encode_project_root(Path::new("/home/user/a%b"));
-        assert!(encoded.starts_with("home-user-a~25b--"), "got: {encoded}");
-    }
-
-    #[test]
-    fn encode_project_root_distinguishes_dash_from_separator() {
-        assert_ne!(
-            encode_project_root(Path::new("/home/user/a-b")),
-            encode_project_root(Path::new("/home/user/a/b"))
+        assert!(s.ends_with(".agent-sandbox/policy.json"), "got: {s}");
+        assert!(
+            path.starts_with(&repo),
+            "path must be inside project root: {s}"
         );
     }
 
     #[test]
-    fn trusted_project_policy_path_rejects_invalid_project_root() {
+    fn trusted_project_policy_path_rejects_symlink_escape() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let home = tmp.path().join("home/user");
-        std::fs::create_dir_all(&home).expect("create dirs");
-        let err =
-            trusted_project_policy_path(&home, Path::new("/nonexistent/path/here")).unwrap_err();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create dirs");
+        // Create a symlink from .agent-sandbox/policy.json to /etc/passwd
+        let sandbox_dir = repo.join(".agent-sandbox");
+        fs::create_dir_all(&sandbox_dir).expect("create dirs");
+        std::os::unix::fs::symlink("/etc/passwd", sandbox_dir.join("policy.json"))
+            .expect("create symlink");
+        let err = trusted_project_policy_path(&repo).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::ProjectPolicyError::InvalidProjectRoot { .. }
+            ),
+            "expected InvalidProjectRoot, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_project_policy_path_rejects_nonexistent_project_root() {
+        let err = trusted_project_policy_path(Path::new("/nonexistent/path/here")).unwrap_err();
         assert!(
             matches!(
                 err,

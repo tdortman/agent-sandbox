@@ -450,13 +450,6 @@ rec {
             if [[ -e "$_asbx_user_config/policy.json" || -L "$_asbx_user_config/policy.json" ]]; then
               _asbx_policy_candidates+=("$_asbx_user_config/policy.json")
             fi
-            if [[ -d "$_asbx_user_config/projects" ]]; then
-              shopt -s nullglob
-              for _asbx_policy_candidate in "$_asbx_user_config"/projects/*/policy.json; do
-                _asbx_policy_candidates+=("$_asbx_policy_candidate")
-              done
-              shopt -u nullglob
-            fi
             for _asbx_policy_candidate in "''${_asbx_policy_candidates[@]}"; do
               _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_policy_candidate")"
               _asbx_ro_bind_once "$_asbx_policy_parent"
@@ -465,6 +458,17 @@ rec {
                 _asbx_ro_bind_once "$_asbx_policy_real"
               fi
             done
+            _asbx_project_agent_sandbox="$_agent_sandbox_project_root/.agent-sandbox"
+            if [[ -d "$_asbx_project_agent_sandbox" ]]; then
+              _asbx_ro_bind_once "$_asbx_project_agent_sandbox"
+            fi
+            _asbx_project_policy="$_asbx_project_agent_sandbox/policy.json"
+            if [[ -e "$_asbx_project_policy" || -L "$_asbx_project_policy" ]]; then
+              _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_project_policy")"
+              _asbx_ro_bind_once "$_asbx_policy_parent"
+              _asbx_policy_real="$(readlink -f "$_asbx_project_policy" 2>/dev/null)" || _asbx_policy_real=""
+              _asbx_ro_bind_once "$_asbx_policy_real"
+            fi
             if [[ -f /run/agent-sandbox/dns-cache.json ]]; then
               RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/dns-cache.json /run/agent-sandbox/dns-cache.json)
             fi

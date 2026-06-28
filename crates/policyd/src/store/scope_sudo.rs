@@ -122,8 +122,8 @@ impl PolicyStore {
         let detail = format!("argv={argv:?} scope={scope_label}");
         Self::audit(action.audit_verb(), None, None, &detail);
         let path = match (home.as_deref(), project_root.as_deref()) {
-            (Some(h), Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(h, p)
+            (_, Some(p)) if scope == ApprovalScope::Project => {
+                Self::project_policy_path_display(Path::new(p))
             }
             _ => None,
         };
