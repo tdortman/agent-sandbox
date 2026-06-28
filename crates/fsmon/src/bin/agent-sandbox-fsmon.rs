@@ -347,14 +347,20 @@ fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
     FileAccess::All
 }
 
+struct MountpointMarks {
+    saw_pre_access_mark: bool,
+    home_covered: bool,
+}
+
 /// Mark each mount point, skipping synthetic filesystem types.
-/// Returns (`saw_pre_access_mark`, `home_covered`).
+/// Returns a [`MountpointMarks`] struct indicating whether a pre-access mark was seen
+/// and whether the home directory is covered.
 fn mark_mountpoints(
     fan_fd: i32,
     mounts: &[MountRecord],
     home_covering_mount: Option<&Path>,
     cli_home: Option<&str>,
-) -> (bool, bool) {
+) -> MountpointMarks {
     let mut saw_pre_access_mark = false;
     let mut home_covered = false;
 
@@ -410,7 +416,10 @@ fn mark_mountpoints(
             }
         }
     }
-    (saw_pre_access_mark, home_covered)
+    MountpointMarks {
+        saw_pre_access_mark,
+        home_covered,
+    }
 }
 
 /// Event loop: read fanotify events and forward to policyd for allow/deny verdicts.
@@ -561,7 +570,10 @@ fn main() {
         .and_then(|home| deepest_covering_mount(&mounts, Path::new(home)))
         .map(Path::to_path_buf);
 
-    let (saw_pre_access_mark, home_covered) = mark_mountpoints(
+    let MountpointMarks {
+        saw_pre_access_mark,
+        home_covered,
+    } = mark_mountpoints(
         fan_fd,
         &mounts,
         home_covering_mount.as_deref(),
