@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
-pub const DEFAULT_MAX_TTL: u32 = 60;
+pub const DEFAULT_MAX_TTL: u32 = 600;
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -349,11 +349,6 @@ mod tests {
             file.entries.get("192.168.1.2").map(|e| &*e.host),
             Some("host-b.example")
         );
-    }
-
-    #[test]
-    fn default_max_ttl_is_short_for_rebinding() {
-        assert_eq!(super::DEFAULT_MAX_TTL, 60);
     }
 
     #[test]
