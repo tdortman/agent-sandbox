@@ -149,8 +149,11 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     };
 
-    let (mut command, ui_log_path, env) =
-        build_ui_spawn_command_env(&runuser, args, &cmd, &user, uid, spawn);
+    let UiSpawnCmd {
+        mut command,
+        log_path: ui_log_path,
+        env,
+    } = build_ui_spawn_command_env(&runuser, args, &cmd, &user, uid, spawn);
 
     let spawn_result = command.spawn();
     let Ok(mut child) = spawn_result else {
@@ -204,6 +207,12 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
             .spawn();
     }
 }
+struct UiSpawnCmd {
+    command: std::process::Command,
+    log_path: String,
+    env: HashMap<String, String>,
+}
+
 fn build_ui_spawn_command_env(
     runuser: &str,
     args: &PolicydArgs,
@@ -211,7 +220,7 @@ fn build_ui_spawn_command_env(
     user: &User,
     uid: u32,
     spawn: &UiSpawnContext<'_>,
-) -> (std::process::Command, String, HashMap<String, String>) {
+) -> UiSpawnCmd {
     let env = ui_spawn_env(
         args,
         user,
@@ -256,5 +265,9 @@ fn build_ui_spawn_command_env(
         command.process_group(0);
     }
 
-    (command, ui_log_path, env)
+    UiSpawnCmd {
+        command,
+        log_path: ui_log_path,
+        env,
+    }
 }
