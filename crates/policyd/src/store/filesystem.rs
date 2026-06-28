@@ -21,6 +21,12 @@ use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnConte
 /// Timeout for waiting for the fsmon `ready` line.
 const FSMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct PendingFsResult {
+    id: String,
+    is_new: bool,
+    rx: oneshot::Receiver<FilesystemCheckReply>,
+}
+
 impl PolicyStore {
     /// Spawn the filesystem monitor for a sandbox, wait for it to signal
     /// readiness, and return a reply.
@@ -154,7 +160,7 @@ impl PolicyStore {
             return reply;
         }
 
-        let (pending_id, created_prompt, rx) = match self
+        let result = match self
             .dedup_or_create_pending_filesystem(
                 &path,
                 access,
@@ -172,9 +178,9 @@ impl PolicyStore {
         let route = UiRoute::new(cwd.clone(), project_root.clone())
             .with_sandbox_session(sandbox_session_id.clone());
 
-        if created_prompt {
+        if result.is_new {
             let push = UiPush::FilesystemRequest {
-                id: pending_id.clone(),
+                id: result.id.clone(),
                 path: path.clone(),
                 access,
                 cwd: cwd.clone(),
@@ -212,7 +218,7 @@ impl PolicyStore {
             }
         }
 
-        self.await_filesystem_verdict(&route, &pending_id, path, access, rx)
+        self.await_filesystem_verdict(&route, &result.id, path, access, result.rx)
             .await
     }
     async fn check_filesystem_verdict_cache(
@@ -244,7 +250,7 @@ impl PolicyStore {
         home: Option<&str>,
         project_root: Option<&str>,
         sandbox_session_id: Option<&str>,
-    ) -> Result<(String, bool, oneshot::Receiver<FilesystemCheckReply>), FilesystemCheckReply> {
+    ) -> Result<PendingFsResult, FilesystemCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
         // Deduplicate: if a pending already exists for the same file and
@@ -272,7 +278,11 @@ impl PolicyStore {
                 .or_default()
                 .push(tx);
             drop(inner);
-            return Ok((existing_id, false, rx));
+            return Ok(PendingFsResult {
+                id: existing_id,
+                is_new: false,
+                rx,
+            });
         }
         if inner.pending.len() >= MAX_PENDING_APPROVALS {
             return Err(FilesystemCheckReply::blocked(
@@ -301,7 +311,11 @@ impl PolicyStore {
             }),
         );
         drop(inner);
-        Ok((pending_id, true, rx))
+        Ok(PendingFsResult {
+            id: pending_id,
+            is_new: true,
+            rx,
+        })
     }
 
     async fn await_filesystem_verdict(
