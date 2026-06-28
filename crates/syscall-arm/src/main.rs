@@ -163,10 +163,10 @@ fn exec_command(args: &[OsString]) -> ! {
         .iter()
         .map(|arg| cstring(arg.as_os_str().as_bytes()))
         .collect();
-    let mut argv: Vec<*const libc::c_char> = cargs.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
+    let mut argv_ptrs: Vec<*const libc::c_char> = cargs.iter().map(|arg| arg.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
     unsafe {
-        libc::execvp(cargs[0].as_ptr(), argv.as_ptr());
+        libc::execvp(cargs[0].as_ptr(), argv_ptrs.as_ptr());
     }
     die("execvp command failed");
 }
@@ -190,10 +190,10 @@ fn exec_broker(listener_fd: i32, child_pid: libc::pid_t) -> ! {
         args.push(cstring(b"--sandbox-session-id"));
         args.push(cstring(session.as_bytes()));
     }
-    let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
+    let mut argv_ptrs: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
     unsafe {
-        libc::execvp(broker.as_ptr(), argv.as_ptr());
+        libc::execvp(broker.as_ptr(), argv_ptrs.as_ptr());
     }
     die("execvp broker failed");
 }

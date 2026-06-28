@@ -245,16 +245,16 @@ pub fn is_descendant_of(ancestor: u32, pid: u32) -> bool {
     }
     let mut current = pid;
     for _ in 0..256 {
-        let Some(ppid) = read_proc_ppid(current) else {
+        let Some(parent_pid) = read_proc_ppid(current) else {
             break;
         };
-        if ppid == ancestor {
+        if parent_pid == ancestor {
             return true;
         }
-        if ppid <= 1 {
+        if parent_pid <= 1 {
             break;
         }
-        current = ppid;
+        current = parent_pid;
     }
     false
 }

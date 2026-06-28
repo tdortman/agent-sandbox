@@ -255,11 +255,11 @@ impl PolicyStore {
                 &argv,
                 elev.cwd
                     .as_deref()
-                    .or(scope_wire.paths.cwd())
+                    .or_else(|| scope_wire.paths.cwd())
                     .map(Path::new),
                 elev.home
                     .as_deref()
-                    .or(scope_wire.paths.home())
+                    .or_else(|| scope_wire.paths.home())
                     .map(Path::new),
             )
             .await;

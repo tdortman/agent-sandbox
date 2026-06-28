@@ -215,13 +215,12 @@ fn scheme_for_fd(notif: &SeccompNotif, sockfd: u64, default: &str) -> String {
     let Some(sockfd_i32) = i32::try_from(sockfd).ok() else {
         return default.to_owned();
     };
-    match get_socket_type(notif.pid, sockfd_i32) {
-        Some(sock_type) => scheme_for_socket_type(sock_type),
-        None => default,
-    }
-    .to_owned()
+    get_socket_type(notif.pid, sockfd_i32)
+        .map_or(default, |sock_type| scheme_for_socket_type(sock_type))
+        .to_owned()
 }
 
+#[must_use]
 pub fn parse_sockaddr(bytes: &[u8]) -> Option<(IpAddr, u16)> {
     if bytes.len() < 2 {
         return None;

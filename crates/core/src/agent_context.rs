@@ -182,7 +182,9 @@ pub fn resolve_sandbox_paths(
 /// Peer process paths from `SO_PEERCRED` + `/proc`.
 #[must_use]
 pub fn peer_sandbox_paths(ids: ProcessIds) -> SandboxPaths {
-    let ctx = ids.pid().map_or(ProcContext::default(), context_from_pid);
+    let ctx = ids
+        .pid()
+        .map_or_else(ProcContext::default, context_from_pid);
     let home = ctx
         .home
         .clone()

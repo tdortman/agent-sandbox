@@ -62,7 +62,7 @@ mod tests {
         }
     }
 
-    async fn make_client(session_id: &str) -> UiClient {
+    fn make_client(session_id: &str) -> UiClient {
         let (a, b) = tokio::net::UnixStream::pair().expect("unix stream pair");
         let _ = a;
         UiClient {
@@ -73,7 +73,7 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_matches_same_project_paths() {
-        let client = make_client("ui1").await;
+        let client = make_client("ui1");
         let client_ctx = ctx("/repo", "/repo");
         let route = UiRoute::new(Some("/repo".into()), Some("/repo".into()));
         assert!(paths_match(&client_ctx, &route));
@@ -82,7 +82,7 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_does_not_match_unrelated_project_paths() {
-        let client = make_client("ui1").await;
+        let client = make_client("ui1");
         let client_ctx = ctx("/dotfiles", "/home/user/dotfiles");
         let route = UiRoute::new(Some("/other".into()), Some("/other".into()));
         assert!(!paths_match(&client_ctx, &route));
@@ -91,7 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_requires_matching_sandbox_session_when_present() {
-        let client = make_client("ui1").await;
+        let client = make_client("ui1");
         let mut client_ctx = ctx("/repo", "/repo");
         client_ctx.sandbox_session_id = Some("sandbox-a".into());
         let route = UiRoute::new(Some("/repo".into()), Some("/repo".into()))
