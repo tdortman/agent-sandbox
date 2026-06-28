@@ -15,6 +15,11 @@ use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
 use super::ui_route::UiRoute;
 
+struct PendingElevationEntry {
+    id: String,
+    rx: oneshot::Receiver<ElevateReply>,
+}
+
 impl PolicyStore {
     pub(crate) fn user_for_home(home: Option<&Path>) -> String {
         let Some(home) = home else {
@@ -113,7 +118,7 @@ impl PolicyStore {
                 .await;
         }
 
-        let Some((pending_id, rx)) = self
+        let Some(entry) = self
             .create_pending_elevation_entry(
                 &argv,
                 cwd.as_deref(),
@@ -137,7 +142,7 @@ impl PolicyStore {
         self.notify_ui(
             &route,
             &UiPush::ElevationRequest {
-                id: pending_id.clone(),
+                id: entry.id.clone(),
                 argv: Some(argv.clone()),
                 cwd: cwd.clone(),
                 home: home.clone(),
@@ -155,7 +160,8 @@ impl PolicyStore {
         )
         .await;
 
-        self.await_elevation_verdict(&route, &pending_id, rx).await
+        self.await_elevation_verdict(&route, &entry.id, entry.rx)
+            .await
     }
     async fn create_pending_elevation_entry(
         &self,
@@ -164,7 +170,7 @@ impl PolicyStore {
         home: Option<&str>,
         project_root: Option<&str>,
         sandbox_session_id: Option<&str>,
-    ) -> Option<(String, oneshot::Receiver<ElevateReply>)> {
+    ) -> Option<PendingElevationEntry> {
         let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
         {
@@ -194,7 +200,7 @@ impl PolicyStore {
         }
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
-        Some((pending_id, rx))
+        Some(PendingElevationEntry { id: pending_id, rx })
     }
 
     async fn maybe_spawn_elevation_ui(
