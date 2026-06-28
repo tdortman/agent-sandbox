@@ -41,13 +41,13 @@ struct Cli {
 enum Command {
     /// List every pending approval request.
     Pending {
-        /// Home directory inside the sandbox. Used to scope "global" rules to the right "policy.json". Defaults to the env var "AGENT_SANDBOX_HOME" or "$HOME".
+        /// Home directory inside the sandbox. Used to scope "global" rules to the right "policy.json". Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
         home: Option<String>,
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var "AGENT_SANDBOX_CWD".
+        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT".
+        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
         project_root: Option<String>,
     },
@@ -61,13 +61,13 @@ enum Command {
         /// Session id the request belongs to. Required when the scope is "session" and the policy is keyed by session.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "AGENT_SANDBOX_HOME" or "$HOME".
+        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
         home: Option<String>,
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var "AGENT_SANDBOX_CWD".
+        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT".
+        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
         project_root: Option<String>,
     },
@@ -83,13 +83,13 @@ enum Command {
         /// Session id the rule applies to. Required when the scope is "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "AGENT_SANDBOX_HOME" or "$HOME".
+        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
         home: Option<String>,
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var "AGENT_SANDBOX_CWD".
+        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT".
+        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
         project_root: Option<String>,
     },

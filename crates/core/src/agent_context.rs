@@ -10,7 +10,7 @@ const fn non_empty(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Cwd / home / project_root after merging peer, file, and env sources.
+/// Cwd / home / `project_root` after merging peer, file, and env sources.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxPaths {
     cwd: String,

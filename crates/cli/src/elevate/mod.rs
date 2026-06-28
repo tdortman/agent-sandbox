@@ -28,7 +28,7 @@ use clap::Parser;
         agent-sandbox-elevate --socket /run/agent-sandbox/policy.sock -- apt update"
 )]
 struct Cli {
-    /// Path to the policyd Unix domain socket. The elevate request is sent here. Falls back to the env var "AGENT_SANDBOX_POLICY_SOCKET" if unset.
+    /// Path to the policyd Unix domain socket. The elevate request is sent here. Falls back to the env var "`AGENT_SANDBOX_POLICY_SOCKET`" if unset.
     #[arg(
         long,
         value_name = "SOCKET",

@@ -3,7 +3,7 @@
 //! Numbers are sourced from the `libc` crate (which tracks the kernel
 //! syscall table per arch) and re-exported under short names so the
 //! broker and tests can spell out what they want to trap. On both
-//! x86_64 and aarch64 the agent-side filter traps packet-emitting
+//! `x86_64` and aarch64 the agent-side filter traps packet-emitting
 //! syscalls and routes them to the user-notification broker.
 
 use std::collections::BTreeSet;

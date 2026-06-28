@@ -56,7 +56,7 @@ pub struct PeerCredentials {
     pub gid: i32,
 }
 
-/// Cwd / home / project_root resolved from a process's environment and `/proc`.
+/// Cwd / home / `project_root` resolved from a process's environment and `/proc`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcContext {
     pub cwd: Option<String>,

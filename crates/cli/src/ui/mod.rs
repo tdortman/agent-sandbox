@@ -40,7 +40,7 @@ use tracing::{info, warn};
             --sandbox-session-id session-2024-05-01-abc"
 )]
 struct Cli {
-    /// Path to the policyd Unix domain socket the UI registers on. Falls back to the env var "AGENT_SANDBOX_POLICY_SOCKET" if unset.
+    /// Path to the policyd Unix domain socket the UI registers on. Falls back to the env var "`AGENT_SANDBOX_POLICY_SOCKET`" if unset.
     #[arg(
         long,
         value_name = "SOCKET",
@@ -48,20 +48,24 @@ struct Cli {
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     socket: PathBuf,
-    /// Working directory inside the sandbox. Forwarded to policyd so per-project rules resolve correctly. Defaults to the env var "AGENT_SANDBOX_CWD".
+    /// Working directory inside the sandbox. Forwarded to policyd so per-project rules resolve correctly. Defaults to the env var "`AGENT_SANDBOX_CWD`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
     cwd: Option<String>,
-    /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "AGENT_SANDBOX_HOME".
+    /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "`AGENT_SANDBOX_HOME`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<String>,
-    /// Project root inside the sandbox. Used to scope "project" rules. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT".
+    /// Project root inside the sandbox. Used to scope "project" rules. Defaults to the env var "`AGENT_SANDBOX_PROJECT_ROOT`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<String>,
-    /// Sandbox session id. Routes this UI client to a specific sandbox session's pending requests. Defaults to the env var "AGENT_SANDBOX_SESSION_ID".
+    /// Sandbox session id. Routes this UI client to a specific sandbox session's pending requests. Defaults to the env var "`AGENT_SANDBOX_SESSION_ID`".
     #[arg(long, value_name = "ID", env = "AGENT_SANDBOX_SESSION_ID")]
     sandbox_session_id: Option<String>,
 }
 
+/// Run the UI client: parse CLI args, build context, connect to policyd, and process pushes.
+///
+/// # Errors
+/// Returns [`UiCliError`] when the RPC connection or push processing fails.
 pub async fn run() -> Result<(), UiCliError> {
     let cli = Cli::parse();
     let mut ctx = RequestContext::from(&SandboxPaths::from_wire(

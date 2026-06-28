@@ -77,15 +77,15 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     interactive_approval: bool,
 
-    /// Path to the "agent-sandbox-ui" binary. If unset, the daemon falls back to the env var "AGENT_SANDBOX_UI_SPAWN_CMD", then to a built-in default. Used when policyd needs to spawn a transient UI client for a request that arrived with no registered UI.
+    /// Path to the "agent-sandbox-ui" binary. If unset, the daemon falls back to the env var `AGENT_SANDBOX_UI_SPAWN_CMD`, then to a built-in default. Used when policyd needs to spawn a transient UI client for a request that arrived with no registered UI.
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_UI_SPAWN_CMD")]
     ui_spawn_cmd: Option<PathBuf>,
 
-    /// Path to the "agent-sandbox-fsmon" binary. If unset, the daemon falls back to the env var "AGENT_SANDBOX_FS_MONITOR_CMD". Used when an "agent-sandbox-fs-arm" request asks for a fanotify monitor to be started in the host mount namespace.
+    /// Path to the "agent-sandbox-fsmon" binary. If unset, the daemon falls back to the env var `AGENT_SANDBOX_FS_MONITOR_CMD`. Used when an "agent-sandbox-fs-arm" request asks for a fanotify monitor to be started in the host mount namespace.
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_FS_MONITOR_CMD")]
     fs_monitor_cmd: Option<PathBuf>,
 
-    /// Path to the "agent-sandbox-syscall-broker" binary. If unset, the daemon falls back to the env var "AGENT_SANDBOX_SYSCALL_BROKER_CMD". Used when an "agent-sandbox-syscall-arm" request needs a host-side seccomp user-notification handler to be spawned.
+    /// Path to the "agent-sandbox-syscall-broker" binary. If unset, the daemon falls back to the env var `AGENT_SANDBOX_SYSCALL_BROKER_CMD`. Used when an "agent-sandbox-syscall-arm" request needs a host-side seccomp user-notification handler to be spawned.
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_SYSCALL_BROKER_CMD")]
     syscall_broker_cmd: Option<PathBuf>,
 }

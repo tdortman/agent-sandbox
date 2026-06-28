@@ -2,7 +2,7 @@
 
 //! Pre-register a policy UI connection on the host policy socket, then
 //! exec the sandbox launcher with the connected stream on a
-//! kernel-assigned fd communicated via AGENT_SANDBOX_UI_FD.
+//! kernel-assigned fd communicated via `AGENT_SANDBOX_UI_FD`.
 //!
 //! The inherited fd is the ONLY approval path into the sandbox.  Future sandbox
 //! socket connections cannot register UI or approve.

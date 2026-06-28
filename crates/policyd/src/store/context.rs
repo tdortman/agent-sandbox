@@ -79,15 +79,14 @@ impl PolicyStore {
     ///
     /// Layer order, lowest priority first:
     /// 1. `self.args.declarative` (NixOS configuration).
-    /// 2. `home/.config/agent-sandbox/policy.json` (trusted user policy).
+    /// 2. `~/.config/agent-sandbox/policy.json` (trusted user policy).
     /// 3. The trusted per-project policy file under
-    ///    `home/.config/agent-sandbox/projects/<encoded>/policy.json`
-    ///    when both `home` and `project_root` are known.
+    ///    `<project_root>/.agent-sandbox/policy.json`
     ///
     /// Layers are merged with deny-wins semantics: any non-empty `deny`
     /// rule shadows the corresponding `allow` rule across the merged set.
-    pub async fn merged_for(&self, ctx: MergeContext) -> Policy {
-        let ctx = self.resolve_context(ctx).await;
+    pub fn merged_for(&self, ctx: &MergeContext) -> Policy {
+        let ctx = self.resolve_context(ctx);
         let home_path = ctx.paths.home().map(Path::new);
         let project_root_path = ctx.paths.project_root().map(Path::new);
         let mut layers: Vec<Policy> = Vec::new();

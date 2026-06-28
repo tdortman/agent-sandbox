@@ -2,7 +2,7 @@
 //!
 //! Wraps [`seccompiler`] to compile the agent's syscall set into a loadable
 //! BPF program. Matches deliver to user-space via `SECCOMP_RET_USER_NOTIF`
-//! on both x86_64 and aarch64. The broker parses tracee structs directly,
+//! on both `x86_64` and aarch64. The broker parses tracee structs directly,
 //! so the filter is arch-neutral now. Anything not in the set passes
 //! through with the default `SECCOMP_RET_ALLOW`. See
 //! <https://docs.kernel.org/bpf/> for the seccomp BPF ABI the program

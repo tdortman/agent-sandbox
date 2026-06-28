@@ -80,7 +80,7 @@ fn socketpair() -> [i32; 2] {
 /// (FAM), so we model it as inline bytes here.
 ///
 /// `cmsg_len` is `u64` rather than `libc::socklen_t` because the Linux kernel
-/// UAPI defines it as `__kernel_size_t`, which is 8 bytes on x86_64, while
+/// UAPI defines it as `__kernel_size_t`, which is 8 bytes on `x86_64`, while
 /// glibc exposes `socklen_t` as 4 bytes. Mismatching the kernel's width makes
 /// `sendmsg` reject the message with `EINVAL`, so we mirror the kernel width
 /// directly. The `u64` first field also gives the struct 8-byte alignment,

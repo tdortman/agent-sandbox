@@ -1,10 +1,10 @@
-//! Explicit project_root handling and home inference for policy resolution.
+//! Explicit `project_root` handling and home inference for policy resolution.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::ProjectPolicyError;
 
-/// Cached inputs for explicit valid project_root handling and home inference.
+/// Cached inputs for explicit valid `project_root` handling and home inference.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectPolicyContext {
     home: Option<PathBuf>,

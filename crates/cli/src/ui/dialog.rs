@@ -27,7 +27,7 @@ fn prefer_graphical() -> bool {
 }
 
 /// Try each graphical backend in priority order. Returns the selected label on success.
-/// If AGENT_SANDBOX_UI_BACKEND is set to a specific backend, only that backend
+/// If `AGENT_SANDBOX_UI_BACKEND` is set to a specific backend, only that backend
 /// is tried. Unset or unrecognised values use the auto fallback: qt-dialog, zenity.
 fn graphical_select(title: &str, options: &[&str]) -> Option<String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
