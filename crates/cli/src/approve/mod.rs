@@ -143,19 +143,18 @@ pub async fn run() -> Result<(), ApproveCliError> {
                 match item {
                     PendingSummary::Elevation { id, argv, .. } => {
                         let argv = argv.unwrap_or_default();
-                        println!("{id}\televation\t{}", argv.join(" "));
+                        println!("{id}\televation\t\t{}", argv.join(" "));
                     }
                     PendingSummary::Network { id, host, port, .. } => {
                         let host = host.unwrap_or_default();
                         let port = port.unwrap_or(0);
-                        println!("{id}\tnetwork\t{host}:{port}");
+                        println!("{id}\tnetwork\t\t{host}:{port}");
                     }
                     PendingSummary::Filesystem {
                         id, path, access, ..
                     } => {
                         let path = path.unwrap_or_default();
-                        let access =
-                            access.map_or_else(|| "?".to_string(), |value| value.to_string());
+                        let access = access.map_or_else(String::new, |value| value.to_string());
                         println!("{id}\tfilesystem\t{access}\t{path}");
                     }
                 }
