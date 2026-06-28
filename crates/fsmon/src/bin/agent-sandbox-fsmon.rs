@@ -15,10 +15,6 @@ use agent_sandbox_core::{FileAccess, FilesystemRule};
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser;
 
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox-fsmon",
@@ -55,28 +51,24 @@ struct Cli {
     )]
     socket: String,
 
-    /// Working directory inside the sandbox. Used to scope per-project policy and to pick which mounts are marked. Defaults to the env var "AGENT_SANDBOX_CWD" if unset.
+    /// Working directory inside the sandbox. Used to scope per-project policy and to pick which mounts are marked. Defaults to the env var `AGENT_SANDBOX_CWD` if unset.
     #[arg(long, value_name = "DIR")]
     cwd: Option<String>,
 
-    /// Home directory inside the sandbox. Used to expand "~" in filesystem rules and to gate "global" scope. Defaults to the env var "AGENT_SANDBOX_HOME" if unset.
+    /// Home directory inside the sandbox. Used to expand "~" in filesystem rules and to gate "global" scope. Defaults to the env var `AGENT_SANDBOX_HOME` if unset.
     #[arg(long, value_name = "DIR")]
     home: Option<String>,
 
-    /// Project root directory inside the sandbox. Required for "project" scope approvals to land in the right per-project policy file. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT" if unset.
+    /// Project root directory inside the sandbox. Required for "project" scope approvals to land in the right per-project policy file. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
     #[arg(long, value_name = "DIR")]
     project_root: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// fanotify_init flags.
+/// `fanotify_init` flags.
 const FAN_CLASS_PRE_CONTENT: u32 = libc::FAN_CLASS_PRE_CONTENT;
 const FAN_CLOEXEC: u32 = libc::FAN_CLOEXEC;
 
-/// fanotify_mark flags.
+/// `fanotify_mark` flags.
 const FAN_MARK_ADD: u32 = libc::FAN_MARK_ADD;
 const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
 
@@ -86,7 +78,7 @@ const FAN_OPEN_EXEC_PERM: u64 = libc::FAN_OPEN_EXEC_PERM;
 const FAN_ACCESS_PERM: u64 = libc::FAN_ACCESS_PERM;
 const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
-/// Event metadata struct (matches kernel struct fanotify_event_metadata).
+/// Event metadata struct (matches kernel struct `fanotify_event_metadata`).
 #[repr(C)]
 struct FanotifyEventMetadata {
     event_len: u32,
@@ -98,7 +90,7 @@ struct FanotifyEventMetadata {
     pid: i32,
 }
 
-/// Response struct (matches kernel struct fanotify_response).
+/// Response struct (matches kernel struct `fanotify_response`).
 #[repr(C)]
 struct FanotifyResponse {
     fd: i32,
@@ -107,10 +99,6 @@ struct FanotifyResponse {
 
 const FAN_ALLOW: u32 = 0x01;
 const FAN_DENY: u32 = 0x02;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// A mount point entry parsed from /proc/self/mountinfo.
 struct MountRecord {
@@ -181,7 +169,7 @@ fn fanotify_mark(fan_fd: i32, path: &CStr, try_pre_access: bool) -> io::Result<u
         libc::syscall(
             libc::SYS_fanotify_mark,
             fan_fd,
-            (FAN_MARK_ADD | FAN_MARK_MOUNT) as i64,
+            i64::from(FAN_MARK_ADD | FAN_MARK_MOUNT),
             mask,
             libc::AT_FDCWD,
             path.as_ptr(),
@@ -359,9 +347,171 @@ fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
     FileAccess::All
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+/// Mark each mount point, skipping synthetic filesystem types.
+/// Returns (`saw_pre_access_mark`, `home_covered`).
+fn mark_mountpoints(
+    fan_fd: i32,
+    mounts: &[MountRecord],
+    home_covering_mount: Option<&Path>,
+    cli_home: Option<&str>,
+) -> (bool, bool) {
+    let mut saw_pre_access_mark = false;
+    let mut home_covered = false;
+
+    for mount in mounts {
+        if home_covering_mount == Some(mount.mount_point.as_path())
+            && is_synthetic_fs(&mount.fstype)
+        {
+            eprintln!(
+                "agent-sandbox-fsmon: --home {} is on unsupported synthetic filesystem {} at {}; \
+                 cannot guarantee filesystem monitoring",
+                cli_home.unwrap_or("?"),
+                mount.fstype,
+                mount.mount_point.display()
+            );
+            process::exit(1);
+        }
+        if is_synthetic_fs(&mount.fstype) {
+            tracing::debug!(
+                path = %mount.mount_point.display(),
+                fstype = %mount.fstype,
+                "skipping synthetic mount"
+            );
+            continue;
+        }
+
+        let mp_cstr =
+            CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
+        match fanotify_mark(fan_fd, &mp_cstr, true) {
+            Ok(actual_mask) => {
+                saw_pre_access_mark |= actual_mask & FAN_PRE_ACCESS != 0;
+                if home_covering_mount == Some(mount.mount_point.as_path()) {
+                    home_covered = true;
+                }
+                tracing::debug!(path = %mount.mount_point.display(), mask = %format_args!("{actual_mask:x}"), "marked mountpoint");
+            }
+            Err(e) => {
+                if home_covering_mount == Some(mount.mount_point.as_path())
+                    || cli_home
+                        .is_some_and(|home| is_under_home(&mount.mount_point, Path::new(home)))
+                {
+                    eprintln!(
+                        "agent-sandbox-fsmon: fanotify_mark {} (under --home): {e}",
+                        mount.mount_point.display()
+                    );
+                    process::exit(1);
+                }
+                tracing::warn!(
+                    path = %mount.mount_point.display(),
+                    fstype = %mount.fstype,
+                    error = %e,
+                    "failed to mark mountpoint (not under home, continuing)"
+                );
+            }
+        }
+    }
+    (saw_pre_access_mark, home_covered)
+}
+
+/// Event loop: read fanotify events and forward to policyd for allow/deny verdicts.
+fn run_event_loop(
+    fan_fd: i32,
+    self_pid: i32,
+    saw_pre_access_mark: bool,
+    ctx: &agent_sandbox_core::RequestContext,
+    socket_path: &Path,
+    static_allow: &[FilesystemRule],
+) -> ! {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n =
+            match unsafe { libc::read(fan_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) }
+            {
+                -1 => {
+                    let e = io::Error::last_os_error();
+                    eprintln!("agent-sandbox-fsmon: read from fanotify fd: {e}");
+                    continue;
+                }
+                n if n >= 0 => usize::try_from(n).expect("nonnegative read length"),
+                _ => continue,
+            };
+        let mut offset = 0;
+        while offset + size_of::<FanotifyEventMetadata>() <= n {
+            let meta = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(offset).cast::<FanotifyEventMetadata>())
+            };
+
+            if meta.metadata_len == 0 {
+                break;
+            }
+
+            if meta.event_len == 0 {
+                break;
+            }
+            let Ok(event_len) = usize::try_from(meta.event_len) else {
+                break;
+            };
+
+            if meta.fd >= 0
+                && meta.mask
+                    & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_PRE_ACCESS | FAN_ACCESS_PERM)
+                    != 0
+            {
+                if meta.pid == self_pid {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
+                if saw_pre_access_mark
+                    && meta.mask & FAN_ACCESS_PERM != 0
+                    && event_fd_is_regular_file(meta.fd)
+                {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
+                if meta.mask & FAN_PRE_ACCESS != 0 {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
+                let Ok(path) = resolve_event_path(meta.fd) else {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                };
+                let access = mask_to_access(meta.mask, meta.fd, meta.pid);
+
+                if static_allow
+                    .iter()
+                    .any(|rule| rule.matches(Path::new(&path), access, None))
+                {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
+                let mut event_ctx = ctx.clone();
+                event_ctx.pid = u32::try_from(meta.pid).ok();
+                let reply = rpc_client::check_filesystem(socket_path, &path, access, event_ctx);
+
+                let verdict = match &reply {
+                    Ok(r) if r.allowed => FAN_ALLOW,
+                    _ => FAN_DENY,
+                };
+
+                if verdict == FAN_DENY {
+                    tracing::info!(%path, ?access, "denied by policy");
+                }
+
+                respond(fan_fd, meta.fd, verdict);
+            } else if meta.fd >= 0 {
+                unsafe { libc::close(meta.fd) };
+            }
+
+            offset += event_len;
+        }
+    }
+}
 
 fn main() {
     let cli = Cli::parse();
@@ -411,66 +561,12 @@ fn main() {
         .and_then(|home| deepest_covering_mount(&mounts, Path::new(home)))
         .map(Path::to_path_buf);
 
-    // Mark each mount point, skipping synthetic filesystem types.
-    let mut saw_pre_access_mark = false;
-    let mut home_covered = false;
-
-    for mount in &mounts {
-        if home_covering_mount.as_deref() == Some(mount.mount_point.as_path())
-            && is_synthetic_fs(&mount.fstype)
-        {
-            eprintln!(
-                "agent-sandbox-fsmon: --home {} is on unsupported synthetic filesystem {} at {}; \
-                 cannot guarantee filesystem monitoring",
-                cli.home.as_deref().unwrap_or("?"),
-                mount.fstype,
-                mount.mount_point.display()
-            );
-            process::exit(1);
-        }
-        if is_synthetic_fs(&mount.fstype) {
-            tracing::debug!(
-                path = %mount.mount_point.display(),
-                fstype = %mount.fstype,
-                "skipping synthetic mount"
-            );
-            continue;
-        }
-
-        let mp_cstr =
-            CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
-        match fanotify_mark(fan_fd, &mp_cstr, true) {
-            Ok(actual_mask) => {
-                saw_pre_access_mark |= actual_mask & FAN_PRE_ACCESS != 0;
-                if home_covering_mount.as_deref() == Some(mount.mount_point.as_path()) {
-                    home_covered = true;
-                }
-                tracing::debug!(path = %mount.mount_point.display(), mask = %format_args!("{actual_mask:x}"), "marked mountpoint");
-            }
-            Err(e) => {
-                // Non-synthetic mounts at or under --home must be successfully
-                // marked to guarantee filesystem monitoring.
-                if home_covering_mount.as_deref() == Some(mount.mount_point.as_path())
-                    || cli
-                        .home
-                        .as_deref()
-                        .is_some_and(|home| is_under_home(&mount.mount_point, Path::new(home)))
-                {
-                    eprintln!(
-                        "agent-sandbox-fsmon: fanotify_mark {} (under --home): {e}",
-                        mount.mount_point.display()
-                    );
-                    process::exit(1);
-                }
-                tracing::warn!(
-                    path = %mount.mount_point.display(),
-                    fstype = %mount.fstype,
-                    error = %e,
-                    "failed to mark mountpoint (not under home, continuing)"
-                );
-            }
-        }
-    }
+    let (saw_pre_access_mark, home_covered) = mark_mountpoints(
+        fan_fd,
+        &mounts,
+        home_covering_mount.as_deref(),
+        cli.home.as_deref(),
+    );
 
     // Before signaling ready, require that at least one marked mount covers --home.
     if let Some(ref home) = cli.home
@@ -506,109 +602,17 @@ fn main() {
         .unwrap_or_default();
     let socket_path = Path::new(&cli.socket);
 
-    // Event loop.
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let n =
-            match unsafe { libc::read(fan_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) }
-            {
-                -1 => {
-                    let e = io::Error::last_os_error();
-                    eprintln!("agent-sandbox-fsmon: read from fanotify fd: {e}");
-                    continue;
-                }
-                n if n >= 0 => usize::try_from(n).expect("nonnegative read length"),
-                _ => continue,
-            };
-        let mut offset = 0;
-        while offset + size_of::<FanotifyEventMetadata>() <= n {
-            let meta = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr().add(offset).cast::<FanotifyEventMetadata>())
-            };
-
-            if meta.metadata_len == 0 {
-                break;
-            }
-
-            if meta.event_len == 0 {
-                break;
-            }
-            let Ok(event_len) = usize::try_from(meta.event_len) else {
-                break;
-            };
-
-            if meta.fd >= 0
-                && meta.mask
-                    & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_PRE_ACCESS | FAN_ACCESS_PERM)
-                    != 0
-            {
-                if meta.pid == self_pid {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-                if saw_pre_access_mark
-                    && meta.mask & FAN_ACCESS_PERM != 0
-                    && event_fd_is_regular_file(meta.fd)
-                {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-                // FAN_PRE_ACCESS is a pre-content notification event, not a
-                // permission event. The kernel does not wait for or honor a
-                // deny response. Auto-allow these events and rely on
-                // FAN_OPEN_PERM for deniable open permission checks.
-                if meta.mask & FAN_PRE_ACCESS != 0 {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-                // Resolve the path from the event fd.
-                let Ok(path) = resolve_event_path(meta.fd) else {
-                    // Cannot resolve, allow by default.
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                };
-                let access = mask_to_access(meta.mask, meta.fd, meta.pid);
-
-                // Auto-allow events matching a static allow rule.
-                if static_allow
-                    .iter()
-                    .any(|rule| rule.matches(Path::new(&path), access, None))
-                {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-                // Tag the request with the fanotify event PID so policyd can
-                // route to the correct UI client (e.g. the host policy UI client
-                let mut event_ctx = ctx.clone();
-                event_ctx.pid = u32::try_from(meta.pid).ok();
-                let reply = rpc_client::check_filesystem(socket_path, &path, access, event_ctx);
-
-                let verdict = match &reply {
-                    Ok(r) if r.allowed => FAN_ALLOW,
-                    _ => FAN_DENY,
-                };
-
-                if verdict == FAN_DENY {
-                    tracing::info!(%path, ?access, "denied by policy");
-                }
-
-                respond(fan_fd, meta.fd, verdict);
-            } else if meta.fd >= 0 {
-                // Event without permission bit -> close fd and allow.
-                unsafe { libc::close(meta.fd) };
-            }
-
-            offset += event_len;
-        }
-    }
+    run_event_loop(
+        fan_fd,
+        self_pid,
+        saw_pre_access_mark,
+        &ctx,
+        socket_path,
+        &static_allow,
+    );
 }
 
-/// Write a FAN_ALLOW or FAN_DENY response and close the event fd.
+/// Write a `FAN_ALLOW` or `FAN_DENY` response and close the event fd.
 fn respond(fan_fd: i32, event_fd: i32, response: u32) {
     let resp = FanotifyResponse {
         fd: event_fd,
