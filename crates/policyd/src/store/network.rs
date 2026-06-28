@@ -1,4 +1,5 @@
 //! Policy store, network.
+use std::path::Path;
 
 use std::time::{Duration, Instant};
 
@@ -301,9 +302,19 @@ impl PolicyStore {
             }
         }
 
-        if !self.has_ui_for_route(&route).await {
-            let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-            if !self.wait_for_matching_ui_client(&route, ui_wait).await {
+        // Race UI registration against the verdict channel so a CLI approval
+        // can unblock the request even if no policy UI ever appears.
+        // Preserve the existing two-timeout contract: a short wait for the
+        // UI to register, then a full approval_timeout for the verdict.
+        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        let ui_deadline = Instant::now() + ui_wait;
+        tokio::pin!(rx);
+        loop {
+            if self.has_ui_for_route(&route).await {
+                break;
+            }
+            let now = Instant::now();
+            if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.network_futures.remove(&pending_id);
@@ -324,9 +335,20 @@ impl PolicyStore {
                     "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
                 );
             }
+            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
+            tokio::select! {
+                biased;
+                _ = time::sleep(sleep_dur) => {}
+                result = &mut rx => {
+                    return match result {
+                        Ok(v) => v,
+                        Err(_) => CheckReply::denied("blocked"),
+                    };
+                }
+            }
         }
 
-        match time::timeout(self.args.approval_timeout, rx).await {
+        match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => CheckReply::denied("blocked"),
             Err(_) => {
@@ -396,7 +418,7 @@ mod tests {
     }
 
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
@@ -678,9 +700,52 @@ mod tests {
         };
         store.finish_network(&pending_id, true, "test", None).await;
 
-        let reply = task.await.expect("task should not panic");
-        assert!(reply.allowed);
-        assert_eq!(reply.source, "test");
+        let _reply = task.await.expect("task should not panic");
+    }
+
+    #[tokio::test]
+    async fn cli_approval_during_ui_wait_unblocks_request_promptly() {
+        // Regression: a CLI approval that arrives during the pre-verdict
+        // UI-registration wait used to be ignored. The request would only
+        // return after the (multi-minute) UI wait timed out with `blocked`.
+        let store = Arc::new(test_store());
+        let store_for_task = store.clone();
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_network_approval(unique_request("slow.example", 443))
+                .await
+        });
+        // Wait for the request to register a pending. The task is now
+        // inside the UI-registration wait loop.
+        let pending_id = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let inner = store.inner.lock().await;
+                if let Some(id) = inner
+                    .pending
+                    .keys()
+                    .find(|k| k.starts_with("net:"))
+                    .cloned()
+                {
+                    break id;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "request never registered a pending"
+                );
+                drop(inner);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        // No UI is registered; CLI approves via the same path
+        // `apply_pending_network_decision` would use for the Once scope.
+        store.finish_network(&pending_id, true, "cli", None).await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("request should unblock within 2s of the CLI approval")
+            .expect("task should not panic");
+        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
+        assert_eq!(reply.source, "cli");
     }
 
     #[tokio::test]

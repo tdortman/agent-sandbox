@@ -1,4 +1,5 @@
 //! Policy store: filesystem (fanotify monitor spawn and declarative checks).
+use std::path::Path;
 
 use std::io::BufRead;
 use std::process::{Command, Stdio};
@@ -286,9 +287,19 @@ impl PolicyStore {
             }
         }
 
-        if !self.has_standalone_ui_for_route(&route).await {
-            let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-            if !self.wait_for_standalone_ui_client(&route, ui_wait).await {
+        // Race UI registration against the verdict channel so a CLI approval
+        // can unblock the request even if no policy UI ever appears.
+        // Preserve the existing two-timeout contract: a short wait for the
+        // UI to register, then a full approval_timeout for the verdict.
+        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        let ui_deadline = Instant::now() + ui_wait;
+        tokio::pin!(rx);
+        loop {
+            if self.has_standalone_ui_for_route(&route).await {
+                break;
+            }
+            let now = Instant::now();
+            if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.filesystem_futures.remove(&pending_id);
@@ -298,9 +309,20 @@ impl PolicyStore {
                     access,
                 );
             }
+            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
+            tokio::select! {
+                biased;
+                _ = time::sleep(sleep_dur) => {}
+                result = &mut rx => {
+                    return match result {
+                        Ok(v) => v,
+                        Err(_) => FilesystemCheckReply::denied("blocked", path, access),
+                    };
+                }
+            }
         }
 
-        match time::timeout(self.args.approval_timeout, rx).await {
+        match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => FilesystemCheckReply::denied("blocked", path, access),
             Err(_) => {
@@ -345,5 +367,94 @@ impl PolicyStore {
             },
         );
         enforce_verdict_cache_limit(&mut inner.filesystem_verdict_cache);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use agent_sandbox_core::{FileAccess, ProcessIds, SandboxPaths};
+
+    use crate::store::types::{PolicyStore, PolicydArgs};
+    use crate::wire::{FilesystemCheckRequest, MergeContext};
+
+    fn test_store() -> PolicyStore {
+        PolicyStore::new(PolicydArgs {
+            host_socket: "/tmp/test.sock".into(),
+            sandbox_socket: "/tmp/test-sandbox.sock".into(),
+            declarative: "/tmp/declarative.json".into(),
+            export_json: "/tmp/export.json".into(),
+            export_nix: None,
+            approval_timeout: Duration::from_secs(30),
+            interactive_approval: true,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        })
+    }
+
+    fn filesystem_request(path: &str, access: FileAccess) -> FilesystemCheckRequest {
+        FilesystemCheckRequest {
+            path: path.into(),
+            access,
+            ctx: MergeContext {
+                paths: SandboxPaths::from_wire(
+                    Some("/repo".into()),
+                    Some("/home/user".into()),
+                    Some("/repo".into()),
+                ),
+                ids: ProcessIds::from_options(Some(0), Some(1000)),
+                sandbox_session_id: Some("sandbox-cap".into()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_approval_during_ui_wait_unblocks_filesystem_promptly() {
+        // Regression: a CLI approval that arrives during the pre-verdict
+        // UI-registration wait used to be ignored. The request would only
+        // return after the (multi-minute) UI wait timed out.
+        let store = Arc::new(test_store());
+        let store_for_task = store.clone();
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_filesystem_approval(filesystem_request("/repo/file.txt", FileAccess::Read))
+                .await
+        });
+        // Wait for the request to register a pending. The task is now
+        // inside the UI-registration wait loop.
+        let pending_id = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let inner = store.inner.lock().await;
+                if let Some(id) = inner.pending.keys().find(|k| k.starts_with("fs:")).cloned() {
+                    break id;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "request never registered a pending"
+                );
+                drop(inner);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        // No UI is registered; CLI approves via the same path
+        // `apply_pending_filesystem_decision` would use.
+        store
+            .finish_filesystem(
+                &pending_id,
+                "/repo/file.txt".into(),
+                FileAccess::Read,
+                true,
+                "cli",
+            )
+            .await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("request should unblock within 2s of the CLI approval")
+            .expect("task should not panic");
+        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
     }
 }

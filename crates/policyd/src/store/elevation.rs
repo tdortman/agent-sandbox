@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{ElevateReply, UiPush};
 use tokio::sync::oneshot;
@@ -189,9 +189,19 @@ impl PolicyStore {
             );
         }
 
-        if !self.has_ui_for_route(&route).await {
-            let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-            if !self.wait_for_matching_ui_client(&route, ui_wait).await {
+        // Race UI registration against the verdict channel so a CLI approval
+        // can unblock the request even if no policy UI ever appears.
+        // Preserve the existing two-timeout contract: a short wait for the
+        // UI to register, then a full approval_timeout for the verdict.
+        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        let ui_deadline = Instant::now() + ui_wait;
+        tokio::pin!(rx);
+        loop {
+            if self.has_ui_for_route(&route).await {
+                break;
+            }
+            let now = Instant::now();
+            if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(&pending_id);
                 inner.elevation_futures.remove(&pending_id);
@@ -206,9 +216,20 @@ impl PolicyStore {
                             .into(),
                 };
             }
+            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
+            tokio::select! {
+                biased;
+                _ = time::sleep(sleep_dur) => {}
+                result = &mut rx => {
+                    return match result {
+                        Ok(v) => v,
+                        Err(_) => ElevateReply::denied(),
+                    };
+                }
+            }
         }
 
-        match time::timeout(self.args.approval_timeout, rx).await {
+        match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => ElevateReply::denied(),
             Err(_) => {
@@ -227,5 +248,91 @@ impl PolicyStore {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::types::{PolicyStore, PolicydArgs};
+    use crate::wire::{ElevationRequest, MergeContext};
+    use agent_sandbox_core::{ElevateReply, ProcessIds, SandboxPaths};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    fn test_store() -> PolicyStore {
+        PolicyStore::new(PolicydArgs {
+            host_socket: "/tmp/test.sock".into(),
+            sandbox_socket: "/tmp/test-sandbox.sock".into(),
+            declarative: "/tmp/declarative.json".into(),
+            export_json: "/tmp/export.json".into(),
+            export_nix: None,
+            approval_timeout: Duration::from_secs(30),
+            interactive_approval: true,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        })
+    }
+
+    fn elevation_request(argv: Vec<String>) -> ElevationRequest {
+        ElevationRequest {
+            argv,
+            ctx: MergeContext {
+                paths: SandboxPaths::from_wire(
+                    Some("/repo".into()),
+                    Some("/home/user".into()),
+                    Some("/repo".into()),
+                ),
+                ids: ProcessIds::from_options(Some(0), Some(1000)),
+                sandbox_session_id: Some("sandbox-cap".into()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_approval_during_ui_wait_unblocks_elevation_promptly() {
+        // Regression: a CLI approval that arrives during the pre-verdict
+        // UI-registration wait used to be ignored. The request would only
+        // return after the (multi-minute) UI wait timed out.
+        let store = Arc::new(test_store());
+        let store_for_task = store.clone();
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_elevation(elevation_request(vec![
+                    "systemctl".into(),
+                    "restart".into(),
+                ]))
+                .await
+        });
+        // Wait for the request to register a pending. The task is now
+        // inside the UI-registration wait loop.
+        let pending_id = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let inner = store.inner.lock().await;
+                if let Some(id) = inner
+                    .pending
+                    .keys()
+                    .find(|k| k.starts_with("elev:"))
+                    .cloned()
+                {
+                    break id;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "request never registered a pending"
+                );
+                drop(inner);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        // No UI is registered; CLI approves via the same path
+        // `apply_pending_sudo_decision` would use.
+        let reply = ElevateReply::executed(0, String::new(), String::new());
+        store.finish_elevation(&pending_id, reply).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("request should unblock within 2s of the CLI approval")
+            .expect("task should not panic");
+        assert!(result.allowed, "expected allowed reply, got: {result:?}");
     }
 }

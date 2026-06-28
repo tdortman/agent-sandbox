@@ -1,14 +1,13 @@
 //! Policy store: ui.
+use std::path::Path;
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{SessionContext, UiPush, attach_ui_aliases};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
-use tokio::time;
 use uuid::Uuid;
 
 use crate::spawn::maybe_spawn_ui;
@@ -210,36 +209,6 @@ impl PolicyStore {
                 home: ctx.home.clone(),
                 project_root: ctx.project_root.clone(),
             })
-    }
-
-    pub(crate) async fn wait_for_matching_ui_client(
-        &self,
-        route: &UiRoute,
-        timeout: Duration,
-    ) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if self.has_ui_for_route(route).await {
-                return true;
-            }
-            time::sleep(Duration::from_millis(50)).await;
-        }
-        false
-    }
-
-    pub(crate) async fn wait_for_standalone_ui_client(
-        &self,
-        route: &UiRoute,
-        timeout: Duration,
-    ) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if self.has_standalone_ui_for_route(route).await {
-                return true;
-            }
-            time::sleep(Duration::from_millis(50)).await;
-        }
-        false
     }
 
     pub(crate) async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) {
