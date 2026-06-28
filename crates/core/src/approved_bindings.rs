@@ -137,6 +137,12 @@ impl ApprovedBindings {
         }
     }
 
+    /// Save bindings to the JSON cache file at `self.path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the parent directory cannot be created, the data cannot be
+    /// serialized to JSON, or the atomic write (temp file + rename) fails.
     pub fn save(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;

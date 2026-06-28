@@ -68,6 +68,11 @@ pub struct NetworkTarget {
     pub scheme: String,
 }
 
+/// Receive a seccomp notification from the listener fd.
+///
+/// # Errors
+///
+/// Returns an error if the `SECCOMP_IOCTL_NOTIF_RECV` ioctl fails.
 pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
     let mut notif = SeccompNotif::default();
     let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif) };
@@ -77,6 +82,11 @@ pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
     Ok(notif)
 }
 
+/// Send a `SECCOMP_USER_NOTIF_FLAG_CONTINUE` response, allowing the syscall.
+///
+/// # Errors
+///
+/// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
 pub fn send_continue(listener_fd: i32, id: u64) -> io::Result<()> {
     let mut resp = SeccompNotifResp {
         id,
@@ -91,6 +101,11 @@ pub fn send_continue(listener_fd: i32, id: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Inject an error return value into the tracee's syscall result.
+///
+/// # Errors
+///
+/// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
 pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
     let mut resp = SeccompNotifResp {
         id,
@@ -105,6 +120,12 @@ pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// Read `len` bytes from the tracee's address space at `addr`.
+///
+/// # Errors
+///
+/// Returns an error if `process_vm_readv` fails (e.g. the process is gone or the
+/// address is invalid).
 pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0_u8; len];
     let local = libc::iovec {
@@ -222,10 +243,20 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Option<(IpAddr, u16)> {
     }
 }
 
+/// Extract a network target from a `connect` syscall notification.
+///
+/// # Errors
+///
+/// Returns an error if reading tracee memory via `process_vm_readv` fails.
 pub fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<NetworkTarget>> {
     let scheme = scheme_for_fd(notif, notif.data.args[0], "tcp");
     sockaddr_target(notif, notif.data.args[1], notif.data.args[2], &scheme)
 }
+/// Extract a network target from a `sendto` syscall notification.
+///
+/// # Errors
+///
+/// Returns an error if reading tracee memory via `process_vm_readv` fails.
 pub fn target_from_sendto(notif: &SeccompNotif) -> io::Result<Option<NetworkTarget>> {
     let scheme = scheme_for_fd(notif, notif.data.args[0], "udp");
     sockaddr_target(notif, notif.data.args[4], notif.data.args[5], &scheme)
@@ -255,6 +286,12 @@ fn parse_msghdr_target(bytes: &[u8]) -> Option<(u64, u32)> {
     Some((name, name_len))
 }
 
+/// Extract a network target from a `sendmsg` syscall notification.
+///
+/// # Errors
+///
+/// Returns an error if reading the tracee's `msghdr` or sockaddr via
+/// `process_vm_readv` fails.
 pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<NetworkTarget>> {
     let msg = notif.data.args[1];
     if msg == 0 {
@@ -268,6 +305,11 @@ pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<NetworkTar
     sockaddr_target(notif, name, u64::from(name_len), &scheme)
 }
 
+/// Extract a network target from a `sendmmsg` syscall notification.
+///
+/// # Errors
+///
+/// Returns an error if reading tracee memory via `process_vm_readv` fails.
 pub fn target_from_sendmmsg(notif: &SeccompNotif) -> io::Result<Option<NetworkTarget>> {
     let msgvec = notif.data.args[1];
     if msgvec == 0 {
@@ -305,6 +347,12 @@ fn sockaddr_target(
     }))
 }
 
+/// Route a notification to the appropriate target extractor based on syscall number.
+///
+/// # Errors
+///
+/// Returns an error if the underlying target extraction (reading tracee memory)
+/// fails.
 pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<NetworkTarget>> {
     match i64::from(notif.data.nr) {
         nr::SENDTO => target_from_sendto(notif),

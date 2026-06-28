@@ -45,6 +45,12 @@ struct Cli {
     argv: Vec<String>,
 }
 
+/// Run the elevate CLI: parse args, build request, send to policyd, handle reply.
+///
+/// # Errors
+/// Returns [`ElevateCliError::Usage`] when no command is provided,
+/// [`ElevateCliError::Rpc`] when the RPC to policyd fails,
+/// or [`ElevateCliError::Policyd`] when policyd returns an error or unexpected reply.
 pub async fn run() -> Result<(), ElevateCliError> {
     let cli = Cli::parse();
     if cli.argv.is_empty() {

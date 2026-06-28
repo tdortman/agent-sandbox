@@ -25,9 +25,12 @@ const _SOCK_FILTER_LAYOUTS_MATCH: () = assert!(
 /// Build a seccomp BPF program from a set of syscall numbers.
 ///
 /// The filter returns [`SeccompAction::UserNotif`] for every syscall
-/// listed in `syscalls` on both x86_64 and aarch64. Any other syscall is
+/// listed in `syscalls` on both `x86_64` and aarch64. Any other syscall is
 /// allowed. The filter also validates `struct seccomp_data.arch` against
 /// the target architecture, killing the process on a mismatch.
+/// # Panics
+/// Panics if seccomp filter construction fails or the compiled BPF program
+/// exceeds [`seccompiler::BPF_MAX_LEN`].
 #[must_use]
 pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
     // An empty rule vector means "match this syscall regardless of its

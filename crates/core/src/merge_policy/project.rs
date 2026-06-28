@@ -81,6 +81,12 @@ fn path_to_string(path: &Path) -> String {
 ///
 /// The returned path is canonicalised and verified to be a descendant of the
 /// canonical project root, defeating symlink-escape attacks.
+///
+/// # Errors
+///
+/// Returns an error if `project_root` cannot be canonicalized, is not a valid
+/// project root (`/` or lacking a file name), or the canonicalized policy path
+/// escapes `project_root`.
 pub fn trusted_project_policy_path(project_root: &Path) -> Result<PathBuf, ProjectPolicyError> {
     let canonical_root =
         project_root

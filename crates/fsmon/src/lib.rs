@@ -40,7 +40,12 @@ pub mod rpc_client {
         }
     }
 
-    /// Send a StartFilesystemMonitor request and wait for a success reply.
+    /// Send a `StartFilesystemMonitor` request and wait for a success reply.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] on socket/stream I/O failure, [`Error::Json`] on
+    /// serialization failure, or [`Error::Reply`] if policyd returns an error or
+    /// an unexpected reply type.
     pub fn start_monitor(
         socket_path: &Path,
         ctx: RequestContext,
@@ -55,7 +60,12 @@ pub mod rpc_client {
         }
     }
 
-    /// Send a CheckFilesystem request and return the reply.
+    /// Send a `CheckFilesystem` request and return the reply.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] on socket/stream I/O failure, [`Error::Json`] on
+    /// serialization failure, or [`Error::Reply`] if policyd returns an error or
+    /// an unexpected reply type.
     pub fn check_filesystem(
         socket_path: &Path,
         path: &str,

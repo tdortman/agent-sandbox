@@ -147,6 +147,11 @@ impl FilesystemRule {
     }
 
     /// Whether this rule's path matches the requested path (exact, descendant, or glob).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.path` is not a valid glob pattern.
+    #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
         // ponytail: recompile on every match. globset compile is ~10us; add a sidecar
         // cache if profiling shows the matcher is hot. Replaces the previous OnceLock

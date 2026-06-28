@@ -62,6 +62,12 @@ fn expand_filesystem_paths(policy: &mut Policy, home: Option<&Path>, project_roo
         rule.path = expand_policy_path(&rule.path, home, project_root);
     }
 }
+/// Resolve the policy write path, verifying symlink containment.
+///
+/// # Errors
+///
+/// Returns an error if canonicalization or stat operations fail, or if the
+/// resolved path (or symlink target) escapes `expected_root`.
 pub fn resolve_policy_write_path(
     path: &Path,
     expected_root: Option<&Path>,
@@ -164,6 +170,13 @@ pub fn chown_policy_path(path: &Path, uid: u32) {
     }
 }
 
+/// Atomically write policy data to disk.
+///
+/// # Errors
+///
+/// Returns an error if the policy path cannot be resolved, directory creation
+/// fails, JSON serialization fails, the temporary file cannot be written or
+/// renamed into place, or filesystem metadata operations fail.
 pub fn atomic_write_policy(
     path: &Path,
     data: &Policy,

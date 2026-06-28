@@ -38,6 +38,16 @@ pub struct ScopeContext<'a> {
 }
 
 impl ScopeTarget {
+    /// Validate a wire-level scope against the provided context and produce a
+    /// [`ScopeTarget`].
+    ///
+    /// # Errors
+    /// Returns [`ScopeResolveError::SessionRequired`] if the session scope is used
+    /// but no valid session is provided, [`ScopeResolveError::ProjectRootRequired`]
+    /// if the project scope is used without a project root,
+    /// [`ScopeResolveError::HomeRequired`] if the global scope is used without a
+    /// home directory, or [`ScopeResolveError::ProjectPolicy`] if the project
+    /// policy path cannot be resolved.
     pub fn resolve(ctx: &ScopeContext<'_>) -> Result<Self, ScopeResolveError> {
         match ctx.scope {
             ApprovalScope::Once => Ok(Self::Ephemeral),

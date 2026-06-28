@@ -78,6 +78,11 @@ impl PolicyServer {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the host and sandbox socket paths are identical, if socket
+    /// binding fails (permissions, path length, or filesystem issues), or if Unix-domain
+    /// socket setup fails.
     pub async fn run(self) -> std::io::Result<()> {
         if self.host_socket_path == self.sandbox_socket_path {
             return Err(std::io::Error::new(
