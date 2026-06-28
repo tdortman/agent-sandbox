@@ -88,13 +88,13 @@ pub async fn handle_check(
     };
     let url = prompt_url(&scheme, url, &policy_host, port, prompt_host);
     let merge = MergeContext::from(&ctx);
-    if let Some(source) = store.allow_source(&policy_host, port, merge.clone()).await {
+    if let Some(source) = store.allow_source(&policy_host, port, &merge).await {
         if source == "deny" {
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return Ok(RpcReply::Check(CheckReply::denied("deny")));
         }
         if source == "once" {
-            let allowed = store.is_allowed(&policy_host, port, merge, true).await;
+            let allowed = store.is_allowed(&policy_host, port, &merge, true).await;
             if allowed {
                 tracing::info!(%policy_host, port, %source, "check allow");
             } else {

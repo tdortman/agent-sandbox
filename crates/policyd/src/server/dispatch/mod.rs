@@ -22,6 +22,6 @@ pub async fn dispatch(
     mut req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     auth::ensure_allowed(role, &req)?;
-    context::resolve(store, &mut req).await;
+    context::resolve(store, &mut req);
     handlers::handle(store, client, peer, req).await
 }

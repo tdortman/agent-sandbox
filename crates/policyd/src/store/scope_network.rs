@@ -38,7 +38,6 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id: _,
         } = wire;
-        let cwd = paths.cwd_string();
         let home = paths.home_string();
         let project_root = paths.project_root_string();
         let session_entries = session_network_entries(&host, port);
@@ -65,31 +64,8 @@ impl PolicyStore {
                 }
             }
             ScopeTarget::Session { session_id } => {
-                let mut inner = self.inner.lock().await;
-                match action {
-                    DecisionAction::Approve => {
-                        let bucket = inner.session_allow.entry(session_id.clone()).or_default();
-                        for entry in &session_entries {
-                            bucket.insert(entry.clone());
-                        }
-                        if let Some(deny_bucket) = inner.session_deny.get_mut(&session_id) {
-                            for entry in session_entries {
-                                deny_bucket.remove(&entry);
-                            }
-                        }
-                    }
-                    DecisionAction::Deny => {
-                        let bucket = inner.session_deny.entry(session_id.clone()).or_default();
-                        for entry in &session_entries {
-                            bucket.insert(entry.clone());
-                        }
-                        if let Some(allow_bucket) = inner.session_allow.get_mut(&session_id) {
-                            for entry in session_entries {
-                                allow_bucket.remove(&entry);
-                            }
-                        }
-                    }
-                }
+                self.apply_network_scope_session(action, session_id, session_entries)
+                    .await;
             }
             ScopeTarget::Global { policy_path, home } => {
                 let persist = match action {
@@ -142,23 +118,64 @@ impl PolicyStore {
                 tracing::info!(path = ?policy_path, "project policy saved");
             }
         }
-        let _ = self
-            .export_policy_files(SandboxPaths::from_wire(
-                cwd,
-                home.clone(),
-                project_root.clone(),
-            ))
-            .await;
-        Self::audit(action.audit_verb(), Some(&host), Some(port), scope_label);
-        let path = match (home.as_deref(), project_root.as_deref()) {
+        self.finalize_network_scope(&paths, host, port, scope, action)
+    }
+
+    async fn apply_network_scope_session(
+        &self,
+        action: DecisionAction,
+        session_id: String,
+        entries: Vec<NetworkRuleKey>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        match action {
+            DecisionAction::Approve => {
+                let bucket = inner.session_allow.entry(session_id.clone()).or_default();
+                for entry in &entries {
+                    bucket.insert(entry.clone());
+                }
+                if let Some(deny_bucket) = inner.session_deny.get_mut(&session_id) {
+                    for entry in entries {
+                        deny_bucket.remove(&entry);
+                    }
+                }
+            }
+            DecisionAction::Deny => {
+                let bucket = inner.session_deny.entry(session_id.clone()).or_default();
+                for entry in &entries {
+                    bucket.insert(entry.clone());
+                }
+                if let Some(allow_bucket) = inner.session_allow.get_mut(&session_id) {
+                    for entry in entries {
+                        allow_bucket.remove(&entry);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize_network_scope(
+        &self,
+        paths: &SandboxPaths,
+        host: String,
+        port: u16,
+        scope: ApprovalScope,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let _ = self.export_policy_files(SandboxPaths::from_wire(
+            paths.cwd_string(),
+            paths.home_string(),
+            paths.project_root_string(),
+        ));
+        Self::audit(action.audit_verb(), Some(&host), Some(port), scope.as_str());
+        let path = match (paths.home_string(), paths.project_root_string()) {
             (_, Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(Path::new(p))
+                Self::project_policy_path_display(Path::new(&p))
             }
             _ => None,
         };
         RpcReply::ScopeAction(ScopeActionReply::ok_network(host, port, scope, path))
     }
-
     pub(crate) async fn resolve_scope_target(
         &self,
         scope: ApprovalScope,

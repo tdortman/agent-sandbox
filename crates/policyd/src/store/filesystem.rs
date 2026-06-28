@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::types::{
     FilesystemVerdictKey, MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING,
-    PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    Pending, PendingFilesystem, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
 use crate::spawn::maybe_spawn_ui;
 use crate::store::ui_route::UiRoute;
@@ -39,7 +39,7 @@ impl PolicyStore {
             return FilesystemMonitorReply::failed("too many filesystem static allow rules");
         }
 
-        let ctx = self.resolve_context(req.ctx).await;
+        let ctx = self.resolve_context(&req.ctx);
         let cwd = ctx.paths.cwd_string();
         let home = ctx.paths.home_string();
         let project_root = ctx.paths.project_root_string();
@@ -114,9 +114,9 @@ impl PolicyStore {
     }
 
     pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
-        let resolved = self.resolve_context(req.ctx.clone()).await;
+        let resolved = self.resolve_context(&req.ctx);
         if let Some(source) = self
-            .filesystem_allow_source(&req.path, req.access, resolved.clone())
+            .filesystem_allow_source(&req.path, req.access, &resolved)
             .await
         {
             if source == "deny" {
@@ -137,112 +137,37 @@ impl PolicyStore {
         req: FilesystemCheckRequest,
     ) -> FilesystemCheckReply {
         let FilesystemCheckRequest { path, access, ctx } = req;
-        let resolved = self.resolve_context(ctx).await;
+        let resolved = self.resolve_context(&ctx);
         let wire_ids = resolved.ids;
         let cwd = resolved.paths.cwd_string();
         let home = resolved.paths.home_string();
         let project_root = resolved.paths.project_root_string();
         let sandbox_session_id = resolved.sandbox_session_id.clone();
-        if self
-            .filesystem_policy_denied(&path, access, resolved.clone())
-            .await
-        {
+        if self.filesystem_policy_denied(&path, access, &resolved) {
             return FilesystemCheckReply::denied("deny", path, access);
         }
         if !self.args.interactive_approval {
             return FilesystemCheckReply::denied("blocked", path, access);
         }
 
-        // Check the short-lived verdict cache before creating a new prompt.
-        {
-            let inner = self.inner.lock().await;
-            if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemVerdictKey {
-                path: path.clone(),
-                access,
-            }) && entry.time.elapsed() < Duration::from_secs(2)
-            {
-                return if entry.allowed {
-                    FilesystemCheckReply::allowed(entry.source.clone(), path, access)
-                } else {
-                    FilesystemCheckReply::denied(entry.source.clone(), path, access)
-                };
-            }
+        if let Some(reply) = self.check_filesystem_verdict_cache(&path, access).await {
+            return reply;
         }
 
-        let pending_id;
-        let (tx, rx) = oneshot::channel();
-        let created_prompt;
+        let (pending_id, created_prompt, rx) = match self
+            .dedup_or_create_pending_filesystem(
+                &path,
+                access,
+                cwd.as_deref(),
+                home.as_deref(),
+                project_root.as_deref(),
+                sandbox_session_id.as_deref(),
+            )
+            .await
         {
-            let mut inner = self.inner.lock().await;
-            // Deduplicate: if a pending already exists for the same file and
-            // access type, join its waiters instead of creating a new prompt.
-            if let Some(existing_id) = inner.pending.values().find_map(|p| {
-                let super::types::Pending::Filesystem(fs) = p else {
-                    return None;
-                };
-                if fs.path == path && fs.access == access {
-                    Some(fs.id.clone())
-                } else {
-                    None
-                }
-            }) {
-                let waiter_count = inner
-                    .filesystem_futures
-                    .get(&existing_id)
-                    .map_or(0, Vec::len);
-                if waiter_count >= MAX_WAITERS_PER_PENDING {
-                    tracing::warn!(
-                        pending_id = %existing_id,
-                        waiter_count,
-                        "filesystem approval blocked (too many waiters)"
-                    );
-                    return FilesystemCheckReply::blocked(
-                        "agent-sandbox: too many waiters for one filesystem approval",
-                        path,
-                        access,
-                    );
-                }
-                inner
-                    .filesystem_futures
-                    .entry(existing_id.clone())
-                    .or_default()
-                    .push(tx);
-                pending_id = existing_id;
-                created_prompt = false;
-            } else {
-                if inner.pending.len() >= MAX_PENDING_APPROVALS {
-                    tracing::warn!(
-                        pending_count = inner.pending.len(),
-                        "filesystem approval blocked (too many pending approvals)"
-                    );
-                    return FilesystemCheckReply::blocked(
-                        "agent-sandbox: too many pending approvals",
-                        path,
-                        access,
-                    );
-                }
-                pending_id = format!("fs:{}", Uuid::now_v7().simple());
-                inner
-                    .filesystem_futures
-                    .insert(pending_id.clone(), vec![tx]);
-                inner.pending.insert(
-                    pending_id.clone(),
-                    super::types::Pending::Filesystem(super::types::PendingFilesystem {
-                        id: pending_id.clone(),
-                        created_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0.0, |d| d.as_secs_f64()),
-                        path: path.clone(),
-                        access,
-                        cwd: cwd.clone(),
-                        home: home.clone(),
-                        project_root: project_root.clone(),
-                        sandbox_session_id: sandbox_session_id.clone(),
-                    }),
-                );
-                created_prompt = true;
-            }
-        }
+            Ok(r) => r,
+            Err(reply) => return reply,
+        };
 
         let route = UiRoute::new(cwd.clone(), project_root.clone())
             .with_sandbox_session(sandbox_session_id.clone());
@@ -287,6 +212,106 @@ impl PolicyStore {
             }
         }
 
+        self.await_filesystem_verdict(&route, &pending_id, path, access, rx)
+            .await
+    }
+    async fn check_filesystem_verdict_cache(
+        &self,
+        path: &str,
+        access: FileAccess,
+    ) -> Option<FilesystemCheckReply> {
+        let inner = self.inner.lock().await;
+        if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemVerdictKey {
+            path: path.to_string(),
+            access,
+        }) && entry.time.elapsed() < Duration::from_secs(2)
+        {
+            return Some(if entry.allowed {
+                FilesystemCheckReply::allowed(entry.source.clone(), path.to_string(), access)
+            } else {
+                FilesystemCheckReply::denied(entry.source.clone(), path.to_string(), access)
+            });
+        }
+        drop(inner);
+        None
+    }
+
+    async fn dedup_or_create_pending_filesystem(
+        &self,
+        path: &str,
+        access: FileAccess,
+        cwd: Option<&str>,
+        home: Option<&str>,
+        project_root: Option<&str>,
+        sandbox_session_id: Option<&str>,
+    ) -> Result<(String, bool, oneshot::Receiver<FilesystemCheckReply>), FilesystemCheckReply> {
+        let (tx, rx) = oneshot::channel();
+        let mut inner = self.inner.lock().await;
+        // Deduplicate: if a pending already exists for the same file and
+        // access type, join its waiters instead of creating a new prompt.
+        if let Some(existing_id) = inner.pending.values().find_map(|p| {
+            let Pending::Filesystem(fs) = p else {
+                return None;
+            };
+            (fs.path == path && fs.access == access).then(|| fs.id.clone())
+        }) {
+            let waiter_count = inner
+                .filesystem_futures
+                .get(&existing_id)
+                .map_or(0, Vec::len);
+            if waiter_count >= MAX_WAITERS_PER_PENDING {
+                return Err(FilesystemCheckReply::blocked(
+                    "agent-sandbox: too many waiters for one filesystem approval",
+                    path.to_string(),
+                    access,
+                ));
+            }
+            inner
+                .filesystem_futures
+                .entry(existing_id.clone())
+                .or_default()
+                .push(tx);
+            drop(inner);
+            return Ok((existing_id, false, rx));
+        }
+        if inner.pending.len() >= MAX_PENDING_APPROVALS {
+            return Err(FilesystemCheckReply::blocked(
+                "agent-sandbox: too many pending approvals",
+                path.to_string(),
+                access,
+            ));
+        }
+        let pending_id = format!("fs:{}", Uuid::now_v7().simple());
+        inner
+            .filesystem_futures
+            .insert(pending_id.clone(), vec![tx]);
+        inner.pending.insert(
+            pending_id.clone(),
+            Pending::Filesystem(PendingFilesystem {
+                id: pending_id.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                path: path.to_string(),
+                access,
+                cwd: cwd.map(String::from),
+                home: home.map(String::from),
+                project_root: project_root.map(String::from),
+                sandbox_session_id: sandbox_session_id.map(String::from),
+            }),
+        );
+        drop(inner);
+        Ok((pending_id, true, rx))
+    }
+
+    async fn await_filesystem_verdict(
+        &self,
+        route: &UiRoute,
+        pending_id: &str,
+        path: String,
+        access: FileAccess,
+        rx: oneshot::Receiver<FilesystemCheckReply>,
+    ) -> FilesystemCheckReply {
         // Race UI registration against the verdict channel so a CLI approval
         // can unblock the request even if no policy UI ever appears.
         // Preserve the existing two-timeout contract: a short wait for the
@@ -295,14 +320,15 @@ impl PolicyStore {
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
         loop {
-            if self.has_standalone_ui_for_route(&route).await {
+            if self.has_standalone_ui_for_route(route).await {
                 break;
             }
             let now = Instant::now();
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(&pending_id);
-                inner.filesystem_futures.remove(&pending_id);
+                inner.pending.remove(pending_id);
+                inner.filesystem_futures.remove(pending_id);
+                drop(inner);
                 return FilesystemCheckReply::blocked(
                     "agent-sandbox: no standalone filesystem policy UI registered (agent-sandbox-ui or auto-spawn)",
                     path,
@@ -312,12 +338,9 @@ impl PolicyStore {
             let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
             tokio::select! {
                 biased;
-                _ = time::sleep(sleep_dur) => {}
+                () = time::sleep(sleep_dur) => {}
                 result = &mut rx => {
-                    return match result {
-                        Ok(v) => v,
-                        Err(_) => FilesystemCheckReply::denied("blocked", path, access),
-                    };
+                    return result.unwrap_or_else(|_| FilesystemCheckReply::denied("blocked", path, access));
                 }
             }
         }
@@ -327,8 +350,9 @@ impl PolicyStore {
             Ok(Err(_)) => FilesystemCheckReply::denied("blocked", path, access),
             Err(_) => {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(&pending_id);
-                inner.filesystem_futures.remove(&pending_id);
+                inner.pending.remove(pending_id);
+                inner.filesystem_futures.remove(pending_id);
+                drop(inner);
                 FilesystemCheckReply::blocked(
                     "agent-sandbox: filesystem approval timed out (no response from policy UI)",
                     path,

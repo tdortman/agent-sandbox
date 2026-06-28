@@ -121,9 +121,7 @@ async fn main() -> Result<(), PolicydError> {
     };
 
     let store = Arc::new(PolicyStore::new(args));
-    store
-        .export_policy_files(agent_sandbox_core::SandboxPaths::default())
-        .await?;
+    store.export_policy_files(agent_sandbox_core::SandboxPaths::default())?;
 
     let host_socket = store.args().host_socket.clone();
     let sandbox_socket = store.args().sandbox_socket.clone();

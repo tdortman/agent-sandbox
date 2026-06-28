@@ -41,8 +41,8 @@ impl PolicyStore {
         matched
     }
 
-    pub(crate) async fn session_allowed(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx).await;
+    pub(crate) async fn session_allowed(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
+        let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
             resolved.paths.cwd_string(),
             resolved.paths.project_root_string(),
@@ -61,8 +61,8 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn session_denied(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx).await;
+    pub(crate) async fn session_denied(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
+        let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
             resolved.paths.cwd_string(),
             resolved.paths.project_root_string(),
@@ -81,9 +81,9 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn policy_denied(&self, host: &str, port: u16, ctx: MergeContext) -> bool {
+    pub(crate) fn policy_denied(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
         let host = normalize_host(host);
-        let merged = self.merged_for(ctx).await;
+        let merged = self.merged_for(ctx);
         merged
             .network
             .deny
@@ -91,18 +91,18 @@ impl PolicyStore {
             .any(|rule| Self::host_matches(&rule.host, &host) && rule.port == port)
     }
 
-    pub(crate) async fn sudo_policy_denied(&self, argv: &[String], ctx: MergeContext) -> bool {
-        let merged = self.merged_for(ctx).await;
+    pub(crate) fn sudo_policy_denied(&self, argv: &[String], ctx: &MergeContext) -> bool {
+        let merged = self.merged_for(ctx);
         merged.sudo.deny.iter().any(|rule| rule.matches(argv))
     }
 
-    pub(crate) async fn sudo_policy_allowed(&self, argv: &[String], ctx: MergeContext) -> bool {
-        let merged = self.merged_for(ctx).await;
+    pub(crate) fn sudo_policy_allowed(&self, argv: &[String], ctx: &MergeContext) -> bool {
+        let merged = self.merged_for(ctx);
         merged.sudo.allow.iter().any(|rule| rule.matches(argv))
     }
 
-    pub(crate) async fn session_sudo_denied(&self, argv: &[String], ctx: MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx).await;
+    pub(crate) async fn session_sudo_denied(&self, argv: &[String], ctx: &MergeContext) -> bool {
+        let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
             resolved.paths.cwd_string(),
             resolved.paths.project_root_string(),
@@ -118,8 +118,8 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn session_sudo_allowed(&self, argv: &[String], ctx: MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx).await;
+    pub(crate) async fn session_sudo_allowed(&self, argv: &[String], ctx: &MergeContext) -> bool {
+        let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
             resolved.paths.cwd_string(),
             resolved.paths.project_root_string(),
@@ -135,22 +135,22 @@ impl PolicyStore {
         })
     }
 
-    pub async fn allow_source(&self, host: &str, port: u16, ctx: MergeContext) -> Option<String> {
+    pub async fn allow_source(&self, host: &str, port: u16, ctx: &MergeContext) -> Option<String> {
         let host = normalize_host(host);
-        let resolved = self.resolve_context(ctx).await;
-        if self.policy_denied(&host, port, resolved.clone()).await {
+        let resolved = self.resolve_context(ctx);
+        if self.policy_denied(&host, port, &resolved) {
             return Some("deny".into());
         }
-        if self.session_denied(&host, port, resolved.clone()).await {
+        if self.session_denied(&host, port, &resolved).await {
             return Some("deny".into());
         }
         if self.once_allowed(&host, port, false).await {
             return Some("once".into());
         }
-        if self.session_allowed(&host, port, resolved.clone()).await {
+        if self.session_allowed(&host, port, &resolved).await {
             return Some("session".into());
         }
-        let merged = self.merged_for(resolved).await;
+        let merged = self.merged_for(&resolved);
         for rule in &merged.network.allow {
             if Self::host_matches(&rule.host, &host) && rule.port == port {
                 if let Some(comment) = &rule.comment
@@ -168,24 +168,24 @@ impl PolicyStore {
         &self,
         host: &str,
         port: u16,
-        ctx: MergeContext,
+        ctx: &MergeContext,
         consume_once: bool,
     ) -> bool {
         let host = normalize_host(host);
-        let resolved = self.resolve_context(ctx).await;
-        if self.policy_denied(&host, port, resolved.clone()).await {
+        let resolved = self.resolve_context(ctx);
+        if self.policy_denied(&host, port, &resolved) {
             return false;
         }
-        if self.session_denied(&host, port, resolved.clone()).await {
+        if self.session_denied(&host, port, &resolved).await {
             return false;
         }
         if self.once_allowed(&host, port, consume_once).await {
             return true;
         }
-        if self.session_allowed(&host, port, resolved.clone()).await {
+        if self.session_allowed(&host, port, &resolved).await {
             return true;
         }
-        let merged = self.merged_for(resolved).await;
+        let merged = self.merged_for(&resolved);
         merged
             .network
             .allow
@@ -206,14 +206,14 @@ fn session_filesystem_matches(
 }
 
 impl PolicyStore {
-    pub(crate) async fn filesystem_policy_denied(
+    pub(crate) fn filesystem_policy_denied(
         &self,
         path: &str,
         access: FileAccess,
-        ctx: MergeContext,
+        ctx: &MergeContext,
     ) -> bool {
         let project_root = ctx.paths.project_root().map(str::to_owned);
-        let merged = self.merged_for(ctx).await;
+        let merged = self.merged_for(ctx);
         merged.filesystem.deny.iter().any(|rule| {
             rule.matches(
                 Path::new(path),
@@ -223,14 +223,14 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn filesystem_policy_allowed(
+    pub(crate) fn filesystem_policy_allowed(
         &self,
         path: &str,
         access: FileAccess,
-        ctx: MergeContext,
+        ctx: &MergeContext,
     ) -> bool {
         let project_root = ctx.paths.project_root().map(str::to_owned);
-        let merged = self.merged_for(ctx).await;
+        let merged = self.merged_for(ctx);
         merged.filesystem.allow.iter().any(|rule| {
             rule.matches(
                 Path::new(path),
@@ -244,9 +244,9 @@ impl PolicyStore {
         &self,
         path: &str,
         access: FileAccess,
-        ctx: MergeContext,
+        ctx: &MergeContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx).await;
+        let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
             resolved.paths.cwd_string(),
             resolved.paths.project_root_string(),
@@ -266,9 +266,9 @@ impl PolicyStore {
         &self,
         path: &str,
         access: FileAccess,
-        ctx: MergeContext,
+        ctx: &MergeContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx).await;
+        let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
             resolved.paths.cwd_string(),
             resolved.paths.project_root_string(),
@@ -288,27 +288,18 @@ impl PolicyStore {
         &self,
         path: &str,
         access: FileAccess,
-        ctx: MergeContext,
+        ctx: &MergeContext,
     ) -> Option<String> {
-        if self
-            .filesystem_policy_denied(path, access, ctx.clone())
-            .await
-        {
+        if self.filesystem_policy_denied(path, access, ctx) {
             return Some("deny".into());
         }
-        if self
-            .session_filesystem_denied(path, access, ctx.clone())
-            .await
-        {
+        if self.session_filesystem_denied(path, access, ctx).await {
             return Some("deny".into());
         }
-        if self
-            .session_filesystem_allowed(path, access, ctx.clone())
-            .await
-        {
+        if self.session_filesystem_allowed(path, access, ctx).await {
             return Some("session".into());
         }
-        if self.filesystem_policy_allowed(path, access, ctx).await {
+        if self.filesystem_policy_allowed(path, access, ctx) {
             return Some("allow".into());
         }
         None
@@ -398,8 +389,8 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(store.policy_denied("34.230.40.69", 443, ctx.clone()).await);
-        assert!(!store.is_allowed("34.230.40.69", 443, ctx, false).await);
+        assert!(store.policy_denied("34.230.40.69", 443, &ctx));
+        assert!(!store.is_allowed("34.230.40.69", 443, &ctx, false).await);
     }
 
     #[test]
@@ -464,8 +455,7 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(store.policy_denied("2001:db8::1", 443, ctx.clone()).await);
-        assert!(!store.is_allowed("2001:db8::1", 443, ctx, false).await);
+        assert!(store.policy_denied("2001:db8::1", 443, &ctx));
     }
 
     #[test]
@@ -527,12 +517,8 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(store.policy_denied("example.com", 443, ctx.clone()).await);
-        assert!(
-            !store
-                .is_allowed("example.com", 443, ctx.clone(), false)
-                .await
-        );
+        assert!(store.policy_denied("example.com", 443, &ctx));
+        assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
 
         let empty = agent_sandbox_core::Policy::default();
         agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None, None)
@@ -540,7 +526,7 @@ mod tests {
 
         // The merged policy is computed on every call, so removing the deny rule
         // from disk takes effect immediately.
-        assert!(!store.policy_denied("example.com", 443, ctx).await);
+        assert!(!store.policy_denied("example.com", 443, &ctx));
     }
 
     #[tokio::test]
@@ -591,7 +577,7 @@ mod tests {
 
         // The repo-local deny rule is applied: policy_denied returns
         // true because the merged policy includes the deny rule.
-        assert!(store.policy_denied("34.230.40.69", 443, ctx.clone()).await);
+        assert!(store.policy_denied("34.230.40.69", 443, &ctx));
     }
 
     #[tokio::test]
@@ -637,16 +623,12 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(
-            store
-                .is_allowed("example.com", 443, ctx.clone(), false)
-                .await
-        );
+        assert!(store.is_allowed("example.com", 443, &ctx, false).await);
 
         let empty = agent_sandbox_core::Policy::default();
         agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None, None)
             .expect("clear policy");
 
-        assert!(!store.is_allowed("example.com", 443, ctx, false).await);
+        assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
     }
 }

@@ -753,17 +753,18 @@ mod tests {
         add_ui_sessions(&store).await;
         approve_filesystem_session(&store, pending_filesystem(), "ui-session").await;
 
-        {
+        let has_allow = {
             let inner = store.inner.lock().await;
-            assert!(inner.session_filesystem_allow.contains_key("ui-session"));
-        }
+            inner.session_filesystem_allow.contains_key("ui-session")
+        };
+        assert!(has_allow);
 
         assert!(
             store
                 .session_filesystem_allowed(
                     "/home/user/projects/foo/src/lib.rs",
                     FileAccess::Read,
-                    merge_context(None),
+                    &merge_context(None),
                 )
                 .await
         );
@@ -775,17 +776,18 @@ mod tests {
         add_ui_sessions(&store).await;
         approve_filesystem_session(&store, pending_filesystem(), "ui-session").await;
 
-        {
+        let has_allow = {
             let inner = store.inner.lock().await;
-            assert!(inner.session_filesystem_allow.contains_key("ui-session"));
-        }
+            inner.session_filesystem_allow.contains_key("ui-session")
+        };
+        assert!(has_allow);
 
         assert!(
             store
                 .session_filesystem_allowed(
                     "/home/user/projects/foo/src/lib.rs",
                     FileAccess::Read,
-                    merge_context(None),
+                    &merge_context(None),
                 )
                 .await
         );
@@ -828,7 +830,7 @@ mod tests {
                 .session_allowed(
                     "api.example.com",
                     443,
-                    MergeContext {
+                    &MergeContext {
                         paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                         ids: ProcessIds::default(),
                         sandbox_session_id: Some("sandbox-a".into()),
@@ -841,7 +843,7 @@ mod tests {
                 .session_allowed(
                     "api.example.com",
                     443,
-                    MergeContext {
+                    &MergeContext {
                         paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                         ids: ProcessIds::default(),
                         sandbox_session_id: Some("sandbox-b".into()),

@@ -24,21 +24,15 @@ impl PolicyStore {
         if port == 0 {
             return PolicydError::InvalidPort.into();
         }
-        let resolved = self.resolve_context(ctx).await;
+        let resolved = self.resolve_context(&ctx);
         let wire_ids = resolved.ids;
         let paths = resolved.paths;
-        if self
-            .policy_denied(
-                &policy_host,
-                port,
-                MergeContext {
-                    paths: paths.clone(),
-                    ids: wire_ids,
-                    sandbox_session_id: resolved.sandbox_session_id.clone(),
-                },
-            )
-            .await
-        {
+        let deny_ctx = MergeContext {
+            paths: paths.clone(),
+            ids: wire_ids,
+            sandbox_session_id: resolved.sandbox_session_id.clone(),
+        };
+        if self.policy_denied(&policy_host, port, &deny_ctx) {
             return PolicydError::HostDeniedByPolicy.into();
         }
         self.apply_network_scope(

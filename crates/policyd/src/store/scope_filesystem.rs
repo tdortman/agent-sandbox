@@ -2,7 +2,8 @@
 use std::path::Path;
 
 use agent_sandbox_core::{
-    ApprovalScope, FilesystemRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget,
+    ApprovalScope, FileAccess, FilesystemRuleKey, RpcReply, SandboxPaths, ScopeActionReply,
+    ScopeTarget,
 };
 
 use crate::error::PolicydError;
@@ -12,6 +13,32 @@ use super::decisions::DecisionAction;
 use super::types::PolicyStore;
 
 impl PolicyStore {
+    fn finalize_filesystem_scope(
+        &self,
+        paths: &SandboxPaths,
+        path: String,
+        access: FileAccess,
+        scope: ApprovalScope,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let _ = self.export_policy_files(paths.clone());
+        let scope_label = scope.as_str();
+        let detail = format!("path={path} access={access:?} scope={scope_label}");
+        Self::audit(action.audit_verb(), None, None, &detail);
+        let policy_path = match (paths.home(), paths.project_root()) {
+            (_, Some(p)) if scope == ApprovalScope::Project => {
+                Self::project_policy_path_display(Path::new(p))
+            }
+            _ => None,
+        };
+        RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
+            path,
+            access,
+            scope,
+            policy_path,
+        ))
+    }
+
     pub(crate) async fn apply_filesystem_scope(
         &self,
         op: FilesystemScopeOp,
@@ -49,33 +76,8 @@ impl PolicyStore {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
                 let key = FilesystemRuleKey::new(&path, access);
-                let mut inner = self.inner.lock().await;
-                match action {
-                    DecisionAction::Approve => {
-                        let bucket = inner
-                            .session_filesystem_allow
-                            .entry(session_id.clone())
-                            .or_default();
-                        bucket.insert(key.clone());
-                        if let Some(deny_bucket) =
-                            inner.session_filesystem_deny.get_mut(&session_id)
-                        {
-                            deny_bucket.remove(&key);
-                        }
-                    }
-                    DecisionAction::Deny => {
-                        let bucket = inner
-                            .session_filesystem_deny
-                            .entry(session_id.clone())
-                            .or_default();
-                        bucket.insert(key.clone());
-                        if let Some(allow_bucket) =
-                            inner.session_filesystem_allow.get_mut(&session_id)
-                        {
-                            allow_bucket.remove(&key);
-                        }
-                    }
-                }
+                self.apply_filesystem_scope_session(action, session_id.clone(), key)
+                    .await;
             }
             ScopeTarget::Global { policy_path, home } => {
                 let persist = match action {
@@ -132,26 +134,42 @@ impl PolicyStore {
                 tracing::info!(path = ?policy_path, "project filesystem policy saved");
             }
         }
-        let _ = self
-            .export_policy_files(SandboxPaths::from_wire(
-                cwd,
-                home.clone(),
-                project_root.clone(),
-            ))
-            .await;
-        let detail = format!("path={path} access={access:?} scope={scope_label}");
-        Self::audit(action.audit_verb(), None, None, &detail);
-        let policy_path = match (home.as_deref(), project_root.as_deref()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(Path::new(p))
-            }
-            _ => None,
-        };
-        RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
+        self.finalize_filesystem_scope(
+            &SandboxPaths::from_wire(cwd, home, project_root),
             path,
             access,
             scope,
-            policy_path,
-        ))
+            action,
+        )
+    }
+    pub(crate) async fn apply_filesystem_scope_session(
+        &self,
+        action: DecisionAction,
+        session_id: String,
+        key: FilesystemRuleKey,
+    ) {
+        let mut inner = self.inner.lock().await;
+        match action {
+            DecisionAction::Approve => {
+                let bucket = inner
+                    .session_filesystem_allow
+                    .entry(session_id.clone())
+                    .or_default();
+                bucket.insert(key.clone());
+                if let Some(deny_bucket) = inner.session_filesystem_deny.get_mut(&session_id) {
+                    deny_bucket.remove(&key);
+                }
+            }
+            DecisionAction::Deny => {
+                let bucket = inner
+                    .session_filesystem_deny
+                    .entry(session_id.clone())
+                    .or_default();
+                bucket.insert(key.clone());
+                if let Some(allow_bucket) = inner.session_filesystem_allow.get_mut(&session_id) {
+                    allow_bucket.remove(&key);
+                }
+            }
+        }
     }
 }

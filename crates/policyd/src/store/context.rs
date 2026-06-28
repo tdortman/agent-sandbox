@@ -30,7 +30,7 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 impl PolicyStore {
-    pub async fn resolve_context(&self, ctx: MergeContext) -> MergeContext {
+    pub fn resolve_context(&self, ctx: &MergeContext) -> MergeContext {
         let mut paths = SandboxPaths::from_wire(
             ctx.paths.cwd_string(),
             ctx.paths.home_string(),
@@ -106,14 +106,19 @@ impl PolicyStore {
         merge_layers(&layers)
     }
 
-    pub async fn export_policy_files(&self, paths: SandboxPaths) -> std::io::Result<()> {
-        let merged = self
-            .merged_for(MergeContext {
-                paths,
-                ids: ProcessIds::default(),
-                sandbox_session_id: None,
-            })
-            .await;
+    /// Export merged policy to JSON and optionally Nix-format files.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if policy files cannot be written (serialization,
+    /// directory creation, or file write failures).
+    pub fn export_policy_files(&self, paths: SandboxPaths) -> std::io::Result<()> {
+        let ctx = MergeContext {
+            paths,
+            ids: ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+        let merged = self.merged_for(&ctx);
         atomic_write_text(
             &self.args.export_json,
             &(serde_json::to_string_pretty(&merged)? + "\n"),

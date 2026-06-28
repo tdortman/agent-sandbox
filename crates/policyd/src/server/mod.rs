@@ -414,11 +414,11 @@ mod tests {
                 .expect("read elevation push");
         assert!(
             matches!(
-                pushed,
+                &pushed,
                 RpcMessage::UiPush(UiPush::ElevationRequest {
-                    argv: Some(ref argv),
+                    argv: Some(elevation_argv),
                     ..
-                }) if argv == &vec!["whoami".to_string()]
+                }) if elevation_argv == &vec!["whoami".to_string()]
             ),
             "expected elevation push, got: {pushed:?}"
         );

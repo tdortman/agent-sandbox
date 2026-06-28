@@ -28,20 +28,20 @@ const NETWORK_VERDICT_CACHE_TTL: Duration = Duration::from_secs(1);
 struct NetworkRequestIdentity<'a> {
     host: &'a str,
     port: u16,
-    cwd: &'a Option<String>,
-    home: &'a Option<String>,
-    project_root: &'a Option<String>,
-    sandbox_session_id: &'a Option<String>,
+    cwd: Option<&'a str>,
+    home: Option<&'a str>,
+    project_root: Option<&'a str>,
+    sandbox_session_id: Option<&'a str>,
 }
 
 impl NetworkRequestIdentity<'_> {
     fn matches(&self, pending: &PendingNetwork) -> bool {
         pending.host == self.host
             && pending.port == self.port
-            && &pending.cwd == self.cwd
-            && &pending.home == self.home
-            && &pending.project_root == self.project_root
-            && &pending.sandbox_session_id == self.sandbox_session_id
+            && pending.cwd.as_deref() == self.cwd
+            && pending.home.as_deref() == self.home
+            && pending.project_root.as_deref() == self.project_root
+            && pending.sandbox_session_id.as_deref() == self.sandbox_session_id
     }
 }
 
@@ -76,7 +76,7 @@ impl PolicyStore {
                 ids: ProcessIds::default(),
                 sandbox_session_id: net.sandbox_session_id.clone(),
             };
-            let Some(source) = self.allow_source(&host, port, merge).await else {
+            let Some(source) = self.allow_source(&host, port, &merge).await else {
                 continue;
             };
             if source == "deny" || source == "once" {
@@ -153,13 +153,13 @@ impl PolicyStore {
             ctx,
         } = req;
         let policy_host = normalize_host(&host);
-        let resolved = self.resolve_context(ctx).await;
+        let resolved = self.resolve_context(&ctx);
         let wire_ids = resolved.ids;
         let cwd = resolved.paths.cwd_string();
         let home = resolved.paths.home_string();
         let project_root = resolved.paths.project_root_string();
         let sandbox_session_id = resolved.sandbox_session_id.clone();
-        if self.policy_denied(&policy_host, port, resolved).await {
+        if self.policy_denied(&policy_host, port, &resolved) {
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return CheckReply::denied("deny");
         }
@@ -171,92 +171,29 @@ impl PolicyStore {
         // This deduplicates prompts when curl tries multiple IPs for the
         // same domain (each IP is a separate SYN, but they share the
         // same hostname from the DNS cache).
-        {
-            let inner = self.inner.lock().await;
-            if let Some(entry) = inner.network_verdict_cache.get(&NetworkVerdictKey {
-                host: policy_host.clone(),
-                port,
-            }) && entry.time.elapsed() < NETWORK_VERDICT_CACHE_TTL
-            {
-                return if entry.allowed {
-                    CheckReply::allowed(entry.source.clone())
-                } else {
-                    CheckReply::denied(entry.source.clone())
-                };
-            }
+        if let Some(reply) = self.check_network_verdict_cache(&policy_host, port).await {
+            return reply;
         }
 
-        let (tx, rx) = oneshot::channel();
         let identity = NetworkRequestIdentity {
             host: &policy_host,
             port,
-            cwd: &cwd,
-            home: &home,
-            project_root: &project_root,
-            sandbox_session_id: &sandbox_session_id,
+            cwd: cwd.as_deref(),
+            home: home.as_deref(),
+            project_root: project_root.as_deref(),
+            sandbox_session_id: sandbox_session_id.as_deref(),
         };
-
-        let (pending_id, created_prompt) = {
-            let mut inner = self.inner.lock().await;
-            if let Some(existing_id) = inner.pending.values().find_map(|pending| {
-                let Pending::Network(net) = pending else {
-                    return None;
-                };
-                identity.matches(net).then(|| net.id.clone())
-            }) {
-                let waiter_count = inner.network_futures.get(&existing_id).map_or(0, Vec::len);
-                tracing::error!(waiter_count, MAX_WAITERS_PER_PENDING, host = %identity.host, "dedup found existing pending, waiter count");
-                if waiter_count >= MAX_WAITERS_PER_PENDING {
-                    return CheckReply::blocked(
-                        "agent-sandbox: too many waiters for one network approval",
-                    );
-                }
-                tracing::error!(
-                    waiter_count,
-                    MAX_WAITERS_PER_PENDING,
-                    "waiter count check failed"
-                );
-                inner
-                    .network_futures
-                    .entry(existing_id.clone())
-                    .or_default()
-                    .push(tx);
-                (existing_id, false)
-            } else {
-                if inner.pending.len() >= MAX_PENDING_APPROVALS {
-                    tracing::warn!(
-                        pending_count = inner.pending.len(),
-                        "network approval blocked (too many pending approvals)"
-                    );
-                    return CheckReply::blocked("agent-sandbox: too many pending approvals");
-                }
-                let pending_id = format!("net:{}", Uuid::now_v7().simple());
-                inner.network_futures.insert(pending_id.clone(), vec![tx]);
-                inner.pending.insert(
-                    pending_id.clone(),
-                    Pending::Network(PendingNetwork {
-                        id: pending_id.clone(),
-                        created_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0.0, |d| d.as_secs_f64()),
-                        host: policy_host.clone(),
-                        port,
-                        scheme: scheme.clone(),
-                        url: url.clone(),
-                        aliases: aliases.clone(),
-                        cwd: cwd.clone(),
-                        home: home.clone(),
-                        project_root: project_root.clone(),
-                        sandbox_session_id: sandbox_session_id.clone(),
-                    }),
-                );
-                (pending_id, true)
-            }
+        let (pending_id, created_prompt, rx) = match self
+            .dedup_or_create_pending_network(&identity, &scheme, &url, &aliases)
+            .await
+        {
+            Ok(r) => r,
+            Err(reply) => return reply,
         };
         let route = UiRoute::new(cwd.clone(), project_root.clone())
             .with_sandbox_session(sandbox_session_id.clone());
         if created_prompt {
-            Self::audit("pending", Some(&policy_host), Some(port), &scheme);
+            Self::audit("pending", Some(policy_host.as_str()), Some(port), &scheme);
             // Notify immediately. Late UI registration is flushed by
             // `RegisterUi` in `server::client` (see `flush_pending_to_ui`).
             self.notify_network_ui(
@@ -302,6 +239,108 @@ impl PolicyStore {
             }
         }
 
+        self.await_network_verdict(&route, &pending_id, policy_host, port, &scheme, rx)
+            .await
+    }
+    async fn check_network_verdict_cache(
+        &self,
+        policy_host: &str,
+        port: u16,
+    ) -> Option<CheckReply> {
+        let inner = self.inner.lock().await;
+        if let Some(entry) = inner.network_verdict_cache.get(&NetworkVerdictKey {
+            host: policy_host.to_string(),
+            port,
+        }) && entry.time.elapsed() < NETWORK_VERDICT_CACHE_TTL
+        {
+            return Some(if entry.allowed {
+                CheckReply::allowed(entry.source.clone())
+            } else {
+                CheckReply::denied(entry.source.clone())
+            });
+        }
+        drop(inner);
+        None
+    }
+
+    async fn dedup_or_create_pending_network(
+        &self,
+        identity: &NetworkRequestIdentity<'_>,
+        scheme: &str,
+        url: &str,
+        aliases: &[String],
+    ) -> Result<(String, bool, oneshot::Receiver<CheckReply>), CheckReply> {
+        let (tx, rx) = oneshot::channel();
+
+        let mut inner = self.inner.lock().await;
+        if let Some(existing_id) = inner.pending.values().find_map(|pending| {
+            let Pending::Network(net) = pending else {
+                return None;
+            };
+            identity.matches(net).then(|| net.id.clone())
+        }) {
+            let waiter_count = inner.network_futures.get(&existing_id).map_or(0, Vec::len);
+            tracing::error!(waiter_count, MAX_WAITERS_PER_PENDING, host = %identity.host, "dedup found existing pending, waiter count");
+            if waiter_count >= MAX_WAITERS_PER_PENDING {
+                return Err(CheckReply::blocked(
+                    "agent-sandbox: too many waiters for one network approval",
+                ));
+            }
+            tracing::error!(
+                waiter_count,
+                MAX_WAITERS_PER_PENDING,
+                "waiter count check failed"
+            );
+            inner
+                .network_futures
+                .entry(existing_id.clone())
+                .or_default()
+                .push(tx);
+            drop(inner);
+            return Ok((existing_id, false, rx));
+        }
+        if inner.pending.len() >= MAX_PENDING_APPROVALS {
+            tracing::warn!(
+                pending_count = inner.pending.len(),
+                "network approval blocked (too many pending approvals)"
+            );
+            return Err(CheckReply::blocked(
+                "agent-sandbox: too many pending approvals",
+            ));
+        }
+        let pending_id = format!("net:{}", Uuid::now_v7().simple());
+        inner.network_futures.insert(pending_id.clone(), vec![tx]);
+        inner.pending.insert(
+            pending_id.clone(),
+            Pending::Network(PendingNetwork {
+                id: pending_id.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                host: identity.host.to_string(),
+                port: identity.port,
+                scheme: scheme.to_string(),
+                url: url.to_string(),
+                aliases: aliases.to_vec(),
+                cwd: identity.cwd.map(String::from),
+                home: identity.home.map(String::from),
+                project_root: identity.project_root.map(String::from),
+                sandbox_session_id: identity.sandbox_session_id.map(String::from),
+            }),
+        );
+        drop(inner);
+        Ok((pending_id, true, rx))
+    }
+
+    async fn await_network_verdict(
+        &self,
+        route: &UiRoute,
+        pending_id: &str,
+        policy_host: String,
+        port: u16,
+        scheme: &str,
+        rx: oneshot::Receiver<CheckReply>,
+    ) -> CheckReply {
         // Race UI registration against the verdict channel so a CLI approval
         // can unblock the request even if no policy UI ever appears.
         // Preserve the existing two-timeout contract: a short wait for the
@@ -310,14 +349,14 @@ impl PolicyStore {
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
         loop {
-            if self.has_ui_for_route(&route).await {
+            if self.has_ui_for_route(route).await {
                 break;
             }
             let now = Instant::now();
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(&pending_id);
-                inner.network_futures.remove(&pending_id);
+                inner.pending.remove(pending_id);
+                inner.network_futures.remove(pending_id);
                 inner.network_verdict_cache.insert(
                     NetworkVerdictKey {
                         host: policy_host.clone(),
@@ -331,6 +370,7 @@ impl PolicyStore {
                 );
                 enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
                 tracing::warn!(%policy_host, port, "network approval blocked (no policy UI)");
+                drop(inner);
                 return CheckReply::blocked(
                     "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
                 );
@@ -338,12 +378,9 @@ impl PolicyStore {
             let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
             tokio::select! {
                 biased;
-                _ = time::sleep(sleep_dur) => {}
+                () = time::sleep(sleep_dur) => {}
                 result = &mut rx => {
-                    return match result {
-                        Ok(v) => v,
-                        Err(_) => CheckReply::denied("blocked"),
-                    };
+                    return result.unwrap_or_else(|_| CheckReply::denied("blocked"));
                 }
             }
         }
@@ -353,8 +390,8 @@ impl PolicyStore {
             Ok(Err(_)) => CheckReply::denied("blocked"),
             Err(_) => {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(&pending_id);
-                inner.network_futures.remove(&pending_id);
+                inner.pending.remove(pending_id);
+                inner.network_futures.remove(pending_id);
                 inner.network_verdict_cache.insert(
                     NetworkVerdictKey {
                         host: policy_host.clone(),
@@ -367,8 +404,9 @@ impl PolicyStore {
                     },
                 );
                 enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
-                Self::audit("timeout", Some(&policy_host), Some(port), &scheme);
+                Self::audit("timeout", Some(&policy_host), Some(port), scheme);
                 tracing::warn!(%policy_host, port, "network approval timed out");
+                drop(inner);
                 CheckReply::blocked(
                     "agent-sandbox: network approval timed out (no response from policy UI)",
                 )
@@ -406,10 +444,10 @@ mod tests {
         let identity = NetworkRequestIdentity {
             host: "example.com",
             port: 443,
-            cwd: &cwd,
-            home: &home,
-            project_root: &project_root,
-            sandbox_session_id: &sandbox_session_id,
+            cwd: cwd.as_deref(),
+            home: home.as_deref(),
+            project_root: project_root.as_deref(),
+            sandbox_session_id: sandbox_session_id.as_deref(),
         };
 
         assert!(identity.matches(&pending_network("example.com", Some("sandbox-a"))));
@@ -491,6 +529,7 @@ mod tests {
                     Pending::Network(pending_network_owned(format!("host{i}.example"))),
                 );
             }
+            drop(inner);
         }
 
         let reply = store

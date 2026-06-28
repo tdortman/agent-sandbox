@@ -8,13 +8,12 @@ use super::types::{Pending, PolicyStore};
 
 impl PolicyStore {
     pub async fn status(&self, paths: SandboxPaths) -> StatusReply {
-        let merged = self
-            .merged_for(MergeContext {
-                paths,
-                ids: ProcessIds::default(),
-                sandbox_session_id: None,
-            })
-            .await;
+        let ctx = MergeContext {
+            paths,
+            ids: ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+        let merged = self.merged_for(&ctx);
         let pending: Vec<PendingSummary> = self
             .inner
             .lock()

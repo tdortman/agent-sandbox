@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{ElevateReply, UiPush};
+use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
@@ -56,7 +56,7 @@ impl PolicyStore {
         cwd: Option<&Path>,
         home: Option<&Path>,
     ) -> ElevateReply {
-        let work_dir = cwd.unwrap_or(Path::new("/"));
+        let work_dir = cwd.unwrap_or_else(|| Path::new("/"));
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .current_dir(work_dir)
@@ -89,20 +89,20 @@ impl PolicyStore {
     pub async fn request_elevation(&self, req: ElevationRequest) -> ElevateReply {
         let ElevationRequest { argv, ctx } = req;
         let argv: Vec<String> = argv.into_iter().collect();
-        let resolved = self.resolve_context(ctx).await;
+        let resolved = self.resolve_context(&ctx);
         let wire_ids = resolved.ids;
         let cwd = resolved.paths.cwd_string();
         let home = resolved.paths.home_string();
         let project_root = resolved.paths.project_root_string();
         let sandbox_session_id = resolved.sandbox_session_id.clone();
-        if self.sudo_policy_denied(&argv, resolved.clone()).await
-            || self.session_sudo_denied(&argv, resolved.clone()).await
+        if self.sudo_policy_denied(&argv, &resolved)
+            || self.session_sudo_denied(&argv, &resolved).await
         {
             tracing::info!(argv = %argv.join(" "), "sudo deny (policy)");
             return ElevateReply::denied();
         }
-        if self.sudo_policy_allowed(&argv, resolved.clone()).await
-            || self.session_sudo_allowed(&argv, resolved).await
+        if self.sudo_policy_allowed(&argv, &resolved)
+            || self.session_sudo_allowed(&argv, &resolved).await
         {
             return self
                 .exec_elevation(
@@ -113,41 +113,24 @@ impl PolicyStore {
                 .await;
         }
 
-        let pending_id = format!("elev:{}", Uuid::now_v7().simple());
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.pending.len() >= MAX_PENDING_APPROVALS {
-                tracing::warn!(
-                    pending_count = inner.pending.len(),
-                    "elevation approval blocked (too many pending approvals)"
-                );
-                return ElevateReply {
-                    ok: true,
-                    allowed: false,
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: "agent-sandbox: too many pending approvals".into(),
-                };
-            }
-            inner.elevation_futures.insert(pending_id.clone(), tx);
-            inner.pending.insert(
-                pending_id.clone(),
-                Pending::Elevation(PendingElevation {
-                    id: pending_id.clone(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0.0, |d| d.as_secs_f64()),
-                    argv: argv.clone(),
-                    cwd: cwd.clone(),
-                    home: home.clone(),
-                    project_root: project_root.clone(),
-                    sandbox_session_id: sandbox_session_id.clone(),
-                }),
-            );
-        }
-        let detail = format!("id={pending_id} argv={argv:?}");
-        Self::audit("pending", None, None, &detail);
+        let Some((pending_id, rx)) = self
+            .create_pending_elevation_entry(
+                &argv,
+                cwd.as_deref(),
+                home.as_deref(),
+                project_root.as_deref(),
+                sandbox_session_id.as_deref(),
+            )
+            .await
+        else {
+            return ElevateReply {
+                ok: true,
+                allowed: false,
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "agent-sandbox: too many pending approvals".into(),
+            };
+        };
 
         let route = UiRoute::new(cwd.clone(), project_root.clone())
             .with_sandbox_session(sandbox_session_id.clone());
@@ -162,33 +145,102 @@ impl PolicyStore {
             },
         )
         .await;
-        if !self.has_ui_for_route(&route).await {
-            let mut spawn_uid = wire_ids.uid();
-            if spawn_uid.is_none_or(|u| u == 0)
-                && let Some(h) = &home
-            {
-                spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(Path::new(h))))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.uid.as_raw());
+        self.maybe_spawn_elevation_ui(
+            &route,
+            &wire_ids,
+            home.as_deref(),
+            cwd.as_deref(),
+            project_root.as_deref(),
+            sandbox_session_id.as_deref(),
+        )
+        .await;
+
+        self.await_elevation_verdict(&route, &pending_id, rx).await
+    }
+    async fn create_pending_elevation_entry(
+        &self,
+        argv: &[String],
+        cwd: Option<&str>,
+        home: Option<&str>,
+        project_root: Option<&str>,
+        sandbox_session_id: Option<&str>,
+    ) -> Option<(String, oneshot::Receiver<ElevateReply>)> {
+        let pending_id = format!("elev:{}", Uuid::now_v7().simple());
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.pending.len() >= MAX_PENDING_APPROVALS {
+                tracing::warn!(
+                    pending_count = inner.pending.len(),
+                    "elevation approval blocked (too many pending approvals)"
+                );
+                return None;
             }
-            let spawn = UiSpawnContext {
-                gate: UiSpawnGate {
-                    has_matching_ui: false,
-                },
-                uid: spawn_uid,
-                home: home.as_deref(),
-                cwd: cwd.as_deref(),
-                project_root: project_root.as_deref(),
-                sandbox_session_id: sandbox_session_id.as_deref(),
-            };
-            maybe_spawn_ui(
-                &self.args,
-                &mut self.inner.lock().await.ui_spawn_last,
-                &spawn,
+            inner.elevation_futures.insert(pending_id.clone(), tx);
+            inner.pending.insert(
+                pending_id.clone(),
+                Pending::Elevation(PendingElevation {
+                    id: pending_id.clone(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0.0, |d| d.as_secs_f64()),
+                    argv: argv.to_vec(),
+                    cwd: cwd.map(String::from),
+                    home: home.map(String::from),
+                    project_root: project_root.map(String::from),
+                    sandbox_session_id: sandbox_session_id.map(String::from),
+                }),
             );
         }
+        let detail = format!("id={pending_id} argv={argv:?}");
+        Self::audit("pending", None, None, &detail);
+        Some((pending_id, rx))
+    }
 
+    async fn maybe_spawn_elevation_ui(
+        &self,
+        route: &UiRoute,
+        wire_ids: &ProcessIds,
+        home: Option<&str>,
+        cwd: Option<&str>,
+        project_root: Option<&str>,
+        sandbox_session_id: Option<&str>,
+    ) {
+        if self.has_ui_for_route(route).await {
+            return;
+        }
+        let mut spawn_uid = wire_ids.uid();
+        if spawn_uid.is_none_or(|u| u == 0)
+            && let Some(h) = home
+        {
+            spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(Path::new(h))))
+                .ok()
+                .flatten()
+                .map(|u| u.uid.as_raw());
+        }
+        let spawn = UiSpawnContext {
+            gate: UiSpawnGate {
+                has_matching_ui: false,
+            },
+            uid: spawn_uid,
+            home,
+            cwd,
+            project_root,
+            sandbox_session_id,
+        };
+        maybe_spawn_ui(
+            &self.args,
+            &mut self.inner.lock().await.ui_spawn_last,
+            &spawn,
+        );
+    }
+
+    async fn await_elevation_verdict(
+        &self,
+        route: &UiRoute,
+        pending_id: &str,
+        rx: oneshot::Receiver<ElevateReply>,
+    ) -> ElevateReply {
         // Race UI registration against the verdict channel so a CLI approval
         // can unblock the request even if no policy UI ever appears.
         // Preserve the existing two-timeout contract: a short wait for the
@@ -197,14 +249,14 @@ impl PolicyStore {
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
         loop {
-            if self.has_ui_for_route(&route).await {
+            if self.has_ui_for_route(route).await {
                 break;
             }
             let now = Instant::now();
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(&pending_id);
-                inner.elevation_futures.remove(&pending_id);
+                inner.pending.remove(pending_id);
+                inner.elevation_futures.remove(pending_id);
                 drop(inner);
                 return ElevateReply {
                     ok: true,
@@ -219,12 +271,9 @@ impl PolicyStore {
             let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
             tokio::select! {
                 biased;
-                _ = time::sleep(sleep_dur) => {}
+                () = time::sleep(sleep_dur) => {}
                 result = &mut rx => {
-                    return match result {
-                        Ok(v) => v,
-                        Err(_) => ElevateReply::denied(),
-                    };
+                    return result.unwrap_or_else(|_| ElevateReply::denied());
                 }
             }
         }
@@ -234,10 +283,10 @@ impl PolicyStore {
             Ok(Err(_)) => ElevateReply::denied(),
             Err(_) => {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(&pending_id);
-                inner.elevation_futures.remove(&pending_id);
+                inner.pending.remove(pending_id);
+                inner.elevation_futures.remove(pending_id);
                 drop(inner);
-                Self::audit("timeout", None, None, &pending_id);
+                Self::audit("timeout", None, None, pending_id);
                 ElevateReply {
                     ok: true,
                     allowed: false,
