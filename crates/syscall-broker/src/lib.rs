@@ -220,8 +220,14 @@ fn scheme_for_fd(notif: &SeccompNotif, sockfd: u64, default: &str) -> String {
         .to_owned()
 }
 
+/// Parsed sockaddr: IP address and port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SockaddrParts {
+    pub ip: IpAddr,
+    pub port: u16,
+}
 #[must_use]
-pub fn parse_sockaddr(bytes: &[u8]) -> Option<(IpAddr, u16)> {
+pub fn parse_sockaddr(bytes: &[u8]) -> Option<SockaddrParts> {
     if bytes.len() < 2 {
         return None;
     }
@@ -230,13 +236,19 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Option<(IpAddr, u16)> {
         libc::AF_INET if bytes.len() >= 16 => {
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
             let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-            Some((IpAddr::V4(ip), port))
+            Some(SockaddrParts {
+                ip: IpAddr::V4(ip),
+                port,
+            })
         }
         libc::AF_INET6 if bytes.len() >= 28 => {
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
             let mut octets = [0_u8; 16];
             octets.copy_from_slice(&bytes[8..24]);
-            Some((IpAddr::V6(Ipv6Addr::from(octets)), port))
+            Some(SockaddrParts {
+                ip: IpAddr::V6(Ipv6Addr::from(octets)),
+                port,
+            })
         }
         _ => None,
     }
@@ -261,11 +273,17 @@ pub fn target_from_sendto(notif: &SeccompNotif) -> io::Result<Option<NetworkTarg
     sockaddr_target(notif, notif.data.args[4], notif.data.args[5], &scheme)
 }
 
+/// Extracted name pointer and length from a `msghdr` structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MsghdrParts {
+    name: u64,
+    name_len: u32,
+}
 /// Extract the `(name_ptr, name_len)` pair from a raw `msghdr` buffer read
 /// from the tracee. Returns `None` if the buffer is too short to contain
 /// both the pointer and the length, or if the name pointer is null.
 #[cfg(target_pointer_width = "64")]
-fn parse_msghdr_target(bytes: &[u8]) -> Option<(u64, u32)> {
+fn parse_msghdr_target(bytes: &[u8]) -> Option<MsghdrParts> {
     if bytes.len() < MSG_NAMELEN_OFFSET + 4 {
         return None;
     }
@@ -282,7 +300,7 @@ fn parse_msghdr_target(bytes: &[u8]) -> Option<(u64, u32)> {
             .try_into()
             .expect("checked length above"),
     );
-    Some((name, name_len))
+    Some(MsghdrParts { name, name_len })
 }
 
 /// Extract a network target from a `sendmsg` syscall notification.
@@ -297,11 +315,11 @@ pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<NetworkTar
         return Ok(None);
     }
     let bytes = read_tracee_bytes(notif.pid, msg, MSGHDR_LEN)?;
-    let Some((name, name_len)) = parse_msghdr_target(&bytes) else {
+    let Some(mhdr) = parse_msghdr_target(&bytes) else {
         return Ok(None);
     };
     let scheme = scheme_for_fd(notif, notif.data.args[0], "udp");
-    sockaddr_target(notif, name, u64::from(name_len), &scheme)
+    sockaddr_target(notif, mhdr.name, u64::from(mhdr.name_len), &scheme)
 }
 
 /// Extract a network target from a `sendmmsg` syscall notification.
@@ -334,14 +352,14 @@ fn sockaddr_target(
         return Ok(None);
     }
     let bytes = read_tracee_bytes(notif.pid, addr, addr_len.min(128))?;
-    let Some((ip, port)) = parse_sockaddr(&bytes) else {
+    let Some(sockaddr) = parse_sockaddr(&bytes) else {
         return Ok(None);
     };
 
     Ok(Some(NetworkTarget {
-        host: ip.to_string(),
-        connect_host: ip.to_string(),
-        port,
+        host: sockaddr.ip.to_string(),
+        connect_host: sockaddr.ip.to_string(),
+        port: sockaddr.port,
         scheme: scheme.to_string(),
     }))
 }
@@ -393,7 +411,7 @@ pub async fn check_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sockaddr, scheme_for_socket_type};
+    use super::{SockaddrParts, parse_sockaddr, scheme_for_socket_type};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -401,7 +419,10 @@ mod tests {
         let bytes = [2, 0, 0, 53, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             parse_sockaddr(&bytes),
-            Some((IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53))
+            Some(SockaddrParts {
+                ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                port: 53
+            })
         );
     }
 
@@ -413,7 +434,10 @@ mod tests {
         let bytes = [2, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             parse_sockaddr(&bytes),
-            Some((IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 0))
+            Some(SockaddrParts {
+                ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                port: 0
+            })
         );
     }
     #[test]
@@ -433,14 +457,20 @@ mod tests {
         assert_eq!(scheme_for_socket_type(libc::SOCK_SEQPACKET), "tcp");
     }
     mod msghdr_tests {
-        use super::super::parse_msghdr_target;
+        use super::super::{MsghdrParts, parse_msghdr_target};
 
         #[test]
         fn parse_msghdr_target_extracts_namelen_and_name() {
             let mut bytes = [0u8; 56];
             bytes[0..8].copy_from_slice(&0x1000_u64.to_ne_bytes());
             bytes[8..12].copy_from_slice(&16_u32.to_ne_bytes());
-            assert_eq!(parse_msghdr_target(&bytes), Some((0x1000, 16)));
+            assert_eq!(
+                parse_msghdr_target(&bytes),
+                Some(MsghdrParts {
+                    name: 0x1000,
+                    name_len: 16
+                })
+            );
         }
 
         #[test]
