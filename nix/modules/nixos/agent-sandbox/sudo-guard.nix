@@ -23,8 +23,6 @@ pkgs.writeShellApplication {
       echo "usage: sudo <command>" >&2
       exit 1
     fi
-    printf ' %q' "$@" >&2
-    echo >&2
     ${body}
   '';
 }
