@@ -43,16 +43,16 @@ async fn handle_network_push(
     let host = net.host.unwrap_or_default();
     let port = net.port.unwrap_or(0);
     let scheme = net.scheme.unwrap_or_else(|| "https".into());
-    let (url, aliases) = split_check_aliases(net.url);
+    let result = split_check_aliases(net.url);
     let url = network_prompt_with_aliases(
         &host,
         port,
         &scheme,
-        url,
-        if aliases.is_empty() {
+        result.url,
+        if result.aliases.is_empty() {
             None
         } else {
-            Some(aliases)
+            Some(result.aliases)
         },
     );
     let paths = paths.merged_with(net.cwd, net.home, net.project_root);

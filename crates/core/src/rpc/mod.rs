@@ -17,7 +17,7 @@ pub use reply::{
     StatusReply,
 };
 pub use request::{
-    ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases, attach_ui_aliases,
-    split_check_aliases, split_ui_aliases,
+    AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,
+    attach_ui_aliases, split_check_aliases, split_ui_aliases,
 };
 pub use scope::ApprovalScope;

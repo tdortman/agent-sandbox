@@ -42,10 +42,11 @@ pub use proc_context::{
     peer_cred_unix, sandbox_session_id_from_pid,
 };
 pub use rpc::{
-    ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply,
-    FilesystemMonitorReply, FilesystemScopeActionReply, PendingSummary, RegisterUiReply,
-    RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply,
-    UiPush, attach_check_aliases, attach_ui_aliases, split_check_aliases, split_ui_aliases,
+    AliasSplit, ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply,
+    FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply, PendingSummary,
+    RegisterUiReply, RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
+    SimpleOkReply, StatusReply, UiPush, attach_check_aliases, attach_ui_aliases,
+    split_check_aliases, split_ui_aliases,
 };
 pub use rpc_client::{RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

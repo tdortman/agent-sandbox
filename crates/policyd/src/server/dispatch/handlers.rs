@@ -35,7 +35,7 @@ pub async fn handle(
             url,
             ctx,
         } => {
-            let (url, aliases) = split_check_aliases(url);
+            let result = split_check_aliases(url);
             handle_check(
                 store,
                 CheckArgs {
@@ -43,8 +43,8 @@ pub async fn handle(
                     connect_host,
                     port,
                     scheme,
-                    url,
-                    aliases,
+                    url: result.url,
+                    aliases: result.aliases,
                     ctx,
                 },
             )

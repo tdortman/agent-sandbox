@@ -213,17 +213,32 @@ pub fn attach_check_aliases(url: Option<String>, aliases: &[String]) -> Option<S
     Some(format!("{base}{CHECK_ALIASES_MARKER}{payload}"))
 }
 
+/// Result of splitting attribution aliases from a check/UI URL.
+pub struct AliasSplit {
+    pub url: Option<String>,
+    pub aliases: Vec<String>,
+}
+
 /// Split attribution hints from a check URL.
 #[must_use]
-pub fn split_check_aliases(url: Option<String>) -> (Option<String>, Vec<String>) {
+pub fn split_check_aliases(url: Option<String>) -> AliasSplit {
     let Some(url) = url else {
-        return (None, Vec::new());
+        return AliasSplit {
+            url: None,
+            aliases: Vec::new(),
+        };
     };
     let Some((base, raw)) = url.split_once(CHECK_ALIASES_MARKER) else {
-        return (Some(url), Vec::new());
+        return AliasSplit {
+            url: Some(url),
+            aliases: Vec::new(),
+        };
     };
     let aliases = serde_json::from_str(raw).unwrap_or_default();
-    (Some(base.to_string()), aliases)
+    AliasSplit {
+        url: Some(base.to_string()),
+        aliases,
+    }
 }
 
 /// Attach attribution hints to a UI prompt URL.
@@ -234,7 +249,7 @@ pub fn attach_ui_aliases(url: Option<String>, aliases: &[String]) -> Option<Stri
 
 /// Split attribution hints from a UI prompt URL.
 #[must_use]
-pub fn split_ui_aliases(url: Option<String>) -> (Option<String>, Vec<String>) {
+pub fn split_ui_aliases(url: Option<String>) -> AliasSplit {
     split_check_aliases(url)
 }
 
@@ -253,12 +268,12 @@ mod tests {
 
     #[test]
     fn attach_check_aliases_roundtrip() {
-        let (url, aliases) = super::split_check_aliases(super::attach_check_aliases(
+        let result = super::split_check_aliases(super::attach_check_aliases(
             Some("tcp://104.18.32.47:443".into()),
             &["chatgpt.com".into()],
         ));
-        assert_eq!(url.as_deref(), Some("tcp://104.18.32.47:443"));
-        assert_eq!(aliases, vec!["chatgpt.com".to_string()]);
+        assert_eq!(result.url.as_deref(), Some("tcp://104.18.32.47:443"));
+        assert_eq!(result.aliases, vec!["chatgpt.com".to_string()]);
     }
 
     #[test]
