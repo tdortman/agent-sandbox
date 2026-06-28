@@ -149,49 +149,8 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     };
 
-    let env = ui_spawn_env(
-        args,
-        &user,
-        uid,
-        spawn.home.map(Path::new),
-        spawn.cwd.map(Path::new),
-        spawn.project_root.map(Path::new),
-        spawn.sandbox_session_id,
-    );
-    let ui_log_path = format!("/run/user/{uid}/agent-sandbox-ui.log");
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&ui_log_path)
-        .map_or_else(|_| Stdio::null(), Stdio::from);
-
-    let mut command = Command::new(&runuser);
-    command
-        .arg("-p")
-        .arg("-u")
-        .arg(&user.name)
-        .arg("--")
-        .arg(&cmd);
-    if let Some(cwd) = spawn.cwd {
-        command.arg("--cwd").arg(cwd);
-    }
-    if let Some(home) = spawn.home {
-        command.arg("--home").arg(home);
-    }
-    if let Some(project_root) = spawn.project_root {
-        command.arg("--project-root").arg(project_root);
-    }
-    command
-        .envs(&env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    let (mut command, ui_log_path, env) =
+        build_ui_spawn_command_env(&runuser, args, &cmd, &user, uid, spawn);
 
     let spawn_result = command.spawn();
     let Ok(mut child) = spawn_result else {
@@ -244,4 +203,58 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
             .stderr(Stdio::null())
             .spawn();
     }
+}
+fn build_ui_spawn_command_env(
+    runuser: &str,
+    args: &PolicydArgs,
+    cmd: &str,
+    user: &User,
+    uid: u32,
+    spawn: &UiSpawnContext<'_>,
+) -> (std::process::Command, String, HashMap<String, String>) {
+    let env = ui_spawn_env(
+        args,
+        user,
+        uid,
+        spawn.home.map(Path::new),
+        spawn.cwd.map(Path::new),
+        spawn.project_root.map(Path::new),
+        spawn.sandbox_session_id,
+    );
+    let ui_log_path = format!("/run/user/{uid}/agent-sandbox-ui.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ui_log_path)
+        .map_or_else(|_| Stdio::null(), Stdio::from);
+
+    let mut command = std::process::Command::new(runuser);
+    command
+        .arg("-p")
+        .arg("-u")
+        .arg(&user.name)
+        .arg("--")
+        .arg(cmd);
+    if let Some(cwd) = spawn.cwd {
+        command.arg("--cwd").arg(cwd);
+    }
+    if let Some(home) = spawn.home {
+        command.arg("--home").arg(home);
+    }
+    if let Some(project_root) = spawn.project_root {
+        command.arg("--project-root").arg(project_root);
+    }
+    command
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    (command, ui_log_path, env)
 }
