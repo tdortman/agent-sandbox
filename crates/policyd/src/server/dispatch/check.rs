@@ -11,7 +11,7 @@ use crate::store::PolicyStore;
 use crate::wire::{MergeContext, NetworkCheckRequest};
 
 /// Inputs for `handle_check`, grouped to keep the call signature small.
-pub(crate) struct CheckArgs {
+pub struct CheckArgs {
     pub host: Option<String>,
     pub connect_host: Option<String>,
     pub port: Option<u16>,
@@ -54,7 +54,7 @@ fn prompt_url(
     }
 }
 
-pub(crate) async fn handle_check(
+pub async fn handle_check(
     store: &Arc<PolicyStore>,
     args: CheckArgs,
 ) -> Result<RpcReply, PolicydError> {

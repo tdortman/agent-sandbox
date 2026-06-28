@@ -8,7 +8,7 @@ use super::super::types::{
     Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DecisionAction {
+pub enum DecisionAction {
     Approve,
     Deny,
 }
@@ -22,7 +22,7 @@ impl DecisionAction {
     }
 }
 
-pub(crate) struct TakenPendingDecision {
+pub struct TakenPendingDecision {
     pub pending: Pending,
     pub wire: ScopeWire,
     pub scope: ApprovalScope,

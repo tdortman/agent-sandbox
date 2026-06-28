@@ -5,7 +5,7 @@ use agent_sandbox_core::RpcRequest;
 use crate::error::PolicydError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SocketRole {
+pub enum SocketRole {
     Host,
     Sandbox,
     UiFd,

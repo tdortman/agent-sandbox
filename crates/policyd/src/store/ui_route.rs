@@ -3,7 +3,7 @@
 use super::types::UiSessionContext;
 
 #[derive(Debug, Clone)]
-pub(crate) struct UiRoute {
+pub struct UiRoute {
     pub cwd: Option<String>,
     pub project_root: Option<String>,
     pub sandbox_session_id: Option<String>,
@@ -40,7 +40,7 @@ fn project_or_cwd_matches(ui: &UiSessionContext, route: &UiRoute) -> bool {
     false
 }
 
-pub(crate) fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
+pub fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
     if let Some(route_session) = &route.sandbox_session_id {
         return ui
             .sandbox_session_id

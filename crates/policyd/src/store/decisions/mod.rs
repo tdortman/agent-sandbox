@@ -5,4 +5,4 @@ mod approve_host;
 mod deny;
 mod wire;
 
-pub(crate) use wire::DecisionAction;
+pub use wire::DecisionAction;

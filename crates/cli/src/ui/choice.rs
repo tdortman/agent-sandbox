@@ -7,12 +7,12 @@ use tracing::info;
 use super::error::UiCliError;
 use super::options::{PromptAction, ScopeOption};
 
-pub(crate) fn format_elevation_title(argv: &[String], _cwd: &str) -> String {
+pub fn format_elevation_title(argv: &[String], _cwd: &str) -> String {
     let cmd = argv.join(" ");
     format!("agent-sandbox: sudo {cmd}")
 }
 
-pub(crate) async fn resolve_choice(
+pub async fn resolve_choice(
     socket: &PathBuf,
     paths: &SandboxPaths,
     session_id: Option<&str>,
@@ -68,7 +68,7 @@ pub(crate) async fn resolve_choice(
 /// Send a one-time deny to policyd for a prompt the user cancelled so the
 /// agent is unblocked with EACCES instead of waiting for the approval
 /// timeout. The denial is in-memory only: no rule is saved.
-pub(crate) async fn deny_cancellation(
+pub async fn deny_cancellation(
     socket: &PathBuf,
     paths: &SandboxPaths,
     session_id: Option<&str>,

@@ -1,7 +1,7 @@
 //! Route incoming RPC requests to store methods.
 
 mod auth;
-pub(crate) use auth::SocketRole;
+pub use auth::SocketRole;
 mod check;
 mod context;
 mod handlers;

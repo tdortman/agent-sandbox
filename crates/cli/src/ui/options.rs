@@ -1,9 +1,9 @@
 use agent_sandbox_core::{ApprovalScope, ApprovalTarget, SudoRule};
 
-pub(crate) const ACTION_OPTIONS: &[&str] = &["Allow", "Deny"];
+pub const ACTION_OPTIONS: &[&str] = &["Allow", "Deny"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PromptAction {
+pub enum PromptAction {
     Allow,
     Deny,
 }
@@ -26,13 +26,13 @@ impl PromptAction {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ScopeOption {
+pub struct ScopeOption {
     pub(crate) label: String,
     pub(crate) scope: ApprovalScope,
     pub(crate) target: Option<ApprovalTarget>,
 }
 
-pub(crate) fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
+pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
     let mut options = vec![ScopeOption {
         label: "Once".into(),
         scope: ApprovalScope::Once,
@@ -59,7 +59,7 @@ pub(crate) fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
 }
 
 /// Command prefix options for a single scope (step 3 of 3-step flow).
-pub(crate) fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOption> {
+pub fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOption> {
     let prefixes = SudoRule::approval_prefixes(argv);
     let mut options = Vec::with_capacity(prefixes.len());
     for argv in &prefixes {

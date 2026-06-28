@@ -36,7 +36,7 @@ impl FileAccess {
 
     /// Whether this access level covers the requested access.
     #[must_use]
-    pub fn covers(self, requested: FileAccess) -> bool {
+    pub fn covers(self, requested: Self) -> bool {
         match self {
             Self::All => true,
             Self::ReadWrite => matches!(requested, Self::Read | Self::Write | Self::ReadWrite),
@@ -46,7 +46,7 @@ impl FileAccess {
 
     /// Smallest policy access that covers both access levels.
     #[must_use]
-    pub fn union(self, other: FileAccess) -> Self {
+    pub fn union(self, other: Self) -> Self {
         if self.covers(other) {
             self
         } else if other.covers(self) {

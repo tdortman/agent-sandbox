@@ -12,7 +12,7 @@ use crate::server::peer::ClientPeer;
 use crate::store::PolicyStore;
 use crate::wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire};
 
-pub(crate) async fn handle(
+pub async fn handle(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,

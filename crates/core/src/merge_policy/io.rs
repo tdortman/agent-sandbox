@@ -208,7 +208,7 @@ pub fn atomic_write_policy(
     Ok(())
 }
 
-pub(crate) fn policy_json(policy: &Policy) -> serde_json::Result<String> {
+pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     let mut json = String::new();
     json.push_str("{\n    \"network\": {\n");
     push_rules(&mut json, "allow", &policy.network.allow)?;

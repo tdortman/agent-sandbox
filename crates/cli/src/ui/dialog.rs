@@ -9,7 +9,7 @@ use tracing::info;
 /// Mutex serialising graphical prompts: only one prompt UI at a time.
 static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
-pub(crate) fn pick_option(title: &str, options: &[&str]) -> Option<String> {
+pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
     if prefer_graphical() {
         if let Some(c) = graphical_select(title, options) {
             return Some(c);

@@ -13,37 +13,37 @@ use tokio::sync::{Mutex, oneshot};
 
 /// Hard cap on the number of pending approval requests held in memory.
 /// Beyond this cap new prompts are blocked instead of being added.
-pub(crate) const MAX_PENDING_APPROVALS: usize = 512;
+pub const MAX_PENDING_APPROVALS: usize = 512;
 
 /// Hard cap on the number of waiters that may join a single pending request.
 /// Beyond this cap extra waiters are blocked instead of being queued.
-pub(crate) const MAX_WAITERS_PER_PENDING: usize = 64;
+pub const MAX_WAITERS_PER_PENDING: usize = 64;
 
 /// Hard cap on the size of the verdict caches. Older entries are evicted
 /// (by `time` for the verdict cache, by `Instant` for the spawn throttle
 /// map) when the cap is exceeded.
-pub(crate) const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
+pub const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
 
 /// Cap on the number of static filesystem allow rules accepted by fsmon.
-pub(crate) const MAX_STATIC_ALLOW_RULES: usize = 4096;
+pub const MAX_STATIC_ALLOW_RULES: usize = 4096;
 
 /// Key for the network verdict cache: hostname and port.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub(crate) struct NetworkVerdictKey {
+pub struct NetworkVerdictKey {
     pub host: String,
     pub port: u16,
 }
 
 /// Key for the filesystem verdict cache: path and access type.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub(crate) struct FilesystemVerdictKey {
+pub struct FilesystemVerdictKey {
     pub path: String,
     pub access: FileAccess,
 }
 
 /// A cached verdict: whether it was allowed, from which source, and when.
 #[derive(Debug, Clone)]
-pub(crate) struct VerdictEntry {
+pub struct VerdictEntry {
     pub allowed: bool,
     pub source: String,
     pub time: Instant,
@@ -51,7 +51,7 @@ pub(crate) struct VerdictEntry {
 
 /// Evict the oldest entries (by `VerdictEntry.time`) from a verdict cache
 /// until the map is within the global cap.
-pub(crate) fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
+pub fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
     map: &mut HashMap<K, VerdictEntry>,
 ) {
     while map.len() > MAX_VERDICT_CACHE_ENTRIES {
@@ -66,7 +66,7 @@ pub(crate) fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
     }
 }
 
-pub(crate) static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+pub static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct PolicydArgs {
@@ -206,7 +206,7 @@ impl Pending {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct UiSessionContext {
+pub struct UiSessionContext {
     pub cwd: Option<String>,
     pub home: Option<String>,
     pub project_root: Option<String>,
@@ -218,7 +218,7 @@ pub struct UiClientHandle {
     pub(crate) writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
 }
 
-pub(crate) struct UiClient {
+pub struct UiClient {
     pub session_id: String,
     pub writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
 }
@@ -228,7 +228,7 @@ pub struct PolicyStore {
     pub(crate) inner: Mutex<StoreInner>,
 }
 
-pub(crate) struct StoreInner {
+pub struct StoreInner {
     pub session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
     pub once_allow: HashSet<NetworkRuleKey>,
     pub pending: HashMap<String, Pending>,
