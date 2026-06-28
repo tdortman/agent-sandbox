@@ -33,12 +33,15 @@ pub fn ui_spawn_env(
     args: &PolicydArgs,
     user: &User,
     uid: u32,
-    home: Option<&str>,
-    cwd: Option<&str>,
-    project_root: Option<&str>,
+    home: Option<&Path>,
+    cwd: Option<&Path>,
+    project_root: Option<&Path>,
     sandbox_session_id: Option<&str>,
 ) -> HashMap<String, String> {
-    let home_dir = home.map_or_else(|| user.dir.to_string_lossy().into_owned(), str::to_string);
+    let home_dir = home.map_or_else(
+        || user.dir.to_string_lossy().into_owned(),
+        |h| h.to_string_lossy().into_owned(),
+    );
     let mut env = HashMap::from([
         ("HOME".into(), home_dir.clone()),
         ("USER".into(), user.name.clone()),
@@ -49,15 +52,21 @@ pub fn ui_spawn_env(
         ),
     ]);
     if let Some(home) = home {
-        env.insert("AGENT_SANDBOX_HOME".into(), home.to_string());
+        env.insert(
+            "AGENT_SANDBOX_HOME".into(),
+            home.to_string_lossy().into_owned(),
+        );
     }
     if let Some(cwd) = cwd {
-        env.insert("AGENT_SANDBOX_CWD".into(), cwd.to_string());
+        env.insert(
+            "AGENT_SANDBOX_CWD".into(),
+            cwd.to_string_lossy().into_owned(),
+        );
     }
     if let Some(project_root) = project_root {
         env.insert(
             "AGENT_SANDBOX_PROJECT_ROOT".into(),
-            project_root.to_string(),
+            project_root.to_string_lossy().into_owned(),
         );
     }
     if let Some(sandbox_session_id) = sandbox_session_id {
@@ -79,7 +88,7 @@ pub fn ui_spawn_env(
             env.insert(key.to_string(), val);
         }
     }
-    env.extend(graphical_session_env(uid, Some(&home_dir)));
+    env.extend(graphical_session_env(uid, Some(Path::new(&home_dir))));
     env.insert("AGENT_SANDBOX_UI_PREFER_GRAPHICAL".into(), "1".into());
 
     let profile_bin = format!("/etc/profiles/per-user/{}/bin", user.name);
@@ -143,9 +152,9 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         args,
         &user,
         uid,
-        spawn.home,
-        spawn.cwd,
-        spawn.project_root,
+        spawn.home.map(Path::new),
+        spawn.cwd.map(Path::new),
+        spawn.project_root.map(Path::new),
         spawn.sandbox_session_id,
     );
     let ui_log_path = format!("/run/user/{uid}/agent-sandbox-ui.log");

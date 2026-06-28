@@ -62,14 +62,14 @@ fn remove_filesystem_rule(rules: &mut Vec<FilesystemRule>, rule_path: &str, acce
     rules.retain(|rule| filesystem_path_key(&rule.path) != key || rule.access != access);
 }
 
-fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&str>) -> FilesystemSortKey {
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemSortKey {
     FilesystemSortKey::new(
         contract_home_path(&filesystem_path_key(&rule.path), home),
         rule.access,
     )
 }
 
-fn sort_filesystem_rules(rules: &mut [FilesystemRule], home: Option<&str>) {
+fn sort_filesystem_rules(rules: &mut [FilesystemRule], home: Option<&Path>) {
     rules.sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
 }
 
@@ -80,10 +80,10 @@ impl PolicyStore {
         port: u16,
         label: &str,
         allow_rule: bool,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
-        let mut current = load_policy(path, home);
+        let mut current = load_policy(path, home, None);
         let host_norm = normalize_host(host);
         let key = network_sort_key(&host_norm, port);
         let mut allow: BTreeMap<NetworkSortKey, NetworkRule> = current
@@ -109,7 +109,7 @@ impl PolicyStore {
 
         current.network.allow = allow.into_values().collect();
         current.network.deny = deny.into_values().collect();
-        atomic_write_policy(path, &current, home, owner_uid)
+        atomic_write_policy(path, &current, home, owner_uid, None)
     }
 
     pub(crate) fn persist_network_allow(
@@ -117,7 +117,7 @@ impl PolicyStore {
         host: &str,
         port: u16,
         label: &str,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         Self::persist_network_rule(path, host, port, label, true, home, owner_uid)
@@ -128,7 +128,7 @@ impl PolicyStore {
         host: &str,
         port: u16,
         label: &str,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         Self::persist_network_rule(path, host, port, label, false, home, owner_uid)
@@ -139,10 +139,10 @@ impl PolicyStore {
         argv: &[String],
         label: &str,
         allow_rule: bool,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
-        let mut current = load_policy(path, home);
+        let mut current = load_policy(path, home, None);
         let key: Vec<String> = argv.to_vec();
         let mut allow: BTreeMap<Vec<String>, SudoRule> = current
             .sudo
@@ -167,14 +167,14 @@ impl PolicyStore {
 
         current.sudo.allow = allow.into_values().collect();
         current.sudo.deny = deny.into_values().collect();
-        atomic_write_policy(path, &current, home, owner_uid)
+        atomic_write_policy(path, &current, home, owner_uid, None)
     }
 
     pub(crate) fn persist_sudo_allow(
         path: &Path,
         argv: &[String],
         label: &str,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         Self::persist_sudo_rule(path, argv, label, true, home, owner_uid)
@@ -184,7 +184,7 @@ impl PolicyStore {
         path: &Path,
         argv: &[String],
         label: &str,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         Self::persist_sudo_rule(path, argv, label, false, home, owner_uid)
@@ -196,10 +196,10 @@ impl PolicyStore {
         access: FileAccess,
         label: &str,
         allow_rule: bool,
-        home: Option<&str>,
+        home: Option<&Path>,
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
-        let mut policy = load_policy(path, home);
+        let mut policy = load_policy(path, home, None);
         if allow_rule {
             upsert_filesystem_rule(&mut policy.filesystem.allow, rule_path, access, label);
             remove_filesystem_rule(&mut policy.filesystem.deny, rule_path, access);
@@ -209,14 +209,14 @@ impl PolicyStore {
         }
         sort_filesystem_rules(&mut policy.filesystem.allow, home);
         sort_filesystem_rules(&mut policy.filesystem.deny, home);
-        atomic_write_policy(path, &policy, home, owner_uid)
+        atomic_write_policy(path, &policy, home, owner_uid, None)
     }
 
     /// Return the on-disk path the project scope writes to. The path lives
-    /// under `home/.config/agent-sandbox/projects/<encoded>/policy.json` so
+    /// under `<project_root>/.agent-sandbox/policy.json` so
     /// the sandboxed process cannot tamper with its own persistent approvals.
-    pub(crate) fn project_policy_path_display(home: &str, project_root: &str) -> Option<String> {
-        trusted_project_policy_path(Path::new(home), Path::new(project_root))
+    pub(crate) fn project_policy_path_display(project_root: &Path) -> Option<String> {
+        trusted_project_policy_path(project_root)
             .ok()
             .map(|path| path.display().to_string())
     }

@@ -131,10 +131,11 @@ impl PolicyStore {
                 _ => self.has_ui_for_route(&route).await,
             };
             if !has_ui {
-                let spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(p.home()))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.uid.as_raw());
+                let spawn_uid =
+                    nix::unistd::User::from_name(&Self::user_for_home(p.home().map(Path::new)))
+                        .ok()
+                        .flatten()
+                        .map(|u| u.uid.as_raw());
                 let spawn = UiSpawnContext {
                     gate: UiSpawnGate {
                         has_matching_ui: false,

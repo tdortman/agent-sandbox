@@ -1,4 +1,5 @@
 //! Policy store: filesystem scope application.
+use std::path::Path;
 
 use agent_sandbox_core::{
     ApprovalScope, FilesystemRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget,
@@ -84,7 +85,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         true,
-                        Some(&home),
+                        Some(Path::new(&home)),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_filesystem_rule(
@@ -93,7 +94,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         false,
-                        Some(&home),
+                        Some(Path::new(&home)),
                         owner_uid,
                     ),
                 };
@@ -112,7 +113,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         true,
-                        home.as_deref(),
+                        home.as_deref().map(Path::new),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_filesystem_rule(
@@ -121,7 +122,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         false,
-                        home.as_deref(),
+                        home.as_deref().map(Path::new),
                         owner_uid,
                     ),
                 };

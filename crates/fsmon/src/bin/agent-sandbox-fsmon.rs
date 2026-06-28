@@ -574,7 +574,10 @@ fn main() {
                 let access = mask_to_access(meta.mask, meta.fd, meta.pid);
 
                 // Auto-allow events matching a static allow rule.
-                if static_allow.iter().any(|rule| rule.matches(&path, access)) {
+                if static_allow
+                    .iter()
+                    .any(|rule| rule.matches(Path::new(&path), access, None))
+                {
                     respond(fan_fd, meta.fd, FAN_ALLOW);
                     offset += event_len;
                     continue;

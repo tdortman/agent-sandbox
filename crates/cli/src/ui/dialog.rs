@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
@@ -32,10 +33,7 @@ fn graphical_select(title: &str, options: &[&str]) -> Option<String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     let uid = nix::unistd::getuid().as_raw();
     if uid > 0 {
-        env.extend(graphical_session_env(
-            uid,
-            env.get("HOME").map(String::as_str),
-        ));
+        env.extend(graphical_session_env(uid, env.get("HOME").map(Path::new)));
     }
 
     match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {

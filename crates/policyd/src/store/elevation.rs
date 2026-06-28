@@ -16,11 +16,12 @@ use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore
 use super::ui_route::UiRoute;
 
 impl PolicyStore {
-    pub(crate) fn user_for_home(home: Option<&str>) -> String {
+    pub(crate) fn user_for_home(home: Option<&Path>) -> String {
         let Some(home) = home else {
             return "root".into();
         };
         if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+            let home_str = home.to_string_lossy();
             for line in passwd.lines() {
                 let mut parts = line.splitn(7, ':');
                 let _ = parts.next();
@@ -29,7 +30,7 @@ impl PolicyStore {
                 let _ = parts.next();
                 let _ = parts.next();
                 let dir = parts.next().unwrap_or("");
-                if dir == home
+                if dir == home_str.as_ref()
                     && let Some(user) = line.split(':').next()
                     && !user.is_empty()
                 {
@@ -37,15 +38,14 @@ impl PolicyStore {
                 }
             }
         }
-        Path::new(home)
-            .file_name()
+        home.file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("nobody")
             .to_string()
     }
 
-    pub(crate) fn elevation_env(home: Option<&str>) -> HashMap<String, String> {
+    pub(crate) fn elevation_env(home: Option<&Path>) -> HashMap<String, String> {
         let user = Self::user_for_home(home);
         HashMap::from([("AGENT_SANDBOX_ELEVATE_USER".into(), user)])
     }
@@ -53,10 +53,10 @@ impl PolicyStore {
     pub(crate) async fn exec_elevation(
         &self,
         argv: &[String],
-        cwd: Option<&str>,
-        home: Option<&str>,
+        cwd: Option<&Path>,
+        home: Option<&Path>,
     ) -> ElevateReply {
-        let work_dir = cwd.unwrap_or("/");
+        let work_dir = cwd.unwrap_or(Path::new("/"));
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .current_dir(work_dir)
@@ -105,7 +105,11 @@ impl PolicyStore {
             || self.session_sudo_allowed(&argv, resolved).await
         {
             return self
-                .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
+                .exec_elevation(
+                    &argv,
+                    cwd.as_deref().map(Path::new),
+                    home.as_deref().map(Path::new),
+                )
                 .await;
         }
 
@@ -163,7 +167,7 @@ impl PolicyStore {
             if spawn_uid.is_none_or(|u| u == 0)
                 && let Some(h) = &home
             {
-                spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
+                spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(Path::new(h))))
                     .ok()
                     .flatten()
                     .map(|u| u.uid.as_raw());

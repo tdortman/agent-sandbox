@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, FileAccess, UiPush, approval_host_patterns,
@@ -276,7 +276,7 @@ fn filesystem_target_options(
     home: Option<&str>,
     scope: ApprovalScope,
 ) -> Vec<ScopeOption> {
-    let levels = filesystem_approval_paths(path, home);
+    let levels = filesystem_approval_paths(Path::new(path), home.map(Path::new));
     let mut options = Vec::with_capacity(levels.len());
     for level in levels {
         options.push(ScopeOption {

@@ -1,4 +1,5 @@
 //! Policy store: sudo scope application.
+use std::path::Path;
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 
@@ -71,14 +72,14 @@ impl PolicyStore {
                         &policy_path,
                         &argv,
                         scope_label,
-                        Some(&home),
+                        Some(Path::new(&home)),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_sudo_deny(
                         &policy_path,
                         &argv,
                         scope_label,
-                        Some(&home),
+                        Some(Path::new(&home)),
                         owner_uid,
                     ),
                 };
@@ -95,14 +96,14 @@ impl PolicyStore {
                         &policy_path,
                         &argv,
                         scope_label,
-                        home.as_deref(),
+                        home.as_deref().map(Path::new),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_sudo_deny(
                         &policy_path,
                         &argv,
                         scope_label,
-                        home.as_deref(),
+                        home.as_deref().map(Path::new),
                         owner_uid,
                     ),
                 };

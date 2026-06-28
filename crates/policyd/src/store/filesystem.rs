@@ -262,10 +262,11 @@ impl PolicyStore {
                 if spawn_uid.is_none_or(|u| u == 0)
                     && let Some(h) = &home
                 {
-                    spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
-                        .ok()
-                        .flatten()
-                        .map(|u| u.uid.as_raw());
+                    spawn_uid =
+                        nix::unistd::User::from_name(&Self::user_for_home(Some(Path::new(h))))
+                            .ok()
+                            .flatten()
+                            .map(|u| u.uid.as_raw());
                 }
                 let spawn = UiSpawnContext {
                     gate: UiSpawnGate {

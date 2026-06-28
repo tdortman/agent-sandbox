@@ -1,4 +1,5 @@
 //! Apply pending network or elevation decisions.
+use std::path::Path;
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
@@ -252,8 +253,14 @@ impl PolicyStore {
         let elevation = self
             .exec_elevation(
                 &argv,
-                elev.cwd.as_deref().or(scope_wire.paths.cwd()),
-                elev.home.as_deref().or(scope_wire.paths.home()),
+                elev.cwd
+                    .as_deref()
+                    .or(scope_wire.paths.cwd())
+                    .map(Path::new),
+                elev.home
+                    .as_deref()
+                    .or(scope_wire.paths.home())
+                    .map(Path::new),
             )
             .await;
         self.finish_elevation(&pending_id, elevation).await;
@@ -392,7 +399,9 @@ impl PolicyStore {
             return Ok(path);
         }
 
-        if FilesystemRule::new(path.clone(), FileAccess::Read, "").path_matches(pending_path) {
+        if FilesystemRule::new(path.clone(), FileAccess::Read, "")
+            .path_matches(Path::new(pending_path), None)
+        {
             return Ok(path);
         }
 

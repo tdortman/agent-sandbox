@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 use super::io::policy_json;
 use super::*;
@@ -45,9 +46,9 @@ fn atomic_write_preserves_symlink() {
     std::os::unix::fs::symlink(&real_policy, &link).expect("symlink");
     let mut data = empty_policy();
     data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
-    atomic_write_policy(&link, &data, None, None).expect("write policy");
+    atomic_write_policy(&link, &data, None, None, None).expect("write policy");
     assert!(link.is_symlink());
-    let loaded = load_policy(&real_policy, None);
+    let loaded = load_policy(&real_policy, None, None);
     assert_eq!(loaded.network.allow[0].host, "example.com");
 }
 
@@ -64,10 +65,10 @@ fn atomic_write_preserves_relative_symlink_to_missing_target() {
     let mut data = empty_policy();
     data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
 
-    atomic_write_policy(&link, &data, None, None).expect("write policy");
+    atomic_write_policy(&link, &data, None, None, None).expect("write policy");
 
     assert!(link.is_symlink());
-    let loaded = load_policy(&real_dir.join("policy.json"), None);
+    let loaded = load_policy(&real_dir.join("policy.json"), None, None);
     assert_eq!(loaded.network.allow[0].host, "example.com");
 }
 
@@ -82,6 +83,7 @@ fn atomic_write_chowns_to_owner() {
         &empty_policy(),
         None,
         Some(nix::unistd::getuid().as_raw()),
+        None,
     )
     .expect("write policy");
     let uid = nix::unistd::getuid().as_raw();
@@ -114,7 +116,7 @@ fn atomic_write_keeps_each_rule_on_one_line() {
         "restart nginx",
     )];
 
-    atomic_write_policy(&policy_path, &policy, None, None).expect("write policy");
+    atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
     let json = fs::read_to_string(policy_path).expect("read file");
 
     assert_eq!(
@@ -254,13 +256,13 @@ fn filesystem_deny_wins_over_allow_at_eval_time() {
         .filesystem
         .deny
         .iter()
-        .any(|r| r.matches("/tmp", FileAccess::Read));
+        .any(|r| r.matches(Path::new("/tmp"), FileAccess::Read, None));
     assert!(denied);
     let allowed = merged
         .filesystem
         .allow
         .iter()
-        .any(|r| r.matches("/tmp", FileAccess::Read));
+        .any(|r| r.matches(Path::new("/tmp"), FileAccess::Read, None));
     assert!(allowed);
 }
 

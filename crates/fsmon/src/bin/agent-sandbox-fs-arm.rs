@@ -42,27 +42,32 @@ struct Cli {
     command: Vec<OsString>,
 }
 
-fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&str>) {
+fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&Path>) {
     let Some(home) = home else {
         return;
     };
+    let home = home.to_string_lossy();
     for rule in static_allow {
         if let Some(rest) = rule.path.strip_prefix("~/") {
             rule.path = format!("{}/{}", home.trim_end_matches('/'), rest);
         } else if rule.path == "~" {
-            home.clone_into(&mut rule.path);
+            rule.path = home.to_string();
         }
     }
 }
 
-fn add_project_static_allow(static_allow: &mut Vec<FilesystemRule>, project_root: Option<&str>) {
-    if let Some(project_root) = project_root.map(str::trim).filter(|path| !path.is_empty()) {
-        static_allow.push(FilesystemRule::new(
-            project_root,
-            FileAccess::All,
-            "project",
-        ));
+fn add_project_static_allow(static_allow: &mut Vec<FilesystemRule>, project_root: Option<&Path>) {
+    let Some(project_root) = project_root else {
+        return;
+    };
+    if project_root.as_os_str().is_empty() {
+        return;
     }
+    static_allow.push(FilesystemRule::new(
+        project_root.to_string_lossy().into_owned(),
+        FileAccess::All,
+        "project",
+    ));
 }
 
 fn main() {
@@ -92,8 +97,8 @@ fn main() {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    expand_home_static_allow(&mut static_allow, home.as_deref());
-    add_project_static_allow(&mut static_allow, project_root.as_deref());
+    expand_home_static_allow(&mut static_allow, home.as_deref().map(Path::new));
+    add_project_static_allow(&mut static_allow, project_root.as_deref().map(Path::new));
 
     // Connect to policyd and request monitor startup.
     let reply = rpc_client::start_monitor(Path::new(&socket_path), ctx, static_allow)

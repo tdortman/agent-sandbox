@@ -1,6 +1,11 @@
 //! On-disk policy document (`network` / `sudo` / `filesystem` allow and deny rules).
+//!
+//! Paths can be absolute (`/foo`), home-relative (`~/foo`), or project-relative (`./foo`).
+//! Paths containing `*` or `?` are treated as glob patterns compiled with [`globset`].
 
+use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 use crate::hosts::NetworkRuleKey;
 
@@ -84,6 +89,30 @@ impl FilesystemRuleKey {
     }
 }
 
+/// Compiled path matching strategy: literal prefix or glob pattern.
+enum CompiledPath {
+    /// Literal path used for exact/descendant prefix matching.
+    Prefix(String),
+    /// Compiled glob matcher.
+    Glob(GlobMatcher),
+}
+
+impl CompiledPath {
+    /// Compile a policy path into a matcher.
+    ///
+    /// If the path (after `./` expansion) contains `*` or `?`, it becomes a `Glob`.
+    /// Otherwise it is treated as a literal `Prefix` path.
+    fn compile(path: &str, project_root: Option<&Path>) -> Result<Self, globset::Error> {
+        let expanded = expand_policy_path(path, None, project_root);
+        if expanded.contains('*') || expanded.contains('?') {
+            let glob = Glob::new(&expanded)?.compile_matcher();
+            Ok(Self::Glob(glob))
+        } else {
+            Ok(Self::Prefix(expanded))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FilesystemSortKey {
     pub path: String,
@@ -99,8 +128,7 @@ impl FilesystemSortKey {
         }
     }
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FilesystemRule {
     pub path: String,
     pub access: FileAccess,
@@ -118,26 +146,33 @@ impl FilesystemRule {
         }
     }
 
-    /// Whether this rule's path matches the requested path (exact or descendant).
-    #[must_use]
-    pub fn path_matches(&self, requested: &str) -> bool {
-        let rule_path = normalize_rule_path(&self.path);
-        let requested = normalize_rule_path(requested);
-        if rule_path == "/" {
-            return requested.starts_with('/');
+    /// Whether this rule's path matches the requested path (exact, descendant, or glob).
+    pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
+        // ponytail: recompile on every match. globset compile is ~10us; add a sidecar
+        // cache if profiling shows the matcher is hot. Replaces the previous OnceLock
+        // field, which forced manual PartialEq/Eq impls.
+        let compiled = CompiledPath::compile(&self.path, project_root).expect("valid glob pattern");
+        match compiled {
+            CompiledPath::Prefix(rule_path) => {
+                let requested = normalize_rule_path(&requested.to_string_lossy());
+                if rule_path == "/" {
+                    return requested.starts_with('/');
+                }
+                if rule_path == requested {
+                    return true;
+                }
+                requested
+                    .strip_prefix(rule_path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            }
+            CompiledPath::Glob(matcher) => matcher.is_match(requested),
         }
-        if rule_path == requested {
-            return true;
-        }
-        requested
-            .strip_prefix(&rule_path)
-            .is_some_and(|rest| rest.starts_with('/'))
     }
 
     /// Whether this rule matches the given path and access request.
     #[must_use]
-    pub fn matches(&self, path: &str, access: FileAccess) -> bool {
-        self.path_matches(path) && self.access.covers(access)
+    pub fn matches(&self, path: &Path, access: FileAccess, project_root: Option<&Path>) -> bool {
+        self.path_matches(path, project_root) && self.access.covers(access)
     }
 }
 
@@ -153,19 +188,19 @@ fn normalize_rule_path(path: &str) -> String {
 /// Convert an absolute path under `home` to the `~/...` shorthand.
 /// Paths outside `home` are returned unchanged.  `home` itself maps to `~`.
 #[must_use]
-pub fn contract_home_path(path: &str, home: Option<&str>) -> String {
+pub fn contract_home_path(path: &str, home: Option<&Path>) -> String {
     let Some(home) = home else {
         return path.to_string();
     };
     let trimmed = path.trim_end_matches('/');
-    let home_trimmed = home.trim_end_matches('/');
+    let home_trimmed = home.to_string_lossy().trim_end_matches('/').to_string();
     if trimmed.is_empty() || home_trimmed.is_empty() {
         return path.to_string();
     }
     if trimmed == home_trimmed {
         return "~".to_string();
     }
-    if let Some(rest) = trimmed.strip_prefix(home_trimmed)
+    if let Some(rest) = trimmed.strip_prefix(&home_trimmed)
         && let Some(stripped) = rest.strip_prefix('/')
     {
         return format!("~/{stripped}");
@@ -177,18 +212,47 @@ pub fn contract_home_path(path: &str, home: Option<&str>) -> String {
 /// start with `~/` are returned unchanged.  When `home` is `None`, `~/` paths
 /// are kept as-is (matching will then fail closed).
 #[must_use]
-pub fn expand_home_path(path: &str, home: Option<&str>) -> String {
+pub fn expand_home_path(path: &str, home: Option<&Path>) -> String {
     let Some(home) = home else {
         return path.to_string();
     };
+    let home_str = home.to_string_lossy();
     if path == "~" {
-        return home.trim_end_matches('/').to_string();
+        return home_str.trim_end_matches('/').to_string();
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        let base = home.trim_end_matches('/');
+        let base = home_str.trim_end_matches('/');
         return format!("{base}/{rest}");
     }
     path.to_string()
+}
+
+/// Expand a `./...` path to an absolute path under `project_root`.
+///
+/// Paths that do not start with `./` are returned unchanged. When `project_root`
+/// is `None`, `./` paths are kept as-is (matching will then fail closed).
+#[must_use]
+pub fn expand_project_relative(path: &str, project_root: &Path) -> String {
+    let pr = project_root.to_string_lossy();
+    if path == "." {
+        return pr.trim_end_matches('/').to_string();
+    }
+    if let Some(rest) = path.strip_prefix("./") {
+        let base = pr.trim_end_matches('/');
+        return format!("{base}/{rest}");
+    }
+    path.to_string()
+}
+
+/// Apply home (`~/`) then project-relative (`./`) expansion in order.
+#[must_use]
+pub fn expand_policy_path(path: &str, home: Option<&Path>, project_root: Option<&Path>) -> String {
+    let expanded = expand_home_path(path, home);
+    if let Some(pr) = project_root {
+        expand_project_relative(&expanded, pr)
+    } else {
+        expanded
+    }
 }
 
 /// Build the ordered list of filesystem paths to present as approval targets.
@@ -198,13 +262,14 @@ pub fn expand_home_path(path: &str, home: Option<&str>) -> String {
 /// For non-home paths, stops after including `/`.
 /// No duplicates are returned.
 #[must_use]
-pub fn filesystem_approval_paths(path: &str, home: Option<&str>) -> Vec<String> {
-    let norm = path.trim_end_matches('/');
+pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<String> {
+    let path_str = path.to_string_lossy();
+    let norm = path_str.trim_end_matches('/');
     if norm.is_empty() {
         return vec!["/".to_string()];
     }
 
-    let home_trimmed = home.map(|h| h.trim_end_matches('/').to_string());
+    let home_trimmed = home.map(|h| h.to_string_lossy().trim_end_matches('/').to_string());
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -349,6 +414,7 @@ mod tests {
         FileAccess, FilesystemRule, SudoRule, contract_home_path, expand_home_path,
         filesystem_approval_paths,
     };
+    use std::path::Path;
 
     #[test]
     fn sudo_rule_matches_prefix() {
@@ -408,34 +474,76 @@ mod tests {
     }
     #[test]
     fn filesystem_rule_matches_exact_path() {
-        let rule = FilesystemRule::new("/home", FileAccess::Read, "");
-        assert!(rule.path_matches("/home"));
-        assert!(!rule.path_matches("/homex"));
+        let rule = FilesystemRule::new("/home/user", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/home/user"), None));
+        assert!(!rule.path_matches(Path::new("/home/userx"), None));
     }
 
     #[test]
     fn filesystem_rule_matches_descendant() {
         let rule = FilesystemRule::new("/home", FileAccess::ReadWrite, "");
-        assert!(rule.path_matches("/home/user"));
-        assert!(rule.path_matches("/home/user/file.txt"));
-        assert!(!rule.path_matches("/var/log"));
+        assert!(rule.path_matches(Path::new("/home/user"), None));
+        assert!(rule.path_matches(Path::new("/home/user/file.txt"), None));
+        assert!(!rule.path_matches(Path::new("/var/log"), None));
     }
 
     #[test]
     fn filesystem_rule_respects_access_hierarchy() {
         let rule = FilesystemRule::new("/tmp", FileAccess::ReadWrite, "");
-        assert!(rule.matches("/tmp", FileAccess::Read));
-        assert!(rule.matches("/tmp", FileAccess::Write));
-        assert!(!rule.matches("/tmp", FileAccess::Execute));
+        assert!(rule.matches(Path::new("/tmp"), FileAccess::Read, None));
+        assert!(rule.matches(Path::new("/tmp"), FileAccess::Write, None));
+        assert!(!rule.matches(Path::new("/tmp"), FileAccess::Execute, None));
 
         let all_rule = FilesystemRule::new("/nix/store", FileAccess::All, "");
-        assert!(all_rule.matches("/nix/store/something", FileAccess::Execute));
-        assert!(all_rule.matches("/nix/store", FileAccess::Write));
+        assert!(all_rule.matches(Path::new("/nix/store/something"), FileAccess::Execute, None));
+        assert!(all_rule.matches(Path::new("/nix/store"), FileAccess::Write, None));
+    }
+
+    #[test]
+    fn glob_match_dot_slash_dot_env() {
+        let rule = FilesystemRule::new("./**/.env", FileAccess::Read, "");
+        // With project_root="/work", ./**/.env -> /work/**/.env
+        assert!(rule.path_matches(Path::new("/work/.env"), Some(Path::new("/work"))));
+        assert!(rule.path_matches(Path::new("/work/sub/.env"), Some(Path::new("/work"))));
+        assert!(!rule.path_matches(Path::new("/etc/.env"), Some(Path::new("/work"))));
+    }
+
+    #[test]
+    fn glob_match_double_star_dot_env() {
+        let rule = FilesystemRule::new("**/.env", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/.env"), None));
+        assert!(rule.path_matches(Path::new("/work/sub/.env"), None));
+    }
+
+    #[test]
+    fn glob_match_dot_slash_double_star_dot_env_with_project_root() {
+        let rule = FilesystemRule::new("./**/.env", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/.env"), Some(Path::new("/work"))));
+        assert!(rule.path_matches(Path::new("/work/sub/.env"), Some(Path::new("/work"))));
+        assert!(!rule.path_matches(Path::new("/etc/.env"), Some(Path::new("/work"))));
+    }
+
+    #[test]
+    fn glob_does_not_match_non_matching_pattern() {
+        let rule = FilesystemRule::new("**/secret", FileAccess::Read, "");
+        assert!(!rule.path_matches(Path::new("/work/.env"), None));
+        assert!(rule.path_matches(Path::new("/work/secret"), None));
+    }
+
+    #[test]
+    fn glob_dot_slash_prefix_expands_correctly() {
+        let rule = FilesystemRule::new("./foo", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/foo"), Some(Path::new("/work"))));
+        assert!(rule.path_matches(Path::new("/work/foo/bar"), Some(Path::new("/work"))));
+        assert!(!rule.path_matches(Path::new("/work/foobar"), Some(Path::new("/work"))));
     }
 
     #[test]
     fn filesystem_approval_paths_exact_path_first() {
-        let paths = filesystem_approval_paths("/home/user/.local/share/foo", Some("/home/user"));
+        let paths = filesystem_approval_paths(
+            Path::new("/home/user/.local/share/foo"),
+            Some(Path::new("/home/user")),
+        );
         assert_eq!(
             paths[0], "/home/user/.local/share/foo",
             "exact path must be first"
@@ -444,7 +552,10 @@ mod tests {
 
     #[test]
     fn filesystem_approval_paths_under_home_stops_at_home() {
-        let paths = filesystem_approval_paths("/home/user/.local/share/foo", Some("/home/user"));
+        let paths = filesystem_approval_paths(
+            Path::new("/home/user/.local/share/foo"),
+            Some(Path::new("/home/user")),
+        );
         assert_eq!(
             paths,
             vec![
@@ -458,7 +569,10 @@ mod tests {
 
     #[test]
     fn filesystem_approval_paths_non_home_includes_root() {
-        let paths = filesystem_approval_paths("/nix/store/abc123/bin/hello", Some("/home/user"));
+        let paths = filesystem_approval_paths(
+            Path::new("/nix/store/abc123/bin/hello"),
+            Some(Path::new("/home/user")),
+        );
         assert_eq!(
             paths,
             vec![
@@ -474,19 +588,20 @@ mod tests {
 
     #[test]
     fn filesystem_approval_paths_root_path_returns_just_root() {
-        let paths = filesystem_approval_paths("/", Some("/home/user"));
+        let paths = filesystem_approval_paths(Path::new("/"), Some(Path::new("/home/user")));
         assert_eq!(paths, vec!["/"]);
     }
 
     #[test]
     fn filesystem_approval_paths_home_exact_returns_just_home() {
-        let paths = filesystem_approval_paths("/home/user", Some("/home/user"));
+        let paths =
+            filesystem_approval_paths(Path::new("/home/user"), Some(Path::new("/home/user")));
         assert_eq!(paths, vec!["/home/user"]);
     }
 
     #[test]
     fn filesystem_approval_paths_no_duplicates() {
-        let paths = filesystem_approval_paths("/etc/passwd", None);
+        let paths = filesystem_approval_paths(Path::new("/etc/passwd"), None);
         let mut dedup = paths.clone();
         dedup.sort();
         dedup.dedup();
@@ -495,7 +610,7 @@ mod tests {
 
     #[test]
     fn contract_home_path_converts_under_home() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         assert_eq!(
             contract_home_path("/home/user/.local/share/foo", Some(home)),
             "~/.local/share/foo"
@@ -506,7 +621,7 @@ mod tests {
 
     #[test]
     fn contract_home_path_leaves_non_home_paths_unchanged() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         assert_eq!(contract_home_path("/nix/store", Some(home)), "/nix/store");
         assert_eq!(contract_home_path("/", Some(home)), "/");
         assert_eq!(contract_home_path("/home", Some(home)), "/home");
@@ -526,7 +641,7 @@ mod tests {
 
     #[test]
     fn expand_home_path_converts_tilde() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         assert_eq!(
             expand_home_path("~/.local/share/foo", Some(home)),
             "/home/user/.local/share/foo"
@@ -536,7 +651,7 @@ mod tests {
 
     #[test]
     fn expand_home_path_leaves_absolute_paths_unchanged() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         assert_eq!(expand_home_path("/nix/store", Some(home)), "/nix/store");
         assert_eq!(expand_home_path("/", Some(home)), "/");
     }
@@ -551,7 +666,7 @@ mod tests {
 
     #[test]
     fn contract_expand_round_trip() {
-        let home = "/home/user";
+        let home = Path::new("/home/user");
         let original = "/home/user/.local/share/foo/agent/models.db-wal";
         let contracted = contract_home_path(original, Some(home));
         assert_eq!(contracted, "~/.local/share/foo/agent/models.db-wal");

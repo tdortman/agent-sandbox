@@ -156,32 +156,39 @@ pub fn x11_display_for_uid(uid: u32) -> Option<String> {
     None
 }
 
-pub fn kde_color_scheme_from_config(home: Option<&str>) -> Option<String> {
+pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
     let home = home?;
-    let path = Path::new(home).join(".config").join("kdeglobals");
-    let content = std::fs::read_to_string(&path).ok()?;
-    let mut in_general = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "[General]" {
-            in_general = true;
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_general = false;
-            continue;
-        }
-        if in_general && let Some(scheme) = line.strip_prefix("ColorScheme=") {
-            let scheme = scheme.trim();
-            if !scheme.is_empty() {
-                return Some(scheme.to_string());
+    let paths = [
+        home.join(".config").join("kdeglobals"),
+        home.join(".config").join("kdedefaults").join("kdeglobals"),
+    ];
+
+    for path in paths {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let mut in_general = false;
+            for line in content.lines() {
+                let line = line.trim();
+                if line == "[General]" {
+                    in_general = true;
+                    continue;
+                }
+                if line.starts_with('[') && line.ends_with(']') {
+                    in_general = false;
+                    continue;
+                }
+                if in_general && let Some(scheme) = line.strip_prefix("ColorScheme=") {
+                    let scheme = scheme.trim();
+                    if !scheme.is_empty() {
+                        return Some(scheme.to_string());
+                    }
+                }
             }
         }
     }
     None
 }
 
-pub fn graphical_session_env(uid: u32, home: Option<&str>) -> HashMap<String, String> {
+pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, String> {
     let mut env = kde_session_defaults();
     env.extend(inherit_plasma_env(uid));
     if !env.contains_key("COLORSCHEME")

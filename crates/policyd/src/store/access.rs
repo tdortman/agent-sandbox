@@ -1,4 +1,5 @@
 //! Policy store: access.
+use std::path::Path;
 
 use std::collections::HashSet;
 
@@ -200,7 +201,7 @@ fn session_filesystem_matches(
 ) -> bool {
     bucket.iter().any(|entry| {
         let rule = FilesystemRule::new(entry.path.as_str(), entry.access, "");
-        rule.matches(path, access)
+        rule.matches(Path::new(path), access, None)
     })
 }
 
@@ -211,12 +212,15 @@ impl PolicyStore {
         access: FileAccess,
         ctx: MergeContext,
     ) -> bool {
+        let project_root = ctx.paths.project_root().map(str::to_owned);
         let merged = self.merged_for(ctx).await;
-        merged
-            .filesystem
-            .deny
-            .iter()
-            .any(|rule| rule.matches(path, access))
+        merged.filesystem.deny.iter().any(|rule| {
+            rule.matches(
+                Path::new(path),
+                access,
+                project_root.as_deref().map(Path::new),
+            )
+        })
     }
 
     pub(crate) async fn filesystem_policy_allowed(
@@ -225,12 +229,15 @@ impl PolicyStore {
         access: FileAccess,
         ctx: MergeContext,
     ) -> bool {
+        let project_root = ctx.paths.project_root().map(str::to_owned);
         let merged = self.merged_for(ctx).await;
-        merged
-            .filesystem
-            .allow
-            .iter()
-            .any(|rule| rule.matches(path, access))
+        merged.filesystem.allow.iter().any(|rule| {
+            rule.matches(
+                Path::new(path),
+                access,
+                project_root.as_deref().map(Path::new),
+            )
+        })
     }
 
     pub(crate) async fn session_filesystem_denied(

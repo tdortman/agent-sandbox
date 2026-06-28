@@ -195,8 +195,7 @@ rec {
           "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package}"
         else
           lib.getExe package;
-      syscallArmPrefix =
-        if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
+      syscallArmPrefix = if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
 
       entryPackage =
         if syscallGate || fsArmPkg != null then
