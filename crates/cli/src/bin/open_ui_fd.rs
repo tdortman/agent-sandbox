@@ -88,11 +88,11 @@ fn build_child_args(
 }
 
 fn exec_cstrings(args: &[CString]) -> ! {
-    let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
+    let mut exec_argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+    exec_argv.push(std::ptr::null());
     // SAFETY: argv is null-terminated and points at live CString storage.
     unsafe {
-        libc::execvp(argv[0], argv.as_ptr());
+        libc::execvp(exec_argv[0], exec_argv.as_ptr());
     }
     die("execvp", &io::Error::last_os_error());
 }
@@ -103,19 +103,22 @@ fn exec_child(
     session_id: &str,
     sandbox_session_id: &str,
 ) -> ! {
-    if let Some(child_args) = build_child_args(args, ui_fd, session_id, sandbox_session_id) {
-        exec_cstrings(&child_args);
-    } else {
-        // No bwrap separator. Set env vars in current process before exec.
-        // SAFETY: single-threaded, about to exec.
-        unsafe {
-            std::env::set_var("AGENT_SANDBOX_UI_FD", ui_fd.to_string());
-            std::env::set_var("AGENT_SANDBOX_UI_SESSION_ID", session_id);
-            std::env::set_var("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
-        }
-        let child_args: Vec<CString> = args.iter().map(|s| cstring(s.as_bytes())).collect();
-        exec_cstrings(&child_args);
-    }
+    build_child_args(args, ui_fd, session_id, sandbox_session_id).map_or_else(
+        || {
+            // No bwrap separator. Set env vars in current process before exec.
+            // SAFETY: single-threaded, about to exec.
+            unsafe {
+                std::env::set_var("AGENT_SANDBOX_UI_FD", ui_fd.to_string());
+                std::env::set_var("AGENT_SANDBOX_UI_SESSION_ID", session_id);
+                std::env::set_var("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
+            }
+            let child_args: Vec<CString> = args.iter().map(|s| cstring(s.as_bytes())).collect();
+            exec_cstrings(&child_args);
+        },
+        |child_args| {
+            exec_cstrings(&child_args);
+        },
+    )
 }
 
 fn main() {

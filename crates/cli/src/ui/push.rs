@@ -12,7 +12,140 @@ use super::options::{
     ACTION_OPTIONS, PromptAction, ScopeOption, scope_only_options, sudo_target_options,
 };
 
-pub(crate) async fn handle_push(
+/// Extracted fields from [`UiPush::NetworkRequest`].
+struct NetworkPush {
+    id: String,
+    host: Option<String>,
+    port: Option<u16>,
+    scheme: Option<String>,
+    url: Option<String>,
+    cwd: Option<String>,
+    home: Option<String>,
+    project_root: Option<String>,
+}
+
+/// Extracted fields from [`UiPush::ElevationRequest`].
+struct ElevationPush {
+    id: String,
+    argv: Option<Vec<String>>,
+    cwd: Option<String>,
+    home: Option<String>,
+    project_root: Option<String>,
+}
+
+/// Prompt the user for a network request approval.
+async fn handle_network_push(
+    socket: &PathBuf,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    net: NetworkPush,
+) -> Result<(), UiCliError> {
+    let host = net.host.unwrap_or_default();
+    let port = net.port.unwrap_or(0);
+    let scheme = net.scheme.unwrap_or_else(|| "https".into());
+    let (url, aliases) = split_check_aliases(net.url);
+    let url = network_prompt_with_aliases(
+        &host,
+        port,
+        &scheme,
+        url,
+        if aliases.is_empty() {
+            None
+        } else {
+            Some(aliases)
+        },
+    );
+    let paths = paths.merged_with(net.cwd, net.home, net.project_root);
+
+    // Step 1: choose action
+    let Some(action) = choose_action(&format!("agent-sandbox: {url}")).await? else {
+        return deny_cancellation(socket, &paths, session_id, &net.id).await;
+    };
+
+    // Step 2: choose scope
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} {url} scope?", action.verb()),
+        session_id.is_some(),
+    )
+    .await?
+    else {
+        return deny_cancellation(socket, &paths, session_id, &net.id).await;
+    };
+
+    // Step 3: for non-Once scopes, choose target level
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        match choose_target_level(
+            &format!("agent-sandbox: {} {url} target?", action.verb()),
+            network_target_options(&host, scope),
+        )
+        .await?
+        {
+            Some(t) => Some(t),
+            None => return deny_cancellation(socket, &paths, session_id, &net.id).await,
+        }
+    };
+    let choice = ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+    };
+    resolve_choice(socket, &paths, session_id, &net.id, action, Some(choice)).await
+}
+
+/// Prompt the user for an elevation (sudo) request approval.
+async fn handle_elevation_push(
+    socket: &PathBuf,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    elev: ElevationPush,
+) -> Result<(), UiCliError> {
+    let argv = elev.argv.unwrap_or_default();
+    let paths = paths.merged_with(elev.cwd, elev.home, elev.project_root);
+
+    // Step 1: choose action
+    let title = format_elevation_title(&argv, paths.cwd().unwrap_or("?"));
+    let Some(action) = choose_action(&title).await? else {
+        return deny_cancellation(socket, &paths, session_id, &elev.id).await;
+    };
+
+    // Step 2: choose scope
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} sudo scope?", action.verb()),
+        session_id.is_some(),
+    )
+    .await?
+    else {
+        return deny_cancellation(socket, &paths, session_id, &elev.id).await;
+    };
+
+    // Step 3: for non-Once scopes, choose command prefix
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        match choose_target_level(
+            &format!("agent-sandbox: {} sudo target?", action.verb()),
+            sudo_target_options(&argv, scope),
+        )
+        .await?
+        {
+            Some(t) => Some(t),
+            None => return deny_cancellation(socket, &paths, session_id, &elev.id).await,
+        }
+    };
+    let choice = ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+    };
+    resolve_choice(socket, &paths, session_id, &elev.id, action, Some(choice)).await
+}
+/// Handle an incoming UI push: parse the variant, prompt the user, and resolve the choice.
+///
+/// # Errors
+/// Returns [`UiCliError`] when RPC communication with policyd fails.
+pub async fn handle_push(
     socket: &PathBuf,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
@@ -29,58 +162,17 @@ pub(crate) async fn handle_push(
             home,
             project_root,
         } => {
-            let host = host.unwrap_or_default();
-            let port = port.unwrap_or(0);
-            let scheme = scheme.unwrap_or_else(|| "https".into());
-            let (url, aliases) = split_check_aliases(url);
-            let url = network_prompt_with_aliases(
-                &host,
+            let net = NetworkPush {
+                id,
+                host,
                 port,
-                &scheme,
+                scheme,
                 url,
-                if aliases.is_empty() {
-                    None
-                } else {
-                    Some(aliases)
-                },
-            );
-            let paths = paths.merged_with(cwd, home, project_root);
-
-            // Step 1: choose action
-            let Some(action) = choose_action(&format!("agent-sandbox: {url}")).await? else {
-                return deny_cancellation(socket, &paths, session_id, &id).await;
+                cwd,
+                home,
+                project_root,
             };
-
-            // Step 2: choose scope
-            let Some(scope) = choose_scope_only(
-                &format!("agent-sandbox: {} {url} scope?", action.verb()),
-                session_id.is_some(),
-            )
-            .await?
-            else {
-                return deny_cancellation(socket, &paths, session_id, &id).await;
-            };
-
-            // Step 3: for non-Once scopes, choose target level
-            let target = if scope == ApprovalScope::Once {
-                None
-            } else {
-                match choose_target_level(
-                    &format!("agent-sandbox: {} {url} target?", action.verb()),
-                    network_target_options(&host, scope),
-                )
-                .await?
-                {
-                    Some(t) => Some(t),
-                    None => return deny_cancellation(socket, &paths, session_id, &id).await,
-                }
-            };
-            let choice = ScopeOption {
-                label: String::new(),
-                scope,
-                target,
-            };
-            resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await?;
+            handle_network_push(socket, paths, session_id, net).await?;
         }
         UiPush::ElevationRequest {
             id,
@@ -89,45 +181,14 @@ pub(crate) async fn handle_push(
             home,
             project_root,
         } => {
-            let argv = argv.unwrap_or_default();
-            let paths = paths.merged_with(cwd, home, project_root);
-
-            // Step 1: choose action
-            let title = format_elevation_title(&argv, paths.cwd().unwrap_or("?"));
-            let Some(action) = choose_action(&title).await? else {
-                return deny_cancellation(socket, &paths, session_id, &id).await;
+            let elev = ElevationPush {
+                id,
+                argv,
+                cwd,
+                home,
+                project_root,
             };
-
-            // Step 2: choose scope
-            let Some(scope) = choose_scope_only(
-                &format!("agent-sandbox: {} sudo scope?", action.verb()),
-                session_id.is_some(),
-            )
-            .await?
-            else {
-                return deny_cancellation(socket, &paths, session_id, &id).await;
-            };
-
-            // Step 3: for non-Once scopes, choose command prefix
-            let target = if scope == ApprovalScope::Once {
-                None
-            } else {
-                match choose_target_level(
-                    &format!("agent-sandbox: {} sudo target?", action.verb()),
-                    sudo_target_options(&argv, scope),
-                )
-                .await?
-                {
-                    Some(t) => Some(t),
-                    None => return deny_cancellation(socket, &paths, session_id, &id).await,
-                }
-            };
-            let choice = ScopeOption {
-                label: String::new(),
-                scope,
-                target,
-            };
-            resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await?;
+            handle_elevation_push(socket, paths, session_id, elev).await?;
         }
         UiPush::FilesystemRequest {
             id,

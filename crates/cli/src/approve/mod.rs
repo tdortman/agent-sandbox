@@ -103,63 +103,31 @@ enum Command {
         /// Session id the request belongs to. Required when the scope is "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "AGENT_SANDBOX_HOME" or "$HOME".
+        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
         home: Option<String>,
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var "AGENT_SANDBOX_CWD".
+        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var "AGENT_SANDBOX_PROJECT_ROOT".
+        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
         project_root: Option<String>,
     },
 }
-
+/// Parse CLI args, dispatch to the matching subcommand handler, and print the result.
+///
+/// # Errors
+/// Returns [`ApproveCliError::Rpc`] when the RPC to policyd fails,
+/// [`ApproveCliError::Json`] when JSON serialization fails,
+/// or [`ApproveCliError::Policyd`] when policyd returns a denial or error response.
 pub async fn run() -> Result<(), ApproveCliError> {
     let cli = Cli::parse();
-    let paths = |home: Option<String>, cwd: Option<String>, project_root: Option<String>| {
-        SandboxPaths::from_wire(cwd, home, project_root)
-    };
-
     match cli.cmd {
         Command::Pending {
             home,
             cwd,
             project_root,
-        } => {
-            let p = paths(home, cwd, project_root);
-            let req = RpcRequest::Status {
-                ctx: RequestContext::from(&p),
-            };
-            let resp = rpc(&cli.socket, req).await?;
-            let RpcReply::Status(body) = resp else {
-                return Err(approve_error(&resp));
-            };
-            if body.pending.is_empty() {
-                println!("No pending approvals.");
-                return Ok(());
-            }
-            for item in body.pending {
-                match item {
-                    PendingSummary::Elevation { id, argv, .. } => {
-                        let argv = argv.unwrap_or_default();
-                        println!("{id}\televation\t\t{}", argv.join(" "));
-                    }
-                    PendingSummary::Network { id, host, port, .. } => {
-                        let host = host.unwrap_or_default();
-                        let port = port.unwrap_or(0);
-                        println!("{id}\tnetwork\t\t{host}:{port}");
-                    }
-                    PendingSummary::Filesystem {
-                        id, path, access, ..
-                    } => {
-                        let path = path.unwrap_or_default();
-                        let access = access.map_or_else(String::new, |value| value.to_string());
-                        println!("{id}\tfilesystem\t{access}\t{path}");
-                    }
-                }
-            }
-        }
+        } => handle_pending(&cli.socket, home, cwd, project_root).await,
         Command::Approve {
             id,
             scope,
@@ -168,7 +136,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
             cwd,
             project_root,
         } => {
-            let p = paths(home, cwd, project_root);
+            let p = SandboxPaths::from_wire(cwd, home, project_root);
             let req = RpcRequest::Approve {
                 id,
                 scope,
@@ -176,8 +144,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
                 target: None,
                 ctx: RequestContext::from(&p),
             };
-            let resp = rpc(&cli.socket, req).await?;
-            print_json(&resp)?;
+            print_json(&rpc(&cli.socket, req).await?)
         }
         Command::ApproveHost {
             host,
@@ -188,7 +155,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
             cwd,
             project_root,
         } => {
-            let p = paths(home, cwd, project_root);
+            let p = SandboxPaths::from_wire(cwd, home, project_root);
             let req = RpcRequest::ApproveHost {
                 host,
                 port,
@@ -196,8 +163,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
                 session_id,
                 ctx: RequestContext::from(&p),
             };
-            let resp = rpc(&cli.socket, req).await?;
-            print_json(&resp)?;
+            print_json(&rpc(&cli.socket, req).await?)
         }
         Command::Deny {
             id,
@@ -207,7 +173,7 @@ pub async fn run() -> Result<(), ApproveCliError> {
             cwd,
             project_root,
         } => {
-            let p = paths(home, cwd, project_root);
+            let p = SandboxPaths::from_wire(cwd, home, project_root);
             let req = RpcRequest::Deny {
                 id,
                 scope,
@@ -215,8 +181,47 @@ pub async fn run() -> Result<(), ApproveCliError> {
                 target: None,
                 ctx: RequestContext::from(&p),
             };
-            let resp = rpc(&cli.socket, req).await?;
-            print_json(&resp)?;
+            print_json(&rpc(&cli.socket, req).await?)
+        }
+    }
+}
+/// Fetch and display the list of pending approval requests.
+async fn handle_pending(
+    socket: &PathBuf,
+    home: Option<String>,
+    cwd: Option<String>,
+    project_root: Option<String>,
+) -> Result<(), ApproveCliError> {
+    let p = SandboxPaths::from_wire(cwd, home, project_root);
+    let req = RpcRequest::Status {
+        ctx: RequestContext::from(&p),
+    };
+    let resp = rpc(socket, req).await?;
+    let RpcReply::Status(body) = resp else {
+        return Err(approve_error(&resp));
+    };
+    if body.pending.is_empty() {
+        println!("No pending approvals.");
+        return Ok(());
+    }
+    for item in body.pending {
+        match item {
+            PendingSummary::Elevation { id, argv, .. } => {
+                let argv = argv.unwrap_or_default();
+                println!("{id}\televation\t\t{}", argv.join(" "));
+            }
+            PendingSummary::Network { id, host, port, .. } => {
+                let host = host.unwrap_or_default();
+                let port = port.unwrap_or(0);
+                println!("{id}\tnetwork\t\t{host}:{port}");
+            }
+            PendingSummary::Filesystem {
+                id, path, access, ..
+            } => {
+                let path = path.unwrap_or_default();
+                let access = access.map_or_else(String::new, |value| value.to_string());
+                println!("{id}\tfilesystem\t{access}\t{path}");
+            }
         }
     }
     Ok(())
