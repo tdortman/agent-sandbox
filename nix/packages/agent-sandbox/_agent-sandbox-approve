@@ -1,0 +1,41 @@
+#compdef agent-sandbox-approve
+
+_arguments -C \
+  '1: :->cmd' \
+  '*: :->arg'
+
+case "$state" in
+  cmd)
+    _values 'subcommand' pending approve approve-host deny
+    ;;
+  arg)
+    case "$words[2]" in
+      approve|deny)
+        if (( CURRENT == 3 )); then
+          local -a rows requests descriptions
+          local row id rest kind permission target
+          rows=("${(@f)$(agent-sandbox-approve pending 2>/dev/null)}")
+          for row in "${rows[@]}"; do
+            [[ -z "$row" || "$row" == "No pending approvals." ]] && continue
+            # Manual tab slicing: (@s:) doesn't handle $'\t' inside the
+            # separator, and empty fields (network/elevation have no
+            # permission) must be preserved.
+            id="${row%%$'\t'*}"
+            rest="${row#*$'\t'}"
+            kind="${rest%%$'\t'*}"
+            rest="${rest#*$'\t'}"
+            permission="${rest%%$'\t'*}"
+            [[ "$rest" == *$'\t'* ]] && target="${rest#*$'\t'}" || target=""
+            [[ -n "$id" ]] || continue
+            requests+=("$id")
+            # Pad columns so the menu lines up regardless of id/kind length.
+            descriptions+=("${(r:40:)id} ${(r:11:)kind} ${(r:6:)permission} $target")
+          done
+          (( ${#requests} )) && compadd -l -d descriptions -- "${requests[@]}"
+        elif (( CURRENT == 4 )); then
+          _values 'scope' once session project global
+        fi
+        ;;
+    esac
+    ;;
+esac

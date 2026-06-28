@@ -54,6 +54,9 @@ rustPlatform.buildRustPackage {
     wrapProgram $out/bin/agent-sandbox-ui \
       --prefix PATH : $out/bin \
       --set-default AGENT_SANDBOX_QT_DIALOG $out/bin/agent-sandbox-qt-dialog
+
+    # Install zsh completion.
+    install -Dm644 ${./_agent-sandbox-approve} $out/share/zsh/site-functions/_agent-sandbox-approve
   '';
 
   meta = with lib; {
