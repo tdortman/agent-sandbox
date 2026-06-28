@@ -13,7 +13,7 @@ pub(crate) enum SocketRole {
 
 /// Whether the request is allowed on the sandbox socket.
 #[must_use]
-pub fn is_sandbox_request(req: &RpcRequest) -> bool {
+pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
     matches!(
         req,
         RpcRequest::RegisterUi { .. }
@@ -26,7 +26,7 @@ pub fn is_sandbox_request(req: &RpcRequest) -> bool {
 
 /// Whether the request is allowed on an inherited UI fd (already-registered UI connection).
 #[must_use]
-pub fn is_uifd_request(req: &RpcRequest) -> bool {
+pub const fn is_uifd_request(req: &RpcRequest) -> bool {
     matches!(
         req,
         RpcRequest::Approve { .. }
@@ -38,7 +38,7 @@ pub fn is_uifd_request(req: &RpcRequest) -> bool {
     )
 }
 
-pub fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), PolicydError> {
+pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), PolicydError> {
     match role {
         SocketRole::Sandbox if !is_sandbox_request(req) => Err(PolicydError::UnauthorizedRequest),
         SocketRole::UiFd if !is_uifd_request(req) => Err(PolicydError::UnauthorizedUiFdRequest),

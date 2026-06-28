@@ -77,6 +77,7 @@ impl ApprovedBindings {
     }
 
     /// Hostnames previously approved for `ip`, for UI attribution only.
+    #[must_use]
     pub fn aliases(&self, ip: &str) -> Vec<String> {
         let now = Instant::now();
         let Some(entry) = self.entries.get(ip) else {

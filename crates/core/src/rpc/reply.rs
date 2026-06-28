@@ -118,6 +118,7 @@ pub struct ElevateReply {
 }
 
 impl ElevateReply {
+    #[must_use]
     pub fn denied() -> Self {
         Self {
             ok: true,
@@ -128,6 +129,7 @@ impl ElevateReply {
         }
     }
 
+    #[must_use]
     pub const fn executed(exit_code: i32, stdout: String, stderr: String) -> Self {
         Self {
             ok: true,
@@ -204,6 +206,7 @@ pub struct FilesystemMonitorReply {
 }
 
 impl FilesystemMonitorReply {
+    #[must_use]
     pub const fn active() -> Self {
         Self {
             ok: true,
@@ -274,6 +277,7 @@ pub struct FilesystemScopeActionReply {
 }
 
 impl ScopeActionReply {
+    #[must_use]
     pub fn ok_network(host: String, port: u16, scope: ApprovalScope, path: Option<String>) -> Self {
         Self::Network(NetworkScopeActionReply {
             ok: true,
@@ -284,6 +288,7 @@ impl ScopeActionReply {
         })
     }
 
+    #[must_use]
     pub fn ok_sudo(argv: Vec<String>, scope: ApprovalScope, path: Option<String>) -> Self {
         Self::Sudo(SudoScopeActionReply {
             ok: true,
@@ -293,6 +298,7 @@ impl ScopeActionReply {
         })
     }
 
+    #[must_use]
     pub fn ok_elevation_approve(scope: ApprovalScope, path: Option<String>) -> Self {
         Self::Elevation(ElevationScopeActionReply {
             ok: true,
@@ -302,6 +308,7 @@ impl ScopeActionReply {
         })
     }
 
+    #[must_use]
     pub fn ok_filesystem(
         path: String,
         access: FileAccess,
@@ -317,6 +324,7 @@ impl ScopeActionReply {
         })
     }
 
+    #[must_use]
     pub const fn is_ok(&self) -> bool {
         match self {
             Self::Network(reply) => reply.ok,
@@ -326,6 +334,7 @@ impl ScopeActionReply {
         }
     }
 
+    #[must_use]
     pub fn scope_label(&self) -> &str {
         match self {
             Self::Network(reply) => &reply.scope,
@@ -335,6 +344,7 @@ impl ScopeActionReply {
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> Option<&str> {
         match self {
             Self::Network(reply) => reply.path.as_deref(),
@@ -353,14 +363,17 @@ pub struct StatusReply {
 }
 
 impl RpcReply {
+    #[must_use]
     pub const fn is_ok(&self) -> bool {
         !matches!(self, Self::Error(_))
     }
 
+    #[must_use]
     pub const fn scope_succeeded(&self) -> bool {
         matches!(self, Self::ScopeAction(reply) if reply.is_ok())
     }
 
+    #[must_use]
     pub fn scope_label(&self) -> Option<&str> {
         match self {
             Self::ScopeAction(reply) => Some(reply.scope_label()),

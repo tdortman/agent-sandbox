@@ -379,6 +379,7 @@ impl NetworkRule {
         }
     }
 
+    #[must_use]
     pub fn key(&self) -> NetworkRuleKey {
         NetworkRuleKey::new(&self.host, self.port)
     }
@@ -392,6 +393,7 @@ impl SudoRule {
         }
     }
 
+    #[must_use]
     pub fn key(&self) -> Option<Vec<String>> {
         if self.argv.is_empty() {
             None
@@ -400,10 +402,12 @@ impl SudoRule {
         }
     }
 
+    #[must_use]
     pub fn matches(&self, argv: &[String]) -> bool {
         !self.argv.is_empty() && argv.starts_with(&self.argv)
     }
 
+    #[must_use]
     pub fn approval_prefixes(argv: &[String]) -> Vec<Vec<String>> {
         let mut prefixes = Vec::with_capacity(argv.len());
         for len in (1..=argv.len()).rev() {

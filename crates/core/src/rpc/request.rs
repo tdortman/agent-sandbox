@@ -33,7 +33,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn ids(&self) -> ProcessIds {
+    pub const fn ids(&self) -> ProcessIds {
         ProcessIds::from_options(self.pid, self.uid)
     }
 
@@ -166,7 +166,8 @@ pub enum RpcRequest {
 }
 
 impl RpcRequest {
-    pub fn context(&self) -> Option<&RequestContext> {
+    #[must_use]
+    pub const fn context(&self) -> Option<&RequestContext> {
         match self {
             Self::RegisterUi { ctx, .. }
             | Self::Check { ctx, .. }
@@ -182,7 +183,7 @@ impl RpcRequest {
         }
     }
 
-    pub fn context_mut(&mut self) -> Option<&mut RequestContext> {
+    pub const fn context_mut(&mut self) -> Option<&mut RequestContext> {
         match self {
             Self::RegisterUi { ctx, .. }
             | Self::Check { ctx, .. }
@@ -241,7 +242,7 @@ fn default_https() -> String {
     "https".into()
 }
 
-fn default_once_scope() -> ApprovalScope {
+const fn default_once_scope() -> ApprovalScope {
     ApprovalScope::Once
 }
 

@@ -59,14 +59,17 @@ impl SandboxPaths {
         )
     }
 
+    #[must_use]
     pub fn cwd(&self) -> Option<&str> {
         non_empty(&self.cwd)
     }
 
+    #[must_use]
     pub fn home(&self) -> Option<&str> {
         non_empty(&self.home)
     }
 
+    #[must_use]
     pub fn project_root(&self) -> Option<&str> {
         non_empty(&self.project_root)
     }
@@ -121,10 +124,12 @@ impl ProcessIds {
         }
     }
 
+    #[must_use]
     pub fn pid(&self) -> Option<u32> {
         (self.pid > 0).then_some(self.pid)
     }
 
+    #[must_use]
     pub fn uid(&self) -> Option<u32> {
         (self.uid > 0).then_some(self.uid)
     }

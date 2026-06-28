@@ -11,7 +11,7 @@ pub(crate) struct UiRoute {
 
 impl UiRoute {
     #[must_use]
-    pub fn new(cwd: Option<String>, project_root: Option<String>) -> Self {
+    pub const fn new(cwd: Option<String>, project_root: Option<String>) -> Self {
         Self {
             cwd,
             project_root,

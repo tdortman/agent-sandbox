@@ -141,7 +141,8 @@ pub enum Pending {
 }
 
 impl Pending {
-    pub fn kind(&self) -> PendingKind {
+    #[must_use]
+    pub const fn kind(&self) -> PendingKind {
         match self {
             Self::Elevation(_) => PendingKind::Elevation,
             Self::Network(_) => PendingKind::Network,
@@ -149,6 +150,7 @@ impl Pending {
         }
     }
 
+    #[must_use]
     pub fn id(&self) -> &str {
         match self {
             Self::Elevation(p) => &p.id,
@@ -157,7 +159,8 @@ impl Pending {
         }
     }
 
-    pub fn created_at(&self) -> f64 {
+    #[must_use]
+    pub const fn created_at(&self) -> f64 {
         match self {
             Self::Elevation(p) => p.created_at,
             Self::Network(p) => p.created_at,
@@ -165,6 +168,7 @@ impl Pending {
         }
     }
 
+    #[must_use]
     pub fn cwd(&self) -> Option<&str> {
         match self {
             Self::Elevation(p) => p.cwd.as_deref(),
@@ -173,6 +177,7 @@ impl Pending {
         }
     }
 
+    #[must_use]
     pub fn home(&self) -> Option<&str> {
         match self {
             Self::Elevation(p) => p.home.as_deref(),
@@ -181,6 +186,7 @@ impl Pending {
         }
     }
 
+    #[must_use]
     pub fn project_root(&self) -> Option<&str> {
         match self {
             Self::Elevation(p) => p.project_root.as_deref(),
@@ -189,6 +195,7 @@ impl Pending {
         }
     }
 
+    #[must_use]
     pub fn sandbox_session_id(&self) -> Option<&str> {
         match self {
             Self::Elevation(p) => p.sandbox_session_id.as_deref(),

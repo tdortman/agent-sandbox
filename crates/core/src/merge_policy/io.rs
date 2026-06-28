@@ -7,6 +7,8 @@ use crate::policy::{
     FilesystemRule, FilesystemSortKey, NetworkRule, Policy, SudoRule, contract_home_path,
     expand_policy_path,
 };
+
+#[must_use]
 pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
     // Containment check: if project_root is given, reject policies outside it.
     if let Some(root) = project_root
@@ -111,6 +113,8 @@ pub fn resolve_policy_write_path(
     }
     Ok(canonical)
 }
+
+#[must_use]
 pub fn resolve_owner_uid(path: &Path, home: Option<&Path>, uid: Option<u32>) -> Option<u32> {
     if let Some(uid) = uid.filter(|u| *u > 0) {
         return Some(uid);

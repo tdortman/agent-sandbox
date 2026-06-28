@@ -45,7 +45,7 @@ pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
         .expect("seccomp filter length is bounded by seccompiler::BPF_MAX_LEN")
 }
 
-fn target_arch() -> TargetArch {
+const fn target_arch() -> TargetArch {
     #[cfg(target_arch = "x86_64")]
     {
         TargetArch::x86_64
@@ -63,7 +63,7 @@ fn target_arch() -> TargetArch {
     }
 }
 
-fn match_action() -> SeccompAction {
+const fn match_action() -> SeccompAction {
     #[cfg(target_arch = "x86_64")]
     {
         SeccompAction::UserNotif

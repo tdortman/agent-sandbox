@@ -8,6 +8,7 @@ use crate::policy::{
     SudoRule, SudoSection,
 };
 
+#[must_use]
 pub fn merge_layers(layers: &[Policy]) -> Policy {
     if layers.is_empty() {
         return Policy::default();

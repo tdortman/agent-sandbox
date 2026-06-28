@@ -7,6 +7,7 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials as NixPeerCredential
 
 const TCP_ESTABLISHED: &str = "01";
 
+#[must_use]
 pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {
     let path = format!("/proc/{pid}/environ");
     let Ok(raw) = std::fs::read(&path) else {
@@ -26,6 +27,7 @@ pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> 
     env
 }
 
+#[must_use]
 pub fn read_proc_cwd(pid: u32) -> Option<String> {
     let link = format!("/proc/{pid}/cwd");
     std::fs::read_link(&link)
@@ -33,6 +35,7 @@ pub fn read_proc_cwd(pid: u32) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+#[must_use]
 pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
     let uid = uid?;
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
@@ -64,6 +67,7 @@ pub struct ProcContext {
     pub project_root: Option<String>,
 }
 
+#[must_use]
 pub fn context_from_pid(pid: u32) -> ProcContext {
     if pid == 0 {
         return ProcContext {
@@ -89,6 +93,7 @@ pub fn context_from_pid(pid: u32) -> ProcContext {
     }
 }
 
+#[must_use]
 pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;

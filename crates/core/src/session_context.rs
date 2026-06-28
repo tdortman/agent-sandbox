@@ -19,6 +19,7 @@ pub fn session_context_path() -> PathBuf {
     )
 }
 
+#[must_use]
 pub fn read_session_context() -> SessionContext {
     let path = session_context_path();
     let Ok(data) = std::fs::read_to_string(&path) else {

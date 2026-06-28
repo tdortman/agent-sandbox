@@ -29,6 +29,7 @@ fn enforce_ui_spawn_last_limit<S: BuildHasher>(map: &mut HashMap<String, Instant
     }
 }
 
+#[must_use]
 pub fn ui_spawn_env(
     args: &PolicydArgs,
     user: &User,

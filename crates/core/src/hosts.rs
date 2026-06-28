@@ -4,11 +4,13 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use crate::dns_cache::lookup_dns_cache;
+#[must_use]
 pub fn is_ip_literal(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     host.parse::<IpAddr>().is_ok()
 }
 
+#[must_use]
 pub fn normalize_host(host: &str) -> String {
     let host = host.trim();
     // Strip surrounding brackets from IPv6 literals for policy matching.
@@ -71,6 +73,7 @@ impl NetworkSortKey {
         }
     }
 }
+#[must_use]
 pub fn approval_host_patterns(host: &str) -> Vec<String> {
     let host = normalize_host(host);
     if host.is_empty() {
@@ -106,6 +109,7 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
     patterns
 }
 
+#[must_use]
 pub fn reverse_hostname(ip: &str) -> Option<String> {
     let ip: IpAddr = ip.parse().ok()?;
     dns_lookup::lookup_addr(&ip)
@@ -135,6 +139,7 @@ impl HostResolution {
 /// Resolve a network destination into a policy host and original connect target.
 ///
 /// For IP literals, tries the DNS forwarder cache first, then falls back to the raw IP.
+#[must_use]
 pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) -> HostResolution {
     let connect_host = connect_host.trim();
     if !is_ip_literal(connect_host) {
@@ -150,6 +155,7 @@ pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) ->
     HostResolution::new(policy_host, connect_host)
 }
 
+#[must_use]
 pub fn allow_keys(host: &str, port: u16) -> Vec<NetworkRuleKey> {
     let host = normalize_host(host);
     vec![NetworkRuleKey::new(&host, port)]

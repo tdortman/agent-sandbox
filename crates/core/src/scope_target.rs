@@ -81,7 +81,8 @@ impl ScopeTarget {
         }
     }
 
-    pub fn project_root(&self) -> Option<&str> {
+    #[must_use]
+    pub const fn project_root(&self) -> Option<&str> {
         match self {
             Self::Project { project_root, .. } => Some(project_root.as_str()),
             _ => None,

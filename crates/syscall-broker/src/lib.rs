@@ -200,7 +200,7 @@ fn get_socket_type(pid: u32, sockfd: i32) -> Option<i32> {
 /// Map a `SO_TYPE` value to a URL scheme. DGRAM sockets are UDP; everything
 /// else (STREAM, RAW, SEQPACKET, ...) is reported as TCP for policy purposes,
 /// because policyd only knows those two schemes today.
-fn scheme_for_socket_type(sock_type: i32) -> &'static str {
+const fn scheme_for_socket_type(sock_type: i32) -> &'static str {
     if sock_type == libc::SOCK_DGRAM {
         "udp"
     } else {

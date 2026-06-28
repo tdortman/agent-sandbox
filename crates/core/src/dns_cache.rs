@@ -110,6 +110,7 @@ impl DnsCache {
         }
     }
 
+    #[must_use]
     pub fn lookup(&self, ip: &str) -> Option<String> {
         let entry = self.entries.get(ip)?;
         if Instant::now() >= entry.expires {

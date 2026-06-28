@@ -35,6 +35,7 @@ impl fmt::Display for ApprovalScope {
 }
 
 impl ApprovalScope {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Once => "once",

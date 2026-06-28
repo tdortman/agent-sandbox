@@ -34,6 +34,7 @@ const ENV_INHERIT: &[&str] = &[
 
 pub type ToolPathFn = fn(&str, &str) -> Option<String>;
 
+#[must_use]
 pub fn tool_path(env_key: &str, binary: &str) -> Option<String> {
     if let Ok(explicit) = std::env::var(env_key) {
         let path = Path::new(&explicit);
@@ -116,6 +117,7 @@ fn kde_session_defaults() -> HashMap<String, String> {
     ])
 }
 
+#[must_use]
 pub fn x11_display_for_uid(uid: u32) -> Option<String> {
     let loginctl = tool_path("AGENT_SANDBOX_LOGINCTL", "loginctl")?;
     let output = Command::new(&loginctl)
@@ -156,6 +158,7 @@ pub fn x11_display_for_uid(uid: u32) -> Option<String> {
     None
 }
 
+#[must_use]
 pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
     let home = home?;
     let paths = [
@@ -188,6 +191,7 @@ pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
     None
 }
 
+#[must_use]
 pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, String> {
     let mut env = kde_session_defaults();
     env.extend(inherit_plasma_env(uid));

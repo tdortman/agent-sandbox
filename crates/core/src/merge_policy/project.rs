@@ -30,6 +30,7 @@ impl ProjectPolicyContext {
     }
 
     /// Return the validated project root, if any (not `/`, has a file name).
+    #[must_use]
     pub fn project_root(&self) -> Option<&Path> {
         self.project_root
             .as_deref()

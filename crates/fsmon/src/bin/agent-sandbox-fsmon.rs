@@ -256,7 +256,7 @@ fn resolve_event_path(event_fd: i32) -> io::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-fn open_flags_to_access(flags: i32) -> FileAccess {
+const fn open_flags_to_access(flags: i32) -> FileAccess {
     match flags & libc::O_ACCMODE {
         libc::O_RDONLY => FileAccess::Read,
         libc::O_WRONLY => FileAccess::Write,

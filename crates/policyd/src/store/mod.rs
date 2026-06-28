@@ -27,6 +27,7 @@ use std::time::Instant;
 use types::StoreInner;
 
 impl PolicyStore {
+    #[must_use]
     pub fn new(args: PolicydArgs) -> Self {
         Self {
             args,
