@@ -1,5 +1,9 @@
 # sudo shim for jailed agents: deny, or delegate to policyd.
-{ pkgs, policyPkg, policy }:
+{
+  pkgs,
+  policyPkg,
+  policy,
+}:
 let
   body =
     if policy == "deny" then
