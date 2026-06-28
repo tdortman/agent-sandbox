@@ -45,6 +45,12 @@ impl NetworkRequestIdentity<'_> {
     }
 }
 
+struct PendingNetResult {
+    id: String,
+    is_new: bool,
+    rx: oneshot::Receiver<CheckReply>,
+}
+
 impl PolicyStore {
     /// Finish pending network checks that declarative/session policy already allows (e.g. after a UI client registers).
     pub async fn resolve_pending_declarative_allow(&self) {
@@ -183,7 +189,7 @@ impl PolicyStore {
             project_root: project_root.as_deref(),
             sandbox_session_id: sandbox_session_id.as_deref(),
         };
-        let (pending_id, created_prompt, rx) = match self
+        let result = match self
             .dedup_or_create_pending_network(&identity, &scheme, &url, &aliases)
             .await
         {
@@ -192,14 +198,14 @@ impl PolicyStore {
         };
         let route = UiRoute::new(cwd.clone(), project_root.clone())
             .with_sandbox_session(sandbox_session_id.clone());
-        if created_prompt {
+        if result.is_new {
             Self::audit("pending", Some(policy_host.as_str()), Some(port), &scheme);
             // Notify immediately. Late UI registration is flushed by
             // `RegisterUi` in `server::client` (see `flush_pending_to_ui`).
             self.notify_network_ui(
                 &route,
                 &UiPush::NetworkRequest {
-                    id: pending_id.clone(),
+                    id: result.id.clone(),
                     host: Some(policy_host.clone()),
                     port: Some(port),
                     scheme: Some(scheme.clone()),
@@ -239,7 +245,7 @@ impl PolicyStore {
             }
         }
 
-        self.await_network_verdict(&route, &pending_id, policy_host, port, &scheme, rx)
+        self.await_network_verdict(&route, &result.id, policy_host, port, &scheme, result.rx)
             .await
     }
     async fn check_network_verdict_cache(
@@ -269,7 +275,7 @@ impl PolicyStore {
         scheme: &str,
         url: &str,
         aliases: &[String],
-    ) -> Result<(String, bool, oneshot::Receiver<CheckReply>), CheckReply> {
+    ) -> Result<PendingNetResult, CheckReply> {
         let (tx, rx) = oneshot::channel();
 
         let mut inner = self.inner.lock().await;
@@ -297,7 +303,11 @@ impl PolicyStore {
                 .or_default()
                 .push(tx);
             drop(inner);
-            return Ok((existing_id, false, rx));
+            return Ok(PendingNetResult {
+                id: existing_id,
+                is_new: false,
+                rx,
+            });
         }
         if inner.pending.len() >= MAX_PENDING_APPROVALS {
             tracing::warn!(
@@ -329,7 +339,11 @@ impl PolicyStore {
             }),
         );
         drop(inner);
-        Ok((pending_id, true, rx))
+        Ok(PendingNetResult {
+            id: pending_id,
+            is_new: true,
+            rx,
+        })
     }
 
     async fn await_network_verdict(
