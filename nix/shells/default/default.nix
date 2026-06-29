@@ -24,8 +24,6 @@ pkgs.mkShell {
       + ":"
       + "${pkgs.qt6.qtbase.out}/include/QtWidgets"
       + ":"
-      + "${pkgs.qt6.qtbase.out}/include/QtGui"
-      + ":"
-      + "${pkgs.nodejs}/include/node";
+      + "${pkgs.qt6.qtbase.out}/include/QtGui";
   };
 }
