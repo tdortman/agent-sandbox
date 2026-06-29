@@ -108,7 +108,7 @@ impl CompiledPath {
             let glob = Glob::new(&expanded)?.compile_matcher();
             Ok(Self::Glob(glob))
         } else {
-            Ok(Self::Prefix(expanded))
+            Ok(Self::Prefix(normalize_rule_path(&expanded)))
         }
     }
 }
@@ -494,6 +494,21 @@ mod tests {
         assert!(rule.path_matches(Path::new("/home/user"), None));
         assert!(rule.path_matches(Path::new("/home/user/file.txt"), None));
         assert!(!rule.path_matches(Path::new("/var/log"), None));
+    }
+
+    #[test]
+    fn filesystem_rule_trailing_slash_matches_descendants() {
+        // Regression: a rule path ending in '/' (e.g. from a Nix readwriteDirs
+        // entry like "~/.local/state/opencode/") must still match its own
+        // directory and its children. The matcher normalizes the requested path
+        // but previously not the rule path, so the descendant prefix check
+        // failed ("model.json" has no leading '/').
+        let rule = FilesystemRule::new("/home/user/state/opencode/", FileAccess::ReadWrite, "");
+        assert!(rule.path_matches(Path::new("/home/user/state/opencode"), None));
+        assert!(rule.path_matches(Path::new("/home/user/state/opencode/model.json"), None));
+        // Prefix boundary: a longer name sharing the prefix stem must not match.
+        assert!(!rule.path_matches(Path::new("/home/user/state/opencode-other"), None));
+        assert!(!rule.path_matches(Path::new("/home/user/elsewhere"), None));
     }
 
     #[test]
