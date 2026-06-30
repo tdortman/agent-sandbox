@@ -281,17 +281,35 @@ fn fdinfo_flags(pid: i32, fd_name: &str) -> io::Result<i32> {
     i32::from_str_radix(flags, 8).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn event_fd_access(event_fd: i32) -> Option<FileAccess> {
-    if event_fd < 0 {
+/// Read the blocked tracee's open flags from `/proc/{pid}/syscall`.
+///
+/// During a `FAN_OPEN_PERM` event the open is blocked: the tracee's fd
+/// does not exist yet, and the fanotify event fd is always `O_RDONLY`.
+/// The only reliable way to learn the real access mode is to read the
+/// syscall arguments from `/proc/{pid}/syscall`, which the kernel
+/// exposes while the task is blocked inside the syscall.
+fn syscall_open_access(pid: i32) -> Option<FileAccess> {
+    const SYS_OPEN: i32 = 2;
+    const SYS_CREAT: i32 = 85;
+    const SYS_OPENAT: i32 = 257;
+    const SYS_OPENAT2: i32 = 437;
+    if pid <= 0 {
         return None;
     }
-    fdinfo_flags(self_pid_i32(), &event_fd.to_string())
-        .ok()
-        .map(open_flags_to_access)
-}
-
-fn self_pid_i32() -> i32 {
-    i32::try_from(process::id()).unwrap_or(i32::MAX)
+    let content = fs::read_to_string(format!("/proc/{pid}/syscall")).ok()?;
+    let mut parts = content.split_whitespace();
+    let nr: i32 = parts.next()?.parse().ok()?;
+    let flags_arg = match nr {
+        // open(path, flags, mode) — flags is arg1
+        SYS_OPEN => parts.nth(1)?,
+        // openat(dirfd, path, flags, mode) — flags is arg2
+        SYS_OPENAT | SYS_OPENAT2 => parts.nth(2)?,
+        // creat(path, mode) — equivalent to open(path, O_WRONLY|O_CREAT|O_TRUNC)
+        SYS_CREAT => return Some(FileAccess::Write),
+        _ => return None,
+    };
+    let flags = i32::from_str_radix(flags_arg.trim_start_matches("0x"), 16).ok()?;
+    Some(open_flags_to_access(flags))
 }
 
 fn process_fd_access(pid: i32, event_fd: i32) -> Option<FileAccess> {
@@ -340,9 +358,12 @@ fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
         return FileAccess::Read;
     }
     if mask & FAN_OPEN_PERM != 0 {
-        return event_fd_access(event_fd)
-            .or_else(|| process_fd_access(pid, event_fd))
-            .unwrap_or(FileAccess::ReadWrite);
+        // The fanotify event fd is always opened O_RDONLY, so fdinfo on
+        // it always yields Read regardless of the tracee's intent. The
+        // tracee's own fd does not exist yet (the open is blocked).
+        // Read the blocked syscall args from /proc/{pid}/syscall to get
+        // the real open flags.
+        return syscall_open_access(pid).unwrap_or(FileAccess::ReadWrite);
     }
     FileAccess::All
 }
@@ -640,7 +661,7 @@ fn respond(fan_fd: i32, event_fd: i32, response: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{File, OpenOptions};
+    use std::fs::File;
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
@@ -666,7 +687,10 @@ mod tests {
     }
 
     #[test]
-    fn open_perm_uses_event_fd_flags_when_available() {
+    fn open_perm_without_pid_falls_back_to_read_write() {
+        // Without a valid pid, syscall_open_access returns None.
+        // The fallback is ReadWrite (conservative: may prompt but won't
+        // misclassify a write as a read).
         let path =
             std::env::temp_dir().join(format!("agent-sandbox-fsmon-test-{}", std::process::id()));
         {
@@ -677,16 +701,6 @@ mod tests {
         let read_file = File::open(&path).expect("open read-only temp file");
         assert_eq!(
             mask_to_access(FAN_OPEN_PERM, read_file.as_raw_fd(), -1),
-            FileAccess::Read
-        );
-
-        let read_write_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("open read-write temp file");
-        assert_eq!(
-            mask_to_access(FAN_OPEN_PERM, read_write_file.as_raw_fd(), -1),
             FileAccess::ReadWrite
         );
 
