@@ -1,14 +1,18 @@
 #![allow(unsafe_code)]
 
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use agent_sandbox_core::{InodeIdentity, ResourceKind};
+use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    check_target, recv_notification, send_continue, send_errno, target_from_notification,
+    ResourceTarget, SeccompNotif, SyscallTarget, check_resource, check_target, recv_notification,
+    send_addfd, send_continue, send_errno, send_result, target_from_notification,
 };
 use clap::Parser;
 use tokio::time;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,7 +71,16 @@ async fn main() -> std::io::Result<()> {
 
     let cli = Cli::parse();
     set_nonblocking(cli.listener_fd)?;
+    // The syscall-arm SIGSTOPs the child before exec'ing the command so the
+    // broker can acquire the listener fd via pidfd_getfd. Now that the
+    // listener is set up and nonblocking, resume the child so it starts
+    // executing and generating seccomp notifications.
+    if let Some(pid) = cli.child_pid {
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+    }
+
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
+
     loop {
         if child_exited(cli.child_pid) {
             return Ok(());
@@ -97,34 +110,94 @@ async fn main() -> std::io::Result<()> {
                 }
             },
         };
-        let allowed = match target_from_notification(&notif) {
-            Ok(Some(target)) => {
-                check_target(
-                    &cli.policy_socket,
-                    &target,
-                    cli.sandbox_session_id.clone(),
-                    notif.pid,
-                    timeout,
-                )
-                .await
-            }
-            Ok(None) => {
-                debug!(syscall = notif.data.nr, "continuing non-network syscall");
-                true
-            }
-            Err(err) => {
-                warn!(error = %err, syscall = notif.data.nr, "failed to parse syscall target");
-                false
-            }
-        };
+        dispatch_notification(&cli, &notif, timeout).await;
+    }
+}
 
-        let result = if allowed {
-            send_continue(cli.listener_fd, notif.id)
-        } else {
-            send_errno(cli.listener_fd, notif.id, libc::EACCES)
-        };
-        if let Err(err) = result {
-            warn!(error = %err, "seccomp notification response failed");
+/// Dispatch a single seccomp notification: classify the target, check
+/// policy, and emulate/deny/continue as appropriate. Extracted from
+/// `main` to keep the loop body readable.
+async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duration) {
+    match target_from_notification(notif) {
+        Ok(Some(SyscallTarget::Network(target))) => {
+            let allowed = check_target(
+                &cli.policy_socket,
+                &target,
+                cli.sandbox_session_id.clone(),
+                notif.pid,
+                timeout,
+            )
+            .await;
+            let result = if allowed {
+                send_continue(cli.listener_fd, notif.id)
+            } else {
+                info!(target = ?target, "network check denied");
+                send_errno(cli.listener_fd, notif.id, libc::EACCES)
+            };
+            if let Err(err) = result {
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    debug!(error = %err, "seccomp notification response failed");
+                } else {
+                    warn!(error = %err, "seccomp notification response failed");
+                }
+            }
+        }
+        Ok(Some(SyscallTarget::Resource(target))) => {
+            if is_policy_socket_bypass(&target, &cli.policy_socket) {
+                debug!(target = ?target, "bypassing policy socket (infrastructure connect)");
+                if let Err(err) = emulate_resource(cli.listener_fd, notif, &target) {
+                    warn!(error = %err, target = ?target, "policy socket emulation failed");
+                    let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+                }
+                return;
+            }
+            let reply = match check_resource(
+                &cli.policy_socket,
+                &target,
+                cli.sandbox_session_id.clone(),
+                notif.pid,
+                timeout,
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(err) => {
+                    warn!(error = %err, target = ?target, "resource check RPC failed");
+                    let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+                    return;
+                }
+            };
+            if !reply.allowed {
+                info!(target = ?target, source = %reply.source, "resource check denied");
+                let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+                return;
+            }
+            // Emulation path. NEVER send_continue for a resource:
+            // the broker must complete the syscall itself so the tracee
+            // never touches the gated resource directly.
+            if let Err(err) = emulate_resource(cli.listener_fd, notif, &target) {
+                // dup_tracee_fd can fail with ESRCH/ENOENT if the tracee
+                // exited while waiting for approval. Send the real errno
+                // so the tracee (if still alive) sees it, and log at
+                // debug level.
+                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+                debug!(error = %err, errno, target = ?target, "resource emulation failed");
+                let _ = send_errno(cli.listener_fd, notif.id, errno);
+            }
+        }
+        Ok(Some(SyscallTarget::None) | None) => {
+            debug!(syscall = notif.data.nr, "continuing non-gated syscall");
+            if let Err(err) = send_continue(cli.listener_fd, notif.id) {
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    debug!(error = %err, "seccomp notification response failed");
+                } else {
+                    warn!(error = %err, "seccomp notification response failed");
+                }
+            }
+        }
+        Err(err) => {
+            warn!(error = %err, syscall = notif.data.nr, "failed to parse syscall target");
+            let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
         }
     }
 }
@@ -147,4 +220,517 @@ fn child_exited(child_pid: Option<i32>) -> bool {
     let mut status = 0;
     let rc = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
     rc == pid
+}
+
+/// Return true if the target is a connect to the broker's own policyd
+/// socket. These connects are infrastructure traffic from fs-arm (which
+/// runs under the seccomp filter), not agent actions, and should not
+/// prompt. The policy socket is `--ro-bind`'d into the sandbox, so the
+/// agent cannot impersonate it. Emulation still uses `target.raw` (captured
+/// at parse time), preserving TOCTOU safety.
+///
+/// Compares by inode and device, not path, to defeat hardlink aliases:
+/// `link(policy_sock, ~/evil.sock)` creates a second path to the same
+/// socket inode. A path comparison would miss the alias and prompt the
+/// user for infrastructure traffic.
+fn is_policy_socket_bypass(target: &ResourceTarget, policy_socket: &Path) -> bool {
+    if target.kind != ResourceKind::UnixSocket {
+        return false;
+    }
+    match (
+        InodeIdentity::from_path(&target.path),
+        InodeIdentity::from_path(policy_socket),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        // Fall back to canonical path comparison if either stat fails
+        // (e.g. socket deleted between canonicalize and stat).
+        _ => normalize_path(&target.path) == normalize_path(policy_socket),
+    }
+}
+
+/// Canonicalize a path for comparison, resolving symlinks. Falls back to
+/// the original path if canonicalization fails (socket not yet created).
+fn normalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Read the `SO_TYPE` of a broker-owned fd. Returns `None` on any failure
+/// (fd revoked, not a socket) so callers fall through to the safe deny path.
+fn socket_type(fd: i32) -> Option<i32> {
+    let mut sock_type: i32 = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<i32>())
+        .expect("size_of::<i32> fits in socklen_t");
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut sock_type).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc == 0 { Some(sock_type) } else { None }
+}
+
+/// Return true if the socket fd has a connected peer. For `SOCK_STREAM` and
+/// `SOCK_SEQPACKET`, the kernel ignores `msg_name` on connected sockets, so
+/// the destination is fixed by the prior approved `connect`. `CONTINUE` is
+/// safe in that case because the tracee cannot redirect the destination by
+/// swapping `msg_name`. For `SOCK_DGRAM`, `msg_name` overrides the default
+/// peer even on a connected socket, so `CONTINUE` would be unsafe.
+fn is_socket_connected(fd: i32) -> bool {
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+        .expect("size_of::<sockaddr_storage> fits in socklen_t");
+    let rc = unsafe { libc::getpeername(fd, (&raw mut addr).cast(), &raw mut len) };
+    rc == 0
+}
+
+/// Emulate a policy-allowed resource syscall on behalf of the tracee. Never
+/// calls `send_continue`: the broker completes the syscall itself and injects
+/// the result, so the tracee never touches the gated resource directly.
+///
+/// For Unix-socket `connect`/`sendto`/`sendmsg`/`sendmmsg`: duplicate the
+/// tracee's socket fd via `pidfd_getfd`, perform the syscall in the broker's
+/// own fd table, and inject the return value with `send_result`. For device
+/// `open*`: open the device in the broker and install the fd into the tracee
+/// with `send_addfd`.
+///
+/// # Errors
+///
+/// Returns an error if any fd duplication, syscall, or ioctls fail.
+fn emulate_resource(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    target: &ResourceTarget,
+) -> std::io::Result<()> {
+    match target.kind {
+        ResourceKind::UnixSocket => emulate_unix_socket(listener_fd, notif, target),
+        ResourceKind::Device => emulate_device_open(listener_fd, notif, target),
+    }
+}
+
+/// Duplicate a tracee fd into the broker's fd table via `pidfd_open` +
+/// `pidfd_getfd`. Returns an `OwnedFd` that closes on drop. Used to emulate
+/// syscalls on the tracee's socket without the tracee performing them.
+fn dup_tracee_fd(pid: u32, fd: i32) -> std::io::Result<OwnedFd> {
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), 0) };
+    if raw_pidfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = i32::try_from(raw_pidfd)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pidfd out of range"))?;
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    let raw_dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    if raw_dup < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let dup_fd = i32::try_from(raw_dup)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "dup fd out of range"))?;
+    Ok(unsafe { OwnedFd::from_raw_fd(dup_fd) })
+}
+
+/// Emulate a `connect`/`sendto`/`sendmsg`/`sendmmsg` on a Unix-domain socket
+/// the tracee already holds open. The broker duplicates the tracee's socket
+/// fd, performs the syscall with the tracee's args, and injects the return
+/// value. For `sendmsg` with a null `msg_name` (already-connected socket),
+/// the broker continues the syscall because there is no destination to
+/// emulate against. For `sendmsg` with control data (e.g. `SCM_RIGHTS`),
+/// the broker denies it with `EACCES` because it cannot safely relay
+/// ancillary data across the pidfd boundary.
+fn emulate_unix_socket(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    target: &ResourceTarget,
+) -> std::io::Result<()> {
+    let nr_val = i64::from(notif.data.nr);
+    let sockfd = i32::try_from(notif.data.args[0]).unwrap_or(-1);
+    if sockfd < 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid sockfd in notification",
+        ));
+    }
+    let dup = dup_tracee_fd(notif.pid, sockfd)?;
+
+    match nr_val {
+        nr::CONNECT => {
+            // Use the captured raw sockaddr from policy parsing, never
+            // re-read the tracee pointer. This prevents a TOCTOU where the
+            // tracee swaps the sockaddr between approval and emulation.
+            if target.raw.is_empty() {
+                return send_continue(listener_fd, notif.id);
+            }
+            let rc = unsafe {
+                libc::connect(
+                    dup.as_raw_fd(),
+                    target.raw.as_ptr().cast(),
+                    u32::try_from(target.raw.len()).unwrap_or(u32::MAX),
+                )
+            };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+                return send_errno(listener_fd, notif.id, errno);
+            }
+            send_result(listener_fd, notif.id, 0)
+        }
+        nr::SENDTO => enhance_sendto_emulation(listener_fd, notif, &dup, target),
+        nr::SENDMSG => enhance_sendmsg_emulation(listener_fd, notif, &dup, target),
+        nr::SENDMMSG => {
+            // For connected SOCK_STREAM / SOCK_SEQPACKET, the kernel ignores
+            // per-message msg_name, so the destination is fixed by the prior
+            // approved connect. CONTINUE is safe. For datagrams or
+            // unconnected sockets, deny: multi-message emulation is not
+            // supported and CONTINUE would allow a TOCTOU on the destination.
+            if matches!(
+                socket_type(dup.as_raw_fd()),
+                Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)
+            ) && is_socket_connected(dup.as_raw_fd())
+            {
+                return send_continue(listener_fd, notif.id);
+            }
+            info!("sendmmsg on AF_UNIX denied: multi-message emulation not supported");
+            send_errno(listener_fd, notif.id, libc::EACCES)
+        }
+        _ => {
+            // Unknown socket syscall, deny to be safe.
+            send_errno(listener_fd, notif.id, libc::EACCES)
+        }
+    }
+}
+
+/// Emulate `sendto(sockfd, buf, len, flags, dest_addr, addrlen)` on a
+/// duplicated tracee socket. If `dest_addr` is null the socket is already
+/// connected and we continue. Otherwise we re-read the sockaddr and call
+/// sendto from the broker.
+fn enhance_sendto_emulation(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    dup: &OwnedFd,
+    target: &ResourceTarget,
+) -> std::io::Result<()> {
+    const MAX_PAYLOAD: usize = 1024 * 1024;
+    let buf_ptr = notif.data.args[1];
+    let len = usize::try_from(notif.data.args[2]).unwrap_or(0);
+    let flags = i32::try_from(notif.data.args[3]).unwrap_or(0);
+    // For a resource target, the destination was non-null when approved.
+    // Use target.raw unconditionally: if it is empty, something is wrong
+    // and we deny rather than CONTINUE (which would bypass the resource gate).
+    if target.raw.is_empty() {
+        return send_errno(listener_fd, notif.id, libc::EACCES);
+    }
+    // Copy the payload from the tracee's address space into a broker-owned
+    // buffer. The user namespace does NOT share the address space, so tracee
+    // pointers are invalid in the broker.
+    if len > MAX_PAYLOAD {
+        return send_errno(listener_fd, notif.id, libc::E2BIG);
+    }
+    let payload =
+        agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, buf_ptr, len.min(MAX_PAYLOAD))?;
+    let sent = unsafe {
+        libc::sendto(
+            dup.as_raw_fd(),
+            payload.as_ptr().cast(),
+            payload.len(),
+            flags,
+            target.raw.as_ptr().cast(),
+            u32::try_from(target.raw.len()).unwrap_or(u32::MAX),
+        )
+    };
+    if sent < 0 {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+        return send_errno(listener_fd, notif.id, errno);
+    }
+    send_result(listener_fd, notif.id, i64::try_from(sent).unwrap_or(0))
+}
+/// Emulate `sendmsg(sockfd, msg, flags)` on a duplicated tracee socket.
+/// If `msg` is null or `msg_name` is null the socket is already connected
+/// and the broker continues. If the `msghdr` carries control data
+/// (`msg_control != NULL && msg_controllen > 0`) the broker denies the
+/// syscall with `EACCES` because it cannot safely relay ancillary data
+/// (e.g. `SCM_RIGHTS` fd passing) across the pidfd boundary.
+fn enhance_sendmsg_emulation(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    dup: &OwnedFd,
+    target: &ResourceTarget,
+) -> std::io::Result<()> {
+    const MAX_PAYLOAD: usize = 1024 * 1024;
+    let msg_ptr = notif.data.args[1];
+    let flags = i32::try_from(notif.data.args[2]).unwrap_or(0);
+    if msg_ptr == 0 {
+        return send_continue(listener_fd, notif.id);
+    }
+    // Connected SOCK_STREAM / SOCK_SEQPACKET sockets: the kernel ignores
+    // msg_name, so the destination is fixed by the prior approved connect.
+    // CONTINUE is safe because the tracee cannot redirect the destination.
+    // This covers the common case of sendmsg with SCM_RIGHTS on a connected
+    // stream socket (D-Bus, Wayland fd passing).
+    if matches!(
+        socket_type(dup.as_raw_fd()),
+        Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)
+    ) && is_socket_connected(dup.as_raw_fd())
+    {
+        return send_continue(listener_fd, notif.id);
+    }
+    // Read the msghdr to check for control data and find iovec locations.
+    // The destination sockaddr is NOT re-read: use target.raw (captured
+    // during policy parsing) to prevent a TOCTOU swap.
+    let bytes = agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, msg_ptr, 56)?;
+    if bytes.len() < 56 {
+        return send_errno(listener_fd, notif.id, libc::EINVAL);
+    }
+    // For a resource target, the destination was non-null when approved.
+    // Use target.raw unconditionally: if empty, deny rather than CONTINUE.
+    if target.raw.is_empty() {
+        return send_errno(listener_fd, notif.id, libc::EACCES);
+    }
+    let msg_control = u64::from_ne_bytes(bytes[32..40].try_into().expect("8 bytes"));
+    let msg_controllen = u64::from_ne_bytes(bytes[40..48].try_into().expect("8 bytes"));
+    if msg_control != 0 && msg_controllen != 0 {
+        // Control data present (SCM_RIGHTS, SCM_CREDENTIALS, etc.). The
+        // broker cannot safely relay ancillary data, so deny.
+        info!("sendmsg with control data denied");
+        return send_errno(listener_fd, notif.id, libc::EACCES);
+    }
+    let msg_iov = u64::from_ne_bytes(bytes[16..24].try_into().expect("8 bytes"));
+    let msg_iovlen = u64::from_ne_bytes(bytes[24..32].try_into().expect("8 bytes"));
+    // Copy each iovec's payload from the tracee into broker-owned buffers.
+    let iov_count = msg_iovlen.min(1024) as usize;
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(iov_count);
+    let mut total: usize = 0;
+    for i in 0..iov_count {
+        let iov_offset = i * 16;
+        let iov_buf = agent_sandbox_syscall_broker::read_tracee_bytes(
+            notif.pid,
+            msg_iov + iov_offset as u64,
+            16,
+        )?;
+        if iov_buf.len() < 16 {
+            return send_errno(listener_fd, notif.id, libc::EINVAL);
+        }
+        let iov_base = u64::from_ne_bytes(iov_buf[0..8].try_into().expect("8 bytes"));
+        let iov_len = u64::from_ne_bytes(iov_buf[8..16].try_into().expect("8 bytes"));
+        if iov_len == 0 {
+            payloads.push(Vec::new());
+            continue;
+        }
+        let iov_len_usize = usize::try_from(iov_len).unwrap_or(0);
+        total = total.saturating_add(iov_len_usize);
+        if total > MAX_PAYLOAD {
+            return send_errno(listener_fd, notif.id, libc::E2BIG);
+        }
+        let payload =
+            agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, iov_base, iov_len_usize)?;
+        payloads.push(payload);
+    }
+    // Build broker-owned iovec array pointing into our payloads.
+    let mut iovs: Vec<libc::iovec> = payloads
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        })
+        .collect();
+    // Build a broker-owned msghdr. Use target.raw as the destination
+    // sockaddr, never re-read the tracee pointer.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iovs.as_mut_ptr();
+    msg.msg_iovlen = iovs.len();
+    if !target.raw.is_empty() {
+        msg.msg_name = target.raw.as_ptr().cast::<libc::c_void>().cast_mut();
+        msg.msg_namelen = u32::try_from(target.raw.len()).unwrap_or(u32::MAX);
+    }
+    let rc = unsafe { libc::sendmsg(dup.as_raw_fd(), &raw const msg, flags) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+        return send_errno(listener_fd, notif.id, errno);
+    }
+    send_result(listener_fd, notif.id, i64::try_from(rc).unwrap_or(0))
+}
+
+/// Emulate `open`/`openat`/`openat2`/`creat` of a policy-allowed device by
+/// opening the device in the broker's own fd table and installing that fd
+/// into the tracee via `SECCOMP_IOCTL_NOTIF_ADDFD` with
+/// `SECCOMP_ADDFD_FLAG_SEND`. This atomically delivers the fd and completes
+/// the notification, so no follow-up `SECCOMP_IOCTL_NOTIF_SEND` is needed.
+/// The `cloexec` flag is propagated from the tracee's requested `O_CLOEXEC`.
+fn emulate_device_open(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    target: &ResourceTarget,
+) -> std::io::Result<()> {
+    // Use the captured flags and mode from policy parsing (target fields),
+    // never re-read the tracee's open_how or flags arg after approval.
+    let flags = target.open_flags;
+    let mode = target.open_mode;
+
+    // Use the captured path from policy parsing (target.raw), never
+    // re-read the tracee pointer. This prevents a TOCTOU where the tracee
+    // swaps the path between approval and emulation.
+    let path = std::str::from_utf8(&target.raw)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 path"))?;
+
+    // Open the device with the broker's privileges.
+    let path_c = std::ffi::CString::new(path)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "path has NUL"))?;
+    let opened = unsafe { libc::open(path_c.as_ptr(), flags, mode) };
+    if opened < 0 {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+        return send_errno(listener_fd, notif.id, errno);
+    }
+    // Send the fd to the tracee. SECCOMP_ADDFD_FLAG_SEND atomically installs
+    // the fd and completes the notification. Propagate O_CLOEXEC so the
+    // tracee's semantics are preserved across its own exec.
+    let cloexec = (flags & libc::O_CLOEXEC) != 0;
+    let result = send_addfd(listener_fd, notif.id, opened, cloexec);
+    // send_addfd consumes the notification. Close our local copy of the fd
+    // because the kernel has installed a separate one in the tracee.
+    unsafe { libc::close(opened) };
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_policy_socket_bypass, is_socket_connected, socket_type};
+    use agent_sandbox_core::{ResourceAccess, ResourceKind};
+    use agent_sandbox_syscall_broker::ResourceTarget;
+    use std::path::{Path, PathBuf};
+
+    fn make_unix_target(path: &str) -> ResourceTarget {
+        ResourceTarget {
+            kind: ResourceKind::UnixSocket,
+            path: PathBuf::from(path),
+            access: ResourceAccess::Connect,
+            raw: path.as_bytes().to_vec(),
+            open_flags: 0,
+            open_mode: 0,
+        }
+    }
+
+    #[test]
+    fn is_socket_connected_detects_connected_stream() {
+        let mut fds = [0_i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        assert!(
+            is_socket_connected(fds[0]),
+            "socketpair fd should be connected"
+        );
+        assert!(
+            is_socket_connected(fds[1]),
+            "socketpair fd should be connected"
+        );
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn is_socket_connected_rejects_unconnected_dgram() {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "socket creation failed");
+        assert!(
+            !is_socket_connected(fd),
+            "unconnected dgram should report not connected"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn socket_type_reads_stream() {
+        let mut fds = [0_i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        assert_eq!(socket_type(fds[0]), Some(libc::SOCK_STREAM));
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn socket_type_reads_dgram() {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "socket creation failed");
+        assert_eq!(socket_type(fd), Some(libc::SOCK_DGRAM));
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn policy_socket_bypass_matches_exact_path() {
+        let target = make_unix_target("/run/agent-sandbox/policy.sock");
+        assert!(is_policy_socket_bypass(
+            &target,
+            Path::new("/run/agent-sandbox/policy.sock")
+        ));
+    }
+
+    #[test]
+    fn policy_socket_bypass_rejects_other_paths() {
+        let target = make_unix_target("/run/user/1000/op-daemon.sock");
+        assert!(!is_policy_socket_bypass(
+            &target,
+            Path::new("/run/agent-sandbox/policy.sock")
+        ));
+    }
+
+    #[test]
+    fn policy_socket_bypass_rejects_device_kind() {
+        let target = ResourceTarget {
+            kind: ResourceKind::Device,
+            path: PathBuf::from("/run/agent-sandbox/policy.sock"),
+            access: ResourceAccess::OpenRead,
+            raw: b"/run/agent-sandbox/policy.sock".to_vec(),
+            open_flags: 0,
+            open_mode: 0,
+        };
+        assert!(!is_policy_socket_bypass(
+            &target,
+            Path::new("/run/agent-sandbox/policy.sock")
+        ));
+    }
+
+    #[test]
+    fn policy_socket_bypass_detects_hardlink() {
+        // Create a real Unix socket, hardlink it, and verify the bypass
+        // detects the alias via inode comparison.
+        let dir = std::env::temp_dir();
+        let orig = dir.join("asbx_bypass_orig.sock");
+        let alias = dir.join("asbx_bypass_alias.sock");
+        let _ = std::fs::remove_file(&orig);
+        let _ = std::fs::remove_file(&alias);
+
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket creation failed");
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = u16::try_from(libc::AF_UNIX).expect("AF_UNIX fits in u16");
+        let path_str = orig.to_string_lossy().into_owned();
+        let path_bytes = path_str.as_bytes();
+        let len = path_bytes.len().min(107);
+        for (i, &b) in path_bytes[..len].iter().enumerate() {
+            addr.sun_path[i] = b.cast_signed();
+        }
+        let addr_len = libc::socklen_t::try_from(2 + len).expect("sockaddr len fits");
+        let rc = unsafe { libc::bind(fd, (&raw const addr).cast::<libc::sockaddr>(), addr_len) };
+        assert_eq!(rc, 0, "bind failed");
+
+        // Create hardlink: both paths share the same inode.
+        std::fs::hard_link(&orig, &alias).expect("hard_link failed");
+
+        let target = make_unix_target(alias.to_string_lossy().as_ref());
+        assert!(
+            is_policy_socket_bypass(&target, &orig),
+            "hardlink to policy socket should be detected via inode comparison"
+        );
+
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_file(&orig);
+        let _ = std::fs::remove_file(&alias);
+    }
 }

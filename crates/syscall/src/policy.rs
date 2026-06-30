@@ -16,7 +16,8 @@ use std::collections::BTreeSet;
 /// `SYS_` prefix.
 pub mod nr {
     pub use libc::{
-        SYS_clone3 as CLONE3, SYS_connect as CONNECT, SYS_sendfile as SENDFILE,
+        SYS_clone3 as CLONE3, SYS_connect as CONNECT, SYS_creat as CREAT, SYS_open as OPEN,
+        SYS_openat as OPENAT, SYS_openat2 as OPENAT2, SYS_sendfile as SENDFILE,
         SYS_sendmmsg as SENDMMSG, SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO,
         SYS_socket as SOCKET, SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE,
         SYS_write as WRITE, SYS_writev as WRITEV,
@@ -37,20 +38,37 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
 
 /// Syscalls trapped by the seccomp filter and routed to the broker.
 ///
-/// Network-egress only: the syscalls the broker actually policy-gates
-/// (`connect`, `sendto`, `sendmmsg`). `sendmsg` is intentionally not
-/// trapped: the arm uses `sendmsg(SCM_RIGHTS)` to pass the seccomp
-/// listener fd to the broker, and trapping it would deadlock the
-/// bootstrap. Never trap high-frequency I/O (`write`, `writev`,
-/// `sendfile`) or thread/namespace syscalls (`clone3`, `unshare`):
-/// the broker is single-threaded, so trapping them serializes every
-/// I/O call and thread spawn and starves the sandboxed process until
-/// its runtime aborts. `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
+/// Resource-gate set: the syscalls the broker policy-gates for both
+/// network egress and sandboxed resource access. Network-egress syscalls
+/// (`connect`, `sendto`, `sendmsg`, `sendmmsg`) are routed to policyd via
+/// the `Check` RPC. Resource-access syscalls (`open`, `openat`, `openat2`,
+/// `creat`) are routed to policyd via the `CheckResource` RPC and emulated
+/// with the broker's own privileges, so the tracee cannot open the device
+/// directly. `sendmsg` is now trapped because the arm no longer uses
+/// `sendmsg(SCM_RIGHTS)` to pass the listener fd. It uses a `pipe2`
+/// handoff instead, so the bootstrap deadlock that previously excluded
+/// `sendmsg` no longer applies. Never trap high-frequency I/O (`write`,
+/// `writev`, `sendfile`) or thread/namespace syscalls (`clone3`,
+/// `unshare`). The broker is single-threaded, so trapping them serializes
+/// every I/O call and thread spawn and starves the sandboxed process until
+/// its runtime aborts. `SOCKET` is excluded because the broker duplicates
+/// tracee socket fds via `pidfd_getfd` to emulate connect/send. Trapping
+/// `socket` would deadlock that emulation path. `PR_SET_NO_NEW_PRIVS`
+/// blocks `clone3` escape.
 #[must_use]
 pub fn default_syscalls() -> BTreeSet<i64> {
-    [nr::SENDTO, nr::SENDMMSG, nr::CONNECT]
-        .into_iter()
-        .collect()
+    [
+        nr::CONNECT,
+        nr::SENDTO,
+        nr::SENDMSG,
+        nr::SENDMMSG,
+        nr::OPEN,
+        nr::OPENAT,
+        nr::OPENAT2,
+        nr::CREAT,
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[cfg(test)]
@@ -61,22 +79,32 @@ mod tests {
     #[test]
     fn default_syscalls_contains_udp_entry_points() {
         let syscalls = default_syscalls();
+        // Network egress set.
         assert!(syscalls.contains(&nr::SENDTO));
-        assert!(!syscalls.contains(&nr::SENDMSG));
+        assert!(syscalls.contains(&nr::SENDMSG));
         assert!(syscalls.contains(&nr::SENDMMSG));
         assert!(syscalls.contains(&nr::CONNECT));
+        // Resource open* set (the broker policy-gates device access).
+        assert!(syscalls.contains(&nr::OPEN));
+        assert!(syscalls.contains(&nr::OPENAT));
+        assert!(syscalls.contains(&nr::OPENAT2));
+        assert!(syscalls.contains(&nr::CREAT));
     }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn default_syscalls_contains_udp_entry_points() {
-        // The aarch64 default syscalls are the same packet-emitting set as
+        // The aarch64 default syscalls are the same resource-gate set as
         // x86_64; the broker path is the only thing that differs.
         let syscalls = default_syscalls();
         assert!(syscalls.contains(&nr::SENDTO));
-        assert!(!syscalls.contains(&nr::SENDMSG));
+        assert!(syscalls.contains(&nr::SENDMSG));
         assert!(syscalls.contains(&nr::SENDMMSG));
         assert!(syscalls.contains(&nr::CONNECT));
+        assert!(syscalls.contains(&nr::OPEN));
+        assert!(syscalls.contains(&nr::OPENAT));
+        assert!(syscalls.contains(&nr::OPENAT2));
+        assert!(syscalls.contains(&nr::CREAT));
     }
 
     /// Regression: high-frequency I/O and thread/namespace syscalls must
