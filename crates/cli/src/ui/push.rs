@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, FileAccess, ResourceAccess, ResourceKind, UiPush,
-    approval_host_patterns, filesystem_approval_paths, is_ip_literal, split_check_aliases,
+    approval_host_patterns, is_ip_literal, split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
-use super::dialog::pick_option;
+use super::dialog::{pick_option, pick_text};
 use super::error::UiCliError;
 use super::options::{
     ACTION_OPTIONS, PromptAction, ScopeOption, scope_only_options, sudo_target_options,
@@ -286,13 +286,14 @@ async fn handle_filesystem_push(
         return deny_cancellation(socket, &paths, session_id, &id).await;
     };
 
-    // Step 3: for non-Once scopes, choose target level
+    // Step 3: for non-Once scopes, edit the rule path in a text field
     let target = if scope == ApprovalScope::Once {
         None
     } else {
-        match choose_target_level(
-            &format!("agent-sandbox: {} filesystem target?", action.verb()),
-            filesystem_target_options(&path, access, paths.home(), scope),
+        match choose_path_target(
+            &format!("agent-sandbox: allow filesystem {access} path?"),
+            &path.display().to_string(),
+            |rule_path| ApprovalTarget::FilesystemPath { path: rule_path },
         )
         .await?
         {
@@ -343,9 +344,13 @@ async fn handle_resource_push(
     let target = if scope == ApprovalScope::Once {
         None
     } else {
-        match choose_target_level(
-            &format!("agent-sandbox: {} {} target?", action.verb(), kind),
-            resource_target_options(kind, &path, access, paths.home(), scope),
+        match choose_path_target(
+            &format!("agent-sandbox: allow {kind} {access} path?"),
+            &path.display().to_string(),
+            move |rule_path| ApprovalTarget::ResourcePath {
+                resource_kind: kind,
+                path: rule_path,
+            },
         )
         .await?
         {
@@ -394,6 +399,19 @@ async fn choose_scope_only(
     let options = scope_only_options(session_available);
     let choice = choose_scope(title, options).await?;
     Ok(choice.map(|opt| opt.scope))
+}
+
+async fn choose_path_target(
+    title: &str,
+    default_path: &str,
+    build_target: impl FnOnce(PathBuf) -> ApprovalTarget + Send + 'static,
+) -> Result<Option<ApprovalTarget>, UiCliError> {
+    let title = title.to_string();
+    let default_path = default_path.to_string();
+    let choice = tokio::task::spawn_blocking(move || pick_text(&title, &default_path))
+        .await
+        .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
+    Ok(choice.map(|path| build_target(PathBuf::from(path))))
 }
 
 async fn choose_target_level(
@@ -445,46 +463,6 @@ fn network_target_options(host: &str, scope: ApprovalScope) -> Vec<ScopeOption> 
             label: host_pattern.clone(),
             scope,
             target: Some(ApprovalTarget::NetworkHost { host: host_pattern }),
-        });
-    }
-    options
-}
-
-fn filesystem_target_options(
-    path: &Path,
-    access: FileAccess,
-    home: Option<&Path>,
-    scope: ApprovalScope,
-) -> Vec<ScopeOption> {
-    let levels = filesystem_approval_paths(path, home);
-    let mut options = Vec::with_capacity(levels.len());
-    for level in levels {
-        options.push(ScopeOption {
-            label: format!("{} ({access})", level.display()),
-            scope,
-            target: Some(ApprovalTarget::FilesystemPath { path: level }),
-        });
-    }
-    options
-}
-
-fn resource_target_options(
-    kind: ResourceKind,
-    path: &Path,
-    access: ResourceAccess,
-    home: Option<&Path>,
-    scope: ApprovalScope,
-) -> Vec<ScopeOption> {
-    let levels = filesystem_approval_paths(path, home);
-    let mut options = Vec::with_capacity(levels.len());
-    for level in levels {
-        options.push(ScopeOption {
-            label: format!("{} ({access})", level.display()),
-            scope,
-            target: Some(ApprovalTarget::ResourcePath {
-                resource_kind: kind,
-                path: level,
-            }),
         });
     }
     options

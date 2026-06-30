@@ -19,6 +19,18 @@ pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
     None
 }
 
+/// Prompt for free-form text (e.g. an editable policy path). Returns the trimmed
+/// user input on success.
+pub fn pick_text(title: &str, default_text: &str) -> Option<String> {
+    if prefer_graphical() {
+        if let Some(c) = graphical_text_select(title, default_text) {
+            return Some(c);
+        }
+        info!("no graphical backend available; use agent-sandbox-approve");
+    }
+    None
+}
+
 fn prefer_graphical() -> bool {
     if std::env::var("AGENT_SANDBOX_UI_PREFER_GRAPHICAL").as_deref() == Ok("1") {
         return true;
@@ -63,6 +75,42 @@ fn graphical_select(title: &str, options: &[&str]) -> Option<String> {
     }
 
     // No graphical backend available.
+    None
+}
+
+/// Try each graphical backend for a text-entry prompt.
+fn graphical_text_select(title: &str, default_text: &str) -> Option<String> {
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    let uid = nix::unistd::getuid().as_raw();
+    if uid > 0 {
+        env.extend(graphical_session_env(uid, env.get("HOME").map(Path::new)));
+    }
+
+    match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {
+        Some("qt-dialog") => {
+            let qt = resolve_qt_dialog(&env)?;
+            return qt_dialog_input(&qt, title, default_text, &env);
+        }
+        Some("zenity") => {
+            let z = resolve_zenity(&env)?;
+            return zenity_input(&z, title, default_text, &env);
+        }
+        Some("none") => return None,
+        Some(_) | None => {}
+    }
+
+    if let Some(qt_dialog) = resolve_qt_dialog(&env)
+        && let Some(choice) = qt_dialog_input(&qt_dialog, title, default_text, &env)
+    {
+        return Some(choice);
+    }
+
+    if let Some(zenity) = resolve_zenity(&env)
+        && let Some(choice) = zenity_input(&zenity, title, default_text, &env)
+    {
+        return Some(choice);
+    }
+
     None
 }
 
@@ -116,6 +164,44 @@ fn qt_dialog_select(
     }
 }
 
+fn qt_dialog_input(
+    binary: &str,
+    title: &str,
+    default_text: &str,
+    env: &HashMap<String, String>,
+) -> Option<String> {
+    let args = [
+        binary,
+        "--title",
+        "agent-sandbox",
+        "--text",
+        title,
+        "--input",
+        default_text,
+    ];
+
+    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let output = Command::new(args[0])
+        .args(&args[1..])
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn resolve_zenity(env: &HashMap<String, String>) -> Option<String> {
     if let Some(p) = env.get("AGENT_SANDBOX_ZENITY") {
         let path = std::path::Path::new(p);
@@ -164,5 +250,44 @@ fn zenity_select(
         Some(trimmed.to_string())
     } else {
         None
+    }
+}
+
+fn zenity_input(
+    binary: &str,
+    title: &str,
+    default_text: &str,
+    env: &HashMap<String, String>,
+) -> Option<String> {
+    let args = [
+        binary,
+        "--entry",
+        "--title",
+        "agent-sandbox",
+        "--text",
+        title,
+        "--entry-text",
+        default_text,
+    ];
+
+    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let output = Command::new(args[0])
+        .args(&args[1..])
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
