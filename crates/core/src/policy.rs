@@ -154,9 +154,9 @@ impl FilesystemRule {
 
     /// Whether this rule's path matches the requested path (exact, descendant, or glob).
     ///
-    /// # Panics
-    ///
-    /// Panics if `self.path` is not a valid glob pattern.
+    /// A rule whose `self.path` is a malformed glob pattern (e.g. an unclosed `[`)
+    /// is treated as non-matching rather than panicking. Such rules can arise when
+    /// a user types a free-form path into the approval text field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
         if self.path_matches_inner(requested, project_root) {
@@ -177,7 +177,11 @@ impl FilesystemRule {
         // ponytail: recompile on every match. globset compile is ~10us; add a sidecar
         // cache if profiling shows the matcher is hot. Replaces the previous OnceLock
         // field, which forced manual PartialEq/Eq impls.
-        let compiled = CompiledPath::compile(&self.path, project_root).expect("valid glob pattern");
+        let Ok(compiled) = CompiledPath::compile(&self.path, project_root) else {
+            // A malformed glob saved as a rule (user-typed, free-form) cannot match.
+            // Previously a panic via .expect; now degrades gracefully.
+            return false;
+        };
         match compiled {
             CompiledPath::Prefix(rule_path) => {
                 let requested = normalize_rule_path(requested);
@@ -538,9 +542,9 @@ impl ResourceRule {
 
     /// Whether this rule's path matches the requested path (exact, descendant, or glob).
     ///
-    /// # Panics
-    ///
-    /// Panics if `self.path` is not a valid glob pattern.
+    /// A rule whose `self.path` is a malformed glob pattern (e.g. an unclosed `[`)
+    /// is treated as non-matching rather than panicking. Such rules can arise when
+    /// a user types a free-form path into the approval text field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
         if self.path_matches_inner(requested, project_root) {
@@ -558,7 +562,11 @@ impl ResourceRule {
     }
 
     fn path_matches_inner(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        let compiled = CompiledPath::compile(&self.path, project_root).expect("valid glob pattern");
+        let Ok(compiled) = CompiledPath::compile(&self.path, project_root) else {
+            // A malformed glob saved as a rule (user-typed, free-form) cannot match.
+            // Previously a panic via .expect; now degrades gracefully.
+            return false;
+        };
         match compiled {
             CompiledPath::Prefix(rule_path) => {
                 let requested = normalize_rule_path(requested);
