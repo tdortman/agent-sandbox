@@ -4,17 +4,26 @@
 // Usage:
 //   agent-sandbox-qt-dialog --title <window-title> --text <prompt-text> \
 //       --option <label> [--option <label> ...]
+//   agent-sandbox-qt-dialog --title <window-title> --text <prompt-text> \
+//       --input <default-text>
 //
-// On user selection of an option, prints the exact label text to stdout and
-// exits 0. If the user closes the dialog or presses Cancel/Escape, exits
-// nonzero with no output.
-
+// Exactly one input mode is required: one or more --option (button mode) OR
+// exactly one --input (text-entry mode). They are mutually exclusive.
+//
+// Button mode: on user selection of an option, prints the exact label text to
+// stdout and exits 0. If the user closes the dialog or presses
+// Cancel/Escape, exits nonzero with no output.
+// Input mode: shows a text field pre-populated with <default-text>; on OK
+// (or Enter) prints the (possibly edited) text to stdout and exits 0; on
+// cancel/close/escape exits nonzero with no output.
 #include <getopt.h>
 #include <cstdio>
 #include <cstdlib>
 #include <QApplication>
 #include <QDialog>
 #include <QFrame>
+#include <QHBoxLayout>
+#include <QLineEdit>
 #include <QPalette>
 #include <QPushButton>
 #include <QTextDocument>
@@ -28,7 +37,7 @@ static void usage(FILE* fp, const char* argv0) {
     fprintf(
         fp,
         "Usage: %s --title <title> --text <text> "
-        "--option <label> [--option <label> ...]\n",
+        "--option <label> [--option <label> ...] | --input <default-text>\n",
         argv0
     );
     std::exit(fp == stderr ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -80,13 +89,15 @@ int main(int argc, char* argv[]) {
     std::string title;
     std::string text;
     std::vector<std::string> options;
+    std::string inputDefault;
 
-    enum { OPT_TITLE = 256, OPT_TEXT, OPT_OPTION };
+    enum { OPT_TITLE = 256, OPT_TEXT, OPT_OPTION, OPT_INPUT };
 
     static struct option long_opts[] = {
         {"title", required_argument, nullptr, OPT_TITLE},
         {"text", required_argument, nullptr, OPT_TEXT},
         {"option", required_argument, nullptr, OPT_OPTION},
+        {"input", required_argument, nullptr, OPT_INPUT},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
@@ -103,6 +114,9 @@ int main(int argc, char* argv[]) {
             case OPT_OPTION:
                 options.emplace_back(optarg);
                 break;
+            case OPT_INPUT:
+                inputDefault = optarg;
+                break;
             case 'h':
                 usage(stdout, argv[0]);
                 break;
@@ -111,7 +125,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (title.empty() || text.empty() || options.empty()) {
+    // title and text are required in both modes; exactly one input mode
+    // (options xor inputDefault) is required.
+    const bool haveOptions = !options.empty();
+    const bool haveInput = !inputDefault.empty();
+    if (title.empty() || text.empty() || (haveOptions == haveInput)) {
         usage(stderr, argv[0]);
     }
 
@@ -140,23 +158,50 @@ int main(int argc, char* argv[]) {
     prompt->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
     mainLayout->addWidget(prompt);
 
+    QLineEdit* edit = nullptr;  // input mode (assigned below); nullptr in button mode
     auto* btnLayout = new QVBoxLayout();
     mainLayout->addLayout(btnLayout);
 
     // Track which option was selected. Captured by the click lambda.
     std::string selected;
 
-    for (const auto& opt : options) {
-        auto* btn = new QPushButton(QString::fromStdString(opt), &dialog);
-        btn->setStyleSheet("text-align: left; padding: 6px 12px;");
-        // Comfortable height so the label clears the frame
-        // (12 = stylesheet vertical padding, 8 = frame slack).
-        btn->setMinimumHeight(btn->fontMetrics().height() + 12 + 8);
-        btnLayout->addWidget(btn);
-        QObject::connect(btn, &QPushButton::clicked, [&dialog, &selected, opt]() {
-            selected = opt;
-            dialog.accept();
-        });
+    if (!options.empty()) {
+        // BUTTON MODE: one QPushButton per option.
+        for (const auto& opt : options) {
+            auto* btn = new QPushButton(QString::fromStdString(opt), &dialog);
+            btn->setStyleSheet("text-align: left; padding: 6px 12px;");
+            // Comfortable height so the label clears the frame
+            // (12 = stylesheet vertical padding, 8 = frame slack).
+            btn->setMinimumHeight(btn->fontMetrics().height() + 12 + 8);
+            btnLayout->addWidget(btn);
+            QObject::connect(btn, &QPushButton::clicked, [&dialog, &selected, opt]() {
+                selected = opt;
+                dialog.accept();
+            });
+        }
+    } else {
+        // INPUT MODE: a bare QLineEdit plus an OK/Cancel row. Qt's QLineEdit
+        // already binds Ctrl+Backspace/Delete to DeleteStartOfWord/
+        // DeleteEndOfWord, so path-segment deletion works with no custom
+        // key handling here.
+        edit = new QLineEdit(QString::fromStdString(inputDefault), &dialog);
+        edit->selectAll();
+        edit->setFocus();
+
+        auto* btnRow = new QHBoxLayout();
+        btnRow->addStretch(1);
+        auto* okBtn = new QPushButton("OK", &dialog);
+        okBtn->setDefault(true);
+        auto* cancelBtn = new QPushButton("Cancel", &dialog);
+        btnRow->addWidget(okBtn);
+        btnRow->addWidget(cancelBtn);
+
+        QObject::connect(okBtn, &QPushButton::clicked, &dialog, &QDialog::accept);
+        QObject::connect(edit, &QLineEdit::returnPressed, &dialog, &QDialog::accept);
+        QObject::connect(cancelBtn, &QPushButton::clicked, &dialog, &QDialog::reject);
+
+        mainLayout->addWidget(edit);
+        mainLayout->addLayout(btnRow);
     }
 
     // Pin the prompt's minimum height to its real wrapped height. A top-level
@@ -179,7 +224,7 @@ int main(int argc, char* argv[]) {
         prompt->setMinimumHeight(qCeil(measureDoc.size().height()));
     }
 
-    // Focus the first option so Enter accepts the default.
+    // In button mode, focus the first option so Enter accepts the default.
     if (btnLayout->itemAt(0) != nullptr) {
         if (auto* firstBtn = btnLayout->itemAt(0)->widget()) {
             firstBtn->setFocus();
@@ -189,11 +234,22 @@ int main(int argc, char* argv[]) {
     // QDialog::reject is called on window close or Escape key.
     int ret = dialog.exec();
 
-    if (ret != QDialog::Accepted || selected.empty()) {
+    if (ret != QDialog::Accepted) {
         return EXIT_FAILURE;
     }
 
-    std::printf("%s\n", selected.c_str());
+    std::string result;
+    if (!options.empty()) {
+        result = selected;  // button mode: set by the click lambda
+    } else if (edit != nullptr) {
+        result = edit->text().toStdString();  // input mode: the edited text
+    }
+
+    if (result.empty()) {
+        return EXIT_FAILURE;
+    }
+
+    std::printf("%s\n", result.c_str());
     std::fflush(stdout);
     return EXIT_SUCCESS;
 }
