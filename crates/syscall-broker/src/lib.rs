@@ -962,20 +962,51 @@ mod tests {
     }
 
     #[test]
-    fn parse_unix_sockaddr_abstract() {
-        // AF_UNIX abstract namespace: bytes[2] == 0 marks abstract, the
-        // name follows and may contain arbitrary bytes.
+    fn parse_unix_sockaddr_abstract_printable_uses_decoded_text() {
+        // Printable UTF-8 abstract names become `@abstract:<text>` so glob
+        // rules like `nv_target_process_*` match the decoded name.
+        let mut bytes = vec![1, 0, 0]; // family + abstract marker
+        bytes.extend_from_slice(b"nv_target_process_1104286");
+        let parsed = parse_sockaddr(&bytes).expect("AF_UNIX abstract parses");
+        match parsed {
+            SockaddrTarget::Unix { address, raw } => {
+                assert_eq!(
+                    address,
+                    UnixAddress::AbstractHex("@abstract:nv_target_process_1104286".into())
+                );
+                assert_eq!(raw, bytes);
+            }
+            other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unix_sockaddr_abstract_truncates_at_embedded_nul() {
+        // Abstract names can contain embedded NULs. We truncate at the first
+        // NUL so trailing zero-padding does not leak into the policy key.
+        // The printable prefix decodes to `@abstract:<text>`.
         let mut bytes = vec![1, 0, 0]; // family + abstract marker
         bytes.extend_from_slice(b"agent\x00sandbox");
         let parsed = parse_sockaddr(&bytes).expect("AF_UNIX abstract parses");
         match parsed {
             SockaddrTarget::Unix { address, raw } => {
-                // Truncates at first embedded NUL, then hex-encodes the prefix.
-                let expected_hex = hex_encode_lower(b"agent");
-                assert_eq!(
-                    address,
-                    UnixAddress::AbstractHex(format!("@hex:{expected_hex}"))
-                );
+                assert_eq!(address, UnixAddress::AbstractHex("@abstract:agent".into()));
+                assert_eq!(raw, bytes);
+            }
+            other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unix_sockaddr_abstract_binary_falls_back_to_hex() {
+        // Non-UTF-8 or control-byte names keep the `@hex:` form so the key
+        // stays byte-stable when there is no printable text to decode.
+        let mut bytes = vec![1, 0, 0]; // family + abstract marker
+        bytes.extend_from_slice(&[0xff, 0xab, 0x01]);
+        let parsed = parse_sockaddr(&bytes).expect("AF_UNIX abstract parses");
+        match parsed {
+            SockaddrTarget::Unix { address, raw } => {
+                assert_eq!(address, UnixAddress::AbstractHex("@hex:ffab01".into()));
                 assert_eq!(raw, bytes);
             }
             other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
