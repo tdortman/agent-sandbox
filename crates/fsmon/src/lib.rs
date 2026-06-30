@@ -1,13 +1,15 @@
 //! Shared types for the fanotify-based filesystem monitor binaries.
 
+use std::path::PathBuf;
+
 /// Arguments passed from the arm helper to the fsmon binary via CLI flags.
 #[derive(Debug, Clone)]
 pub struct FsmonArgs {
     pub pid: u32,
-    pub socket: String,
-    pub cwd: Option<String>,
-    pub home: Option<String>,
-    pub project_root: Option<String>,
+    pub socket: PathBuf,
+    pub cwd: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
 }
 
 /// Minimal RPC client for connecting to policyd over a Unix socket.
@@ -68,12 +70,12 @@ pub mod rpc_client {
     /// an unexpected reply type.
     pub fn check_filesystem(
         socket_path: &Path,
-        path: &str,
+        path: &Path,
         access: FileAccess,
         ctx: RequestContext,
     ) -> Result<FilesystemCheckReply, Error> {
         let req = RpcRequest::CheckFilesystem {
-            path: path.to_owned(),
+            path: path.to_path_buf(),
             access,
             ctx,
         };

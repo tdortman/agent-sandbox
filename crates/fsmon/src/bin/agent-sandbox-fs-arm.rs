@@ -5,12 +5,12 @@
 //! before the command is accepted but not required.
 #![allow(unsafe_code)]
 
-use agent_sandbox_core::{FileAccess, FilesystemRule, RequestContext};
+use agent_sandbox_core::{FilesystemRule, RequestContext};
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser as _;
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(clap::Parser, Debug)]
@@ -48,26 +48,12 @@ fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&P
     };
     let home = home.to_string_lossy();
     for rule in static_allow {
-        if let Some(rest) = rule.path.strip_prefix("~/") {
-            rule.path = format!("{}/{}", home.trim_end_matches('/'), rest);
-        } else if rule.path == "~" {
-            rule.path = home.to_string();
+        if let Ok(rest) = rule.path.strip_prefix("~/") {
+            rule.path = PathBuf::from(format!("{}/{}", home.trim_end_matches('/'), rest.display()));
+        } else if rule.path == Path::new("~") {
+            rule.path = PathBuf::from(home.to_string());
         }
     }
-}
-
-fn add_project_static_allow(static_allow: &mut Vec<FilesystemRule>, project_root: Option<&Path>) {
-    let Some(project_root) = project_root else {
-        return;
-    };
-    if project_root.as_os_str().is_empty() {
-        return;
-    }
-    static_allow.push(FilesystemRule::new(
-        project_root.to_string_lossy().into_owned(),
-        FileAccess::All,
-        "project",
-    ));
 }
 
 fn main() {
@@ -83,9 +69,9 @@ fn main() {
         .unwrap_or_else(|_| "/run/agent-sandbox/policy.sock".to_owned());
 
     let ctx = RequestContext {
-        cwd,
-        home: home.clone(),
-        project_root: project_root.clone(),
+        cwd: cwd.map(PathBuf::from),
+        home: home.clone().map(PathBuf::from),
+        project_root: project_root.map(PathBuf::from),
         pid: None,
         uid: None,
         sandbox_session_id,
@@ -98,8 +84,6 @@ fn main() {
         .unwrap_or_default();
 
     expand_home_static_allow(&mut static_allow, home.as_deref().map(Path::new));
-    add_project_static_allow(&mut static_allow, project_root.as_deref().map(Path::new));
-
     // Connect to policyd and request monitor startup.
     let reply = rpc_client::start_monitor(Path::new(&socket_path), ctx, static_allow)
         .unwrap_or_else(|e| {

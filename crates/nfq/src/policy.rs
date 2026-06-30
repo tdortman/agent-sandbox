@@ -100,6 +100,8 @@ fn pid_uid(pid: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
 
     use super::request_context;
@@ -110,8 +112,8 @@ mod tests {
         let ctx = request_context(&paths, ProcessIds::new(0, 1000), Some("s1".into()));
 
         assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
-        assert_eq!(ctx.cwd.as_deref(), Some("/work"));
-        assert_eq!(ctx.home.as_deref(), Some("/home/user"));
-        assert_eq!(ctx.project_root.as_deref(), Some("/work"));
+        assert_eq!(ctx.cwd.as_deref(), Some(Path::new("/work")));
+        assert_eq!(ctx.home.as_deref(), Some(Path::new("/home/user")));
+        assert_eq!(ctx.project_root.as_deref(), Some(Path::new("/work")));
     }
 }

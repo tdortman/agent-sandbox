@@ -49,19 +49,19 @@ struct Cli {
         value_name = "SOCKET",
         default_value = "/run/agent-sandbox/policy.sock"
     )]
-    socket: String,
+    socket: PathBuf,
 
     /// Working directory inside the sandbox. Used to scope per-project policy and to pick which mounts are marked. Defaults to the env var `AGENT_SANDBOX_CWD` if unset.
     #[arg(long, value_name = "DIR")]
-    cwd: Option<String>,
+    cwd: Option<PathBuf>,
 
     /// Home directory inside the sandbox. Used to expand "~" in filesystem rules and to gate "global" scope. Defaults to the env var `AGENT_SANDBOX_HOME` if unset.
     #[arg(long, value_name = "DIR")]
-    home: Option<String>,
+    home: Option<PathBuf>,
 
     /// Project root directory inside the sandbox. Required for "project" scope approvals to land in the right per-project policy file. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
     #[arg(long, value_name = "DIR")]
-    project_root: Option<String>,
+    project_root: Option<PathBuf>,
 }
 
 /// `fanotify_init` flags.
@@ -380,7 +380,7 @@ fn mark_mountpoints(
     fan_fd: i32,
     mounts: &[MountRecord],
     home_covering_mount: Option<&Path>,
-    cli_home: Option<&str>,
+    cli_home: Option<&Path>,
 ) -> MountpointMarks {
     let mut saw_pre_access_mark = false;
     let mut home_covered = false;
@@ -392,7 +392,7 @@ fn mark_mountpoints(
             eprintln!(
                 "agent-sandbox-fsmon: --home {} is on unsupported synthetic filesystem {} at {}; \
                  cannot guarantee filesystem monitoring",
-                cli_home.unwrap_or("?"),
+                cli_home.map_or_else(|| "?".into(), |h| h.to_string_lossy().into_owned()),
                 mount.fstype,
                 mount.mount_point.display()
             );
@@ -419,8 +419,7 @@ fn mark_mountpoints(
             }
             Err(e) => {
                 if home_covering_mount == Some(mount.mount_point.as_path())
-                    || cli_home
-                        .is_some_and(|home| is_under_home(&mount.mount_point, Path::new(home)))
+                    || cli_home.is_some_and(|home| is_under_home(&mount.mount_point, home))
                 {
                     eprintln!(
                         "agent-sandbox-fsmon: fanotify_mark {} (under --home): {e}",
@@ -522,7 +521,8 @@ fn run_event_loop(
                 }
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
-                let reply = rpc_client::check_filesystem(socket_path, &path, access, event_ctx);
+                let reply =
+                    rpc_client::check_filesystem(socket_path, Path::new(&path), access, event_ctx);
 
                 let verdict = match &reply {
                     Ok(r) if r.allowed => FAN_ALLOW,
@@ -588,7 +588,7 @@ fn main() {
     let home_covering_mount = cli
         .home
         .as_deref()
-        .and_then(|home| deepest_covering_mount(&mounts, Path::new(home)))
+        .and_then(|home| deepest_covering_mount(&mounts, home))
         .map(Path::to_path_buf);
 
     let MountpointMarks {
@@ -606,8 +606,9 @@ fn main() {
         && !home_covered
     {
         eprintln!(
-            "agent-sandbox-fsmon: no successfully marked mount covers --home {home}; \
-             cannot guarantee filesystem monitoring"
+            "agent-sandbox-fsmon: no successfully marked mount covers --home {}; \
+             cannot guarantee filesystem monitoring",
+            home.display()
         );
         process::exit(1);
     }
@@ -616,12 +617,10 @@ fn main() {
     println!("ready");
     let _ = io::stdout().flush();
 
-    let home = cli.home.clone();
-
     // Build the request context for RPC checks.
     let ctx = agent_sandbox_core::RequestContext {
         cwd: cli.cwd,
-        home,
+        home: cli.home,
         project_root: cli.project_root,
         pid: None,
         uid: None,
@@ -633,7 +632,7 @@ fn main() {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let socket_path = Path::new(&cli.socket);
+    let socket_path = cli.socket.as_path();
 
     run_event_loop(
         fan_fd,
