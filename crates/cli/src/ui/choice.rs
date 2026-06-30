@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 
 use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
@@ -7,13 +7,13 @@ use tracing::info;
 use super::error::UiCliError;
 use super::options::{PromptAction, ScopeOption};
 
-pub fn format_elevation_title(argv: &[String], _cwd: &str) -> String {
+pub fn format_elevation_title(argv: &[String], _cwd: &Path) -> String {
     let cmd = argv.join(" ");
     format!("agent-sandbox: sudo {cmd}")
 }
 
 pub async fn resolve_choice(
-    socket: &PathBuf,
+    socket: &Path,
     paths: &SandboxPaths,
     session_id: Option<&str>,
     id: &str,
@@ -58,7 +58,11 @@ pub async fn resolve_choice(
             eprintln!("agent-sandbox: {verb} failed ({})", e.error);
         }
         RpcReply::ScopeAction(s) if s.path().is_some() => {
-            eprintln!("Project policy saved to {}.", s.path().unwrap_or_default());
+            eprintln!(
+                "Project policy saved to {}.",
+                s.path()
+                    .map_or_else(String::new, |p| p.display().to_string())
+            );
         }
         _ => {}
     }
@@ -69,7 +73,7 @@ pub async fn resolve_choice(
 /// agent is unblocked with EACCES instead of waiting for the approval
 /// timeout. The denial is in-memory only: no rule is saved.
 pub async fn deny_cancellation(
-    socket: &PathBuf,
+    socket: &Path,
     paths: &SandboxPaths,
     session_id: Option<&str>,
     id: &str,
@@ -91,6 +95,7 @@ pub async fn deny_cancellation(
 #[cfg(test)]
 mod tests {
     use super::format_elevation_title;
+    use std::path::Path;
 
     #[test]
     fn format_elevation_title_keeps_full_long_argv() {
@@ -100,7 +105,7 @@ mod tests {
                 20,
             ))
             .collect();
-        let title = format_elevation_title(&argv, "/work");
+        let title = format_elevation_title(&argv, Path::new("/work"));
         let expected_cmd = argv.join(" ");
         assert!(
             title.contains(&expected_cmd),
@@ -121,7 +126,7 @@ mod tests {
             "adsfsdafsdafdasadsfsdafsdafsadfasd".repeat(20),
             "BLOB=".to_string() + &"a".repeat(500),
         ];
-        let title = format_elevation_title(&argv, "/work");
+        let title = format_elevation_title(&argv, Path::new("/work"));
         assert!(
             !title.contains('\n'),
             "CLI must not insert newlines; the dialog reflows. got {title}"

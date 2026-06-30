@@ -24,13 +24,13 @@ struct Cli {
     socket: PathBuf,
 
     #[arg(long)]
-    cwd: String,
+    cwd: PathBuf,
 
     #[arg(long)]
-    home: String,
+    home: PathBuf,
 
     #[arg(long)]
-    project_root: Option<String>,
+    project_root: Option<PathBuf>,
 
     #[arg(long)]
     sandbox_session_id: String,

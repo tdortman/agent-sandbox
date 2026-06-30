@@ -1,6 +1,6 @@
 //! Host CLI for pending policy approvals.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_sandbox_core::{
@@ -43,13 +43,13 @@ enum Command {
     Pending {
         /// Home directory inside the sandbox. Used to scope "global" rules to the right "policy.json". Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
-        home: Option<String>,
+        home: Option<PathBuf>,
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
-        cwd: Option<String>,
+        cwd: Option<PathBuf>,
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
-        project_root: Option<String>,
+        project_root: Option<PathBuf>,
     },
     /// Approve a pending request and persist the rule at the requested scope.
     Approve {
@@ -63,13 +63,13 @@ enum Command {
         session_id: Option<String>,
         /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
-        home: Option<String>,
+        home: Option<PathBuf>,
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
-        cwd: Option<String>,
+        cwd: Option<PathBuf>,
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
-        project_root: Option<String>,
+        project_root: Option<PathBuf>,
     },
     /// Pre-approve a single (host, port) pair without an outstanding request. Writes the rule directly to policyd.
     ApproveHost {
@@ -85,13 +85,13 @@ enum Command {
         session_id: Option<String>,
         /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
-        home: Option<String>,
+        home: Option<PathBuf>,
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
-        cwd: Option<String>,
+        cwd: Option<PathBuf>,
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
-        project_root: Option<String>,
+        project_root: Option<PathBuf>,
     },
     /// Deny a pending request and persist the deny rule at the requested scope.
     Deny {
@@ -105,13 +105,13 @@ enum Command {
         session_id: Option<String>,
         /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
         #[arg(long, value_name = "DIR")]
-        home: Option<String>,
+        home: Option<PathBuf>,
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR")]
-        cwd: Option<String>,
+        cwd: Option<PathBuf>,
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR")]
-        project_root: Option<String>,
+        project_root: Option<PathBuf>,
     },
 }
 /// Parse CLI args, dispatch to the matching subcommand handler, and print the result.
@@ -187,10 +187,10 @@ pub async fn run() -> Result<(), ApproveCliError> {
 }
 /// Fetch and display the list of pending approval requests.
 async fn handle_pending(
-    socket: &PathBuf,
-    home: Option<String>,
-    cwd: Option<String>,
-    project_root: Option<String>,
+    socket: &Path,
+    home: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    project_root: Option<PathBuf>,
 ) -> Result<(), ApproveCliError> {
     let p = SandboxPaths::from_wire(cwd, home, project_root);
     let req = RpcRequest::Status {
@@ -220,14 +220,26 @@ async fn handle_pending(
             } => {
                 let path = path.unwrap_or_default();
                 let access = access.map_or_else(String::new, |value| value.to_string());
-                println!("{id}\tfilesystem\t{access}\t{path}");
+                println!("{id}\tfilesystem\t{access}\t{}", path.display());
+            }
+            PendingSummary::Resource {
+                id,
+                resource_kind,
+                path,
+                access,
+                ..
+            } => {
+                let kind = resource_kind.to_string();
+                let path = path.unwrap_or_default();
+                let access = access.map_or_else(String::new, |value| value.to_string());
+                println!("{id}\tresource\t{kind}\t{access}\t{}", path.display());
             }
         }
     }
     Ok(())
 }
 
-async fn rpc(socket: &PathBuf, req: RpcRequest) -> Result<RpcReply, ApproveCliError> {
+async fn rpc(socket: &Path, req: RpcRequest) -> Result<RpcReply, ApproveCliError> {
     policy_rpc(socket, req, Duration::from_secs(30))
         .await
         .map_err(ApproveCliError::Rpc)

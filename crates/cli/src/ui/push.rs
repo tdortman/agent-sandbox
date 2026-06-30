@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, FileAccess, UiPush, approval_host_patterns,
-    filesystem_approval_paths, is_ip_literal, split_check_aliases,
+    ApprovalScope, ApprovalTarget, FileAccess, ResourceAccess, ResourceKind, UiPush,
+    approval_host_patterns, filesystem_approval_paths, is_ip_literal, split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
@@ -19,23 +19,44 @@ struct NetworkPush {
     port: Option<u16>,
     scheme: Option<String>,
     url: Option<String>,
-    cwd: Option<String>,
-    home: Option<String>,
-    project_root: Option<String>,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
 }
 
 /// Extracted fields from [`UiPush::ElevationRequest`].
 struct ElevationPush {
     id: String,
     argv: Option<Vec<String>>,
-    cwd: Option<String>,
-    home: Option<String>,
-    project_root: Option<String>,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+}
+
+/// Extracted fields from [`UiPush::FilesystemRequest`].
+struct FilesystemPush {
+    id: String,
+    path: PathBuf,
+    access: FileAccess,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+}
+
+/// Extracted fields from [`UiPush::ResourceRequest`].
+struct ResourcePush {
+    id: String,
+    kind: ResourceKind,
+    path: PathBuf,
+    access: ResourceAccess,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
 }
 
 /// Prompt the user for a network request approval.
 async fn handle_network_push(
-    socket: &PathBuf,
+    socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     net: NetworkPush,
@@ -96,7 +117,7 @@ async fn handle_network_push(
 
 /// Prompt the user for an elevation (sudo) request approval.
 async fn handle_elevation_push(
-    socket: &PathBuf,
+    socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     elev: ElevationPush,
@@ -105,7 +126,7 @@ async fn handle_elevation_push(
     let paths = paths.merged_with(elev.cwd, elev.home, elev.project_root);
 
     // Step 1: choose action
-    let title = format_elevation_title(&argv, paths.cwd().unwrap_or("?"));
+    let title = format_elevation_title(&argv, paths.cwd().unwrap_or_else(|| Path::new("?")));
     let Some(action) = choose_action(&title).await? else {
         return deny_cancellation(socket, &paths, session_id, &elev.id).await;
     };
@@ -146,7 +167,7 @@ async fn handle_elevation_push(
 /// # Errors
 /// Returns [`UiCliError`] when RPC communication with policyd fails.
 pub async fn handle_push(
-    socket: &PathBuf,
+    socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     push: UiPush,
@@ -198,48 +219,146 @@ pub async fn handle_push(
             home,
             project_root,
         } => {
-            let paths = paths.merged_with(cwd, home, project_root);
-            let title = format!("agent-sandbox: filesystem {access} {path}");
-
-            // Step 1: choose action
-            let Some(action) = choose_action(&title).await? else {
-                return deny_cancellation(socket, &paths, session_id, &id).await;
+            let fs = FilesystemPush {
+                id,
+                path,
+                access,
+                cwd,
+                home,
+                project_root,
             };
-
-            // Step 2: choose scope
-            let Some(scope) = choose_scope_only(
-                &format!("agent-sandbox: {} filesystem scope?", action.verb()),
-                session_id.is_some(),
-            )
-            .await?
-            else {
-                return deny_cancellation(socket, &paths, session_id, &id).await;
+            handle_filesystem_push(socket, paths, session_id, fs).await?;
+        }
+        UiPush::ResourceRequest {
+            id,
+            kind,
+            path,
+            access,
+            cwd,
+            home,
+            project_root,
+        } => {
+            let res = ResourcePush {
+                id,
+                kind,
+                path,
+                access,
+                cwd,
+                home,
+                project_root,
             };
-
-            // Step 3: for non-Once scopes, choose target level
-            let home_str = paths.home_string();
-            let target = if scope == ApprovalScope::Once {
-                None
-            } else {
-                match choose_target_level(
-                    &format!("agent-sandbox: {} filesystem target?", action.verb()),
-                    filesystem_target_options(&path, access, home_str.as_deref(), scope),
-                )
-                .await?
-                {
-                    Some(t) => Some(t),
-                    None => return deny_cancellation(socket, &paths, session_id, &id).await,
-                }
-            };
-            let choice = ScopeOption {
-                label: String::new(),
-                scope,
-                target,
-            };
-            resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await?;
+            handle_resource_push(socket, paths, session_id, res).await?;
         }
     }
     Ok(())
+}
+
+/// Prompt the user for a filesystem access approval.
+async fn handle_filesystem_push(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    fs: FilesystemPush,
+) -> Result<(), UiCliError> {
+    let FilesystemPush {
+        id,
+        path,
+        access,
+        cwd,
+        home,
+        project_root,
+    } = fs;
+    let paths = paths.merged_with(cwd, home, project_root);
+    let title = format!("agent-sandbox: filesystem {access} {}", path.display());
+
+    // Step 1: choose action
+    let Some(action) = choose_action(&title).await? else {
+        return deny_cancellation(socket, &paths, session_id, &id).await;
+    };
+
+    // Step 2: choose scope
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} filesystem scope?", action.verb()),
+        session_id.is_some(),
+    )
+    .await?
+    else {
+        return deny_cancellation(socket, &paths, session_id, &id).await;
+    };
+
+    // Step 3: for non-Once scopes, choose target level
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        match choose_target_level(
+            &format!("agent-sandbox: {} filesystem target?", action.verb()),
+            filesystem_target_options(&path, access, paths.home(), scope),
+        )
+        .await?
+        {
+            Some(t) => Some(t),
+            None => return deny_cancellation(socket, &paths, session_id, &id).await,
+        }
+    };
+    let choice = ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+    };
+    resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await
+}
+
+/// Prompt the user for a resource access approval.
+async fn handle_resource_push(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    res: ResourcePush,
+) -> Result<(), UiCliError> {
+    let ResourcePush {
+        id,
+        kind,
+        path,
+        access,
+        cwd,
+        home,
+        project_root,
+    } = res;
+    let paths = paths.merged_with(cwd, home, project_root);
+    let title = format!("agent-sandbox: {kind} {access} {}", path.display());
+
+    let Some(action) = choose_action(&title).await? else {
+        return deny_cancellation(socket, &paths, session_id, &id).await;
+    };
+
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} {} scope?", action.verb(), kind),
+        session_id.is_some(),
+    )
+    .await?
+    else {
+        return deny_cancellation(socket, &paths, session_id, &id).await;
+    };
+
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        match choose_target_level(
+            &format!("agent-sandbox: {} {} target?", action.verb(), kind),
+            resource_target_options(kind, &path, access, paths.home(), scope),
+        )
+        .await?
+        {
+            Some(t) => Some(t),
+            None => return deny_cancellation(socket, &paths, session_id, &id).await,
+        }
+    };
+    let choice = ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+    };
+    resolve_choice(socket, &paths, session_id, &id, action, Some(choice)).await
 }
 
 async fn choose_action(title: &str) -> Result<Option<PromptAction>, UiCliError> {
@@ -332,18 +451,40 @@ fn network_target_options(host: &str, scope: ApprovalScope) -> Vec<ScopeOption> 
 }
 
 fn filesystem_target_options(
-    path: &str,
+    path: &Path,
     access: FileAccess,
-    home: Option<&str>,
+    home: Option<&Path>,
     scope: ApprovalScope,
 ) -> Vec<ScopeOption> {
-    let levels = filesystem_approval_paths(Path::new(path), home.map(Path::new));
+    let levels = filesystem_approval_paths(path, home);
     let mut options = Vec::with_capacity(levels.len());
     for level in levels {
         options.push(ScopeOption {
-            label: format!("{level} ({access})"),
+            label: format!("{} ({access})", level.display()),
             scope,
             target: Some(ApprovalTarget::FilesystemPath { path: level }),
+        });
+    }
+    options
+}
+
+fn resource_target_options(
+    kind: ResourceKind,
+    path: &Path,
+    access: ResourceAccess,
+    home: Option<&Path>,
+    scope: ApprovalScope,
+) -> Vec<ScopeOption> {
+    let levels = filesystem_approval_paths(path, home);
+    let mut options = Vec::with_capacity(levels.len());
+    for level in levels {
+        options.push(ScopeOption {
+            label: format!("{} ({access})", level.display()),
+            scope,
+            target: Some(ApprovalTarget::ResourcePath {
+                resource_kind: kind,
+                path: level,
+            }),
         });
     }
     options

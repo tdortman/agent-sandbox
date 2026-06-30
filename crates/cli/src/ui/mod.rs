@@ -50,13 +50,13 @@ struct Cli {
     socket: PathBuf,
     /// Working directory inside the sandbox. Forwarded to policyd so per-project rules resolve correctly. Defaults to the env var "`AGENT_SANDBOX_CWD`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
-    cwd: Option<String>,
+    cwd: Option<PathBuf>,
     /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var "`AGENT_SANDBOX_HOME`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
-    home: Option<String>,
+    home: Option<PathBuf>,
     /// Project root inside the sandbox. Used to scope "project" rules. Defaults to the env var "`AGENT_SANDBOX_PROJECT_ROOT`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
-    project_root: Option<String>,
+    project_root: Option<PathBuf>,
     /// Sandbox session id. Routes this UI client to a specific sandbox session's pending requests. Defaults to the env var "`AGENT_SANDBOX_SESSION_ID`".
     #[arg(long, value_name = "ID", env = "AGENT_SANDBOX_SESSION_ID")]
     sandbox_session_id: Option<String>,
