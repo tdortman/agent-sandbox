@@ -123,9 +123,10 @@ pub enum SyscallTarget {
 }
 /// Parsed `AF_UNIX` address: a filesystem path or a kernel abstract name.
 ///
-/// Abstract names are encoded as `@hex:<lower-hex>` so they survive JSON
-/// round-trips (they may contain NULs and arbitrary bytes) and can be
-/// matched verbatim by policyd's resource rule engine.
+/// Abstract names are encoded as either `@abstract:<text>` (when the name
+/// is printable UTF-8, so rules like `nv_target_process_*` match) or
+/// `@hex:<lower-hex>` (fallback for binary names). Both survive JSON
+/// round-trips and match verbatim in policyd's resource rule engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnixAddress {
     Path(String),
@@ -151,6 +152,22 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
         out.push(HEX[usize::from(b & 0x0f)] as char);
     }
     out
+}
+/// Format a kernel abstract socket name for use as a policy key.
+///
+/// Printable UTF-8 names become `@abstract:<text>` so users can write glob
+/// rules (`nv_target_process_*`). Binary names fall back to `@hex:<hex>` to
+/// stay byte-stable when the name is not valid text.
+fn format_abstract_name(name: &[u8]) -> String {
+    if name.is_empty() {
+        return "@hex:".to_string();
+    }
+    if let Ok(s) = std::str::from_utf8(name)
+        && s.bytes().all(|b| b >= 0x20 && b != 0x7f)
+    {
+        return format!("@abstract:{s}");
+    }
+    format!("@hex:{}", hex_encode_lower(name))
 }
 
 /// Receive a seccomp notification from the listener fd.
@@ -400,9 +417,9 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Option<SockaddrTarget> {
                 // truncate at the first NUL (the common case) so trailing
                 // zero-padding does not leak into the policy match key.
                 let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-                let hex = hex_encode_lower(&name[..end]);
+                let key = format_abstract_name(&name[..end]);
                 Some(SockaddrTarget::Unix {
-                    address: UnixAddress::AbstractHex(format!("@hex:{hex}")),
+                    address: UnixAddress::AbstractHex(key),
                     raw,
                 })
             } else {
