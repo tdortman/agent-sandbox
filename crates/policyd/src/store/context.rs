@@ -1,11 +1,11 @@
 //! Policy store: context.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    Policy, ProcessIds, ProjectPolicyContext, SandboxPaths, context_from_pid, home_from_uid,
-    load_policy, merge_layers, resolve_policy_write_path, sandbox_session_id_from_pid,
-    trusted_project_policy_path,
+    FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, SandboxPaths,
+    context_from_pid, home_from_uid, load_policy, merge_layers, resolve_policy_write_path,
+    sandbox_session_id_from_pid, trusted_project_policy_path,
 };
 
 use crate::wire::MergeContext;
@@ -32,9 +32,9 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
 impl PolicyStore {
     pub fn resolve_context(&self, ctx: &MergeContext) -> MergeContext {
         let mut paths = SandboxPaths::from_wire(
-            ctx.paths.cwd_string(),
-            ctx.paths.home_string(),
-            ctx.paths.project_root_string(),
+            ctx.paths.cwd_path(),
+            ctx.paths.home_path(),
+            ctx.paths.project_root_path(),
         );
 
         let mut sandbox_session_id = ctx.sandbox_session_id.clone();
@@ -42,9 +42,9 @@ impl PolicyStore {
             let ctx = context_from_pid(pid);
             let proc_paths = SandboxPaths::from_wire(ctx.cwd, ctx.home, ctx.project_root);
             paths = proc_paths.merged_with(
-                paths.cwd_string(),
-                paths.home_string(),
-                paths.project_root_string(),
+                paths.cwd_path(),
+                paths.home_path(),
+                paths.project_root_path(),
             );
             if sandbox_session_id.is_none() {
                 sandbox_session_id = sandbox_session_id_from_pid(pid);
@@ -69,7 +69,11 @@ impl PolicyStore {
         }
 
         MergeContext {
-            paths: SandboxPaths::from_wire(paths.cwd_string(), home, project_root),
+            paths: SandboxPaths::from_wire(
+                paths.cwd_path(),
+                home.map(PathBuf::from),
+                project_root.map(PathBuf::from),
+            ),
             ids: ctx.ids,
             sandbox_session_id,
         }
@@ -103,7 +107,31 @@ impl PolicyStore {
                 layers.push(load_policy(&trusted, home_path, project_root_path));
             }
         }
-        merge_layers(&layers)
+        let mut merged = merge_layers(&layers);
+        // Implicit deny-write for trusted policy files. Covers O_WRONLY
+        // (Write) and O_RDWR (ReadWrite) but NOT O_RDONLY (Read), so the
+        // agent can still read its policy. The DenyInodeCache fingerprints
+        // these by inode, so hardlinks at any path are caught.
+        if let Some(home) = home_path {
+            merged.filesystem.deny.push(FilesystemRule {
+                path: home
+                    .join(".config")
+                    .join("agent-sandbox")
+                    .join("policy.json"),
+                access: FileAccess::Write,
+                comment: Some("trusted policy file".into()),
+            });
+        }
+        if let Some(root) = project_root_path
+            && let Ok(trusted) = trusted_project_policy_path(root)
+        {
+            merged.filesystem.deny.push(FilesystemRule {
+                path: trusted,
+                access: FileAccess::Write,
+                comment: Some("trusted policy file".into()),
+            });
+        }
+        merged
     }
 
     /// Export merged policy to JSON and optionally Nix-format files.

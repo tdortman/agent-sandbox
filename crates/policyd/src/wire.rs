@@ -1,8 +1,10 @@
 //! Grouped wire/context fields for policyd.
 
+use std::path::{Path, PathBuf};
+
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, ProcessIds, RequestContext,
-    SandboxPaths,
+    ResourceAccess, ResourceKind, SandboxPaths,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -25,9 +27,9 @@ impl From<&RequestContext> for MergeContext {
 impl From<MergeContext> for RequestContext {
     fn from(ctx: MergeContext) -> Self {
         Self {
-            cwd: ctx.paths.cwd_string(),
-            home: ctx.paths.home_string(),
-            project_root: ctx.paths.project_root_string(),
+            cwd: ctx.paths.cwd_path(),
+            home: ctx.paths.home_path(),
+            project_root: ctx.paths.project_root_path(),
             pid: ctx.ids.pid(),
             uid: ctx.ids.uid(),
             sandbox_session_id: ctx.sandbox_session_id,
@@ -73,8 +75,17 @@ pub struct SudoScopeOp {
 
 #[derive(Debug, Clone)]
 pub struct FilesystemScopeOp {
-    pub path: String,
+    pub path: PathBuf,
     pub access: FileAccess,
+    pub scope: ApprovalScope,
+    pub wire: ScopeWire,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceScopeOp {
+    pub kind: ResourceKind,
+    pub path: PathBuf,
+    pub access: ResourceAccess,
     pub scope: ApprovalScope,
     pub wire: ScopeWire,
 }
@@ -88,9 +99,9 @@ pub struct UiSpawnContext<'a> {
     pub gate: UiSpawnGate,
     pub sandbox_session_id: Option<&'a str>,
     pub uid: Option<u32>,
-    pub home: Option<&'a str>,
-    pub cwd: Option<&'a str>,
-    pub project_root: Option<&'a str>,
+    pub home: Option<&'a Path>,
+    pub cwd: Option<&'a Path>,
+    pub project_root: Option<&'a Path>,
 }
 
 /// Network check payload for policyd approval.
@@ -107,8 +118,16 @@ pub struct NetworkCheckRequest {
 
 #[derive(Debug, Clone)]
 pub struct FilesystemCheckRequest {
-    pub path: String,
+    pub path: PathBuf,
     pub access: FileAccess,
+    pub ctx: MergeContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceCheckRequest {
+    pub kind: ResourceKind,
+    pub path: PathBuf,
+    pub access: ResourceAccess,
     pub ctx: MergeContext,
 }
 

@@ -1,5 +1,5 @@
 //! Policy store, network.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::time::{Duration, Instant};
 
@@ -28,9 +28,9 @@ const NETWORK_VERDICT_CACHE_TTL: Duration = Duration::from_secs(1);
 struct NetworkRequestIdentity<'a> {
     host: &'a str,
     port: u16,
-    cwd: Option<&'a str>,
-    home: Option<&'a str>,
-    project_root: Option<&'a str>,
+    cwd: Option<&'a Path>,
+    home: Option<&'a Path>,
+    project_root: Option<&'a Path>,
     sandbox_session_id: Option<&'a str>,
 }
 
@@ -161,9 +161,9 @@ impl PolicyStore {
         let policy_host = normalize_host(&host);
         let resolved = self.resolve_context(&ctx);
         let wire_ids = resolved.ids;
-        let cwd = resolved.paths.cwd_string();
-        let home = resolved.paths.home_string();
-        let project_root = resolved.paths.project_root_string();
+        let cwd = resolved.paths.cwd_path();
+        let home = resolved.paths.home_path();
+        let project_root = resolved.paths.project_root_path();
         let sandbox_session_id = resolved.sandbox_session_id.clone();
         if self.policy_denied(&policy_host, port, &resolved) {
             tracing::info!(%policy_host, port, "check deny (project policy)");
@@ -222,7 +222,7 @@ impl PolicyStore {
                     && let Some(h) = &home
                 {
                     spawn_uid =
-                        nix::unistd::User::from_name(&Self::user_for_home(Some(Path::new(h))))
+                        nix::unistd::User::from_name(&Self::user_for_home(Some(h.as_path())))
                             .ok()
                             .flatten()
                             .map(|u| u.uid.as_raw());
@@ -332,9 +332,9 @@ impl PolicyStore {
                 scheme: scheme.to_string(),
                 url: url.to_string(),
                 aliases: aliases.to_vec(),
-                cwd: identity.cwd.map(String::from),
-                home: identity.home.map(String::from),
-                project_root: identity.project_root.map(String::from),
+                cwd: identity.cwd.map(PathBuf::from),
+                home: identity.home.map(PathBuf::from),
+                project_root: identity.project_root.map(PathBuf::from),
                 sandbox_session_id: identity.sandbox_session_id.map(String::from),
             }),
         );
@@ -431,6 +431,8 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{NetworkRequestIdentity, PendingNetwork};
 
     fn pending_network(host: &str, sandbox_session_id: Option<&str>) -> PendingNetwork {
@@ -458,9 +460,9 @@ mod tests {
         let identity = NetworkRequestIdentity {
             host: "example.com",
             port: 443,
-            cwd: cwd.as_deref(),
-            home: home.as_deref(),
-            project_root: project_root.as_deref(),
+            cwd: cwd.as_deref().map(Path::new),
+            home: home.as_deref().map(Path::new),
+            project_root: project_root.as_deref().map(Path::new),
             sandbox_session_id: sandbox_session_id.as_deref(),
         };
 

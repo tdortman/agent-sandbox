@@ -1,7 +1,7 @@
 //! Policy store: elevation.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
@@ -96,9 +96,9 @@ impl PolicyStore {
         let argv: Vec<String> = argv.into_iter().collect();
         let resolved = self.resolve_context(&ctx);
         let wire_ids = resolved.ids;
-        let cwd = resolved.paths.cwd_string();
-        let home = resolved.paths.home_string();
-        let project_root = resolved.paths.project_root_string();
+        let cwd = resolved.paths.cwd_path();
+        let home = resolved.paths.home_path();
+        let project_root = resolved.paths.project_root_path();
         let sandbox_session_id = resolved.sandbox_session_id.clone();
         if self.sudo_policy_denied(&argv, &resolved)
             || self.session_sudo_denied(&argv, &resolved).await
@@ -110,11 +110,7 @@ impl PolicyStore {
             || self.session_sudo_allowed(&argv, &resolved).await
         {
             return self
-                .exec_elevation(
-                    &argv,
-                    cwd.as_deref().map(Path::new),
-                    home.as_deref().map(Path::new),
-                )
+                .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
                 .await;
         }
 
@@ -166,9 +162,9 @@ impl PolicyStore {
     async fn create_pending_elevation_entry(
         &self,
         argv: &[String],
-        cwd: Option<&str>,
-        home: Option<&str>,
-        project_root: Option<&str>,
+        cwd: Option<&Path>,
+        home: Option<&Path>,
+        project_root: Option<&Path>,
         sandbox_session_id: Option<&str>,
     ) -> Option<PendingElevationEntry> {
         let pending_id = format!("elev:{}", Uuid::now_v7().simple());
@@ -191,9 +187,9 @@ impl PolicyStore {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0.0, |d| d.as_secs_f64()),
                     argv: argv.to_vec(),
-                    cwd: cwd.map(String::from),
-                    home: home.map(String::from),
-                    project_root: project_root.map(String::from),
+                    cwd: cwd.map(PathBuf::from),
+                    home: home.map(PathBuf::from),
+                    project_root: project_root.map(PathBuf::from),
                     sandbox_session_id: sandbox_session_id.map(String::from),
                 }),
             );
@@ -207,9 +203,9 @@ impl PolicyStore {
         &self,
         route: &UiRoute,
         wire_ids: &ProcessIds,
-        home: Option<&str>,
-        cwd: Option<&str>,
-        project_root: Option<&str>,
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+        project_root: Option<&Path>,
         sandbox_session_id: Option<&str>,
     ) {
         if self.has_ui_for_route(route).await {
@@ -219,7 +215,7 @@ impl PolicyStore {
         if spawn_uid.is_none_or(|u| u == 0)
             && let Some(h) = home
         {
-            spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(Path::new(h))))
+            spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
                 .ok()
                 .flatten()
                 .map(|u| u.uid.as_raw());

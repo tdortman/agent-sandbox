@@ -1,19 +1,19 @@
 //! Apply pending network or elevation decisions.
-use std::path::Path;
+use std::path::PathBuf;
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
-    RpcReply, ScopeActionReply, SudoRule, approval_host_patterns,
+    ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SudoRule, approval_host_patterns,
 };
-
-use crate::error::PolicydError;
-use crate::store::ui_route::UiRoute;
-use crate::wire::{NetworkScopeOp, PendingDecision, SudoScopeOp};
 
 use super::super::types::{
-    NetworkVerdictKey, Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore,
+    NetworkVerdictKey, Pending, PendingElevation, PendingFilesystem, PendingNetwork,
+    PendingResource, PolicyStore,
 };
 use super::DecisionAction;
+use crate::error::PolicydError;
+use crate::store::ui_route::UiRoute;
+use crate::wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp};
 
 impl PolicyStore {
     pub async fn approve(&self, decision: PendingDecision) -> RpcReply {
@@ -54,6 +54,16 @@ impl PolicyStore {
             Pending::Filesystem(fs) => {
                 self.apply_pending_filesystem_decision(
                     fs,
+                    decision.wire,
+                    decision.scope,
+                    decision.target.as_ref(),
+                    action,
+                )
+                .await
+            }
+            Pending::Resource(res) => {
+                self.apply_pending_resource_decision(
+                    res,
                     decision.wire,
                     decision.scope,
                     decision.target.as_ref(),
@@ -253,18 +263,15 @@ impl PolicyStore {
         let elevation = self
             .exec_elevation(
                 &argv,
-                elev.cwd
-                    .as_deref()
-                    .or_else(|| scope_wire.paths.cwd())
-                    .map(Path::new),
-                elev.home
-                    .as_deref()
-                    .or_else(|| scope_wire.paths.home())
-                    .map(Path::new),
+                elev.cwd.as_deref().or_else(|| scope_wire.paths.cwd()),
+                elev.home.as_deref().or_else(|| scope_wire.paths.home()),
             )
             .await;
         self.finish_elevation(&pending_id, elevation).await;
-        RpcReply::ScopeAction(ScopeActionReply::ok_elevation_approve(scope, saved_path))
+        RpcReply::ScopeAction(ScopeActionReply::ok_elevation_approve(
+            scope,
+            saved_path.map(PathBuf::from),
+        ))
     }
 
     async fn apply_pending_filesystem_decision(
@@ -289,12 +296,19 @@ impl PolicyStore {
         };
 
         if action == DecisionAction::Approve && scope == ApprovalScope::Once {
-            let detail = format!("id={pending_id} path={path} access={:?}", fs.access);
+            let detail = format!(
+                "id={pending_id} path={} access={:?}",
+                path.display(),
+                fs.access
+            );
             Self::audit(action.audit_verb(), None, None, &detail);
             self.finish_filesystem(&pending_id, path.clone(), fs.access, true, "once")
                 .await;
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
-                path, fs.access, scope, None,
+                path.clone(),
+                fs.access,
+                scope,
+                None,
             ));
         }
 
@@ -303,12 +317,15 @@ impl PolicyStore {
             .await;
 
         if action == DecisionAction::Deny && scope == ApprovalScope::Once {
-            let detail = format!("id={pending_id} path={path}");
+            let detail = format!("id={pending_id} path={}", path.display());
             Self::audit(action.audit_verb(), None, None, &detail);
             self.finish_filesystem(&pending_id, path.clone(), fs.access, false, "denied")
                 .await;
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
-                path, fs.access, scope, None,
+                path.clone(),
+                fs.access,
+                scope,
+                None,
             ));
         }
 
@@ -378,7 +395,7 @@ impl PolicyStore {
         pending: &PendingFilesystem,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
-    ) -> Result<String, PolicydError> {
+    ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
         let path = match target {
             None => pending_path.clone(),
@@ -400,7 +417,190 @@ impl PolicyStore {
         }
 
         if FilesystemRule::new(path.clone(), FileAccess::Read, "")
-            .path_matches(Path::new(pending_path), None)
+            .path_matches(pending_path.as_path(), None)
+        {
+            return Ok(path);
+        }
+
+        Err(PolicydError::InvalidDecisionTarget)
+    }
+
+    async fn apply_pending_resource_decision(
+        &self,
+        res: PendingResource,
+        wire: crate::wire::ScopeWire,
+        scope: ApprovalScope,
+        target: Option<&ApprovalTarget>,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let pending_id = res.id.clone();
+        let path = match Self::resolve_pending_resource_target(&res, scope, target) {
+            Ok(value) => value,
+            Err(err) => {
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(pending_id.clone(), Pending::Resource(res));
+                return err.into();
+            }
+        };
+
+        if action == DecisionAction::Approve && scope == ApprovalScope::Once {
+            let detail = format!(
+                "id={pending_id} kind={:?} path={} access={:?}",
+                res.kind,
+                path.display(),
+                res.access
+            );
+            Self::audit(action.audit_verb(), None, None, &detail);
+            self.finish_resource(
+                &pending_id,
+                res.kind,
+                path.clone(),
+                res.access,
+                true,
+                "once",
+            )
+            .await;
+            return RpcReply::ScopeAction(ScopeActionReply::ok_resource(
+                res.kind,
+                path.clone(),
+                res.access,
+                scope,
+                None,
+            ));
+        }
+
+        let scope_wire = self
+            .resource_scope_wire_for_pending(wire, &res, scope)
+            .await;
+
+        if action == DecisionAction::Deny && scope == ApprovalScope::Once {
+            let detail = format!(
+                "id={pending_id} kind={:?} path={}",
+                res.kind,
+                path.display()
+            );
+            Self::audit(action.audit_verb(), None, None, &detail);
+            self.finish_resource(
+                &pending_id,
+                res.kind,
+                path.clone(),
+                res.access,
+                false,
+                "denied",
+            )
+            .await;
+            return RpcReply::ScopeAction(ScopeActionReply::ok_resource(
+                res.kind,
+                path.clone(),
+                res.access,
+                scope,
+                None,
+            ));
+        }
+
+        let result = self
+            .apply_resource_scope(
+                ResourceScopeOp {
+                    kind: res.kind,
+                    path: path.clone(),
+                    access: res.access,
+                    scope,
+                    wire: scope_wire,
+                },
+                action,
+            )
+            .await;
+
+        if result.scope_succeeded() {
+            let source = result.scope_label().unwrap_or(scope.as_str());
+            self.finish_resource(
+                &pending_id,
+                res.kind,
+                path.clone(),
+                res.access,
+                action == DecisionAction::Approve,
+                source,
+            )
+            .await;
+        } else if action == DecisionAction::Approve {
+            self.finish_resource(&pending_id, res.kind, path, res.access, false, "blocked")
+                .await;
+        } else {
+            self.inner
+                .lock()
+                .await
+                .pending
+                .insert(pending_id, Pending::Resource(res));
+        }
+        result
+    }
+
+    async fn resource_scope_wire_for_pending(
+        &self,
+        wire: crate::wire::ScopeWire,
+        res: &PendingResource,
+        scope: ApprovalScope,
+    ) -> crate::wire::ScopeWire {
+        let mut scope_wire = Self::scope_wire_for_pending_resource(wire, res);
+        if scope != ApprovalScope::Session {
+            return scope_wire;
+        }
+
+        let route = UiRoute::new(res.cwd.clone(), res.project_root.clone())
+            .with_sandbox_session(res.sandbox_session_id.clone());
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        if scope_wire
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_ids.contains(session_id))
+        {
+            return scope_wire;
+        }
+        if let Some(session_id) = session_ids.into_iter().min() {
+            scope_wire.session_id = Some(session_id);
+        }
+        scope_wire
+    }
+
+    fn resolve_pending_resource_target(
+        pending: &PendingResource,
+        scope: ApprovalScope,
+        target: Option<&ApprovalTarget>,
+    ) -> Result<PathBuf, PolicydError> {
+        let pending_path = &pending.path;
+        let (kind, path) = match target {
+            None => (pending.kind, pending_path.clone()),
+            Some(ApprovalTarget::ResourcePath {
+                resource_kind,
+                path,
+            }) => {
+                if *resource_kind != pending.kind {
+                    return Err(PolicydError::InvalidDecisionTarget);
+                }
+                (*resource_kind, path.clone())
+            }
+            Some(_) => return Err(PolicydError::InvalidDecisionTarget),
+        };
+        let _ = kind;
+
+        // For Once scope, only exact match is allowed.
+        if scope == ApprovalScope::Once {
+            if path != *pending_path {
+                return Err(PolicydError::InvalidDecisionTarget);
+            }
+            return Ok(path);
+        }
+
+        // For broader scopes, accept exact match or ancestor path (with boundary).
+        if path == *pending_path {
+            return Ok(path);
+        }
+
+        if ResourceRule::new(pending.kind, path.clone(), ResourceAccess::Connect, "")
+            .path_matches(pending_path.as_path(), None)
         {
             return Ok(path);
         }
@@ -462,6 +662,7 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -591,7 +792,7 @@ mod tests {
                 Some(&target),
             )
             .expect("resolve pending filesystem target"),
-            "/home/user/projects/foo"
+            PathBuf::from("/home/user/projects/foo")
         );
     }
 
@@ -762,7 +963,7 @@ mod tests {
         assert!(
             store
                 .session_filesystem_allowed(
-                    "/home/user/projects/foo/src/lib.rs",
+                    Path::new("/home/user/projects/foo/src/lib.rs"),
                     FileAccess::Read,
                     &merge_context(None),
                 )
@@ -785,7 +986,7 @@ mod tests {
         assert!(
             store
                 .session_filesystem_allowed(
-                    "/home/user/projects/foo/src/lib.rs",
+                    Path::new("/home/user/projects/foo/src/lib.rs"),
                     FileAccess::Read,
                     &merge_context(None),
                 )

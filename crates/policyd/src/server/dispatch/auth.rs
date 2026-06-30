@@ -20,6 +20,7 @@ pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
             | RpcRequest::Check { .. }
             | RpcRequest::Elevate { .. }
             | RpcRequest::CheckFilesystem { .. }
+            | RpcRequest::CheckResource { .. }
             | RpcRequest::StartFilesystemMonitor { .. }
     )
 }

@@ -1,5 +1,5 @@
 //! Policy store: ui.
-use std::path::Path;
+use std::path::PathBuf;
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -121,8 +121,8 @@ impl PolicyStore {
         let pending: Vec<Pending> = self.inner.lock().await.pending.values().cloned().collect();
         for p in pending {
             let route = UiRoute::new(
-                p.cwd().map(str::to_owned),
-                p.project_root().map(str::to_owned),
+                p.cwd().map(PathBuf::from),
+                p.project_root().map(PathBuf::from),
             )
             .with_sandbox_session(p.sandbox_session_id().map(str::to_owned));
             let has_ui = match p {
@@ -130,11 +130,10 @@ impl PolicyStore {
                 _ => self.has_ui_for_route(&route).await,
             };
             if !has_ui {
-                let spawn_uid =
-                    nix::unistd::User::from_name(&Self::user_for_home(p.home().map(Path::new)))
-                        .ok()
-                        .flatten()
-                        .map(|u| u.uid.as_raw());
+                let spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(p.home()))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.uid.as_raw());
                 let spawn = UiSpawnContext {
                     gate: UiSpawnGate {
                         has_matching_ui: false,
@@ -157,8 +156,8 @@ impl PolicyStore {
 
     async fn notify_pending(&self, p: &Pending) {
         let route = UiRoute::new(
-            p.cwd().map(str::to_owned),
-            p.project_root().map(str::to_owned),
+            p.cwd().map(PathBuf::from),
+            p.project_root().map(PathBuf::from),
         )
         .with_sandbox_session(p.sandbox_session_id().map(str::to_owned));
         let push = match p {
@@ -186,6 +185,15 @@ impl PolicyStore {
                 cwd: fs.cwd.clone(),
                 home: fs.home.clone(),
                 project_root: fs.project_root.clone(),
+            },
+            Pending::Resource(res) => UiPush::ResourceRequest {
+                id: res.id.clone(),
+                kind: res.kind,
+                path: res.path.clone(),
+                access: res.access,
+                cwd: res.cwd.clone(),
+                home: res.home.clone(),
+                project_root: res.project_root.clone(),
             },
         };
         self.notify_ui(&route, &push).await;

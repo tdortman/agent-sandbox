@@ -6,7 +6,8 @@ mod decisions;
 mod elevation;
 mod filesystem;
 mod network;
-mod persist;
+pub(crate) mod persist;
+mod resource;
 mod scope_filesystem;
 mod scope_network;
 mod scope_sudo;
@@ -16,10 +17,10 @@ mod ui;
 mod ui_route;
 mod util;
 
-pub(crate) use types::UiSessionContext;
 pub use types::{
-    Pending, PendingElevation, PendingFilesystem, PendingKind, PendingNetwork, PolicyStore,
-    PolicydArgs, UiClientHandle,
+    DenyFingerprint, DenyInodeCache, Pending, PendingElevation, PendingFilesystem, PendingKind,
+    PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ResourceVerdictKey, UiClientHandle,
+    UiSessionContext,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,7 @@ impl PolicyStore {
                 elevation_futures: HashMap::new(),
                 network_futures: HashMap::new(),
                 filesystem_futures: HashMap::new(),
+                resource_futures: HashMap::new(),
                 ui_clients: HashMap::new(),
                 ui_context_by_session: HashMap::new(),
                 ui_spawn_last: HashMap::<String, Instant>::new(),
@@ -46,8 +48,12 @@ impl PolicyStore {
                 session_sudo_deny: HashMap::new(),
                 session_filesystem_allow: HashMap::new(),
                 session_filesystem_deny: HashMap::new(),
+                session_resource_allow: HashMap::new(),
+                session_resource_deny: HashMap::new(),
                 network_verdict_cache: HashMap::new(),
                 filesystem_verdict_cache: HashMap::new(),
+                resource_verdict_cache: HashMap::new(),
+                deny_inode_cache: DenyInodeCache::default(),
             }),
         }
     }

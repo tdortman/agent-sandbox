@@ -1,41 +1,43 @@
 //! Policy store: filesystem scope application.
-use std::path::Path;
+use std::path::PathBuf;
 
 use agent_sandbox_core::{
-    ApprovalScope, FileAccess, FilesystemRuleKey, RpcReply, SandboxPaths, ScopeActionReply,
-    ScopeTarget,
+    ApprovalScope, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind, ResourceRuleKey,
+    RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget,
 };
 
 use crate::error::PolicydError;
-use crate::wire::{FilesystemScopeOp, ScopeWire};
+use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 
 use super::decisions::DecisionAction;
+use super::persist::PersistResourceRuleArgs;
 use super::types::PolicyStore;
 
 impl PolicyStore {
     fn finalize_filesystem_scope(
         &self,
         paths: &SandboxPaths,
-        path: String,
+        path: PathBuf,
         access: FileAccess,
         scope: ApprovalScope,
         action: DecisionAction,
     ) -> RpcReply {
         let _ = self.export_policy_files(paths.clone());
         let scope_label = scope.as_str();
-        let detail = format!("path={path} access={access:?} scope={scope_label}");
+        let detail = format!(
+            "path={} access={access:?} scope={scope_label}",
+            path.display()
+        );
         Self::audit(action.audit_verb(), None, None, &detail);
         let policy_path = match (paths.home(), paths.project_root()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(Path::new(p))
-            }
+            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
             _ => None,
         };
         RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
             path,
             access,
             scope,
-            policy_path,
+            policy_path.map(PathBuf::from),
         ))
     }
 
@@ -56,16 +58,10 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id: _,
         } = wire;
-        let cwd = paths.cwd_string();
-        let home = paths.home_string();
-        let project_root = paths.project_root_string();
+        let home = paths.home();
+        let project_root = paths.project_root();
         let target = match self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
-                home.as_deref(),
-                project_root.as_deref(),
-            )
+            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
         {
             Ok(target) => target,
@@ -87,7 +83,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         true,
-                        Some(Path::new(&home)),
+                        Some(home.as_path()),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_filesystem_rule(
@@ -96,7 +92,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         false,
-                        Some(Path::new(&home)),
+                        Some(home.as_path()),
                         owner_uid,
                     ),
                 };
@@ -115,7 +111,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         true,
-                        home.as_deref().map(Path::new),
+                        home,
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_filesystem_rule(
@@ -124,7 +120,7 @@ impl PolicyStore {
                         access,
                         scope_label,
                         false,
-                        home.as_deref().map(Path::new),
+                        home,
                         owner_uid,
                     ),
                 };
@@ -134,13 +130,7 @@ impl PolicyStore {
                 tracing::info!(path = ?policy_path, "project filesystem policy saved");
             }
         }
-        self.finalize_filesystem_scope(
-            &SandboxPaths::from_wire(cwd, home, project_root),
-            path,
-            access,
-            scope,
-            action,
-        )
+        self.finalize_filesystem_scope(&paths, path, access, scope, action)
     }
     pub(crate) async fn apply_filesystem_scope_session(
         &self,
@@ -167,6 +157,136 @@ impl PolicyStore {
                     .or_default();
                 bucket.insert(key.clone());
                 if let Some(allow_bucket) = inner.session_filesystem_allow.get_mut(&session_id) {
+                    allow_bucket.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn finalize_resource_scope(
+        &self,
+        paths: &SandboxPaths,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+        scope: ApprovalScope,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let _ = self.export_policy_files(paths.clone());
+        let scope_label = scope.as_str();
+        let detail = format!(
+            "kind={kind:?} path={} access={access:?} scope={scope_label}",
+            path.display()
+        );
+        Self::audit(action.audit_verb(), None, None, &detail);
+        let policy_path = match (paths.home(), paths.project_root()) {
+            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
+            _ => None,
+        };
+        RpcReply::ScopeAction(ScopeActionReply::ok_resource(
+            kind,
+            path,
+            access,
+            scope,
+            policy_path.map(PathBuf::from),
+        ))
+    }
+
+    pub(crate) async fn apply_resource_scope(
+        &self,
+        op: ResourceScopeOp,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let ResourceScopeOp {
+            kind,
+            path,
+            access,
+            scope,
+            wire,
+        } = op;
+        let ScopeWire {
+            paths,
+            session_id,
+            owner_uid,
+            sandbox_session_id: _,
+        } = wire;
+        let home = paths.home();
+        let project_root = paths.project_root();
+        let target = match self
+            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
+            .await
+        {
+            Ok(target) => target,
+            Err(reply) => return reply,
+        };
+        let scope_label = scope.as_str();
+        match target {
+            ScopeTarget::Ephemeral => {}
+            ScopeTarget::Session { session_id } => {
+                let key = ResourceRuleKey::new(kind, &path, access);
+                self.apply_resource_scope_session(action, session_id.clone(), key)
+                    .await;
+            }
+            ScopeTarget::Global { policy_path, home } => {
+                if let Err(err) = Self::persist_resource_rule(&PersistResourceRuleArgs {
+                    path: &policy_path,
+                    kind,
+                    rule_path: &path,
+                    access,
+                    label: scope_label,
+                    allow_rule: matches!(action, DecisionAction::Approve),
+                    home: Some(home.as_path()),
+                    owner_uid,
+                }) {
+                    return PolicydError::from(err).into();
+                }
+            }
+            ScopeTarget::Project {
+                policy_path,
+                project_root: _,
+            } => {
+                if let Err(err) = Self::persist_resource_rule(&PersistResourceRuleArgs {
+                    path: &policy_path,
+                    kind,
+                    rule_path: &path,
+                    access,
+                    label: scope_label,
+                    allow_rule: matches!(action, DecisionAction::Approve),
+                    home,
+                    owner_uid,
+                }) {
+                    return PolicydError::from(err).into();
+                }
+                tracing::info!(path = ?policy_path, "project resource policy saved");
+            }
+        }
+        self.finalize_resource_scope(&paths, kind, path, access, scope, action)
+    }
+    pub(crate) async fn apply_resource_scope_session(
+        &self,
+        action: DecisionAction,
+        session_id: String,
+        key: ResourceRuleKey,
+    ) {
+        let mut inner = self.inner.lock().await;
+        match action {
+            DecisionAction::Approve => {
+                let bucket = inner
+                    .session_resource_allow
+                    .entry(session_id.clone())
+                    .or_default();
+                bucket.insert(key.clone());
+                if let Some(deny_bucket) = inner.session_resource_deny.get_mut(&session_id) {
+                    deny_bucket.remove(&key);
+                }
+            }
+            DecisionAction::Deny => {
+                let bucket = inner
+                    .session_resource_deny
+                    .entry(session_id.clone())
+                    .or_default();
+                bucket.insert(key.clone());
+                if let Some(allow_bucket) = inner.session_resource_allow.get_mut(&session_id) {
                     allow_bucket.remove(&key);
                 }
             }

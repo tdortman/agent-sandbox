@@ -1,16 +1,17 @@
 //! Policy store: access.
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use std::collections::HashSet;
-
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, FilesystemRuleKey, NetworkRuleKey, allow_keys, normalize_host,
+    FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity, NetworkRuleKey, Policy,
+    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, allow_keys, expand_policy_path,
+    normalize_host,
 };
 
 use crate::store::ui_route::UiRoute;
 use crate::wire::MergeContext;
 
-use super::types::PolicyStore;
+use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
 
 fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u16) -> bool {
     let keys = allow_keys(host, port);
@@ -44,8 +45,8 @@ impl PolicyStore {
     pub(crate) async fn session_allowed(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
         let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
-            resolved.paths.cwd_string(),
-            resolved.paths.project_root_string(),
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
@@ -64,8 +65,8 @@ impl PolicyStore {
     pub(crate) async fn session_denied(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
         let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
-            resolved.paths.cwd_string(),
-            resolved.paths.project_root_string(),
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
@@ -104,8 +105,8 @@ impl PolicyStore {
     pub(crate) async fn session_sudo_denied(&self, argv: &[String], ctx: &MergeContext) -> bool {
         let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
-            resolved.paths.cwd_string(),
-            resolved.paths.project_root_string(),
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
@@ -121,8 +122,8 @@ impl PolicyStore {
     pub(crate) async fn session_sudo_allowed(&self, argv: &[String], ctx: &MergeContext) -> bool {
         let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
-            resolved.paths.cwd_string(),
-            resolved.paths.project_root_string(),
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.session_ids_for_route(&route).await;
@@ -196,60 +197,68 @@ impl PolicyStore {
 
 fn session_filesystem_matches(
     bucket: &HashSet<FilesystemRuleKey>,
-    path: &str,
+    path: &Path,
     access: FileAccess,
 ) -> bool {
     bucket.iter().any(|entry| {
-        let rule = FilesystemRule::new(entry.path.as_str(), entry.access, "");
-        rule.matches(Path::new(path), access, None)
+        let rule = FilesystemRule::new(entry.path.clone(), entry.access, "");
+        rule.matches(path, access, None)
     })
 }
 
 impl PolicyStore {
-    pub(crate) fn filesystem_policy_denied(
+    pub(crate) async fn filesystem_policy_denied(
         &self,
-        path: &str,
+        path: &Path,
         access: FileAccess,
         ctx: &MergeContext,
     ) -> bool {
-        let project_root = ctx.paths.project_root().map(str::to_owned);
+        let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
-        merged.filesystem.deny.iter().any(|rule| {
-            rule.matches(
-                Path::new(path),
-                access,
-                project_root.as_deref().map(Path::new),
-            )
-        })
+        let home = ctx.paths.home();
+        let path_match = merged
+            .filesystem
+            .deny
+            .iter()
+            .any(|rule| rule.matches(path, access, project_root));
+        if path_match {
+            return true;
+        }
+        // Hardlink defense: check if the request path's inode matches any
+        // file under a deny rule. Rebuilds the cache when the fingerprint
+        // (deny rule paths + mtimes) changes.
+        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+        let mut inner = self.inner.lock().await;
+        if Self::fingerprint_changed(&inner.deny_inode_cache, &fingerprint) {
+            inner.deny_inode_cache = Self::rebuild_deny_inode_cache(fingerprint);
+        }
+        Self::is_denied_by_inode(path, access, &inner.deny_inode_cache)
     }
-
     pub(crate) fn filesystem_policy_allowed(
         &self,
-        path: &str,
+        path: &Path,
         access: FileAccess,
         ctx: &MergeContext,
     ) -> bool {
-        let project_root = ctx.paths.project_root().map(str::to_owned);
+        let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
-        merged.filesystem.allow.iter().any(|rule| {
-            rule.matches(
-                Path::new(path),
-                access,
-                project_root.as_deref().map(Path::new),
-            )
-        })
+        merged
+            .filesystem
+            .allow
+            .iter()
+            .any(|rule| rule.matches(path, access, project_root))
     }
 
     pub(crate) async fn session_filesystem_denied(
         &self,
-        path: &str,
+        path: &Path,
         access: FileAccess,
         ctx: &MergeContext,
     ) -> bool {
         let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
-            resolved.paths.cwd_string(),
-            resolved.paths.project_root_string(),
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.filesystem_session_ids_for_route(&route).await;
@@ -264,14 +273,14 @@ impl PolicyStore {
 
     pub(crate) async fn session_filesystem_allowed(
         &self,
-        path: &str,
+        path: &Path,
         access: FileAccess,
         ctx: &MergeContext,
     ) -> bool {
         let resolved = self.resolve_context(ctx);
         let route = UiRoute::new(
-            resolved.paths.cwd_string(),
-            resolved.paths.project_root_string(),
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.filesystem_session_ids_for_route(&route).await;
@@ -284,13 +293,47 @@ impl PolicyStore {
         })
     }
 
+    /// Check if a request path is session-allowed by inode comparison.
+    /// If a hardlink at a different path was already approved this session,
+    /// skip the prompt. The inode is the same, so the approval covers it.
+    pub(crate) async fn session_filesystem_allowed_by_inode(
+        &self,
+        path: &Path,
+        access: FileAccess,
+        ctx: &MergeContext,
+    ) -> bool {
+        let Some(identity) = InodeIdentity::from_path(path) else {
+            return false;
+        };
+        let resolved = self.resolve_context(ctx);
+        let route = UiRoute::new(
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_filesystem_allow
+                .get(sid)
+                .is_some_and(|bucket| {
+                    bucket.iter().any(|entry| {
+                        entry.access.covers(access)
+                            && InodeIdentity::from_path(&entry.path)
+                                .is_some_and(|id| id == identity)
+                    })
+                })
+        })
+    }
+
     pub(crate) async fn filesystem_allow_source(
         &self,
-        path: &str,
+        path: &Path,
         access: FileAccess,
         ctx: &MergeContext,
     ) -> Option<String> {
-        if self.filesystem_policy_denied(path, access, ctx) {
+        if self.filesystem_policy_denied(path, access, ctx).await {
             return Some("deny".into());
         }
         if self.session_filesystem_denied(path, access, ctx).await {
@@ -299,7 +342,259 @@ impl PolicyStore {
         if self.session_filesystem_allowed(path, access, ctx).await {
             return Some("session".into());
         }
+        // Inode-based session allow: if a hardlink at a different path was
+        // already approved this session, skip the prompt. The inode is the
+        // same, so the approval covers it.
+        if self
+            .session_filesystem_allowed_by_inode(path, access, ctx)
+            .await
+        {
+            return Some("session".into());
+        }
         if self.filesystem_policy_allowed(path, access, ctx) {
+            return Some("allow".into());
+        }
+        None
+    }
+
+    /// Compute a fingerprint for the deny rules: one `DenyFingerprint` per
+    /// concrete (non-glob) deny rule path. When this changes the inode
+    /// cache must be rebuilt.
+    fn deny_fingerprint(
+        merged: &Policy,
+        home: Option<&Path>,
+        project_root: Option<&Path>,
+    ) -> Vec<DenyFingerprint> {
+        let mut fps = Vec::new();
+        for rule in &merged.filesystem.deny {
+            let expanded = expand_policy_path(&rule.path, home, project_root);
+            if !expanded.to_string_lossy().contains('*')
+                && !expanded.to_string_lossy().contains('?')
+            {
+                let mtime = std::fs::metadata(&expanded).and_then(|m| m.modified()).ok();
+                fps.push(DenyFingerprint {
+                    path: expanded,
+                    access: rule.access,
+                    mtime,
+                });
+            }
+        }
+        for rule in &merged.resources.deny {
+            let expanded = expand_policy_path(&rule.path, home, project_root);
+            if !expanded.to_string_lossy().contains('*')
+                && !expanded.to_string_lossy().contains('?')
+            {
+                let mtime = std::fs::metadata(&expanded).and_then(|m| m.modified()).ok();
+                fps.push(DenyFingerprint {
+                    path: expanded,
+                    access: FileAccess::All,
+                    mtime,
+                });
+            }
+        }
+        fps.sort_by(|a, b| a.path.cmp(&b.path));
+        fps
+    }
+
+    fn fingerprint_changed(cache: &DenyInodeCache, fingerprint: &[DenyFingerprint]) -> bool {
+        cache.fingerprint.len() != fingerprint.len()
+            || cache
+                .fingerprint
+                .iter()
+                .zip(fingerprint.iter())
+                .any(|(a, b)| a != b)
+    }
+
+    /// Rebuild the inode cache from deny rules. Stats each deny rule path:
+    /// concrete files are cached directly, directories are walked recursively
+    /// so hardlinks to files inside a denied directory are caught by inode
+    /// comparison regardless of the path the tracee used.
+    fn rebuild_deny_inode_cache(fingerprint: Vec<DenyFingerprint>) -> DenyInodeCache {
+        use std::os::unix::fs::MetadataExt;
+        let mut inodes: HashMap<InodeIdentity, Vec<DenyCacheEntry>> = HashMap::new();
+        for entry in &fingerprint {
+            let Ok(meta) = std::fs::metadata(&entry.path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                Self::walk_dir_inodes(&entry.path, entry.access, &mut inodes);
+            } else {
+                let identity = InodeIdentity {
+                    inode: meta.ino(),
+                    device: meta.dev(),
+                };
+                inodes.entry(identity).or_default().push(DenyCacheEntry {
+                    path: entry.path.clone(),
+                    access: entry.access,
+                });
+            }
+        }
+        DenyInodeCache {
+            inodes,
+            fingerprint,
+        }
+    }
+    fn walk_dir_inodes(
+        dir: &Path,
+        access: FileAccess,
+        inodes: &mut HashMap<InodeIdentity, Vec<DenyCacheEntry>>,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                Self::walk_dir_inodes(&entry.path(), access, inodes);
+            } else {
+                let identity = InodeIdentity {
+                    inode: meta.ino(),
+                    device: meta.dev(),
+                };
+                inodes.entry(identity).or_default().push(DenyCacheEntry {
+                    path: entry.path(),
+                    access,
+                });
+            }
+        }
+    }
+
+    /// Check if a request path is denied by inode comparison. Stats the
+    /// requested path and checks if its `InodeIdentity` matches any deny
+    /// rule target, including files inside denied directories. Only denies
+    /// if the deny rule's access covers the requested access.
+    fn is_denied_by_inode(path: &Path, access: FileAccess, cache: &DenyInodeCache) -> bool {
+        InodeIdentity::from_path(path).is_some_and(|identity| {
+            cache
+                .inodes
+                .get(&identity)
+                .is_some_and(|entries| entries.iter().any(|e| e.access.covers(access)))
+        })
+    }
+}
+fn session_resource_matches(
+    bucket: &HashSet<ResourceRuleKey>,
+    kind: ResourceKind,
+    path: &Path,
+    access: ResourceAccess,
+) -> bool {
+    bucket.iter().any(|entry| {
+        let rule = ResourceRule::new(entry.kind, entry.path.clone(), entry.access, "");
+        rule.matches(kind, path, access, None)
+    })
+}
+
+impl PolicyStore {
+    pub(crate) async fn resource_policy_denied(
+        &self,
+        kind: ResourceKind,
+        path: &Path,
+        access: ResourceAccess,
+        ctx: &MergeContext,
+    ) -> bool {
+        let project_root = ctx.paths.project_root();
+        let merged = self.merged_for(ctx);
+        let home = ctx.paths.home();
+        let path_match = merged
+            .resources
+            .deny
+            .iter()
+            .any(|rule| rule.matches(kind, path, access, project_root));
+        if path_match {
+            return true;
+        }
+        // Hardlink defense: check if the request path's inode matches any
+        // resource deny rule target.
+        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+        let mut inner = self.inner.lock().await;
+        if Self::fingerprint_changed(&inner.deny_inode_cache, &fingerprint) {
+            inner.deny_inode_cache = Self::rebuild_deny_inode_cache(fingerprint);
+        }
+        Self::is_denied_by_inode(path, FileAccess::All, &inner.deny_inode_cache)
+    }
+
+    pub(crate) fn resource_policy_allowed(
+        &self,
+        kind: ResourceKind,
+        path: &Path,
+        access: ResourceAccess,
+        ctx: &MergeContext,
+    ) -> bool {
+        let project_root = ctx.paths.project_root();
+        let merged = self.merged_for(ctx);
+        merged
+            .resources
+            .allow
+            .iter()
+            .any(|rule| rule.matches(kind, path, access, project_root))
+    }
+
+    pub(crate) async fn session_resource_denied(
+        &self,
+        kind: ResourceKind,
+        path: &Path,
+        access: ResourceAccess,
+        ctx: &MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx);
+        let route = UiRoute::new(
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_resource_deny
+                .get(sid)
+                .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
+        })
+    }
+
+    pub(crate) async fn session_resource_allowed(
+        &self,
+        kind: ResourceKind,
+        path: &Path,
+        access: ResourceAccess,
+        ctx: &MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx);
+        let route = UiRoute::new(
+            resolved.paths.cwd_path(),
+            resolved.paths.project_root_path(),
+        )
+        .with_sandbox_session(resolved.sandbox_session_id.clone());
+        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_resource_allow
+                .get(sid)
+                .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
+        })
+    }
+
+    pub(crate) async fn resource_allow_source(
+        &self,
+        kind: ResourceKind,
+        path: &Path,
+        access: ResourceAccess,
+        ctx: &MergeContext,
+    ) -> Option<String> {
+        if self.resource_policy_denied(kind, path, access, ctx).await {
+            return Some("deny".into());
+        }
+        if self.session_resource_denied(kind, path, access, ctx).await {
+            return Some("deny".into());
+        }
+        if self.session_resource_allowed(kind, path, access, ctx).await {
+            return Some("session".into());
+        }
+        if self.resource_policy_allowed(kind, path, access, ctx) {
             return Some("allow".into());
         }
         None

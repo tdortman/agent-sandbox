@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,11 @@ pub fn ui_spawn_env(
     env
 }
 
+/// Convert an `Option<&Path>` to a lossy String, returning an empty String for None.
+fn opt_path_str(path: Option<&Path>) -> String {
+    path.map_or_else(String::new, |p| p.to_string_lossy().into_owned())
+}
+
 pub fn maybe_spawn_ui<S: BuildHasher>(
     args: &PolicydArgs,
     ui_spawn_last: &mut HashMap<String, Instant, S>,
@@ -117,8 +122,8 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     }
     let Some(uid) = spawn.uid.filter(|u| *u > 0) else {
         tracing::warn!(
-            cwd = spawn.cwd.unwrap_or(""),
-            project_root = spawn.project_root.unwrap_or(""),
+            cwd = opt_path_str(spawn.cwd),
+            project_root = opt_path_str(spawn.project_root),
             "cannot spawn policy UI (missing uid)"
         );
         return;
@@ -127,8 +132,8 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         "{}:{}:{}:{}",
         uid,
         spawn.sandbox_session_id.unwrap_or(""),
-        spawn.cwd.unwrap_or(""),
-        spawn.project_root.unwrap_or("")
+        opt_path_str(spawn.cwd),
+        opt_path_str(spawn.project_root)
     );
     let now = Instant::now();
     if ui_spawn_last
@@ -170,7 +175,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
             tracing::warn!(
                 uid,
                 exit_code = ?status.code(),
-                log_path = %ui_log_path,
+                log_path = %ui_log_path.display(),
                 "policy UI spawn exited early"
             );
             return;
@@ -185,7 +190,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     tracing::info!(
         uid,
         user = %user.name,
-        log_path = %ui_log_path,
+        log_path = %ui_log_path.display(),
         "spawned policy UI"
     );
 
@@ -209,7 +214,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
 }
 struct UiSpawnCmd {
     command: std::process::Command,
-    log_path: String,
+    log_path: PathBuf,
     env: HashMap<String, String>,
 }
 
@@ -225,12 +230,12 @@ fn build_ui_spawn_command_env(
         args,
         user,
         uid,
-        spawn.home.map(Path::new),
-        spawn.cwd.map(Path::new),
-        spawn.project_root.map(Path::new),
+        spawn.home,
+        spawn.cwd,
+        spawn.project_root,
         spawn.sandbox_session_id,
     );
-    let ui_log_path = format!("/run/user/{uid}/agent-sandbox-ui.log");
+    let ui_log_path = PathBuf::from(format!("/run/user/{uid}/agent-sandbox-ui.log"));
     let stderr = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

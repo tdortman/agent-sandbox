@@ -1,5 +1,5 @@
 //! Policy store: sudo scope application.
-use std::path::Path;
+use std::path::PathBuf;
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 
@@ -22,12 +22,14 @@ impl PolicyStore {
         let detail = format!("argv={argv:?} scope={scope_label}");
         Self::audit(action.audit_verb(), None, None, &detail);
         let path = match (paths.home(), paths.project_root()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(Path::new(p))
-            }
+            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
             _ => None,
         };
-        RpcReply::ScopeAction(ScopeActionReply::ok_sudo(argv, scope, path))
+        RpcReply::ScopeAction(ScopeActionReply::ok_sudo(
+            argv,
+            scope,
+            path.map(PathBuf::from),
+        ))
     }
 
     pub(crate) async fn apply_sudo_scope(
@@ -42,17 +44,12 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id: _,
         } = wire;
-        let cwd = paths.cwd_string();
-        let home = paths.home_string();
-        let project_root = paths.project_root_string();
+        let cwd = paths.cwd_path();
+        let home = paths.home();
+        let project_root = paths.project_root();
         let key = argv.clone();
         let target = match self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
-                home.as_deref(),
-                project_root.as_deref(),
-            )
+            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
         {
             Ok(target) => target,
@@ -71,14 +68,14 @@ impl PolicyStore {
                         &policy_path,
                         &argv,
                         scope_label,
-                        Some(Path::new(&home)),
+                        Some(home.as_path()),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_sudo_deny(
                         &policy_path,
                         &argv,
                         scope_label,
-                        Some(Path::new(&home)),
+                        Some(home.as_path()),
                         owner_uid,
                     ),
                 };
@@ -91,20 +88,12 @@ impl PolicyStore {
                 project_root: _,
             } => {
                 let persist = match action {
-                    DecisionAction::Approve => Self::persist_sudo_allow(
-                        &policy_path,
-                        &argv,
-                        scope_label,
-                        home.as_deref().map(Path::new),
-                        owner_uid,
-                    ),
-                    DecisionAction::Deny => Self::persist_sudo_deny(
-                        &policy_path,
-                        &argv,
-                        scope_label,
-                        home.as_deref().map(Path::new),
-                        owner_uid,
-                    ),
+                    DecisionAction::Approve => {
+                        Self::persist_sudo_allow(&policy_path, &argv, scope_label, home, owner_uid)
+                    }
+                    DecisionAction::Deny => {
+                        Self::persist_sudo_deny(&policy_path, &argv, scope_label, home, owner_uid)
+                    }
                 };
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
@@ -113,7 +102,11 @@ impl PolicyStore {
             }
         }
         self.finalize_sudo_scope(
-            &SandboxPaths::from_wire(cwd, home, project_root),
+            &SandboxPaths::from_wire(
+                cwd,
+                home.map(PathBuf::from),
+                project_root.map(PathBuf::from),
+            ),
             argv,
             scope,
             action,

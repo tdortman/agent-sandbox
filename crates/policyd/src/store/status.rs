@@ -43,6 +43,14 @@ impl PolicyStore {
                     cwd: fs.cwd.clone(),
                     home: fs.home.clone(),
                 },
+                Pending::Resource(res) => PendingSummary::Resource {
+                    id: res.id.clone(),
+                    resource_kind: res.kind,
+                    path: Some(res.path.clone()),
+                    access: Some(res.access),
+                    cwd: res.cwd.clone(),
+                    home: res.home.clone(),
+                },
             })
             .collect();
         StatusReply {

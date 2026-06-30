@@ -1,5 +1,6 @@
 //! RPC request handlers after context resolution.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_sandbox_core::{
@@ -59,17 +60,14 @@ pub async fn handle(
                 })
                 .await,
         )),
+        RpcRequest::CheckResource {
+            kind,
+            path,
+            access,
+            ctx,
+        } => handle_check_resource(store, kind, path, access, ctx).await,
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
-            let peer_pid = peer.pid;
-            Ok(RpcReply::FilesystemMonitor(
-                store
-                    .start_filesystem_monitor(crate::wire::FilesystemMonitorRequest {
-                        peer_pid,
-                        ctx: MergeContext::from(&ctx),
-                        static_allow,
-                    })
-                    .await,
-            ))
+            handle_start_filesystem_monitor(store, peer, ctx, static_allow).await
         }
         RpcRequest::Elevate { argv, ctx } => handle_elevate_request(store, argv, ctx).await,
         RpcRequest::Approve {
@@ -117,6 +115,41 @@ pub async fn handle(
         }
     }
 }
+async fn handle_check_resource(
+    store: &Arc<PolicyStore>,
+    kind: agent_sandbox_core::ResourceKind,
+    path: PathBuf,
+    access: agent_sandbox_core::ResourceAccess,
+    ctx: RequestContext,
+) -> Result<RpcReply, PolicydError> {
+    Ok(RpcReply::ResourceCheck(
+        store
+            .check_resource(crate::wire::ResourceCheckRequest {
+                kind,
+                path,
+                access,
+                ctx: MergeContext::from(&ctx),
+            })
+            .await,
+    ))
+}
+async fn handle_start_filesystem_monitor(
+    store: &Arc<PolicyStore>,
+    peer: ClientPeer,
+    ctx: RequestContext,
+    static_allow: Vec<agent_sandbox_core::FilesystemRule>,
+) -> Result<RpcReply, PolicydError> {
+    let peer_pid = peer.pid;
+    Ok(RpcReply::FilesystemMonitor(
+        store
+            .start_filesystem_monitor(crate::wire::FilesystemMonitorRequest {
+                peer_pid,
+                ctx: MergeContext::from(&ctx),
+                static_allow,
+            })
+            .await,
+    ))
+}
 async fn handle_register_ui(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
@@ -127,9 +160,9 @@ async fn handle_register_ui(
         .start_ui_session(
             client,
             crate::store::UiSessionContext {
-                cwd: paths.cwd_string(),
-                home: paths.home_string(),
-                project_root: paths.project_root_string(),
+                cwd: paths.cwd_path(),
+                home: paths.home_path(),
+                project_root: paths.project_root_path(),
                 sandbox_session_id: ctx.sandbox_session_id,
             },
         )
@@ -137,7 +170,7 @@ async fn handle_register_ui(
     if let Some(sess) = store.ui_context_for_session(&session_id).await
         && let Some(project_root) = &sess.project_root
     {
-        tracing::info!(project_root = %project_root, "policy UI registered");
+        tracing::info!(project_root = ?project_root, "policy UI registered");
     }
     Ok(RpcReply::RegisterUi(RegisterUiReply {
         ok: true,

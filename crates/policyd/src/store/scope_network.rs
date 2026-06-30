@@ -1,5 +1,5 @@
 //! Policy store: network scope application.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,
@@ -38,16 +38,11 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id: _,
         } = wire;
-        let home = paths.home_string();
-        let project_root = paths.project_root_string();
+        let home = paths.home();
+        let project_root = paths.project_root();
         let session_entries = session_network_entries(&host, port);
         let target = match self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
-                home.as_deref(),
-                project_root.as_deref(),
-            )
+            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
         {
             Ok(target) => target,
@@ -74,7 +69,7 @@ impl PolicyStore {
                         &host,
                         port,
                         scope_label,
-                        Some(Path::new(&home)),
+                        Some(home.as_path()),
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_network_deny(
@@ -82,7 +77,7 @@ impl PolicyStore {
                         &host,
                         port,
                         scope_label,
-                        Some(Path::new(&home)),
+                        Some(home.as_path()),
                         owner_uid,
                     ),
                 };
@@ -100,7 +95,7 @@ impl PolicyStore {
                         &host,
                         port,
                         scope_label,
-                        home.as_deref().map(Path::new),
+                        home,
                         owner_uid,
                     ),
                     DecisionAction::Deny => Self::persist_network_deny(
@@ -108,7 +103,7 @@ impl PolicyStore {
                         &host,
                         port,
                         scope_label,
-                        home.as_deref().map(Path::new),
+                        home,
                         owner_uid,
                     ),
                 };
@@ -163,32 +158,37 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let _ = self.export_policy_files(SandboxPaths::from_wire(
-            paths.cwd_string(),
-            paths.home_string(),
-            paths.project_root_string(),
+            paths.cwd_path(),
+            paths.home_path(),
+            paths.project_root_path(),
         ));
         Self::audit(action.audit_verb(), Some(&host), Some(port), scope.as_str());
-        let path = match (paths.home_string(), paths.project_root_string()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => {
-                Self::project_policy_path_display(Path::new(&p))
-            }
+        let path = match (paths.home(), paths.project_root()) {
+            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
             _ => None,
         };
-        RpcReply::ScopeAction(ScopeActionReply::ok_network(host, port, scope, path))
+        RpcReply::ScopeAction(ScopeActionReply::ok_network(
+            host,
+            port,
+            scope,
+            path.map(PathBuf::from),
+        ))
     }
     pub(crate) async fn resolve_scope_target(
         &self,
         scope: ApprovalScope,
         session_id: Option<&str>,
-        home: Option<&str>,
-        project_root: Option<&str>,
+        home: Option<&Path>,
+        project_root: Option<&Path>,
     ) -> Result<ScopeTarget, RpcReply> {
         let active = self.active_session_ids().await;
+        let home_str = home.and_then(Path::to_str);
+        let project_root_str = project_root.and_then(Path::to_str);
         let ctx = ScopeContext {
             scope,
             session_id,
-            home,
-            project_root,
+            home: home_str,
+            project_root: project_root_str,
             active_session_ids: &active,
         };
         ScopeTarget::resolve(&ctx).map_err(RpcReply::from)

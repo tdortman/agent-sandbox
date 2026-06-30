@@ -1,17 +1,19 @@
 //! Match pending requests to the UI client that owns the agent.
 
+use std::path::PathBuf;
+
 use super::types::UiSessionContext;
 
 #[derive(Debug, Clone)]
 pub struct UiRoute {
-    pub cwd: Option<String>,
-    pub project_root: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
 
 impl UiRoute {
     #[must_use]
-    pub const fn new(cwd: Option<String>, project_root: Option<String>) -> Self {
+    pub const fn new(cwd: Option<PathBuf>, project_root: Option<PathBuf>) -> Self {
         Self {
             cwd,
             project_root,
@@ -51,13 +53,15 @@ pub fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::{UiRoute, paths_match};
     use crate::store::types::{UiClient, UiSessionContext};
-    fn ctx(cwd: &str, project_root: &str) -> UiSessionContext {
+    fn ctx(cwd: &Path, project_root: &Path) -> UiSessionContext {
         UiSessionContext {
-            cwd: Some(cwd.into()),
-            home: Some("/home/user".into()),
-            project_root: Some(project_root.into()),
+            cwd: Some(cwd.to_path_buf()),
+            home: Some(PathBuf::from("/home/user")),
+            project_root: Some(project_root.to_path_buf()),
             sandbox_session_id: None,
         }
     }
@@ -74,8 +78,8 @@ mod tests {
     #[tokio::test]
     async fn standalone_matches_same_project_paths() {
         let client = make_client("ui1");
-        let client_ctx = ctx("/repo", "/repo");
-        let route = UiRoute::new(Some("/repo".into()), Some("/repo".into()));
+        let client_ctx = ctx(Path::new("/repo"), Path::new("/repo"));
+        let route = UiRoute::new(Some(PathBuf::from("/repo")), Some(PathBuf::from("/repo")));
         assert!(paths_match(&client_ctx, &route));
         let _ = client;
     }
@@ -83,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_does_not_match_unrelated_project_paths() {
         let client = make_client("ui1");
-        let client_ctx = ctx("/dotfiles", "/home/user/dotfiles");
+        let client_ctx = ctx(Path::new("/dotfiles"), Path::new("/home/user/dotfiles"));
         let route = UiRoute::new(Some("/other".into()), Some("/other".into()));
         assert!(!paths_match(&client_ctx, &route));
         let _ = client;
@@ -92,7 +96,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_requires_matching_sandbox_session_when_present() {
         let client = make_client("ui1");
-        let mut client_ctx = ctx("/repo", "/repo");
+        let mut client_ctx = ctx(Path::new("/repo"), Path::new("/repo"));
         client_ctx.sandbox_session_id = Some("sandbox-a".into());
         let route = UiRoute::new(Some("/repo".into()), Some("/repo".into()))
             .with_sandbox_session(Some("sandbox-b".into()));
