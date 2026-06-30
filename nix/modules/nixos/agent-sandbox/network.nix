@@ -10,8 +10,7 @@ let
 
   rootCfg = config.agent-sandbox;
   cfg = config.agent-sandbox.network;
-  policyEnabled =
-    cfg.enable || rootCfg.sudoPolicy == "approve" || rootCfg.filesystem.dynamicApproval.enable;
+  policyEnabled = cfg.enable || rootCfg.sudoPolicy == "approve" || rootCfg.gates.filesystem.enable;
   sandboxPkg = flake.package "agent-sandbox";
   policyPkg = sandboxPkg;
   enterBin = sandboxPkg;
@@ -182,7 +181,7 @@ lib.mkIf policyEnabled (
             deny = [ ];
           };
         }
-        // lib.optionalAttrs config.agent-sandbox.filesystem.dynamicApproval.enable {
+        // lib.optionalAttrs config.agent-sandbox.gates.filesystem.enable {
           filesystem = {
             allow = [
               {
@@ -239,16 +238,23 @@ lib.mkIf policyEnabled (
               "--export-nix"
               config.agent-sandbox.policy.exportedNix
             ]
-            ++ lib.optionals config.agent-sandbox.filesystem.dynamicApproval.enable [
+            ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
               "--fs-monitor-cmd"
               "${policyPkg}/bin/agent-sandbox-fsmon"
             ]
-            ++ lib.optionals (config.agent-sandbox.syscallGate.enable && config.agent-sandbox.network.enable) [
-              "--syscall-broker-cmd"
-              "${policyPkg}/bin/agent-sandbox-syscall-broker"
-            ]
+            ++
+              lib.optionals
+                (
+                  (config.agent-sandbox.gates.syscalls.enable && config.agent-sandbox.network.enable)
+                  || config.agent-sandbox.gates.resources.enable
+                )
+                [
+                  "--syscall-broker-cmd"
+                  "${policyPkg}/bin/agent-sandbox-syscall-broker"
+                ]
           );
           StateDirectory = "agent-sandbox";
+          RuntimeDirectory = "agent-sandbox";
           Restart = "on-failure";
         };
         path = [

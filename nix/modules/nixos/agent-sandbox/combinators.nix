@@ -311,7 +311,7 @@ in
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
-        RUNTIME_ARGS+=(--ro-bind "''${sandboxPolicySocket}" "''${sandboxPolicySocket}")
+        RUNTIME_ARGS+=(--ro-bind-try "''${sandboxPolicySocket}" "''${sandboxPolicySocket}")
       '')
       (lib.id sandboxPolicySocket)
     ];

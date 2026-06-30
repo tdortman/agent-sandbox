@@ -173,6 +173,7 @@ rec {
       sudoGuard ? null,
       fsArmPkg ? null,
       syscallArmPkg ? null,
+      resourceGate ? false,
     }:
     let
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
@@ -346,6 +347,27 @@ rec {
           ''
       ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique (readwriteDirs ++ readwriteFiles)));
 
+      runMaskScript =
+        if resourceGate then
+          ''
+            if [[ -d /run/agent-sandbox ]]; then
+              RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
+            fi
+            # In resource-gate mode /run comes from --bind / /, so safe
+            # runtime paths are already visible. Only /run/agent-sandbox
+            # needs masking (above) to hide the host control socket.
+          ''
+        else
+          ''
+            RUNTIME_ARGS+=(--tmpfs /run)
+            for _asbx_safe_runtime in /run/current-system /run/wrappers /run/opengl-driver /run/opengl-driver-32 /run/netns; do
+              if [[ -e "$_asbx_safe_runtime" ]]; then
+                RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
+              fi
+            done
+            RUNTIME_ARGS+=(--dir /run/agent-sandbox)
+          '';
+
       policyScript =
         lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
           ''
@@ -380,16 +402,12 @@ rec {
             RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
             RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
 
-            # Mask the entire host /run so unrelated host IPC sockets are
-            # invisible. The sandbox policy socket is rebound below from a
-            # known clean location, not from the host /run tree.
-            RUNTIME_ARGS+=(--tmpfs /run)
-            for _asbx_safe_runtime in /run/current-system /run/wrappers /run/opengl-driver /run/opengl-driver-32 /run/netns; do
-              if [[ -e "$_asbx_safe_runtime" ]]; then
-                RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
-              fi
-            done
-            RUNTIME_ARGS+=(--dir /run/agent-sandbox)
+            # Mask /run so unrelated host IPC sockets are invisible. With
+            # resource gate, only /run/agent-sandbox is tmpfs'd; AF_UNIX
+            # sockets remain visible from the host /run tree and are gated
+            # by the broker. Otherwise, the entire /run is masked and safe
+            # runtime directories are selectively rebound.
+            ${runMaskScript}
 
             # The dynamic path bind-mounts the host root with --bind / /, so
             # the user's $HOME (including ~/.config/agent-sandbox) is fully
@@ -479,7 +497,7 @@ rec {
 
             # Expose only the restricted sandbox request socket. The host
             # control socket stays hidden by tmpfs.
-            RUNTIME_ARGS+=(--ro-bind ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
+            RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
           '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
@@ -528,16 +546,18 @@ rec {
           ${policyScript}
           ${dnsScript}
 
-          for _gpu in /dev/nvidia*; do
-            [[ -e "$_gpu" ]] || continue
-            RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
-          done
-          if [[ -d /dev/nvidia-caps ]]; then
-            for _cap in /dev/nvidia-caps/*; do
-              [[ -e "$_cap" ]] || continue
-              RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
+          ${lib.optionalString (!resourceGate) ''
+            for _gpu in /dev/nvidia*; do
+              [[ -e "$_gpu" ]] || continue
+              RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
             done
-          fi
+            if [[ -d /dev/nvidia-caps ]]; then
+              for _cap in /dev/nvidia-caps/*; do
+                [[ -e "$_cap" ]] || continue
+                RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
+              done
+            fi
+          ''}
           if [[ -d /run/opengl-driver/lib ]]; then
             _asbx_ld="/run/opengl-driver/lib"
             if [[ -n "''${LD_LIBRARY_PATH:-}" ]]; then
@@ -545,21 +565,14 @@ rec {
             fi
             RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
           fi
-          ${deviceBindScript}
+          ${lib.optionalString (!resourceGate) deviceBindScript}
 
           ${fsArmScript}
 
           exec ${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
             --proc /proc \
-            --tmpfs /dev \
-            --dev-bind /dev/null /dev/null \
-            --dev-bind /dev/zero /dev/zero \
-            --dev-bind /dev/random /dev/random \
-            --dev-bind /dev/urandom /dev/urandom \
-            --dev-bind /dev/full /dev/full \
-            --dev-bind /dev/pts /dev/pts \
-            --dev-bind /dev/tty /dev/tty \
+            --dev-bind /dev /dev \
             --tmpfs /tmp \
             --clearenv \
             --ro-bind ~/.local/share/jail.nix/passwd /etc/passwd \

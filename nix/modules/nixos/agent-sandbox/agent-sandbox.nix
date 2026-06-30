@@ -112,7 +112,7 @@ let
   cfg = config.agent-sandbox;
 
   policyContextEnabled =
-    cfg.network.enable || cfg.filesystem.dynamicApproval.enable || cfg.sudoPolicy == "approve";
+    cfg.network.enable || cfg.gates.filesystem.enable || cfg.sudoPolicy == "approve";
 
   sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
 
@@ -152,11 +152,16 @@ let
         network = networkConfig;
         sudoGuard = sudoGuardPkg;
       }
-      // lib.optionalAttrs cfg.filesystem.dynamicApproval.enable {
+      // lib.optionalAttrs cfg.gates.filesystem.enable {
         inherit fsArmPkg;
       }
-      // lib.optionalAttrs (cfg.syscallGate.enable && cfg.network.enable) {
-        inherit syscallArmPkg;
+      //
+        lib.optionalAttrs ((cfg.gates.syscalls.enable && cfg.network.enable) || cfg.gates.resources.enable)
+          {
+            inherit syscallArmPkg;
+          }
+      // lib.optionalAttrs cfg.gates.resources.enable {
+        resourceGate = true;
       }
     );
 in
@@ -338,8 +343,8 @@ in
         '';
       };
     };
-    filesystem = {
-      dynamicApproval = {
+    gates = {
+      filesystem = {
         enable = lib.mkEnableOption ''
           kernel-mediated dynamic filesystem access approval via fanotify.
           Controls filesystem access at runtime using path-based allow/deny rules.
@@ -350,19 +355,25 @@ in
           is used and there is no kernel-level filesystem mediation.
         '';
       };
-    };
-
-    syscallGate = {
-      enable = lib.mkEnableOption ''
-        kernel-mediated seccomp user-notification gate for packet-emitting syscalls.
-        The arm helper installs a seccomp filter inside the sandbox, then execs its
-        argv tail. The host-side broker (``agent-sandbox-syscall-broker``) consults policyd
-        before allowing or denying the syscall. The user-visible benefit is that a
-        short-timeout UDP client such as ``dig @1.1.1.1 +time=2`` blocks inside the
-        kernel until the approval prompt is answered, instead of returning before
-        the prompt renders. NFQUEUE remains in place as a backstop. Disabled by
-        default. When disabled, no syscall-arm helper or broker is wired.
-      '';
+      resources = {
+        enable = lib.mkEnableOption ''
+          seccomp-backed resource gates for AF_UNIX sockets under /run and
+          broker-opened host device nodes under /dev in dynamic filesystem mode.
+          Requires gates.filesystem.enable.
+        '';
+      };
+      syscalls = {
+        enable = lib.mkEnableOption ''
+          kernel-mediated seccomp user-notification gate for packet-emitting syscalls.
+          The arm helper installs a seccomp filter inside the sandbox, then execs its
+          argv tail. The host-side broker (``agent-sandbox-syscall-broker``) consults policyd
+          before allowing or denying the syscall. The user-visible benefit is that a
+          short-timeout UDP client such as ``dig @1.1.1.1 +time=2`` blocks inside the
+          kernel until the approval prompt is answered, instead of returning before
+          the prompt renders. NFQUEUE remains in place as a backstop. Disabled by
+          default. When disabled, no syscall-arm helper or broker is wired.
+        '';
+      };
     };
   }
   // mountOptions;
@@ -372,6 +383,10 @@ in
       {
         assertion = policyContextEnabled -> cfg.policy.socketPath != cfg.policy.sandboxSocketPath;
         message = "agent-sandbox.policy.socketPath and sandboxSocketPath must differ when policy is enabled";
+      }
+      {
+        assertion = !(cfg.gates.resources.enable && !cfg.gates.filesystem.enable);
+        message = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
       }
     ];
     environment.systemPackages = (map wrapOne cfg.packages) ++ [
