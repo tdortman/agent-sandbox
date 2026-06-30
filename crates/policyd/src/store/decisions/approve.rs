@@ -667,14 +667,16 @@ mod tests {
     use std::time::Duration;
 
     use agent_sandbox_core::{
-        ApprovalScope, ApprovalTarget, FileAccess, NetworkRuleKey, ProcessIds, SandboxPaths,
+        ApprovalScope, ApprovalTarget, FileAccess, NetworkRuleKey, ProcessIds, ResourceAccess,
+        ResourceKind, SandboxPaths,
     };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
 
     use crate::store::types::{UiClient, UiSessionContext};
     use crate::store::{
-        Pending, PendingElevation, PendingFilesystem, PendingNetwork, PolicyStore, PolicydArgs,
+        Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource, PolicyStore,
+        PolicydArgs,
     };
     use crate::wire::{MergeContext, PendingDecision, ScopeWire};
 
@@ -836,6 +838,66 @@ mod tests {
             )
             .is_err(),
             "ancestor target should be rejected for Once scope"
+        );
+    }
+
+    #[test]
+    fn filesystem_target_accepts_project_relative_path() {
+        let pending = Pending::Filesystem(PendingFilesystem {
+            id: "fs1".into(),
+            created_at: 0.0,
+            path: "/home/user/repo/.gitattributes".into(),
+            access: FileAccess::Read,
+            cwd: None,
+            home: Some("/home/user".into()),
+            project_root: Some("/home/user/repo".into()),
+            sandbox_session_id: None,
+        });
+        let target = ApprovalTarget::FilesystemPath {
+            path: "./.gitattributes".into(),
+        };
+        assert_eq!(
+            PolicyStore::resolve_pending_filesystem_target(
+                match &pending {
+                    Pending::Filesystem(fs) => fs,
+                    _ => panic!("expected Filesystem"),
+                },
+                ApprovalScope::Session,
+                Some(&target),
+            )
+            .expect("project-relative target should resolve"),
+            PathBuf::from("./.gitattributes")
+        );
+    }
+
+    #[test]
+    fn resource_target_accepts_project_relative_path() {
+        let pending = Pending::Resource(PendingResource {
+            id: "rs1".into(),
+            created_at: 0.0,
+            kind: ResourceKind::UnixSocket,
+            path: "/home/user/repo/.sock".into(),
+            access: ResourceAccess::Connect,
+            cwd: None,
+            home: Some("/home/user".into()),
+            project_root: Some("/home/user/repo".into()),
+            sandbox_session_id: None,
+        });
+        let target = ApprovalTarget::ResourcePath {
+            resource_kind: ResourceKind::UnixSocket,
+            path: "./.sock".into(),
+        };
+        assert_eq!(
+            PolicyStore::resolve_pending_resource_target(
+                match &pending {
+                    Pending::Resource(rs) => rs,
+                    _ => panic!("expected Resource"),
+                },
+                ApprovalScope::Session,
+                Some(&target),
+            )
+            .expect("project-relative resource target should resolve"),
+            PathBuf::from("./.sock")
         );
     }
 
