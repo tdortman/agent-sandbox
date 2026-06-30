@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionContext {
-    pub cwd: Option<String>,
-    pub home: Option<String>,
-    pub project_root: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
 }
 
 pub fn session_context_path() -> PathBuf {

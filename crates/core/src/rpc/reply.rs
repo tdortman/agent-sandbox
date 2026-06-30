@@ -1,8 +1,10 @@
+use std::path::{Path, PathBuf};
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{FileAccess, Policy};
+use crate::policy::{FileAccess, Policy, ResourceAccess, ResourceKind};
 
 use super::{message::RpcMessage, scope::ApprovalScope};
 
@@ -17,6 +19,7 @@ use super::{message::RpcMessage, scope::ApprovalScope};
 pub enum RpcReply {
     RegisterUi(RegisterUiReply),
     FilesystemCheck(FilesystemCheckReply),
+    ResourceCheck(ResourceCheckReply),
     FilesystemMonitor(FilesystemMonitorReply),
     Check(CheckReply),
     Elevate(ElevateReply),
@@ -156,14 +159,14 @@ pub struct FilesystemCheckReply {
     pub ok: bool,
     pub allowed: bool,
     pub source: String,
-    pub path: String,
+    pub path: PathBuf,
     pub access: FileAccess,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl FilesystemCheckReply {
-    pub fn allowed(source: impl Into<String>, path: String, access: FileAccess) -> Self {
+    pub fn allowed(source: impl Into<String>, path: PathBuf, access: FileAccess) -> Self {
         Self {
             ok: true,
             allowed: true,
@@ -174,7 +177,7 @@ impl FilesystemCheckReply {
         }
     }
 
-    pub fn denied(source: impl Into<String>, path: String, access: FileAccess) -> Self {
+    pub fn denied(source: impl Into<String>, path: PathBuf, access: FileAccess) -> Self {
         Self {
             ok: true,
             allowed: false,
@@ -185,11 +188,76 @@ impl FilesystemCheckReply {
         }
     }
 
-    pub fn blocked(message: impl Into<String>, path: String, access: FileAccess) -> Self {
+    pub fn blocked(message: impl Into<String>, path: PathBuf, access: FileAccess) -> Self {
         Self {
             ok: true,
             allowed: false,
             source: "blocked".into(),
+            path,
+            access,
+            error: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceCheckReply {
+    pub ok: bool,
+    pub allowed: bool,
+    pub source: String,
+    pub kind: ResourceKind,
+    pub path: PathBuf,
+    pub access: ResourceAccess,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ResourceCheckReply {
+    pub fn allowed(
+        source: impl Into<String>,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+    ) -> Self {
+        Self {
+            ok: true,
+            allowed: true,
+            source: source.into(),
+            kind,
+            path,
+            access,
+            error: None,
+        }
+    }
+
+    pub fn denied(
+        source: impl Into<String>,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+    ) -> Self {
+        Self {
+            ok: true,
+            allowed: false,
+            source: source.into(),
+            kind,
+            path,
+            access,
+            error: None,
+        }
+    }
+
+    pub fn blocked(
+        message: impl Into<String>,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+    ) -> Self {
+        Self {
+            ok: true,
+            allowed: false,
+            source: "blocked".into(),
+            kind,
             path,
             access,
             error: Some(message.into()),
@@ -232,6 +300,7 @@ pub enum ScopeActionReply {
     Sudo(SudoScopeActionReply),
     Elevation(ElevationScopeActionReply),
     Filesystem(FilesystemScopeActionReply),
+    Resource(ResourceScopeActionReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,7 +311,7 @@ pub struct NetworkScopeActionReply {
     pub port: u16,
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +321,7 @@ pub struct SudoScopeActionReply {
     pub argv: Vec<String>,
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +330,7 @@ pub struct ElevationScopeActionReply {
     pub ok: bool,
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub path: Option<PathBuf>,
     pub allowed: bool,
 }
 
@@ -269,16 +338,33 @@ pub struct ElevationScopeActionReply {
 #[serde(deny_unknown_fields)]
 pub struct FilesystemScopeActionReply {
     pub ok: bool,
-    pub path: String,
+    pub path: PathBuf,
     pub access: FileAccess,
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy_path: Option<String>,
+    pub policy_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceScopeActionReply {
+    pub ok: bool,
+    pub kind: ResourceKind,
+    pub path: PathBuf,
+    pub access: ResourceAccess,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_path: Option<PathBuf>,
 }
 
 impl ScopeActionReply {
     #[must_use]
-    pub fn ok_network(host: String, port: u16, scope: ApprovalScope, path: Option<String>) -> Self {
+    pub fn ok_network(
+        host: String,
+        port: u16,
+        scope: ApprovalScope,
+        path: Option<PathBuf>,
+    ) -> Self {
         Self::Network(NetworkScopeActionReply {
             ok: true,
             host,
@@ -289,7 +375,7 @@ impl ScopeActionReply {
     }
 
     #[must_use]
-    pub fn ok_sudo(argv: Vec<String>, scope: ApprovalScope, path: Option<String>) -> Self {
+    pub fn ok_sudo(argv: Vec<String>, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
         Self::Sudo(SudoScopeActionReply {
             ok: true,
             argv,
@@ -299,7 +385,7 @@ impl ScopeActionReply {
     }
 
     #[must_use]
-    pub fn ok_elevation_approve(scope: ApprovalScope, path: Option<String>) -> Self {
+    pub fn ok_elevation_approve(scope: ApprovalScope, path: Option<PathBuf>) -> Self {
         Self::Elevation(ElevationScopeActionReply {
             ok: true,
             scope: scope.to_string(),
@@ -310,10 +396,10 @@ impl ScopeActionReply {
 
     #[must_use]
     pub fn ok_filesystem(
-        path: String,
+        path: PathBuf,
         access: FileAccess,
         scope: ApprovalScope,
-        policy_path: Option<String>,
+        policy_path: Option<PathBuf>,
     ) -> Self {
         Self::Filesystem(FilesystemScopeActionReply {
             ok: true,
@@ -325,12 +411,30 @@ impl ScopeActionReply {
     }
 
     #[must_use]
+    pub fn ok_resource(
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+        scope: ApprovalScope,
+        policy_path: Option<PathBuf>,
+    ) -> Self {
+        Self::Resource(ResourceScopeActionReply {
+            ok: true,
+            kind,
+            path,
+            access,
+            scope: scope.to_string(),
+            policy_path,
+        })
+    }
+    #[must_use]
     pub const fn is_ok(&self) -> bool {
         match self {
             Self::Network(reply) => reply.ok,
             Self::Sudo(reply) => reply.ok,
             Self::Elevation(reply) => reply.ok,
             Self::Filesystem(reply) => reply.ok,
+            Self::Resource(reply) => reply.ok,
         }
     }
 
@@ -341,16 +445,18 @@ impl ScopeActionReply {
             Self::Sudo(reply) => &reply.scope,
             Self::Elevation(reply) => &reply.scope,
             Self::Filesystem(reply) => &reply.scope,
+            Self::Resource(reply) => &reply.scope,
         }
     }
 
     #[must_use]
-    pub fn path(&self) -> Option<&str> {
+    pub fn path(&self) -> Option<&Path> {
         match self {
             Self::Network(reply) => reply.path.as_deref(),
             Self::Sudo(reply) => reply.path.as_deref(),
             Self::Elevation(reply) => reply.path.as_deref(),
             Self::Filesystem(reply) => Some(&reply.path),
+            Self::Resource(reply) => Some(&reply.path),
         }
     }
 }
@@ -380,10 +486,10 @@ impl RpcReply {
             _ => None,
         }
     }
-
+    #[must_use]
     pub fn scope_path(&self) -> Option<String> {
         match self {
-            Self::ScopeAction(reply) => reply.path().map(str::to_owned),
+            Self::ScopeAction(reply) => reply.path().map(|p| p.display().to_string()),
             _ => None,
         }
     }

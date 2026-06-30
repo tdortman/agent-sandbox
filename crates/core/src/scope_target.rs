@@ -20,11 +20,11 @@ pub enum ScopeTarget {
     },
     Project {
         policy_path: PathBuf,
-        project_root: String,
+        project_root: PathBuf,
     },
     Global {
         policy_path: PathBuf,
-        home: String,
+        home: PathBuf,
     },
 }
 
@@ -67,7 +67,7 @@ impl ScopeTarget {
                 let policy_path = trusted_project_policy_path(Path::new(project_root))?;
                 Ok(Self::Project {
                     policy_path,
-                    project_root: project_root.to_string(),
+                    project_root: PathBuf::from(project_root),
                 })
             }
             ApprovalScope::Global => {
@@ -75,16 +75,16 @@ impl ScopeTarget {
                 let policy_path = global_policy_path(Path::new(home));
                 Ok(Self::Global {
                     policy_path,
-                    home: home.to_string(),
+                    home: PathBuf::from(home),
                 })
             }
         }
     }
 
     #[must_use]
-    pub const fn project_root(&self) -> Option<&str> {
+    pub fn project_root(&self) -> Option<&Path> {
         match self {
-            Self::Project { project_root, .. } => Some(project_root.as_str()),
+            Self::Project { project_root, .. } => Some(project_root.as_path()),
             _ => None,
         }
     }

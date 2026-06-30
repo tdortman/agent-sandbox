@@ -13,8 +13,8 @@ pub use message::RpcMessage;
 pub use push::{PendingSummary, UiPush};
 pub use reply::{
     CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
-    FilesystemScopeActionReply, RegisterUiReply, RpcReply, ScopeActionReply, SimpleOkReply,
-    StatusReply,
+    FilesystemScopeActionReply, RegisterUiReply, ResourceCheckReply, ResourceScopeActionReply,
+    RpcReply, ScopeActionReply, SimpleOkReply, StatusReply,
 };
 pub use request::{
     AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,

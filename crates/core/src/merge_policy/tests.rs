@@ -138,6 +138,10 @@ fn atomic_write_keeps_each_rule_on_one_line() {
     "filesystem": {
         "allow": [],
         "deny": []
+    },
+    "resources": {
+        "allow": [],
+        "deny": []
     }
 }
 "#
@@ -239,7 +243,7 @@ fn filesystem_trailing_slash_path_merge_deduplicates() {
     };
     let merged = merge_layers(&[low, high]);
     assert_eq!(merged.filesystem.allow.len(), 1);
-    assert_eq!(merged.filesystem.allow[0].path, "/home");
+    assert_eq!(merged.filesystem.allow[0].path, Path::new("/home"));
 }
 
 #[test]

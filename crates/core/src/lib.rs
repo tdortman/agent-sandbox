@@ -34,8 +34,9 @@ pub use merge_policy::{
 };
 pub use policy::{
     FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection, FilesystemSortKey,
-    NetworkRule, NetworkSection, Policy, SudoRule, SudoSection, contract_home_path,
-    expand_home_path, filesystem_approval_paths,
+    InodeIdentity, NetworkRule, NetworkSection, Policy, ResourceAccess, ResourceKind, ResourceRule,
+    ResourceRuleKey, ResourceSection, ResourceSortKey, SudoRule, SudoSection, contract_home_path,
+    expand_home_path, expand_policy_path, filesystem_approval_paths,
 };
 pub use proc_context::{
     PeerCredentials, ProcContext, context_from_pid, home_from_uid, is_descendant_of, peer_cred,
@@ -44,9 +45,9 @@ pub use proc_context::{
 pub use rpc::{
     AliasSplit, ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply,
     FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply, PendingSummary,
-    RegisterUiReply, RequestContext, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
-    SimpleOkReply, StatusReply, UiPush, attach_check_aliases, attach_ui_aliases,
-    split_check_aliases, split_ui_aliases,
+    RegisterUiReply, RequestContext, ResourceCheckReply, ResourceScopeActionReply, RpcMessage,
+    RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply, UiPush,
+    attach_check_aliases, attach_ui_aliases, split_check_aliases, split_ui_aliases,
 };
 pub use rpc_client::{RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

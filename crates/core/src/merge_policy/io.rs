@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::hosts::NetworkSortKey;
 use crate::policy::{
-    FilesystemRule, FilesystemSortKey, NetworkRule, Policy, SudoRule, contract_home_path,
-    expand_policy_path,
+    FilesystemRule, FilesystemSortKey, NetworkRule, Policy, ResourceRule, ResourceSortKey,
+    SudoRule, contract_home_path, expand_policy_path,
 };
 
 #[must_use]
@@ -27,7 +27,7 @@ pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>
         return Policy::default();
     };
     let mut policy: Policy = serde_json::from_str(&data).unwrap_or_default();
-    expand_filesystem_paths(&mut policy, home, project_root);
+    expand_policy_paths(&mut policy, home, project_root);
     policy
 }
 
@@ -42,6 +42,9 @@ fn sudo_rule_sort_key(rule: &SudoRule) -> Vec<String> {
 fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemSortKey {
     FilesystemSortKey::new(contract_home_path(&rule.path, home), rule.access)
 }
+fn resource_rule_sort_key(rule: &ResourceRule, home: Option<&Path>) -> ResourceSortKey {
+    ResourceSortKey::new(rule.kind, contract_home_path(&rule.path, home), rule.access)
+}
 fn sorted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
     out.network.allow.sort_by_key(network_rule_sort_key);
@@ -54,13 +57,25 @@ fn sorted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     out.filesystem
         .deny
         .sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
+    out.resources
+        .allow
+        .sort_by_key(|rule| resource_rule_sort_key(rule, home));
+    out.resources
+        .deny
+        .sort_by_key(|rule| resource_rule_sort_key(rule, home));
     out
 }
-fn expand_filesystem_paths(policy: &mut Policy, home: Option<&Path>, project_root: Option<&Path>) {
+fn expand_policy_paths(policy: &mut Policy, home: Option<&Path>, project_root: Option<&Path>) {
     for rule in &mut policy.filesystem.allow {
         rule.path = expand_policy_path(&rule.path, home, project_root);
     }
     for rule in &mut policy.filesystem.deny {
+        rule.path = expand_policy_path(&rule.path, home, project_root);
+    }
+    for rule in &mut policy.resources.allow {
+        rule.path = expand_policy_path(&rule.path, home, project_root);
+    }
+    for rule in &mut policy.resources.deny {
         rule.path = expand_policy_path(&rule.path, home, project_root);
     }
 }
@@ -222,17 +237,27 @@ pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     push_rules(&mut json, "allow", &policy.filesystem.allow)?;
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.filesystem.deny)?;
+    json.push_str("\n    },\n    \"resources\": {\n");
+    push_rules(&mut json, "allow", &policy.resources.allow)?;
+    json.push_str(",\n");
+    push_rules(&mut json, "deny", &policy.resources.deny)?;
     json.push_str("\n    }\n}");
     Ok(json)
 }
-/// Return a copy of `policy` with filesystem allow/deny paths under `home`
-/// contracted to the `~/...` shorthand for on-disk serialization.
+/// Return a copy of `policy` with filesystem and resource allow/deny paths
+/// under `home` contracted to the `~/...` shorthand for on-disk serialization.
 fn contracted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
     for rule in &mut out.filesystem.allow {
         rule.path = contract_home_path(&rule.path, home);
     }
     for rule in &mut out.filesystem.deny {
+        rule.path = contract_home_path(&rule.path, home);
+    }
+    for rule in &mut out.resources.allow {
+        rule.path = contract_home_path(&rule.path, home);
+    }
+    for rule in &mut out.resources.deny {
         rule.path = contract_home_path(&rule.path, home);
     }
     out
@@ -402,9 +427,12 @@ mod tests {
         let loaded = load_policy(&path, Some(home), None);
         assert_eq!(
             loaded.filesystem.allow[0].path,
-            "/home/user/.local/share/foo"
+            Path::new("/home/user/.local/share/foo")
         );
-        assert_eq!(loaded.filesystem.deny[0].path, "/home/user/.cache/secret");
+        assert_eq!(
+            loaded.filesystem.deny[0].path,
+            Path::new("/home/user/.cache/secret")
+        );
     }
 
     #[test]
@@ -422,7 +450,10 @@ mod tests {
         let path = tmp.path().join("policy.json");
         std::fs::write(&path, raw).expect("write file");
         let loaded = load_policy(&path, Some(home), None);
-        assert_eq!(loaded.filesystem.allow[0].path, "/home/user2/.cache");
+        assert_eq!(
+            loaded.filesystem.allow[0].path,
+            Path::new("/home/user2/.cache")
+        );
     }
 
     #[test]
@@ -440,10 +471,10 @@ mod tests {
         assert!(raw.contains("\"~/.local/share/foo\""), "raw: {raw}");
         assert!(raw.contains("\"/nix/store\""), "raw: {raw}");
         let loaded = load_policy(&path, Some(Path::new("/home/user")), None);
-        assert_eq!(loaded.filesystem.allow[0].path, "/nix/store");
+        assert_eq!(loaded.filesystem.allow[0].path, Path::new("/nix/store"));
         assert_eq!(
             loaded.filesystem.allow[1].path,
-            "/home/user/.local/share/foo"
+            Path::new("/home/user/.local/share/foo")
         );
     }
 }

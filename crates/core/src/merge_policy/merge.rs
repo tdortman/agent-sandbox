@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::hosts::NetworkRuleKey;
 use crate::policy::{
     FilesystemRule, FilesystemRuleKey, FilesystemSection, NetworkRule, NetworkSection, Policy,
-    SudoRule, SudoSection,
+    ResourceRule, ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
 };
 
 #[must_use]
@@ -17,6 +17,7 @@ pub fn merge_layers(layers: &[Policy]) -> Policy {
         network: merge_network(layers),
         sudo: merge_sudo(layers),
         filesystem: merge_filesystem(layers),
+        resources: merge_resources(layers),
     }
 }
 
@@ -84,6 +85,30 @@ fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
         allow.remove(key);
     }
     FilesystemSection {
+        allow: allow.into_values().collect(),
+        deny: deny.into_values().collect(),
+    }
+}
+
+fn resource_rule_key(rule: &ResourceRule) -> ResourceRuleKey {
+    ResourceRuleKey::from_rule(rule)
+}
+
+fn merge_resources(layers: &[Policy]) -> ResourceSection {
+    let mut allow: BTreeMap<ResourceRuleKey, ResourceRule> = BTreeMap::new();
+    let mut deny: BTreeMap<ResourceRuleKey, ResourceRule> = BTreeMap::new();
+    for layer in layers {
+        for rule in &layer.resources.allow {
+            allow.insert(resource_rule_key(rule), rule.clone());
+        }
+        for rule in &layer.resources.deny {
+            deny.insert(resource_rule_key(rule), rule.clone());
+        }
+    }
+    for key in deny.keys() {
+        allow.remove(key);
+    }
+    ResourceSection {
         allow: allow.into_values().collect(),
         deny: deny.into_values().collect(),
     }

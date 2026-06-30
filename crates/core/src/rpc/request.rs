@@ -1,5 +1,7 @@
 //! Incoming RPC request types (`op` tag).
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ProcessIds, SandboxPaths};
@@ -9,11 +11,11 @@ use super::scope::ApprovalScope;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub home: Option<String>,
+    pub home: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_root: Option<String>,
+    pub project_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,18 +41,18 @@ impl RequestContext {
 
     #[must_use]
     pub fn with_paths(mut self, paths: &SandboxPaths) -> Self {
-        self.cwd = paths.cwd_string();
-        self.home = paths.home_string();
-        self.project_root = paths.project_root_string();
+        self.cwd = paths.cwd_path();
+        self.home = paths.home_path();
+        self.project_root = paths.project_root_path();
         self
     }
 
     #[must_use]
     pub fn from_paths_and_ids(paths: &SandboxPaths, ids: ProcessIds) -> Self {
         Self {
-            cwd: paths.cwd_string(),
-            home: paths.home_string(),
-            project_root: paths.project_root_string(),
+            cwd: paths.cwd_path(),
+            home: paths.home_path(),
+            project_root: paths.project_root_path(),
             pid: ids.pid(),
             uid: ids.uid(),
             sandbox_session_id: None,
@@ -61,9 +63,9 @@ impl RequestContext {
 impl From<&SandboxPaths> for RequestContext {
     fn from(paths: &SandboxPaths) -> Self {
         Self {
-            cwd: paths.cwd_string(),
-            home: paths.home_string(),
-            project_root: paths.project_root_string(),
+            cwd: paths.cwd_path(),
+            home: paths.home_path(),
+            project_root: paths.project_root_path(),
             pid: None,
             uid: None,
             sandbox_session_id: None,
@@ -76,9 +78,19 @@ use crate::policy::FileAccess;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalTarget {
-    NetworkHost { host: String },
-    SudoCommand { argv: Vec<String> },
-    FilesystemPath { path: String },
+    NetworkHost {
+        host: String,
+    },
+    SudoCommand {
+        argv: Vec<String>,
+    },
+    FilesystemPath {
+        path: PathBuf,
+    },
+    ResourcePath {
+        resource_kind: crate::policy::ResourceKind,
+        path: PathBuf,
+    },
 }
 
 /// Incoming RPC request (`op` tag).
@@ -108,9 +120,17 @@ pub enum RpcRequest {
         ctx: RequestContext,
     },
     CheckFilesystem {
-        path: String,
+        path: PathBuf,
         #[serde(default)]
         access: FileAccess,
+        #[serde(default)]
+        ctx: RequestContext,
+    },
+    CheckResource {
+        kind: crate::policy::ResourceKind,
+        path: PathBuf,
+        #[serde(default)]
+        access: crate::policy::ResourceAccess,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -172,6 +192,7 @@ impl RpcRequest {
             Self::RegisterUi { ctx, .. }
             | Self::Check { ctx, .. }
             | Self::CheckFilesystem { ctx, .. }
+            | Self::CheckResource { ctx, .. }
             | Self::StartFilesystemMonitor { ctx, .. }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }
@@ -188,6 +209,7 @@ impl RpcRequest {
             Self::RegisterUi { ctx, .. }
             | Self::Check { ctx, .. }
             | Self::CheckFilesystem { ctx, .. }
+            | Self::CheckResource { ctx, .. }
             | Self::StartFilesystemMonitor { ctx, .. }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }
@@ -265,6 +287,7 @@ const fn default_once_scope() -> ApprovalScope {
 mod tests {
     use super::{ApprovalTarget, RequestContext, RpcRequest};
     use crate::{ProcessIds, SandboxPaths};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn attach_check_aliases_roundtrip() {
@@ -304,8 +327,8 @@ mod tests {
     fn request_context_roundtrips_paths_and_ids() {
         let paths = SandboxPaths::new("/cwd", "/home/user", "/repo");
         let ctx = RequestContext::from_paths_and_ids(&paths, ProcessIds::new(42, 1000));
-        assert_eq!(ctx.sandbox_paths().cwd(), Some("/cwd"));
-        assert_eq!(ctx.sandbox_paths().home(), Some("/home/user"));
+        assert_eq!(ctx.sandbox_paths().cwd(), Some(Path::new("/cwd")));
+        assert_eq!(ctx.sandbox_paths().home(), Some(Path::new("/home/user")));
         assert_eq!(ctx.ids().pid(), Some(42));
         assert_eq!(ctx.ids().uid(), Some(1000));
     }
@@ -335,7 +358,7 @@ mod tests {
         match req {
             RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
                 assert_eq!(static_allow.len(), 1);
-                assert_eq!(static_allow[0].path, "/home/user");
+                assert_eq!(static_allow[0].path, PathBuf::from("/home/user"));
                 assert_eq!(static_allow[0].access, crate::policy::FileAccess::All);
             }
             _ => panic!("expected StartFilesystemMonitor"),

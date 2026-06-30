@@ -3,6 +3,7 @@ use super::{
     RpcMessage, RpcReply, RpcRequest, StatusReply, UiPush,
 };
 use crate::policy::FileAccess;
+use std::path::Path;
 
 #[test]
 fn check_request_deserializes() {
@@ -129,7 +130,7 @@ fn filesystem_check_reply_deserializes_as_filesystem_check() {
     .expect("serialize rpc reply");
     let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
     assert!(
-        matches!(reply, RpcReply::FilesystemCheck(c) if c.allowed && c.source == "once" && c.path == "/data")
+        matches!(reply, RpcReply::FilesystemCheck(c) if c.allowed && c.source == "once" && c.path == Path::new("/data"))
     );
 }
 
@@ -159,7 +160,7 @@ fn start_filesystem_monitor_with_static_allow() {
     match req {
         RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
             assert_eq!(static_allow.len(), 1);
-            assert_eq!(static_allow[0].path, "/nix/store");
+            assert_eq!(static_allow[0].path, Path::new("/nix/store"));
             assert_eq!(static_allow[0].access, FileAccess::All);
         }
         _ => panic!("expected StartFilesystemMonitor"),

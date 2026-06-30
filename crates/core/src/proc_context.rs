@@ -1,5 +1,7 @@
 //! Read sandbox context from a client process via /proc (host pid namespace).
 
+use std::path::PathBuf;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 
@@ -28,11 +30,9 @@ pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> 
 }
 
 #[must_use]
-pub fn read_proc_cwd(pid: u32) -> Option<String> {
+pub fn read_proc_cwd(pid: u32) -> Option<PathBuf> {
     let link = format!("/proc/{pid}/cwd");
-    std::fs::read_link(&link)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+    std::fs::read_link(&link).ok()
 }
 
 #[must_use]
@@ -62,9 +62,9 @@ pub struct PeerCredentials {
 /// Cwd / home / `project_root` resolved from a process's environment and `/proc`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcContext {
-    pub cwd: Option<String>,
-    pub home: Option<String>,
-    pub project_root: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
 }
 
 #[must_use]
@@ -80,12 +80,17 @@ pub fn context_from_pid(pid: u32) -> ProcContext {
     let cwd = env
         .get("AGENT_SANDBOX_CWD")
         .cloned()
+        .map(PathBuf::from)
         .or_else(|| read_proc_cwd(pid));
     let home = env
         .get("AGENT_SANDBOX_HOME")
         .cloned()
-        .or_else(|| env.get("HOME").cloned());
-    let project_root = env.get("AGENT_SANDBOX_PROJECT_ROOT").cloned();
+        .or_else(|| env.get("HOME").cloned())
+        .map(PathBuf::from);
+    let project_root = env
+        .get("AGENT_SANDBOX_PROJECT_ROOT")
+        .cloned()
+        .map(PathBuf::from);
     ProcContext {
         cwd,
         home,
