@@ -76,7 +76,7 @@ pub async fn handle_check(
     // Rejecting here means a tool that targets port 0 (e.g. nmap, custom
     // probes) never produces a `tcp://host:0` prompt.
     if port == 0 {
-        tracing::info!(%policy_host, "check deny (port 0)");
+        tracing::debug!(%policy_host, "check deny (port 0)");
         return Ok(RpcReply::Check(CheckReply::denied("port-zero")));
     }
     let prompt_host = if policy_host.is_empty() || is_ip_literal(&policy_host) {

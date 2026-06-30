@@ -131,7 +131,7 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
             let result = if allowed {
                 send_continue(cli.listener_fd, notif.id)
             } else {
-                info!(target = ?target, "network check denied");
+                debug!(target = ?target, "network check denied");
                 send_errno(cli.listener_fd, notif.id, libc::EACCES)
             };
             if let Err(err) = result {
@@ -168,7 +168,7 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
                 }
             };
             if !reply.allowed {
-                info!(target = ?target, source = %reply.source, "resource check denied");
+                debug!(target = ?target, source = %reply.source, "resource check denied");
                 let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
                 return;
             }

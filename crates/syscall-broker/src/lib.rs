@@ -574,6 +574,11 @@ fn sockaddr_target(
     };
 
     let target = match sockaddr {
+        // Port 0 means "unspecified" in sockaddr_in(6). We cannot form a
+        // meaningful policy key (and must never prompt for `host:0`), so
+        // skip gating here and let the tracee run the syscall. NFQUEUE still
+        // enforces egress on the real destination port from the packet header.
+        SockaddrTarget::Inet { port: 0, .. } => return Ok(None),
         SockaddrTarget::Inet { ip, port } => SyscallTarget::Network(NetworkTarget {
             host: ip.to_string(),
             connect_host: ip.to_string(),
@@ -889,6 +894,18 @@ mod tests {
             })
         );
     }
+    #[test]
+    fn inet_sockaddr_skips_port_zero_gating() {
+        let bytes = [2, 0, 0, 0, 75, 101, 254, 170, 0, 0, 0, 0, 0, 0, 0, 0];
+        let parsed = parse_sockaddr(&bytes).expect("parses");
+        let SockaddrTarget::Inet { port, .. } = parsed else {
+            panic!("expected inet");
+        };
+        assert_eq!(port, 0);
+        // sockaddr_target would return Ok(None) for port 0; we only test the
+        // parsed shape here because target extraction needs a live tracee.
+    }
+
     #[test]
     fn scheme_for_socket_type_dgram_is_udp() {
         assert_eq!(scheme_for_socket_type(libc::SOCK_DGRAM), "udp");
