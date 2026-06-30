@@ -417,7 +417,7 @@ impl PolicyStore {
         }
 
         if FilesystemRule::new(path.clone(), FileAccess::Read, "")
-            .path_matches(pending_path.as_path(), None)
+            .path_matches(pending_path.as_path(), pending.project_root.as_deref())
         {
             return Ok(path);
         }
@@ -600,7 +600,7 @@ impl PolicyStore {
         }
 
         if ResourceRule::new(pending.kind, path.clone(), ResourceAccess::Connect, "")
-            .path_matches(pending_path.as_path(), None)
+            .path_matches(pending_path.as_path(), pending.project_root.as_deref())
         {
             return Ok(path);
         }
