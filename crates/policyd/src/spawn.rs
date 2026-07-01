@@ -203,7 +203,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
                 "--",
                 &notify,
                 "agent-sandbox",
-                "Network approval needed. Respond to the policy prompt.",
+                "Approval needed. Respond to the policy prompt.",
             ])
             .envs(&env)
             .stdin(Stdio::null())
