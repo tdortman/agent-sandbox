@@ -178,8 +178,11 @@ mod tests {
             "host RegisterUi should succeed, got: {reply:?}"
         );
 
-        // 2. RegisterUi to sandbox socket should succeed (any client kind is
-        //    allowed; the connection transitions to UiFd after this reply).
+        // 2. RegisterUi to sandbox socket must be REJECTED. The sandbox socket
+        //    is exposed inside the jail; if an attacker could register as the
+        //    UI on it they could approve their own Check/Elevate requests (and
+        //    Elevate runs approved commands as root on the host). See
+        //    `sandbox_socket_blocks_self_approval_escape` for the full chain.
         let reply = send_and_recv(
             &args.sandbox_socket,
             RpcRequest::RegisterUi {
@@ -190,8 +193,8 @@ mod tests {
         .await
         .expect("sandbox RegisterUi");
         assert!(
-            matches!(&reply, RpcReply::RegisterUi(r) if r.ok),
-            "sandbox RegisterUi should succeed, got: {reply:?}"
+            matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
+            "sandbox RegisterUi must be rejected, got: {reply:?}"
         );
 
         // 3. StartFilesystemMonitor to sandbox socket should reach handler.

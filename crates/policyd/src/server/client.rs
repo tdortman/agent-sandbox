@@ -44,15 +44,21 @@ pub async fn handle_client(
             }
         };
 
+        let register_succeeded = is_register && resp.is_ok();
         reply(writer.clone(), &resp).await;
 
-        // Transition Host/Sandbox → UiFd after a successful RegisterUi.
-        // Future requests on this connection are UI-only (Approve, Deny, etc).
-        if (role == SocketRole::Host || role == SocketRole::Sandbox) && is_register {
+        // Transition Host/Sandbox → UiFd ONLY after a *successful* RegisterUi.
+        // A rejected RegisterUi (notably on the sandbox socket, where it is
+        // refused to block the self-approval escape) must NOT grant the UiFd
+        // role, because UiFd is approval-capable (Approve/Deny/ApproveHost).
+        // Transitioning on the request shape alone, ignoring the verdict,
+        // would let an attacker attain the approval role by sending a
+        // RegisterUi that policyd rejects.
+        if (role == SocketRole::Host || role == SocketRole::Sandbox) && register_succeeded {
             role = SocketRole::UiFd;
         }
 
-        if flush_pending && resp.is_ok() {
+        if flush_pending && register_succeeded {
             store.resolve_pending_declarative_allow().await;
             store.flush_pending_to_ui().await;
         }

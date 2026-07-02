@@ -12,12 +12,25 @@ pub enum SocketRole {
 }
 
 /// Whether the request is allowed on the sandbox socket.
+///
+/// `RegisterUi` is deliberately **excluded**. The sandbox socket is exposed
+/// inside the jail (`/run/agent-sandbox/sandbox-policy.sock`), so any
+/// sandboxed process can connect to it. Allowing `RegisterUi` there would let
+/// a malicious agent register itself as the UI for its own route, receive the
+/// prompt push for its own `Check`/`Elevate` request, and then approve that
+/// request — fully bypassing the human-in-the-loop and (for `Elevate`)
+/// executing arbitrary commands as root on the host.
+///
+/// UI registration (and therefore the `UiFd` approval role that only a
+/// registered connection can attain) is host-socket-only. The intended
+/// approval channel from inside the sandbox is the inherited fd pre-opened by
+/// `agent-sandbox-open-ui-fd` against the host socket before bwrap exec; see
+/// `open_ui_fd.rs`.
 #[must_use]
 pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
     matches!(
         req,
-        RpcRequest::RegisterUi { .. }
-            | RpcRequest::Check { .. }
+        RpcRequest::Check { .. }
             | RpcRequest::Elevate { .. }
             | RpcRequest::CheckFilesystem { .. }
             | RpcRequest::CheckResource { .. }
@@ -77,10 +90,6 @@ mod tests {
                 ctx: RequestContext::default(),
                 static_allow: vec![],
             },
-            RpcRequest::RegisterUi {
-                ui_client: Some("standalone".into()),
-                ctx: RequestContext::default(),
-            },
         ] {
             assert!(
                 ensure_allowed(SocketRole::Sandbox, &req).is_ok(),
@@ -88,6 +97,25 @@ mod tests {
                 std::mem::discriminant(&req)
             );
         }
+    }
+
+    #[test]
+    fn sandbox_socket_rejects_register_ui() {
+        // RegisterUi must be host-socket-only. The sandbox socket is exposed
+        // inside the jail; allowing UI registration there would let a
+        // malicious agent approve its own requests. See the audit finding
+        // tracked by `sandbox_socket_blocks_self_approval_escape`.
+        let req = RpcRequest::RegisterUi {
+            ui_client: Some("standalone".into()),
+            ctx: RequestContext::default(),
+        };
+        assert!(
+            matches!(
+                ensure_allowed(SocketRole::Sandbox, &req),
+                Err(PolicydError::UnauthorizedRequest)
+            ),
+            "sandbox socket must reject RegisterUi"
+        );
     }
 
     #[test]
