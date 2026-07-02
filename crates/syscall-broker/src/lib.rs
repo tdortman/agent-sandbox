@@ -681,16 +681,18 @@ fn is_device_file(path: &Path) -> bool {
     )
 }
 
-/// Return true if `path` is on the device bypass list, or under `/dev/pts/`
-/// (any pty device the kernel assigns). The broker continues these opens
-/// directly because they are structurally safe and unavoidable for
-/// interactive agents.
+/// Return true if `path` is on the device bypass list, under `/dev/pts/`
+/// (any pty device the kernel assigns), or an fd alias under `/dev/fd`.
+/// The broker continues these opens directly because they are structurally
+/// safe and unavoidable for interactive agents.
 fn is_device_bypass(path: &Path) -> bool {
     if DEVICE_BYPASS.iter().any(|d| Path::new(d) == path) {
         return true;
     }
-    // /dev/pts and descendants: /dev/pts/0, /dev/pts/3, etc.
-    path == Path::new("/dev/pts") || path.starts_with("/dev/pts/")
+    path == Path::new("/dev/pts")
+        || path.starts_with("/dev/pts/")
+        || path == Path::new("/dev/fd")
+        || path.starts_with("/dev/fd/")
 }
 
 /// Classify an `open`/`openat`/`openat2`/`creat` notification. Returns
@@ -1057,6 +1059,20 @@ mod tests {
         assert!(!is_device_bypass(Path::new("/dev/sda")));
         assert!(!is_device_bypass(Path::new("/etc/hosts")));
         assert!(!is_device_bypass(Path::new("/dev")));
+    }
+
+    #[test]
+    fn dev_fd_paths_are_bypassed_as_fd_aliases() {
+        // /dev/fd and /dev/fd/<num> are fd aliases (equivalent to dup-ing
+        // an already-open fd via /proc/self/fd), not device nodes that need
+        // resource approval. The broker must continue these without
+        // prompting; actual file access stays governed by bwrap/fanotify.
+        assert!(is_device_bypass(Path::new("/dev/fd")));
+        assert!(is_device_bypass(Path::new("/dev/fd/0")));
+        assert!(is_device_bypass(Path::new("/dev/fd/1")));
+        assert!(is_device_bypass(Path::new("/dev/fd/2")));
+        assert!(is_device_bypass(Path::new("/dev/fd/63")));
+        assert!(is_device_bypass(Path::new("/dev/fd/1023")));
     }
     mod msghdr_tests {
         use super::super::{MsghdrParts, parse_msghdr_target};
