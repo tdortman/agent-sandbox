@@ -668,7 +668,7 @@ mod tests {
 
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, FileAccess, NetworkRuleKey, ProcessIds, ResourceAccess,
-        ResourceKind, SandboxPaths, load_policy,
+        ResourceKind, RpcReply, SandboxPaths, load_policy,
     };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
@@ -1118,6 +1118,91 @@ mod tests {
                     &merge_context(None),
                 )
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_session_pending_rejects_direct_host_approval() {
+        let store = test_store("sandbox-session-direct-approval");
+        let mut pending = pending_filesystem();
+        pending.sandbox_session_id = Some("sandbox-a".into());
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id: pending_id.clone(),
+                scope: ApprovalScope::Once,
+                target: None,
+                wire: ScopeWire {
+                    paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                    session_id: None,
+                    owner_uid: Some(1000),
+                    sandbox_session_id: Some("sandbox-a".into()),
+                },
+            })
+            .await;
+
+        assert!(
+            matches!(&reply, RpcReply::Error(e) if e.error == "approval session does not match pending sandbox session"),
+            "direct host approval must be rejected, got: {reply:?}"
+        );
+        assert!(
+            store.inner.lock().await.pending.contains_key(&pending_id),
+            "rejected approval must leave pending request intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_session_pending_allows_matching_uifd_approval() {
+        let store = test_store("sandbox-session-uifd-approval");
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                UiClient {
+                    session_id: "ui-a".into(),
+                    writer: writer(),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                "ui-a".into(),
+                UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-a".into()),
+                },
+            );
+        }
+
+        let mut pending = pending_filesystem();
+        pending.sandbox_session_id = Some("sandbox-a".into());
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Once,
+                target: None,
+                wire: scope_wire("ui-a"),
+            })
+            .await;
+
+        assert!(
+            reply.scope_succeeded(),
+            "matching UiFd approval failed: {reply:?}"
         );
     }
 

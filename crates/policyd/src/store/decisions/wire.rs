@@ -106,6 +106,22 @@ impl PolicyStore {
         }
     }
 
+    async fn approval_session_matches_sandbox(
+        &self,
+        ui_session_id: Option<&str>,
+        sandbox_session_id: &str,
+    ) -> bool {
+        let Some(ui_session_id) = ui_session_id else {
+            return false;
+        };
+        let inner = self.inner.lock().await;
+        inner
+            .ui_context_by_session
+            .get(ui_session_id)
+            .and_then(|ctx| ctx.sandbox_session_id.as_deref())
+            .is_some_and(|ui_sandbox_session| ui_sandbox_session == sandbox_session_id)
+    }
+
     pub(crate) async fn take_pending_decision(
         &self,
         decision: PendingDecision,
@@ -124,6 +140,16 @@ impl PolicyStore {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
             err
         })?;
+        if let Some(sandbox_session_id) = pending.sandbox_session_id()
+            && !self
+                .approval_session_matches_sandbox(wire.session_id.as_deref(), sandbox_session_id)
+                .await
+        {
+            let mut inner = self.inner.lock().await;
+            inner.pending.insert(pending_id, pending);
+            drop(inner);
+            return Err(crate::error::PolicydError::UnauthorizedApprovalSession.into());
+        }
         Ok(TakenPendingDecision {
             pending,
             wire,
