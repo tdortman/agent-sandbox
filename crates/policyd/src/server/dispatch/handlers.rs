@@ -156,6 +156,9 @@ async fn handle_register_ui(
     ctx: RequestContext,
 ) -> Result<RpcReply, PolicydError> {
     let paths = ctx.sandbox_paths();
+    let Some(sandbox_session_id) = ctx.sandbox_session_id else {
+        return Err(PolicydError::UnauthorizedApprovalSession);
+    };
     let session_id = store
         .start_ui_session(
             client,
@@ -163,7 +166,7 @@ async fn handle_register_ui(
                 cwd: paths.cwd_path(),
                 home: paths.home_path(),
                 project_root: paths.project_root_path(),
-                sandbox_session_id: ctx.sandbox_session_id,
+                sandbox_session_id: Some(sandbox_session_id),
             },
         )
         .await;

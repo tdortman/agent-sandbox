@@ -31,6 +31,8 @@ pub enum PolicydError {
     UnauthorizedRequest,
     #[error("request not allowed on inherited UI policy fd")]
     UnauthorizedUiFdRequest,
+    #[error("approval session does not match pending sandbox session")]
+    UnauthorizedApprovalSession,
 }
 
 impl From<PolicydError> for RpcReply {

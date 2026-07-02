@@ -163,7 +163,8 @@ mod tests {
         // Allow sockets to be created.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // 1. RegisterUi to host socket should succeed.
+        // 1. RegisterUi to host socket without a sandbox session is rejected:
+        //    otherwise any host-local process could subscribe to prompts by path.
         let reply = send_and_recv(
             &args.host_socket,
             RpcRequest::RegisterUi {
@@ -174,8 +175,8 @@ mod tests {
         .await
         .expect("host RegisterUi");
         assert!(
-            matches!(&reply, RpcReply::RegisterUi(r) if r.ok),
-            "host RegisterUi should succeed, got: {reply:?}"
+            matches!(&reply, RpcReply::Error(e) if e.error == "approval session does not match pending sandbox session"),
+            "host RegisterUi without sandbox_session_id must be rejected, got: {reply:?}"
         );
 
         // 2. RegisterUi to sandbox socket must be REJECTED. The sandbox socket

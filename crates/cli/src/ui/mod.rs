@@ -29,7 +29,7 @@ use tracing::{info, warn};
         user's decisions back to policyd. Typically spawned by \"agent-sandbox-open-ui-fd\" or by \
         policyd itself when no other UI is registered for a given request.\n\n\
         EXAMPLES:\n\
-        # Start a UI client with the default policyd socket, sourcing context from env vars.\n\
+        # Start a UI client from launcher-provided env vars, including AGENT_SANDBOX_SESSION_ID.\n\
         agent-sandbox-ui\n\n\
         # Pass context explicitly and tag the session for policy routing.\n\
         agent-sandbox-ui \\\n\
