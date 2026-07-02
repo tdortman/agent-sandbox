@@ -118,7 +118,7 @@ mod tests {
     use super::*;
     use crate::store::PolicydArgs;
     use agent_sandbox_core::{
-        RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, UiPush,
+        ApprovalScope, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, UiPush,
     };
     use std::time::Duration;
 
@@ -424,6 +424,86 @@ mod tests {
                 }) if elevation_argv == &vec!["whoami".to_string()]
             ),
             "expected elevation push, got: {pushed:?}"
+        );
+
+        server_task.abort();
+    }
+
+    /// Regression for the self-approval sandbox escape.
+    ///
+    /// Threat model: a malicious agent inside the jail can reach the
+    /// sandbox-facing policy socket (`/run/agent-sandbox/sandbox-policy.sock`,
+    /// bound into the sandbox by bwrap). The attack is:
+    ///   1. Connect to the sandbox socket.
+    ///   2. `RegisterUi` to transition the connection to the `UiFd` role.
+    ///   3. Issue an `Elevate` (or `Check`) on another connection.
+    ///   4. Receive the prompt push (the attacker matches its own route) and
+    ///      read the `pending_id`.
+    ///   5. `Approve` the pending id from the `UiFd` connection.
+    /// Because policyd runs as root and `Elevate` executes the approved argv
+    /// on the host, this is arbitrary-code-execution as root with no human
+    /// ever answering a prompt.
+    ///
+    /// The fix gates the whole chain at step 2: `RegisterUi` is rejected on
+    /// the sandbox socket, so an attacker can never attain the `UiFd` role
+    /// from inside the jail, and therefore can never call `Approve`.
+    #[tokio::test]
+    async fn sandbox_socket_blocks_self_approval_escape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let store = Arc::new(PolicyStore::new(args.clone()));
+        let server = PolicyServer::new(
+            store.clone(),
+            args.host_socket.clone(),
+            args.sandbox_socket.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Attacker (inside the sandbox) connects to the sandbox socket and
+        // attempts to register as the UI. This MUST be rejected; without the
+        // fix it succeeds and the connection becomes an approval-capable UiFd.
+        let mut attacker = RpcConnection::connect(&args.sandbox_socket)
+            .await
+            .expect("connect sandbox socket");
+        let reply = attacker
+            .request(RpcRequest::RegisterUi {
+                ui_client: Some("standalone".into()),
+                ctx: RequestContext {
+                    cwd: Some("/workspace".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/workspace".into()),
+                    sandbox_session_id: Some("attacker".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("sandbox RegisterUi");
+        assert!(
+            matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
+            "sandbox RegisterUi must be rejected to block the self-approval escape, got: {reply:?}"
+        );
+
+        // Because registration was rejected, the connection did NOT transition
+        // to UiFd. A follow-up Approve on the same connection must also be
+        // rejected (still Sandbox role), proving the approval capability was
+        // never granted.
+        let reply = attacker
+            .request(RpcRequest::Approve {
+                id: "elev:fabricated".into(),
+                scope: ApprovalScope::Once,
+                session_id: None,
+                target: None,
+                ctx: RequestContext::default(),
+            })
+            .await
+            .expect("sandbox Approve");
+        assert!(
+            matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
+            "Approve must remain blocked on a sandbox connection that failed to register, got: {reply:?}"
         );
 
         server_task.abort();
