@@ -668,7 +668,7 @@ mod tests {
 
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, FileAccess, NetworkRuleKey, ProcessIds, ResourceAccess,
-        ResourceKind, SandboxPaths,
+        ResourceKind, SandboxPaths, load_policy,
     };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
@@ -898,6 +898,71 @@ mod tests {
             )
             .expect("project-relative resource target should resolve"),
             PathBuf::from("./.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn global_resource_dev_fd_glob_persists_to_policy_json() {
+        // A non-once approval for a resource prompt whose target is the glob
+        // /dev/fd/* under Global scope must persist an allow rule to the
+        // global policy.json rather than silently doing nothing.
+        let store = test_store("global-devfd");
+        let home = std::env::temp_dir().join(format!(
+            "agent-sandbox-home-global-devfd-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create test home");
+        let pending = PendingResource {
+            id: "rs-devfd".into(),
+            created_at: 0.0,
+            kind: ResourceKind::UnixSocket,
+            path: "/dev/fd/3".into(),
+            access: ResourceAccess::Connect,
+            cwd: None,
+            home: Some(home.clone()),
+            project_root: None,
+            sandbox_session_id: None,
+        };
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Resource(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Global,
+                target: Some(ApprovalTarget::ResourcePath {
+                    resource_kind: ResourceKind::UnixSocket,
+                    path: "/dev/fd/*".into(),
+                }),
+                wire: ScopeWire {
+                    paths: SandboxPaths::new("/repo", home.clone(), "/repo"),
+                    session_id: None,
+                    owner_uid: Some(1000),
+                    sandbox_session_id: None,
+                },
+            })
+            .await;
+        assert!(
+            reply.scope_succeeded(),
+            "global resource approval should succeed, got {reply:?}"
+        );
+
+        let policy_path = home.join(".config/agent-sandbox/policy.json");
+        let policy = load_policy(&policy_path, Some(home.as_path()), None);
+        let found = policy.resources.allow.iter().any(|rule| {
+            rule.kind == ResourceKind::UnixSocket
+                && rule.path == Path::new("/dev/fd/*")
+                && rule.access.covers(ResourceAccess::Connect)
+        });
+        assert!(
+            found,
+            "global /dev/fd/* resource rule should be persisted to {:?}, allow={:?}",
+            policy_path, policy.resources.allow
         );
     }
 
