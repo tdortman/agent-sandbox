@@ -744,11 +744,51 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
     }))
 }
 
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+/// Resolve an open-family path against the directory base that the kernel will
+/// use. Plain absolute paths stay absolute. `openat2(RESOLVE_IN_ROOT)` scopes
+/// even absolute paths under `dir_base`, so `/kvm` with `dirfd=/dev` resolves
+/// as `/dev/kvm`.
+fn resolve_open_path(path: &Path, dir_base: &Path, absolute_in_dir: bool) -> PathBuf {
+    if path.is_absolute() {
+        if absolute_in_dir {
+            return dir_base.join(path.strip_prefix("/").unwrap_or(path));
+        }
+        path.to_path_buf()
+    } else {
+        dir_base.join(path)
+    }
+}
+
+/// True when `dirfd` is the `AT_FDCWD` sentinel (-100). Seccomp stores
+/// syscall args as u64 with the register's sign extension.
+fn is_at_fdcwd(dirfd: u64) -> bool {
+    dirfd.cast_signed() == i64::from(libc::AT_FDCWD)
+}
+
+fn at_fdcwd_arg() -> u64 {
+    i64::from(libc::AT_FDCWD).cast_unsigned()
+}
+
+/// Resolve the tracee directory used for a relative open-family path: cwd for
+/// `AT_FDCWD`, otherwise the path of the dirfd via `/proc/<pid>/fd/<n>`.
+fn tracee_open_dir_base(pid: u32, dirfd: u64) -> io::Result<PathBuf> {
+    let link = if is_at_fdcwd(dirfd) {
+        format!("/proc/{pid}/cwd")
+    } else {
+        format!("/proc/{pid}/fd/{dirfd}")
+    };
+    std::fs::read_link(link)
+}
+
 /// Resolve the path the tracee passed to `open`/`openat`/`openat2`/`creat`.
 /// `open(path, ...)`, `openat(dirfd, path, ...)`, and `openat2(dirfd, path,
 /// how, size)` all carry the path as args[1] (a pointer). `open` and `creat`
-/// carry it as args[0]. Returns `None` if the pointer is null or the path is
-/// not valid UTF-8 (treat as no target).
+/// carry it as args[0]. Relative names are joined against the tracee cwd or
+/// `dirfd` directory before callers canonicalize or classify the target.
+/// Returns `None` if the pointer is null or the path is not valid UTF-8 (treat
+/// as no target).
 fn read_tracee_open_path(notif: &SeccompNotif) -> io::Result<Option<PathBuf>> {
     let nr_val = i64::from(notif.data.nr);
     let path_arg = if nr_val == nr::OPEN || nr_val == nr::CREAT {
@@ -763,7 +803,35 @@ fn read_tracee_open_path(notif: &SeccompNotif) -> io::Result<Option<PathBuf>> {
     // Read up to PATH_MAX (4096) bytes, then truncate at the first NUL.
     let bytes = read_tracee_bytes(notif.pid, path_arg, 4096)?;
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
+    let Some(path) = std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let dirfd = if nr_val == nr::OPEN || nr_val == nr::CREAT {
+        at_fdcwd_arg()
+    } else {
+        notif.data.args[0]
+    };
+    let absolute_in_dir = nr_val == nr::OPENAT2
+        && openat2_resolve_flags(notif).is_ok_and(|r| r & RESOLVE_IN_ROOT != 0);
+    if path.is_absolute() && !absolute_in_dir {
+        return Ok(Some(path));
+    }
+    let base = tracee_open_dir_base(notif.pid, dirfd)?;
+    Ok(Some(resolve_open_path(&path, &base, absolute_in_dir)))
+}
+
+fn openat2_resolve_flags(notif: &SeccompNotif) -> io::Result<u64> {
+    let how_ptr = notif.data.args[2];
+    if how_ptr == 0 {
+        return Ok(0);
+    }
+    let bytes = read_tracee_bytes(notif.pid, how_ptr, 24)?;
+    if bytes.len() < 24 {
+        return Ok(0);
+    }
+    Ok(u64::from_ne_bytes(
+        bytes[16..24].try_into().expect("checked length"),
+    ))
 }
 
 /// Extract the raw `(flags, mode)` from an open-family notification at
