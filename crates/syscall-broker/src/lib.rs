@@ -1,8 +1,8 @@
 #![allow(unsafe_code)]
 
 use agent_sandbox_core::{
-    ProcessIds, RequestContext, ResourceAccess, ResourceCheckReply, ResourceKind, RpcReply,
-    RpcRequest, SandboxPaths, policy_rpc,
+    FileAccess, FilesystemCheckReply, ProcessIds, RequestContext, ResourceAccess,
+    ResourceCheckReply, ResourceKind, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
 use agent_sandbox_syscall::policy::nr;
 use std::io;
@@ -111,14 +111,23 @@ pub struct ResourceTarget {
     pub open_mode: u32,
 }
 
+/// Filesystem mutation target from a sandboxed syscall: one or more path
+/// and access pairs checked via policyd's `CheckFilesystem` RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemTarget {
+    pub checks: Vec<(PathBuf, FileAccess)>,
+}
+
 /// Classified target of a notified syscall, driving broker dispatch.
 ///
 /// Network targets go through the `Check` RPC, resource targets through
-/// `CheckResource`, and `None` means continue with no further work.
+/// `CheckResource`, filesystem targets through `CheckFilesystem`, and
+/// `None` means continue with no further work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallTarget {
     Network(NetworkTarget),
     Resource(ResourceTarget),
+    Filesystem(FilesystemTarget),
     None,
 }
 /// Parsed `AF_UNIX` address: a filesystem path or a kernel abstract name.
@@ -623,6 +632,203 @@ fn sockaddr_target(
     Ok(Some(target))
 }
 
+fn filesystem_target(checks: Vec<(PathBuf, FileAccess)>) -> Option<SyscallTarget> {
+    if checks.is_empty() {
+        None
+    } else {
+        Some(SyscallTarget::Filesystem(FilesystemTarget { checks }))
+    }
+}
+
+fn normalize_check_path(path: &Path) -> PathBuf {
+    normalize_unix_path(path)
+}
+
+fn filesystem_checks_rename(old: &Path, new: &Path) -> Option<SyscallTarget> {
+    filesystem_target(vec![
+        (normalize_check_path(old), FileAccess::ReadWrite),
+        (normalize_check_path(new), FileAccess::ReadWrite),
+    ])
+}
+
+fn filesystem_checks_link(old: &Path, new: &Path) -> Option<SyscallTarget> {
+    filesystem_target(vec![
+        (normalize_check_path(old), FileAccess::ReadWrite),
+        (normalize_check_path(new), FileAccess::ReadWrite),
+    ])
+}
+
+fn filesystem_checks_symlink(target: Option<&Path>, linkpath: &Path) -> Option<SyscallTarget> {
+    let mut checks = Vec::new();
+    if let Some(target) = target {
+        checks.push((normalize_check_path(target), FileAccess::Read));
+    }
+    checks.push((normalize_check_path(linkpath), FileAccess::Write));
+    filesystem_target(checks)
+}
+
+fn filesystem_checks_unlink(path: &Path) -> Option<SyscallTarget> {
+    filesystem_target(vec![(normalize_check_path(path), FileAccess::Write)])
+}
+
+fn filesystem_checks_truncate(path: &Path) -> Option<SyscallTarget> {
+    filesystem_target(vec![(normalize_check_path(path), FileAccess::Write)])
+}
+
+/// Read a NUL-terminated path pointer from the tracee. Returns `None` for a
+/// null pointer or non-UTF-8 path.
+fn read_tracee_path_ptr(pid: u32, path_ptr: u64) -> io::Result<Option<PathBuf>> {
+    if path_ptr == 0 {
+        return Ok(None);
+    }
+    let bytes = read_tracee_bytes(pid, path_ptr, 4096)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
+}
+
+/// Resolve a relative tracee path against `dirfd` or cwd (`AT_FDCWD`).
+fn resolve_tracee_path(pid: u32, dirfd: u64, path: PathBuf) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let base = tracee_open_dir_base(pid, dirfd)?;
+    Ok(resolve_open_path(&path, &base, false))
+}
+
+fn resolve_symlink_target(target: Option<PathBuf>, linkpath: &Path) -> Option<PathBuf> {
+    let target = target?;
+    if target.is_absolute() {
+        Some(target)
+    } else {
+        Some(
+            linkpath
+                .parent()
+                .map_or_else(|| target.clone(), |parent| parent.join(&target)),
+        )
+    }
+}
+
+/// Resolve a tracee `(dirfd, path)` pair the same way the open-family helpers do.
+fn read_resolved_path_arg(pid: u32, dirfd: u64, path_ptr: u64) -> io::Result<Option<PathBuf>> {
+    let Some(path) = read_tracee_path_ptr(pid, path_ptr)? else {
+        return Ok(None);
+    };
+    Ok(Some(resolve_tracee_path(pid, dirfd, path)?))
+}
+
+/// Resolve `/proc/<pid>/fd/<fd>` for an open tracee descriptor.
+fn tracee_fd_path(pid: u32, fd: u64) -> io::Result<PathBuf> {
+    let link = format!("/proc/{pid}/fd/{fd}");
+    std::fs::read_link(link)
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_rename(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let old = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
+    let new = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[1])?;
+    Ok(match (old, new) {
+        (Some(old), Some(new)) => filesystem_checks_rename(&old, &new),
+        _ => None,
+    })
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_renameat_family(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let old = read_resolved_path_arg(notif.pid, notif.data.args[0], notif.data.args[1])?;
+    let new = read_resolved_path_arg(notif.pid, notif.data.args[2], notif.data.args[3])?;
+    Ok(match (old, new) {
+        (Some(old), Some(new)) => filesystem_checks_rename(&old, &new),
+        _ => None,
+    })
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_link(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let old = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
+    let new = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[1])?;
+    Ok(match (old, new) {
+        (Some(old), Some(new)) => filesystem_checks_link(&old, &new),
+        _ => None,
+    })
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_linkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let old = read_resolved_path_arg(notif.pid, notif.data.args[0], notif.data.args[1])?;
+    let new = read_resolved_path_arg(notif.pid, notif.data.args[2], notif.data.args[3])?;
+    Ok(match (old, new) {
+        (Some(old), Some(new)) => filesystem_checks_link(&old, &new),
+        _ => None,
+    })
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_symlink(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let target = read_tracee_path_ptr(notif.pid, notif.data.args[0])?;
+    let linkpath = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[1])?;
+    Ok(linkpath.and_then(|linkpath| {
+        let target = resolve_symlink_target(target, &linkpath);
+        filesystem_checks_symlink(target.as_deref(), &linkpath)
+    }))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let target = read_tracee_path_ptr(notif.pid, notif.data.args[0])?;
+    let linkpath = read_resolved_path_arg(notif.pid, notif.data.args[1], notif.data.args[2])?;
+    Ok(linkpath.and_then(|linkpath| {
+        let target = resolve_symlink_target(target, &linkpath);
+        filesystem_checks_symlink(target.as_deref(), &linkpath)
+    }))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_unlink(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let path = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
+    Ok(path.and_then(|path| filesystem_checks_unlink(&path)))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_unlinkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let path = read_resolved_path_arg(notif.pid, notif.data.args[0], notif.data.args[1])?;
+    Ok(path.and_then(|path| filesystem_checks_unlink(&path)))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_truncate(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let path = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
+    Ok(path.and_then(|path| filesystem_checks_truncate(&path)))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    let fd = notif.data.args[0];
+    let path = tracee_fd_path(notif.pid, fd)?;
+    Ok(filesystem_checks_truncate(&path))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn target_from_filesystem_mutation(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    match i64::from(notif.data.nr) {
+        nr::RENAME => target_from_rename(notif),
+        nr::RENAMEAT | nr::RENAMEAT2 => target_from_renameat_family(notif),
+        nr::LINK => target_from_link(notif),
+        nr::LINKAT => target_from_linkat(notif),
+        nr::SYMLINK => target_from_symlink(notif),
+        nr::SYMLINKAT => target_from_symlinkat(notif),
+        nr::UNLINK => target_from_unlink(notif),
+        nr::UNLINKAT => target_from_unlinkat(notif),
+        nr::TRUNCATE => target_from_truncate(notif),
+        nr::FTRUNCATE => target_from_ftruncate(notif),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn target_from_filesystem_mutation(_notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+    Ok(None)
+}
+
 /// Route a notification to the target extractor based on syscall number.
 ///
 /// Network-egress syscalls (`connect`/`sendto`/`sendmsg`/`sendmmsg`)
@@ -630,12 +836,13 @@ fn sockaddr_target(
 /// (`open`/`openat`/`openat2`/`creat`) are classified by the path they
 /// target: `/dev` paths become a `Resource` target of kind `Device`,
 /// except for a built-in bypass list of safe devices the broker always
-/// continues without a policy check.
+/// continues without a policy check. Filesystem mutation syscalls are
+/// classified into path/access checks against policyd's filesystem gate.
 ///
 /// # Errors
 ///
 /// Returns an error if the underlying target extraction (reading tracee
-/// memory) fails.
+/// memory or resolving tracee paths/fds) fails.
 pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     match i64::from(notif.data.nr) {
         nr::SENDTO => target_from_sendto(notif),
@@ -643,7 +850,7 @@ pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<Sysca
         nr::SENDMSG => target_from_sendmsg(notif),
         nr::SENDMMSG => target_from_sendmmsg(notif),
         nr::OPEN | nr::OPENAT | nr::OPENAT2 | nr::CREAT => Ok(target_from_open(notif)),
-        _ => Ok(None),
+        _ => target_from_filesystem_mutation(notif),
     }
 }
 
@@ -946,17 +1153,59 @@ pub async fn check_resource(
     }
 }
 
+/// Ask policyd whether a filesystem-gated syscall path/access pair is allowed.
+///
+/// Returns the `FilesystemCheckReply` so the broker can distinguish a policy
+/// denial from a policyd error and log the source label policyd attached to
+/// the verdict.
+///
+/// # Errors
+///
+/// Returns an error if the RPC itself fails (policyd unreachable, timeout,
+/// malformed reply). A policy denial is returned as `Ok(FilesystemCheckReply {
+/// allowed: false, .. })`, not as an error.
+pub async fn check_filesystem(
+    policy_socket: &Path,
+    path: &Path,
+    access: FileAccess,
+    sandbox_session_id: Option<String>,
+    pid: u32,
+    timeout: Duration,
+) -> io::Result<FilesystemCheckReply> {
+    let mut ctx = RequestContext::from_paths_and_ids(
+        &SandboxPaths::default(),
+        ProcessIds::from_options(Some(pid), None),
+    );
+    ctx.sandbox_session_id = sandbox_session_id;
+    let req = RpcRequest::CheckFilesystem {
+        path: path.to_path_buf(),
+        access,
+        ctx,
+    };
+    match policy_rpc(&policy_socket.display().to_string(), req, timeout).await {
+        Ok(RpcReply::FilesystemCheck(reply)) => Ok(reply),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "policyd returned a non-FilesystemCheck reply for CheckFilesystem",
+        )),
+        Err(err) => Err(io::Error::other(err.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SockaddrTarget, UnixAddress, at_fdcwd_arg, hex_encode_lower, is_at_fdcwd, is_device_bypass,
-        is_device_file, parse_sockaddr, resolve_open_path, scheme_for_socket_type,
+        FileAccess, FilesystemTarget, SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg,
+        filesystem_checks_link, filesystem_checks_rename, filesystem_checks_symlink,
+        filesystem_checks_truncate, filesystem_checks_unlink, hex_encode_lower, is_at_fdcwd,
+        is_device_bypass, is_device_file, parse_sockaddr, read_resolved_path_arg,
+        resolve_open_path, resolve_tracee_path, scheme_for_socket_type, tracee_fd_path,
         tracee_open_dir_base,
     };
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn parse_ipv4_sockaddr() {
@@ -1211,6 +1460,217 @@ mod tests {
         assert!(is_device_bypass(Path::new("/dev/fd/63")));
         assert!(is_device_bypass(Path::new("/dev/fd/1023")));
     }
+
+    #[test]
+    fn filesystem_checks_rename_requires_read_write_on_both_paths() {
+        let target = filesystem_checks_rename(Path::new("/tmp/old.txt"), Path::new("/tmp/new.txt"))
+            .expect("rename target");
+        let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {
+            panic!("expected filesystem target");
+        };
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].1, FileAccess::ReadWrite);
+        assert_eq!(checks[1].1, FileAccess::ReadWrite);
+        assert!(checks[0].0.ends_with("old.txt"));
+        assert!(checks[1].0.ends_with("new.txt"));
+    }
+
+    #[test]
+    fn filesystem_checks_link_requires_read_write_on_both_paths() {
+        let target = filesystem_checks_link(Path::new("/tmp/src"), Path::new("/tmp/dst"))
+            .expect("link target");
+        let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {
+            panic!("expected filesystem target");
+        };
+        assert_eq!(
+            checks,
+            vec![
+                (PathBuf::from("/tmp/src"), FileAccess::ReadWrite),
+                (PathBuf::from("/tmp/dst"), FileAccess::ReadWrite),
+            ]
+        );
+    }
+
+    /// Mirrors `dispatch_filesystem_target`: every `(path, access)` must pass
+    /// before the broker may continue the syscall.
+    #[cfg(test)]
+    async fn filesystem_target_allowed_with<F, Fut>(target: &FilesystemTarget, mut check: F) -> bool
+    where
+        F: FnMut(&Path, FileAccess) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for (path, access) in &target.checks {
+            if !check(path, *access).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn filesystem_mutation_dispatch_denies_when_any_endpoint_denied() {
+        let target = FilesystemTarget {
+            checks: vec![
+                (PathBuf::from("/repo/allowed.txt"), FileAccess::Write),
+                (PathBuf::from("/repo/denied.txt"), FileAccess::Write),
+            ],
+        };
+        let mut calls = 0_u32;
+        let allowed = filesystem_target_allowed_with(&target, |path, _access| {
+            calls += 1;
+            let denied = path == Path::new("/repo/denied.txt");
+            async move { !denied }
+        })
+        .await;
+        assert!(
+            !allowed,
+            "broker must deny when any mutation endpoint fails"
+        );
+        assert_eq!(calls, 2, "broker must CheckFilesystem every affected path");
+    }
+
+    #[tokio::test]
+    async fn filesystem_mutation_dispatch_short_circuits_on_first_denial() {
+        let target = FilesystemTarget {
+            checks: vec![
+                (PathBuf::from("/repo/denied.txt"), FileAccess::Write),
+                (PathBuf::from("/repo/allowed.txt"), FileAccess::Write),
+            ],
+        };
+        let mut calls = 0_u32;
+        let allowed = filesystem_target_allowed_with(&target, |path, _access| {
+            calls += 1;
+            let denied = path == Path::new("/repo/denied.txt");
+            async move { !denied }
+        })
+        .await;
+        assert!(!allowed);
+        assert_eq!(
+            calls, 1,
+            "broker should stop checking once a mutation endpoint is denied"
+        );
+    }
+
+    #[test]
+    fn filesystem_mutation_multi_path_syscalls_cover_all_affected_endpoints() {
+        let rename =
+            filesystem_checks_rename(Path::new("/repo/old.txt"), Path::new("/repo/new.txt"))
+                .expect("rename");
+        let link = filesystem_checks_link(Path::new("/repo/src.txt"), Path::new("/repo/dst.txt"))
+            .expect("link");
+        for (name, target, expected_paths) in [
+            ("rename", rename, ["/repo/old.txt", "/repo/new.txt"]),
+            ("link", link, ["/repo/src.txt", "/repo/dst.txt"]),
+        ] {
+            let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {
+                panic!("{name} must classify as filesystem mutation");
+            };
+            assert_eq!(
+                checks.len(),
+                expected_paths.len(),
+                "{name} must register every affected path for CheckFilesystem"
+            );
+            for (i, expected) in expected_paths.iter().enumerate() {
+                assert!(
+                    checks[i].0.ends_with(expected),
+                    "{name} check {i} should cover {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filesystem_checks_symlink_checks_target_read_and_linkpath_write() {
+        let symlink =
+            filesystem_checks_symlink(Some(Path::new("/tmp/source")), Path::new("/tmp/link"))
+                .expect("symlink target");
+        let SyscallTarget::Filesystem(FilesystemTarget { checks }) = symlink else {
+            panic!("expected filesystem target");
+        };
+        assert_eq!(
+            checks,
+            vec![
+                (PathBuf::from("/tmp/source"), FileAccess::Read),
+                (PathBuf::from("/tmp/link"), FileAccess::Write),
+            ]
+        );
+
+        let symlink_without_target =
+            filesystem_checks_symlink(None, Path::new("/tmp/link")).expect("symlink target");
+        let SyscallTarget::Filesystem(FilesystemTarget { checks }) = symlink_without_target else {
+            panic!("expected filesystem target");
+        };
+        assert_eq!(
+            checks,
+            vec![(PathBuf::from("/tmp/link"), FileAccess::Write)]
+        );
+    }
+
+    #[test]
+    fn filesystem_checks_unlink_and_truncate_are_write_only() {
+        let unlink = filesystem_checks_unlink(Path::new("/tmp/gone")).expect("unlink target");
+        let truncate = filesystem_checks_truncate(Path::new("/tmp/file")).expect("truncate target");
+        for target in [unlink, truncate] {
+            let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {
+                panic!("expected filesystem target");
+            };
+            assert_eq!(checks, vec![(checks[0].0.clone(), FileAccess::Write)]);
+        }
+    }
+
+    #[test]
+    fn resolve_tracee_path_joins_relative_name_against_dirfd() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-sandbox-syscall-broker-fs-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).expect("create temp dir");
+        let dir_file = fs::File::open(&dir).expect("open temp dir");
+
+        let resolved = resolve_tracee_path(
+            std::process::id(),
+            u64::try_from(dir_file.as_raw_fd()).expect("dir fd"),
+            PathBuf::from("child.txt"),
+        )
+        .expect("resolved path");
+        assert_eq!(resolved, dir.join("child.txt"));
+
+        let absolute = resolve_tracee_path(
+            std::process::id(),
+            at_fdcwd_arg(),
+            PathBuf::from("/etc/hosts"),
+        )
+        .expect("absolute path");
+        assert_eq!(absolute, PathBuf::from("/etc/hosts"));
+
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn read_resolved_path_arg_returns_none_for_null_pointer() {
+        let resolved =
+            read_resolved_path_arg(std::process::id(), at_fdcwd_arg(), 0).expect("read resolved");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn tracee_fd_path_resolves_open_file() {
+        let file = std::env::temp_dir().join(format!(
+            "agent-sandbox-syscall-broker-fd-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&file);
+        let opened = fs::File::create(&file).expect("create temp file");
+        let resolved = tracee_fd_path(
+            std::process::id(),
+            u64::try_from(opened.as_raw_fd()).expect("fd"),
+        )
+        .expect("fd path");
+        assert_eq!(resolved, file);
+        let _ = fs::remove_file(file);
+    }
+
     mod msghdr_tests {
         use super::super::{MsghdrParts, parse_msghdr_target};
 

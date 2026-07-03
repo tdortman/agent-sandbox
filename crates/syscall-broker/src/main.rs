@@ -7,8 +7,9 @@ use std::time::Duration;
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    ResourceTarget, SeccompNotif, SyscallTarget, check_resource, check_target, recv_notification,
-    send_addfd, send_continue, send_errno, send_result, target_from_notification,
+    FilesystemTarget, ResourceTarget, SeccompNotif, SyscallTarget, check_filesystem,
+    check_resource, check_target, recv_notification, send_addfd, send_continue, send_errno,
+    send_result, target_from_notification,
 };
 use clap::Parser;
 use tokio::time;
@@ -185,6 +186,21 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
                 let _ = send_errno(cli.listener_fd, notif.id, errno);
             }
         }
+        Ok(Some(SyscallTarget::Filesystem(target))) => {
+            if let Err(err) = dispatch_filesystem_target(
+                &cli.policy_socket,
+                cli.sandbox_session_id.clone(),
+                cli.listener_fd,
+                notif,
+                &target,
+                timeout,
+            )
+            .await
+            {
+                warn!(error = %err, target = ?target, "filesystem dispatch failed");
+                let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+            }
+        }
         Ok(Some(SyscallTarget::None) | None) => {
             debug!(syscall = notif.data.nr, "continuing non-gated syscall");
             if let Err(err) = send_continue(cli.listener_fd, notif.id) {
@@ -200,6 +216,33 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
             let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
         }
     }
+}
+
+/// Policy-check every filesystem path/access pair, then continue or deny.
+async fn dispatch_filesystem_target(
+    policy_socket: &Path,
+    sandbox_session_id: Option<String>,
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    target: &FilesystemTarget,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    for (path, access) in &target.checks {
+        let reply = check_filesystem(
+            policy_socket,
+            path,
+            *access,
+            sandbox_session_id.clone(),
+            notif.pid,
+            timeout,
+        )
+        .await?;
+        if !reply.allowed {
+            debug!(path = %path.display(), ?access, source = %reply.source, "filesystem check denied");
+            return send_errno(listener_fd, notif.id, libc::EACCES);
+        }
+    }
+    send_continue(listener_fd, notif.id)
 }
 
 fn set_nonblocking(fd: i32) -> std::io::Result<()> {
