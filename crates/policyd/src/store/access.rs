@@ -574,6 +574,9 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
         let home = ctx.paths.home();
+        if is_session_bus_socket(kind, path, access) {
+            return true;
+        }
         let path_match = merged
             .resources
             .deny
