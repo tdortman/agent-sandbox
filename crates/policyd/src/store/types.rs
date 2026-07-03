@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{
-    CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRuleKey, NetworkRuleKey,
-    ResourceAccess, ResourceCheckReply, ResourceKind, ResourceRuleKey,
+    CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRule, FilesystemRuleKey,
+    NetworkRuleKey, ResourceAccess, ResourceCheckReply, ResourceKind, ResourceRuleKey,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
@@ -25,7 +25,7 @@ pub const MAX_WAITERS_PER_PENDING: usize = 64;
 /// map) when the cap is exceeded.
 pub const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
 
-/// Cap on the number of static filesystem allow rules accepted by fsmon.
+/// Cap on the number of static filesystem allow rules retained per sandbox session.
 pub const MAX_STATIC_ALLOW_RULES: usize = 4096;
 
 /// Key for the network verdict cache: hostname and port.
@@ -280,6 +280,9 @@ pub struct StoreInner {
     pub session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
     pub session_resource_allow: HashMap<String, HashSet<ResourceRuleKey>>,
     pub session_resource_deny: HashMap<String, HashSet<ResourceRuleKey>>,
+    /// Static filesystem allow rules registered by `StartFilesystemMonitor`,
+    /// keyed by sandbox session id (or cwd/project-root context fallback).
+    pub sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
     /// Inode cache for hardlink defense. Maps `(inode, device)` to canonical
     /// paths for files under deny rules. Built by walking deny directories and
     /// stat'ing concrete deny files. Fingerprinted by deny rule path mtimes.

@@ -50,6 +50,7 @@ impl PolicyStore {
                 session_filesystem_deny: HashMap::new(),
                 session_resource_allow: HashMap::new(),
                 session_resource_deny: HashMap::new(),
+                sandbox_filesystem_static_allow: HashMap::new(),
                 network_verdict_cache: HashMap::new(),
                 filesystem_verdict_cache: HashMap::new(),
                 resource_verdict_cache: HashMap::new(),

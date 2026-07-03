@@ -29,6 +29,23 @@ fn session_sudo_matches(bucket: &HashSet<Vec<String>>, argv: &[String]) -> bool 
         .any(|rule| !rule.is_empty() && argv.starts_with(rule))
 }
 
+fn sandbox_filesystem_static_allow_key(ctx: &MergeContext) -> String {
+    if let Some(id) = &ctx.sandbox_session_id {
+        return format!("sandbox:{id}");
+    }
+    let cwd = ctx
+        .paths
+        .cwd()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let project_root = ctx
+        .paths
+        .project_root()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("ctx:{cwd}:{project_root}")
+}
+
 impl PolicyStore {
     pub(crate) async fn once_allowed(&self, host: &str, port: u16, consume: bool) -> bool {
         let keys = allow_keys(host, port);
@@ -327,6 +344,43 @@ impl PolicyStore {
         })
     }
 
+    pub(crate) async fn static_filesystem_allowed(
+        &self,
+        path: &Path,
+        access: FileAccess,
+        ctx: &MergeContext,
+    ) -> bool {
+        let resolved = self.resolve_context(ctx);
+        let key = sandbox_filesystem_static_allow_key(&resolved);
+        let project_root = resolved.paths.project_root();
+        let inner = self.inner.lock().await;
+        inner
+            .sandbox_filesystem_static_allow
+            .get(&key)
+            .is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|rule| rule.matches(path, access, project_root))
+            })
+    }
+
+    pub(crate) async fn store_sandbox_static_allow(
+        &self,
+        ctx: &MergeContext,
+        rules: Vec<FilesystemRule>,
+    ) {
+        if rules.is_empty() {
+            return;
+        }
+        let resolved = self.resolve_context(ctx);
+        let key = sandbox_filesystem_static_allow_key(&resolved);
+        self.inner
+            .lock()
+            .await
+            .sandbox_filesystem_static_allow
+            .insert(key, rules);
+    }
+
     pub(crate) async fn filesystem_allow_source(
         &self,
         path: &Path,
@@ -350,6 +404,9 @@ impl PolicyStore {
             .await
         {
             return Some("session".into());
+        }
+        if self.static_filesystem_allowed(path, access, ctx).await {
+            return Some("static".into());
         }
         if self.filesystem_policy_allowed(path, access, ctx) {
             return Some("allow".into());
@@ -925,5 +982,371 @@ mod tests {
             .expect("clear policy");
 
         assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
+    }
+    #[tokio::test]
+    async fn static_allow_does_not_override_concrete_deny() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).expect("policy dir");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        std::fs::create_dir_all(&home).expect("home");
+        let license_path = project_root.join("LICENSE");
+        std::fs::write(&license_path, "license").expect("write license");
+
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
+            .expect("trusted project policy path");
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .deny
+            .push(agent_sandbox_core::FilesystemRule::new(
+                license_path.clone(),
+                agent_sandbox_core::FileAccess::All,
+                "deny license",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-test".into()),
+        };
+        {
+            let mut inner = store.inner.lock().await;
+            inner.sandbox_filesystem_static_allow.insert(
+                "sandbox:sandbox-test".into(),
+                vec![agent_sandbox_core::FilesystemRule::new(
+                    license_path.clone(),
+                    agent_sandbox_core::FileAccess::All,
+                    "static allow license",
+                )],
+            );
+        }
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .await,
+            Some("deny".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn static_allow_does_not_override_inode_deny() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).expect("policy dir");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        std::fs::create_dir_all(&home).expect("home");
+        let secret_path = project_root.join("secret.txt");
+        std::fs::write(&secret_path, "secret").expect("write secret");
+        let alias_path = project_root.join("alias.txt");
+        std::fs::hard_link(&secret_path, &alias_path).expect("hardlink alias");
+
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
+            .expect("trusted project policy path");
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .deny
+            .push(agent_sandbox_core::FilesystemRule::new(
+                secret_path.clone(),
+                agent_sandbox_core::FileAccess::All,
+                "deny secret",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-inode".into()),
+        };
+        {
+            let mut inner = store.inner.lock().await;
+            inner.sandbox_filesystem_static_allow.insert(
+                "sandbox:sandbox-inode".into(),
+                vec![agent_sandbox_core::FilesystemRule::new(
+                    alias_path.clone(),
+                    agent_sandbox_core::FileAccess::All,
+                    "static allow alias",
+                )],
+            );
+        }
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .await,
+            Some("deny".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn static_allow_allows_when_no_deny_matches() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        std::fs::create_dir_all(&home).expect("home");
+        let license_path = project_root.join("LICENSE");
+        std::fs::write(&license_path, "license").expect("write license");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-allow".into()),
+        };
+        {
+            let mut inner = store.inner.lock().await;
+            inner.sandbox_filesystem_static_allow.insert(
+                "sandbox:sandbox-allow".into(),
+                vec![agent_sandbox_core::FilesystemRule::new(
+                    license_path.clone(),
+                    agent_sandbox_core::FileAccess::Read,
+                    "static allow license",
+                )],
+            );
+        }
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .await,
+            Some("static".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn static_allow_glob_does_not_override_inode_deny() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).expect("policy dir");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        std::fs::create_dir_all(&home).expect("home");
+        let secret_path = project_root.join("secret.txt");
+        std::fs::write(&secret_path, "secret").expect("write secret");
+        let alias_path = project_root.join("writable/alias.txt");
+        std::fs::create_dir_all(alias_path.parent().unwrap()).expect("writable dir");
+        std::fs::hard_link(&secret_path, &alias_path).expect("hardlink alias");
+
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
+            .expect("trusted project policy path");
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .deny
+            .push(agent_sandbox_core::FilesystemRule::new(
+                secret_path.clone(),
+                agent_sandbox_core::FileAccess::All,
+                "deny secret",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-glob".into()),
+        };
+        {
+            let mut inner = store.inner.lock().await;
+            inner.sandbox_filesystem_static_allow.insert(
+                "sandbox:sandbox-glob".into(),
+                vec![agent_sandbox_core::FilesystemRule::new(
+                    project_root.join("writable/**"),
+                    agent_sandbox_core::FileAccess::All,
+                    "static allow writable tree",
+                )],
+            );
+        }
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Write, &ctx)
+                .await,
+            Some("deny".into()),
+            "static allow globs must not bypass inode deny checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_allow_glob_matches_broad_paths_when_not_denied() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join("vendor/pkg")).expect("vendor dir");
+        std::fs::create_dir_all(&home).expect("home");
+        let nested_path = project_root.join("vendor/pkg/LICENSE");
+        std::fs::write(&nested_path, "license").expect("write license");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-glob-allow".into()),
+        };
+        {
+            let mut inner = store.inner.lock().await;
+            inner.sandbox_filesystem_static_allow.insert(
+                "sandbox:sandbox-glob-allow".into(),
+                vec![agent_sandbox_core::FilesystemRule::new(
+                    project_root.join("vendor/**"),
+                    agent_sandbox_core::FileAccess::Read,
+                    "static allow vendor tree",
+                )],
+            );
+        }
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&nested_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .await,
+            Some("static".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn static_allow_broad_glob_does_not_override_concrete_deny() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(project_root.join(".agent-sandbox")).expect("policy dir");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        std::fs::create_dir_all(&home).expect("home");
+        let license_path = project_root.join("LICENSE");
+        std::fs::write(&license_path, "license").expect("write license");
+
+        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
+            .expect("trusted project policy path");
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .deny
+            .push(agent_sandbox_core::FilesystemRule::new(
+                license_path.clone(),
+                agent_sandbox_core::FileAccess::All,
+                "deny license",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-broad-glob-deny".into()),
+        };
+        {
+            let mut inner = store.inner.lock().await;
+            inner.sandbox_filesystem_static_allow.insert(
+                "sandbox:sandbox-broad-glob-deny".into(),
+                vec![agent_sandbox_core::FilesystemRule::new(
+                    project_root.join("**"),
+                    agent_sandbox_core::FileAccess::All,
+                    "broad static allow repo tree",
+                )],
+            );
+        }
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .await,
+            Some("deny".into()),
+            "broad user-defined globs must not bypass concrete policy deny"
+        );
     }
 }

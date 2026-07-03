@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::{fs, io, process};
 
-use agent_sandbox_core::{FileAccess, FilesystemRule};
+use agent_sandbox_core::FileAccess;
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser;
 
@@ -449,7 +449,6 @@ fn run_event_loop(
     saw_pre_access_mark: bool,
     ctx: &agent_sandbox_core::RequestContext,
     socket_path: &Path,
-    static_allow: &[FilesystemRule],
 ) -> ! {
     let mut buf = vec![0u8; 4096];
     loop {
@@ -511,14 +510,6 @@ fn run_event_loop(
                 };
                 let access = mask_to_access(meta.mask, meta.fd, meta.pid);
 
-                if static_allow
-                    .iter()
-                    .any(|rule| rule.matches(Path::new(&path), access, None))
-                {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
                 let reply =
@@ -627,21 +618,9 @@ fn main() {
         sandbox_session_id: std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
     };
 
-    // Read static allow rules from environment (set by policyd).
-    let static_allow: Vec<FilesystemRule> = std::env::var("AGENT_SANDBOX_FS_STATIC_ALLOW")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
     let socket_path = cli.socket.as_path();
 
-    run_event_loop(
-        fan_fd,
-        self_pid,
-        saw_pre_access_mark,
-        &ctx,
-        socket_path,
-        &static_allow,
-    );
+    run_event_loop(fan_fd, self_pid, saw_pre_access_mark, &ctx, socket_path);
 }
 
 /// Write a `FAN_ALLOW` or `FAN_DENY` response and close the event fd.
