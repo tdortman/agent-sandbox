@@ -216,6 +216,10 @@ rec {
           path = "/nix/store";
           access = "all";
         }
+        {
+          path = "/tmp";
+          access = "all";
+        }
       ]
       ++ (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
         inherit path;
