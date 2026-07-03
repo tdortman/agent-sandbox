@@ -681,11 +681,29 @@ impl PolicyStore {
 }
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::Path};
 
-    use super::{session_network_matches, session_sudo_matches};
-    use agent_sandbox_core::NetworkRuleKey;
+    use super::{is_session_bus_socket, session_network_matches, session_sudo_matches};
+    use agent_sandbox_core::{NetworkRuleKey, ResourceAccess, ResourceKind};
 
+    #[test]
+    fn session_bus_socket_is_builtin_denied() {
+        assert!(is_session_bus_socket(
+            ResourceKind::UnixSocket,
+            Path::new("/run/user/1000/bus"),
+            ResourceAccess::Connect
+        ));
+        assert!(!is_session_bus_socket(
+            ResourceKind::UnixSocket,
+            Path::new("/run/user/1000/portal-bus"),
+            ResourceAccess::Connect
+        ));
+        assert!(!is_session_bus_socket(
+            ResourceKind::Device,
+            Path::new("/run/user/1000/bus"),
+            ResourceAccess::OpenRead
+        ));
+    }
     #[test]
     fn session_network_matches_wildcard_hosts() {
         let bucket = HashSet::from([NetworkRuleKey::new("*.baz.com", 443)]);
