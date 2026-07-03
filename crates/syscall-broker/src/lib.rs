@@ -949,10 +949,13 @@ pub async fn check_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        SockaddrTarget, UnixAddress, hex_encode_lower, is_device_bypass, parse_sockaddr,
-        scheme_for_socket_type,
+        SockaddrTarget, UnixAddress, at_fdcwd_arg, hex_encode_lower, is_at_fdcwd, is_device_bypass,
+        is_device_file, parse_sockaddr, resolve_open_path, scheme_for_socket_type,
+        tracee_open_dir_base,
     };
+    use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::os::fd::AsRawFd;
     use std::path::Path;
 
     #[test]
@@ -1127,6 +1130,72 @@ mod tests {
         assert!(!is_device_bypass(Path::new("/dev/sda")));
         assert!(!is_device_bypass(Path::new("/etc/hosts")));
         assert!(!is_device_bypass(Path::new("/dev")));
+    }
+
+    #[test]
+    fn resolve_open_path_relative_under_dev_dir() {
+        let resolved = resolve_open_path(Path::new("kvm"), Path::new("/dev"), false);
+        assert_eq!(resolved, Path::new("/dev/kvm"));
+        // Without dirfd resolution a bare "kvm" would not classify as a device.
+        assert!(!is_device_file(Path::new("kvm")));
+        assert!(is_device_file(&resolved));
+    }
+
+    #[test]
+    fn resolve_open_path_absolute_ignores_dir_base() {
+        assert_eq!(
+            resolve_open_path(Path::new("/dev/kvm"), Path::new("/tmp"), false),
+            Path::new("/dev/kvm")
+        );
+    }
+
+    #[test]
+    fn resolve_open_path_in_root_scopes_absolute_path_to_dirfd() {
+        assert_eq!(
+            resolve_open_path(Path::new("/kvm"), Path::new("/dev"), true),
+            Path::new("/dev/kvm")
+        );
+        assert_eq!(
+            resolve_open_path(Path::new("/"), Path::new("/dev"), true),
+            Path::new("/dev/")
+        );
+    }
+
+    #[test]
+    fn is_at_fdcwd_recognizes_sentinel() {
+        assert!(is_at_fdcwd(at_fdcwd_arg()));
+        assert!(!is_at_fdcwd(3));
+    }
+
+    #[test]
+    fn tracee_open_dir_base_at_fdcwd_reads_cwd() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let base = tracee_open_dir_base(std::process::id(), at_fdcwd_arg()).expect("tracee cwd");
+        assert_eq!(base, cwd);
+    }
+
+    #[test]
+    fn tracee_open_dir_base_reads_open_dirfd() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-sandbox-syscall-broker-dirfd-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).expect("create temp dir");
+        let dir_file = fs::File::open(&dir).expect("open temp dir");
+
+        let base = tracee_open_dir_base(
+            std::process::id(),
+            u64::try_from(dir_file.as_raw_fd()).expect("non-negative dir fd"),
+        )
+        .expect("tracee dirfd");
+        assert_eq!(base, dir);
+        assert_eq!(
+            resolve_open_path(Path::new("kvm"), &base, false),
+            dir.join("kvm")
+        );
+
+        fs::remove_dir_all(dir).expect("remove temp dir");
     }
 
     #[test]
