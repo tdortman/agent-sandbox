@@ -16,11 +16,13 @@ use std::collections::BTreeSet;
 /// `SYS_` prefix.
 pub mod nr {
     pub use libc::{
-        SYS_clone3 as CLONE3, SYS_connect as CONNECT, SYS_creat as CREAT, SYS_open as OPEN,
-        SYS_openat as OPENAT, SYS_openat2 as OPENAT2, SYS_sendfile as SENDFILE,
-        SYS_sendmmsg as SENDMMSG, SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO,
-        SYS_socket as SOCKET, SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE,
-        SYS_write as WRITE, SYS_writev as WRITEV,
+        SYS_clone3 as CLONE3, SYS_connect as CONNECT, SYS_creat as CREAT,
+        SYS_io_uring_enter as IO_URING_ENTER, SYS_io_uring_register as IO_URING_REGISTER,
+        SYS_io_uring_setup as IO_URING_SETUP, SYS_open as OPEN, SYS_openat as OPENAT,
+        SYS_openat2 as OPENAT2, SYS_sendfile as SENDFILE, SYS_sendmmsg as SENDMMSG,
+        SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO, SYS_socket as SOCKET,
+        SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE, SYS_write as WRITE,
+        SYS_writev as WRITEV,
     };
 
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for the target.

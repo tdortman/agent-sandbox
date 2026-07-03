@@ -121,13 +121,15 @@ pub struct FilesystemTarget {
 /// Classified target of a notified syscall, driving broker dispatch.
 ///
 /// Network targets go through the `Check` RPC, resource targets through
-/// `CheckResource`, filesystem targets through `CheckFilesystem`, and
-/// `None` means continue with no further work.
+/// `CheckResource`, filesystem targets through `CheckFilesystem`, `Errno`
+/// completes the syscall with that errno, and `None` means continue with no
+/// further work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallTarget {
     Network(NetworkTarget),
     Resource(ResourceTarget),
     Filesystem(FilesystemTarget),
+    Errno(i32),
     None,
 }
 /// Parsed `AF_UNIX` address: a filesystem path or a kernel abstract name.
@@ -838,6 +840,8 @@ fn target_from_filesystem_mutation(_notif: &SeccompNotif) -> io::Result<Option<S
 /// except for a built-in bypass list of safe devices the broker always
 /// continues without a policy check. Filesystem mutation syscalls are
 /// classified into path/access checks against policyd's filesystem gate.
+/// `io_uring_*` syscalls are denied with `ENOSYS` so runtimes fall back to
+/// ordinary syscalls that seccomp/fanotify can mediate.
 ///
 /// # Errors
 ///
@@ -850,6 +854,9 @@ pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<Sysca
         nr::SENDMSG => target_from_sendmsg(notif),
         nr::SENDMMSG => target_from_sendmmsg(notif),
         nr::OPEN | nr::OPENAT | nr::OPENAT2 | nr::CREAT => Ok(target_from_open(notif)),
+        nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
+            Ok(Some(SyscallTarget::Errno(libc::ENOSYS)))
+        }
         _ => target_from_filesystem_mutation(notif),
     }
 }
@@ -1195,13 +1202,14 @@ pub async fn check_filesystem(
 #[cfg(test)]
 mod tests {
     use super::{
-        FileAccess, FilesystemTarget, SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg,
-        filesystem_checks_link, filesystem_checks_rename, filesystem_checks_symlink,
-        filesystem_checks_truncate, filesystem_checks_unlink, hex_encode_lower, is_at_fdcwd,
-        is_device_bypass, is_device_file, parse_sockaddr, read_resolved_path_arg,
-        resolve_open_path, resolve_tracee_path, scheme_for_socket_type, tracee_fd_path,
-        tracee_open_dir_base,
+        FileAccess, FilesystemTarget, SeccompData, SeccompNotif, SockaddrTarget, SyscallTarget,
+        UnixAddress, at_fdcwd_arg, filesystem_checks_link, filesystem_checks_rename,
+        filesystem_checks_symlink, filesystem_checks_truncate, filesystem_checks_unlink,
+        hex_encode_lower, is_at_fdcwd, is_device_bypass, is_device_file, parse_sockaddr,
+        read_resolved_path_arg, resolve_open_path, resolve_tracee_path, scheme_for_socket_type,
+        target_from_notification, tracee_fd_path, tracee_open_dir_base,
     };
+    use agent_sandbox_syscall::policy::nr;
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
@@ -1671,6 +1679,25 @@ mod tests {
         let _ = fs::remove_file(file);
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn io_uring_syscalls_are_classified_as_enosys() {
+        for nr in [
+            nr::IO_URING_SETUP,
+            nr::IO_URING_ENTER,
+            nr::IO_URING_REGISTER,
+        ] {
+            let target = target_from_notification(&SeccompNotif {
+                data: SeccompData {
+                    nr: i32::try_from(nr).expect("syscall fits i32"),
+                    ..SeccompData::default()
+                },
+                ..SeccompNotif::default()
+            })
+            .expect("classify io_uring");
+            assert_eq!(target, Some(SyscallTarget::Errno(libc::ENOSYS)));
+        }
+    }
     mod msghdr_tests {
         use super::super::{MsghdrParts, parse_msghdr_target};
 

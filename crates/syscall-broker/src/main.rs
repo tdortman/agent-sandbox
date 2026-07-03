@@ -115,6 +115,16 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
+fn log_notification_response(result: std::io::Result<()>) {
+    if let Err(err) = result {
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            debug!(error = %err, "seccomp notification response failed");
+        } else {
+            warn!(error = %err, "seccomp notification response failed");
+        }
+    }
+}
+
 /// Dispatch a single seccomp notification: classify the target, check
 /// policy, and emulate/deny/continue as appropriate. Extracted from
 /// `main` to keep the loop body readable.
@@ -200,6 +210,10 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
                 warn!(error = %err, target = ?target, "filesystem dispatch failed");
                 let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
             }
+        }
+        Ok(Some(SyscallTarget::Errno(errno))) => {
+            debug!(syscall = notif.data.nr, errno, "denying syscall with errno");
+            log_notification_response(send_errno(cli.listener_fd, notif.id, errno));
         }
         Ok(Some(SyscallTarget::None) | None) => {
             debug!(syscall = notif.data.nr, "continuing non-gated syscall");
