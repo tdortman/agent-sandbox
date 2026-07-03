@@ -544,6 +544,25 @@ fn session_resource_matches(
     })
 }
 
+fn is_session_bus_socket(kind: ResourceKind, path: &Path, access: ResourceAccess) -> bool {
+    if kind != ResourceKind::UnixSocket || !ResourceAccess::Connect.covers(access) {
+        return false;
+    }
+    let parts: Vec<_> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect();
+    matches!(
+        parts.as_slice(),
+        [root, run, user, uid, bus]
+            if root.as_ref() == "/"
+                && run.as_ref() == "run"
+                && user.as_ref() == "user"
+                && uid.chars().all(|c| c.is_ascii_digit())
+                && bus.as_ref() == "bus"
+    )
+}
+
 impl PolicyStore {
     pub(crate) async fn resource_policy_denied(
         &self,
