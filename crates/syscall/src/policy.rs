@@ -60,14 +60,16 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
 /// `CheckFilesystem` RPC and continued on approval (not emulated). `sendmsg`
 /// is now trapped because the arm no longer uses `sendmsg(SCM_RIGHTS)` to
 /// pass the listener fd. It uses a `pipe2` handoff instead, so the bootstrap
-/// deadlock that previously excluded `sendmsg` no longer applies. Never trap
-/// high-frequency I/O (`write`, `writev`, `sendfile`) or thread/namespace
-/// syscalls (`clone3`, `unshare`). The broker is single-threaded, so trapping
-/// them serializes every I/O call and thread spawn and starves the sandboxed
-/// process until its runtime aborts. `SOCKET` is excluded because the broker
-/// duplicates tracee socket fds via `pidfd_getfd` to emulate connect/send.
-/// Trapping `socket` would deadlock that emulation path. `PR_SET_NO_NEW_PRIVS`
-/// blocks `clone3` escape.
+/// deadlock that previously excluded `sendmsg` no longer applies. `io_uring_*`
+/// syscalls are trapped so the broker can return `ENOSYS`; allowing rings would
+/// let `IORING_OP_OPENAT` execute in-kernel outside seccomp user notification.
+/// Never trap high-frequency I/O (`write`, `writev`, `sendfile`) or
+/// thread/namespace syscalls (`clone3`, `unshare`). The broker is
+/// single-threaded, so trapping them serializes every I/O call and thread spawn
+/// and starves the sandboxed process until its runtime aborts. `SOCKET` is
+/// excluded because the broker duplicates tracee socket fds via `pidfd_getfd` to
+/// emulate connect/send. Trapping `socket` would deadlock that emulation path.
+/// `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
 #[must_use]
 pub fn default_syscalls() -> BTreeSet<i64> {
     let mut syscalls = BTreeSet::from([
@@ -79,6 +81,9 @@ pub fn default_syscalls() -> BTreeSet<i64> {
         nr::OPENAT,
         nr::OPENAT2,
         nr::CREAT,
+        nr::IO_URING_SETUP,
+        nr::IO_URING_ENTER,
+        nr::IO_URING_REGISTER,
     ]);
     push_filesystem_mutation_syscalls(&mut syscalls);
     syscalls
@@ -113,6 +118,11 @@ mod tests {
         // Network egress set.
         assert!(syscalls.contains(&nr::SENDTO));
         assert!(syscalls.contains(&nr::SENDMSG));
+        // io_uring setup/operation syscalls are trapped and denied with ENOSYS
+        // by the broker; otherwise IORING_OP_OPENAT bypasses path mediation.
+        assert!(syscalls.contains(&nr::IO_URING_SETUP));
+        assert!(syscalls.contains(&nr::IO_URING_ENTER));
+        assert!(syscalls.contains(&nr::IO_URING_REGISTER));
         assert!(syscalls.contains(&nr::SENDMMSG));
         assert!(syscalls.contains(&nr::CONNECT));
         // Resource open* set (the broker policy-gates device access).
@@ -156,6 +166,9 @@ mod tests {
         assert!(syscalls.contains(&nr::SYMLINK));
         assert!(syscalls.contains(&nr::SYMLINKAT));
         assert!(syscalls.contains(&nr::UNLINK));
+        assert!(syscalls.contains(&nr::IO_URING_SETUP));
+        assert!(syscalls.contains(&nr::IO_URING_ENTER));
+        assert!(syscalls.contains(&nr::IO_URING_REGISTER));
         assert!(syscalls.contains(&nr::UNLINKAT));
         assert!(syscalls.contains(&nr::TRUNCATE));
         assert!(syscalls.contains(&nr::FTRUNCATE));
@@ -210,5 +223,29 @@ mod tests {
                 "filesystem mutation syscall {nr} must be in the seccomp trap set"
             );
         }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn default_syscalls_traps_io_uring_syscalls() {
+        let syscalls = default_syscalls();
+        for nr in [
+            nr::IO_URING_SETUP,
+            nr::IO_URING_ENTER,
+            nr::IO_URING_REGISTER,
+        ] {
+            assert!(
+                syscalls.contains(&nr),
+                "io_uring syscall {nr} must be trapped so the broker can return ENOSYS"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn io_uring_syscall_numbers_match_linux_x86_64_table() {
+        assert_eq!(nr::IO_URING_SETUP, 425);
+        assert_eq!(nr::IO_URING_ENTER, 426);
+        assert_eq!(nr::IO_URING_REGISTER, 427);
     }
 }
