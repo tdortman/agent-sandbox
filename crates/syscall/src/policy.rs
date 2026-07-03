@@ -22,6 +22,15 @@ pub mod nr {
         SYS_socket as SOCKET, SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE,
         SYS_write as WRITE, SYS_writev as WRITEV,
     };
+
+    /// Filesystem mutation syscalls, re-exported when `libc` defines them for the target.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub use libc::{
+        SYS_ftruncate as FTRUNCATE, SYS_link as LINK, SYS_linkat as LINKAT, SYS_rename as RENAME,
+        SYS_renameat as RENAMEAT, SYS_renameat2 as RENAMEAT2, SYS_symlink as SYMLINK,
+        SYS_symlinkat as SYMLINKAT, SYS_truncate as TRUNCATE, SYS_unlink as UNLINK,
+        SYS_unlinkat as UNLINKAT,
+    };
 }
 
 /// Audit arch value for the native architecture, used by the broker to
@@ -44,20 +53,22 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
 /// the `Check` RPC. Resource-access syscalls (`open`, `openat`, `openat2`,
 /// `creat`) are routed to policyd via the `CheckResource` RPC and emulated
 /// with the broker's own privileges, so the tracee cannot open the device
-/// directly. `sendmsg` is now trapped because the arm no longer uses
-/// `sendmsg(SCM_RIGHTS)` to pass the listener fd. It uses a `pipe2`
-/// handoff instead, so the bootstrap deadlock that previously excluded
-/// `sendmsg` no longer applies. Never trap high-frequency I/O (`write`,
-/// `writev`, `sendfile`) or thread/namespace syscalls (`clone3`,
-/// `unshare`). The broker is single-threaded, so trapping them serializes
-/// every I/O call and thread spawn and starves the sandboxed process until
-/// its runtime aborts. `SOCKET` is excluded because the broker duplicates
-/// tracee socket fds via `pidfd_getfd` to emulate connect/send. Trapping
-/// `socket` would deadlock that emulation path. `PR_SET_NO_NEW_PRIVS`
+/// directly. Filesystem mutation syscalls (`rename*`, `link*`, `symlink*`,
+/// `unlink*`, `truncate`, `ftruncate`) are routed to policyd via the
+/// `CheckFilesystem` RPC and continued on approval (not emulated). `sendmsg`
+/// is now trapped because the arm no longer uses `sendmsg(SCM_RIGHTS)` to
+/// pass the listener fd. It uses a `pipe2` handoff instead, so the bootstrap
+/// deadlock that previously excluded `sendmsg` no longer applies. Never trap
+/// high-frequency I/O (`write`, `writev`, `sendfile`) or thread/namespace
+/// syscalls (`clone3`, `unshare`). The broker is single-threaded, so trapping
+/// them serializes every I/O call and thread spawn and starves the sandboxed
+/// process until its runtime aborts. `SOCKET` is excluded because the broker
+/// duplicates tracee socket fds via `pidfd_getfd` to emulate connect/send.
+/// Trapping `socket` would deadlock that emulation path. `PR_SET_NO_NEW_PRIVS`
 /// blocks `clone3` escape.
 #[must_use]
 pub fn default_syscalls() -> BTreeSet<i64> {
-    [
+    let mut syscalls = BTreeSet::from([
         nr::CONNECT,
         nr::SENDTO,
         nr::SENDMSG,
@@ -66,10 +77,28 @@ pub fn default_syscalls() -> BTreeSet<i64> {
         nr::OPENAT,
         nr::OPENAT2,
         nr::CREAT,
-    ]
-    .into_iter()
-    .collect()
+    ]);
+    push_filesystem_mutation_syscalls(&mut syscalls);
+    syscalls
 }
+
+/// Extend `syscalls` with filesystem mutation traps when `libc` exposes them.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn push_filesystem_mutation_syscalls(syscalls: &mut BTreeSet<i64>) {
+    use nr::{
+        FTRUNCATE, LINK, LINKAT, RENAME, RENAMEAT, RENAMEAT2, SYMLINK, SYMLINKAT, TRUNCATE, UNLINK,
+        UNLINKAT,
+    };
+    for nr in [
+        RENAME, RENAMEAT, RENAMEAT2, LINK, LINKAT, SYMLINK, SYMLINKAT, UNLINK, UNLINKAT, TRUNCATE,
+        FTRUNCATE,
+    ] {
+        syscalls.insert(nr);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn push_filesystem_mutation_syscalls(_syscalls: &mut BTreeSet<i64>) {}
 
 #[cfg(test)]
 mod tests {
@@ -89,6 +118,18 @@ mod tests {
         assert!(syscalls.contains(&nr::OPENAT));
         assert!(syscalls.contains(&nr::OPENAT2));
         assert!(syscalls.contains(&nr::CREAT));
+        // Filesystem mutation set (broker policy-gates via CheckFilesystem).
+        assert!(syscalls.contains(&nr::RENAME));
+        assert!(syscalls.contains(&nr::RENAMEAT));
+        assert!(syscalls.contains(&nr::RENAMEAT2));
+        assert!(syscalls.contains(&nr::LINK));
+        assert!(syscalls.contains(&nr::LINKAT));
+        assert!(syscalls.contains(&nr::SYMLINK));
+        assert!(syscalls.contains(&nr::SYMLINKAT));
+        assert!(syscalls.contains(&nr::UNLINK));
+        assert!(syscalls.contains(&nr::UNLINKAT));
+        assert!(syscalls.contains(&nr::TRUNCATE));
+        assert!(syscalls.contains(&nr::FTRUNCATE));
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -105,6 +146,17 @@ mod tests {
         assert!(syscalls.contains(&nr::OPENAT));
         assert!(syscalls.contains(&nr::OPENAT2));
         assert!(syscalls.contains(&nr::CREAT));
+        assert!(syscalls.contains(&nr::RENAME));
+        assert!(syscalls.contains(&nr::RENAMEAT));
+        assert!(syscalls.contains(&nr::RENAMEAT2));
+        assert!(syscalls.contains(&nr::LINK));
+        assert!(syscalls.contains(&nr::LINKAT));
+        assert!(syscalls.contains(&nr::SYMLINK));
+        assert!(syscalls.contains(&nr::SYMLINKAT));
+        assert!(syscalls.contains(&nr::UNLINK));
+        assert!(syscalls.contains(&nr::UNLINKAT));
+        assert!(syscalls.contains(&nr::TRUNCATE));
+        assert!(syscalls.contains(&nr::FTRUNCATE));
     }
 
     /// Regression: high-frequency I/O and thread/namespace syscalls must
@@ -128,5 +180,33 @@ mod tests {
         let syscalls = default_syscalls();
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert!(!syscalls.is_empty());
+    }
+
+    /// Regression: filesystem mutation syscalls must be seccomp-trapped so the
+    /// broker can policy-gate them via `CheckFilesystem`. Untrapped mutations
+    /// bypass fanotify (open/access only) and let a sandbox rewrite paths
+    /// outside the declared allow rules.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn default_syscalls_traps_filesystem_mutation_syscalls() {
+        let syscalls = default_syscalls();
+        for nr in [
+            nr::RENAME,
+            nr::RENAMEAT,
+            nr::RENAMEAT2,
+            nr::LINK,
+            nr::LINKAT,
+            nr::SYMLINK,
+            nr::SYMLINKAT,
+            nr::UNLINK,
+            nr::UNLINKAT,
+            nr::TRUNCATE,
+            nr::FTRUNCATE,
+        ] {
+            assert!(
+                syscalls.contains(&nr),
+                "filesystem mutation syscall {nr} must be in the seccomp trap set"
+            );
+        }
     }
 }
