@@ -47,6 +47,16 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
     () => 0,
 };
 
+/// x32 compat audit arch on `x86_64`. Non-native values must never reach
+/// broker policy checks; the BPF filter kills these before allow fallback.
+#[cfg(target_arch = "x86_64")]
+pub const AUDIT_ARCH_X86_32: u32 = 0x4000_0002;
+
+/// i686 compat audit arch on `x86_64`. Non-native values must never reach
+/// broker policy checks; the BPF filter kills these before allow fallback.
+#[cfg(target_arch = "x86_64")]
+pub const AUDIT_ARCH_I686: u32 = 0x4000_0003;
+
 /// Syscalls trapped by the seccomp filter and routed to the broker.
 ///
 /// Resource-gate set: the syscalls the broker policy-gates for both
@@ -188,6 +198,16 @@ mod tests {
         assert!(!syscalls.contains(&libc::SYS_socketpair));
         assert!(!syscalls.contains(&libc::SYS_clone3));
         assert!(!syscalls.contains(&libc::SYS_unshare));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compat_audit_arch_constants_match_linux_headers() {
+        use super::{AUDIT_ARCH_I686, AUDIT_ARCH_X86_32};
+        assert_eq!(AUDIT_ARCH_X86_32, 0x4000_0002);
+        assert_eq!(AUDIT_ARCH_I686, 0x4000_0003);
+        assert_ne!(AUDIT_ARCH_X86_32, super::AUDIT_ARCH_NATIVE);
+        assert_ne!(AUDIT_ARCH_I686, super::AUDIT_ARCH_NATIVE);
     }
 
     #[test]

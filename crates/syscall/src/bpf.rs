@@ -86,7 +86,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::build_filter;
-    use crate::RET_ALLOW;
+    use crate::{RET_ALLOW, RET_KILL_PROCESS};
     // `BPF_RET | BPF_K` per the BPF instruction encoding. The seccomp
     // program ends with a return of `SECCOMP_RET_ALLOW` as the default
     // action; we read the last instruction directly to verify. The
@@ -162,6 +162,17 @@ mod tests {
         }
         let filter = build_filter(&syscalls);
         assert!(filter.len() < BPF_MAX_LEN);
+    }
+
+    #[test]
+    fn filter_rejects_non_native_audit_arch_before_allow() {
+        // seccompiler prepends an arch check: mismatch returns KILL_PROCESS
+        // so x32/i686 compat syscalls cannot fall through to SECCOMP_RET_ALLOW.
+        let filter = build_filter(&crate::policy::default_syscalls());
+        assert!(
+            filter.iter().any(|insn| insn.k == RET_KILL_PROCESS),
+            "filter must kill non-native audit arch before allow fallback"
+        );
     }
 
     #[test]

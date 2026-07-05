@@ -13,6 +13,8 @@ use std::time::Duration;
 
 pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
 pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+/// `SECCOMP_IOW(2, __u64)` — not `IOWR` like SEND; argument is a single u64 id.
+pub const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
 pub const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
 pub const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1;
 pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
@@ -181,6 +183,28 @@ fn format_abstract_name(name: &[u8]) -> String {
     format!("@hex:{}", hex_encode_lower(name))
 }
 
+/// Return true when `notif.data.arch` matches the broker's native audit arch.
+#[must_use]
+pub const fn notification_arch_valid(notif: &SeccompNotif) -> bool {
+    notif.data.arch == agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE
+}
+
+/// Verify that a notification id is still valid before responding.
+///
+/// The kernel returns `EINVAL` when the id was recycled or the tracee died.
+///
+/// # Errors
+///
+/// Returns an error if the `SECCOMP_IOCTL_NOTIF_ID_VALID` ioctl fails.
+pub fn notif_id_valid(listener_fd: i32, id: u64) -> io::Result<()> {
+    let mut id = id;
+    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &mut id) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Receive a seccomp notification from the listener fd.
 ///
 /// # Errors
@@ -201,6 +225,7 @@ pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
 ///
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
 pub fn send_continue(listener_fd: i32, id: u64) -> io::Result<()> {
+    notif_id_valid(listener_fd, id)?;
     let mut resp = SeccompNotifResp {
         id,
         val: 0,
@@ -220,6 +245,7 @@ pub fn send_continue(listener_fd: i32, id: u64) -> io::Result<()> {
 ///
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
 pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
+    notif_id_valid(listener_fd, id)?;
     let mut resp = SeccompNotifResp {
         id,
         val: 0,
@@ -242,6 +268,7 @@ pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
 ///
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
 pub fn send_result(listener_fd: i32, id: u64, val: i64) -> io::Result<()> {
+    notif_id_valid(listener_fd, id)?;
     let resp = SeccompNotifResp {
         id,
         val,
@@ -270,6 +297,7 @@ pub fn send_result(listener_fd: i32, id: u64, val: i64) -> io::Result<()> {
 ///
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails.
 pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::Result<()> {
+    notif_id_valid(listener_fd, id)?;
     let addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
@@ -1216,10 +1244,26 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
+    fn seccomp_ioctl_numbers_match_linux_uapi() {
+        // SECCOMP_IOC_MAGIC = 0x21; see include/uapi/linux/seccomp.h.
+        fn ioc(dir: u32, nr: u32, size: u32) -> libc::c_ulong {
+            libc::c_ulong::from((dir << 30) | (0x21 << 8) | nr | (size << 16))
+        }
+        const IOREWR: u32 = 3;
+        const IOW: u32 = 1;
+        assert_eq!(SECCOMP_IOCTL_NOTIF_RECV, ioc(IOREWR, 0, 80));
+        assert_eq!(SECCOMP_IOCTL_NOTIF_SEND, ioc(IOREWR, 1, 24));
+        // ID_VALID is IOW(2, __u64), not IOREWR like SEND — mixing them up
+        // makes every send_continue fail with EINVAL.
+        assert_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, ioc(IOW, 2, 8));
+        assert_eq!(SECCOMP_IOCTL_NOTIF_ADDFD, ioc(IOW, 3, 24));
+    }
+
+    #[test]
     fn parse_ipv4_sockaddr() {
         let bytes = [2, 0, 0, 53, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
-            parse_sockaddr(&bytes),
+            parse_sockaddr(&bytes, bytes.len()),
             Some(SockaddrTarget::Inet {
                 ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
                 port: 53
