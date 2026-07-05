@@ -8,6 +8,23 @@ use crate::policy::{
     SudoRule, contract_home_path, expand_policy_path,
 };
 
+/// Maximum on-disk policy JSON size policyd/core will load.
+pub const MAX_POLICY_JSON_BYTES: usize = 1 << 20;
+
+/// Maximum total allow+deny rules per policy section aggregate.
+pub const MAX_POLICY_RULES: usize = 8192;
+
+const fn policy_rule_count(policy: &Policy) -> usize {
+    policy.network.allow.len()
+        + policy.network.deny.len()
+        + policy.sudo.allow.len()
+        + policy.sudo.deny.len()
+        + policy.filesystem.allow.len()
+        + policy.filesystem.deny.len()
+        + policy.resources.allow.len()
+        + policy.resources.deny.len()
+}
+
 #[must_use]
 pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
     // Containment check: if project_root is given, reject policies outside it.
@@ -23,10 +40,21 @@ pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>
     if !read_path.is_file() {
         return Policy::default();
     }
+    let Ok(meta) = std::fs::metadata(&read_path) else {
+        return Policy::default();
+    };
+    if meta.len() > MAX_POLICY_JSON_BYTES as u64 {
+        return Policy::default();
+    }
     let Ok(data) = std::fs::read_to_string(&read_path) else {
         return Policy::default();
     };
-    let mut policy: Policy = serde_json::from_str(&data).unwrap_or_default();
+    let Ok(mut policy) = serde_json::from_str::<Policy>(&data) else {
+        return Policy::default();
+    };
+    if policy_rule_count(&policy) > MAX_POLICY_RULES {
+        return Policy::default();
+    }
     expand_policy_paths(&mut policy, home, project_root);
     policy
 }
