@@ -75,9 +75,11 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
     fail "resource-gate: /dev must not be tmpfs-masked (broker gates device access)"
   fi
 
-  # 5. /proc is sandbox-private.
+  # 5. /proc and /tmp are sandbox-private (overlay host root bind).
   grep -F -q -- '--proc /proc' rg-wrapper.sh \
     || fail "resource-gate: missing --proc /proc"
+  grep -F -q -- '--tmpfs /tmp' rg-wrapper.sh \
+    || fail "resource-gate: missing --tmpfs /tmp"
 
   # 6. GPU auto-bind loop is suppressed.
   if grep -F -q 'for _gpu in /dev/nvidia' rg-wrapper.sh; then
@@ -106,6 +108,10 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
   # 11. Configured devicePaths ARE present in non-resource-gate mode.
   grep -F -q 'agent-sandbox-regression-device' nrg-wrapper.sh \
     || fail "non-resource-gate: configured devicePaths should be present"
+
+  # 12. /tmp is sandbox-private in both dynamic wrappers.
+  grep -F -q -- '--tmpfs /tmp' nrg-wrapper.sh \
+    || fail "non-resource-gate: missing --tmpfs /tmp"
 
   echo "PASS: resource-gate wrapper regression guard satisfied"
   touch $out

@@ -217,6 +217,10 @@ rec {
           path = "/nix/store";
           access = "all";
         }
+        {
+          path = "/tmp";
+          access = "all";
+        }
       ]
       ++ (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
         inherit path;
@@ -282,9 +286,10 @@ rec {
 
       # ---- Dynamic-FS direct wrapper (bypasses jail-nix entirely) ----
       # When dynamic FS approval is active, --bind / / exposes the full host
-      # filesystem.  Every jail-nix bind-mount combinator is both redundant and
-      # broken (bwrap cannot mkdir through symlinks on a root-bound tree).
-      # Generate the wrapper directly to guarantee zero unexpected bind mounts.
+      # filesystem.  Sandbox-private /proc and /tmp overlay that bind.  Every
+      # jail-nix bind-mount combinator is both redundant and broken (bwrap
+      # cannot mkdir through symlinks on a root-bound tree).  Generate the
+      # wrapper directly to guarantee zero unexpected bind mounts.
       hasNetwork = network != null;
       sandboxPkgsList = lib.unique (
         [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
@@ -590,6 +595,7 @@ rec {
 
           exec ${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
+            --tmpfs /tmp \
             --proc /proc \
             --dev-bind /dev /dev \
             --clearenv \
