@@ -321,6 +321,29 @@ fn sudo_deny_beats_later_allow() {
 }
 
 #[test]
+fn deny_wins_over_wildcard_allow_on_merge() {
+    let low = Policy {
+        network: crate::policy::NetworkSection {
+            allow: vec![NetworkRule::new("*.evil.com", 443, "")],
+            deny: vec![],
+        },
+        ..empty_policy()
+    };
+    let high = Policy {
+        network: crate::policy::NetworkSection {
+            allow: vec![],
+            deny: vec![NetworkRule::new("evil.com", 443, "")],
+        },
+        ..empty_policy()
+    };
+    let merged = merge_layers(&[low, high]);
+    assert!(
+        merged.network.allow.is_empty(),
+        "deny evil.com must shadow allow *.evil.com"
+    );
+}
+
+#[test]
 fn filesystem_deny_beats_later_allow() {
     let low = Policy {
         filesystem: crate::policy::FilesystemSection {

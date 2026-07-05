@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hosts::NetworkRuleKey;
+use crate::hosts::{NetworkRuleKey, host_pattern_matches};
 use crate::policy::{
     FilesystemRule, FilesystemRuleKey, FilesystemSection, NetworkRule, NetworkSection, Policy,
     ResourceRule, ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
@@ -21,6 +21,13 @@ pub fn merge_layers(layers: &[Policy]) -> Policy {
     }
 }
 
+fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {
+    if deny.port != allow.port {
+        return false;
+    }
+    host_pattern_matches(&deny.host, &allow.host) || host_pattern_matches(&allow.host, &deny.host)
+}
+
 fn merge_network(layers: &[Policy]) -> NetworkSection {
     let mut allow: BTreeMap<NetworkRuleKey, NetworkRule> = BTreeMap::new();
     let mut deny: BTreeMap<NetworkRuleKey, NetworkRule> = BTreeMap::new();
@@ -32,14 +39,19 @@ fn merge_network(layers: &[Policy]) -> NetworkSection {
             deny.insert(rule.key(), rule.clone());
         }
     }
-    // Deny-wins: a deny for a key is final even if a later layer allowed it.
-    for key in deny.keys() {
-        allow.remove(key);
-    }
+    allow.retain(|_, allow_rule| {
+        !deny
+            .values()
+            .any(|deny_rule| network_rules_overlap(deny_rule, allow_rule))
+    });
     NetworkSection {
         allow: allow.into_values().collect(),
         deny: deny.into_values().collect(),
     }
+}
+
+fn sudo_rules_overlap(deny: &SudoRule, allow: &SudoRule) -> bool {
+    deny.matches(&allow.argv) || allow.matches(&deny.argv)
 }
 
 fn merge_sudo(layers: &[Policy]) -> SudoSection {
@@ -57,9 +69,11 @@ fn merge_sudo(layers: &[Policy]) -> SudoSection {
             }
         }
     }
-    for key in deny.keys() {
-        allow.remove(key);
-    }
+    allow.retain(|_, allow_rule| {
+        !deny
+            .values()
+            .any(|deny_rule| sudo_rules_overlap(deny_rule, allow_rule))
+    });
     SudoSection {
         allow: allow.into_values().collect(),
         deny: deny.into_values().collect(),
@@ -68,6 +82,10 @@ fn merge_sudo(layers: &[Policy]) -> SudoSection {
 
 fn filesystem_rule_key(rule: &FilesystemRule) -> FilesystemRuleKey {
     FilesystemRuleKey::from_rule(rule)
+}
+
+fn filesystem_rules_overlap(deny: &FilesystemRule, allow: &FilesystemRule) -> bool {
+    deny.matches(&allow.path, allow.access, None) || allow.matches(&deny.path, deny.access, None)
 }
 
 fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
@@ -81,9 +99,11 @@ fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
             deny.insert(filesystem_rule_key(rule), rule.clone());
         }
     }
-    for key in deny.keys() {
-        allow.remove(key);
-    }
+    allow.retain(|_, allow_rule| {
+        !deny
+            .values()
+            .any(|deny_rule| filesystem_rules_overlap(deny_rule, allow_rule))
+    });
     FilesystemSection {
         allow: allow.into_values().collect(),
         deny: deny.into_values().collect(),
@@ -92,6 +112,11 @@ fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
 
 fn resource_rule_key(rule: &ResourceRule) -> ResourceRuleKey {
     ResourceRuleKey::from_rule(rule)
+}
+
+fn resource_rules_overlap(deny: &ResourceRule, allow: &ResourceRule) -> bool {
+    deny.matches(allow.kind, &allow.path, allow.access, None)
+        || allow.matches(deny.kind, &deny.path, deny.access, None)
 }
 
 fn merge_resources(layers: &[Policy]) -> ResourceSection {
@@ -105,9 +130,11 @@ fn merge_resources(layers: &[Policy]) -> ResourceSection {
             deny.insert(resource_rule_key(rule), rule.clone());
         }
     }
-    for key in deny.keys() {
-        allow.remove(key);
-    }
+    allow.retain(|_, allow_rule| {
+        !deny
+            .values()
+            .any(|deny_rule| resource_rules_overlap(deny_rule, allow_rule))
+    });
     ResourceSection {
         allow: allow.into_values().collect(),
         deny: deny.into_values().collect(),
