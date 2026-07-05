@@ -76,9 +76,8 @@ let
         ip daddr ${cfg.hostIp} tcp dport 53 accept
         ip6 daddr ${cfg.hostIp6} udp dport 53 accept
         ip6 daddr ${cfg.hostIp6} tcp dport 53 accept
-        # ICMPv6 is required for NDP (neighbor discovery). Without it,
-        # IPv6 packets cannot reach the host veth gateway.
-        ip6 nexthdr icmpv6 accept
+        # NDP only: neighbor and router discovery for the veth gateway.
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
         # Reject denied destinations from transient reject sets
         ip daddr . tcp dport @reject_v4 reject with tcp reset
         ip daddr . udp dport @reject_v4 reject
@@ -247,6 +246,7 @@ lib.mkIf policyEnabled (
                 (
                   (config.agent-sandbox.gates.syscalls.enable && config.agent-sandbox.network.enable)
                   || config.agent-sandbox.gates.resources.enable
+                  || config.agent-sandbox.gates.filesystem.enable
                 )
                 [
                   "--syscall-broker-cmd"

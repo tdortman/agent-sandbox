@@ -174,6 +174,7 @@ rec {
       fsArmPkg ? null,
       syscallArmPkg ? null,
       resourceGate ? false,
+      hiddenPaths ? [ ],
     }:
     let
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
@@ -214,10 +215,6 @@ rec {
       staticAllowRules = [
         {
           path = "/nix/store";
-          access = "all";
-        }
-        {
-          path = "/tmp";
           access = "all";
         }
       ]
@@ -354,12 +351,7 @@ rec {
       runMaskScript =
         if resourceGate then
           ''
-            if [[ -d /run/agent-sandbox ]]; then
-              RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
-            fi
-            # In resource-gate mode /run comes from --bind / /, so safe
-            # runtime paths are already visible. Only /run/agent-sandbox
-            # needs masking (above) to hide the host control socket.
+            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
           ''
         else
           ''
@@ -369,7 +361,7 @@ rec {
                 RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
               fi
             done
-            RUNTIME_ARGS+=(--dir /run/agent-sandbox)
+            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
           '';
 
       policyScript =
@@ -506,6 +498,28 @@ rec {
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
+      # Mask paths so the sandbox cannot see their contents even though the
+      # dynamic-FS wrapper binds the whole host root. Directories are shadowed
+      # with an empty tmpfs, files with /dev/null. Appended after all other
+      # mounts so nothing re-exposes them. Entries may start with `~/` to
+      # refer to the invoking user's home (expanded at wrapper generation time
+      # so the runtime script never contains bare `~`, which shellcheck rejects).
+      hidePathAssignment =
+        path:
+        if path == "~" then
+          ''_asbx_hide="$HOME"''
+        else if lib.hasPrefix "~/" path then
+          ''_asbx_hide="$HOME/${lib.removePrefix "~/" path}"''
+        else
+          ''_asbx_hide=${lib.escapeShellArg path}'';
+      hidePathsScript = lib.concatMapStringsSep "\n" (path: ''
+        ${hidePathAssignment path}
+        if [[ -d "$_asbx_hide" ]]; then
+          RUNTIME_ARGS+=(--tmpfs "$_asbx_hide")
+        elif [[ -e "$_asbx_hide" ]]; then
+          RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide")
+        fi
+      '') hiddenPaths;
       deviceBindScript = lib.concatMapStringsSep "\n" (path: ''
         if [[ -e "${path}" ]]; then
           RUNTIME_ARGS+=(--dev-bind "${path}" "${path}")
@@ -572,12 +586,12 @@ rec {
           ${lib.optionalString (!resourceGate) deviceBindScript}
 
           ${fsArmScript}
+          ${hidePathsScript}
 
           exec ${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
             --proc /proc \
             --dev-bind /dev /dev \
-            --tmpfs /tmp \
             --clearenv \
             --ro-bind ~/.local/share/jail.nix/passwd /etc/passwd \
             --ro-bind ~/.local/share/jail.nix/group /etc/group \

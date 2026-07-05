@@ -62,6 +62,16 @@ let
     };
   };
 
+  hiddenPathType = mountPathType;
+
+  hiddenPathDescription = ''
+    Paths masked inside dynamic-FS sandboxes (``gates.filesystem.enable``).
+    The wrapper bind-mounts the host root, then overlays these entries so
+    the sandbox cannot see their contents: directories become empty tmpfs
+    mounts, files become ``/dev/null``. Use ``~/…`` for paths under the
+    invoking user's ``$HOME``, or ``/…`` for absolute host paths.
+  '';
+
   ruleType = lib.types.submodule {
     options = {
       host = lib.mkOption { type = lib.types.str; };
@@ -107,6 +117,14 @@ let
       type = lib.types.listOf lib.types.str;
       default = [ ];
     };
+    hiddenPaths = lib.mkOption {
+      type = lib.types.listOf hiddenPathType;
+      default = [ ];
+      description = ''
+        ${hiddenPathDescription}
+        Merged with ``agent-sandbox.hiddenPaths`` for this package only.
+      '';
+    };
   };
 
   cfg = config.agent-sandbox;
@@ -124,6 +142,7 @@ let
       readwriteDirs = lib.unique (cfg.readwriteDirs ++ pkgCfg.readwriteDirs);
       readonlyFiles = lib.unique (cfg.readonlyFiles ++ pkgCfg.readonlyFiles);
       readwriteFiles = lib.unique (cfg.readwriteFiles ++ pkgCfg.readwriteFiles);
+      hiddenPaths = lib.unique (cfg.hiddenPaths ++ pkgCfg.hiddenPaths);
     };
 
   networkConfig =
@@ -374,6 +393,20 @@ in
           default. When disabled, no syscall-arm helper or broker is wired.
         '';
       };
+    };
+    hiddenPaths = lib.mkOption {
+      type = lib.types.listOf hiddenPathType;
+      default = [
+        "~/.snapshots"
+        "/home/.snapshots"
+      ];
+      description = ''
+        ${hiddenPathDescription}
+
+        Defaults to ``~/.snapshots`` and ``/home/.snapshots`` so btrfs snapshot trees are invisible inside
+        sandboxes and never hit filesystem policy checks. Set to ``[]`` to
+        disable masking entirely, or extend the list with additional paths.
+      '';
     };
   }
   // mountOptions;

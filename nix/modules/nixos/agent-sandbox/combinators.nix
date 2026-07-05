@@ -30,7 +30,7 @@ let
     (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
     (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
     (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
-    (unsafe-add-raw-args "--tmpfs /tmp")
+    (unsafe-add-raw-args "--bind /tmp /tmp")
     (unsafe-add-raw-args "--tmpfs ~")
     (ro-bind "${pkgs.bash}/bin/sh" "/bin/sh")
     (add-path "/bin")
@@ -47,8 +47,8 @@ let
   # Base combinator for dynamic filesystem-approval mode.
   # Exposes the full host filesystem via --bind / / so that fanotify (fsmon)
   # can gate individual opens instead of relying on static bwrap mounts.
-  # Sandbox-private /proc, /dev, and /tmp still overlay the host root.  Host
-  # /bin remains visible; rebinding /bin/sh breaks bwrap root-bind setup.
+  # Sandbox-private /proc and /dev still overlay the host root. /tmp is the
+  # host tree so agents can share scratch files with the outside world.
   agent-sandbox-dynamic-base = compose [
     (unsafe-add-raw-args "--bind / /")
     (unsafe-add-raw-args "--proc /proc")
@@ -60,7 +60,6 @@ let
     (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
     (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
     (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
-    (unsafe-add-raw-args "--tmpfs /tmp")
     (add-pkg-deps [
       pkgs.coreutils
       pkgs.bash
@@ -93,6 +92,7 @@ let
       [[ "$p" == "$_asbx_home_root" || "$p" == "$_asbx_home_root"/* ]]
     }
     _asbx_is_jail_tmpfs() {
+      # Host /tmp is bind-mounted; skip per-path ro-binds for entries under it.
       local p="$1"
       [[ "$p" == "/tmp" || "$p" == /tmp/* ]] && return 0
       [[ "$p" == "/var/tmp" || "$p" == /var/tmp/* ]] && return 0
