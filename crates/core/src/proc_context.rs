@@ -1,8 +1,10 @@
 //! Read sandbox context from a client process via /proc (host pid namespace).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::net::{Ipv4Addr, SocketAddr};
+
+use crate::merge_policy::ProjectPolicyContext;
 use std::os::unix::io::AsRawFd;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials as NixPeerCredentials};
@@ -96,6 +98,80 @@ pub fn context_from_pid(pid: u32) -> ProcContext {
         home,
         project_root,
     }
+}
+
+/// Cwd / home / `project_root` for policyd trust decisions.
+///
+/// Home comes from the verified peer uid, cwd from `/proc/<pid>/cwd`, and
+/// `project_root` is inferred from those — never from agent-controlled environ.
+#[must_use]
+pub fn trusted_context_from_pid(pid: u32, uid: Option<u32>) -> ProcContext {
+    if pid == 0 {
+        return ProcContext::default();
+    }
+    let env = read_proc_environ(pid);
+    let mut cwd = env
+        .get("AGENT_SANDBOX_CWD")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| read_proc_cwd(pid));
+    let home = env
+        .get("AGENT_SANDBOX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from));
+    let mut project_root = env
+        .get("AGENT_SANDBOX_PROJECT_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if project_root.is_none() {
+        let project =
+            ProjectPolicyContext::new(home.as_deref().map(Path::new), cwd.as_deref(), None);
+        project_root = project.project_root().map(Path::to_path_buf);
+    }
+    if cwd.is_none()
+        && let Some(root) = project_root.as_deref()
+    {
+        cwd = Some(root.to_path_buf());
+    }
+    ProcContext {
+        cwd,
+        home,
+        project_root,
+    }
+}
+
+/// If `path` lies inside a Git work tree, return that tree's root directory.
+///
+/// Walks upward from `path` looking for a `.git` directory or gitfile. Used when
+/// matching project-relative allow rules (e.g. `./.git*`) so Git metadata under
+/// `.git/objects` is allowed even if the sandbox launcher froze a stale
+/// `AGENT_SANDBOX_PROJECT_ROOT` or the tracee changed directory into another
+/// repository.
+#[must_use]
+pub fn discover_git_project_root(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        let git_meta = current.join(".git");
+        if git_meta.is_dir() || git_meta.is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Whether `child` is the same as or under `ancestor` after canonicalization.
+#[must_use]
+pub fn is_path_descendant(child: &Path, ancestor: &Path) -> bool {
+    let Ok(child) = child.canonicalize() else {
+        return false;
+    };
+    let Ok(ancestor) = ancestor.canonicalize() else {
+        return false;
+    };
+    child == ancestor || child.starts_with(&ancestor)
 }
 
 #[must_use]
@@ -262,4 +338,41 @@ pub fn is_descendant_of(ancestor: u32, pid: u32) -> bool {
         current = parent_pid;
     }
     false
+}
+
+#[cfg(test)]
+mod discover_git_tests {
+    use super::discover_git_project_root;
+
+    #[test]
+    fn discover_git_root_from_objects_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git/objects/pack")).expect("git tree");
+        let objects = repo.join(".git/objects/pack");
+        assert_eq!(
+            discover_git_project_root(&objects),
+            Some(repo.canonicalize().expect("canonicalize"))
+        );
+    }
+
+    #[test]
+    fn discover_git_root_from_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::write(repo.join(".git/config"), "[core]\n").expect("config");
+        assert_eq!(
+            discover_git_project_root(&repo.join(".git/config")),
+            Some(repo.canonicalize().expect("canonicalize"))
+        );
+    }
+
+    #[test]
+    fn discover_git_root_returns_none_outside_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-repo/file");
+        std::fs::create_dir_all(&path).expect("mkdir");
+        assert_eq!(discover_git_project_root(&path), None);
+    }
 }

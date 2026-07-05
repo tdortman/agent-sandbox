@@ -40,8 +40,9 @@ pub use policy::{
     normalize_directory_traverse_access,
 };
 pub use proc_context::{
-    PeerCredentials, ProcContext, context_from_pid, home_from_uid, is_descendant_of, peer_cred,
-    peer_cred_unix, sandbox_session_id_from_pid,
+    PeerCredentials, ProcContext, context_from_pid, discover_git_project_root, home_from_uid,
+    is_descendant_of, is_path_descendant, peer_cred, peer_cred_unix, read_proc_environ,
+    sandbox_session_id_from_pid, trusted_context_from_pid,
 };
 pub use rpc::{
     AliasSplit, ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply,
