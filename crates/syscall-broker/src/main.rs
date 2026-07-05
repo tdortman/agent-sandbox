@@ -8,7 +8,7 @@ use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
     FilesystemTarget, NetworkTarget, ResourceTarget, SeccompNotif, SyscallTarget, check_filesystem,
-    check_resource, check_target, notification_arch_valid, recv_notification,
+    check_resource, check_target, is_transient_tracee_io_err, notification_arch_valid, recv_notification,
     revalidate_filesystem_mutation, send_addfd, send_continue, send_errno, send_result,
     target_from_notification,
 };
@@ -185,7 +185,15 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
             }
         }
         Err(err) => {
-            if is_open_family_syscall(notif.data.nr) {
+            if is_transient_tracee_io_err(&err) {
+                debug!(
+                    error = %err,
+                    syscall = notif.data.nr,
+                    pid = notif.pid,
+                    "could not read tracee syscall args; continuing"
+                );
+                log_notification_response(send_continue(cli.listener_fd, notif.id));
+            } else if is_open_family_syscall(notif.data.nr) {
                 tracing::info!(
                     error = %err,
                     syscall = notif.data.nr,
@@ -193,9 +201,11 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
                     "failed to classify open-family syscall; denying before fanotify"
                 );
             } else {
-                warn!(error = %err, syscall = notif.data.nr, "failed to parse syscall target");
+                warn!(error = %err, syscall = notif.data.nr, pid = notif.pid, "failed to parse syscall target");
             }
-            let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+            if !is_transient_tracee_io_err(&err) {
+                let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+            }
         }
     }
 }
