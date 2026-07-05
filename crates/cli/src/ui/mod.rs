@@ -118,6 +118,7 @@ impl UiClient {
 
         *self.session_id.lock().await = None;
 
+        let mut queued_pushes = Vec::new();
         while self.session_id.lock().await.is_none() {
             let msg = conn.read_message().await?;
             match msg {
@@ -129,10 +130,14 @@ impl UiClient {
                     return Err(UiCliError::Register(e.error));
                 }
                 RpcMessage::UiPush(push) => {
-                    self.spawn_prompt(push);
+                    queued_pushes.push(push);
                 }
                 RpcMessage::Reply(_) => {}
             }
+        }
+
+        for push in queued_pushes {
+            self.spawn_prompt(push);
         }
 
         loop {
@@ -146,10 +151,19 @@ impl UiClient {
     fn spawn_prompt(&self, push: UiPush) {
         let socket = self.socket.clone();
         let paths = self.paths.clone();
+        let sandbox_session_id = self.sandbox_session_id.clone();
         let session_id = Arc::clone(&self.session_id);
         tokio::spawn(async move {
             let sid = session_id.lock().await.clone();
-            if let Err(err) = push::handle_push(&socket, &paths, sid.as_deref(), push).await {
+            if let Err(err) = push::handle_push(
+                &socket,
+                &paths,
+                sid.as_deref(),
+                sandbox_session_id.as_deref(),
+                push,
+            )
+            .await
+            {
                 warn!(error = %err, "prompt error");
             }
         });

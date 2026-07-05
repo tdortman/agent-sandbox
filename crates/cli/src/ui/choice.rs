@@ -16,36 +16,40 @@ pub async fn resolve_choice(
     socket: &Path,
     paths: &SandboxPaths,
     session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
     id: &str,
     action: PromptAction,
     choice: Option<ScopeOption>,
 ) -> Result<(), UiCliError> {
     let Some(choice) = choice else {
-        return deny_cancellation(socket, paths, session_id, id).await;
+        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
     if choice.scope == ApprovalScope::Session && session_id.is_none() {
         let noun = match action {
             PromptAction::Allow => "approval",
             PromptAction::Deny => "deny",
         };
-        eprintln!("agent-sandbox: session {noun} unavailable (policy UI not connected).");
-        return Ok(());
+        return Err(UiCliError::Register(format!(
+            "session {noun} unavailable (policy UI not connected yet)"
+        )));
     }
 
+    let mut ctx = RequestContext::from(paths);
+    ctx.sandbox_session_id = sandbox_session_id.map(str::to_owned);
     let req = match action {
         PromptAction::Allow => RpcRequest::Approve {
             id: id.to_string(),
             scope: choice.scope,
             session_id: session_id.map(str::to_owned),
             target: choice.target,
-            ctx: RequestContext::from(paths),
+            ctx,
         },
         PromptAction::Deny => RpcRequest::Deny {
             id: id.to_string(),
             scope: choice.scope,
             session_id: session_id.map(str::to_owned),
             target: choice.target,
-            ctx: RequestContext::from(paths),
+            ctx,
         },
     };
     let resp = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await?;
@@ -75,16 +79,18 @@ pub async fn resolve_choice(
 pub async fn deny_cancellation(
     socket: &Path,
     paths: &SandboxPaths,
-    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
     id: &str,
 ) -> Result<(), UiCliError> {
     info!(request_id = %id, "prompt cancelled by user; sending one-time deny");
+    let mut ctx = RequestContext::from(paths);
+    ctx.sandbox_session_id = sandbox_session_id.map(str::to_owned);
     let req = RpcRequest::Deny {
         id: id.to_string(),
         scope: ApprovalScope::Once,
-        session_id: session_id.map(str::to_owned),
+        session_id: None,
         target: None,
-        ctx: RequestContext::from(paths),
+        ctx,
     };
     if let Err(err) = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await {
         eprintln!("agent-sandbox: cancel-deny failed ({err})");
