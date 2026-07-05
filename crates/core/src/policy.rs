@@ -255,8 +255,20 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
         return PathBuf::from(home_str.trim_end_matches('/'));
     }
     if let Some(rest) = s.strip_prefix("~/") {
+        if rest.split('/').any(|part| part == "..") {
+            return path.to_path_buf();
+        }
         let base = home_str.trim_end_matches('/');
-        return PathBuf::from(format!("{base}/{rest}"));
+        let expanded = PathBuf::from(format!("{base}/{rest}"));
+        if let Ok(home_canon) = home.canonicalize() {
+            match expanded.canonicalize() {
+                Ok(canonical) if canonical.starts_with(&home_canon) => return canonical,
+                Ok(_) => return path.to_path_buf(),
+                Err(_) if rest.split('/').any(|part| part == "..") => return path.to_path_buf(),
+                Err(_) => return expanded,
+            }
+        }
+        return expanded;
     }
     path.to_path_buf()
 }
@@ -724,6 +736,20 @@ mod tests {
         filesystem_approval_paths,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn expand_home_path_blocks_parent_traversal() {
+        let home = Path::new("/home/user");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let escaped = expand_home_path(Path::new("~/../outside"), Some(home));
+        assert_eq!(
+            escaped,
+            Path::new("~/../outside"),
+            "traversal outside home must not expand"
+        );
+    }
 
     #[test]
     fn sudo_rule_matches_prefix() {
