@@ -2,6 +2,7 @@
 //!
 //! Multi-path syscalls must register every affected endpoint for
 //! `CheckFilesystem`, and dispatch must deny when any endpoint is denied.
+//! Re-validation must reject path swaps before CONTINUE.
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,8 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::FileAccess;
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, SeccompData, SeccompNotif, SyscallTarget, target_from_notification,
+    FilesystemTarget, SeccompData, SeccompNotif, SyscallTarget, revalidate_filesystem_mutation,
+    target_from_notification,
 };
 
 fn as_seccomp_nr(raw: i64) -> i32 {
@@ -119,6 +121,25 @@ fn single_path_mutation_syscalls_require_write_access() {
             "syscall {syscall_nr} must require write on the affected path"
         );
     }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn filesystem_mutation_revalidation_rejects_path_swap() {
+    let stable = CString::new("/tmp/agent-sandbox-stable-path").expect("nul-free path");
+    let swapped = CString::new("/tmp/agent-sandbox-swapped-path").expect("nul-free path");
+    let mut notif = notif_with_path_args(nr::UNLINK, &[stable.to_string_lossy().as_ref()]);
+    let target = target_from_notification(&notif).expect("classify unlink");
+    let Some(SyscallTarget::Filesystem(fs_target)) = target else {
+        panic!("expected filesystem target");
+    };
+    revalidate_filesystem_mutation(&notif, &fs_target).expect("initial paths match");
+
+    notif.data.args[0] = swapped.as_ptr().cast::<u8>() as u64;
+    std::mem::forget(swapped);
+    std::mem::forget(stable);
+    let err = revalidate_filesystem_mutation(&notif, &fs_target).expect_err("swapped path");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[tokio::test]
