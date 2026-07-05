@@ -7,9 +7,10 @@ use std::time::Duration;
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, ResourceTarget, SeccompNotif, SyscallTarget, check_filesystem,
-    check_resource, check_target, recv_notification, send_addfd, send_continue, send_errno,
-    send_result, target_from_notification,
+    FilesystemTarget, NetworkTarget, ResourceTarget, SeccompNotif, SyscallTarget, check_filesystem,
+    check_resource, check_target, notification_arch_valid, recv_notification,
+    revalidate_filesystem_mutation, send_addfd, send_continue, send_errno, send_result,
+    target_from_notification,
 };
 use clap::Parser;
 use tokio::time;
@@ -129,72 +130,21 @@ fn log_notification_response(result: std::io::Result<()>) {
 /// policy, and emulate/deny/continue as appropriate. Extracted from
 /// `main` to keep the loop body readable.
 async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duration) {
+    if !notification_arch_valid(notif) {
+        warn!(
+            arch = notif.data.arch,
+            native = agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE,
+            "seccomp notification arch mismatch; denying"
+        );
+        log_notification_response(send_errno(cli.listener_fd, notif.id, libc::EACCES));
+        return;
+    }
     match target_from_notification(notif) {
         Ok(Some(SyscallTarget::Network(target))) => {
-            let allowed = check_target(
-                &cli.policy_socket,
-                &target,
-                cli.sandbox_session_id.clone(),
-                notif.pid,
-                timeout,
-            )
-            .await;
-            let result = if allowed {
-                send_continue(cli.listener_fd, notif.id)
-            } else {
-                debug!(target = ?target, "network check denied");
-                send_errno(cli.listener_fd, notif.id, libc::EACCES)
-            };
-            if let Err(err) = result {
-                if err.raw_os_error() == Some(libc::ENOENT) {
-                    debug!(error = %err, "seccomp notification response failed");
-                } else {
-                    warn!(error = %err, "seccomp notification response failed");
-                }
-            }
+            dispatch_network_target(cli, notif, &target, timeout).await;
         }
         Ok(Some(SyscallTarget::Resource(target))) => {
-            if is_policy_socket_bypass(&target, &cli.policy_socket) {
-                debug!(target = ?target, "bypassing policy socket (infrastructure connect)");
-                if let Err(err) = emulate_resource(cli.listener_fd, notif, &target) {
-                    warn!(error = %err, target = ?target, "policy socket emulation failed");
-                    let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
-                }
-                return;
-            }
-            let reply = match check_resource(
-                &cli.policy_socket,
-                &target,
-                cli.sandbox_session_id.clone(),
-                notif.pid,
-                timeout,
-            )
-            .await
-            {
-                Ok(reply) => reply,
-                Err(err) => {
-                    warn!(error = %err, target = ?target, "resource check RPC failed");
-                    let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
-                    return;
-                }
-            };
-            if !reply.allowed {
-                debug!(target = ?target, source = %reply.source, "resource check denied");
-                let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
-                return;
-            }
-            // Emulation path. NEVER send_continue for a resource:
-            // the broker must complete the syscall itself so the tracee
-            // never touches the gated resource directly.
-            if let Err(err) = emulate_resource(cli.listener_fd, notif, &target) {
-                // dup_tracee_fd can fail with ESRCH/ENOENT if the tracee
-                // exited while waiting for approval. Send the real errno
-                // so the tracee (if still alive) sees it, and log at
-                // debug level.
-                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-                debug!(error = %err, errno, target = ?target, "resource emulation failed");
-                let _ = send_errno(cli.listener_fd, notif.id, errno);
-            }
+            dispatch_resource_target(cli, notif, &target, timeout).await;
         }
         Ok(Some(SyscallTarget::Filesystem(target))) => {
             if let Err(err) = dispatch_filesystem_target(
@@ -212,7 +162,16 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
             }
         }
         Ok(Some(SyscallTarget::Errno(errno))) => {
-            debug!(syscall = notif.data.nr, errno, "denying syscall with errno");
+            if is_open_family_syscall(notif.data.nr) {
+                tracing::info!(
+                    syscall = notif.data.nr,
+                    errno,
+                    pid = notif.pid,
+                    "denying open-family syscall before fanotify"
+                );
+            } else {
+                debug!(syscall = notif.data.nr, errno, "denying syscall with errno");
+            }
             log_notification_response(send_errno(cli.listener_fd, notif.id, errno));
         }
         Ok(Some(SyscallTarget::None) | None) => {
@@ -226,9 +185,117 @@ async fn dispatch_notification(cli: &Cli, notif: &SeccompNotif, timeout: Duratio
             }
         }
         Err(err) => {
-            warn!(error = %err, syscall = notif.data.nr, "failed to parse syscall target");
+            if is_open_family_syscall(notif.data.nr) {
+                tracing::info!(
+                    error = %err,
+                    syscall = notif.data.nr,
+                    pid = notif.pid,
+                    "failed to classify open-family syscall; denying before fanotify"
+                );
+            } else {
+                warn!(error = %err, syscall = notif.data.nr, "failed to parse syscall target");
+            }
             let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
         }
+    }
+}
+
+fn is_open_family_syscall(nr: i32) -> bool {
+    matches!(
+        i64::from(nr),
+        nr::OPEN | nr::OPENAT | nr::OPENAT2 | nr::CREAT
+    )
+}
+
+async fn dispatch_network_target(
+    cli: &Cli,
+    notif: &SeccompNotif,
+    target: &NetworkTarget,
+    timeout: Duration,
+) {
+    let allowed = check_target(
+        &cli.policy_socket,
+        target,
+        cli.sandbox_session_id.clone(),
+        notif.pid,
+        timeout,
+    )
+    .await;
+    let result = if allowed {
+        send_continue(cli.listener_fd, notif.id)
+    } else {
+        debug!(target = ?target, "network check denied");
+        send_errno(cli.listener_fd, notif.id, libc::EACCES)
+    };
+    if let Err(err) = result {
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            debug!(error = %err, "seccomp notification response failed");
+        } else {
+            warn!(error = %err, "seccomp notification response failed");
+        }
+    }
+}
+
+async fn dispatch_resource_target(
+    cli: &Cli,
+    notif: &SeccompNotif,
+    target: &ResourceTarget,
+    timeout: Duration,
+) {
+    if is_policy_socket_bypass(target, &cli.policy_socket) {
+        debug!(target = ?target, "bypassing policy socket (infrastructure connect)");
+        // Let the tracee complete the paused connect() itself. The sockaddr
+        // args are frozen for the duration of the seccomp notification, so
+        // this is TOCTOU-safe. Emulating the connect in the broker process
+        // would make policyd see the broker's pid on SO_PEERCRED instead of
+        // the tracee's, breaking fsmon pid routing and RPC context.
+        log_notification_response(send_continue(cli.listener_fd, notif.id));
+        return;
+    }
+    let reply = match check_resource(
+        &cli.policy_socket,
+        target,
+        cli.sandbox_session_id.clone(),
+        notif.pid,
+        timeout,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(err) => {
+            warn!(error = %err, target = ?target, "resource check RPC failed");
+            let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+            return;
+        }
+    };
+    if !reply.allowed {
+        if matches!(target.kind, ResourceKind::Device) {
+            tracing::info!(
+                path = %target.path.display(),
+                source = %reply.source,
+                pid = notif.pid,
+                "device open denied in syscall broker before fanotify"
+            );
+        } else {
+            debug!(target = ?target, source = %reply.source, "resource check denied");
+        }
+        let _ = send_errno(cli.listener_fd, notif.id, libc::EACCES);
+        return;
+    }
+    if let Err(err) = emulate_resource(cli.listener_fd, notif, target) {
+        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+        if matches!(target.kind, ResourceKind::Device) {
+            tracing::info!(
+                error = %err,
+                errno,
+                path = %target.path.display(),
+                pid = notif.pid,
+                "device open emulation failed in syscall broker before fanotify"
+            );
+        } else {
+            debug!(error = %err, errno, target = ?target, "resource emulation failed");
+        }
+        let _ = send_errno(cli.listener_fd, notif.id, errno);
     }
 }
 
@@ -256,6 +323,7 @@ async fn dispatch_filesystem_target(
             return send_errno(listener_fd, notif.id, libc::EACCES);
         }
     }
+    revalidate_filesystem_mutation(notif, target)?;
     send_continue(listener_fd, notif.id)
 }
 
@@ -283,8 +351,9 @@ fn child_exited(child_pid: Option<i32>) -> bool {
 /// socket. These connects are infrastructure traffic from fs-arm (which
 /// runs under the seccomp filter), not agent actions, and should not
 /// prompt. The policy socket is `--ro-bind`'d into the sandbox, so the
-/// agent cannot impersonate it. Emulation still uses `target.raw` (captured
-/// at parse time), preserving TOCTOU safety.
+/// agent cannot impersonate it. The broker issues `CONTINUE` so the tracee
+/// completes the paused `connect()` with frozen args (TOCTOU-safe) and
+/// policyd observes the tracee pid on `SO_PEERCRED`.
 ///
 /// Compares by inode and device, not path, to defeat hardlink aliases:
 /// `link(policy_sock, ~/evil.sock)` creates a second path to the same
@@ -609,6 +678,9 @@ fn enhance_sendmsg_emulation(
     send_result(listener_fd, notif.id, i64::try_from(rc).unwrap_or(0))
 }
 
+/// Emulate `open`/`openat`/`openat2`/`creat` using captured path and flags.
+/// Installs the resulting fd into the tracee via `NOTIF_ADDFD` so the tracee
+/// never re-runs the syscall with live pointer args.
 /// Emulate `open`/`openat`/`openat2`/`creat` of a policy-allowed device by
 /// opening the device in the broker's own fd table and installing that fd
 /// into the tracee via `SECCOMP_IOCTL_NOTIF_ADDFD` with
@@ -620,33 +692,35 @@ fn emulate_device_open(
     notif: &SeccompNotif,
     target: &ResourceTarget,
 ) -> std::io::Result<()> {
-    // Use the captured flags and mode from policy parsing (target fields),
-    // never re-read the tracee's open_how or flags arg after approval.
-    let flags = target.open_flags;
-    let mode = target.open_mode;
+    emulate_open_with_path(
+        listener_fd,
+        notif.id,
+        &target.raw,
+        target.open_flags,
+        target.open_mode,
+    )
+}
 
-    // Use the captured path from policy parsing (target.raw), never
-    // re-read the tracee pointer. This prevents a TOCTOU where the tracee
-    // swaps the path between approval and emulation.
-    let path = std::str::from_utf8(&target.raw)
+fn emulate_open_with_path(
+    listener_fd: i32,
+    notif_id: u64,
+    raw_path: &[u8],
+    flags: i32,
+    mode: u32,
+) -> std::io::Result<()> {
+    let path = std::str::from_utf8(raw_path)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 path"))?;
 
-    // Open the device with the broker's privileges.
     let path_c = std::ffi::CString::new(path)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "path has NUL"))?;
     let opened = unsafe { libc::open(path_c.as_ptr(), flags, mode) };
     if opened < 0 {
         let err = std::io::Error::last_os_error();
         let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-        return send_errno(listener_fd, notif.id, errno);
+        return send_errno(listener_fd, notif_id, errno);
     }
-    // Send the fd to the tracee. SECCOMP_ADDFD_FLAG_SEND atomically installs
-    // the fd and completes the notification. Propagate O_CLOEXEC so the
-    // tracee's semantics are preserved across its own exec.
     let cloexec = (flags & libc::O_CLOEXEC) != 0;
-    let result = send_addfd(listener_fd, notif.id, opened, cloexec);
-    // send_addfd consumes the notification. Close our local copy of the fd
-    // because the kernel has installed a separate one in the tracee.
+    let result = send_addfd(listener_fd, notif_id, opened, cloexec);
     unsafe { libc::close(opened) };
     result
 }
