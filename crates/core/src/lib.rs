@@ -37,6 +37,7 @@ pub use policy::{
     InodeIdentity, NetworkRule, NetworkSection, Policy, ResourceAccess, ResourceKind, ResourceRule,
     ResourceRuleKey, ResourceSection, ResourceSortKey, SudoRule, SudoSection, contract_home_path,
     expand_home_path, expand_policy_path, filesystem_approval_paths,
+    normalize_directory_traverse_access,
 };
 pub use proc_context::{
     PeerCredentials, ProcContext, context_from_pid, home_from_uid, is_descendant_of, peer_cred,

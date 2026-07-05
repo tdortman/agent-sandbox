@@ -69,6 +69,21 @@ impl std::fmt::Display for FileAccess {
     }
 }
 
+/// Map directory `FAN_OPEN_EXEC_PERM` (traverse) to [`FileAccess::Read`].
+///
+/// Fanotify reports search permission as execute; `read_write` rules (e.g.
+/// `./.git*`, `./crates`) must still cover `ls` / `opendir`.
+#[must_use]
+pub fn normalize_directory_traverse_access(path: &Path, access: FileAccess) -> FileAccess {
+    if access == FileAccess::Execute
+        && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+    {
+        FileAccess::Read
+    } else {
+        access
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FilesystemRuleKey {
     pub path: PathBuf,
@@ -778,6 +793,23 @@ mod tests {
     }
 
     #[test]
+    fn normalize_directory_traverse_maps_execute_to_read_on_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join(".git/objects/pack");
+        std::fs::create_dir_all(&pack).expect("pack dir");
+        assert_eq!(
+            super::normalize_directory_traverse_access(&pack, FileAccess::Execute),
+            FileAccess::Read
+        );
+        let pack_file = pack.join("pack-abc.pack");
+        std::fs::write(&pack_file, b"x").expect("pack file");
+        assert_eq!(
+            super::normalize_directory_traverse_access(&pack_file, FileAccess::Execute),
+            FileAccess::Execute
+        );
+    }
+
+    #[test]
     fn file_access_covers() {
         assert!(FileAccess::All.covers(FileAccess::Read));
         assert!(FileAccess::All.covers(FileAccess::Write));
@@ -886,6 +918,56 @@ mod tests {
         assert!(rule.path_matches(Path::new("/work/foo"), Some(Path::new("/work"))));
         assert!(rule.path_matches(Path::new("/work/foo/bar"), Some(Path::new("/work"))));
         assert!(!rule.path_matches(Path::new("/work/foobar"), Some(Path::new("/work"))));
+    }
+
+    #[test]
+    fn git_star_glob_matches_inside_git_directory_with_project_root() {
+        // globset `*` can span `/`, so `./.git*` covers `.git/config` when the rule
+        // is expanded with project_root at check time (normal sandbox path).
+        let rule = FilesystemRule::new("./.git*", FileAccess::ReadWrite, "");
+        let root = Path::new("/home/user/dotfiles");
+        assert!(rule.matches(&root.join(".git"), FileAccess::ReadWrite, Some(root)));
+        assert!(rule.matches(&root.join(".git/config"), FileAccess::ReadWrite, Some(root)));
+        assert!(rule.matches(
+            &root.join(".git/objects/pack"),
+            FileAccess::Read,
+            Some(root)
+        ));
+        assert!(rule.matches(
+            &root.join(".git/objects/39/2aff17307d2091111c7a71e95580c632d90421"),
+            FileAccess::ReadWrite,
+            Some(root)
+        ));
+    }
+
+    #[test]
+    fn git_star_glob_without_project_root_does_not_match_absolute_git_paths() {
+        let rule = FilesystemRule::new("./.git*", FileAccess::ReadWrite, "");
+        let root = Path::new("/home/user/dotfiles");
+        assert!(!rule.matches(&root.join(".git/config"), FileAccess::ReadWrite, None));
+    }
+
+    #[test]
+    fn globset_star_matches_across_slashes_by_default() {
+        use globset::{Glob, GlobBuilder};
+        let default = Glob::new("/home/user/dotfiles/.git*")
+            .expect("glob")
+            .compile_matcher();
+        assert!(default.is_match("/home/user/dotfiles/.git/config"));
+
+        let literal = GlobBuilder::new("/home/user/dotfiles/.git*")
+            .literal_separator(true)
+            .build()
+            .expect("glob")
+            .compile_matcher();
+        assert!(!literal.is_match("/home/user/dotfiles/.git/config"));
+    }
+
+    #[test]
+    fn git_directory_prefix_matches_files_inside() {
+        let rule = FilesystemRule::new("./.git", FileAccess::ReadWrite, "");
+        let root = Path::new("/home/user/dotfiles");
+        assert!(rule.matches(&root.join(".git/config"), FileAccess::ReadWrite, Some(root)));
     }
 
     #[test]
