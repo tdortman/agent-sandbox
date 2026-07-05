@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process;
 
 use caps::CapSet;
@@ -46,6 +46,61 @@ fn drop_capabilities() -> io::Result<()> {
     Ok(())
 }
 
+const NETNS_DIR: &str = "/run/netns";
+
+/// Reject traversal, separators, and names outside the agent-sandbox netns convention.
+fn netns_name_allowed(name: &str) -> bool {
+    if name.is_empty() || name.len() > 200 {
+        return false;
+    }
+    if name.contains("..") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Resolve `/run/netns/<name>` and ensure it stays under the netns directory.
+fn resolve_netns_path(name: &str) -> io::Result<PathBuf> {
+    if !netns_name_allowed(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid netns name",
+        ));
+    }
+    let requested = PathBuf::from(NETNS_DIR).join(name);
+    let canonical = requested.canonicalize().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("canonicalize netns path {}: {err}", requested.display()),
+        )
+    })?;
+    let netns_root = Path::new(NETNS_DIR)
+        .canonicalize()
+        .map_err(|err| io::Error::new(err.kind(), format!("canonicalize {NETNS_DIR}: {err}")))?;
+    if !canonical.starts_with(&netns_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "netns path escapes /run/netns",
+        ));
+    }
+    for component in canonical.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "netns path escapes /run/netns",
+            ));
+        }
+    }
+    if canonical.file_name().and_then(|n| n.to_str()) != Some(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "netns symlink target name mismatch",
+        ));
+    }
+    Ok(canonical)
+}
+
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "agent-sandbox-enter",
@@ -80,12 +135,7 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    if cli.netns.len() > 200 {
-        eprintln!("netns name too long");
-        process::exit(1);
-    }
-
-    let path = PathBuf::from("/run/netns").join(&cli.netns);
+    let path = resolve_netns_path(&cli.netns).unwrap_or_else(|e| die("resolve netns", &e));
     let file = OpenOptions::new()
         .read(true)
         .open(&path)
@@ -117,4 +167,24 @@ fn main() {
     // the compiler can prove the Ok variant is uninhabited.
     let err = execvp(&cmd, &cargs).unwrap_err();
     die("execvp", &io::Error::other(err));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netns_name_rejects_traversal_and_separators() {
+        assert!(!netns_name_allowed(".."));
+        assert!(!netns_name_allowed("../agent-sandbox"));
+        assert!(!netns_name_allowed("agent/sandbox"));
+        assert!(!netns_name_allowed(""));
+    }
+
+    #[test]
+    fn netns_name_accepts_agent_sandbox_convention() {
+        assert!(netns_name_allowed("agent-sandbox"));
+        assert!(netns_name_allowed("sandbox-netns-1"));
+        assert!(netns_name_allowed("default-netns"));
+    }
 }
