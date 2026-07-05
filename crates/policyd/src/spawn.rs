@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use agent_sandbox_core::graphical_env::{graphical_session_env, tool_path};
 use nix::unistd::User;
 
-use crate::store::PolicydArgs;
-use crate::wire::UiSpawnContext;
+use crate::store::{PolicyStore, PolicydArgs};
+use crate::wire::{UiSpawnContext, UiSpawnGate};
 
 const MAX_UI_SPAWN_THROTTLES: usize = 1024;
 
@@ -103,6 +103,49 @@ pub fn ui_spawn_env(
 /// Convert an `Option<&Path>` to a lossy String, returning an empty String for None.
 fn opt_path_str(path: Option<&Path>) -> String {
     path.map_or_else(String::new, |p| p.to_string_lossy().into_owned())
+}
+
+impl PolicyStore {
+    /// Spawn the policy UI without holding the store mutex across blocking I/O.
+    pub(crate) async fn spawn_policy_ui(&self, spawn: UiSpawnContext<'_>) {
+        if spawn.gate.has_matching_ui {
+            return;
+        }
+        let args = self.args.clone();
+        let sandbox_session_id = spawn.sandbox_session_id.map(str::to_owned);
+        let home = spawn.home.map(PathBuf::from);
+        let cwd = spawn.cwd.map(PathBuf::from);
+        let project_root = spawn.project_root.map(PathBuf::from);
+        let uid = spawn.uid;
+        let mut throttle = {
+            let inner = self.inner.lock().await;
+            inner.ui_spawn_last.clone()
+        };
+        let throttle = match tokio::task::spawn_blocking(move || {
+            let spawn = UiSpawnContext {
+                gate: UiSpawnGate {
+                    has_matching_ui: false,
+                },
+                sandbox_session_id: sandbox_session_id.as_deref(),
+                uid,
+                home: home.as_deref(),
+                cwd: cwd.as_deref(),
+                project_root: project_root.as_deref(),
+            };
+            maybe_spawn_ui(&args, &mut throttle, &spawn);
+            throttle
+        })
+        .await
+        {
+            Ok(throttle) => throttle,
+            Err(err) => {
+                tracing::warn!(error = %err, "policy UI spawn worker panicked");
+                return;
+            }
+        };
+        let mut inner = self.inner.lock().await;
+        inner.ui_spawn_last = throttle;
+    }
 }
 
 pub fn maybe_spawn_ui<S: BuildHasher>(

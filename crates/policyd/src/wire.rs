@@ -153,6 +153,9 @@ pub struct PendingDecision {
     pub scope: ApprovalScope,
     pub target: Option<ApprovalTarget>,
     pub wire: ScopeWire,
+    pub client_id: u64,
+    /// `SO_PEERCRED` uid of the connection issuing Approve/Deny.
+    pub approver_uid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

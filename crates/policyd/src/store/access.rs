@@ -1,17 +1,21 @@
-//! Policy store: access.
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity, NetworkRuleKey, Policy,
-    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, allow_keys, expand_policy_path,
-    normalize_host,
+    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, allow_keys, discover_git_project_root,
+    expand_policy_path, normalize_host,
 };
 
 use crate::store::ui_route::UiRoute;
 use crate::wire::MergeContext;
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
+
+/// Upper bound on files indexed by the deny inode cache across all deny
+/// rules. Keeps a deny rule on a huge tree (e.g. a btrfs snapshot dir with
+/// millions of files) from consuming unbounded memory and blocking checks.
+const MAX_DENY_INODE_ENTRIES: usize = 100_000;
 
 fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u16) -> bool {
     let keys = allow_keys(host, port);
@@ -44,6 +48,12 @@ fn sandbox_filesystem_static_allow_key(ctx: &MergeContext) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     format!("ctx:{cwd}:{project_root}")
+}
+
+/// Host-managed runtime paths under `/run/agent-sandbox` are infrastructure,
+/// not agent actions. Fanotify must allow them without loading merged policy.
+fn is_sandbox_infrastructure_path(path: &Path) -> bool {
+    path.starts_with("/run/agent-sandbox")
 }
 
 impl PolicyStore {
@@ -216,11 +226,65 @@ fn session_filesystem_matches(
     bucket: &HashSet<FilesystemRuleKey>,
     path: &Path,
     access: FileAccess,
+    project_root: Option<&Path>,
 ) -> bool {
     bucket.iter().any(|entry| {
         let rule = FilesystemRule::new(entry.path.clone(), entry.access, "");
-        rule.matches(path, access, None)
+        rule.matches(path, access, project_root)
     })
+}
+
+/// Candidate project roots for matching project-relative allow rules.
+///
+/// Includes the resolved sandbox context root and, when the requested path lies
+/// inside a Git work tree, that repository's root so `./.git*` still matches
+/// `.git/objects` after `cd` into another repo or a stale launcher root.
+fn project_roots_for_allow(ctx_root: Option<&Path>, path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |root: PathBuf| {
+        if !root.as_os_str().is_empty() && !roots.iter().any(|r| r == &root) {
+            roots.push(root);
+        }
+    };
+    if let Some(pr) = ctx_root {
+        push(pr.to_path_buf());
+    }
+    if let Some(git_root) = discover_git_project_root(path) {
+        push(git_root);
+    }
+    roots
+}
+
+fn filesystem_rules_match_allow(
+    rules: &[FilesystemRule],
+    path: &Path,
+    access: FileAccess,
+    ctx_root: Option<&Path>,
+) -> bool {
+    let roots = project_roots_for_allow(ctx_root, path);
+    if roots.is_empty() {
+        return rules.iter().any(|rule| rule.matches(path, access, None));
+    }
+    roots.iter().any(|root| {
+        rules
+            .iter()
+            .any(|rule| rule.matches(path, access, Some(root)))
+    })
+}
+
+fn session_filesystem_bucket_matches_allow(
+    bucket: &HashSet<FilesystemRuleKey>,
+    path: &Path,
+    access: FileAccess,
+    ctx_root: Option<&Path>,
+) -> bool {
+    let roots = project_roots_for_allow(ctx_root, path);
+    if roots.is_empty() {
+        return session_filesystem_matches(bucket, path, access, None);
+    }
+    roots
+        .iter()
+        .any(|root| session_filesystem_matches(bucket, path, access, Some(root)))
 }
 
 impl PolicyStore {
@@ -230,8 +294,10 @@ impl PolicyStore {
         access: FileAccess,
         ctx: &MergeContext,
     ) -> bool {
+        let access = agent_sandbox_core::normalize_directory_traverse_access(path, access);
         let project_root = ctx.paths.project_root();
-        let merged = self.merged_for(ctx);
+        let ctx = ctx.clone();
+        let merged = self.merged_for_worker(&ctx);
         let home = ctx.paths.home();
         let path_match = merged
             .filesystem
@@ -241,29 +307,8 @@ impl PolicyStore {
         if path_match {
             return true;
         }
-        // Hardlink defense: check if the request path's inode matches any
-        // file under a deny rule. Rebuilds the cache when the fingerprint
-        // (deny rule paths + mtimes) changes.
         let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
-        let mut inner = self.inner.lock().await;
-        if Self::fingerprint_changed(&inner.deny_inode_cache, &fingerprint) {
-            inner.deny_inode_cache = Self::rebuild_deny_inode_cache(fingerprint);
-        }
-        Self::is_denied_by_inode(path, access, &inner.deny_inode_cache)
-    }
-    pub(crate) fn filesystem_policy_allowed(
-        &self,
-        path: &Path,
-        access: FileAccess,
-        ctx: &MergeContext,
-    ) -> bool {
-        let project_root = ctx.paths.project_root();
-        let merged = self.merged_for(ctx);
-        merged
-            .filesystem
-            .allow
-            .iter()
-            .any(|rule| rule.matches(path, access, project_root))
+        self.deny_inode_denied(path, access, &fingerprint).await
     }
 
     pub(crate) async fn session_filesystem_denied(
@@ -279,12 +324,15 @@ impl PolicyStore {
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let project_root = resolved.paths.project_root();
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
                 .session_filesystem_deny
                 .get(sid)
-                .is_some_and(|bucket| session_filesystem_matches(bucket, path, access))
+                .is_some_and(|bucket| {
+                    session_filesystem_matches(bucket, path, access, project_root)
+                })
         })
     }
 
@@ -301,12 +349,20 @@ impl PolicyStore {
         )
         .with_sandbox_session(resolved.sandbox_session_id.clone());
         let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let project_root = resolved.paths.project_root();
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
                 .session_filesystem_allow
                 .get(sid)
-                .is_some_and(|bucket| session_filesystem_matches(bucket, path, access))
+                .is_some_and(|bucket| {
+                    session_filesystem_bucket_matches_allow(
+                        bucket,
+                        path,
+                        access,
+                        project_root,
+                    )
+                })
         })
     }
 
@@ -387,7 +443,24 @@ impl PolicyStore {
         access: FileAccess,
         ctx: &MergeContext,
     ) -> Option<String> {
-        if self.filesystem_policy_denied(path, access, ctx).await {
+        let access = agent_sandbox_core::normalize_directory_traverse_access(path, access);
+        if is_sandbox_infrastructure_path(path) {
+            return Some("infrastructure".into());
+        }
+        let ctx_for_merge = ctx.clone();
+        let merged = self.merged_for_worker(&ctx_for_merge);
+        let project_root = ctx.paths.project_root();
+        let home = ctx.paths.home();
+        let path_denied = merged
+            .filesystem
+            .deny
+            .iter()
+            .any(|rule| rule.matches(path, access, project_root));
+        if path_denied {
+            return Some("deny".into());
+        }
+        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+        if self.deny_inode_denied(path, access, &fingerprint).await {
             return Some("deny".into());
         }
         if self.session_filesystem_denied(path, access, ctx).await {
@@ -396,9 +469,6 @@ impl PolicyStore {
         if self.session_filesystem_allowed(path, access, ctx).await {
             return Some("session".into());
         }
-        // Inode-based session allow: if a hardlink at a different path was
-        // already approved this session, skip the prompt. The inode is the
-        // same, so the approval covers it.
         if self
             .session_filesystem_allowed_by_inode(path, access, ctx)
             .await
@@ -408,10 +478,47 @@ impl PolicyStore {
         if self.static_filesystem_allowed(path, access, ctx).await {
             return Some("static".into());
         }
-        if self.filesystem_policy_allowed(path, access, ctx) {
+        if filesystem_rules_match_allow(&merged.filesystem.allow, path, access, project_root) {
             return Some("allow".into());
         }
         None
+    }
+
+    async fn deny_inode_denied(
+        &self,
+        path: &Path,
+        access: FileAccess,
+        fingerprint: &[DenyFingerprint],
+    ) -> bool {
+        let needs_rebuild = {
+            let inner = self.inner.lock().await;
+            Self::fingerprint_changed(&inner.deny_inode_cache, fingerprint)
+        };
+        if needs_rebuild {
+            // Single-flight: concurrent checks wait here instead of each
+            // launching a full recursive walk of every denied directory.
+            let _rebuild_guard = self.deny_inode_rebuild.lock().await;
+            let still_stale = {
+                let inner = self.inner.lock().await;
+                Self::fingerprint_changed(&inner.deny_inode_cache, fingerprint)
+            };
+            if still_stale {
+                let fp = fingerprint.to_vec();
+                // The walk can hit disk for a long time; keep it off the
+                // async runtime so other requests stay responsive.
+                match tokio::task::spawn_blocking(move || Self::rebuild_deny_inode_cache(fp)).await
+                {
+                    Ok(new_cache) => {
+                        self.inner.lock().await.deny_inode_cache = new_cache;
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "deny inode cache rebuild panicked");
+                    }
+                }
+            }
+        }
+        let inner = self.inner.lock().await;
+        Self::is_denied_by_inode(path, access, &inner.deny_inode_cache)
     }
 
     /// Compute a fingerprint for the deny rules: one `DenyFingerprint` per
@@ -469,12 +576,20 @@ impl PolicyStore {
     fn rebuild_deny_inode_cache(fingerprint: Vec<DenyFingerprint>) -> DenyInodeCache {
         use std::os::unix::fs::MetadataExt;
         let mut inodes: HashMap<InodeIdentity, Vec<DenyCacheEntry>> = HashMap::new();
+        let mut budget = MAX_DENY_INODE_ENTRIES;
         for entry in &fingerprint {
             let Ok(meta) = std::fs::metadata(&entry.path) else {
                 continue;
             };
             if meta.is_dir() {
-                Self::walk_dir_inodes(&entry.path, entry.access, &mut inodes);
+                if !Self::walk_dir_inodes(&entry.path, entry.access, &mut inodes, &mut budget) {
+                    tracing::warn!(
+                        path = %entry.path.display(),
+                        limit = MAX_DENY_INODE_ENTRIES,
+                        "deny directory too large for inode hardlink defense; walk truncated \
+                         (path-based deny rules still apply)"
+                    );
+                }
             } else {
                 let identity = InodeIdentity {
                     inode: meta.ino(),
@@ -491,22 +606,33 @@ impl PolicyStore {
             fingerprint,
         }
     }
+    /// Recursively index files under a denied directory. Decrements `budget`
+    /// per cached file; returns `false` when the budget is exhausted and the
+    /// walk was abandoned (deny rules on huge trees, e.g. snapshot
+    /// directories, would otherwise consume unbounded time and memory).
     fn walk_dir_inodes(
         dir: &Path,
         access: FileAccess,
         inodes: &mut HashMap<InodeIdentity, Vec<DenyCacheEntry>>,
-    ) {
+        budget: &mut usize,
+    ) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+            return true;
         };
         for entry in entries.flatten() {
+            if *budget == 0 {
+                return false;
+            }
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
             if meta.is_dir() {
-                Self::walk_dir_inodes(&entry.path(), access, inodes);
+                if !Self::walk_dir_inodes(&entry.path(), access, inodes, budget) {
+                    return false;
+                }
             } else {
+                *budget -= 1;
                 let identity = InodeIdentity {
                     inode: meta.ino(),
                     device: meta.dev(),
@@ -517,6 +643,7 @@ impl PolicyStore {
                 });
             }
         }
+        true
     }
 
     /// Check if a request path is denied by inode comparison. Stats the
@@ -588,11 +715,8 @@ impl PolicyStore {
         // Hardlink defense: check if the request path's inode matches any
         // resource deny rule target.
         let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
-        let mut inner = self.inner.lock().await;
-        if Self::fingerprint_changed(&inner.deny_inode_cache, &fingerprint) {
-            inner.deny_inode_cache = Self::rebuild_deny_inode_cache(fingerprint);
-        }
-        Self::is_denied_by_inode(path, FileAccess::All, &inner.deny_inode_cache)
+        self.deny_inode_denied(path, FileAccess::All, &fingerprint)
+            .await
     }
 
     pub(crate) fn resource_policy_allowed(
@@ -683,8 +807,32 @@ impl PolicyStore {
 mod tests {
     use std::{collections::HashSet, path::Path};
 
-    use super::{is_session_bus_socket, session_network_matches, session_sudo_matches};
-    use agent_sandbox_core::{NetworkRuleKey, ResourceAccess, ResourceKind};
+    use super::{
+        is_session_bus_socket, session_filesystem_matches, session_network_matches,
+        session_sudo_matches,
+    };
+    use agent_sandbox_core::{
+        FileAccess, FilesystemRuleKey, NetworkRuleKey, ResourceAccess, ResourceKind,
+    };
+
+    #[test]
+    fn session_filesystem_matches_honors_project_relative_paths() {
+        let bucket = HashSet::from([FilesystemRuleKey::new("./.git", FileAccess::ReadWrite)]);
+        let project = Path::new("/home/user/dotfiles");
+        let config = Path::new("/home/user/dotfiles/.git/config");
+        assert!(session_filesystem_matches(
+            &bucket,
+            config,
+            FileAccess::ReadWrite,
+            Some(project),
+        ));
+        assert!(!session_filesystem_matches(
+            &bucket,
+            config,
+            FileAccess::ReadWrite,
+            None,
+        ));
+    }
 
     #[test]
     fn session_bus_socket_is_builtin_denied() {
@@ -1023,6 +1171,291 @@ mod tests {
 
         assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
     }
+
+    #[tokio::test]
+    async fn global_git_star_rule_needs_project_root_to_match() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(project_root.join(".git")).expect("create git dir");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+        let policy_path = policy_dir.join("policy.json");
+        let config_path = project_root.join(".git/config");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .allow
+            .push(agent_sandbox_core::FilesystemRule::new(
+                "./.git*",
+                agent_sandbox_core::FileAccess::ReadWrite,
+                "global",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let home_s = home.to_string_lossy().into_owned();
+        let root_s = project_root.to_string_lossy().into_owned();
+        let with_root = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+        let without_root = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, ""),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &config_path,
+                    agent_sandbox_core::FileAccess::ReadWrite,
+                    &with_root,
+                )
+                .await
+                .as_deref(),
+            Some("allow"),
+            "global ./.git* should match .git/config when project_root is set"
+        );
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &config_path,
+                    agent_sandbox_core::FileAccess::ReadWrite,
+                    &without_root,
+                )
+                .await
+                .as_deref(),
+            Some("allow"),
+            "global ./.git* should still match via git-discovered project root when ctx project_root is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_git_star_matches_objects_when_ctx_project_root_is_stale() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("agent-sandbox");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(project_root.join(".git/objects/pack")).expect("git tree");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+        let policy_path = policy_dir.join("policy.json");
+        let objects_path = project_root.join(".git/objects/pack");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .allow
+            .push(agent_sandbox_core::FilesystemRule::new(
+                "./.git*",
+                agent_sandbox_core::FileAccess::ReadWrite,
+                "global",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let home_s = home.to_string_lossy().into_owned();
+        let stale_root = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new("/tmp", &home_s, "/tmp"),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &objects_path,
+                    agent_sandbox_core::FileAccess::ReadWrite,
+                    &stale_root,
+                )
+                .await
+                .as_deref(),
+            Some("allow"),
+            "git root inferred from path should match ./.git* even when launcher project_root is stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_git_star_matches_pack_directory_execute_traverse() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("agent-sandbox");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(project_root.join(".git/objects/pack")).expect("git tree");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+        let policy_path = policy_dir.join("policy.json");
+        let pack_dir = project_root.join(".git/objects/pack");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .allow
+            .push(agent_sandbox_core::FilesystemRule::new(
+                "./.git*",
+                agent_sandbox_core::FileAccess::ReadWrite,
+                "global",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &pack_dir,
+                    agent_sandbox_core::FileAccess::Execute,
+                    &ctx,
+                )
+                .await
+                .as_deref(),
+            Some("allow"),
+            "opendir on .git/objects/pack is directory traverse (Execute), not binary exec"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_deny_overrides_global_allow_for_git_objects() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(project_root.join(".git/objects/pack")).expect("git tree");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+        let policy_path = policy_dir.join("policy.json");
+        let pack_dir = project_root.join(".git/objects/pack");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .allow
+            .push(agent_sandbox_core::FilesystemRule::new(
+                "./.git*",
+                agent_sandbox_core::FileAccess::ReadWrite,
+                "global",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+
+        let session_id = "sandbox-git-session";
+        let ui_session_id = "ui-git-session";
+        {
+            let (a, b) = tokio::net::UnixStream::pair().expect("unix stream pair");
+            drop(a);
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                super::super::types::UiClient {
+                    session_id: ui_session_id.into(),
+                    writer: std::sync::Arc::new(tokio::sync::Mutex::new(b.into_split().1)),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                ui_session_id.into(),
+                super::super::types::UiSessionContext {
+                    cwd: Some(project_root.clone()),
+                    home: Some(home.clone()),
+                    project_root: Some(project_root.clone()),
+                    sandbox_session_id: Some(session_id.into()),
+                    owner_uid: Some(1000),
+                    client_id: 1,
+                },
+            );
+        }
+        store
+            .apply_filesystem_scope_session(
+                crate::store::decisions::DecisionAction::Deny,
+                ui_session_id.into(),
+                agent_sandbox_core::FilesystemRuleKey::new(
+                    "./.git",
+                    agent_sandbox_core::FileAccess::ReadWrite,
+                ),
+            )
+            .await;
+
+        let home_s = home.to_string_lossy().into_owned();
+        let root_s = project_root.to_string_lossy().into_owned();
+        let ctx = crate::wire::MergeContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some(session_id.into()),
+        };
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &pack_dir,
+                    agent_sandbox_core::FileAccess::Read,
+                    &ctx,
+                )
+                .await
+                .as_deref(),
+            Some("deny"),
+            "session deny on ./.git blocks the tree even when global ./.git* allows"
+        );
+    }
+
     #[tokio::test]
     async fn static_allow_does_not_override_concrete_deny() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1152,6 +1585,34 @@ mod tests {
                 .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Read, &ctx)
                 .await,
             Some("deny".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn infrastructure_paths_are_allowed_without_merged_policy() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        });
+        let ctx = crate::wire::MergeContext::default();
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    Path::new("/run/agent-sandbox/sandbox-policy.sock"),
+                    agent_sandbox_core::FileAccess::ReadWrite,
+                    &ctx,
+                )
+                .await,
+            Some("infrastructure".into())
         );
     }
 

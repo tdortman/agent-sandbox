@@ -1,5 +1,5 @@
 //! Apply pending network or elevation decisions.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
@@ -260,13 +260,24 @@ impl PolicyStore {
 
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit(action.audit_verb(), None, None, &detail);
-        let elevation = self
+        let elevation = match self
             .exec_elevation(
                 &argv,
                 elev.cwd.as_deref().or_else(|| scope_wire.paths.cwd()),
                 elev.home.as_deref().or_else(|| scope_wire.paths.home()),
             )
-            .await;
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(pending_id.clone(), Pending::Elevation(elev));
+                return err.into();
+            }
+        };
         self.finish_elevation(&pending_id, elevation).await;
         RpcReply::ScopeAction(ScopeActionReply::ok_elevation_approve(
             scope,
@@ -283,7 +294,12 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = fs.id.clone();
-        let path = match Self::resolve_pending_filesystem_target(&fs, scope, target) {
+        let path = match Self::resolve_pending_filesystem_target(
+            &fs,
+            scope,
+            target,
+            wire.paths.project_root().or(fs.project_root.as_deref()),
+        ) {
             Ok(value) => value,
             Err(err) => {
                 self.inner
@@ -395,8 +411,10 @@ impl PolicyStore {
         pending: &PendingFilesystem,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
+        project_root: Option<&Path>,
     ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
+        let project_root = project_root.or(pending.project_root.as_deref());
         let path = match target {
             None => pending_path.clone(),
             Some(ApprovalTarget::FilesystemPath { path }) => path.clone(),
@@ -417,7 +435,7 @@ impl PolicyStore {
         }
 
         if FilesystemRule::new(path.clone(), FileAccess::Read, "")
-            .path_matches(pending_path.as_path(), pending.project_root.as_deref())
+            .path_matches(pending_path.as_path(), project_root)
         {
             return Ok(path);
         }
@@ -434,7 +452,12 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = res.id.clone();
-        let path = match Self::resolve_pending_resource_target(&res, scope, target) {
+        let path = match Self::resolve_pending_resource_target(
+            &res,
+            scope,
+            target,
+            wire.paths.project_root().or(res.project_root.as_deref()),
+        ) {
             Ok(value) => value,
             Err(err) => {
                 self.inner
@@ -446,60 +469,41 @@ impl PolicyStore {
             }
         };
 
-        if action == DecisionAction::Approve && scope == ApprovalScope::Once {
-            let detail = format!(
-                "id={pending_id} kind={:?} path={} access={:?}",
-                res.kind,
-                path.display(),
-                res.access
-            );
+        if scope == ApprovalScope::Once {
+            let allowed = matches!(action, DecisionAction::Approve);
+            let source = if allowed { "once" } else { "denied" };
+            let detail = if allowed {
+                format!(
+                    "id={pending_id} kind={:?} path={} access={:?}",
+                    res.kind,
+                    path.display(),
+                    res.access
+                )
+            } else {
+                format!(
+                    "id={pending_id} kind={:?} path={}",
+                    res.kind,
+                    path.display()
+                )
+            };
             Self::audit(action.audit_verb(), None, None, &detail);
             self.finish_resource(
                 &pending_id,
                 res.kind,
                 path.clone(),
                 res.access,
-                true,
-                "once",
+                allowed,
+                source,
             )
             .await;
             return RpcReply::ScopeAction(ScopeActionReply::ok_resource(
-                res.kind,
-                path.clone(),
-                res.access,
-                scope,
-                None,
+                res.kind, path, res.access, scope, None,
             ));
         }
 
         let scope_wire = self
             .resource_scope_wire_for_pending(wire, &res, scope)
             .await;
-
-        if action == DecisionAction::Deny && scope == ApprovalScope::Once {
-            let detail = format!(
-                "id={pending_id} kind={:?} path={}",
-                res.kind,
-                path.display()
-            );
-            Self::audit(action.audit_verb(), None, None, &detail);
-            self.finish_resource(
-                &pending_id,
-                res.kind,
-                path.clone(),
-                res.access,
-                false,
-                "denied",
-            )
-            .await;
-            return RpcReply::ScopeAction(ScopeActionReply::ok_resource(
-                res.kind,
-                path.clone(),
-                res.access,
-                scope,
-                None,
-            ));
-        }
 
         let result = self
             .apply_resource_scope(
@@ -569,8 +573,10 @@ impl PolicyStore {
         pending: &PendingResource,
         scope: ApprovalScope,
         target: Option<&ApprovalTarget>,
+        project_root: Option<&Path>,
     ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
+        let project_root = project_root.or(pending.project_root.as_deref());
         let (kind, path) = match target {
             None => (pending.kind, pending_path.clone()),
             Some(ApprovalTarget::ResourcePath {
@@ -600,7 +606,7 @@ impl PolicyStore {
         }
 
         if ResourceRule::new(pending.kind, path.clone(), ResourceAccess::Connect, "")
-            .path_matches(pending_path.as_path(), pending.project_root.as_deref())
+            .path_matches(pending_path.as_path(), project_root)
         {
             return Ok(path);
         }
@@ -763,6 +769,7 @@ mod tests {
                 },
                 ApprovalScope::Session,
                 Some(&target),
+                None,
             )
             .is_err(),
             "unrelated path should be rejected"
@@ -792,6 +799,7 @@ mod tests {
                 },
                 ApprovalScope::Session,
                 Some(&target),
+                None,
             )
             .expect("resolve pending filesystem target"),
             PathBuf::from("/home/user/projects/foo")
@@ -819,6 +827,7 @@ mod tests {
                 },
                 ApprovalScope::Once,
                 None,
+                None,
             )
             .is_ok()
         );
@@ -835,6 +844,7 @@ mod tests {
                 },
                 ApprovalScope::Once,
                 Some(&ancestor_target),
+                None,
             )
             .is_err(),
             "ancestor target should be rejected for Once scope"
@@ -864,6 +874,7 @@ mod tests {
                 },
                 ApprovalScope::Session,
                 Some(&target),
+                None,
             )
             .expect("project-relative target should resolve"),
             PathBuf::from("./.gitattributes")
@@ -895,9 +906,166 @@ mod tests {
                 },
                 ApprovalScope::Session,
                 Some(&target),
+                None,
             )
             .expect("project-relative resource target should resolve"),
             PathBuf::from("./.sock")
+        );
+    }
+
+    #[test]
+    fn filesystem_target_accepts_project_relative_from_wire_project_root() {
+        let pending = Pending::Filesystem(PendingFilesystem {
+            id: "fs1".into(),
+            created_at: 0.0,
+            path: "/home/user/repo/.git/config".into(),
+            access: FileAccess::ReadWrite,
+            cwd: None,
+            home: Some("/home/user".into()),
+            project_root: None,
+            sandbox_session_id: None,
+        });
+        let target = ApprovalTarget::FilesystemPath {
+            path: "./.git".into(),
+        };
+        assert_eq!(
+            PolicyStore::resolve_pending_filesystem_target(
+                match &pending {
+                    Pending::Filesystem(fs) => fs,
+                    _ => panic!("expected Filesystem"),
+                },
+                ApprovalScope::Global,
+                Some(&target),
+                Some(Path::new("/home/user/repo")),
+            )
+            .expect("wire project_root should validate ./.git against .git/config"),
+            PathBuf::from("./.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn global_git_approval_works_when_pending_lacks_project_root() {
+        let store = test_store("global-git-wire-root");
+        let home = std::env::temp_dir().join(format!(
+            "agent-sandbox-home-global-git-wire-{}",
+            std::process::id()
+        ));
+        let project_root = home.join("dotfiles");
+        std::fs::create_dir_all(&home).expect("create test home");
+        std::fs::create_dir_all(project_root.join(".git")).expect("create git dir");
+        let pending = PendingFilesystem {
+            id: "fs-git-config-wire".into(),
+            created_at: 0.0,
+            path: project_root.join(".git/config"),
+            access: FileAccess::ReadWrite,
+            cwd: Some(project_root.clone()),
+            home: Some(home.clone()),
+            project_root: None,
+            sandbox_session_id: None,
+        };
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Global,
+                target: Some(ApprovalTarget::FilesystemPath {
+                    path: PathBuf::from("./.git"),
+                }),
+                wire: ScopeWire {
+                    paths: SandboxPaths::new(
+                        project_root.clone(),
+                        home.clone(),
+                        project_root.clone(),
+                    ),
+                    session_id: None,
+                    owner_uid: Some(1000),
+                    sandbox_session_id: None,
+                },
+                client_id: 1,
+                approver_uid: None,
+            })
+            .await;
+        assert!(
+            reply.scope_succeeded(),
+            "global ./.git approval should succeed via wire project_root, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_filesystem_git_dir_persists_project_relative_path() {
+        let store = test_store("global-git-dir");
+        let home = std::env::temp_dir().join(format!(
+            "agent-sandbox-home-global-git-{}",
+            std::process::id()
+        ));
+        let project_root = home.join("dotfiles");
+        std::fs::create_dir_all(&home).expect("create test home");
+        std::fs::create_dir_all(project_root.join(".git")).expect("create git dir");
+        let pending = PendingFilesystem {
+            id: "fs-git-config".into(),
+            created_at: 0.0,
+            path: project_root.join(".git/config"),
+            access: FileAccess::ReadWrite,
+            cwd: Some(project_root.clone()),
+            home: Some(home.clone()),
+            project_root: Some(project_root.clone()),
+            sandbox_session_id: None,
+        };
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Global,
+                target: Some(ApprovalTarget::FilesystemPath {
+                    path: PathBuf::from("./.git"),
+                }),
+                wire: ScopeWire {
+                    paths: SandboxPaths::new(
+                        project_root.clone(),
+                        home.clone(),
+                        project_root.clone(),
+                    ),
+                    session_id: None,
+                    owner_uid: Some(1000),
+                    sandbox_session_id: None,
+                },
+                client_id: 1,
+                approver_uid: None,
+            })
+            .await;
+        assert!(
+            reply.scope_succeeded(),
+            "global filesystem approval should succeed, got {reply:?}"
+        );
+
+        let policy_path = home.join(".config/agent-sandbox/policy.json");
+        let raw = std::fs::read_to_string(&policy_path).expect("read policy.json");
+        assert!(
+            raw.contains("./.git"),
+            "global project-relative paths should persist literally, got: {raw}"
+        );
+        let policy = agent_sandbox_core::load_policy(&policy_path, Some(home.as_path()), None);
+        let found = policy.filesystem.allow.iter().any(|rule| {
+            rule.path == Path::new("./.git") && rule.access.covers(FileAccess::ReadWrite)
+        });
+        assert!(
+            found,
+            "global ./.git approval should persist as ./.git in {:?}, allow={:?}",
+            policy_path, policy.filesystem.allow
         );
     }
 
@@ -945,6 +1113,8 @@ mod tests {
                     owner_uid: Some(1000),
                     sandbox_session_id: None,
                 },
+                client_id: 1,
+                approver_uid: None,
             })
             .await;
         assert!(
@@ -1003,6 +1173,8 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: None,
+            owner_uid: Some(1000),
+            client_id: 1,
         }
     }
 
@@ -1062,6 +1234,8 @@ mod tests {
                     path: "/home/user/projects/foo".into(),
                 }),
                 wire: scope_wire(submitting_session_id),
+                client_id: 1,
+                approver_uid: None,
             })
             .await;
         assert!(reply.scope_succeeded());
@@ -1122,8 +1296,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_session_pending_rejects_direct_host_approval() {
+    async fn sandbox_session_pending_rejects_foreign_host_uid() {
         let store = test_store("sandbox-session-direct-approval");
+        store.sandbox_sessions.write().unwrap().insert(
+            "sandbox-a".into(),
+            crate::store::types::SandboxSessionRegistration {
+                root_pid: 42,
+                owner_uid: 1000,
+                project_root: "/repo".into(),
+            },
+        );
         let mut pending = pending_filesystem();
         pending.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
@@ -1142,15 +1324,73 @@ mod tests {
                 wire: ScopeWire {
                     paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                     session_id: None,
-                    owner_uid: Some(1000),
+                    owner_uid: Some(1001),
                     sandbox_session_id: Some("sandbox-a".into()),
                 },
+                client_id: 99,
+                approver_uid: Some(1001),
             })
             .await;
 
         assert!(
-            matches!(&reply, RpcReply::Error(e) if e.error == "approval session does not match pending sandbox session"),
-            "direct host approval must be rejected, got: {reply:?}"
+            matches!(&reply, RpcReply::Error(e) if e.error == "approval not authorized for this connection"),
+            "foreign uid host approval must be rejected, got: {reply:?}"
+        );
+        assert!(
+            store.inner.lock().await.pending.contains_key(&pending_id),
+            "rejected approval must leave pending request intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_connection_approve_rejects_foreign_sandbox_ui() {
+        let store = test_store("cross-connection-approve");
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                UiClient {
+                    session_id: "ui-b".into(),
+                    writer: writer(),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                "ui-b".into(),
+                UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-b".into()),
+                    owner_uid: Some(1000),
+                    client_id: 1,
+                },
+            );
+        }
+
+        let mut pending = pending_filesystem();
+        pending.sandbox_session_id = Some("sandbox-a".into());
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id: pending_id.clone(),
+                scope: ApprovalScope::Once,
+                target: None,
+                wire: scope_wire("ui-b"),
+                client_id: 1,
+                approver_uid: None,
+            })
+            .await;
+
+        assert!(
+            matches!(&reply, RpcReply::Error(e) if e.error == "approval not authorized for this connection"),
+            "cross-sandbox Approve must be rejected, got: {reply:?}"
         );
         assert!(
             store.inner.lock().await.pending.contains_key(&pending_id),
@@ -1177,6 +1417,8 @@ mod tests {
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-a".into()),
+                    owner_uid: Some(1000),
+                    client_id: 1,
                 },
             );
         }
@@ -1197,12 +1439,57 @@ mod tests {
                 scope: ApprovalScope::Once,
                 target: None,
                 wire: scope_wire("ui-a"),
+                client_id: 1,
+                approver_uid: None,
             })
             .await;
 
         assert!(
             reply.scope_succeeded(),
             "matching UiFd approval failed: {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_session_pending_allows_host_owner_cli_approval() {
+        let store = test_store("sandbox-session-host-cli-approval");
+        store.sandbox_sessions.write().unwrap().insert(
+            "sandbox-a".into(),
+            crate::store::types::SandboxSessionRegistration {
+                root_pid: 42,
+                owner_uid: 1000,
+                project_root: "/repo".into(),
+            },
+        );
+        let mut pending = pending_filesystem();
+        pending.sandbox_session_id = Some("sandbox-a".into());
+        let pending_id = pending.id.clone();
+        store
+            .inner
+            .lock()
+            .await
+            .pending
+            .insert(pending_id.clone(), Pending::Filesystem(pending));
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Once,
+                target: None,
+                wire: ScopeWire {
+                    paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                    session_id: None,
+                    owner_uid: Some(1000),
+                    sandbox_session_id: Some("sandbox-a".into()),
+                },
+                client_id: 99,
+                approver_uid: Some(1000),
+            })
+            .await;
+
+        assert!(
+            reply.scope_succeeded(),
+            "host owner CLI approval failed: {reply:?}"
         );
     }
 
@@ -1228,6 +1515,8 @@ mod tests {
                         home: Some("/home/user".into()),
                         project_root: Some("/repo".into()),
                         sandbox_session_id: Some(sandbox_session_id.into()),
+                        owner_uid: Some(1000),
+                        client_id,
                     },
                 );
             }

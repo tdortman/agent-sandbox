@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use agent_sandbox_core::{
     ApprovalScope, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind, ResourceRuleKey,
-    RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget,
+    RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
 };
 
 use crate::error::PolicydError;
@@ -71,7 +71,8 @@ impl PolicyStore {
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
-                let key = FilesystemRuleKey::new(&path, access);
+                let resolved_path = expand_policy_path(&path, home, project_root);
+                let key = FilesystemRuleKey::new(resolved_path, access);
                 self.apply_filesystem_scope_session(action, session_id.clone(), key)
                     .await;
             }

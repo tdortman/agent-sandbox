@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{
@@ -27,6 +28,25 @@ pub const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
 
 /// Cap on the number of static filesystem allow rules retained per sandbox session.
 pub const MAX_STATIC_ALLOW_RULES: usize = 4096;
+
+/// Cap on concurrent RPC connections per local uid.
+pub const MAX_CONNECTIONS_PER_UID: usize = 64;
+
+/// Maximum JSON-line RPC payload size.
+pub const MAX_RPC_LINE_BYTES: usize = 1 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedPeer {
+    pub pid: u32,
+    pub uid: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxSessionRegistration {
+    pub root_pid: u32,
+    pub owner_uid: u32,
+    pub project_root: PathBuf,
+}
 
 /// Key for the network verdict cache: hostname and port.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -242,6 +262,8 @@ pub struct UiSessionContext {
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
+    pub owner_uid: Option<u32>,
+    pub client_id: u64,
 }
 
 pub struct UiClientHandle {
@@ -257,6 +279,57 @@ pub struct UiClient {
 pub struct PolicyStore {
     pub(crate) args: PolicydArgs,
     pub(crate) inner: Mutex<StoreInner>,
+    /// Single-flight guard for deny inode cache rebuilds: concurrent
+    /// filesystem checks must wait for one rebuild instead of each starting
+    /// their own recursive directory walk.
+    pub(crate) deny_inode_rebuild: Mutex<()>,
+    pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
+    pub(crate) merged_cache: std::sync::Mutex<MergedPolicyCache>,
+}
+
+/// LRU-ish cache of merged policies keyed by context paths and source mtimes.
+#[derive(Debug, Default)]
+pub struct MergedPolicyCache {
+    pub entries: HashMap<MergedCacheKey, agent_sandbox_core::Policy>,
+    order: std::collections::VecDeque<MergedCacheKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MergedCacheKey {
+    pub home: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
+    pub declarative_mtime: Option<MtimeKey>,
+    pub home_policy_mtime: Option<MtimeKey>,
+    pub project_policy_mtime: Option<MtimeKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MtimeKey {
+    pub secs: u64,
+    pub nanos: u32,
+}
+
+impl MergedPolicyCache {
+    pub const MAX_ENTRIES: usize = 32;
+
+    pub fn get(&self, key: &MergedCacheKey) -> Option<agent_sandbox_core::Policy> {
+        self.entries.get(key).cloned()
+    }
+
+    #[allow(clippy::map_entry)]
+    pub fn insert(&mut self, key: MergedCacheKey, policy: agent_sandbox_core::Policy) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, policy);
+            return;
+        }
+        while self.order.len() >= Self::MAX_ENTRIES {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, policy);
+    }
 }
 
 pub struct StoreInner {
@@ -288,6 +361,8 @@ pub struct StoreInner {
     /// stat'ing concrete deny files. Fingerprinted by deny rule path mtimes.
     /// When the fingerprint changes the cache is rebuilt on next access.
     pub deny_inode_cache: DenyInodeCache,
+    /// Active RPC connections per peer uid.
+    pub connections_by_uid: HashMap<u32, usize>,
 }
 
 /// Fingerprint entry for a single deny rule path.

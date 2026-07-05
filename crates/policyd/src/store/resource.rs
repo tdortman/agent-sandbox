@@ -11,7 +11,6 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
     ResourceVerdictKey, VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::spawn::maybe_spawn_ui;
 use crate::store::ui_route::UiRoute;
 use crate::wire::{ResourceCheckRequest, UiSpawnContext, UiSpawnGate};
 
@@ -132,11 +131,7 @@ impl PolicyStore {
                     project_root: project_root.as_deref(),
                     sandbox_session_id: sandbox_session_id.as_deref(),
                 };
-                maybe_spawn_ui(
-                    &self.args,
-                    &mut self.inner.lock().await.ui_spawn_last,
-                    &spawn,
-                );
+                self.spawn_policy_ui(spawn).await;
             }
         }
 

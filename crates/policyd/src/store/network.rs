@@ -10,7 +10,6 @@ use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
 
-use crate::spawn::maybe_spawn_ui;
 use crate::wire::{MergeContext, NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
 use super::types::{
@@ -237,11 +236,7 @@ impl PolicyStore {
                     project_root: project_root.as_deref(),
                     sandbox_session_id: sandbox_session_id.as_deref(),
                 };
-                maybe_spawn_ui(
-                    &self.args,
-                    &mut self.inner.lock().await.ui_spawn_last,
-                    &spawn,
-                );
+                self.spawn_policy_ui(spawn).await;
             }
         }
 
@@ -612,7 +607,7 @@ mod tests {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
-                    sandbox_session_id: None,
+                    ..Default::default()
                 },
             );
         }
@@ -662,7 +657,7 @@ mod tests {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
-                    sandbox_session_id: None,
+                    ..Default::default()
                 },
             );
         }
@@ -721,6 +716,7 @@ mod tests {
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-cap".into()),
+                    ..Default::default()
                 },
             );
         }
@@ -826,7 +822,7 @@ mod tests {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
-                    sandbox_session_id: None,
+                    ..Default::default()
                 },
             );
         }

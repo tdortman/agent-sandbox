@@ -17,17 +17,44 @@ use super::types::{
     FilesystemVerdictKey, MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING,
     Pending, PendingFilesystem, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::spawn::maybe_spawn_ui;
 use crate::store::ui_route::UiRoute;
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext, UiSpawnGate};
 
 /// Timeout for waiting for the fsmon `ready` line.
 const FSMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a **deny** filesystem verdict is cached after a decision.
+///
+/// Concurrent opens of the same path while a prompt is in flight are joined
+/// via [`dedup_or_create_pending_filesystem`]; this TTL only covers rapid
+/// re-denials (or hardlink aliases) without re-prompting. Allow verdicts are
+/// not cached: a one-shot approval must not silently cover later opens unless
+/// the user chose session/global/project scope (which installs a real rule).
+const FILESYSTEM_VERDICT_DENY_CACHE_TTL: Duration = Duration::from_secs(2);
+
 struct PendingFsResult {
     id: String,
     is_new: bool,
     rx: oneshot::Receiver<FilesystemCheckReply>,
+}
+
+fn canonicalize_static_allow_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn wait_fsmon_ready(stdout: std::process::ChildStdout) -> Result<(), String> {
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("fsmon closed stdout before ready".to_string());
+        }
+        if line.trim() == "ready" {
+            return Ok(());
+        }
+    }
 }
 
 fn expand_static_allow_rules(
@@ -37,10 +64,13 @@ fn expand_static_allow_rules(
 ) -> Vec<FilesystemRule> {
     rules
         .iter()
-        .map(|rule| FilesystemRule {
-            path: expand_policy_path(&rule.path, home, project_root),
-            access: rule.access,
-            comment: rule.comment.clone(),
+        .map(|rule| {
+            let path = expand_policy_path(&rule.path, home, project_root);
+            FilesystemRule {
+                path: canonicalize_static_allow_path(path),
+                access: rule.access,
+                comment: rule.comment.clone(),
+            }
         })
         .collect()
 }
@@ -58,6 +88,10 @@ impl PolicyStore {
                 return FilesystemMonitorReply::failed("fs_monitor_cmd not configured");
             }
         };
+
+        if req.peer_pid == 0 {
+            return FilesystemMonitorReply::failed("cannot determine monitor target pid");
+        }
 
         if req.static_allow.len() > MAX_STATIC_ALLOW_RULES {
             return FilesystemMonitorReply::failed("too many filesystem static allow rules");
@@ -90,8 +124,24 @@ impl PolicyStore {
             command.arg("--project-root").arg(p);
         }
 
-        let static_allow =
-            expand_static_allow_rules(&req.static_allow, home.as_deref(), project_root.as_deref());
+        let static_allow_input = req.static_allow.clone();
+        let home_for_expand = home.clone();
+        let project_root_for_expand = project_root.clone();
+        let static_allow = match tokio::task::spawn_blocking(move || {
+            expand_static_allow_rules(
+                &static_allow_input,
+                home_for_expand.as_deref(),
+                project_root_for_expand.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(rules) => rules,
+            Err(err) => {
+                tracing::error!(error = %err, "expand static allow panicked");
+                return FilesystemMonitorReply::failed("internal error expanding static allow");
+            }
+        };
         self.store_sandbox_static_allow(&ctx, static_allow).await;
         if let Some(sandbox_session_id) = &sandbox_session_id {
             command.env("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
@@ -110,44 +160,45 @@ impl PolicyStore {
             return FilesystemMonitorReply::failed("stdout not captured");
         };
 
-        // Wait for the "ready" line.
-        let result = tokio::time::timeout(FSMON_READY_TIMEOUT, async {
-            let mut reader = std::io::BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    return Err("fsmon closed stdout before ready".to_string());
-                }
-                if line.trim() == "ready" {
-                    return Ok::<_, String>(());
-                }
-            }
-        })
+        tracing::info!(peer_pid = req.peer_pid, "spawning fsmon");
+        let peer_pid = req.peer_pid;
+        let result = tokio::time::timeout(
+            FSMON_READY_TIMEOUT,
+            tokio::task::spawn_blocking(move || wait_fsmon_ready(stdout)),
+        )
         .await;
 
         match result {
-            Ok(Ok(())) => FilesystemMonitorReply::active(),
-            Ok(Err(err)) => FilesystemMonitorReply::failed(format!("ready wait failed: {err}")),
+            Ok(Ok(Ok(()))) => {
+                tracing::info!(peer_pid, "fsmon ready");
+                FilesystemMonitorReply::active()
+            }
+            Ok(Ok(Err(err))) => FilesystemMonitorReply::failed(format!("ready wait failed: {err}")),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "fsmon ready wait panicked");
+                FilesystemMonitorReply::failed("internal error waiting for fsmon")
+            }
             Err(_) => FilesystemMonitorReply::failed("fsmon ready timeout"),
         }
     }
 
     pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
+        let path = req.path;
+        let access =
+            agent_sandbox_core::normalize_directory_traverse_access(&path, req.access);
         let resolved = self.resolve_context(&req.ctx);
         if let Some(source) = self
-            .filesystem_allow_source(&req.path, req.access, &resolved)
+            .filesystem_allow_source(&path, access, &resolved)
             .await
         {
             if source == "deny" {
-                return FilesystemCheckReply::denied("deny", req.path.clone(), req.access);
+                return FilesystemCheckReply::denied("deny", path, access);
             }
-            return FilesystemCheckReply::allowed(source, req.path.clone(), req.access);
+            return FilesystemCheckReply::allowed(source, path, access);
         }
         self.request_filesystem_approval(FilesystemCheckRequest {
-            path: req.path,
-            access: req.access,
+            path,
+            access,
             ctx: resolved,
         })
         .await
@@ -197,6 +248,13 @@ impl PolicyStore {
             .with_sandbox_session(sandbox_session_id.clone());
 
         if result.is_new {
+            tracing::info!(
+                pending_id = %result.id,
+                path = %path.display(),
+                access = ?access,
+                sandbox_session_id = ?sandbox_session_id,
+                "filesystem approval pending; run agent-sandbox-approve pending or respond in the policy UI"
+            );
             let push = UiPush::FilesystemRequest {
                 id: result.id.clone(),
                 path: path.clone(),
@@ -218,6 +276,16 @@ impl PolicyStore {
                             .flatten()
                             .map(|u| u.uid.as_raw());
                 }
+                if spawn_uid.is_none_or(|u| u == 0)
+                    && let Some(session_id) = sandbox_session_id.as_deref()
+                {
+                    spawn_uid = self
+                        .sandbox_sessions
+                        .read()
+                        .ok()
+                        .and_then(|sessions| sessions.get(session_id).map(|reg| reg.owner_uid))
+                        .filter(|uid| *uid > 0);
+                }
                 let spawn = UiSpawnContext {
                     gate: UiSpawnGate {
                         has_matching_ui: false,
@@ -228,11 +296,7 @@ impl PolicyStore {
                     project_root: project_root.as_deref(),
                     sandbox_session_id: sandbox_session_id.as_deref(),
                 };
-                maybe_spawn_ui(
-                    &self.args,
-                    &mut self.inner.lock().await.ui_spawn_last,
-                    &spawn,
-                );
+                self.spawn_policy_ui(spawn).await;
             }
         }
 
@@ -248,44 +312,32 @@ impl PolicyStore {
         if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemVerdictKey {
             path: path.to_path_buf(),
             access,
-        }) && entry.time.elapsed() < Duration::from_secs(2)
+        }) && !entry.allowed
+            && entry.time.elapsed() < FILESYSTEM_VERDICT_DENY_CACHE_TTL
         {
-            return Some(if entry.allowed {
-                FilesystemCheckReply::allowed(entry.source.clone(), path.to_path_buf(), access)
-            } else {
-                FilesystemCheckReply::denied(entry.source.clone(), path.to_path_buf(), access)
-            });
+            return Some(FilesystemCheckReply::denied(
+                entry.source.clone(),
+                path.to_path_buf(),
+                access,
+            ));
         }
         // Inode-based cache lookup: hardlinks share the same inode, so a
-        // verdict for one path covers all hardlinks at any path.
-        // Deny verdicts are checked first so they take precedence over
-        // allow verdicts for the same inode.
+        // deny verdict for one path covers all hardlinks at any path.
         if let Some(identity) = InodeIdentity::from_path(path) {
-            let mut inode_allow = None;
             for (key, entry) in &inner.filesystem_verdict_cache {
-                if entry.time.elapsed() >= Duration::from_secs(2) {
+                if entry.allowed || entry.time.elapsed() >= FILESYSTEM_VERDICT_DENY_CACHE_TTL {
                     continue;
                 }
                 if !key.access.covers(access) {
                     continue;
                 }
                 if InodeIdentity::from_path(&key.path).is_some_and(|id| id == identity) {
-                    if !entry.allowed {
-                        return Some(FilesystemCheckReply::denied(
-                            entry.source.clone(),
-                            path.to_path_buf(),
-                            access,
-                        ));
-                    }
-                    inode_allow = Some(entry.clone());
+                    return Some(FilesystemCheckReply::denied(
+                        entry.source.clone(),
+                        path.to_path_buf(),
+                        access,
+                    ));
                 }
-            }
-            if let Some(entry) = inode_allow {
-                return Some(FilesystemCheckReply::allowed(
-                    entry.source,
-                    path.to_path_buf(),
-                    access,
-                ));
             }
         }
         drop(inner);
@@ -383,9 +435,25 @@ impl PolicyStore {
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
+        let mut logged_ui_wait = false;
         loop {
             if self.has_standalone_ui_for_route(route).await {
+                tracing::info!(
+                    pending_id,
+                    path = %path.display(),
+                    access = ?access,
+                    "filesystem approval waiting for user decision"
+                );
                 break;
+            }
+            if !logged_ui_wait {
+                tracing::info!(
+                    pending_id,
+                    path = %path.display(),
+                    access = ?access,
+                    "filesystem approval waiting for policy UI to register"
+                );
+                logged_ui_wait = true;
             }
             let now = Instant::now();
             if now >= ui_deadline {
@@ -445,23 +513,26 @@ impl PolicyStore {
                 let _ = tx.send(reply.clone());
             }
         }
-        // Cache the verdict for deduplication.
-        inner.filesystem_verdict_cache.insert(
-            FilesystemVerdictKey { path, access },
-            VerdictEntry {
-                allowed,
-                source: source.to_string(),
-                time: Instant::now(),
-            },
-        );
-        enforce_verdict_cache_limit(&mut inner.filesystem_verdict_cache);
+        // Cache deny verdicts briefly so rapid re-opens of a denied path (or
+        // its hardlinks) fail closed without spamming prompts.
+        if !allowed {
+            inner.filesystem_verdict_cache.insert(
+                FilesystemVerdictKey { path, access },
+                VerdictEntry {
+                    allowed: false,
+                    source: source.to_string(),
+                    time: Instant::now(),
+                },
+            );
+            enforce_verdict_cache_limit(&mut inner.filesystem_verdict_cache);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use agent_sandbox_core::{FileAccess, ProcessIds, SandboxPaths};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -547,6 +618,36 @@ mod tests {
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
         assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_allow_verdict_is_not_cached() {
+        let store = test_store();
+        let path = PathBuf::from("/tmp/agent-sandbox-allow-not-cached");
+        store
+            .finish_filesystem("fs:test", path.clone(), FileAccess::Read, true, "once")
+            .await;
+        assert!(
+            store
+                .check_filesystem_verdict_cache(&path, FileAccess::Read)
+                .await
+                .is_none(),
+            "allow verdicts must not be replayed from the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_deny_verdict_is_cached_briefly() {
+        let store = test_store();
+        let path = PathBuf::from("/tmp/agent-sandbox-deny-cached");
+        store
+            .finish_filesystem("fs:test", path.clone(), FileAccess::Read, false, "denied")
+            .await;
+        let reply = store
+            .check_filesystem_verdict_cache(&path, FileAccess::Read)
+            .await
+            .expect("deny verdict should be cached");
+        assert!(!reply.allowed);
     }
 
     #[tokio::test]
@@ -840,5 +941,33 @@ mod tests {
             "policyd must deny before broad static-allow globs can allow, got: {reply:?}"
         );
         assert_eq!(reply.source, "deny");
+    }
+
+    #[test]
+    fn expand_static_allow_rules_canonicalizes_home_symlinks() {
+        use super::expand_static_allow_rules;
+        use agent_sandbox_core::FilesystemRule;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let target = home.join("dotfiles/home/dot_omp");
+        std::fs::create_dir_all(&target).expect("target dir");
+        symlink(&target, home.join(".omp")).expect("symlink .omp");
+
+        let rules = expand_static_allow_rules(
+            &[FilesystemRule::new("~/.omp", FileAccess::ReadWrite, "")],
+            Some(home),
+            None,
+        );
+        assert_eq!(rules[0].path, target);
+        assert!(
+            rules[0].matches(
+                &target.join("private_agent/config.yml"),
+                FileAccess::ReadWrite,
+                None,
+            ),
+            "static allow must match paths under the symlink target"
+        );
     }
 }

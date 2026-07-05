@@ -62,7 +62,7 @@ mod tests {
             cwd: Some(cwd.to_path_buf()),
             home: Some(PathBuf::from("/home/user")),
             project_root: Some(project_root.to_path_buf()),
-            sandbox_session_id: None,
+            ..Default::default()
         }
     }
 

@@ -33,6 +33,16 @@ pub enum PolicydError {
     UnauthorizedUiFdRequest,
     #[error("approval session does not match pending sandbox session")]
     UnauthorizedApprovalSession,
+    #[error("approval not authorized for this connection")]
+    UnauthorizedApprovalClient,
+    #[error("UI registration uid does not match sandbox owner")]
+    UnauthorizedUiRegistration,
+    #[error("too many connections for this uid")]
+    TooManyConnections,
+    #[error("RPC line too large")]
+    RpcLineTooLarge,
+    #[error("elevation argv[0] must be absolute or resolvable in trusted PATH")]
+    ElevationArgvNotAbsolute,
 }
 
 impl From<PolicydError> for RpcReply {

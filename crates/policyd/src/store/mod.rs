@@ -18,20 +18,22 @@ mod ui_route;
 mod util;
 
 pub use types::{
-    DenyFingerprint, DenyInodeCache, Pending, PendingElevation, PendingFilesystem, PendingKind,
-    PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ResourceVerdictKey, UiClientHandle,
-    UiSessionContext,
+    DenyFingerprint, DenyInodeCache, MAX_CONNECTIONS_PER_UID, MAX_RPC_LINE_BYTES, Pending,
+    PendingElevation, PendingFilesystem, PendingKind, PendingNetwork, PendingResource, PolicyStore,
+    PolicydArgs, ResourceVerdictKey, TrustedPeer, UiClientHandle, UiSessionContext,
 };
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use types::StoreInner;
+use types::{MergedPolicyCache, StoreInner};
 
 impl PolicyStore {
     #[must_use]
     pub fn new(args: PolicydArgs) -> Self {
         Self {
             args,
+            sandbox_sessions: Arc::new(RwLock::new(HashMap::new())),
             inner: tokio::sync::Mutex::new(StoreInner {
                 session_allow: HashMap::new(),
                 once_allow: HashSet::new(),
@@ -55,7 +57,10 @@ impl PolicyStore {
                 filesystem_verdict_cache: HashMap::new(),
                 resource_verdict_cache: HashMap::new(),
                 deny_inode_cache: DenyInodeCache::default(),
+                connections_by_uid: HashMap::new(),
             }),
+            deny_inode_rebuild: tokio::sync::Mutex::new(()),
+            merged_cache: std::sync::Mutex::new(MergedPolicyCache::default()),
         }
     }
 

@@ -9,11 +9,13 @@ use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
 
-use crate::spawn::maybe_spawn_ui;
+use crate::error::PolicydError;
 use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
 use super::ui_route::UiRoute;
+
+const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
 struct PendingElevationEntry {
     id: String,
@@ -52,7 +54,25 @@ impl PolicyStore {
 
     pub(crate) fn elevation_env(home: Option<&Path>) -> HashMap<String, String> {
         let user = Self::user_for_home(home);
-        HashMap::from([("AGENT_SANDBOX_ELEVATE_USER".into(), user)])
+        HashMap::from([
+            ("AGENT_SANDBOX_ELEVATE_USER".into(), user),
+            ("PATH".into(), ELEVATION_PATH.into()),
+        ])
+    }
+
+    fn resolve_elevation_argv(argv: &[String]) -> Result<PathBuf, PolicydError> {
+        let Some(program) = argv.first() else {
+            return Err(PolicydError::ArgvRequired);
+        };
+        let path = Path::new(program);
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+        let candidate = Path::new(ELEVATION_PATH).join(program);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        Err(PolicydError::ElevationArgvNotAbsolute)
     }
 
     pub(crate) async fn exec_elevation(
@@ -60,11 +80,16 @@ impl PolicyStore {
         argv: &[String],
         cwd: Option<&Path>,
         home: Option<&Path>,
-    ) -> ElevateReply {
-        let work_dir = cwd.unwrap_or_else(|| Path::new("/"));
-        let mut cmd = tokio::process::Command::new(&argv[0]);
+    ) -> Result<ElevateReply, PolicydError> {
+        let prog = Self::resolve_elevation_argv(argv)?;
+        let work_dir = cwd
+            .and_then(|dir| dir.canonicalize().ok())
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let mut cmd = tokio::process::Command::new(&prog);
         cmd.args(&argv[1..])
             .current_dir(work_dir)
+            .env_clear()
             .envs(Self::elevation_env(home))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -72,15 +97,18 @@ impl PolicyStore {
         match output {
             Ok(out) => {
                 let exit_code = out.status.code().unwrap_or(1);
-                let detail = format!("argv={argv:?} exit_code={exit_code}");
+                let detail = format!(
+                    "argv={argv:?} resolved={} exit_code={exit_code}",
+                    prog.display()
+                );
                 Self::audit("exec", None, None, &detail);
-                ElevateReply::executed(
+                Ok(ElevateReply::executed(
                     exit_code,
                     String::from_utf8_lossy(&out.stdout).into_owned(),
                     String::from_utf8_lossy(&out.stderr).into_owned(),
-                )
+                ))
             }
-            Err(err) => ElevateReply::exec_failed(err),
+            Err(err) => Ok(ElevateReply::exec_failed(err)),
         }
     }
 
@@ -109,9 +137,24 @@ impl PolicyStore {
         if self.sudo_policy_allowed(&argv, &resolved)
             || self.session_sudo_allowed(&argv, &resolved).await
         {
-            return self
+            return match self
                 .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
-                .await;
+                .await
+            {
+                Ok(reply) => reply,
+                Err(PolicydError::ElevationArgvNotAbsolute) => ElevateReply {
+                    ok: true,
+                    allowed: false,
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "agent-sandbox: elevation argv[0] must be absolute or in trusted PATH"
+                        .into(),
+                },
+                Err(err) => {
+                    tracing::warn!(error = %err, "elevation exec rejected");
+                    ElevateReply::denied()
+                }
+            };
         }
 
         let Some(entry) = self
@@ -230,11 +273,7 @@ impl PolicyStore {
             project_root,
             sandbox_session_id,
         };
-        maybe_spawn_ui(
-            &self.args,
-            &mut self.inner.lock().await.ui_spawn_last,
-            &spawn,
-        );
+        self.spawn_policy_ui(spawn).await;
     }
 
     async fn await_elevation_verdict(
@@ -385,5 +424,47 @@ mod tests {
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
         assert!(result.allowed, "expected allowed reply, got: {result:?}");
+    }
+
+    #[test]
+    fn forged_home_does_not_auto_elevate_via_attacker_policy() {
+        use crate::store::types::TrustedPeer;
+        use agent_sandbox_core::{Policy, SudoRule};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_home = tmp.path().join("home/user");
+        let evil = tmp.path().join("evil");
+        std::fs::create_dir_all(real_home.join(".config/agent-sandbox")).expect("real config");
+        std::fs::create_dir_all(evil.join(".config/agent-sandbox")).expect("evil config");
+        std::fs::write(
+            real_home.join(".config/agent-sandbox/policy.json"),
+            r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]},"filesystem":{"allow":[],"deny":[]},"resources":{"allow":[],"deny":[]}}"#,
+        )
+        .expect("real policy");
+        std::fs::write(
+            evil.join(".config/agent-sandbox/policy.json"),
+            serde_json::to_string(&Policy {
+                sudo: agent_sandbox_core::SudoSection {
+                    allow: vec![SudoRule::new(vec!["id".into()], "evil")],
+                    deny: vec![],
+                },
+                ..Policy::default()
+            })
+            .expect("serialize"),
+        )
+        .expect("evil policy");
+
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let forged = MergeContext {
+            paths: SandboxPaths::from_wire(Some(evil.clone()), Some(evil.clone()), Some(evil)),
+            ids: ProcessIds::from_options(Some(0), Some(uid)),
+            sandbox_session_id: None,
+        };
+        let resolved = store.resolve_context_with_peer(&forged, Some(TrustedPeer { pid: 0, uid }));
+        assert!(
+            !store.sudo_policy_allowed(&["id".into()], &resolved),
+            "forged home must not auto-approve elevation via attacker sudo policy"
+        );
     }
 }

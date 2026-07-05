@@ -106,20 +106,49 @@ impl PolicyStore {
         }
     }
 
-    async fn approval_session_matches_sandbox(
+    async fn approval_client_authorized(
         &self,
-        ui_session_id: Option<&str>,
-        sandbox_session_id: &str,
+        client_id: u64,
+        sandbox_session_id: Option<&str>,
+        approver_uid: Option<u32>,
     ) -> bool {
-        let Some(ui_session_id) = ui_session_id else {
+        // Host-scoped pendings (no sandbox session) may be resolved by any
+        // connection on the host control socket. That socket is local and
+        // sensitive ops bind to SO_PEERCRED; the sandbox socket cannot issue
+        // Approve/Deny (see auth.rs).
+        let Some(pending_session) = sandbox_session_id else {
+            return true;
+        };
+        // Registered UI for this exact sandbox session (UiFd after RegisterUi).
+        let inner = self.inner.lock().await;
+        let ui_authorized = inner
+            .ui_clients
+            .get(&client_id)
+            .and_then(|client| inner.ui_context_by_session.get(&client.session_id))
+            .is_some_and(|ctx| {
+                ctx.client_id == client_id
+                    && ctx.sandbox_session_id.as_deref() == Some(pending_session)
+            });
+        drop(inner);
+        if ui_authorized {
+            return true;
+        }
+        // Host-side CLI (`agent-sandbox-approve`) and auto-spawned UI: the
+        // sandbox socket cannot reach the host socket, so matching session
+        // owner uid is sufficient. Blocks cross-user approval and a
+        // registered UI for a different sandbox session.
+        let Some(uid) = approver_uid.filter(|&u| u > 0) else {
             return false;
         };
-        let inner = self.inner.lock().await;
-        inner
-            .ui_context_by_session
-            .get(ui_session_id)
-            .and_then(|ctx| ctx.sandbox_session_id.as_deref())
-            .is_some_and(|ui_sandbox_session| ui_sandbox_session == sandbox_session_id)
+        self.sandbox_sessions
+            .read()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(pending_session)
+                    .map(|reg| reg.owner_uid == uid)
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) async fn take_pending_decision(
@@ -131,6 +160,8 @@ impl PolicyStore {
             scope,
             target,
             wire,
+            client_id,
+            approver_uid,
         } = decision;
         let pending = {
             let mut inner = self.inner.lock().await;
@@ -140,15 +171,14 @@ impl PolicyStore {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
             err
         })?;
-        if let Some(sandbox_session_id) = pending.sandbox_session_id()
-            && !self
-                .approval_session_matches_sandbox(wire.session_id.as_deref(), sandbox_session_id)
-                .await
+        if !self
+            .approval_client_authorized(client_id, pending.sandbox_session_id(), approver_uid)
+            .await
         {
             let mut inner = self.inner.lock().await;
             inner.pending.insert(pending_id, pending);
             drop(inner);
-            return Err(crate::error::PolicydError::UnauthorizedApprovalSession.into());
+            return Err(crate::error::PolicydError::UnauthorizedApprovalClient.into());
         }
         Ok(TakenPendingDecision {
             pending,

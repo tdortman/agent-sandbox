@@ -7,8 +7,8 @@ use agent_sandbox_core::{RpcReply, RpcRequest};
 use super::dispatch::SocketRole;
 use crate::error::PolicydError;
 use crate::server::peer::ClientPeer;
-use crate::store::PolicyStore;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use crate::store::{MAX_RPC_LINE_BYTES, PolicyStore};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::Mutex;
 
@@ -18,12 +18,28 @@ pub async fn handle_client(
     mut role: SocketRole,
 ) -> std::io::Result<()> {
     let peer = ClientPeer::from_stream(&stream);
+    if !store.try_acquire_connection(peer).await {
+        let (_reader, writer) = stream.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        reply(writer, &PolicydError::TooManyConnections.into()).await;
+        return Ok(());
+    }
+
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let client = PolicyStore::new_client_handle(writer.clone());
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match read_line_limited(&mut reader, MAX_RPC_LINE_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                reply(writer.clone(), &PolicydError::RpcLineTooLarge.into()).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if line.is_empty() {
             continue;
         }
@@ -47,13 +63,6 @@ pub async fn handle_client(
         let register_succeeded = is_register && resp.is_ok();
         reply(writer.clone(), &resp).await;
 
-        // Transition Host/Sandbox → UiFd ONLY after a *successful* RegisterUi.
-        // A rejected RegisterUi (notably on the sandbox socket, where it is
-        // refused to block the self-approval escape) must NOT grant the UiFd
-        // role, because UiFd is approval-capable (Approve/Deny/ApproveHost).
-        // Transitioning on the request shape alone, ignoring the verdict,
-        // would let an attacker attain the approval role by sending a
-        // RegisterUi that policyd rejects.
         if (role == SocketRole::Host || role == SocketRole::Sandbox) && register_succeeded {
             role = SocketRole::UiFd;
         }
@@ -65,7 +74,40 @@ pub async fn handle_client(
     }
 
     store.end_ui_session(client.id).await;
+    store.release_connection(peer).await;
     Ok(())
+}
+
+async fn read_line_limited(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 1];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8(buf).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
+                })?))
+            };
+        }
+        if chunk[0] == b'\n' {
+            return Ok(Some(String::from_utf8(buf).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
+            })?));
+        }
+        if buf.len() >= max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RPC line too large",
+            ));
+        }
+        buf.push(chunk[0]);
+    }
 }
 
 async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {

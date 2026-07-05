@@ -1,5 +1,7 @@
 //! Policy store: status.
 
+use std::sync::Arc;
+
 use agent_sandbox_core::{PendingSummary, ProcessIds, SandboxPaths, StatusReply};
 
 use crate::wire::MergeContext;
@@ -7,17 +9,38 @@ use crate::wire::MergeContext;
 use super::types::{Pending, PolicyStore};
 
 impl PolicyStore {
-    pub async fn status(&self, paths: SandboxPaths) -> StatusReply {
+    pub async fn status(self: &Arc<Self>, paths: SandboxPaths) -> StatusReply {
+        let pending = self.pending_summaries().await;
         let ctx = MergeContext {
             paths,
             ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
-        let merged = self.merged_for(&ctx);
-        let pending: Vec<PendingSummary> = self
-            .inner
-            .lock()
+        let merged = self.merged_for_async(&ctx).await;
+        StatusReply {
+            ok: true,
+            merged,
+            pending,
+        }
+    }
+
+    pub(crate) async fn merged_for_async(
+        self: &Arc<Self>,
+        ctx: &MergeContext,
+    ) -> agent_sandbox_core::Policy {
+        let store = Arc::clone(self);
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || store.merged_for(&ctx))
             .await
+            .unwrap_or_else(|err| {
+                tracing::error!(error = %err, "merged_for worker panicked");
+                agent_sandbox_core::Policy::default()
+            })
+    }
+
+    async fn pending_summaries(&self) -> Vec<PendingSummary> {
+        let inner = self.inner.lock().await;
+        inner
             .pending
             .values()
             .map(|p| match p {
@@ -52,11 +75,6 @@ impl PolicyStore {
                     home: res.home.clone(),
                 },
             })
-            .collect();
-        StatusReply {
-            ok: true,
-            merged,
-            pending,
-        }
+            .collect()
     }
 }

@@ -10,7 +10,6 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::spawn::maybe_spawn_ui;
 use crate::wire::{UiSpawnContext, UiSpawnGate};
 
 use super::types::{CLIENT_ID, Pending, PolicyStore, UiClient, UiClientHandle, UiSessionContext};
@@ -73,10 +72,16 @@ impl PolicyStore {
     pub(crate) async fn start_ui_session(
         &self,
         handle: &UiClientHandle,
+        peer: crate::server::ClientPeer,
         context: UiSessionContext,
     ) -> String {
         let session_id = Uuid::now_v7().simple().to_string();
         let mut inner = self.inner.lock().await;
+        let mut ctx = context;
+        ctx.client_id = handle.id;
+        if ctx.owner_uid.is_none() && peer.uid > 0 {
+            ctx.owner_uid = Some(peer.uid);
+        }
         inner.ui_clients.insert(
             handle.id,
             UiClient {
@@ -84,14 +89,39 @@ impl PolicyStore {
                 writer: handle.writer.clone(),
             },
         );
-        inner
-            .ui_context_by_session
-            .insert(session_id.clone(), context);
+        inner.ui_context_by_session.insert(session_id.clone(), ctx);
         session_id
     }
 
     pub async fn end_ui_session(&self, client_id: u64) {
         self.end_ui_session_by_id(client_id).await;
+    }
+
+    pub async fn try_acquire_connection(&self, peer: crate::server::ClientPeer) -> bool {
+        if peer.uid == 0 {
+            return true;
+        }
+        let mut inner = self.inner.lock().await;
+        let count = inner.connections_by_uid.entry(peer.uid).or_insert(0);
+        if *count >= super::types::MAX_CONNECTIONS_PER_UID {
+            return false;
+        }
+        *count += 1;
+        drop(inner);
+        true
+    }
+
+    pub async fn release_connection(&self, peer: crate::server::ClientPeer) {
+        if peer.uid == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        if let Some(count) = inner.connections_by_uid.get_mut(&peer.uid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.connections_by_uid.remove(&peer.uid);
+            }
+        }
     }
 
     async fn end_ui_session_by_id(&self, client_id: u64) {
@@ -144,11 +174,7 @@ impl PolicyStore {
                     project_root: p.project_root(),
                     sandbox_session_id: p.sandbox_session_id(),
                 };
-                maybe_spawn_ui(
-                    &self.args,
-                    &mut self.inner.lock().await.ui_spawn_last,
-                    &spawn,
-                );
+                self.spawn_policy_ui(spawn).await;
             }
             self.notify_pending(&p).await;
         }

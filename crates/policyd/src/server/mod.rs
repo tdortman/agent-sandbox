@@ -32,7 +32,7 @@ impl PolicyServer {
         }
     }
 
-    fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
+    fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -44,7 +44,7 @@ impl PolicyServer {
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(path)?.permissions();
-            perms.set_mode(0o666);
+            perms.set_mode(mode);
             std::fs::set_permissions(path, perms)?;
         }
         Ok(listener)
@@ -91,8 +91,12 @@ impl PolicyServer {
             ));
         }
 
-        let host_listener = Self::bind_socket(&self.host_socket_path)?;
-        let sandbox_listener = Self::bind_socket(&self.sandbox_socket_path)?;
+        // Host socket: world-accessible like the pre-hardening default. policyd runs
+        // as root, so 0600 would mean only root can connect and the desktop user's
+        // UI/approve CLI could never register. Sensitive ops still bind to
+        // SO_PEERCRED. Sandbox socket: same mode; RPC auth limits it to request ops.
+        let host_listener = Self::bind_socket(&self.host_socket_path, 0o666)?;
+        let sandbox_listener = Self::bind_socket(&self.sandbox_socket_path, 0o666)?;
 
         tokio::join!(
             Self::accept_loop(
