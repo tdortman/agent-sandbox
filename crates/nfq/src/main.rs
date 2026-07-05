@@ -5,6 +5,8 @@
 //! DNS forwarder's in-memory cache, asks policyd for a verdict, then accepts or
 //! actively rejects the packet.
 
+#![allow(unsafe_code)]
+
 mod owner;
 mod packet;
 mod policy;
@@ -84,6 +86,10 @@ struct Cli {
         default_value = "/run/agent-sandbox/dns-push.sock"
     )]
     push_socket: PathBuf,
+
+    /// Only accept DNS push frames from this peer uid (default: root / the host DNS forwarder).
+    #[arg(long, value_name = "UID", default_value_t = 0)]
+    push_trusted_uid: u32,
 }
 struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
@@ -174,7 +180,7 @@ fn main() {
         .expect("tokio runtime");
 
     let state = NfqState::new(&cli);
-    spawn_push_socket_listener(&cli.push_socket, &state);
+    spawn_push_socket_listener(&cli.push_socket, cli.push_trusted_uid, &state);
 
     loop {
         let mut message = match queue.recv() {
@@ -197,7 +203,7 @@ fn main() {
 /// forwarder's push socket and inserts them into the in-memory cache. The
 /// socket is optional: if `push_socket` does not exist or cannot be bound,
 /// the daemon falls back to the on-disk cache only.
-fn spawn_push_socket_listener(push_socket: &Path, state: &NfqState) {
+fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &NfqState) {
     if !push_socket.exists()
         && let Some(parent) = push_socket.parent()
     {
@@ -214,16 +220,32 @@ fn spawn_push_socket_listener(push_socket: &Path, state: &NfqState) {
             return;
         }
     };
-    info!(socket = %push_socket.display(), "push socket listener bound");
+    if let Err(err) = restrict_push_socket_permissions(push_socket) {
+        warn!(socket = %push_socket.display(), error = %err, "push socket chmod failed");
+    }
+    if let Err(err) = enable_passcred(&listener) {
+        warn!(socket = %push_socket.display(), error = %err, "push socket SO_PASSCRED failed");
+        return;
+    }
+    info!(socket = %push_socket.display(), trusted_uid, "push socket listener bound");
     let cache = Arc::clone(&state.dns_cache);
     std::thread::Builder::new()
         .name("dns-push-listener".to_string())
         .spawn(move || {
             let mut buf = [0u8; 512];
             loop {
-                let Ok(n) = listener.recv(&mut buf) else {
+                let Ok((n, cred)) = recv_datagram_with_creds(&listener, &mut buf) else {
                     continue;
                 };
+                if cred.uid != trusted_uid {
+                    warn!(
+                        peer_uid = cred.uid,
+                        peer_pid = cred.pid,
+                        trusted_uid,
+                        "push socket rejected untrusted peer"
+                    );
+                    continue;
+                }
                 let line = match std::str::from_utf8(&buf[..n]) {
                     Ok(s) => s,
                     Err(err) => {
@@ -237,19 +259,105 @@ fn spawn_push_socket_listener(push_socket: &Path, state: &NfqState) {
                     debug!(line, "push socket malformed JSON");
                     continue;
                 };
-                if entry.host.is_empty() {
-                    continue;
-                }
-                if let Ok(mut cache) = cache.lock() {
-                    cache.remember_ephemeral(
-                        &entry.ip,
-                        &entry.host,
-                        entry.ttl.min(DEFAULT_MAX_TTL),
-                    );
-                }
+                apply_push_mapping(&cache, &entry);
             }
         })
         .expect("spawn push socket listener");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixPeerCred {
+    pid: u32,
+    uid: u32,
+    gid: u32,
+}
+
+fn restrict_push_socket_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+fn enable_passcred(sock: &std::os::unix::net::UnixDatagram) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let one: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&raw const one).cast::<libc::c_void>(),
+            libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                .expect("c_int size fits in socklen_t"),
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn recv_datagram_with_creds(
+    sock: &std::os::unix::net::UnixDatagram,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, UnixPeerCred)> {
+    use std::mem::MaybeUninit;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = sock.as_raw_fd();
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut cmsg = [MaybeUninit::<u8>::uninit(); 128];
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &raw mut iov,
+        msg_iovlen: 1,
+        msg_control: cmsg.as_mut_ptr().cast(),
+        msg_controllen: cmsg.len(),
+        msg_flags: 0,
+    };
+    let n = unsafe { libc::recvmsg(fd, &raw mut msg, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let cred = parse_scm_credentials(&msg).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "push socket frame missing SCM_CREDENTIALS",
+        )
+    })?;
+    Ok((usize::try_from(n).unwrap_or(0), cred))
+}
+
+fn parse_scm_credentials(msg: &libc::msghdr) -> Option<UnixPeerCred> {
+    let mut cmsg_ptr = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg_ptr.is_null() {
+        let hdr = unsafe { *cmsg_ptr };
+        if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_CREDENTIALS {
+            let data = unsafe { libc::CMSG_DATA(cmsg_ptr) };
+            let ucred = unsafe { std::ptr::read_unaligned(data.cast::<libc::ucred>()) };
+            return Some(UnixPeerCred {
+                pid: u32::try_from(ucred.pid).unwrap_or(u32::MAX),
+                uid: ucred.uid,
+                gid: ucred.gid,
+            });
+        }
+        cmsg_ptr = unsafe { libc::CMSG_NXTHDR(msg, cmsg_ptr) };
+    }
+    None
+}
+
+/// Apply a validated push mapping to the in-memory DNS cache.
+fn apply_push_mapping(cache: &Arc<std::sync::Mutex<DnsCache>>, entry: &PushMapping) {
+    if entry.host.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = cache.lock() {
+        cache.remember_ephemeral(&entry.ip, &entry.host, entry.ttl.min(DEFAULT_MAX_TTL));
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1177,6 +1285,81 @@ mod tests {
             &["chatgpt.com".to_string()],
             "approved bindings aliases should be passed to policy check"
         );
+    }
+
+    #[test]
+    fn push_mapping_applies_to_cache() {
+        let state = state_for_tests();
+        let entry = PushMapping {
+            ip: "93.184.216.34".to_string(),
+            host: "example.com".to_string(),
+            ttl: 300,
+        };
+        apply_push_mapping(&state.dns_cache, &entry);
+        assert_eq!(
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .lookup("93.184.216.34")
+                .as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn push_socket_rejects_untrusted_peer_uid() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let socket_path = std::env::temp_dir().join(format!(
+            "agent-sandbox-nfq-push-{}-{stamp}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = std::os::unix::net::UnixDatagram::bind(&socket_path).expect("bind listener");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod push socket");
+        enable_passcred(&listener).expect("SO_PASSCRED");
+
+        let state = state_for_tests();
+        let cache = Arc::clone(&state.dns_cache);
+        let listener_path = socket_path.clone();
+        let listener_thread = std::thread::spawn(move || {
+            let mut buf = [0_u8; 512];
+            let Ok((n, cred)) = recv_datagram_with_creds(&listener, &mut buf) else {
+                return false;
+            };
+            if cred.uid != 0 {
+                return false;
+            }
+            let line = std::str::from_utf8(&buf[..n]).expect("utf8");
+            let entry: PushMapping = serde_json::from_str(line.trim()).expect("json");
+            apply_push_mapping(&cache, &entry);
+            true
+        });
+
+        let sender = std::os::unix::net::UnixDatagram::unbound().expect("unbound sender");
+        sender
+            .send_to(
+                br#"{"ip":"1.2.3.4","host":"evil.com","ttl":60}"#,
+                &listener_path,
+            )
+            .expect("send push frame");
+        let accepted = listener_thread.join().expect("listener thread");
+        assert!(!accepted, "untrusted peer uid must not apply push mappings");
+        assert!(
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .lookup("1.2.3.4")
+                .is_none()
+        );
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]
