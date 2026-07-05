@@ -72,7 +72,7 @@ fn main() {
         cwd: cwd.map(PathBuf::from),
         home: home.clone().map(PathBuf::from),
         project_root: project_root.map(PathBuf::from),
-        pid: None,
+        pid: Some(process::id()),
         uid: None,
         sandbox_session_id,
     };
@@ -84,6 +84,7 @@ fn main() {
         .unwrap_or_default();
 
     expand_home_static_allow(&mut static_allow, home.as_deref().map(Path::new));
+    eprintln!("agent-sandbox-fs-arm: starting filesystem monitor...");
     // Connect to policyd and request monitor startup.
     let reply = rpc_client::start_monitor(Path::new(&socket_path), ctx, static_allow)
         .unwrap_or_else(|e| {

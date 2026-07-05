@@ -4,8 +4,10 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -100,6 +102,49 @@ struct FanotifyResponse {
 const FAN_ALLOW: u32 = 0x01;
 const FAN_DENY: u32 = 0x02;
 
+/// Host procfs directory opened before `setns` into a sandbox mount namespace.
+///
+/// Fanotify reports PIDs in the listener's PID namespace (host). After `setns`,
+/// the mounted `/proc` belongs to the sandbox and may use different PID
+/// assignments, so tracee metadata must be read through this saved directory
+/// via `/proc/self/fd/{fd}/<pid>/…`.
+struct HostProc {
+    dir: File,
+}
+
+impl HostProc {
+    fn open() -> io::Result<Self> {
+        Ok(Self {
+            dir: File::open("/proc")?,
+        })
+    }
+
+    fn entry_path(&self, pid: i32, leaf: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/self/fd/{}/{pid}/{leaf}",
+            self.dir.as_raw_fd()
+        ))
+    }
+
+    fn read_to_string(&self, pid: i32, leaf: &str) -> io::Result<String> {
+        fs::read_to_string(self.entry_path(pid, leaf))
+    }
+
+    /// Thread group id for `pid` (accepts either a tid or tgid).
+    fn thread_group_id(&self, pid: i32) -> Option<i32> {
+        if pid <= 0 {
+            return None;
+        }
+        let status = self.read_to_string(pid, "status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Tgid:") {
+                return rest.trim().parse().ok();
+            }
+        }
+        None
+    }
+}
+
 /// A mount point entry parsed from /proc/self/mountinfo.
 struct MountRecord {
     mount_point: PathBuf,
@@ -116,7 +161,6 @@ fn is_synthetic_fs(fstype: &str) -> bool {
             | "cgroup"
             | "cgroup2"
             | "devpts"
-            | "tmpfs"
             | "devtmpfs"
             | "pstore"
             | "bpf"
@@ -134,20 +178,34 @@ fn is_synthetic_fs(fstype: &str) -> bool {
 }
 
 /// Open a fanotify fd suitable for pre-content permission events.
-fn fanotify_init() -> io::Result<i32> {
-    let raw_fd = unsafe {
-        libc::syscall(
-            libc::SYS_fanotify_init,
-            FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC,
-            0,
-        )
-    };
-    let fd = i32::try_from(raw_fd)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fanotify fd overflow"))?;
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+///
+/// Returns `(fd, reports_tid)` where `reports_tid` is true when the kernel
+/// honours `FAN_REPORT_TID` and `meta.pid` is the thread id of the opener.
+fn fanotify_init_pre_content() -> io::Result<(i32, bool)> {
+    for (flags, reports_tid) in [
+        (
+            FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC | libc::FAN_REPORT_TID,
+            true,
+        ),
+        (FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC, false),
+    ] {
+        let raw_fd = unsafe { libc::syscall(libc::SYS_fanotify_init, flags, 0) };
+        let fd = i32::try_from(raw_fd)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fanotify fd overflow"))?;
+        if fd >= 0 {
+            return Ok((fd, reports_tid));
+        }
+        let err = io::Error::last_os_error();
+        if reports_tid && matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+            tracing::debug!("FAN_REPORT_TID unsupported, falling back to process ids");
+            continue;
+        }
+        return Err(err);
     }
-    Ok(fd)
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fanotify_init failed",
+    ))
 }
 
 /// Add a fanotify mark on a mount point path.
@@ -244,6 +302,122 @@ fn resolve_event_path(event_fd: i32) -> io::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+fn is_at_fdcwd(dirfd: i64) -> bool {
+    dirfd == i64::from(libc::AT_FDCWD)
+}
+
+fn tracee_open_dir_base(host_proc: &HostProc, pid: i32, dirfd: i64) -> io::Result<PathBuf> {
+    let link = if is_at_fdcwd(dirfd) {
+        host_proc.entry_path(pid, "cwd")
+    } else {
+        host_proc.entry_path(pid, &format!("fd/{dirfd}"))
+    };
+    fs::read_link(link)
+}
+
+fn read_tracee_path_ptr(host_proc: &HostProc, pid: i32, path_ptr: u64) -> io::Result<Option<PathBuf>> {
+    if path_ptr == 0 {
+        return Ok(None);
+    }
+    let bytes = read_tracee_bytes(host_proc, pid, path_ptr, 4096)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Ok(std::str::from_utf8(&bytes[..end])
+        .ok()
+        .map(PathBuf::from))
+}
+
+fn resolve_relative_open_path(
+    host_proc: &HostProc,
+    pid: i32,
+    dirfd: i64,
+    path: PathBuf,
+) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path);
+    }
+    let base = tracee_open_dir_base(host_proc, pid, dirfd).ok()?;
+    Some(base.join(path))
+}
+
+/// Parse the pathname from a blocked open-family syscall in `/proc/<tid>/syscall`.
+fn parse_open_syscall_path(
+    host_proc: &HostProc,
+    trace_pid: i32,
+    content: &str,
+) -> Option<PathBuf> {
+    let content = content.trim();
+    if content == "running" {
+        return None;
+    }
+
+    let mut parts = content.split_whitespace();
+    let nr: i64 = parts.next()?.parse().ok()?;
+    if nr <= 0 {
+        return None;
+    }
+    let args: Vec<&str> = parts.collect();
+    match nr {
+        n if n == libc::SYS_open || n == libc::SYS_creat => {
+            let path_ptr = parse_proc_syscall_arg(args.first()?)?;
+            let path = read_tracee_path_ptr(host_proc, trace_pid, path_ptr).ok()??;
+            resolve_relative_open_path(host_proc, trace_pid, i64::from(libc::AT_FDCWD), path)
+        }
+        n if n == libc::SYS_openat || n == libc::SYS_openat2 => {
+            let dirfd = i64::try_from(parse_proc_syscall_arg(args.first()?)?).ok()?;
+            let path_ptr = parse_proc_syscall_arg(args.get(1)?)?;
+            let path = read_tracee_path_ptr(host_proc, trace_pid, path_ptr).ok()??;
+            resolve_relative_open_path(host_proc, trace_pid, dirfd, path)
+        }
+        _ => None,
+    }
+}
+
+fn scan_threads_for_open_syscall_path(host_proc: &HostProc, tgid: i32) -> Option<PathBuf> {
+    let task_dir = host_proc.entry_path(tgid, "task");
+    let entries = fs::read_dir(task_dir).ok()?;
+    for entry in entries.flatten() {
+        let thread_id: i32 = entry.file_name().to_str()?.parse().ok()?;
+        let content = host_proc.read_to_string(thread_id, "syscall").ok()?;
+        if let Some(path) = parse_open_syscall_path(host_proc, thread_id, &content) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Resolve the blocked open path from syscall args when fanotify's event fd
+/// cannot be read via `/proc/self/fd` (common for directory traverse events).
+fn syscall_open_path(host_proc: &HostProc, trace_pid: i32) -> Option<PathBuf> {
+    if trace_pid <= 0 {
+        return None;
+    }
+    if let Ok(content) = host_proc.read_to_string(trace_pid, "syscall")
+        && let Some(path) = parse_open_syscall_path(host_proc, trace_pid, &content)
+    {
+        return Some(path);
+    }
+    let tgid = host_proc.thread_group_id(trace_pid)?;
+    scan_threads_for_open_syscall_path(host_proc, tgid)
+}
+
+/// Best-effort path for a fanotify permission event: event fd first, then the
+/// blocked tracee's open syscall args.
+fn resolve_blocked_open_path(
+    host_proc: &HostProc,
+    trace_pid: i32,
+    event_fd: i32,
+) -> Option<String> {
+    resolve_event_path(event_fd)
+        .ok()
+        .or_else(|| {
+            syscall_open_path(host_proc, trace_pid).map(|path| path.to_string_lossy().into_owned())
+        })
+}
+
+/// Map `open(2)`/`openat(2)` flag bits to policy access.
+///
+/// Uses `O_ACCMODE` per `fcntl(2)`; `creat(2)` is handled separately as
+/// always write-equivalent (`O_WRONLY|O_CREAT|O_TRUNC`).
 const fn open_flags_to_access(flags: i32) -> FileAccess {
     match flags & libc::O_ACCMODE {
         libc::O_RDONLY => FileAccess::Read,
@@ -271,14 +445,131 @@ fn combine_access(left: FileAccess, right: FileAccess) -> FileAccess {
     FileAccess::All
 }
 
-fn fdinfo_flags(pid: i32, fd_name: &str) -> io::Result<i32> {
-    let content = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd_name}"))?;
+fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32> {
+    let content = host_proc.read_to_string(pid, &format!("fdinfo/{fd_name}"))?;
     let flags = content
         .lines()
         .find_map(|line| line.strip_prefix("flags:"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing fdinfo flags"))?
         .trim();
     i32::from_str_radix(flags, 8).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Read bytes from a tracee's address space via `process_vm_readv`, falling
+/// back to `/proc/<pid>/mem` when the syscall is unavailable.
+fn read_tracee_bytes(host_proc: &HostProc, pid: i32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0_u8; len];
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: len,
+    };
+    let remote = libc::iovec {
+        iov_base: usize::try_from(addr).unwrap_or(0) as *mut libc::c_void,
+        iov_len: len,
+    };
+    let n = unsafe { libc::process_vm_readv(pid, &raw const local, 1, &raw const remote, 1, 0) };
+    if n >= 0 {
+        buf.truncate(usize::try_from(n).unwrap_or(0));
+        return Ok(buf);
+    }
+    let mut mem = fs::File::open(host_proc.entry_path(pid, "mem"))?;
+    mem.seek(SeekFrom::Start(addr))?;
+    mem.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Parse one hex argument from `/proc/<pid>/syscall` (`proc_pid_syscall(5)`).
+fn parse_proc_syscall_arg(word: &str) -> Option<u64> {
+    let word = word.trim();
+    let hex = word.strip_prefix("0x").unwrap_or(word);
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// `open(2)` / `openat(2)` pass flags as a signed `int`; the proc file
+/// exposes the full register as an unsigned hex word.
+fn open_flags_from_proc_arg(word: &str) -> Option<i32> {
+    let raw = parse_proc_syscall_arg(word)?;
+    i32::try_from(raw)
+        .ok()
+        .or_else(|| i32::try_from(raw & 0xffff_ffff).ok())
+}
+
+/// First eight bytes of `struct open_how` (`openat2(2)`): `__u64 flags`.
+fn open_how_flags_from_bytes(bytes: &[u8]) -> Option<i32> {
+    let raw = u64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?);
+    i32::try_from(raw)
+        .ok()
+        .or_else(|| i32::try_from(raw & 0xffff_ffff).ok())
+}
+
+/// `openat2` syscall arg2 (0-based) points at `struct open_how { flags, mode, resolve }`.
+fn read_tracee_open_how_flags(host_proc: &HostProc, pid: i32, how_ptr: u64) -> Option<i32> {
+    if how_ptr == 0 {
+        return None;
+    }
+    let bytes = read_tracee_bytes(host_proc, pid, how_ptr, 24).ok()?;
+    open_how_flags_from_bytes(&bytes)
+}
+
+/// Parse a blocked open-family syscall from `/proc/<tid>/syscall`.
+///
+/// Layout per `proc_pid_syscall(5)`: `nr arg0 arg1 … arg5 sp pc`, where each
+/// `argN` is the corresponding syscall argument register in ABI order
+/// (`openat(2)`: arg0 `dirfd`, arg1 `pathname`, arg2 `flags`, arg3 `mode`;
+/// `openat2(2)`: arg2 `struct open_how *`; `open(2)`: arg1 `flags`).
+///
+/// Syscall numbers come from `libc::SYS_*` (per-arch). Kept in sync with
+/// `syscall-broker` `read_tracee_open_flags_mode`.
+fn parse_open_syscall_access(
+    host_proc: &HostProc,
+    trace_pid: i32,
+    content: &str,
+) -> Option<FileAccess> {
+    let content = content.trim();
+    if content == "running" {
+        return None;
+    }
+
+    let mut parts = content.split_whitespace();
+    let nr: i64 = parts.next()?.parse().ok()?;
+    if nr <= 0 {
+        // `0` = idle, `-1` = blocked but not in a syscall (`proc_pid_syscall(5)`).
+        return None;
+    }
+    let args: Vec<&str> = parts.collect();
+    match nr {
+        // open(const char *pathname, int flags, mode_t mode)
+        n if n == libc::SYS_open => Some(open_flags_to_access(open_flags_from_proc_arg(
+            args.get(1)?,
+        )?)),
+        // openat(int dirfd, const char *pathname, int flags, mode_t mode)
+        n if n == libc::SYS_openat => Some(open_flags_to_access(open_flags_from_proc_arg(
+            args.get(2)?,
+        )?)),
+        // openat2(int dirfd, const char *pathname, struct open_how *how, size_t size)
+        n if n == libc::SYS_openat2 => {
+            let how_ptr = parse_proc_syscall_arg(args.get(2)?)?;
+            let flags = read_tracee_open_how_flags(host_proc, trace_pid, how_ptr)?;
+            Some(open_flags_to_access(flags))
+        }
+        // creat(const char *pathname, mode_t mode) — open(2) with O_WRONLY|O_CREAT|O_TRUNC
+        n if n == libc::SYS_creat => Some(FileAccess::Write),
+        _ => None,
+    }
+}
+
+/// Scan every thread in `tgid` for a blocked open-family syscall.
+fn scan_threads_for_open_syscall(host_proc: &HostProc, tgid: i32) -> Option<FileAccess> {
+    let task_dir = host_proc.entry_path(tgid, "task");
+    let entries = fs::read_dir(task_dir).ok()?;
+    for entry in entries.flatten() {
+        let thread_id: i32 = entry.file_name().to_str()?.parse().ok()?;
+        let content = host_proc.read_to_string(thread_id, "syscall").ok()?;
+        if let Some(access) = parse_open_syscall_access(host_proc, thread_id, &content) {
+            return Some(access);
+        }
+    }
+    None
 }
 
 /// Read the blocked tracee's open flags from `/proc/{pid}/syscall`.
@@ -288,36 +579,31 @@ fn fdinfo_flags(pid: i32, fd_name: &str) -> io::Result<i32> {
 /// The only reliable way to learn the real access mode is to read the
 /// syscall arguments from `/proc/{pid}/syscall`, which the kernel
 /// exposes while the task is blocked inside the syscall.
-fn syscall_open_access(pid: i32) -> Option<FileAccess> {
-    const SYS_OPEN: i32 = 2;
-    const SYS_CREAT: i32 = 85;
-    const SYS_OPENAT: i32 = 257;
-    const SYS_OPENAT2: i32 = 437;
-    if pid <= 0 {
+///
+/// Fanotify normally reports the process id. On multi-threaded programs the
+/// blocked `open` runs on a worker thread, so `/proc/<tgid>/syscall` shows
+/// `0` (not in a syscall) while `/proc/<tid>/syscall` has the real flags.
+/// With `FAN_REPORT_TID`, `trace_pid` is already the opener's tid; otherwise
+/// we scan `/proc/<tgid>/task/*/syscall`.
+fn syscall_open_access(host_proc: &HostProc, trace_pid: i32) -> Option<FileAccess> {
+    if trace_pid <= 0 {
         return None;
     }
-    let content = fs::read_to_string(format!("/proc/{pid}/syscall")).ok()?;
-    let mut parts = content.split_whitespace();
-    let nr: i32 = parts.next()?.parse().ok()?;
-    let flags_arg = match nr {
-        // open(path, flags, mode) — flags is arg1
-        SYS_OPEN => parts.nth(1)?,
-        // openat(dirfd, path, flags, mode) — flags is arg2
-        SYS_OPENAT | SYS_OPENAT2 => parts.nth(2)?,
-        // creat(path, mode) — equivalent to open(path, O_WRONLY|O_CREAT|O_TRUNC)
-        SYS_CREAT => return Some(FileAccess::Write),
-        _ => return None,
-    };
-    let flags = i32::from_str_radix(flags_arg.trim_start_matches("0x"), 16).ok()?;
-    Some(open_flags_to_access(flags))
+    if let Ok(content) = host_proc.read_to_string(trace_pid, "syscall")
+        && let Some(access) = parse_open_syscall_access(host_proc, trace_pid, &content)
+    {
+        return Some(access);
+    }
+    let tgid = host_proc.thread_group_id(trace_pid)?;
+    scan_threads_for_open_syscall(host_proc, tgid)
 }
 
-fn process_fd_access(pid: i32, event_fd: i32) -> Option<FileAccess> {
+fn process_fd_access(host_proc: &HostProc, pid: i32, event_fd: i32) -> Option<FileAccess> {
     if pid <= 0 {
         return None;
     }
     let event_meta = fs::metadata(format!("/proc/self/fd/{event_fd}")).ok()?;
-    let dir = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let dir = fs::read_dir(host_proc.entry_path(pid, "fd")).ok()?;
     let mut access = None;
     for entry in dir.flatten() {
         let fd_name = entry.file_name();
@@ -330,7 +616,7 @@ fn process_fd_access(pid: i32, event_fd: i32) -> Option<FileAccess> {
         if meta.dev() != event_meta.dev() || meta.ino() != event_meta.ino() {
             continue;
         }
-        let Ok(flags) = fdinfo_flags(pid, fd_name) else {
+        let Ok(flags) = fdinfo_flags(host_proc, pid, fd_name) else {
             continue;
         };
         let fd_access = open_flags_to_access(flags);
@@ -347,15 +633,24 @@ fn event_fd_is_regular_file(event_fd: i32) -> bool {
 }
 
 /// Translate a fanotify event mask to the corresponding `FileAccess`.
-fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
-    if mask & FAN_OPEN_EXEC_PERM != 0 {
-        return FileAccess::Execute;
-    }
+fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: i32, pid: i32) -> FileAccess {
     if mask & FAN_PRE_ACCESS != 0 {
-        return process_fd_access(pid, event_fd).unwrap_or(FileAccess::ReadWrite);
+        return process_fd_access(host_proc, pid, event_fd).unwrap_or(FileAccess::ReadWrite);
     }
+    // ACCESS means read/opendir; must win over EXEC traverse on combined masks.
     if mask & FAN_ACCESS_PERM != 0 {
         return FileAccess::Read;
+    }
+    if mask & FAN_OPEN_EXEC_PERM != 0 {
+        // Directories are never executed as programs; classifying them as
+        // Execute would miss read_write allow rules (e.g. global `./.git*`).
+        if event_fd >= 0
+            && fs::metadata(format!("/proc/self/fd/{event_fd}"))
+                .is_ok_and(|meta| meta.is_dir())
+        {
+            return FileAccess::Read;
+        }
+        return FileAccess::Execute;
     }
     if mask & FAN_OPEN_PERM != 0 {
         // The fanotify event fd is always opened O_RDONLY, so fdinfo on
@@ -363,7 +658,14 @@ fn mask_to_access(mask: u64, event_fd: i32, pid: i32) -> FileAccess {
         // tracee's own fd does not exist yet (the open is blocked).
         // Read the blocked syscall args from /proc/{pid}/syscall to get
         // the real open flags.
-        return syscall_open_access(pid).unwrap_or(FileAccess::ReadWrite);
+        return syscall_open_access(host_proc, pid).unwrap_or_else(|| {
+            tracing::warn!(
+                pid,
+                mask = format_args!("{mask:#x}"),
+                "open syscall flags unavailable, defaulting to read_write"
+            );
+            FileAccess::ReadWrite
+        });
     }
     FileAccess::All
 }
@@ -442,11 +744,43 @@ fn mark_mountpoints(
     }
 }
 
+/// Returns true when `child` is `ancestor` or a descendant of `ancestor`.
+fn is_descendant_of(host_proc: &HostProc, child: i32, ancestor: i32) -> bool {
+    if child <= 0 || ancestor <= 0 {
+        return false;
+    }
+    let mut pid = child;
+    for _ in 0..256 {
+        if pid == ancestor {
+            return true;
+        }
+        if pid <= 1 {
+            return false;
+        }
+        let Some(parent) = parent_pid(host_proc, pid) else {
+            return false;
+        };
+        pid = parent;
+    }
+    false
+}
+
+fn parent_pid(host_proc: &HostProc, pid: i32) -> Option<i32> {
+    let stat = host_proc.read_to_string(pid, "stat").ok()?;
+    let end = stat.rfind(')')?;
+    let after = stat[end + 1..].trim_start();
+    let mut fields = after.split_whitespace();
+    fields.next()?; // state
+    fields.next()?.parse().ok()
+}
+
 /// Event loop: read fanotify events and forward to policyd for allow/deny verdicts.
 fn run_event_loop(
     fan_fd: i32,
     self_pid: i32,
+    target_pid: i32,
     saw_pre_access_mark: bool,
+    host_proc: &HostProc,
     ctx: &agent_sandbox_core::RequestContext,
     socket_path: &Path,
 ) -> ! {
@@ -490,6 +824,12 @@ fn run_event_loop(
                     offset += event_len;
                     continue;
                 }
+                let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
+                if !is_descendant_of(host_proc, process_pid, target_pid) {
+                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
                 if saw_pre_access_mark
                     && meta.mask & FAN_ACCESS_PERM != 0
                     && event_fd_is_regular_file(meta.fd)
@@ -503,12 +843,21 @@ fn run_event_loop(
                     offset += event_len;
                     continue;
                 }
-                let Ok(path) = resolve_event_path(meta.fd) else {
+                let path = resolve_blocked_open_path(host_proc, meta.pid, meta.fd);
+                let Some(path) = path else {
+                    tracing::warn!(
+                        pid = meta.pid,
+                        "path resolution failed, allowing (fail-open)"
+                    );
                     respond(fan_fd, meta.fd, FAN_ALLOW);
                     offset += event_len;
                     continue;
                 };
-                let access = mask_to_access(meta.mask, meta.fd, meta.pid);
+                let access = agent_sandbox_core::normalize_directory_traverse_access(
+                    Path::new(&path),
+                    mask_to_access(host_proc, meta.mask, meta.fd, meta.pid),
+                );
+                tracing::info!(%path, ?access, pid = meta.pid, "filesystem check");
 
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
@@ -534,7 +883,58 @@ fn run_event_loop(
     }
 }
 
+/// Join the mount namespace of `target_pid`, refusing when it is our own.
+fn join_target_mount_namespace(target_pid: u32) {
+    let ns_path = format!("/proc/{target_pid}/ns/mnt");
+    // Defense in depth: never mark our own (host) mount namespace. A wrong
+    // --pid (e.g. a namespace-local pid like 1 resolving to systemd) would
+    // otherwise put FAN_OPEN_PERM marks on every host mount and gate every
+    // file access on the machine through policyd.
+    match (fs::metadata("/proc/self/ns/mnt"), fs::metadata(&ns_path)) {
+        (Ok(self_ns), Ok(target_ns))
+            if self_ns.dev() == target_ns.dev() && self_ns.ino() == target_ns.ino() =>
+        {
+            eprintln!(
+                "agent-sandbox-fsmon: refusing to monitor pid {target_pid}: it shares this \
+                 process's own mount namespace (would mark every host mount)"
+            );
+            process::exit(1);
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("agent-sandbox-fsmon: cannot compare mount namespaces ({ns_path}): {e}");
+            process::exit(1);
+        }
+        _ => {}
+    }
+    let ns_cstr = CString::new(ns_path.as_bytes()).expect("null in ns path");
+    let ns_fd = unsafe { libc::open(ns_cstr.as_ptr(), libc::O_RDONLY) };
+    if ns_fd < 0 {
+        eprintln!(
+            "agent-sandbox-fsmon: open {ns_path}: {}",
+            io::Error::last_os_error()
+        );
+        process::exit(1);
+    }
+    let ret = unsafe { libc::setns(ns_fd, libc::CLONE_NEWNS) };
+    if ret < 0 {
+        eprintln!(
+            "agent-sandbox-fsmon: setns {ns_path}: {}",
+            io::Error::last_os_error()
+        );
+        process::exit(1);
+    }
+    unsafe { libc::close(ns_fd) };
+}
+
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let cli = Cli::parse();
 
     let self_pid = i32::try_from(process::id()).unwrap_or_else(|_| {
@@ -543,33 +943,23 @@ fn main() {
     });
 
     // Open fanotify fd.
-    let fan_fd = fanotify_init().unwrap_or_else(|e| {
+    let (fan_fd, fanotify_reports_tid) = fanotify_init_pre_content().unwrap_or_else(|e| {
         eprintln!("agent-sandbox-fsmon: fanotify_init failed: {e}");
+        process::exit(1);
+    });
+    if fanotify_reports_tid {
+        tracing::debug!("fanotify reports opener thread ids (FAN_REPORT_TID)");
+    }
+
+    // Open host procfs before setns. After joining the sandbox mount namespace,
+    // `/proc` no longer resolves tracee PIDs reported by fanotify.
+    let host_proc = HostProc::open().unwrap_or_else(|e| {
+        eprintln!("agent-sandbox-fsmon: open host /proc: {e}");
         process::exit(1);
     });
 
     // setns into the target mount namespace.
-    let ns_path = format!("/proc/{}/ns/mnt", cli.pid);
-    let ns_cstr = CString::new(ns_path.as_bytes()).expect("null in ns path");
-    let ns_fd = unsafe { libc::open(ns_cstr.as_ptr(), libc::O_RDONLY) };
-    if ns_fd < 0 {
-        eprintln!(
-            "agent-sandbox-fsmon: open {}: {}",
-            ns_path,
-            io::Error::last_os_error()
-        );
-        process::exit(1);
-    }
-    let ret = unsafe { libc::setns(ns_fd, libc::CLONE_NEWNS) };
-    if ret < 0 {
-        eprintln!(
-            "agent-sandbox-fsmon: setns {}: {}",
-            ns_path,
-            io::Error::last_os_error()
-        );
-        process::exit(1);
-    }
-    unsafe { libc::close(ns_fd) };
+    join_target_mount_namespace(cli.pid);
 
     // Parse mountinfo from inside the target namespace.
     let mounts = parse_mountinfo().unwrap_or_else(|e| {
@@ -620,7 +1010,19 @@ fn main() {
 
     let socket_path = cli.socket.as_path();
 
-    run_event_loop(fan_fd, self_pid, saw_pre_access_mark, &ctx, socket_path);
+    let target_pid = i32::try_from(cli.pid).unwrap_or_else(|_| {
+        eprintln!("agent-sandbox-fsmon: --pid does not fit in pid_t");
+        process::exit(1);
+    });
+    run_event_loop(
+        fan_fd,
+        self_pid,
+        target_pid,
+        saw_pre_access_mark,
+        &host_proc,
+        &ctx,
+        socket_path,
+    );
 }
 
 /// Write a `FAN_ALLOW` or `FAN_DENY` response and close the event fd.
@@ -643,6 +1045,110 @@ mod tests {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
+    fn test_host_proc() -> HostProc {
+        HostProc::open().expect("open host proc")
+    }
+
+    #[test]
+    fn host_proc_entry_path_resolves_tracee_status() {
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        assert!(host_proc.entry_path(pid, "status").is_file());
+    }
+
+    #[test]
+    fn parse_openat_syscall_flags_rdonly() {
+        let host_proc = test_host_proc();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+        let content = format!(
+            "{} 0xffffffffffffff9c 0x7fff00001000 0x{flags:x} 0",
+            libc::SYS_openat
+        );
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, &content),
+            Some(FileAccess::Read)
+        );
+    }
+
+    #[test]
+    fn parse_open_syscall_flags_rdonly() {
+        let host_proc = test_host_proc();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+        let content = format!("{} 0x7fff00002000 0x{flags:x} 0", libc::SYS_open);
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, &content),
+            Some(FileAccess::Read)
+        );
+    }
+
+    #[test]
+    fn parse_openat_syscall_flags_wronly() {
+        let host_proc = test_host_proc();
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+        let content = format!(
+            "{} 0xffffffffffffff9c 0x7fff00003000 0x{flags:x} 0x1a4",
+            libc::SYS_openat
+        );
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, &content),
+            Some(FileAccess::Write)
+        );
+    }
+
+    #[test]
+    fn parse_creat_syscall_is_write() {
+        let host_proc = test_host_proc();
+        let content = format!("{} 0x7fff00004000 0x1a4", libc::SYS_creat);
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, &content),
+            Some(FileAccess::Write)
+        );
+    }
+
+    #[test]
+    fn parse_openat2_syscall_arg_indices() {
+        // openat2(dirfd, path, how*, size) — how pointer is arg2 in proc file.
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+        let mut how = [0_u8; 24];
+        how[..8].copy_from_slice(&u64::from(flags.cast_unsigned()).to_ne_bytes());
+        assert_eq!(
+            open_how_flags_from_bytes(&how),
+            Some(libc::O_RDONLY | libc::O_CLOEXEC)
+        );
+        let host_proc = test_host_proc();
+        let content = format!(
+            "{} 0xffffffffffffff9c 0x7fff00005000 0x0 0x18",
+            libc::SYS_openat2
+        );
+        assert_eq!(parse_open_syscall_access(&host_proc, 1, &content), None);
+    }
+
+    #[test]
+    fn parse_syscall_running_and_not_in_syscall() {
+        let host_proc = test_host_proc();
+        assert_eq!(parse_open_syscall_access(&host_proc, 1, "running"), None);
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, "-1 0 0 0 0 0 0"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_syscall_nr_zero_is_not_open() {
+        let host_proc = test_host_proc();
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, "0 0 0 0 0 0 0"),
+            None
+        );
+    }
+
+    #[test]
+    fn thread_group_id_for_self() {
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        assert_eq!(host_proc.thread_group_id(pid), Some(pid));
+    }
+
     #[test]
     fn open_flags_map_to_granular_access() {
         assert_eq!(open_flags_to_access(libc::O_RDONLY), FileAccess::Read);
@@ -656,12 +1162,34 @@ mod tests {
 
     #[test]
     fn mask_to_access_prefers_exec_and_read_events() {
+        let host_proc = test_host_proc();
         assert_eq!(
-            mask_to_access(FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM, -1, -1),
+            mask_to_access(&host_proc, FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM, -1, -1),
+            FileAccess::Read
+        );
+        assert_eq!(
+            mask_to_access(&host_proc, FAN_OPEN_EXEC_PERM, -1, -1),
             FileAccess::Execute
         );
-        assert_eq!(mask_to_access(FAN_ACCESS_PERM, -1, -1), FileAccess::Read);
-        assert_eq!(mask_to_access(FAN_OPEN_PERM, -1, -1), FileAccess::ReadWrite);
+        assert_eq!(
+            mask_to_access(&host_proc, FAN_ACCESS_PERM, -1, -1),
+            FileAccess::Read
+        );
+        assert_eq!(
+            mask_to_access(&host_proc, FAN_OPEN_PERM, -1, -1),
+            FileAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn mask_to_access_access_perm_beats_open_perm() {
+        let host_proc = test_host_proc();
+        // Combined open events carry both masks. ACCESS means read/opendir;
+        // do not let a failed OPEN syscall parse downgrade to read_write.
+        assert_eq!(
+            mask_to_access(&host_proc, FAN_OPEN_PERM | FAN_ACCESS_PERM, -1, -1),
+            FileAccess::Read
+        );
     }
 
     #[test]
@@ -669,6 +1197,7 @@ mod tests {
         // Without a valid pid, syscall_open_access returns None.
         // The fallback is ReadWrite (conservative: may prompt but won't
         // misclassify a write as a read).
+        let host_proc = test_host_proc();
         let path =
             std::env::temp_dir().join(format!("agent-sandbox-fsmon-test-{}", std::process::id()));
         {
@@ -678,7 +1207,7 @@ mod tests {
 
         let read_file = File::open(&path).expect("open read-only temp file");
         assert_eq!(
-            mask_to_access(FAN_OPEN_PERM, read_file.as_raw_fd(), -1),
+            mask_to_access(&host_proc, FAN_OPEN_PERM, read_file.as_raw_fd(), -1),
             FileAccess::ReadWrite
         );
 
@@ -687,8 +1216,9 @@ mod tests {
 
     #[test]
     fn pre_access_without_fd_flags_stays_conservative() {
+        let host_proc = test_host_proc();
         assert_eq!(
-            mask_to_access(FAN_PRE_ACCESS, -1, -1),
+            mask_to_access(&host_proc, FAN_PRE_ACCESS, -1, -1),
             FileAccess::ReadWrite
         );
     }
@@ -703,5 +1233,49 @@ mod tests {
             combine_access(FileAccess::Read, FileAccess::Execute),
             FileAccess::All
         );
+    }
+
+    #[test]
+    fn tmpfs_is_not_synthetic() {
+        assert!(!is_synthetic_fs("tmpfs"));
+    }
+
+    #[test]
+    fn proc_and_sysfs_remain_synthetic() {
+        assert!(is_synthetic_fs("proc"));
+        assert!(is_synthetic_fs("sysfs"));
+        assert!(is_synthetic_fs("cgroup2"));
+    }
+
+    #[test]
+    fn open_how_flags_classify_rdwr_as_read_write() {
+        let flags = libc::O_RDWR;
+        let mut how = [0_u8; 8];
+        how.copy_from_slice(&u64::from(flags.cast_unsigned()).to_ne_bytes());
+        assert_eq!(
+            open_how_flags_from_bytes(&how).map(open_flags_to_access),
+            Some(FileAccess::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn path_resolution_failure_is_fail_open() {
+        assert!(resolve_event_path(-1).is_err());
+    }
+
+    #[test]
+    fn parent_pid_reads_ppid_from_proc_stat() {
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        let parent = parent_pid(&host_proc, pid).expect("parent pid");
+        assert!(parent > 0);
+        assert_ne!(parent, pid);
+    }
+
+    #[test]
+    fn is_descendant_of_current_process() {
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        assert!(is_descendant_of(&host_proc, pid, pid));
     }
 }
