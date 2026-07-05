@@ -161,6 +161,86 @@ pub fn allow_keys(host: &str, port: u16) -> Vec<NetworkRuleKey> {
     vec![NetworkRuleKey::new(&host, port)]
 }
 
+/// Whether `host` matches a policy `pattern` (exact, `*.suffix`, or IP prefix wildcards).
+#[must_use]
+pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let host = host.to_lowercase();
+    if let Some(bare) = pattern.strip_prefix("*.") {
+        let suffix = &pattern[1..];
+        return host == bare || host.ends_with(suffix);
+    }
+    if let Some(matches) = ipv4_prefix_matches(&pattern, &host) {
+        return matches;
+    }
+    if let Some(matches) = ipv6_prefix_matches(&pattern, &host) {
+        return matches;
+    }
+    if let (Ok(ip_pat), Ok(ip_host)) = (
+        pattern.parse::<std::net::IpAddr>(),
+        host.parse::<std::net::IpAddr>(),
+    ) {
+        return ip_pat == ip_host;
+    }
+    pattern == host
+}
+
+/// Parsed IPv4 prefix octets and count for wildcard matching.
+struct Ipv4Prefix {
+    octets: [u8; 3],
+    count: usize,
+}
+
+fn parse_ipv4_prefix(prefix: &str) -> Option<Ipv4Prefix> {
+    let mut octets = [0_u8; 3];
+    let mut count = 0_usize;
+    for part in prefix.split('.') {
+        if count == octets.len() {
+            return None;
+        }
+        octets[count] = part.parse().ok()?;
+        count += 1;
+    }
+    if (1..=3).contains(&count) {
+        Some(Ipv4Prefix { octets, count })
+    } else {
+        None
+    }
+}
+
+fn ipv4_prefix_matches(pattern: &str, host: &str) -> Option<bool> {
+    let prefix = pattern.strip_suffix(".*")?;
+    let Ipv4Prefix {
+        octets: prefix_octets,
+        count: prefix_len,
+    } = parse_ipv4_prefix(prefix)?;
+    let host_octets = host.parse::<std::net::Ipv4Addr>().ok()?.octets();
+    Some(host_octets[..prefix_len] == prefix_octets[..prefix_len])
+}
+
+fn parse_ipv6_hextets(prefix: &str) -> Option<Vec<u16>> {
+    let hextets: Vec<&str> = prefix.split(':').collect();
+    if hextets.is_empty() || hextets.len() > 7 {
+        return None;
+    }
+    let mut result = Vec::with_capacity(hextets.len());
+    for h in &hextets {
+        if h.is_empty() || h.len() > 4 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        result.push(u16::from_str_radix(h, 16).ok()?);
+    }
+    Some(result)
+}
+
+fn ipv6_prefix_matches(pattern: &str, host: &str) -> Option<bool> {
+    let prefix = pattern.strip_suffix(":*")?;
+    let prefix_hextets = parse_ipv6_hextets(prefix)?;
+    let host_addr = host.parse::<std::net::Ipv6Addr>().ok()?;
+    let host_segments = host_addr.segments();
+    Some(host_segments[..prefix_hextets.len()] == prefix_hextets[..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

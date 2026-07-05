@@ -26,7 +26,7 @@ pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 pub use hosts::{
     HostResolution, NetworkRuleKey, NetworkSortKey, allow_keys, approval_host_patterns,
-    is_ip_literal, normalize_host, policy_host_for_connect, reverse_hostname,
+    host_pattern_matches, is_ip_literal, normalize_host, policy_host_for_connect, reverse_hostname,
 };
 pub use merge_policy::{
     ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers,
