@@ -5,7 +5,7 @@ use agent_sandbox_core::{
     ResourceCheckReply, ResourceKind, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
 use agent_sandbox_syscall::policy::nr;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -315,8 +315,8 @@ pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::R
 ///
 /// # Errors
 ///
-/// Returns an error if `process_vm_readv` fails (e.g. the process is gone or the
-/// address is invalid).
+/// Returns an error if `process_vm_readv` and the `/proc/<pid>/mem` fallback
+/// both fail (e.g. the process is gone or the address is invalid).
 pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0_u8; len];
     let local = libc::iovec {
@@ -337,10 +337,19 @@ pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>>
             0,
         )
     };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+    if n >= 0 {
+        buf.truncate(usize::try_from(n).unwrap_or(0));
+        return Ok(buf);
     }
-    buf.truncate(usize::try_from(n).unwrap_or(0));
+    read_tracee_bytes_via_proc_mem(pid, addr, len)
+}
+
+fn read_tracee_bytes_via_proc_mem(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+    let path = format!("/proc/{pid}/mem");
+    let mut mem = std::fs::File::open(path)?;
+    mem.seek(SeekFrom::Start(addr))?;
+    let mut buf = vec![0_u8; len];
+    mem.read_exact(&mut buf)?;
     Ok(buf)
 }
 
