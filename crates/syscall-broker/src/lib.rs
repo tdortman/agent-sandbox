@@ -311,6 +311,17 @@ pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::R
     }
     Ok(())
 }
+/// Returns true for tracee memory read failures that are routine races (tracee
+/// exited, ptrace scope, another tracer such as `nsys`, notification recycled)
+/// rather than broker bugs.
+#[must_use]
+pub fn is_transient_tracee_io_err(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EPERM | libc::EACCES | libc::ESRCH | libc::ENOENT)
+    )
+}
+
 /// Read `len` bytes from the tracee's address space at `addr`.
 ///
 /// # Errors
@@ -1364,6 +1375,22 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn transient_tracee_io_err_classifies_expected_errno() {
+        assert!(super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        assert!(super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+        assert!(!super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+    }
 
     #[test]
     fn seccomp_ioctl_numbers_match_linux_uapi() {
