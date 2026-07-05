@@ -69,6 +69,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -78,6 +79,7 @@ dependencies = [
  "agent-sandbox-core",
  "clap",
  "hickory-proto",
+ "libc",
  "nfq-updated",
  "serde",
  "serde_json",
