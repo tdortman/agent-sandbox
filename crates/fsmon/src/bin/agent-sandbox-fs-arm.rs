@@ -1,9 +1,7 @@
 //! Arm helper: runs inside the sandbox before the real agent.
 //!
 //! Connects to policyd, sends `StartFilesystemMonitor { ctx, static_allow }`,
-//! waits for an active ok, then execvp the real command. A `--` separator
 //! before the command is accepted but not required.
-#![allow(unsafe_code)]
 
 use agent_sandbox_core::{FilesystemRule, RequestContext};
 use agent_sandbox_fsmon::rpc_client;
@@ -92,11 +90,7 @@ fn main() {
             process::exit(1);
         });
 
-    // SAFETY: fs-arm is still single-threaded here. Removing private environment
-    // keys before exec cannot race another Rust thread reading environment.
-    unsafe {
-        std::env::remove_var("AGENT_SANDBOX_FS_STATIC_ALLOW");
-    }
+    agent_sandbox_sysutil::pre_exec_remove_var("AGENT_SANDBOX_FS_STATIC_ALLOW");
 
     if !reply.active {
         eprintln!(
