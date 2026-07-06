@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity, NetworkRuleKey, Policy,
-    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, allow_keys, discover_git_project_root,
-    expand_policy_path, normalize_host,
+    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, allow_keys,
+    discover_git_project_root, expand_policy_path, normalize_host,
 };
 
 use crate::store::ui_route::UiRoute;
@@ -356,12 +356,7 @@ impl PolicyStore {
                 .session_filesystem_allow
                 .get(sid)
                 .is_some_and(|bucket| {
-                    session_filesystem_bucket_matches_allow(
-                        bucket,
-                        path,
-                        access,
-                        project_root,
-                    )
+                    session_filesystem_bucket_matches_allow(bucket, path, access, project_root)
                 })
         })
     }
@@ -1350,11 +1345,7 @@ mod tests {
 
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &pack_dir,
-                    agent_sandbox_core::FileAccess::Execute,
-                    &ctx,
-                )
+                .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Execute, &ctx,)
                 .await
                 .as_deref(),
             Some("allow"),
@@ -1444,11 +1435,7 @@ mod tests {
 
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &pack_dir,
-                    agent_sandbox_core::FileAccess::Read,
-                    &ctx,
-                )
+                .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Read, &ctx,)
                 .await
                 .as_deref(),
             Some("deny"),

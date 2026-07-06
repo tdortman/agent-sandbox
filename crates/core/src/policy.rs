@@ -75,9 +75,7 @@ impl std::fmt::Display for FileAccess {
 /// `./.git*`, `./crates`) must still cover `ls` / `opendir`.
 #[must_use]
 pub fn normalize_directory_traverse_access(path: &Path, access: FileAccess) -> FileAccess {
-    if access == FileAccess::Execute
-        && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir())
-    {
+    if access == FileAccess::Execute && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
         FileAccess::Read
     } else {
         access

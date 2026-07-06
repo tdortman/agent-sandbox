@@ -184,13 +184,9 @@ impl PolicyStore {
 
     pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
         let path = req.path;
-        let access =
-            agent_sandbox_core::normalize_directory_traverse_access(&path, req.access);
+        let access = agent_sandbox_core::normalize_directory_traverse_access(&path, req.access);
         let resolved = self.resolve_context(&req.ctx);
-        if let Some(source) = self
-            .filesystem_allow_source(&path, access, &resolved)
-            .await
-        {
+        if let Some(source) = self.filesystem_allow_source(&path, access, &resolved).await {
             if source == "deny" {
                 return FilesystemCheckReply::denied("deny", path, access);
             }
