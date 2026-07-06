@@ -14,8 +14,10 @@ path = "src/main.rs"
 [dependencies]
 agent-sandbox-core.workspace    = true
 agent-sandbox-syscall.workspace = true
+agent-sandbox-sysutil.workspace = true
 clap.workspace                  = true
 libc.workspace                  = true
+nix                             = { workspace = true, features = ["fs", "process", "signal", "socket"] }
 tokio                           = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tracing.workspace               = true
 tracing-subscriber.workspace    = true

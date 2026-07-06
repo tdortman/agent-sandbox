@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,9 +8,9 @@ use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
     FilesystemTarget, NetworkTarget, ResourceTarget, SeccompNotif, SyscallTarget, check_filesystem,
-    check_resource, check_target, is_transient_tracee_io_err, notification_arch_valid, recv_notification,
-    revalidate_filesystem_mutation, send_addfd, send_continue, send_errno, send_result,
-    target_from_notification,
+    check_resource, check_target, is_transient_tracee_io_err, notification_arch_valid,
+    recv_notification, revalidate_filesystem_mutation, send_addfd, send_continue, send_errno,
+    send_result, target_from_notification,
 };
 use clap::Parser;
 use tokio::time;
@@ -78,7 +78,10 @@ async fn main() -> std::io::Result<()> {
     // listener is set up and nonblocking, resume the child so it starts
     // executing and generating seccomp notifications.
     if let Some(pid) = cli.child_pid {
-        unsafe { libc::kill(pid, libc::SIGCONT) };
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGCONT,
+        );
     }
 
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
@@ -338,23 +341,28 @@ async fn dispatch_filesystem_target(
 }
 
 fn set_nonblocking(fd: i32) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    // SAFETY: caller owns `fd` (a live listener fd) for the call duration.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
+    fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
 }
 
 fn child_exited(child_pid: Option<i32>) -> bool {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
     let Some(pid) = child_pid else {
         return false;
     };
-    let mut status = 0;
-    let rc = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
-    rc == pid
+    // The original checked `rc == pid` (child reaped). With WNOHANG nix
+    // returns StillAlive when the child has not changed state. Any other
+    // variant (Exited, Signaled, etc.) means the child has terminated and
+    // been reaped.
+    matches!(
+        waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)),
+        Ok(status) if !matches!(status, WaitStatus::StillAlive)
+    )
 }
 
 /// Return true if the target is a connect to the broker's own policyd
@@ -390,38 +398,6 @@ fn normalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Read the `SO_TYPE` of a broker-owned fd. Returns `None` on any failure
-/// (fd revoked, not a socket) so callers fall through to the safe deny path.
-fn socket_type(fd: i32) -> Option<i32> {
-    let mut sock_type: i32 = 0;
-    let mut len = libc::socklen_t::try_from(std::mem::size_of::<i32>())
-        .expect("size_of::<i32> fits in socklen_t");
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&raw mut sock_type).cast::<libc::c_void>(),
-            &raw mut len,
-        )
-    };
-    if rc == 0 { Some(sock_type) } else { None }
-}
-
-/// Return true if the socket fd has a connected peer. For `SOCK_STREAM` and
-/// `SOCK_SEQPACKET`, the kernel ignores `msg_name` on connected sockets, so
-/// the destination is fixed by the prior approved `connect`. `CONTINUE` is
-/// safe in that case because the tracee cannot redirect the destination by
-/// swapping `msg_name`. For `SOCK_DGRAM`, `msg_name` overrides the default
-/// peer even on a connected socket, so `CONTINUE` would be unsafe.
-fn is_socket_connected(fd: i32) -> bool {
-    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
-        .expect("size_of::<sockaddr_storage> fits in socklen_t");
-    let rc = unsafe { libc::getpeername(fd, (&raw mut addr).cast(), &raw mut len) };
-    rc == 0
-}
-
 /// Emulate a policy-allowed resource syscall on behalf of the tracee. Never
 /// calls `send_continue`: the broker completes the syscall itself and injects
 /// the result, so the tracee never touches the gated resource directly.
@@ -446,26 +422,6 @@ fn emulate_resource(
     }
 }
 
-/// Duplicate a tracee fd into the broker's fd table via `pidfd_open` +
-/// `pidfd_getfd`. Returns an `OwnedFd` that closes on drop. Used to emulate
-/// syscalls on the tracee's socket without the tracee performing them.
-fn dup_tracee_fd(pid: u32, fd: i32) -> std::io::Result<OwnedFd> {
-    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), 0) };
-    if raw_pidfd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let pidfd = i32::try_from(raw_pidfd)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pidfd out of range"))?;
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-    let raw_dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
-    if raw_dup < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let dup_fd = i32::try_from(raw_dup)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "dup fd out of range"))?;
-    Ok(unsafe { OwnedFd::from_raw_fd(dup_fd) })
-}
-
 /// Emulate a `connect`/`sendto`/`sendmsg`/`sendmmsg` on a Unix-domain socket
 /// the tracee already holds open. The broker duplicates the tracee's socket
 /// fd, performs the syscall with the tracee's args, and injects the return
@@ -487,7 +443,7 @@ fn emulate_unix_socket(
             "invalid sockfd in notification",
         ));
     }
-    let dup = dup_tracee_fd(notif.pid, sockfd)?;
+    let dup = agent_sandbox_sysutil::dup_tracee_fd(notif.pid, sockfd)?;
 
     match nr_val {
         nr::CONNECT => {
@@ -497,6 +453,9 @@ fn emulate_unix_socket(
             if target.raw.is_empty() {
                 return send_continue(listener_fd, notif.id);
             }
+            // SAFETY: `target.raw` is a captured sockaddr validated at policy
+            // parse time. `dup` is a live OwnedFd. The kernel reads the
+            // sockaddr for the duration of the call.
             let rc = unsafe {
                 libc::connect(
                     dup.as_raw_fd(),
@@ -520,9 +479,9 @@ fn emulate_unix_socket(
             // unconnected sockets, deny: multi-message emulation is not
             // supported and CONTINUE would allow a TOCTOU on the destination.
             if matches!(
-                socket_type(dup.as_raw_fd()),
+                agent_sandbox_sysutil::socket_type(dup.as_fd()),
                 Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)
-            ) && is_socket_connected(dup.as_raw_fd())
+            ) && agent_sandbox_sysutil::is_socket_connected(dup.as_fd())
             {
                 return send_continue(listener_fd, notif.id);
             }
@@ -564,6 +523,8 @@ fn enhance_sendto_emulation(
     }
     let payload =
         agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, buf_ptr, len.min(MAX_PAYLOAD))?;
+    // SAFETY: `dup` is a live OwnedFd. `payload` outlives the call. The
+    // sockaddr in `target.raw` was captured at policy parse time.
     let sent = unsafe {
         libc::sendto(
             dup.as_raw_fd(),
@@ -605,9 +566,9 @@ fn enhance_sendmsg_emulation(
     // This covers the common case of sendmsg with SCM_RIGHTS on a connected
     // stream socket (D-Bus, Wayland fd passing).
     if matches!(
-        socket_type(dup.as_raw_fd()),
+        agent_sandbox_sysutil::socket_type(dup.as_fd()),
         Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)
-    ) && is_socket_connected(dup.as_raw_fd())
+    ) && agent_sandbox_sysutil::is_socket_connected(dup.as_fd())
     {
         return send_continue(listener_fd, notif.id);
     }
@@ -672,13 +633,21 @@ fn enhance_sendmsg_emulation(
         .collect();
     // Build a broker-owned msghdr. Use target.raw as the destination
     // sockaddr, never re-read the tracee pointer.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = iovs.as_mut_ptr();
-    msg.msg_iovlen = iovs.len();
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iovs.as_mut_ptr(),
+        msg_iovlen: iovs.len(),
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
     if !target.raw.is_empty() {
         msg.msg_name = target.raw.as_ptr().cast::<libc::c_void>().cast_mut();
         msg.msg_namelen = u32::try_from(target.raw.len()).unwrap_or(u32::MAX);
     }
+    // SAFETY: `dup` is a live OwnedFd. `msg` is a broker-owned msghdr with
+    // iovecs and a captured sockaddr. The kernel reads it for the call.
     let rc = unsafe { libc::sendmsg(dup.as_raw_fd(), &raw const msg, flags) };
     if rc < 0 {
         let err = std::io::Error::last_os_error();
@@ -720,24 +689,24 @@ fn emulate_open_with_path(
 ) -> std::io::Result<()> {
     let path = std::str::from_utf8(raw_path)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 path"))?;
-
-    let path_c = std::ffi::CString::new(path)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "path has NUL"))?;
-    let opened = unsafe { libc::open(path_c.as_ptr(), flags, mode) };
-    if opened < 0 {
-        let err = std::io::Error::last_os_error();
-        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-        return send_errno(listener_fd, notif_id, errno);
-    }
-    let cloexec = (flags & libc::O_CLOEXEC) != 0;
-    let result = send_addfd(listener_fd, notif_id, opened, cloexec);
-    unsafe { libc::close(opened) };
-    result
+    let oflag = nix::fcntl::OFlag::from_bits_truncate(flags);
+    let mode = nix::sys::stat::Mode::from_bits_truncate(mode);
+    let opened = match nix::fcntl::open(path, oflag, mode) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let errno = err as i32;
+            return send_errno(listener_fd, notif_id, errno);
+        }
+    };
+    let cloexec = oflag.contains(nix::fcntl::OFlag::O_CLOEXEC);
+    // `opened` (OwnedFd) closes on drop after the fd is installed into the
+    // tracee via SECCOMP_IOCTL_NOTIF_ADDFD.
+    send_addfd(listener_fd, notif_id, opened.as_raw_fd(), cloexec)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_policy_socket_bypass, is_socket_connected, socket_type};
+    use super::is_policy_socket_bypass;
     use agent_sandbox_core::{ResourceAccess, ResourceKind};
     use agent_sandbox_syscall_broker::ResourceTarget;
     use std::path::{Path, PathBuf};
@@ -755,52 +724,70 @@ mod tests {
 
     #[test]
     fn is_socket_connected_detects_connected_stream() {
-        let mut fds = [0_i32; 2];
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "socketpair failed");
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+        let fds = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair failed");
         assert!(
-            is_socket_connected(fds[0]),
+            agent_sandbox_sysutil::is_socket_connected(&fds.0),
             "socketpair fd should be connected"
         );
         assert!(
-            is_socket_connected(fds[1]),
+            agent_sandbox_sysutil::is_socket_connected(&fds.1),
             "socketpair fd should be connected"
         );
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
     }
 
     #[test]
     fn is_socket_connected_rejects_unconnected_dgram() {
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
-        assert!(fd >= 0, "socket creation failed");
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .expect("socket creation failed");
         assert!(
-            !is_socket_connected(fd),
+            !agent_sandbox_sysutil::is_socket_connected(&fd),
             "unconnected dgram should report not connected"
         );
-        unsafe { libc::close(fd) };
     }
 
     #[test]
     fn socket_type_reads_stream() {
-        let mut fds = [0_i32; 2];
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "socketpair failed");
-        assert_eq!(socket_type(fds[0]), Some(libc::SOCK_STREAM));
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+        let fds = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair failed");
+        assert_eq!(
+            agent_sandbox_sysutil::socket_type(&fds.0),
+            Some(libc::SOCK_STREAM)
+        );
     }
 
     #[test]
     fn socket_type_reads_dgram() {
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
-        assert!(fd >= 0, "socket creation failed");
-        assert_eq!(socket_type(fd), Some(libc::SOCK_DGRAM));
-        unsafe { libc::close(fd) };
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .expect("socket creation failed");
+        assert_eq!(
+            agent_sandbox_sysutil::socket_type(&fd),
+            Some(libc::SOCK_DGRAM)
+        );
     }
 
     #[test]
@@ -839,6 +826,7 @@ mod tests {
 
     #[test]
     fn policy_socket_bypass_detects_hardlink() {
+        use std::os::unix::net::UnixListener;
         // Create a real Unix socket, hardlink it, and verify the bypass
         // detects the alias via inode comparison.
         let dir = std::env::temp_dir();
@@ -847,19 +835,7 @@ mod tests {
         let _ = std::fs::remove_file(&orig);
         let _ = std::fs::remove_file(&alias);
 
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(fd >= 0, "socket creation failed");
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = u16::try_from(libc::AF_UNIX).expect("AF_UNIX fits in u16");
-        let path_str = orig.to_string_lossy().into_owned();
-        let path_bytes = path_str.as_bytes();
-        let len = path_bytes.len().min(107);
-        for (i, &b) in path_bytes[..len].iter().enumerate() {
-            addr.sun_path[i] = b.cast_signed();
-        }
-        let addr_len = libc::socklen_t::try_from(2 + len).expect("sockaddr len fits");
-        let rc = unsafe { libc::bind(fd, (&raw const addr).cast::<libc::sockaddr>(), addr_len) };
-        assert_eq!(rc, 0, "bind failed");
+        let _listener = UnixListener::bind(&orig).expect("bind failed");
 
         // Create hardlink: both paths share the same inode.
         std::fs::hard_link(&orig, &alias).expect("hard_link failed");
@@ -870,7 +846,6 @@ mod tests {
             "hardlink to policy socket should be detected via inode comparison"
         );
 
-        unsafe { libc::close(fd) };
         let _ = std::fs::remove_file(&orig);
         let _ = std::fs::remove_file(&alias);
     }
