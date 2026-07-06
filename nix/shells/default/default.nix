@@ -1,17 +1,10 @@
-{ pkgs, ... }:
+{ pkgs, inputs, ... }:
 let
-  rust-toolchain = pkgs.rust-bin.stable.latest.default.override {
-    extensions = [
-      "rust-src"
-      "rustfmt"
-      "clippy"
-      "rust-analyzer"
-    ];
-  };
+  rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
 in
 pkgs.mkShell {
   nativeBuildInputs = with pkgs; [
-    rust-toolchain
+    rust.toolchain
     pkg-config
     cmake
     llvmPackages_22.clang-tools

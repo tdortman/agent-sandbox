@@ -3,12 +3,13 @@
   inputs,
   pkg-config,
   cmake,
-  rustPlatform,
   makeWrapper,
   pkgs,
   ...
 }:
 let
+  rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
+
   qtDialog = pkgs.stdenv.mkDerivation {
     name = "agent-sandbox-qt-dialog";
     src = ./qt-helper;
@@ -21,7 +22,7 @@ let
   src = inputs.self;
   workspacePackage = (fromTOML (builtins.readFile "${src}/Cargo.toml")).workspace.package;
 in
-rustPlatform.buildRustPackage {
+rust.rustPlatform.buildRustPackage {
   pname = "agent-sandbox";
   inherit (workspacePackage) version;
   inherit src;
