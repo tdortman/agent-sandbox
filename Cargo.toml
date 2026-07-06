@@ -10,6 +10,7 @@ members = [
     "crates/syscall",
     "crates/syscall-arm",
     "crates/syscall-broker",
+    "crates/sysutil",
 ]
 resolver = "2"
 
@@ -22,6 +23,7 @@ version = "0.1.0"
 # internal crates
 agent-sandbox-core    = { path = "crates/core" }
 agent-sandbox-syscall = { path = "crates/syscall" }
+agent-sandbox-sysutil = { path = "crates/sysutil" }
 
 # external
 caps               = "0.5.6"
