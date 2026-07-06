@@ -72,22 +72,28 @@ async fn main() -> std::io::Result<()> {
 
     let cli = Cli::parse();
     set_raw_fd_nonblocking(cli.listener_fd)?;
-    // The syscall-arm SIGSTOPs the child before exec'ing the command so the
-    // broker can acquire the listener fd via pidfd_getfd. Now that the
-    // listener is set up and nonblocking, resume the child so it starts
-    // executing and generating seccomp notifications.
-    if let Some(pid) = cli.child_pid {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGCONT,
-        );
-    }
-
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
+
+    // Don't SIGCONT the child until the broker is inside its notification
+    // loop and ready to receive. The child traps from the first openat onward
+    // (dynamic linker), and if the kernel finds a USER_NOTIF filter with no
+    // listener-fd holder, it returns ENOSYS to the tracee. We set a flag and
+    // SIGCONT on the first loop iteration.
+    let mut child_was_resumed = false;
 
     loop {
         if child_exited(cli.child_pid) {
             return Ok(());
+        }
+        if !child_was_resumed {
+            if let Some(pid) = cli.child_pid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGCONT,
+                );
+                debug!(child_pid = pid, "resumed sandboxed child");
+            }
+            child_was_resumed = true;
         }
         let notif = match recv_notification(cli.listener_fd) {
             Ok(notif) => notif,
@@ -98,11 +104,22 @@ async fn main() -> std::io::Result<()> {
                     continue;
                 }
                 Some(libc::ENOENT) => {
-                    // The seccomp listener fd is invalid; the task that
-                    // installed the filter is gone. Exiting avoids a noisy
-                    // log race against waitpid, which may not yet observe
-                    // the exit.
-                    return Ok(());
+                    // NOTIF_RECV returned ENOENT because a pending notification
+                    // was withdrawn (the tracee thread that triggered it was
+                    // killed by a signal before the broker could process it).
+                    // This is a transient per-notification condition, not a
+                    // listener-fd failure. We must NOT exit here: the child
+                    // process (omp's main thread) is still alive and will
+                    // generate more notifications. Exiting would close the
+                    // listener fd, turning every future trap into ENOSYS for
+                    // the still-alive child.
+                    //
+                    // If the child has truly exited, child_exited() above
+                    // catches it. Brief backoff so a signal-storm won't
+                    // spin the loop.
+                    debug!("notification withdrawn before processing");
+                    time::sleep(Duration::from_millis(1)).await;
+                    continue;
                 }
                 _ => {
                     if child_exited(cli.child_pid) {

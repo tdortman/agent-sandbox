@@ -237,7 +237,9 @@ fn main() {
             // Do NOT SIGCONT the child here. The broker must be ready to receive
             // seccomp notifications before the child resumes, otherwise the child's
             // first openat (during dynamic linking) traps with no broker listening,
-            // causing ENOSYS. The broker SIGCONTs the child after entering its loop.
+            // causing ENOSYS. The broker SIGCONTs the child on the first iteration
+            // of its notification loop, ensuring it is inside the loop and the
+            // listener fd is held before the child resumes.
             exec_broker(&listener_fd, child);
         }
     }
