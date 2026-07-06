@@ -5,9 +5,9 @@
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -66,41 +66,10 @@ struct Cli {
     project_root: Option<PathBuf>,
 }
 
-/// `fanotify_init` flags.
-const FAN_CLASS_PRE_CONTENT: u32 = libc::FAN_CLASS_PRE_CONTENT;
-const FAN_CLOEXEC: u32 = libc::FAN_CLOEXEC;
-
-/// `fanotify_mark` flags.
-const FAN_MARK_ADD: u32 = libc::FAN_MARK_ADD;
-const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
-
-/// Permission event masks.
-const FAN_OPEN_PERM: u64 = libc::FAN_OPEN_PERM;
-const FAN_OPEN_EXEC_PERM: u64 = libc::FAN_OPEN_EXEC_PERM;
-const FAN_ACCESS_PERM: u64 = libc::FAN_ACCESS_PERM;
-const FAN_PRE_ACCESS: u64 = 0x0010_0000;
-
-/// Event metadata struct (matches kernel struct `fanotify_event_metadata`).
-#[repr(C)]
-struct FanotifyEventMetadata {
-    event_len: u32,
-    vers: u8,
-    reserved: u8,
-    metadata_len: u16,
-    mask: u64,
-    fd: i32,
-    pid: i32,
-}
-
-/// Response struct (matches kernel struct `fanotify_response`).
-#[repr(C)]
-struct FanotifyResponse {
-    fd: i32,
-    response: u32,
-}
-
-const FAN_ALLOW: u32 = 0x01;
-const FAN_DENY: u32 = 0x02;
+// fanotify constants and event structs come from `agent_sandbox_sysutil`.
+use agent_sandbox_sysutil::{
+    FAN_ACCESS_PERM, FAN_ALLOW, FAN_DENY, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM, FAN_PRE_ACCESS,
+};
 
 /// Host procfs directory opened before `setns` into a sandbox mount namespace.
 ///
@@ -181,69 +150,19 @@ fn is_synthetic_fs(fstype: &str) -> bool {
 ///
 /// Returns `(fd, reports_tid)` where `reports_tid` is true when the kernel
 /// honours `FAN_REPORT_TID` and `meta.pid` is the thread id of the opener.
-fn fanotify_init_pre_content() -> io::Result<(i32, bool)> {
-    for (flags, reports_tid) in [
-        (
-            FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC | libc::FAN_REPORT_TID,
-            true,
-        ),
-        (FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC, false),
-    ] {
-        let raw_fd = unsafe { libc::syscall(libc::SYS_fanotify_init, flags, 0) };
-        let fd = i32::try_from(raw_fd)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fanotify fd overflow"))?;
-        if fd >= 0 {
-            return Ok((fd, reports_tid));
-        }
-        let err = io::Error::last_os_error();
-        if reports_tid && matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
-            tracing::debug!("FAN_REPORT_TID unsupported, falling back to process ids");
-            continue;
-        }
-        return Err(err);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "fanotify_init failed",
-    ))
+fn fanotify_init_pre_content() -> io::Result<(std::os::fd::OwnedFd, bool)> {
+    agent_sandbox_sysutil::fanotify_init_pre_content()
 }
 
-/// Add a fanotify mark on a mount point path.
-///
-/// Returns the mask that was actually applied. Kernels with
-/// `FAN_PRE_ACCESS` support can also receive pre-content notification
-/// events for content reads. Unlike the old behavior, `FAN_OPEN_PERM` is
-/// always included so that file opens produce deniable permission events.
-/// `FAN_PRE_ACCESS` is supplementary and provides fd-level visibility for
-/// content classification but cannot deny access.
-fn fanotify_mark(fan_fd: i32, path: &CStr, try_pre_access: bool) -> io::Result<u64> {
-    let mask = if try_pre_access {
-        FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM | FAN_PRE_ACCESS
-    } else {
-        FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM
-    };
-
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_fanotify_mark,
-            fan_fd,
-            i64::from(FAN_MARK_ADD | FAN_MARK_MOUNT),
-            mask,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-        )
-    };
-
-    if ret == 0 {
-        return Ok(mask);
-    }
-
-    let err = io::Error::last_os_error();
-    // If FAN_PRE_ACCESS is not supported, try again without it.
-    if try_pre_access && matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
-        return fanotify_mark(fan_fd, path, false);
-    }
-    Err(err)
+/// Add a fanotify mark on a mount point path. Returns the mask that was
+/// actually applied. Kernels with `FAN_PRE_ACCESS` support also receive
+/// pre-content notification events for content reads.
+fn fanotify_mark(
+    fan_fd: impl std::os::fd::AsFd,
+    path: &CStr,
+    try_pre_access: bool,
+) -> io::Result<u64> {
+    agent_sandbox_sysutil::fanotify_mark(fan_fd, path, try_pre_access)
 }
 
 /// Parse `/proc/self/mountinfo` and return all mount entries with their fstype.
@@ -315,15 +234,17 @@ fn tracee_open_dir_base(host_proc: &HostProc, pid: i32, dirfd: i64) -> io::Resul
     fs::read_link(link)
 }
 
-fn read_tracee_path_ptr(host_proc: &HostProc, pid: i32, path_ptr: u64) -> io::Result<Option<PathBuf>> {
+fn read_tracee_path_ptr(
+    host_proc: &HostProc,
+    pid: i32,
+    path_ptr: u64,
+) -> io::Result<Option<PathBuf>> {
     if path_ptr == 0 {
         return Ok(None);
     }
     let bytes = read_tracee_bytes(host_proc, pid, path_ptr, 4096)?;
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Ok(std::str::from_utf8(&bytes[..end])
-        .ok()
-        .map(PathBuf::from))
+    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
 }
 
 fn resolve_relative_open_path(
@@ -340,11 +261,7 @@ fn resolve_relative_open_path(
 }
 
 /// Parse the pathname from a blocked open-family syscall in `/proc/<tid>/syscall`.
-fn parse_open_syscall_path(
-    host_proc: &HostProc,
-    trace_pid: i32,
-    content: &str,
-) -> Option<PathBuf> {
+fn parse_open_syscall_path(host_proc: &HostProc, trace_pid: i32, content: &str) -> Option<PathBuf> {
     let content = content.trim();
     if content == "running" {
         return None;
@@ -407,11 +324,9 @@ fn resolve_blocked_open_path(
     trace_pid: i32,
     event_fd: i32,
 ) -> Option<String> {
-    resolve_event_path(event_fd)
-        .ok()
-        .or_else(|| {
-            syscall_open_path(host_proc, trace_pid).map(|path| path.to_string_lossy().into_owned())
-        })
+    resolve_event_path(event_fd).ok().or_else(|| {
+        syscall_open_path(host_proc, trace_pid).map(|path| path.to_string_lossy().into_owned())
+    })
 }
 
 /// Map `open(2)`/`openat(2)` flag bits to policy access.
@@ -459,22 +374,13 @@ fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32
 /// back to `/proc/<pid>/mem` when the syscall is unavailable.
 fn read_tracee_bytes(host_proc: &HostProc, pid: i32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0_u8; len];
-    let local = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: len,
-    };
-    let remote = libc::iovec {
-        iov_base: usize::try_from(addr).unwrap_or(0) as *mut libc::c_void,
-        iov_len: len,
-    };
-    let n = unsafe { libc::process_vm_readv(pid, &raw const local, 1, &raw const remote, 1, 0) };
-    if n >= 0 {
-        buf.truncate(usize::try_from(n).unwrap_or(0));
+    if let Some(n) =
+        agent_sandbox_sysutil::process_vm_readv_into(pid.cast_unsigned(), addr, &mut buf)
+    {
+        buf.truncate(n);
         return Ok(buf);
     }
-    let mut mem = fs::File::open(host_proc.entry_path(pid, "mem"))?;
-    mem.seek(SeekFrom::Start(addr))?;
-    mem.read_exact(&mut buf)?;
+    agent_sandbox_sysutil::read_proc_mem(&host_proc.entry_path(pid, "mem"), addr, &mut buf)?;
     Ok(buf)
 }
 
@@ -645,8 +551,7 @@ fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: i32, pid: i32) -> F
         // Directories are never executed as programs; classifying them as
         // Execute would miss read_write allow rules (e.g. global `./.git*`).
         if event_fd >= 0
-            && fs::metadata(format!("/proc/self/fd/{event_fd}"))
-                .is_ok_and(|meta| meta.is_dir())
+            && fs::metadata(format!("/proc/self/fd/{event_fd}")).is_ok_and(|meta| meta.is_dir())
         {
             return FileAccess::Read;
         }
@@ -679,7 +584,7 @@ struct MountpointMarks {
 /// Returns a [`MountpointMarks`] struct indicating whether a pre-access mark was seen
 /// and whether the home directory is covered.
 fn mark_mountpoints(
-    fan_fd: i32,
+    fan_fd: impl std::os::fd::AsFd,
     mounts: &[MountRecord],
     home_covering_mount: Option<&Path>,
     cli_home: Option<&Path>,
@@ -711,7 +616,7 @@ fn mark_mountpoints(
 
         let mp_cstr =
             CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
-        match fanotify_mark(fan_fd, &mp_cstr, true) {
+        match fanotify_mark(&fan_fd, &mp_cstr, true) {
             Ok(actual_mask) => {
                 saw_pre_access_mark |= actual_mask & FAN_PRE_ACCESS != 0;
                 if home_covering_mount == Some(mount.mount_point.as_path()) {
@@ -776,7 +681,7 @@ fn parent_pid(host_proc: &HostProc, pid: i32) -> Option<i32> {
 
 /// Event loop: read fanotify events and forward to policyd for allow/deny verdicts.
 fn run_event_loop(
-    fan_fd: i32,
+    fan_fd: &std::os::fd::OwnedFd,
     self_pid: i32,
     target_pid: i32,
     saw_pre_access_mark: bool,
@@ -784,23 +689,20 @@ fn run_event_loop(
     ctx: &agent_sandbox_core::RequestContext,
     socket_path: &Path,
 ) -> ! {
+    use std::os::fd::AsFd;
     let mut buf = vec![0u8; 4096];
     loop {
-        let n =
-            match unsafe { libc::read(fan_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) }
-            {
-                -1 => {
-                    let e = io::Error::last_os_error();
-                    eprintln!("agent-sandbox-fsmon: read from fanotify fd: {e}");
-                    continue;
-                }
-                n if n >= 0 => usize::try_from(n).expect("nonnegative read length"),
-                _ => continue,
-            };
+        let n = match nix::unistd::read(fan_fd.as_fd(), &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("agent-sandbox-fsmon: read from fanotify fd: {e}");
+                continue;
+            }
+        };
         let mut offset = 0;
-        while offset + size_of::<FanotifyEventMetadata>() <= n {
-            let meta = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr().add(offset).cast::<FanotifyEventMetadata>())
+        while offset + size_of::<agent_sandbox_sysutil::FanotifyEventMetadata>() <= n {
+            let Some(meta) = agent_sandbox_sysutil::fanotify_event(&buf[offset..n]) else {
+                break;
             };
 
             if meta.metadata_len == 0 {
@@ -875,7 +777,9 @@ fn run_event_loop(
 
                 respond(fan_fd, meta.fd, verdict);
             } else if meta.fd >= 0 {
-                unsafe { libc::close(meta.fd) };
+                // SAFETY: `meta.fd` is a kernel-handed fd we did not open.
+                // OwnedFd closes it on drop.
+                let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(meta.fd) };
             }
 
             offset += event_len;
@@ -906,24 +810,10 @@ fn join_target_mount_namespace(target_pid: u32) {
         }
         _ => {}
     }
-    let ns_cstr = CString::new(ns_path.as_bytes()).expect("null in ns path");
-    let ns_fd = unsafe { libc::open(ns_cstr.as_ptr(), libc::O_RDONLY) };
-    if ns_fd < 0 {
-        eprintln!(
-            "agent-sandbox-fsmon: open {ns_path}: {}",
-            io::Error::last_os_error()
-        );
+    if let Err(e) = agent_sandbox_sysutil::join_mount_namespace(target_pid) {
+        eprintln!("agent-sandbox-fsmon: setns {ns_path}: {e}");
         process::exit(1);
     }
-    let ret = unsafe { libc::setns(ns_fd, libc::CLONE_NEWNS) };
-    if ret < 0 {
-        eprintln!(
-            "agent-sandbox-fsmon: setns {ns_path}: {}",
-            io::Error::last_os_error()
-        );
-        process::exit(1);
-    }
-    unsafe { libc::close(ns_fd) };
 }
 
 fn main() {
@@ -976,7 +866,7 @@ fn main() {
         saw_pre_access_mark,
         home_covered,
     } = mark_mountpoints(
-        fan_fd,
+        &fan_fd,
         &mounts,
         home_covering_mount.as_deref(),
         cli.home.as_deref(),
@@ -1015,7 +905,7 @@ fn main() {
         process::exit(1);
     });
     run_event_loop(
-        fan_fd,
+        &fan_fd,
         self_pid,
         target_pid,
         saw_pre_access_mark,
@@ -1026,16 +916,20 @@ fn main() {
 }
 
 /// Write a `FAN_ALLOW` or `FAN_DENY` response and close the event fd.
-fn respond(fan_fd: i32, event_fd: i32, response: u32) {
-    let resp = FanotifyResponse {
+fn respond(fan_fd: impl std::os::fd::AsFd, event_fd: i32, response: u32) {
+    use std::os::fd::FromRawFd;
+    let resp = agent_sandbox_sysutil::FanotifyResponse {
         fd: event_fd,
         response,
     };
-    unsafe {
-        let resp_ptr = (&raw const resp).cast::<libc::c_void>();
-        libc::write(fan_fd, resp_ptr, size_of::<FanotifyResponse>());
-        libc::close(event_fd);
-    }
+    // SAFETY: the struct is `#[repr(C)]` POD. We borrow `resp` for a single
+    // write syscall. The fanotify fd is live for the call.
+    let resp_bytes = unsafe {
+        std::slice::from_raw_parts((&raw const resp).cast::<u8>(), std::mem::size_of_val(&resp))
+    };
+    let _ = nix::unistd::write(fan_fd.as_fd(), resp_bytes);
+    // SAFETY: `event_fd` is a kernel-handed fd from the fanotify event.
+    let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(event_fd) };
 }
 
 #[cfg(test)]
