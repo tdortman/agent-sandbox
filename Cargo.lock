@@ -121,8 +121,10 @@ name = "agent-sandbox-syscall-arm"
 version = "0.1.0"
 dependencies = [
  "agent-sandbox-syscall",
+ "agent-sandbox-sysutil",
  "clap",
  "libc",
+ "nix",
 ]
 
 [[package]]
