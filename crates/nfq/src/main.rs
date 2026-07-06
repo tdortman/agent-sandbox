@@ -5,8 +5,6 @@
 //! DNS forwarder's in-memory cache, asks policyd for a verdict, then accepts or
 //! actively rejects the packet.
 
-#![allow(unsafe_code)]
-
 mod owner;
 mod packet;
 mod policy;
@@ -278,76 +276,45 @@ fn restrict_push_socket_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 fn enable_passcred(sock: &std::os::unix::net::UnixDatagram) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = sock.as_raw_fd();
-    let one: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PASSCRED,
-            (&raw const one).cast::<libc::c_void>(),
-            libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-                .expect("c_int size fits in socklen_t"),
-        )
-    };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    use nix::sys::socket::{setsockopt, sockopt::PassCred};
+
+    setsockopt(sock, PassCred, &true).map_err(std::io::Error::from)
 }
 
 fn recv_datagram_with_creds(
     sock: &std::os::unix::net::UnixDatagram,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, UnixPeerCred)> {
-    use std::mem::MaybeUninit;
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::io::IoSliceMut;
     use std::os::unix::io::AsRawFd;
 
-    let fd = sock.as_raw_fd();
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    let mut cmsg = [MaybeUninit::<u8>::uninit(); 128];
-    let mut msg = libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: &raw mut iov,
-        msg_iovlen: 1,
-        msg_control: cmsg.as_mut_ptr().cast(),
-        msg_controllen: cmsg.len(),
-        msg_flags: 0,
-    };
-    let n = unsafe { libc::recvmsg(fd, &raw mut msg, 0) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let cred = parse_scm_credentials(&msg).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "push socket frame missing SCM_CREDENTIALS",
-        )
-    })?;
-    Ok((usize::try_from(n).unwrap_or(0), cred))
-}
-
-fn parse_scm_credentials(msg: &libc::msghdr) -> Option<UnixPeerCred> {
-    let mut cmsg_ptr = unsafe { libc::CMSG_FIRSTHDR(msg) };
-    while !cmsg_ptr.is_null() {
-        let hdr = unsafe { *cmsg_ptr };
-        if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_CREDENTIALS {
-            let data = unsafe { libc::CMSG_DATA(cmsg_ptr) };
-            let ucred = unsafe { std::ptr::read_unaligned(data.cast::<libc::ucred>()) };
-            return Some(UnixPeerCred {
-                pid: u32::try_from(ucred.pid).unwrap_or(u32::MAX),
-                uid: ucred.uid,
-                gid: ucred.gid,
-            });
-        }
-        cmsg_ptr = unsafe { libc::CMSG_NXTHDR(msg, cmsg_ptr) };
-    }
-    None
+    let mut cmsg = [0u8; 128];
+    let mut iov = [IoSliceMut::new(buf)];
+    let msg: nix::sys::socket::RecvMsg<'_, '_, ()> = recvmsg(
+        sock.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg),
+        MsgFlags::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let cred = msg
+        .cmsgs()?
+        .find_map(|cmsg| match cmsg {
+            ControlMessageOwned::ScmCredentials(cred) => Some(UnixPeerCred {
+                pid: u32::try_from(cred.pid()).unwrap_or(u32::MAX),
+                uid: cred.uid(),
+                gid: cred.gid(),
+            }),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "push socket frame missing SCM_CREDENTIALS",
+            )
+        })?;
+    Ok((msg.bytes, cred))
 }
 
 /// Apply a validated push mapping to the in-memory DNS cache.

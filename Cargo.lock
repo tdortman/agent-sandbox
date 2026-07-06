@@ -83,6 +83,7 @@ dependencies = [
  "hickory-proto",
  "libc",
  "nfq-updated",
+ "nix",
  "serde",
  "serde_json",
  "tokio",
