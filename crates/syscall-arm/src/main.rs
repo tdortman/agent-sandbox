@@ -1,14 +1,10 @@
-#![allow(unsafe_code)] // fork + seccomp install
-
-use agent_sandbox_syscall::{
-    LISTENER_FLAG_NEW_LISTENER, SECCOMP_SET_MODE_FILTER, build_filter, default_syscalls,
-};
-use agent_sandbox_sysutil::{pidfd_getfd, pidfd_open};
+use agent_sandbox_syscall::{build_filter, default_syscalls};
+use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::prctl::set_no_new_privs;
 use nix::sys::signal::{Signal, raise};
-use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2};
+use nix::unistd::{ForkResult, Pid, execvp, pipe2};
 use std::env;
 use std::ffi::{CStr, CString, OsString};
 use std::io::{Read, Write};
@@ -33,7 +29,7 @@ fn cstring(bytes: &[u8]) -> CString {
     })
 }
 
-fn install_filter() -> i32 {
+fn install_filter() -> OwnedFd {
     set_no_new_privs()
         .map_err(|_| ())
         .unwrap_or_else(|()| die("prctl PR_SET_NO_NEW_PRIVS failed"));
@@ -48,21 +44,8 @@ fn install_filter() -> i32 {
         len: u16::try_from(filter.len()).unwrap_or(u16::MAX),
         filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
     };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            u64::from(SECCOMP_SET_MODE_FILTER),
-            u64::from(LISTENER_FLAG_NEW_LISTENER),
-            &mut prog,
-        )
-    };
-    if fd < 0 {
-        die("seccomp user notification install failed");
-    }
-    i32::try_from(fd).unwrap_or_else(|_| {
-        eprintln!("agent-sandbox-syscall-arm: listener fd out of range");
-        process::exit(1);
-    })
+    install_seccomp_notify(&mut prog)
+        .unwrap_or_else(|_| die("seccomp user notification install failed"))
 }
 
 /// Create a `pipe2(O_CLOEXEC)` pair for passing the listener fd number
@@ -200,8 +183,7 @@ fn main() {
         process::exit(2);
     }
     let (read_end, write_end) = handoff_pipe();
-    // SAFETY: the process is single-threaded before fork.
-    let fork_result = unsafe { fork() }.unwrap_or_else(|_| die("fork failed"));
+    let fork_result = pre_exec_fork().unwrap_or_else(|_| die("fork failed"));
     match fork_result {
         ForkResult::Child => {
             // Child: drop the read end (we only write our side), install the
@@ -210,7 +192,7 @@ fn main() {
             // pidfd_getfd before the command execs, then exec.
             drop(read_end);
             let listener_fd = install_filter();
-            write_listener_fd(write_end, listener_fd);
+            write_listener_fd(write_end, listener_fd.as_raw_fd());
             raise(Signal::SIGSTOP)
                 .map_err(|_| ())
                 .unwrap_or_else(|()| die("raise SIGSTOP failed"));

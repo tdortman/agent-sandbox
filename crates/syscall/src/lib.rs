@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 pub mod bpf;
 pub mod policy;
 
