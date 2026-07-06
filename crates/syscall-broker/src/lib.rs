@@ -5,9 +5,8 @@ use agent_sandbox_core::{
     ResourceCheckReply, ResourceKind, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
 use agent_sandbox_syscall::policy::nr;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -198,11 +197,7 @@ pub const fn notification_arch_valid(notif: &SeccompNotif) -> bool {
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_ID_VALID` ioctl fails.
 pub fn notif_id_valid(listener_fd: i32, id: u64) -> io::Result<()> {
     let mut id = id;
-    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &mut id) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &mut id)
 }
 
 /// Receive a seccomp notification from the listener fd.
@@ -212,10 +207,7 @@ pub fn notif_id_valid(listener_fd: i32, id: u64) -> io::Result<()> {
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_RECV` ioctl fails.
 pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
     let mut notif = SeccompNotif::default();
-    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif)?;
     Ok(notif)
 }
 
@@ -232,11 +224,7 @@ pub fn send_continue(listener_fd: i32, id: u64) -> io::Result<()> {
         error: 0,
         flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
     };
-    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
 }
 
 /// Inject an error return value into the tracee's syscall result.
@@ -252,11 +240,7 @@ pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
         error: -errno,
         flags: 0,
     };
-    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
 }
 
 /// Inject a success return value into the tracee's syscall result.
@@ -269,17 +253,13 @@ pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
 pub fn send_result(listener_fd: i32, id: u64, val: i64) -> io::Result<()> {
     notif_id_valid(listener_fd, id)?;
-    let resp = SeccompNotifResp {
+    let mut resp = SeccompNotifResp {
         id,
         val,
         error: 0,
         flags: 0,
     };
-    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
 }
 
 /// Duplicate a broker-held fd into the tracee as the syscall result.
@@ -298,18 +278,14 @@ pub fn send_result(listener_fd: i32, id: u64, val: i64) -> io::Result<()> {
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails.
 pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::Result<()> {
     notif_id_valid(listener_fd, id)?;
-    let addfd = SeccompNotifAddfd {
+    let mut addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
         srcfd: u32::try_from(srcfd).unwrap_or(u32::MAX),
         newfd: 0,
         newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
     };
-    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &mut addfd)
 }
 /// Returns true for tracee memory read failures that are routine races (tracee
 /// exited, ptrace scope, another tracer such as `nsys`, notification recycled)
@@ -328,84 +304,15 @@ pub fn is_transient_tracee_io_err(err: &io::Error) -> bool {
 ///
 /// Returns an error if `process_vm_readv` and the `/proc/<pid>/mem` fallback
 /// both fail (e.g. the process is gone or the address is invalid).
-pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0_u8; len];
-    let local = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: len,
-    };
-    let remote = libc::iovec {
-        iov_base: usize::try_from(addr).unwrap_or(0) as *mut libc::c_void,
-        iov_len: len,
-    };
-    let n = unsafe {
-        libc::process_vm_readv(
-            i32::try_from(pid).unwrap_or(i32::MAX),
-            &raw const local,
-            1,
-            &raw const remote,
-            1,
-            0,
-        )
-    };
-    if n >= 0 {
-        buf.truncate(usize::try_from(n).unwrap_or(0));
-        return Ok(buf);
-    }
-    read_tracee_bytes_via_proc_mem(pid, addr, len)
-}
-
-fn read_tracee_bytes_via_proc_mem(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
-    let path = format!("/proc/{pid}/mem");
-    let mut mem = std::fs::File::open(path)?;
-    mem.seek(SeekFrom::Start(addr))?;
-    let mut buf = vec![0_u8; len];
-    mem.read_exact(&mut buf)?;
-    Ok(buf)
-}
+pub use agent_sandbox_sysutil::read_tracee_bytes;
 
 /// Look up the actual `SO_TYPE` of a tracee socket via `pidfd_open` +
 /// `pidfd_getfd`. Returns `None` on any failure (process gone, fd not a
 /// socket, kernel too old for the syscalls, etc.) so the caller can fall
 /// back to a per-syscall default.
 fn get_socket_type(pid: u32, sockfd: i32) -> Option<i32> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    // pidfd_open(2): Linux 5.3+. Returns a pidfd referring to the tracee.
-    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), 0) };
-    let pidfd = i32::try_from(raw_pidfd).ok()?;
-    if pidfd < 0 {
-        return None;
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-    // pidfd_getfd(2): Linux 5.6+. Duplicates the tracee's sockfd into our
-    // fd table. The tracee and broker share the user namespace (bwrap uses
-    // --unshare-user), so this works across the namespace boundary; opening
-    // /proc/<pid>/fd/<sockfd> would not, because the symlink is gone for
-    // sockets once the tracee has unshared.
-    let raw_dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), sockfd, 0) };
-    let dup_fd = i32::try_from(raw_dup).ok()?;
-    if dup_fd < 0 {
-        return None;
-    }
-    let dup_fd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-    // getsockopt(SO_TYPE): read the socket type. Returns SOCK_STREAM, SOCK_DGRAM,
-    // SOCK_RAW, SOCK_SEQPACKET, etc.
-    let mut sock_type: libc::c_int = 0;
-    let mut optlen: libc::socklen_t =
-        u32::try_from(std::mem::size_of::<libc::c_int>()).expect("size_of c_int fits in u32");
-    let ret = unsafe {
-        libc::getsockopt(
-            dup_fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&raw mut sock_type).cast::<libc::c_void>(),
-            &raw mut optlen,
-        )
-    };
-    if ret < 0 {
-        return None;
-    }
-    Some(sock_type)
+    let dup = agent_sandbox_sysutil::dup_tracee_fd(pid, sockfd).ok()?;
+    agent_sandbox_sysutil::socket_type(&dup)
 }
 
 /// Map a `SO_TYPE` value to a URL scheme. DGRAM sockets are UDP; everything
@@ -829,45 +736,54 @@ fn tracee_fd_path(pid: u32, fd: u64) -> io::Result<PathBuf> {
     std::fs::read_link(link)
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_rename(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let old = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
-    let new = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[1])?;
-    Ok(match (old, new) {
-        (Some(old), Some(new)) => filesystem_checks_rename(&old, &new),
-        _ => None,
-    })
+/// Generate a two-path filesystem-mutation target extractor (`rename`/`link`).
+///
+/// Indices are passed as integer literals and dereferenced inside the macro
+/// so the `notif` binding resolves under the macro's own hygiene.
+macro_rules! fs_two_path_target {
+    ($name:ident, $check:ident, cwd, $old_idx:expr, cwd, $new_idx:expr) => {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+            let old = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[$old_idx])?;
+            let new = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[$new_idx])?;
+            Ok(match (old, new) {
+                (Some(o), Some(n)) => $check(&o, &n),
+                _ => None,
+            })
+        }
+    };
+    ($name:ident, $check:ident, arg($od:expr), $old_idx:expr, arg($nd:expr), $new_idx:expr) => {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+            let old =
+                read_resolved_path_arg(notif.pid, notif.data.args[$od], notif.data.args[$old_idx])?;
+            let new =
+                read_resolved_path_arg(notif.pid, notif.data.args[$nd], notif.data.args[$new_idx])?;
+            Ok(match (old, new) {
+                (Some(o), Some(n)) => $check(&o, &n),
+                _ => None,
+            })
+        }
+    };
 }
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_renameat_family(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let old = read_resolved_path_arg(notif.pid, notif.data.args[0], notif.data.args[1])?;
-    let new = read_resolved_path_arg(notif.pid, notif.data.args[2], notif.data.args[3])?;
-    Ok(match (old, new) {
-        (Some(old), Some(new)) => filesystem_checks_rename(&old, &new),
-        _ => None,
-    })
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_link(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let old = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
-    let new = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[1])?;
-    Ok(match (old, new) {
-        (Some(old), Some(new)) => filesystem_checks_link(&old, &new),
-        _ => None,
-    })
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_linkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let old = read_resolved_path_arg(notif.pid, notif.data.args[0], notif.data.args[1])?;
-    let new = read_resolved_path_arg(notif.pid, notif.data.args[2], notif.data.args[3])?;
-    Ok(match (old, new) {
-        (Some(old), Some(new)) => filesystem_checks_link(&old, &new),
-        _ => None,
-    })
-}
+fs_two_path_target!(target_from_rename, filesystem_checks_rename, cwd, 0, cwd, 1);
+fs_two_path_target!(
+    target_from_renameat_family,
+    filesystem_checks_rename,
+    arg(0),
+    1,
+    arg(2),
+    3
+);
+fs_two_path_target!(target_from_link, filesystem_checks_link, cwd, 0, cwd, 1);
+fs_two_path_target!(
+    target_from_linkat,
+    filesystem_checks_link,
+    arg(0),
+    1,
+    arg(2),
+    3
+);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn target_from_symlink(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
@@ -889,23 +805,29 @@ fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarge
     }))
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_unlink(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let path = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
-    Ok(path.and_then(|path| filesystem_checks_unlink(&path)))
+/// Generate a single-path filesystem-mutation target extractor
+/// (`unlink`/`truncate`). See [`fs_two_path_target`] for the index hygiene.
+macro_rules! fs_path_target {
+    ($name:ident, $check:ident, cwd, $arg_idx:expr) => {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+            let path =
+                read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[$arg_idx])?;
+            Ok(path.and_then(|p| $check(&p)))
+        }
+    };
+    ($name:ident, $check:ident, arg($d:expr), $arg_idx:expr) => {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+            let path =
+                read_resolved_path_arg(notif.pid, notif.data.args[$d], notif.data.args[$arg_idx])?;
+            Ok(path.and_then(|p| $check(&p)))
+        }
+    };
 }
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_unlinkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let path = read_resolved_path_arg(notif.pid, notif.data.args[0], notif.data.args[1])?;
-    Ok(path.and_then(|path| filesystem_checks_unlink(&path)))
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn target_from_truncate(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let path = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[0])?;
-    Ok(path.and_then(|path| filesystem_checks_truncate(&path)))
-}
+fs_path_target!(target_from_unlink, filesystem_checks_unlink, cwd, 0);
+fs_path_target!(target_from_unlinkat, filesystem_checks_unlink, arg(0), 1);
+fs_path_target!(target_from_truncate, filesystem_checks_truncate, cwd, 0);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
@@ -1365,10 +1287,9 @@ mod tests {
         filesystem_checks_link, filesystem_checks_rename, filesystem_checks_symlink,
         filesystem_checks_truncate, filesystem_checks_unlink, hex_encode_lower, is_at_fdcwd,
         is_device_bypass, is_device_file, is_device_node_for_resource_gate,
-        notification_arch_valid, parse_sockaddr,
-        read_resolved_path_arg, resolve_open_path, resolve_tracee_path,
-        revalidate_filesystem_mutation, scheme_for_socket_type, target_from_notification,
-        tracee_fd_path, tracee_open_dir_base,
+        notification_arch_valid, parse_sockaddr, read_resolved_path_arg, resolve_open_path,
+        resolve_tracee_path, revalidate_filesystem_mutation, scheme_for_socket_type,
+        target_from_notification, tracee_fd_path, tracee_open_dir_base,
     };
     use agent_sandbox_syscall::policy::nr;
     use std::fs;
@@ -1378,18 +1299,18 @@ mod tests {
 
     #[test]
     fn transient_tracee_io_err_classifies_expected_errno() {
-        assert!(super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
-            libc::EPERM
-        )));
-        assert!(super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
-            libc::EACCES
-        )));
-        assert!(super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
-            libc::ESRCH
-        )));
-        assert!(!super::is_transient_tracee_io_err(&std::io::Error::from_raw_os_error(
-            libc::EINVAL
-        )));
+        assert!(super::is_transient_tracee_io_err(
+            &std::io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(super::is_transient_tracee_io_err(
+            &std::io::Error::from_raw_os_error(libc::EACCES)
+        ));
+        assert!(super::is_transient_tracee_io_err(
+            &std::io::Error::from_raw_os_error(libc::ESRCH)
+        ));
+        assert!(!super::is_transient_tracee_io_err(
+            &std::io::Error::from_raw_os_error(libc::EINVAL)
+        ));
     }
 
     #[test]
