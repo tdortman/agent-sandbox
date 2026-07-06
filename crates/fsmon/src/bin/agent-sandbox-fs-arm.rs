@@ -8,7 +8,7 @@
 use agent_sandbox_core::{FilesystemRule, RequestContext};
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser as _;
-use std::ffi::{CString, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -105,19 +105,13 @@ fn main() {
         );
         process::exit(1);
     }
-
-    // Exec the real command.
+    // Exec the real command. nix::unistd::execvp null-terminates argv.
     let cargs: Vec<CString> = real_args
         .iter()
         .map(|a| CString::new(a.as_os_str().as_bytes()).expect("arg contains null byte"))
         .collect();
-    let mut argv: Vec<*const libc::c_char> = cargs.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
-
-    // execvp replaces the process.
-    unsafe {
-        libc::execvp(cargs[0].as_ptr(), argv.as_ptr());
-    }
+    let cstr_refs: Vec<&CStr> = cargs.iter().map(CString::as_c_str).collect();
+    let _ = nix::unistd::execvp(cargs[0].as_c_str(), &cstr_refs);
 
     // If execvp returns, it failed.
     eprintln!(
