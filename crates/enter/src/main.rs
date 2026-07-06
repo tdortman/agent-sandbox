@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 //! Join a named network namespace, drop inherited capabilities, then exec the command.
 //!
 //! Installed as a setuid-root wrapper (`security.wrappers`) so unprivileged sandboxes can
@@ -30,20 +28,7 @@ fn die(msg: &str, err: &io::Error) -> ! {
 /// exec replaces the image anyway. Ambient + effective must be cleared before execvp.
 fn drop_capabilities() -> io::Result<()> {
     caps::clear(None, CapSet::Effective).map_err(io::Error::other)?;
-
-    // SAFETY: `PR_CAP_AMBIENT` + `PR_CAP_AMBIENT_LOWER`. Stop when the kernel returns EINVAL.
-    unsafe {
-        for cap in 0_i32.. {
-            if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_LOWER, cap, 0, 0) < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINVAL) {
-                    break;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Ok(())
+    agent_sandbox_sysutil::clear_ambient_capabilities()
 }
 
 const NETNS_DIR: &str = "/run/netns";
