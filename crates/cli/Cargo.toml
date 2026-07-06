@@ -31,7 +31,7 @@ path = "src/bin/open_ui_fd.rs"
 agent-sandbox-core.workspace = true
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true
-nix = { workspace = true, features = ["fs", "user"] }
+nix = { workspace = true, features = ["fs", "user", "process"] }
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

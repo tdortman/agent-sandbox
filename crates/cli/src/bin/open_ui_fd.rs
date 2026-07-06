@@ -75,13 +75,13 @@ fn build_child_args(args: &[String], sandbox_session_id: &str) -> Option<Vec<CSt
 }
 
 fn exec_cstrings(args: &[CString]) -> ! {
-    let mut exec_argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-    exec_argv.push(std::ptr::null());
-    // SAFETY: argv is null-terminated and points at live CString storage.
-    unsafe {
-        libc::execvp(exec_argv[0], exec_argv.as_ptr());
+    match nix::unistd::execvp(
+        args[0].as_c_str(),
+        &args.iter().map(CString::as_c_str).collect::<Vec<_>>(),
+    ) {
+        Err(err) => die("execvp", &io::Error::from(err)),
+        Ok(infallible) => match infallible {},
     }
-    die("execvp", &io::Error::last_os_error());
 }
 
 fn exec_child(args: &[String], sandbox_session_id: &str) -> ! {
