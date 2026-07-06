@@ -1,0 +1,12 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "agent-sandbox-sysutil"
+version.workspace = true
+
+[dependencies]
+libc.workspace = true
+nix = { workspace = true, features = ["fs", "process", "sched", "socket", "uio", "user"] }
+
+[lints]
+workspace = true
