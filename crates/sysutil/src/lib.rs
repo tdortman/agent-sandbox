@@ -7,7 +7,7 @@
 
 use std::ffi::CStr;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
 use nix::sys::socket::{SockaddrStorage, getpeername};
@@ -334,6 +334,179 @@ pub struct FanotifyResponse {
     pub response: u32,
 }
 
+/// Set an environment variable in a single-threaded pre-exec context.
+///
+/// # Safety context
+///
+/// Call only from the main thread before any threads are spawned and
+/// immediately before `exec`. The caller guarantees no other Rust
+/// thread is concurrently reading or writing the environment.
+pub fn pre_exec_set_var(key: &str, value: &str) {
+    // SAFETY: documented pre-exec single-threaded constraint.
+    unsafe { std::env::set_var(key, value) }
+}
+
+/// Remove an environment variable in a single-threaded pre-exec context.
+///
+/// # Safety context
+///
+/// Call only from the main thread before any threads are spawned and
+/// immediately before `exec`. The caller guarantees no other Rust
+/// thread is concurrently reading or writing the environment.
+pub fn pre_exec_remove_var(key: &str) {
+    // SAFETY: documented pre-exec single-threaded constraint.
+    unsafe { std::env::remove_var(key) }
+}
+
+/// Take ownership of a kernel fanotify event fd for automatic cleanup.
+///
+/// Returns `None` when `fd` is negative (no event fd to close).
+/// The returned `OwnedFd` closes the fd on drop.
+#[must_use]
+pub fn take_fanotify_event_fd(fd: i32) -> Option<OwnedFd> {
+    if fd >= 0 {
+        // SAFETY: the fd is a kernel-handed fanotify event fd not owned
+        // by anyone else.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    } else {
+        None
+    }
+}
+
+/// View a [`FanotifyResponse`] as a byte slice for writing to a fanotify fd.
+#[must_use]
+pub const fn fanotify_response_bytes(resp: &FanotifyResponse) -> &[u8] {
+    // SAFETY: `FanotifyResponse` is `#[repr(C)]` POD. The returned slice
+    // borrows `resp` for its lifetime.
+    unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref::<FanotifyResponse>(resp).cast::<u8>(),
+            std::mem::size_of::<FanotifyResponse>(),
+        )
+    }
+}
+
+/// Perform `connect` with a raw sockaddr byte buffer.
+///
+/// The kernel reads `addr` for the call duration. Callers guarantee the
+/// buffer matches the expected sockaddr layout for the socket family.
+///
+/// # Errors
+/// Returns the kernel error if `connect` fails.
+pub fn connect_raw(fd: impl AsFd, addr: &[u8]) -> io::Result<()> {
+    // SAFETY: `addr` is caller-provided sockaddr bytes, valid for the
+    // kernel call. `fd` is a live descriptor.
+    let rc = unsafe {
+        libc::connect(
+            fd.as_fd().as_raw_fd(),
+            addr.as_ptr().cast(),
+            u32::try_from(addr.len()).unwrap_or(u32::MAX),
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Perform `sendto` with a raw sockaddr byte buffer.
+///
+/// The kernel reads `buf` and `addr` for the call duration.
+///
+/// # Errors
+/// Returns the kernel error if `sendto` fails.
+pub fn sendto_raw(fd: impl AsFd, buf: &[u8], flags: i32, addr: &[u8]) -> io::Result<isize> {
+    // SAFETY: `buf` and `addr` are caller-owned slices valid for the
+    // kernel call. `fd` is a live descriptor.
+    let rc = unsafe {
+        libc::sendto(
+            fd.as_fd().as_raw_fd(),
+            buf.as_ptr().cast(),
+            buf.len(),
+            flags,
+            addr.as_ptr().cast(),
+            u32::try_from(addr.len()).unwrap_or(u32::MAX),
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// Perform `sendmsg` with a pre-constructed `msghdr`. The kernel reads
+/// `msg.msg_name`, `msg.msg_iov`, and `msg.msg_control` for the call.
+///
+/// # Safety
+///
+/// The caller guarantees all pointers reachable through `msg` point to
+/// valid, live memory for the kernel call.
+///
+/// # Errors
+/// Returns the kernel error if `sendmsg` fails.
+pub unsafe fn sendmsg_raw(fd: impl AsFd, msg: &libc::msghdr, flags: i32) -> io::Result<isize> {
+    // SAFETY: deferred to caller per the function's safety contract.
+    let rc = unsafe { libc::sendmsg(fd.as_fd().as_raw_fd(), msg, flags) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// Install a seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+///
+/// Returns an `OwnedFd` for the seccomp user-notification listener.
+///
+/// # Errors
+/// Returns the kernel error if the seccomp syscall fails.
+pub fn install_seccomp_notify(prog: &mut libc::sock_fprog) -> io::Result<OwnedFd> {
+    // Stable kernel UAPI constants from <linux/seccomp.h>.
+    const SECCOMP_SET_MODE_FILTER: u32 = 1;
+    const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
+
+    // SAFETY: `prog` is a valid BPF program. The syscall is the standard
+    // seccomp install path; the kernel validates the program.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            u64::from(SECCOMP_SET_MODE_FILTER),
+            u64::from(SECCOMP_FILTER_FLAG_NEW_LISTENER),
+            std::ptr::from_mut::<libc::sock_fprog>(prog),
+        )
+    };
+    fd_from_syscall(raw)
+}
+
+/// Fork in a single-threaded pre-exec context.
+///
+/// # Safety context
+///
+/// Call only from the main thread before any threads are spawned.
+///
+/// # Errors
+/// Returns the kernel error if `fork` fails.
+pub fn pre_exec_fork() -> io::Result<nix::unistd::ForkResult> {
+    // SAFETY: documented pre-exec single-threaded constraint.
+    unsafe { nix::unistd::fork() }.map_err(io::Error::from)
+}
+
+/// Set `O_NONBLOCK` on a raw file descriptor.
+///
+/// The caller guarantees `fd` is a live file descriptor.
+///
+/// # Errors
+/// Returns the kernel error if `fcntl` fails.
+pub fn set_raw_fd_nonblocking(fd: i32) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    // SAFETY: caller guarantees `fd` is live.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
+    fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
