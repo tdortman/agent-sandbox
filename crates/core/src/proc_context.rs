@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::merge_policy::ProjectPolicyContext;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials as NixPeerCredentials};
 
@@ -247,10 +247,12 @@ fn pid_for_socket_inode(inode: &str) -> Option<u32> {
 }
 
 /// Return process credentials for the peer of a connected Unix domain socket.
-#[allow(unsafe_code)]
 pub fn peer_cred_unix(stream: &tokio::net::UnixStream) -> Option<PeerCredentials> {
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(stream.as_raw_fd()) };
-    peer_cred_fd(fd)
+    let cred = stream.peer_cred().ok()?;
+    let pid = u32::try_from(cred.pid()?).ok()?;
+    let uid = cred.uid();
+    let gid = i32::try_from(cred.gid()).unwrap_or(-1);
+    Some(PeerCredentials { pid, uid, gid })
 }
 
 /// Return process credentials for the peer of a connected socket.
@@ -258,7 +260,6 @@ pub fn peer_cred_unix(stream: &tokio::net::UnixStream) -> Option<PeerCredentials
 /// For accepted TCP connections, the local endpoint's `/proc/net/tcp` row
 /// belongs to this process. Look up the inverse quad first so we resolve the
 /// connecting client's pid for policy UI routing.
-#[allow(unsafe_code)]
 pub fn peer_cred(stream: &tokio::net::TcpStream) -> Option<PeerCredentials> {
     let local = stream.local_addr().ok()?;
     let peer = stream.peer_addr().ok()?;
@@ -284,12 +285,10 @@ pub fn peer_cred(stream: &tokio::net::TcpStream) -> Option<PeerCredentials> {
             });
         }
     }
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(stream.as_raw_fd()) };
-    peer_cred_fd(fd)
+    peer_cred_fd(stream.as_fd())
 }
 
-#[allow(unsafe_code)]
-fn peer_cred_fd(fd: std::os::fd::BorrowedFd<'_>) -> Option<PeerCredentials> {
+fn peer_cred_fd(fd: impl AsFd) -> Option<PeerCredentials> {
     let cred = getsockopt(&fd, NixPeerCredentials).ok()?;
     let pid = u32::try_from(cred.pid()).ok()?;
     let uid = cred.uid();
