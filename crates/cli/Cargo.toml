@@ -29,6 +29,7 @@ path = "src/bin/open_ui_fd.rs"
 
 [dependencies]
 agent-sandbox-core.workspace = true
+agent-sandbox-sysutil.workspace = true
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "user", "process"] }

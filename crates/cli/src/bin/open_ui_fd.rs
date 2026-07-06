@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 //! Pre-register a policy UI connection on the host policy socket, then exec a
 //! launcher command.
 //!
@@ -87,10 +85,7 @@ fn exec_cstrings(args: &[CString]) -> ! {
 fn exec_child(args: &[String], sandbox_session_id: &str) -> ! {
     build_child_args(args, sandbox_session_id).map_or_else(
         || {
-            // SAFETY: single-threaded, about to exec.
-            unsafe {
-                std::env::set_var("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
-            }
+            agent_sandbox_sysutil::pre_exec_set_var("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
             let child_args: Vec<CString> = args.iter().map(|s| cstring(s.as_bytes())).collect();
             exec_cstrings(&child_args);
         },
