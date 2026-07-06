@@ -1,13 +1,11 @@
 //! Root fanotify monitor: setns into the sandbox mount namespace,
 //! mark each mountpoint, then event-loop handling permission events.
 
-#![allow(unsafe_code)]
-
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::Write;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -721,37 +719,26 @@ fn run_event_loop(
                     & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_PRE_ACCESS | FAN_ACCESS_PERM)
                     != 0
             {
-                if meta.pid == self_pid {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                if try_fast_path_allow(
+                    fan_fd,
+                    &meta,
+                    self_pid,
+                    target_pid,
+                    saw_pre_access_mark,
+                    host_proc,
+                ) {
                     offset += event_len;
                     continue;
                 }
-                let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
-                if !is_descendant_of(host_proc, process_pid, target_pid) {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-                if saw_pre_access_mark
-                    && meta.mask & FAN_ACCESS_PERM != 0
-                    && event_fd_is_regular_file(meta.fd)
-                {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-                if meta.mask & FAN_PRE_ACCESS != 0 {
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
+                let event_fd =
+                    agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd).expect("event fd");
                 let path = resolve_blocked_open_path(host_proc, meta.pid, meta.fd);
                 let Some(path) = path else {
                     tracing::warn!(
                         pid = meta.pid,
                         "path resolution failed, allowing (fail-open)"
                     );
-                    respond(fan_fd, meta.fd, FAN_ALLOW);
+                    respond(fan_fd, &event_fd, FAN_ALLOW);
                     offset += event_len;
                     continue;
                 };
@@ -775,11 +762,9 @@ fn run_event_loop(
                     tracing::info!(%path, ?access, "denied by policy");
                 }
 
-                respond(fan_fd, meta.fd, verdict);
+                respond(fan_fd, &event_fd, verdict);
             } else if meta.fd >= 0 {
-                // SAFETY: `meta.fd` is a kernel-handed fd we did not open.
-                // OwnedFd closes it on drop.
-                let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(meta.fd) };
+                let _ = agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd);
             }
 
             offset += event_len;
@@ -915,21 +900,62 @@ fn main() {
     );
 }
 
+/// Fast-path allow checks that do not need a policyd RPC.
+/// Returns `true` when the event was already handled.
+fn try_fast_path_allow(
+    fan_fd: &std::os::fd::OwnedFd,
+    meta: &agent_sandbox_sysutil::FanotifyEventMetadata,
+    self_pid: i32,
+    target_pid: i32,
+    saw_pre_access_mark: bool,
+    host_proc: &HostProc,
+) -> bool {
+    if meta.pid == self_pid {
+        respond(
+            fan_fd,
+            &agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd).expect("event fd"),
+            FAN_ALLOW,
+        );
+        return true;
+    }
+    let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
+    if !is_descendant_of(host_proc, process_pid, target_pid) {
+        respond(
+            fan_fd,
+            &agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd).expect("event fd"),
+            FAN_ALLOW,
+        );
+        return true;
+    }
+    if saw_pre_access_mark && meta.mask & FAN_ACCESS_PERM != 0 && event_fd_is_regular_file(meta.fd)
+    {
+        respond(
+            fan_fd,
+            &agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd).expect("event fd"),
+            FAN_ALLOW,
+        );
+        return true;
+    }
+    if meta.mask & FAN_PRE_ACCESS != 0 {
+        respond(
+            fan_fd,
+            &agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd).expect("event fd"),
+            FAN_ALLOW,
+        );
+        return true;
+    }
+    false
+}
+
 /// Write a `FAN_ALLOW` or `FAN_DENY` response and close the event fd.
-fn respond(fan_fd: impl std::os::fd::AsFd, event_fd: i32, response: u32) {
-    use std::os::fd::FromRawFd;
+fn respond(fan_fd: impl std::os::fd::AsFd, event_fd: &std::os::fd::OwnedFd, response: u32) {
     let resp = agent_sandbox_sysutil::FanotifyResponse {
-        fd: event_fd,
+        fd: event_fd.as_raw_fd(),
         response,
     };
-    // SAFETY: the struct is `#[repr(C)]` POD. We borrow `resp` for a single
-    // write syscall. The fanotify fd is live for the call.
-    let resp_bytes = unsafe {
-        std::slice::from_raw_parts((&raw const resp).cast::<u8>(), std::mem::size_of_val(&resp))
-    };
+    let resp_bytes = agent_sandbox_sysutil::fanotify_response_bytes(&resp);
     let _ = nix::unistd::write(fan_fd.as_fd(), resp_bytes);
-    // SAFETY: `event_fd` is a kernel-handed fd from the fanotify event.
-    let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(event_fd) };
+    // event_fd dropped here, closing the fd
 }
 
 #[cfg(test)]
