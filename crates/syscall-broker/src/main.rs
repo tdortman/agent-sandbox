@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,6 +10,7 @@ use agent_sandbox_syscall_broker::{
     recv_notification, revalidate_filesystem_mutation, send_addfd, send_continue, send_errno,
     send_result, target_from_notification,
 };
+use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
 use clap::Parser;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -72,7 +71,7 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    set_nonblocking(cli.listener_fd)?;
+    set_raw_fd_nonblocking(cli.listener_fd)?;
     // The syscall-arm SIGSTOPs the child before exec'ing the command so the
     // broker can acquire the listener fd via pidfd_getfd. Now that the
     // listener is set up and nonblocking, resume the child so it starts
@@ -340,15 +339,6 @@ async fn dispatch_filesystem_target(
     send_continue(listener_fd, notif.id)
 }
 
-fn set_nonblocking(fd: i32) -> std::io::Result<()> {
-    use nix::fcntl::{FcntlArg, OFlag, fcntl};
-    // SAFETY: caller owns `fd` (a live listener fd) for the call duration.
-    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
-    fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-    Ok(())
-}
-
 fn child_exited(child_pid: Option<i32>) -> bool {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::Pid;
@@ -453,22 +443,13 @@ fn emulate_unix_socket(
             if target.raw.is_empty() {
                 return send_continue(listener_fd, notif.id);
             }
-            // SAFETY: `target.raw` is a captured sockaddr validated at policy
-            // parse time. `dup` is a live OwnedFd. The kernel reads the
-            // sockaddr for the duration of the call.
-            let rc = unsafe {
-                libc::connect(
-                    dup.as_raw_fd(),
-                    target.raw.as_ptr().cast(),
-                    u32::try_from(target.raw.len()).unwrap_or(u32::MAX),
-                )
-            };
-            if rc < 0 {
-                let err = std::io::Error::last_os_error();
-                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-                return send_errno(listener_fd, notif.id, errno);
+            match connect_raw(&dup, &target.raw) {
+                Ok(()) => send_result(listener_fd, notif.id, 0),
+                Err(err) => {
+                    let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+                    send_errno(listener_fd, notif.id, errno)
+                }
             }
-            send_result(listener_fd, notif.id, 0)
         }
         nr::SENDTO => enhance_sendto_emulation(listener_fd, notif, &dup, target),
         nr::SENDMSG => enhance_sendmsg_emulation(listener_fd, notif, &dup, target),
@@ -523,23 +504,13 @@ fn enhance_sendto_emulation(
     }
     let payload =
         agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, buf_ptr, len.min(MAX_PAYLOAD))?;
-    // SAFETY: `dup` is a live OwnedFd. `payload` outlives the call. The
-    // sockaddr in `target.raw` was captured at policy parse time.
-    let sent = unsafe {
-        libc::sendto(
-            dup.as_raw_fd(),
-            payload.as_ptr().cast(),
-            payload.len(),
-            flags,
-            target.raw.as_ptr().cast(),
-            u32::try_from(target.raw.len()).unwrap_or(u32::MAX),
-        )
+    let sent = match sendto_raw(dup, &payload, flags, &target.raw) {
+        Ok(n) => n,
+        Err(err) => {
+            let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+            return send_errno(listener_fd, notif.id, errno);
+        }
     };
-    if sent < 0 {
-        let err = std::io::Error::last_os_error();
-        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-        return send_errno(listener_fd, notif.id, errno);
-    }
     send_result(listener_fd, notif.id, i64::try_from(sent).unwrap_or(0))
 }
 /// Emulate `sendmsg(sockfd, msg, flags)` on a duplicated tracee socket.
@@ -646,14 +617,16 @@ fn enhance_sendmsg_emulation(
         msg.msg_name = target.raw.as_ptr().cast::<libc::c_void>().cast_mut();
         msg.msg_namelen = u32::try_from(target.raw.len()).unwrap_or(u32::MAX);
     }
-    // SAFETY: `dup` is a live OwnedFd. `msg` is a broker-owned msghdr with
-    // iovecs and a captured sockaddr. The kernel reads it for the call.
-    let rc = unsafe { libc::sendmsg(dup.as_raw_fd(), &raw const msg, flags) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-        return send_errno(listener_fd, notif.id, errno);
-    }
+    // SAFETY: `msg` is a broker-owned msghdr with iovecs and a captured
+    // sockaddr. All pointers are valid for the kernel call.
+    #[allow(unsafe_code)]
+    let rc = match unsafe { sendmsg_raw(dup, &msg, flags) } {
+        Ok(n) => n,
+        Err(err) => {
+            let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+            return send_errno(listener_fd, notif.id, errno);
+        }
+    };
     send_result(listener_fd, notif.id, i64::try_from(rc).unwrap_or(0))
 }
 

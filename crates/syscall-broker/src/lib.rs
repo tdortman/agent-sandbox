@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, ProcessIds, RequestContext, ResourceAccess,
     ResourceCheckReply, ResourceKind, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
