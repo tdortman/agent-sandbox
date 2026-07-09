@@ -551,7 +551,7 @@ in
         else if lib.hasPrefix "~/" path then
           ''_asbx_hide="$HOME/${lib.removePrefix "~/" path}"''
         else
-          ''_asbx_hide=${lib.escapeShellArg path}'';
+          "_asbx_hide=${lib.escapeShellArg path}";
       hidePathsScript = lib.concatMapStringsSep "\n" (path: ''
         ${hidePathAssignment path}
         if [[ -d "$_asbx_hide" ]]; then
