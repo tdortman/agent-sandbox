@@ -133,6 +133,10 @@ let
     cfg.network.enable || cfg.gates.filesystem.enable || cfg.sudoPolicy == "approve";
 
   sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
+  runtime = agentSandboxLib.mkRuntime {
+    rootCfg = cfg;
+    netnsEnter = "${config.security.wrapperDir}/agent-sandbox-enter";
+  };
 
   mergePackageMounts =
     pkgCfg:
@@ -145,15 +149,6 @@ let
       hiddenPaths = lib.unique (cfg.hiddenPaths ++ pkgCfg.hiddenPaths);
     };
 
-  networkConfig =
-    if cfg.network.enable then
-      {
-        netnsName = cfg.network.netnsName;
-        netnsEnter = "${config.security.wrapperDir}/agent-sandbox-enter";
-      }
-    else
-      null;
-
   sudoGuardPkg = import ./sudo-guard.nix {
     inherit pkgs policyPkg;
     policy = cfg.sudoPolicy;
@@ -165,10 +160,13 @@ let
       mergePackageMounts value
       // {
         inherit (cfg.wrapping) replaceOriginalBinary unsafeAliasPrefix;
-        policySocket = cfg.policy.socketPath;
-        sandboxPolicySocket = cfg.policy.sandboxSocketPath;
-        policyContext = policyContextEnabled;
-        network = networkConfig;
+        inherit runtime;
+        inherit (runtime)
+          policySocket
+          sandboxPolicySocket
+          policyContext
+          network
+          ;
         sudoGuard = sudoGuardPkg;
       }
       // lib.optionalAttrs cfg.gates.filesystem.enable {

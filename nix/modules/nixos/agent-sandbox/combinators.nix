@@ -276,7 +276,10 @@ in
   ]);
 
   agent-sandbox-context-env =
-    { sandboxPolicySocket, ... }:
+    { runtime, ... }:
+    let
+      inherit (runtime) sandboxPolicySocket;
+    in
     compose [
       (set-env "AGENT_SANDBOX_POLICY_SOCKET" sandboxPolicySocket)
       (add-runtime ''

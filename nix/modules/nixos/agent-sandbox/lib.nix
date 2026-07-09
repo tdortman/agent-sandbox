@@ -120,10 +120,7 @@ let
       blockEnvVars ? defaultBlockEnvVars,
       exposeWorkingDirectory ? true,
       extraBwrapArgs ? [ ],
-      policySocket ? null,
-      sandboxPolicySocket ? null,
-      policyContext ? false,
-      network ? null,
+      runtime ? null,
       sudoGuard ? null,
       ...
     }@cfg:
@@ -162,10 +159,10 @@ let
       (home-readonly-mounts homeReadonly)
       (home-readwrite-mounts homeReadwrite)
     ]
-    ++ lib.optionals (policyContext && policySocket != null && sandboxPolicySocket != null) [
-      (agent-sandbox-context-env { inherit policySocket sandboxPolicySocket; })
+    ++ lib.optionals (runtime != null && runtime.policyContext) [
+      (agent-sandbox-context-env { inherit runtime; })
     ]
-    ++ lib.optionals (network != null) [
+    ++ lib.optionals (runtime != null && runtime.network != { }) [
       (if dynamicFs then c.agent-sandbox-restricted-net-dynamic else agent-sandbox-restricted-net)
     ]
     ++ lib.optionals (sudoGuard != null) [
@@ -209,6 +206,7 @@ in
       sandboxPolicySocket ? null,
       policyContext ? false,
       network ? null,
+      runtime ? null,
       sudoGuard ? null,
       fsArmPkg ? null,
       syscallArmPkg ? null,
@@ -301,9 +299,7 @@ in
             blockEnvVars
             exposeWorkingDirectory
             extraBwrapArgs
-            policySocket
-            policyContext
-            network
+            runtime
             sudoGuard
             fsArmPkg
             syscallArmPkg
