@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+use super::decision::{
+    NormalizedNotification, ResponsePlan, RpcPolicyAdapter, decide, normalize_or_failure,
+};
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, NetworkTarget, ResourceTarget, SeccompNotif, SyscallTarget, check_filesystem,
-    check_resource, check_target, is_transient_tracee_io_err, notification_arch_valid,
-    revalidate_filesystem_mutation, send_continue, send_errno, target_from_notification,
+    SeccompNotif, notification_arch_valid, revalidate_filesystem_mutation, send_continue,
+    send_errno,
 };
 use tracing::{debug, info, warn};
 
@@ -25,201 +27,114 @@ pub async fn dispatch_notification(
         super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
         return;
     }
-    match target_from_notification(notif) {
-        Ok(Some(SyscallTarget::Network(target))) => {
-            dispatch_network_target(
-                policy_socket,
-                sandbox_session_id,
-                listener_fd,
-                notif,
-                &target,
-                timeout,
-            )
-            .await;
+
+    let facts = normalize_or_failure(notif);
+    if let NormalizedNotification::ClassificationFailure { error, transient } = &facts {
+        if *transient {
+            debug!(error = %error, syscall = notif.data.nr, pid = notif.pid, "could not read tracee syscall args; continuing");
+        } else if super::is_open_family_syscall(notif.data.nr) {
+            info!(error = %error, syscall = notif.data.nr, pid = notif.pid, "failed to classify open-family syscall; denying before fanotify");
+        } else {
+            warn!(error = %error, syscall = notif.data.nr, pid = notif.pid, "failed to parse syscall target");
         }
-        Ok(Some(SyscallTarget::Resource(target))) => {
-            dispatch_resource_target(
-                policy_socket,
-                sandbox_session_id,
-                listener_fd,
-                notif,
-                &target,
-                timeout,
-            )
-            .await;
+    }
+    if let NormalizedNotification::Deny { errno } = &facts {
+        if super::is_open_family_syscall(notif.data.nr) {
+            info!(
+                syscall = notif.data.nr,
+                errno,
+                pid = notif.pid,
+                "denying open-family syscall before fanotify"
+            );
+        } else {
+            debug!(syscall = notif.data.nr, errno, "denying syscall with errno");
         }
-        Ok(Some(SyscallTarget::Filesystem(target))) => {
-            if let Err(err) = dispatch_filesystem_target(
-                policy_socket,
-                sandbox_session_id,
-                listener_fd,
-                notif,
-                &target,
-                timeout,
-            )
-            .await
-            {
-                warn!(error = %err, target = ?target, "filesystem dispatch failed");
-                let _ = send_errno(listener_fd, notif.id, libc::EACCES);
-            }
-        }
-        Ok(Some(SyscallTarget::Errno(errno))) => {
-            if super::is_open_family_syscall(notif.data.nr) {
-                tracing::info!(
-                    syscall = notif.data.nr,
-                    errno,
-                    pid = notif.pid,
-                    "denying open-family syscall before fanotify"
-                );
+    }
+
+    let policy_socket_bypass = matches!(
+        &facts,
+        NormalizedNotification::Target {
+            target: agent_sandbox_syscall_broker::SyscallTarget::Resource(target),
+        } if super::is_policy_socket_bypass(target, policy_socket)
+    );
+
+    let adapter = RpcPolicyAdapter {
+        policy_socket,
+        sandbox_session_id,
+        pid: notif.pid,
+        timeout,
+    };
+    let plan = decide(&adapter, facts).await;
+    execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
+}
+
+fn execute_response_plan(
+    plan: ResponsePlan,
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    policy_socket_bypass: bool,
+) {
+    match plan {
+        ResponsePlan::Continue => {
+            if policy_socket_bypass {
+                debug!("bypassing policy socket (infrastructure connect)");
             } else {
-                debug!(syscall = notif.data.nr, errno, "denying syscall with errno");
+                debug!(syscall = notif.data.nr, "continuing non-gated syscall");
             }
+            super::log_notification_response(send_continue(listener_fd, notif.id));
+        }
+        ResponsePlan::DenyErrno { errno } => {
             super::log_notification_response(send_errno(listener_fd, notif.id, errno));
         }
-        Ok(Some(SyscallTarget::None) | None) => {
-            debug!(syscall = notif.data.nr, "continuing non-gated syscall");
-            if let Err(err) = send_continue(listener_fd, notif.id) {
-                if err.raw_os_error() == Some(libc::ENOENT) {
-                    debug!(error = %err, "seccomp notification response failed");
-                } else {
-                    warn!(error = %err, "seccomp notification response failed");
-                }
-            }
+        ResponsePlan::ResourcePolicyDenied {
+            target,
+            source,
+            error,
+        } => {
+            info!(target = ?target, source = ?source, error = ?error, "resource syscall denied by policy");
+            super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
         }
-        Err(err) => {
-            if is_transient_tracee_io_err(&err) {
-                debug!(
-                    error = %err,
-                    syscall = notif.data.nr,
-                    pid = notif.pid,
-                    "could not read tracee syscall args; continuing"
-                );
-                super::log_notification_response(send_continue(listener_fd, notif.id));
-            } else if super::is_open_family_syscall(notif.data.nr) {
-                tracing::info!(
-                    error = %err,
-                    syscall = notif.data.nr,
-                    pid = notif.pid,
-                    "failed to classify open-family syscall; denying before fanotify"
-                );
-            } else {
-                warn!(error = %err, syscall = notif.data.nr, pid = notif.pid, "failed to parse syscall target");
-            }
-            if !is_transient_tracee_io_err(&err) {
-                let _ = send_errno(listener_fd, notif.id, libc::EACCES);
-            }
+        ResponsePlan::ResourceRpcFailure { target, error } => {
+            warn!(target = ?target, error = %error, "resource policy RPC failed");
+            super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
         }
-    }
-}
-
-async fn dispatch_network_target(
-    policy_socket: &Path,
-    sandbox_session_id: Option<&str>,
-    listener_fd: i32,
-    notif: &SeccompNotif,
-    target: &NetworkTarget,
-    timeout: Duration,
-) {
-    let allowed = check_target(
-        policy_socket,
-        target,
-        sandbox_session_id.map(str::to_owned),
-        notif.pid,
-        timeout,
-    )
-    .await;
-    let result = if allowed {
-        send_continue(listener_fd, notif.id)
-    } else {
-        debug!(target = ?target, "network check denied");
-        send_errno(listener_fd, notif.id, libc::EACCES)
-    };
-    super::log_notification_response(result);
-}
-
-async fn dispatch_resource_target(
-    policy_socket: &Path,
-    sandbox_session_id: Option<&str>,
-    listener_fd: i32,
-    notif: &SeccompNotif,
-    target: &ResourceTarget,
-    timeout: Duration,
-) {
-    if super::is_policy_socket_bypass(target, policy_socket) {
-        debug!(target = ?target, "bypassing policy socket (infrastructure connect)");
-        super::log_notification_response(send_continue(listener_fd, notif.id));
-        return;
-    }
-    let reply = match check_resource(
-        policy_socket,
-        target,
-        sandbox_session_id.map(str::to_owned),
-        notif.pid,
-        timeout,
-    )
-    .await
-    {
-        Ok(reply) => reply,
-        Err(err) => {
-            warn!(error = %err, target = ?target, "resource check RPC failed");
-            let _ = send_errno(listener_fd, notif.id, libc::EACCES);
-            return;
-        }
-    };
-    if !reply.allowed {
-        if matches!(target.kind, ResourceKind::Device) {
-            info!(
-                path = %target.path.display(),
-                source = %reply.source,
-                pid = notif.pid,
-                "device open denied in syscall broker before fanotify"
-            );
-        } else {
-            debug!(target = ?target, source = %reply.source, "resource check denied");
-        }
-        let _ = send_errno(listener_fd, notif.id, libc::EACCES);
-        return;
-    }
-    if let Err(err) = super::emulate_resource(listener_fd, notif, target) {
-        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-        if matches!(target.kind, ResourceKind::Device) {
-            info!(
-                error = %err,
-                errno,
-                path = %target.path.display(),
-                pid = notif.pid,
-                "device open emulation failed in syscall broker before fanotify"
-            );
-        } else {
-            debug!(error = %err, errno, target = ?target, "resource emulation failed");
-        }
-        let _ = send_errno(listener_fd, notif.id, errno);
-    }
-}
-
-async fn dispatch_filesystem_target(
-    policy_socket: &Path,
-    sandbox_session_id: Option<&str>,
-    listener_fd: i32,
-    notif: &SeccompNotif,
-    target: &FilesystemTarget,
-    timeout: Duration,
-) -> std::io::Result<()> {
-    for (path, access) in &target.checks {
-        let reply = check_filesystem(
-            policy_socket,
+        ResponsePlan::FilesystemPolicyDenied {
+            errno,
             path,
-            *access,
-            sandbox_session_id.map(str::to_owned),
-            notif.pid,
-            timeout,
-        )
-        .await?;
-        if !reply.allowed {
-            debug!(path = %path.display(), ?access, source = %reply.source, "filesystem check denied");
-            return send_errno(listener_fd, notif.id, libc::EACCES);
+            access,
+            source,
+            error,
+        } => {
+            info!(path = %path.display(), access = ?access, source = ?source, error = ?error, "filesystem syscall denied by policy");
+            super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+        }
+        ResponsePlan::FilesystemRpcFailure {
+            errno,
+            path,
+            access,
+            error,
+        } => {
+            warn!(path = %path.display(), access = ?access, error = %error, "filesystem policy RPC failed");
+            super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+        }
+        ResponsePlan::EmulateResource { target } => {
+            if let Err(err) = super::emulate_resource(listener_fd, notif, &target) {
+                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+                if matches!(target.kind, ResourceKind::Device) {
+                    info!(error = %err, errno, path = %target.path.display(), pid = notif.pid, "device open emulation failed in syscall broker before fanotify");
+                } else {
+                    debug!(error = %err, errno, target = ?target, "resource emulation failed");
+                }
+                super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+            }
+        }
+        ResponsePlan::RevalidateFilesystemThenContinue { target } => {
+            if let Err(err) = revalidate_filesystem_mutation(notif, &target) {
+                warn!(error = %err, target = ?target, "filesystem dispatch failed");
+                super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
+            } else {
+                super::log_notification_response(send_continue(listener_fd, notif.id));
+            }
         }
     }
-    revalidate_filesystem_mutation(notif, target)?;
-    send_continue(listener_fd, notif.id)
 }
