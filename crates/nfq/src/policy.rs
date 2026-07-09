@@ -50,7 +50,8 @@ pub async fn check_destination(
         ctx: request_context(
             &ctx.paths,
             ctx.ids,
-            std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
+            args.src_pid
+                .and_then(agent_sandbox_core::sandbox_session_id_from_pid),
         ),
     };
 

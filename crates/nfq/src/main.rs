@@ -5,18 +5,19 @@
 //! DNS forwarder's in-memory cache, asks policyd for a verdict, then accepts or
 //! actively rejects the packet.
 
+mod attribution;
 mod owner;
 mod packet;
 mod policy;
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
-    lookup_dns_cache, mappings_from_response,
+    lookup_dns_cache, mappings_from_response, sandbox_session_id_from_pid,
 };
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -91,9 +92,8 @@ struct Cli {
 }
 struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
+    attribution: Arc<Mutex<attribution::SessionAttribution>>,
     approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
-    #[allow(dead_code)]
-    approved_bindings_path: PathBuf,
     cache_path: Option<PathBuf>,
     dns_server_ip: IpAddr,
     nft_binary: String,
@@ -116,8 +116,8 @@ impl NfqState {
         Self {
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
-            approved_bindings_path,
             cache_path,
+            attribution: Arc::new(Mutex::new(attribution::SessionAttribution::new())),
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
         }
@@ -129,17 +129,33 @@ impl NfqState {
     /// forwarder has already written the mapping by the time the SYN arrives
     /// because the app cannot connect until DNS resolution completes. Returns
     /// the raw IP if the cache still has no entry (no PTR fallback).
-    fn resolve_host(&self, ip: &str) -> String {
+    fn resolve_host_for_session(&self, ip: &str, session_id: Option<&str>) -> String {
         if let Ok(cache) = self.dns_cache.lock()
             && let Some(host) = cache.lookup(ip)
         {
+            if let Some(session_id) = session_id
+                && let Ok(mut attribution) = self.attribution.lock()
+            {
+                attribution.remember(session_id, ip, &host);
+            }
             return host;
+        }
+        if let Some(session_id) = session_id
+            && let Ok(attribution) = self.attribution.lock()
+            && let Some(host) = attribution.lookup(session_id, ip)
+        {
+            return host.to_owned();
         }
         let Some(host) = lookup_dns_cache(ip, self.cache_path.as_deref()) else {
             return ip.to_string();
         };
         if let Ok(mut cache) = self.dns_cache.lock() {
             cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
+        }
+        if let Some(session_id) = session_id
+            && let Ok(mut attribution) = self.attribution.lock()
+        {
+            attribution.remember(session_id, ip, &host);
         }
         host
     }
@@ -480,14 +496,15 @@ where
     // Resolve hostname and ask policyd for every policy-boundary packet.
     // No long-lived per-host verdict cache: policy file edits take effect
     // on the next connection within the same daemon session.
-    let hostname = state.resolve_host(&meta.dst_ip.to_string());
+    let src_pid = owner::pid_from_src_port(meta.protocol, meta.src_ip, meta.src_port);
+    let session_id = src_pid.and_then(sandbox_session_id_from_pid);
+    let hostname = state.resolve_host_for_session(&meta.dst_ip.to_string(), session_id.as_deref());
     let dst_ip = meta.dst_ip.to_string();
     let aliases = state
         .approved_bindings
         .lock()
         .map(|bindings| bindings.aliases(&dst_ip))
         .unwrap_or_default();
-    let src_pid = owner::pid_from_src_port(meta.protocol, meta.src_ip, meta.src_port);
     let result = check(
         policy_socket,
         &hostname,
@@ -601,10 +618,10 @@ mod tests {
                 None::<PathBuf>,
                 DEFAULT_MAX_TTL,
             ))),
+            attribution: Arc::new(Mutex::new(attribution::SessionAttribution::new())),
             approved_bindings: Arc::new(std::sync::Mutex::new(ApprovedBindings::load(
                 &approved_bindings_path,
             ))),
-            approved_bindings_path,
             cache_path: None,
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
@@ -1051,7 +1068,7 @@ mod tests {
     #[test]
     fn resolve_host_cache_miss_returns_raw_ip_no_ptr() {
         let state = state_for_tests();
-        let result = state.resolve_host("93.184.216.34");
+        let result = state.resolve_host_for_session("93.184.216.34", None);
         assert_eq!(result, "93.184.216.34");
     }
 
@@ -1063,7 +1080,7 @@ mod tests {
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.com", 300);
-        let result = state.resolve_host("93.184.216.34");
+        let result = state.resolve_host_for_session("93.184.216.34", None);
         assert_eq!(result, "example.com");
     }
 
@@ -1083,7 +1100,7 @@ mod tests {
         let mut state = state_for_tests();
         state.cache_path = Some(path.clone());
 
-        let result = state.resolve_host("104.20.23.154");
+        let result = state.resolve_host_for_session("104.20.23.154", None);
 
         assert_eq!(result, "example.com");
         assert_eq!(
@@ -1096,6 +1113,49 @@ mod tests {
             Some("example.com")
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn disk_mapping_survives_dns_cache_expiry_only_for_attributed_session() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "agent-sandbox-nfq-dns-attribution-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut writer = DnsCache::new(Some(&path), DEFAULT_MAX_TTL);
+        writer.remember("104.20.23.154", "example.com", 300);
+        let mut state = state_for_tests();
+        state.cache_path = Some(path.clone());
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
+            "example.com"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("104.20.23.154", "temporary.example", 1);
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-a")),
+            "example.com"
+        );
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", Some("session-b")),
+            "104.20.23.154"
+        );
+        assert_eq!(
+            state.resolve_host_for_session("104.20.23.154", None),
+            "104.20.23.154"
+        );
     }
 
     #[test]
