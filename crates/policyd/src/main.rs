@@ -26,9 +26,8 @@ use clap::Parser;
         agent-sandbox-policyd \\\n\
             --socket /run/agent-sandbox/policy.sock \\\n\
             --declarative /home/user/.config/agent-sandbox/declarative.json\n\n\
-        # Enable interactive approval with a longer timeout and a Nix expression export.\n\
+        # Use interactive approval with a longer timeout and a Nix expression export.\n\
         agent-sandbox-policyd \\\n\
-            --interactive-approval \\\n\
             --approval-timeout 600 \\\n\
             --export-nix /var/lib/agent-sandbox/exported-policy.nix"
 )]
@@ -74,7 +73,7 @@ struct Cli {
     approval_timeout: f64,
 
     /// Allow UI clients to receive interactive approval prompts. When disabled, all non-declarative requests are denied without prompting. Useful for headless or CI sandboxes.
-    #[arg(long, default_value_t = true)]
+    #[arg(long = "no-interactive-approval", action = clap::ArgAction::SetFalse, default_value_t = true)]
     interactive_approval: bool,
 
     /// Path to the "agent-sandbox-ui" binary. If unset, the daemon falls back to the env var `AGENT_SANDBOX_UI_SPAWN_CMD`, then to a built-in default. Used when policyd needs to spawn a transient UI client for a request that arrived with no registered UI.
@@ -128,4 +127,81 @@ async fn main() -> Result<(), PolicydError> {
     let server = PolicyServer::new(store.clone(), host_socket, sandbox_socket);
     server.run().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_defaults_preserve_standalone_fallbacks() {
+        let cli = Cli::try_parse_from(["agent-sandbox-policyd"])
+            .expect("standalone invocation has valid defaults");
+        assert_eq!(cli.socket, PathBuf::from("/run/agent-sandbox/policy.sock"));
+        assert_eq!(
+            cli.sandbox_socket,
+            PathBuf::from("/run/agent-sandbox/sandbox-policy.sock")
+        );
+        assert_eq!(
+            cli.declarative,
+            PathBuf::from("/etc/agent-sandbox/declarative.json")
+        );
+        assert_eq!(
+            cli.export_json,
+            PathBuf::from("/var/lib/agent-sandbox/exported-policy.json")
+        );
+        assert_eq!(cli.export_nix, "");
+        assert!((cli.approval_timeout - 300.0).abs() < f64::EPSILON);
+        assert!(cli.interactive_approval);
+        assert_eq!(cli.ui_spawn_cmd, None);
+        assert_eq!(cli.fs_monitor_cmd, None);
+        assert_eq!(cli.syscall_broker_cmd, None);
+    }
+
+    #[test]
+    fn cli_accepts_nix_supplied_launch_facts() {
+        let cli = Cli::try_parse_from([
+            "agent-sandbox-policyd",
+            "--socket",
+            "/run/test/policy.sock",
+            "--sandbox-socket",
+            "/run/test/sandbox-policy.sock",
+            "--declarative",
+            "/etc/test/declarative.json",
+            "--export-json",
+            "/var/lib/test/exported-policy.json",
+            "--export-nix",
+            "/var/lib/test/policy.nix",
+            "--approval-timeout",
+            "42.5",
+            "--no-interactive-approval",
+            "--ui-spawn-cmd",
+            "/bin/test-ui",
+            "--fs-monitor-cmd",
+            "/bin/test-fsmon",
+            "--syscall-broker-cmd",
+            "/bin/test-broker",
+        ])
+        .expect("explicit launch facts parse");
+        assert_eq!(cli.socket, PathBuf::from("/run/test/policy.sock"));
+        assert_eq!(
+            cli.sandbox_socket,
+            PathBuf::from("/run/test/sandbox-policy.sock")
+        );
+        assert_eq!(cli.declarative, PathBuf::from("/etc/test/declarative.json"));
+        assert_eq!(
+            cli.export_json,
+            PathBuf::from("/var/lib/test/exported-policy.json")
+        );
+        assert_eq!(cli.export_nix, "/var/lib/test/policy.nix");
+        assert!((cli.approval_timeout - 42.5).abs() < f64::EPSILON);
+        assert!(!cli.interactive_approval);
+        assert_eq!(cli.ui_spawn_cmd, Some(PathBuf::from("/bin/test-ui")));
+        assert_eq!(cli.fs_monitor_cmd, Some(PathBuf::from("/bin/test-fsmon")));
+        assert_eq!(
+            cli.syscall_broker_cmd,
+            Some(PathBuf::from("/bin/test-broker"))
+        );
+    }
 }
