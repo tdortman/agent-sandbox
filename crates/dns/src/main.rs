@@ -514,4 +514,49 @@ mod tests {
         assert_eq!(mappings[0].ip, "93.184.216.34");
         assert_eq!(mappings[1].ip, "93.184.216.35");
     }
+    #[test]
+    fn cli_defaults_preserve_standalone_fallbacks() {
+        let args = Args::try_parse_from(["agent-sandbox-dns-forwarder"])
+            .expect("standalone invocation has valid defaults");
+        assert_eq!(args.listen_host, "169.254.100.1");
+        assert_eq!(args.cache_path, PathBuf::from(DEFAULT_CACHE_PATH));
+        assert_eq!(
+            args.push_socket,
+            PathBuf::from("/run/agent-sandbox/dns-push.sock")
+        );
+        assert_eq!(
+            args.forward_target,
+            "127.0.0.53:53"
+                .parse::<SocketAddr>()
+                .expect("valid default forward target")
+        );
+    }
+
+    #[test]
+    fn cli_accepts_nix_supplied_launch_facts() {
+        let args = Args::try_parse_from([
+            "agent-sandbox-dns-forwarder",
+            "--listen-host",
+            "192.0.2.10",
+            "--cache-path",
+            "/var/lib/test/dns-cache.json",
+            "--push-socket",
+            "/run/test/dns-push.sock",
+            "--forward-target",
+            "192.0.2.53:53",
+        ])
+        .expect("explicit launch facts parse");
+        assert_eq!(args.listen_host, "192.0.2.10");
+        assert_eq!(
+            args.cache_path,
+            PathBuf::from("/var/lib/test/dns-cache.json")
+        );
+        assert_eq!(args.push_socket, PathBuf::from("/run/test/dns-push.sock"));
+        assert_eq!(
+            args.forward_target,
+            "192.0.2.53:53"
+                .parse::<SocketAddr>()
+                .expect("valid test forward target")
+        );
+    }
 }
