@@ -117,9 +117,26 @@ impl NfqState {
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
             cache_path,
-            attribution: Arc::new(Mutex::new(attribution::SessionAttribution::new())),
+            attribution: Arc::new(Mutex::new(attribution::SessionAttribution::load(
+                attribution::SESSION_ATTRIBUTION_PATH,
+            ))),
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
+        }
+    }
+
+    fn remember_attribution(&self, session_id: &str, ip: &str, hostname: &str) {
+        let Ok(mut attribution) = self.attribution.lock() else {
+            return;
+        };
+        if let Err(error) = attribution.remember(session_id, ip, hostname) {
+            warn!(
+                session_id,
+                ip,
+                hostname,
+                error = %error,
+                "failed to persist session hostname attribution"
+            );
         }
     }
 
@@ -133,10 +150,8 @@ impl NfqState {
         if let Ok(cache) = self.dns_cache.lock()
             && let Some(host) = cache.lookup(ip)
         {
-            if let Some(session_id) = session_id
-                && let Ok(mut attribution) = self.attribution.lock()
-            {
-                attribution.remember(session_id, ip, &host);
+            if let Some(session_id) = session_id {
+                self.remember_attribution(session_id, ip, &host);
             }
             return host;
         }
@@ -152,10 +167,8 @@ impl NfqState {
         if let Ok(mut cache) = self.dns_cache.lock() {
             cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
         }
-        if let Some(session_id) = session_id
-            && let Ok(mut attribution) = self.attribution.lock()
-        {
-            attribution.remember(session_id, ip, &host);
+        if let Some(session_id) = session_id {
+            self.remember_attribution(session_id, ip, &host);
         }
         host
     }
@@ -493,8 +506,8 @@ where
     // on the next connection within the same daemon session.
     let src_pid = owner::pid_from_src_port(meta.protocol, meta.src_ip, meta.src_port);
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
-    let hostname = state.resolve_host_for_session(&meta.dst_ip.to_string(), session_id.as_deref());
     let dst_ip = meta.dst_ip.to_string();
+    let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
     let aliases = state
         .approved_bindings
         .lock()
@@ -591,7 +604,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::process::ExitStatusExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -600,6 +613,10 @@ mod tests {
 
     const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
     fn state_for_tests() -> NfqState {
+        state_for_tests_with_attribution_path(None)
+    }
+
+    fn state_for_tests_with_attribution_path(attribution_path: Option<&Path>) -> NfqState {
         let mut approved_bindings_path = std::env::temp_dir();
         approved_bindings_path.push(format!(
             "agent-sandbox-nfq-bindings-{}-{}.json",
@@ -608,12 +625,16 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
+        let attribution = attribution_path.map_or_else(
+            attribution::SessionAttribution::new,
+            attribution::SessionAttribution::load,
+        );
         NfqState {
             dns_cache: Arc::new(std::sync::Mutex::new(DnsCache::new(
                 None::<PathBuf>,
                 DEFAULT_MAX_TTL,
             ))),
-            attribution: Arc::new(Mutex::new(attribution::SessionAttribution::new())),
+            attribution: Arc::new(Mutex::new(attribution)),
             approved_bindings: Arc::new(std::sync::Mutex::new(ApprovedBindings::load(
                 &approved_bindings_path,
             ))),
@@ -1151,6 +1172,33 @@ mod tests {
             state.resolve_host_for_session("104.20.23.154", None),
             "104.20.23.154"
         );
+    }
+    #[test]
+    fn resolve_host_uses_persisted_attribution_after_nfqueue_restart() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let attribution_path = std::env::temp_dir().join(format!(
+            "agent-sandbox-nfq-restart-attribution-{}-{stamp}.json",
+            std::process::id()
+        ));
+        let mut writer = attribution::SessionAttribution::load(&attribution_path);
+        writer
+            .remember("session-a", "93.184.216.34", "example.com")
+            .expect("persist attribution");
+
+        let restarted = state_for_tests_with_attribution_path(Some(&attribution_path));
+        assert_eq!(
+            restarted.resolve_host_for_session("93.184.216.34", Some("session-a")),
+            "example.com"
+        );
+        assert_eq!(
+            restarted.resolve_host_for_session("93.184.216.34", Some("session-b")),
+            "93.184.216.34"
+        );
+
+        std::fs::remove_file(attribution_path).expect("remove attribution state");
     }
 
     #[test]
