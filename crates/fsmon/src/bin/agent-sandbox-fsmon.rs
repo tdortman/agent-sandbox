@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::{fs, io, process};
 
-use agent_sandbox_core::FileAccess;
+use agent_sandbox_core::{FileAccess, open_flags_to_file_access};
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser;
 
@@ -327,37 +327,6 @@ fn resolve_blocked_open_path(
     })
 }
 
-/// Map `open(2)`/`openat(2)` flag bits to policy access.
-///
-/// Uses `O_ACCMODE` per `fcntl(2)`; `creat(2)` is handled separately as
-/// always write-equivalent (`O_WRONLY|O_CREAT|O_TRUNC`).
-const fn open_flags_to_access(flags: i32) -> FileAccess {
-    match flags & libc::O_ACCMODE {
-        libc::O_RDONLY => FileAccess::Read,
-        libc::O_WRONLY => FileAccess::Write,
-        _ => FileAccess::ReadWrite,
-    }
-}
-
-fn combine_access(left: FileAccess, right: FileAccess) -> FileAccess {
-    if left == right {
-        return left;
-    }
-    if left == FileAccess::All || right == FileAccess::All {
-        return FileAccess::All;
-    }
-    if left == FileAccess::ReadWrite || right == FileAccess::ReadWrite {
-        return FileAccess::ReadWrite;
-    }
-    if matches!(
-        (left, right),
-        (FileAccess::Read, FileAccess::Write) | (FileAccess::Write, FileAccess::Read)
-    ) {
-        return FileAccess::ReadWrite;
-    }
-    FileAccess::All
-}
-
 fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32> {
     let content = host_proc.read_to_string(pid, &format!("fdinfo/{fd_name}"))?;
     let flags = content
@@ -443,18 +412,18 @@ fn parse_open_syscall_access(
     let args: Vec<&str> = parts.collect();
     match nr {
         // open(const char *pathname, int flags, mode_t mode)
-        n if n == libc::SYS_open => Some(open_flags_to_access(open_flags_from_proc_arg(
+        n if n == libc::SYS_open => Some(open_flags_to_file_access(open_flags_from_proc_arg(
             args.get(1)?,
         )?)),
         // openat(int dirfd, const char *pathname, int flags, mode_t mode)
-        n if n == libc::SYS_openat => Some(open_flags_to_access(open_flags_from_proc_arg(
+        n if n == libc::SYS_openat => Some(open_flags_to_file_access(open_flags_from_proc_arg(
             args.get(2)?,
         )?)),
         // openat2(int dirfd, const char *pathname, struct open_how *how, size_t size)
         n if n == libc::SYS_openat2 => {
             let how_ptr = parse_proc_syscall_arg(args.get(2)?)?;
             let flags = read_tracee_open_how_flags(host_proc, trace_pid, how_ptr)?;
-            Some(open_flags_to_access(flags))
+            Some(open_flags_to_file_access(flags))
         }
         // creat(const char *pathname, mode_t mode) — open(2) with O_WRONLY|O_CREAT|O_TRUNC
         n if n == libc::SYS_creat => Some(FileAccess::Write),
@@ -523,8 +492,10 @@ fn process_fd_access(host_proc: &HostProc, pid: i32, event_fd: i32) -> Option<Fi
         let Ok(flags) = fdinfo_flags(host_proc, pid, fd_name) else {
             continue;
         };
-        let fd_access = open_flags_to_access(flags);
-        access = Some(access.map_or(fd_access, |current| combine_access(current, fd_access)));
+        let fd_access = open_flags_to_file_access(flags);
+        access = Some(access.map_or(fd_access, |current: FileAccess| {
+            current.combine_observed(fd_access)
+        }));
         if access == Some(FileAccess::ReadWrite) {
             return access;
         }
@@ -1014,6 +985,33 @@ mod tests {
             Some(FileAccess::Write)
         );
     }
+    #[test]
+    fn parse_openat_syscall_flags_rdonly_with_creat_is_write_semantics() {
+        let host_proc = test_host_proc();
+        let flags = libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC;
+        let content = format!(
+            "{} 0xffffffffffffff9c 0x7fff00003100 0x{flags:x} 0x1a4",
+            libc::SYS_openat
+        );
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, &content),
+            Some(FileAccess::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn parse_openat_syscall_flags_rdonly_with_trunc_is_write_semantics() {
+        let host_proc = test_host_proc();
+        let flags = libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC;
+        let content = format!(
+            "{} 0xffffffffffffff9c 0x7fff00003200 0x{flags:x} 0x1a4",
+            libc::SYS_openat
+        );
+        assert_eq!(
+            parse_open_syscall_access(&host_proc, 1, &content),
+            Some(FileAccess::ReadWrite)
+        );
+    }
 
     #[test]
     fn parse_creat_syscall_is_write() {
@@ -1067,17 +1065,6 @@ mod tests {
         let host_proc = test_host_proc();
         let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
         assert_eq!(host_proc.thread_group_id(pid), Some(pid));
-    }
-
-    #[test]
-    fn open_flags_map_to_granular_access() {
-        assert_eq!(open_flags_to_access(libc::O_RDONLY), FileAccess::Read);
-        assert_eq!(open_flags_to_access(libc::O_WRONLY), FileAccess::Write);
-        assert_eq!(open_flags_to_access(libc::O_RDWR), FileAccess::ReadWrite);
-        assert_eq!(
-            open_flags_to_access(libc::O_RDWR | libc::O_APPEND),
-            FileAccess::ReadWrite
-        );
     }
 
     #[test]
@@ -1144,15 +1131,26 @@ mod tests {
     }
 
     #[test]
-    fn combine_read_and_write_becomes_read_write() {
-        assert_eq!(
-            combine_access(FileAccess::Read, FileAccess::Write),
-            FileAccess::ReadWrite
-        );
-        assert_eq!(
-            combine_access(FileAccess::Read, FileAccess::Execute),
-            FileAccess::All
-        );
+    fn process_fd_access_combines_read_and_write_descriptors_into_read_write() {
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        let path = std::env::temp_dir().join(format!(
+            "agent-sandbox-fsmon-test-rw-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"x").expect("seed temp file");
+
+        let access = {
+            let read_file = File::open(&path).expect("open read-only temp file");
+            let _write_file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open write-only temp file");
+            process_fd_access(&host_proc, pid, read_file.as_raw_fd())
+        };
+
+        assert_eq!(access, Some(FileAccess::ReadWrite));
+        std::fs::remove_file(path).expect("remove temp file");
     }
 
     #[test]
@@ -1173,7 +1171,7 @@ mod tests {
         let mut how = [0_u8; 8];
         how.copy_from_slice(&u64::from(flags.cast_unsigned()).to_ne_bytes());
         assert_eq!(
-            open_how_flags_from_bytes(&how).map(open_flags_to_access),
+            open_how_flags_from_bytes(&how).map(open_flags_to_file_access),
             Some(FileAccess::ReadWrite)
         );
     }
