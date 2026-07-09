@@ -114,6 +114,21 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
+    fn pid_from_src_port_resolves_current_process_for_loopback_tcp_client() {
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
+        let listener_addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(listener_addr).expect("connect loopback client");
+        let (_server, _) = listener.accept().expect("accept loopback client");
+        let client_addr = client.local_addr().expect("client local address");
+
+        let resolved_pid =
+            pid_from_src_port(TransportProtocol::Tcp, client_addr.ip(), client_addr.port());
+
+        assert_eq!(resolved_pid, Some(std::process::id()));
+    }
+
+    #[test]
     fn proc_addr_field_ipv4_little_endian() {
         let field = proc_addr_field(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 443);
         assert_eq!(field, "0501A8C0:01BB");
