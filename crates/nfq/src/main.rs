@@ -174,7 +174,6 @@ fn main() {
 
     let cli = Cli::parse();
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
-
     let mut queue = match open_queue(cli.queue, cli.queue_len) {
         Ok(queue) => queue,
         Err(err) => {
@@ -185,17 +184,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-
     info!(queue = cli.queue, "nfqueue listening");
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-
     let state = NfqState::new(&cli);
     spawn_push_socket_listener(&cli.push_socket, cli.push_trusted_uid, &state);
-
     loop {
         let mut message = match queue.recv() {
             Ok(message) => message,
