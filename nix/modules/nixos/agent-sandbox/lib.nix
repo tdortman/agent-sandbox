@@ -67,6 +67,44 @@ let
         abs = lib.filter isHostMountPath paths;
       };
 
+  mkRuntime =
+    {
+      rootCfg,
+      netnsEnter ? null,
+    }:
+    let
+      inherit (rootCfg) policy network;
+      policyContext =
+        network.enable || rootCfg.gates.filesystem.enable || rootCfg.sudoPolicy == "approve";
+    in
+    {
+      inherit policyContext;
+      policySocket = policy.socketPath;
+      sandboxPolicySocket = policy.sandboxSocketPath;
+      inherit (policy)
+        exportedJson
+        exportedNix
+        interactiveApproval
+        approvalTimeout
+        autoSpawnPolicyUi
+        uiBackend
+        ;
+      network = lib.optionalAttrs network.enable {
+        inherit (network)
+          netnsName
+          vethHost
+          vethNetns
+          netnsIp
+          netnsIp6
+          netnsIp6Prefix
+          ;
+        inherit netnsEnter;
+      };
+      inherit (network) queueNumber hostIp hostIp6;
+      policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
+      inherit (network) dnsForwardTarget;
+    };
+
   buildPermissions =
     c:
     {
@@ -140,8 +178,9 @@ let
     ++ map try-dev-bind devicePaths;
 
 in
-rec {
+{
   inherit
+    mkRuntime
     defaultCommonPkgs
     defaultBlockEnvVars
     defaultRuntimeReadonlyDirs
