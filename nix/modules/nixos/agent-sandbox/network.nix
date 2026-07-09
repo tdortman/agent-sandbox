@@ -12,19 +12,22 @@ let
   cfg = config.agent-sandbox.network;
   policyEnabled = cfg.enable || rootCfg.sudoPolicy == "approve" || rootCfg.gates.filesystem.enable;
   sandboxPkg = flake.package "agent-sandbox";
+  agentSandboxLib = import ./lib.nix {
+    inherit lib;
+    inherit (flake) jail-nix;
+  };
+  runtime = agentSandboxLib.mkRuntime { inherit rootCfg; };
   policyPkg = sandboxPkg;
   enterBin = sandboxPkg;
   dnsTargetHost =
     let
-      parts = lib.splitString ":" cfg.dnsForwardTarget;
+      parts = lib.splitString ":" runtime.dnsForwardTarget;
     in
-    if builtins.length parts > 1 then builtins.elemAt parts 0 else cfg.dnsForwardTarget;
-
-  # Sandboxes query the veth gateway for DNS. The forwarder transparently
+    if builtins.length parts > 1 then builtins.elemAt parts 0 else runtime.dnsForwardTarget;
   # forwards raw DNS queries to the configured upstream resolver and writes
   # IP->hostname mappings to a shared cache for NFQUEUE prompts.
   resolvConfText = ''
-    nameserver ${cfg.hostIp}
+    nameserver ${runtime.hostIp}
     options edns0 trust-ad
   '';
 
@@ -72,10 +75,10 @@ let
         type filter hook output priority 0; policy drop;
         ct state established,related accept
         # DNS traffic to the forwarder bypasses NFQUEUE
-        ip daddr ${cfg.hostIp} udp dport 53 accept
-        ip daddr ${cfg.hostIp} tcp dport 53 accept
-        ip6 daddr ${cfg.hostIp6} udp dport 53 accept
-        ip6 daddr ${cfg.hostIp6} tcp dport 53 accept
+        ip daddr ${runtime.hostIp} udp dport 53 accept
+        ip daddr ${runtime.hostIp} tcp dport 53 accept
+        ip6 daddr ${runtime.hostIp6} udp dport 53 accept
+        ip6 daddr ${runtime.hostIp6} tcp dport 53 accept
         # NDP only: neighbor and router discovery for the veth gateway.
         icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
         # Reject denied destinations from transient reject sets
@@ -84,10 +87,10 @@ let
         ip6 daddr . tcp dport @reject_v6 reject with tcp reset
         ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
         # Queue TCP SYN and UDP for policy enforcement
-        ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
-        ip protocol udp queue num ${toString cfg.queueNumber}
-        meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString cfg.queueNumber}
-        meta nfproto ipv6 meta l4proto udp queue num ${toString cfg.queueNumber}
+        ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
+        ip protocol udp queue num ${toString runtime.queueNumber}
+        meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
+        meta nfproto ipv6 meta l4proto udp queue num ${toString runtime.queueNumber}
       }
     }
   '';
@@ -105,7 +108,7 @@ let
           "@dnsTargetHost@"
         ]
         [
-          cfg.vethHost
+          runtime.network.vethHost
           dnsTargetHost
         ]
         (builtins.readFile ./netns/host-nat.sh);
@@ -134,15 +137,15 @@ let
           "@hostNatBin@"
         ]
         [
-          cfg.netnsName
-          cfg.vethHost
-          cfg.vethNetns
-          cfg.netnsIp
-          cfg.hostIp
-          "${cfg.hostIp}/30"
-          cfg.hostIp6
-          "${cfg.hostIp6}/${toString cfg.netnsIp6Prefix}"
-          "${cfg.netnsIp6}/${toString cfg.netnsIp6Prefix}"
+          runtime.network.netnsName
+          runtime.network.vethHost
+          runtime.network.vethNetns
+          runtime.network.netnsIp
+          runtime.hostIp
+          "${runtime.hostIp}/30"
+          runtime.hostIp6
+          "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}"
+          "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}"
           nftRules
           "${hostNatPkg}/bin/agent-sandbox-host-nat"
         ]
@@ -159,8 +162,8 @@ let
           "@vethHost@"
         ]
         [
-          cfg.netnsName
-          cfg.vethHost
+          runtime.network.netnsName
+          runtime.network.vethHost
         ]
         (builtins.readFile ./netns/down.sh);
   };
@@ -213,29 +216,26 @@ lib.mkIf policyEnabled (
             [
               "${policyPkg}/bin/agent-sandbox-policyd"
               "--socket"
-              config.agent-sandbox.policy.socketPath
+              runtime.policySocket
               "--sandbox-socket"
-              config.agent-sandbox.policy.sandboxSocketPath
+              runtime.sandboxPolicySocket
               "--declarative"
               "/etc/agent-sandbox/declarative.json"
               "--export-json"
-              config.agent-sandbox.policy.exportedJson
+              runtime.exportedJson
               "--approval-timeout"
-              (toString config.agent-sandbox.policy.approvalTimeout)
+              (toString runtime.approvalTimeout)
             ]
-            ++ lib.optionals (!config.agent-sandbox.policy.interactiveApproval) [
+            ++ lib.optionals (!runtime.interactiveApproval) [
               "--no-interactive-approval"
             ]
-            ++
-              lib.optionals
-                (config.agent-sandbox.policy.autoSpawnPolicyUi && config.agent-sandbox.policy.uiBackend != "none")
-                [
-                  "--ui-spawn-cmd"
-                  "${policyPkg}/bin/agent-sandbox-ui"
-                ]
-            ++ lib.optionals (config.agent-sandbox.policy.exportedNix != "") [
+            ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
+              "--ui-spawn-cmd"
+              "${policyPkg}/bin/agent-sandbox-ui"
+            ]
+            ++ lib.optionals (runtime.exportedNix != "") [
               "--export-nix"
-              config.agent-sandbox.policy.exportedNix
+              runtime.exportedNix
             ]
             ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
               "--fs-monitor-cmd"
@@ -262,17 +262,17 @@ lib.mkIf policyEnabled (
           pkgs.systemd
           pkgs.libnotify
         ]
-        ++ lib.optionals (config.agent-sandbox.policy.uiBackend == "zenity") [
+        ++ lib.optionals (runtime.uiBackend == "zenity") [
           pkgs.zenity
         ];
         environment = {
           AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
           AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
           AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
-          AGENT_SANDBOX_UI_BACKEND = config.agent-sandbox.policy.uiBackend;
+          AGENT_SANDBOX_UI_BACKEND = runtime.uiBackend;
           AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
         }
-        // lib.optionalAttrs (config.agent-sandbox.policy.uiBackend == "zenity") {
+        // lib.optionalAttrs (runtime.uiBackend == "zenity") {
           AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
         };
       };
@@ -288,7 +288,7 @@ lib.mkIf policyEnabled (
 
       # Runtime nft INPUT accepts are not enough when the host firewall has its own
       # later input chains. Open bridge ports declaratively on the veth interface.
-      networking.firewall.interfaces.${cfg.vethHost} = {
+      networking.firewall.interfaces.${runtime.network.vethHost} = {
         allowedTCPPorts = lib.mkAfter [ 53 ];
         allowedUDPPorts = lib.mkAfter [ 53 ];
       };
@@ -341,11 +341,11 @@ lib.mkIf policyEnabled (
             ExecStart = lib.escapeShellArgs [
               "${policyPkg}/bin/agent-sandbox-dns-forwarder"
               "--listen-host"
-              cfg.hostIp
+              runtime.hostIp
               "--listen-port"
               "53"
               "--forward-target"
-              cfg.dnsForwardTarget
+              runtime.dnsForwardTarget
               "--cache-path"
               "/run/agent-sandbox/dns-cache.json"
               "--push-socket"
@@ -372,19 +372,19 @@ lib.mkIf policyEnabled (
           ];
           serviceConfig = {
             Type = "simple";
-            NetworkNamespacePath = "/run/netns/${cfg.netnsName}";
+            NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             ExecStart = lib.escapeShellArgs [
               "${policyPkg}/bin/agent-sandbox-nfq"
               "--queue"
-              (toString cfg.queueNumber)
+              (toString runtime.queueNumber)
               "--policy-socket"
-              config.agent-sandbox.policy.sandboxSocketPath
+              runtime.sandboxPolicySocket
               "--policy-timeout"
-              (toString (lib.max cfg.policyTimeout config.agent-sandbox.policy.approvalTimeout))
+              (toString runtime.policyTimeout)
               "--nft-binary"
               "${pkgs.nftables}/bin/nft"
               "--dns-server-ip"
-              cfg.hostIp
+              runtime.hostIp
               "--push-socket"
               "/run/agent-sandbox/dns-push.sock"
             ];
