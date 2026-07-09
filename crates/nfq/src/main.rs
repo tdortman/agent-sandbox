@@ -1384,4 +1384,52 @@ mod tests {
             "UDP/53 to loopback must invoke policy check"
         );
     }
+    #[test]
+    fn cli_defaults_preserve_standalone_fallbacks() {
+        let cli = Cli::try_parse_from(["agent-sandbox-nfq"])
+            .expect("standalone invocation has valid defaults");
+        assert_eq!(cli.queue, 0);
+        assert_eq!(cli.policy_socket, "/run/agent-sandbox/policy.sock");
+        assert!((cli.policy_timeout - 305.0).abs() < f64::EPSILON);
+        assert_eq!(cli.nft_binary, "nft");
+        assert_eq!(
+            cli.dns_server_ip,
+            "169.254.100.1"
+                .parse::<IpAddr>()
+                .expect("valid default gateway")
+        );
+        assert_eq!(
+            cli.push_socket,
+            PathBuf::from("/run/agent-sandbox/dns-push.sock")
+        );
+    }
+
+    #[test]
+    fn cli_accepts_nix_supplied_launch_facts() {
+        let cli = Cli::try_parse_from([
+            "agent-sandbox-nfq",
+            "--queue",
+            "7",
+            "--policy-socket",
+            "/run/test/policy.sock",
+            "--policy-timeout",
+            "12.5",
+            "--nft-binary",
+            "/bin/nft-test",
+            "--dns-server-ip",
+            "192.0.2.1",
+            "--push-socket",
+            "/run/test/dns-push.sock",
+        ])
+        .expect("explicit launch facts parse");
+        assert_eq!(cli.queue, 7);
+        assert_eq!(cli.policy_socket, "/run/test/policy.sock");
+        assert!((cli.policy_timeout - 12.5).abs() < f64::EPSILON);
+        assert_eq!(cli.nft_binary, "/bin/nft-test");
+        assert_eq!(
+            cli.dns_server_ip,
+            "192.0.2.1".parse::<IpAddr>().expect("valid test gateway")
+        );
+        assert_eq!(cli.push_socket, PathBuf::from("/run/test/dns-push.sock"));
+    }
 }
