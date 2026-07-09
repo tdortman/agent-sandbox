@@ -4,9 +4,13 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, ProcessIds, RequestContext,
-    ResourceAccess, ResourceKind, SandboxPaths,
+    ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
 };
 
+/// Attacker-controlled request context as received on the wire.
+///
+/// This stays distinct from [`ResolvedRequestContext`] until dispatch applies
+/// `SO_PEERCRED` and store-side enrichment.
 #[derive(Debug, Clone, Default)]
 pub struct MergeContext {
     pub paths: SandboxPaths,
@@ -47,10 +51,10 @@ pub struct ScopeWire {
 
 impl ScopeWire {
     #[must_use]
-    pub fn from_request(ctx: &RequestContext, session_id: Option<String>) -> Self {
-        let owner_uid = ctx.uid;
+    pub fn from_resolved(ctx: &ResolvedRequestContext, session_id: Option<String>) -> Self {
+        let owner_uid = ctx.ids.uid();
         Self {
-            paths: ctx.sandbox_paths(),
+            paths: ctx.paths.clone(),
             session_id,
             owner_uid,
             sandbox_session_id: ctx.sandbox_session_id.clone(),
@@ -113,14 +117,14 @@ pub struct NetworkCheckRequest {
     pub port: u16,
     pub scheme: String,
     pub url: String,
-    pub ctx: MergeContext,
+    pub ctx: ResolvedRequestContext,
 }
 
 #[derive(Debug, Clone)]
 pub struct FilesystemCheckRequest {
     pub path: PathBuf,
     pub access: FileAccess,
-    pub ctx: MergeContext,
+    pub ctx: ResolvedRequestContext,
 }
 
 #[derive(Debug, Clone)]
@@ -128,13 +132,13 @@ pub struct ResourceCheckRequest {
     pub kind: ResourceKind,
     pub path: PathBuf,
     pub access: ResourceAccess,
-    pub ctx: MergeContext,
+    pub ctx: ResolvedRequestContext,
 }
 
 #[derive(Debug, Clone)]
 pub struct FilesystemMonitorRequest {
     pub peer_pid: u32,
-    pub ctx: MergeContext,
+    pub ctx: ResolvedRequestContext,
     pub static_allow: Vec<FilesystemRule>,
 }
 
@@ -144,7 +148,7 @@ pub struct HostApproveRequest {
     pub port: u16,
     pub scope: ApprovalScope,
     pub session_id: Option<String>,
-    pub ctx: MergeContext,
+    pub ctx: ResolvedRequestContext,
 }
 
 #[derive(Debug, Clone)]
@@ -161,5 +165,5 @@ pub struct PendingDecision {
 #[derive(Debug, Clone)]
 pub struct ElevationRequest {
     pub argv: Vec<String>,
-    pub ctx: MergeContext,
+    pub ctx: ResolvedRequestContext,
 }

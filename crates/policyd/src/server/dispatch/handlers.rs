@@ -4,31 +4,32 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_sandbox_core::{
-    ApprovalScope, RegisterUiReply, RequestContext, RpcReply, RpcRequest, SimpleOkReply,
+    ApprovalScope, RegisterUiReply, ResolvedRequestContext, RpcReply, SimpleOkReply,
     split_check_aliases,
 };
 
 use crate::error::PolicydError;
 use crate::server::dispatch::check::{CheckArgs, handle_check};
+use crate::server::dispatch::context::ResolvedRpcRequest;
 use crate::server::peer::ClientPeer;
 use crate::store::PolicyStore;
-use crate::wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire};
+use crate::wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire};
 
 pub async fn handle(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,
-    req: RpcRequest,
+    req: ResolvedRpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     match req {
-        RpcRequest::RegisterUi { ui_client: _, ctx } => {
+        ResolvedRpcRequest::RegisterUi { ctx } => {
             handle_register_ui(store, client, peer, ctx).await
         }
-        RpcRequest::UnregisterUi => {
+        ResolvedRpcRequest::UnregisterUi => {
             store.end_ui_session(client.id).await;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
-        RpcRequest::Check {
+        ResolvedRpcRequest::Check {
             host,
             connect_host,
             port,
@@ -51,26 +52,24 @@ pub async fn handle(
             )
             .await
         }
-        RpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
+        ResolvedRpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
             store
-                .check_filesystem(crate::wire::FilesystemCheckRequest {
-                    path,
-                    access,
-                    ctx: MergeContext::from(&ctx),
-                })
+                .check_filesystem(crate::wire::FilesystemCheckRequest { path, access, ctx })
                 .await,
         )),
-        RpcRequest::CheckResource {
+        ResolvedRpcRequest::CheckResource {
             kind,
             path,
             access,
             ctx,
         } => handle_check_resource(store, kind, path, access, ctx).await,
-        RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
-            handle_start_filesystem_monitor(store, peer, ctx, static_allow).await
-        }
-        RpcRequest::Elevate { argv, ctx } => handle_elevate_request(store, argv, ctx).await,
-        RpcRequest::Approve {
+        ResolvedRpcRequest::StartFilesystemMonitor {
+            peer_pid,
+            ctx,
+            static_allow,
+        } => handle_start_filesystem_monitor(store, peer_pid, ctx, static_allow).await,
+        ResolvedRpcRequest::Elevate { argv, ctx } => handle_elevate_request(store, argv, ctx).await,
+        ResolvedRpcRequest::Approve {
             id,
             scope,
             session_id,
@@ -81,19 +80,19 @@ pub async fn handle(
                 pending_id: id,
                 scope,
                 target,
-                wire: ScopeWire::from_request(&ctx, session_id),
+                wire: ScopeWire::from_resolved(&ctx, session_id),
                 client_id: client.id,
                 approver_uid: (peer.uid > 0).then_some(peer.uid),
             })
             .await),
-        RpcRequest::ApproveHost {
+        ResolvedRpcRequest::ApproveHost {
             host,
             port,
             scope,
             session_id,
             ctx,
         } => handle_approve_host(store, host, port, scope, session_id, ctx).await,
-        RpcRequest::Deny {
+        ResolvedRpcRequest::Deny {
             id,
             scope,
             session_id,
@@ -104,27 +103,28 @@ pub async fn handle(
                 pending_id: id,
                 scope,
                 target,
-                wire: ScopeWire::from_request(&ctx, session_id),
+                wire: ScopeWire::from_resolved(&ctx, session_id),
                 client_id: client.id,
                 approver_uid: (peer.uid > 0).then_some(peer.uid),
             })
             .await),
-        RpcRequest::Status { ctx } => {
-            let body = store.status(ctx.sandbox_paths()).await;
+        ResolvedRpcRequest::Status { ctx } => {
+            let body = store.status(ctx).await;
             Ok(RpcReply::Status(body))
         }
-        RpcRequest::Reload { ctx } => {
-            store.export_policy_files(ctx.sandbox_paths())?;
+        ResolvedRpcRequest::Reload { ctx } => {
+            store.export_policy_files(ctx.paths)?;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
     }
 }
+
 async fn handle_check_resource(
     store: &Arc<PolicyStore>,
     kind: agent_sandbox_core::ResourceKind,
     path: PathBuf,
     access: agent_sandbox_core::ResourceAccess,
-    ctx: RequestContext,
+    ctx: ResolvedRequestContext,
 ) -> Result<RpcReply, PolicydError> {
     Ok(RpcReply::ResourceCheck(
         store
@@ -132,44 +132,36 @@ async fn handle_check_resource(
                 kind,
                 path,
                 access,
-                ctx: MergeContext::from(&ctx),
+                ctx,
             })
             .await,
     ))
 }
+
 async fn handle_start_filesystem_monitor(
     store: &Arc<PolicyStore>,
-    peer: ClientPeer,
-    ctx: RequestContext,
+    peer_pid: u32,
+    ctx: ResolvedRequestContext,
     static_allow: Vec<agent_sandbox_core::FilesystemRule>,
 ) -> Result<RpcReply, PolicydError> {
-    // Prefer the SO_PEERCRED pid: the kernel translates it into policyd's
-    // pid namespace. `ctx.pid` is the client's own `getpid()`, which inside
-    // a `--unshare-pid` sandbox is a namespace-local pid (typically 1).
-    // Using it verbatim would make fsmon setns into /proc/1/ns/mnt — the
-    // HOST mount namespace — and mark every host mount.
-    let monitor_pid = if peer.pid > 0 {
-        peer.pid
-    } else {
-        ctx.pid.unwrap_or(0)
-    };
     Ok(RpcReply::FilesystemMonitor(
         store
             .start_filesystem_monitor(crate::wire::FilesystemMonitorRequest {
-                peer_pid: monitor_pid,
-                ctx: MergeContext::from(&ctx),
+                peer_pid,
+                ctx,
                 static_allow,
             })
             .await,
     ))
 }
+
 async fn handle_register_ui(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,
-    ctx: RequestContext,
+    ctx: ResolvedRequestContext,
 ) -> Result<RpcReply, PolicydError> {
-    let paths = ctx.sandbox_paths();
+    let paths = ctx.paths;
     let Some(sandbox_session_id) = ctx.sandbox_session_id else {
         return Err(PolicydError::UnauthorizedApprovalSession);
     };
@@ -210,17 +202,14 @@ async fn handle_register_ui(
 async fn handle_elevate_request(
     store: &Arc<PolicyStore>,
     argv: Vec<String>,
-    ctx: RequestContext,
+    ctx: ResolvedRequestContext,
 ) -> Result<RpcReply, PolicydError> {
     if argv.is_empty() {
         return Err(PolicydError::ArgvRequired);
     }
     Ok(RpcReply::Elevate(
         store
-            .request_elevation(ElevationRequest {
-                argv,
-                ctx: MergeContext::from(&ctx),
-            })
+            .request_elevation(ElevationRequest { argv, ctx })
             .await,
     ))
 }
@@ -231,7 +220,7 @@ async fn handle_approve_host(
     port: u16,
     scope: ApprovalScope,
     session_id: Option<String>,
-    ctx: RequestContext,
+    ctx: ResolvedRequestContext,
 ) -> Result<RpcReply, PolicydError> {
     if port == 0 {
         return Err(PolicydError::PortRequired);
@@ -242,7 +231,7 @@ async fn handle_approve_host(
             port,
             scope,
             session_id,
-            ctx: MergeContext::from(&ctx),
+            ctx,
         })
         .await)
 }
@@ -252,7 +241,7 @@ mod tests {
     use super::*;
     use crate::error::PolicydError;
     use crate::store::{PolicyStore, PolicydArgs, TrustedPeer};
-    use agent_sandbox_core::RequestContext;
+    use agent_sandbox_core::{ProcessIds, SandboxPaths};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UnixStream;
@@ -302,10 +291,11 @@ mod tests {
                 uid: 2000,
                 gid: 0,
             },
-            RequestContext {
-                sandbox_session_id: Some("sandbox-a".into()),
-                ..Default::default()
-            },
+            ResolvedRequestContext::new(
+                SandboxPaths::default(),
+                ProcessIds::default(),
+                Some("sandbox-a".into()),
+            ),
         )
         .await;
         assert!(

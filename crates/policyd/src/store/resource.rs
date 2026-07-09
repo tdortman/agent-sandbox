@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{ResourceAccess, ResourceCheckReply, ResourceKind, UiPush};
+use agent_sandbox_core::{ResourceAccess, ResourceCheckReply, ResourceKind, UiPush, VerdictSource};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
@@ -11,7 +11,6 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
     ResourceVerdictKey, VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::store::ui_route::UiRoute;
 use crate::wire::{ResourceCheckRequest, UiSpawnContext, UiSpawnGate};
 
 struct PendingResResult {
@@ -31,21 +30,20 @@ struct PendingCtx<'a> {
 
 impl PolicyStore {
     pub async fn check_resource(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
-        let resolved = self.resolve_context(&req.ctx);
-        if let Some(source) = self
-            .resource_allow_source(req.kind, &req.path, req.access, &resolved)
-            .await
-        {
-            if source == "deny" {
-                return ResourceCheckReply::denied("deny", req.kind, req.path.clone(), req.access);
-            }
-            return ResourceCheckReply::allowed(source, req.kind, req.path.clone(), req.access);
+        let ResourceCheckRequest {
+            kind,
+            path,
+            access,
+            ctx,
+        } = req;
+        if let Some(verdict) = self.resource_allow_source(kind, &path, access, &ctx).await {
+            return ResourceCheckReply::from_verdict(verdict, kind, path.clone(), access);
         }
         self.request_resource_approval(ResourceCheckRequest {
-            kind: req.kind,
-            path: req.path,
-            access: req.access,
-            ctx: resolved,
+            kind,
+            path,
+            access,
+            ctx,
         })
         .await
     }
@@ -57,20 +55,16 @@ impl PolicyStore {
             access,
             ctx,
         } = req;
-        let resolved = self.resolve_context(&ctx);
-        let wire_ids = resolved.ids;
-        let cwd = resolved.paths.cwd_path();
-        let home = resolved.paths.home_path();
-        let project_root = resolved.paths.project_root_path();
-        let sandbox_session_id = resolved.sandbox_session_id.clone();
-        if self
-            .resource_policy_denied(kind, &path, access, &resolved)
-            .await
-        {
-            return ResourceCheckReply::denied("deny", kind, path.clone(), access);
+        let wire_ids = ctx.ids;
+        let cwd = ctx.paths.cwd_path();
+        let home = ctx.paths.home_path();
+        let project_root = ctx.paths.project_root_path();
+        let sandbox_session_id = ctx.sandbox_session_id.clone();
+        if self.resource_policy_denied(kind, &path, access, &ctx).await {
+            return ResourceCheckReply::denied(VerdictSource::policy(), kind, path.clone(), access);
         }
         if !self.args.interactive_approval {
-            return ResourceCheckReply::denied("blocked", kind, path.clone(), access);
+            return ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access);
         }
 
         if let Some(reply) = self.check_resource_verdict_cache(kind, &path, access).await {
@@ -95,9 +89,6 @@ impl PolicyStore {
             Err(reply) => return reply,
         };
 
-        let route = UiRoute::new(cwd.clone(), project_root.clone())
-            .with_sandbox_session(sandbox_session_id.clone());
-
         if result.is_new {
             let push = UiPush::ResourceRequest {
                 id: result.id.clone(),
@@ -108,9 +99,9 @@ impl PolicyStore {
                 home: home.clone(),
                 project_root: project_root.clone(),
             };
-            self.notify_standalone_ui(&route, &push).await;
+            self.notify_standalone_ui(&ctx, &push).await;
 
-            if !self.has_standalone_ui_for_route(&route).await {
+            if !self.has_standalone_ui_for_context(&ctx).await {
                 let mut spawn_uid = wire_ids.uid();
                 if spawn_uid.is_none_or(|u| u == 0)
                     && let Some(h) = &home
@@ -135,7 +126,7 @@ impl PolicyStore {
             }
         }
 
-        self.await_resource_verdict(&route, &result.id, kind, path, access, result.rx)
+        self.await_resource_verdict(&ctx, &result.id, kind, path, access, result.rx)
             .await
     }
 
@@ -237,7 +228,7 @@ impl PolicyStore {
 
     async fn await_resource_verdict(
         &self,
-        route: &UiRoute,
+        ctx: &agent_sandbox_core::ResolvedRequestContext,
         pending_id: &str,
         kind: ResourceKind,
         path: PathBuf,
@@ -250,7 +241,7 @@ impl PolicyStore {
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
         loop {
-            if self.has_standalone_ui_for_route(route).await {
+            if self.has_standalone_ui_for_context(ctx).await {
                 break;
             }
             let now = Instant::now();
@@ -271,14 +262,16 @@ impl PolicyStore {
                 biased;
                 () = time::sleep(sleep_dur) => {}
                 result = &mut rx => {
-                    return result.unwrap_or_else(|_| ResourceCheckReply::denied("blocked", kind, path.clone(), access));
+                    return result.unwrap_or_else(|_| ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access));
                 }
             }
         }
 
         match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
-            Ok(Err(_)) => ResourceCheckReply::denied("blocked", kind, path.clone(), access),
+            Ok(Err(_)) => {
+                ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access)
+            }
             Err(_) => {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(pending_id);
@@ -301,14 +294,14 @@ impl PolicyStore {
         path: PathBuf,
         access: ResourceAccess,
         allowed: bool,
-        source: &str,
+        source: VerdictSource,
     ) {
         let mut inner = self.inner.lock().await;
         if let Some(waiters) = inner.resource_futures.remove(pending_id) {
             let reply = if allowed {
-                ResourceCheckReply::allowed(source, kind, path.clone(), access)
+                ResourceCheckReply::allowed(source.clone(), kind, path.clone(), access)
             } else {
-                ResourceCheckReply::denied(source, kind, path.clone(), access)
+                ResourceCheckReply::denied(source.clone(), kind, path.clone(), access)
             };
             for tx in waiters {
                 let _ = tx.send(reply.clone());
@@ -319,10 +312,183 @@ impl PolicyStore {
             ResourceVerdictKey { kind, path, access },
             VerdictEntry {
                 allowed,
-                source: source.to_string(),
+                source,
                 time: Instant::now(),
             },
         );
         enforce_verdict_cache_limit(&mut inner.resource_verdict_cache);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use agent_sandbox_core::{
+        ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
+        VerdictSource,
+    };
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixStream;
+    use tokio::sync::Mutex;
+
+    use super::PolicyStore;
+    use crate::store::types::UiClient;
+    use crate::store::{PolicydArgs, UiSessionContext};
+    use crate::wire::ResourceCheckRequest;
+
+    fn test_store() -> PolicyStore {
+        PolicyStore::new(PolicydArgs {
+            host_socket: "/tmp/test.sock".into(),
+            sandbox_socket: "/tmp/test-sandbox.sock".into(),
+            declarative: "/tmp/declarative.json".into(),
+            export_json: "/tmp/export.json".into(),
+            export_nix: None,
+            approval_timeout: Duration::from_secs(30),
+            interactive_approval: true,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        })
+    }
+
+    fn unique_request(path: &str) -> ResourceCheckRequest {
+        ResourceCheckRequest {
+            kind: ResourceKind::UnixSocket,
+            path: PathBuf::from(path),
+            access: ResourceAccess::Connect,
+            ctx: ResolvedRequestContext {
+                paths: SandboxPaths::from_wire(
+                    Some("/repo".into()),
+                    Some("/home/user".into()),
+                    Some("/repo".into()),
+                ),
+                ids: ProcessIds::from_options(Some(0), Some(1000)),
+                sandbox_session_id: Some("sandbox-cap".into()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn request_resource_approval_prompts_already_registered_standalone_immediately() {
+        let store = Arc::new(test_store());
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
+        let (_, standalone_write) = a.into_split();
+        let (mut standalone_read, _) = b.into_split();
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                UiClient {
+                    session_id: "ui1".into(),
+                    writer: Arc::new(Mutex::new(standalone_write)),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                "ui1".into(),
+                UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-cap".into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let store_for_task = store.clone();
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_resource_approval(unique_request("/repo/fast.sock"))
+                .await
+        });
+
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_millis(200), standalone_read.read(&mut buf))
+            .await
+            .expect("standalone UI should receive resource prompt within 200ms")
+            .expect("read should succeed");
+        let received = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            received.contains("res:") && received.contains("/repo/fast.sock"),
+            "expected pending id and resource path in prompt, got: {received}"
+        );
+
+        let pending_id = {
+            let inner = store.inner.lock().await;
+            inner
+                .pending
+                .keys()
+                .find(|k| k.starts_with("res:"))
+                .cloned()
+                .expect("pending resource request should be tracked")
+        };
+        store
+            .finish_resource(
+                &pending_id,
+                ResourceKind::UnixSocket,
+                PathBuf::from("/repo/fast.sock"),
+                ResourceAccess::Connect,
+                true,
+                VerdictSource::policy_with_comment("test"),
+            )
+            .await;
+
+        let reply = task.await.expect("task should not panic");
+        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
+        assert_eq!(reply.source, VerdictSource::policy_with_comment("test"));
+    }
+
+    #[tokio::test]
+    async fn cli_approval_during_ui_wait_unblocks_resource_promptly() {
+        let store = Arc::new(test_store());
+        let store_for_task = store.clone();
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_resource_approval(unique_request("/repo/slow.sock"))
+                .await
+        });
+
+        let pending_id = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let inner = store.inner.lock().await;
+                if let Some(id) = inner
+                    .pending
+                    .keys()
+                    .find(|k| k.starts_with("res:"))
+                    .cloned()
+                {
+                    break id;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "request never registered a pending"
+                );
+                drop(inner);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        store
+            .finish_resource(
+                &pending_id,
+                ResourceKind::UnixSocket,
+                PathBuf::from("/repo/slow.sock"),
+                ResourceAccess::Connect,
+                true,
+                VerdictSource::policy_with_comment("cli"),
+            )
+            .await;
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("request should unblock within 2s of the CLI approval")
+            .expect("task should not panic");
+        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
+        assert_eq!(reply.source, VerdictSource::policy_with_comment("cli"));
     }
 }

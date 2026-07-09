@@ -3,7 +3,7 @@
 use agent_sandbox_core::{RpcReply, normalize_host};
 
 use crate::error::PolicydError;
-use crate::wire::{HostApproveRequest, MergeContext, NetworkScopeOp, ScopeWire};
+use crate::wire::{HostApproveRequest, NetworkScopeOp, ScopeWire};
 
 use super::super::types::PolicyStore;
 use super::DecisionAction;
@@ -24,13 +24,12 @@ impl PolicyStore {
         if port == 0 {
             return PolicydError::InvalidPort.into();
         }
-        let resolved = self.resolve_context(&ctx);
-        let wire_ids = resolved.ids;
-        let paths = resolved.paths;
-        let deny_ctx = MergeContext {
+        let wire_ids = ctx.ids;
+        let paths = ctx.paths.clone();
+        let deny_ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: paths.clone(),
             ids: wire_ids,
-            sandbox_session_id: resolved.sandbox_session_id.clone(),
+            sandbox_session_id: ctx.sandbox_session_id.clone(),
         };
         if self.policy_denied(&policy_host, port, &deny_ctx) {
             return PolicydError::HostDeniedByPolicy.into();
@@ -44,7 +43,7 @@ impl PolicyStore {
                     paths,
                     session_id,
                     owner_uid: wire_ids.uid(),
-                    sandbox_session_id: resolved.sandbox_session_id,
+                    sandbox_session_id: ctx.sandbox_session_id,
                 },
             },
             DecisionAction::Approve,

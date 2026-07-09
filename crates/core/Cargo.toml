@@ -9,14 +9,15 @@ workspace = true
 
 [dependencies]
 dns-lookup.workspace    = true
+globset.workspace       = true
 hickory-proto.workspace = true
+libc.workspace          = true
 nix                     = { workspace = true, features = ["fs", "socket", "user"] }
 serde.workspace         = true
 serde_json.workspace    = true
 thiserror.workspace     = true
 tokio                   = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 which.workspace         = true
-globset.workspace       = true
 
 [dev-dependencies]
 tempfile.workspace = true

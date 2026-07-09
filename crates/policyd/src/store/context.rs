@@ -3,14 +3,13 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, SandboxPaths,
-    home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
+    FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
+    SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
     read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
     trusted_context_from_pid, trusted_project_policy_path,
 };
 
 use crate::store::types::{SandboxSessionRegistration, TrustedPeer};
-
 use crate::wire::MergeContext;
 
 use super::types::PolicyStore;
@@ -65,29 +64,28 @@ impl PolicyStore {
             });
     }
 
-    pub fn resolve_context(&self, ctx: &MergeContext) -> MergeContext {
-        self.resolve_context_with_peer(ctx, None)
-    }
-
     pub fn resolve_context_with_peer(
         &self,
         ctx: &MergeContext,
         peer: Option<TrustedPeer>,
-    ) -> MergeContext {
+    ) -> ResolvedRequestContext {
         let Some(peer) = peer else {
-            return Self::resolve_trusted_context(ctx);
+            return Self::resolve_trusted_context(&ResolvedRequestContext::new(
+                ctx.paths.clone(),
+                ctx.ids,
+                ctx.sandbox_session_id.clone(),
+            ));
         };
         self.resolve_from_peer(ctx, peer)
     }
 
     /// Re-resolve a context that was already sanitized upstream by
-    /// [`Self::resolve_from_peer`] (called from `dispatch::context::resolve`
-    /// with the connection's `SO_PEERCRED`). Internal store methods invoke
-    /// this without a peer; the incoming paths are trusted and only missing
-    /// fields are enriched from the verified pid/uid. This must never be
-    /// reached with attacker-supplied wire paths — those are overwritten at
-    /// the dispatch boundary before any handler runs.
-    fn resolve_trusted_context(ctx: &MergeContext) -> MergeContext {
+    /// [`Self::resolve_from_peer`]. Internal store methods invoke this without
+    /// a peer. The incoming paths are trusted and only missing fields are
+    /// enriched from the verified pid and uid. This must never be reached with
+    /// attacker-supplied wire paths. Those are overwritten at the dispatch
+    /// boundary before any handler runs.
+    fn resolve_trusted_context(ctx: &ResolvedRequestContext) -> ResolvedRequestContext {
         let uid = ctx.ids.uid();
         let pid = ctx.ids.pid();
 
@@ -123,19 +121,23 @@ impl PolicyStore {
             project_root = project.project_root().map(Path::to_path_buf);
         }
 
-        MergeContext {
+        ResolvedRequestContext {
             paths: SandboxPaths::from_wire(cwd, home, project_root),
             ids: ProcessIds::from_options(pid, uid),
             sandbox_session_id,
         }
     }
 
-    fn resolve_from_peer(&self, ctx: &MergeContext, peer: TrustedPeer) -> MergeContext {
+    fn resolve_from_peer(&self, ctx: &MergeContext, peer: TrustedPeer) -> ResolvedRequestContext {
         // Host-side helpers (fsmon, syscall-broker) connect to the sandbox
         // socket as root. Their wire ctx was populated at spawn time (or carries
         // the tracee pid); peer-based home/cwd would be wrong and breaks UI spawn.
         if peer.uid == 0 {
-            return Self::resolve_trusted_context(ctx);
+            return Self::resolve_trusted_context(&ResolvedRequestContext::new(
+                ctx.paths.clone(),
+                ctx.ids,
+                ctx.sandbox_session_id.clone(),
+            ));
         }
 
         let peer = Some(peer);
@@ -217,7 +219,7 @@ impl PolicyStore {
 
         let ids = ProcessIds::from_options(verified_pid, trusted_uid);
 
-        MergeContext {
+        ResolvedRequestContext {
             paths: SandboxPaths::from_wire(cwd, home, project_root),
             ids,
             sandbox_session_id,
@@ -234,7 +236,7 @@ impl PolicyStore {
     ///
     /// Layers are merged with deny-wins semantics: any non-empty `deny`
     /// rule shadows the corresponding `allow` rule across the merged set.
-    pub fn merged_for(&self, ctx: &MergeContext) -> Policy {
+    pub fn merged_for(&self, ctx: &ResolvedRequestContext) -> Policy {
         let key = self.merged_cache_key(ctx);
         if let Ok(cache) = self.merged_cache.lock()
             && let Some(policy) = cache.get(&key)
@@ -248,8 +250,8 @@ impl PolicyStore {
         policy
     }
 
-    fn merged_cache_key(&self, ctx: &MergeContext) -> super::types::MergedCacheKey {
-        let ctx = self.resolve_context(ctx);
+    fn merged_cache_key(&self, ctx: &ResolvedRequestContext) -> super::types::MergedCacheKey {
+        let ctx = ctx.clone();
         let home_path = ctx.paths.home().map(Path::new);
         let project_root_path = ctx.paths.project_root().map(Path::new);
         let home_policy = home_path.map(|home| {
@@ -268,8 +270,8 @@ impl PolicyStore {
         }
     }
 
-    fn build_merged_for(&self, ctx: &MergeContext) -> Policy {
-        let ctx = self.resolve_context(ctx);
+    fn build_merged_for(&self, ctx: &ResolvedRequestContext) -> Policy {
+        let ctx = ctx.clone();
         let home_path = ctx.paths.home().map(Path::new);
         let project_root_path = ctx.paths.project_root().map(Path::new);
         let mut layers: Vec<Policy> = Vec::new();
@@ -314,7 +316,7 @@ impl PolicyStore {
     }
 
     /// Load merged policy from async handlers without blocking the Tokio runtime.
-    pub(crate) fn merged_for_worker(&self, ctx: &MergeContext) -> Policy {
+    pub(crate) fn merged_for_worker(&self, ctx: &ResolvedRequestContext) -> Policy {
         let ctx = ctx.clone();
         if tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
@@ -332,7 +334,7 @@ impl PolicyStore {
     /// Returns `io::Error` if policy files cannot be written (serialization,
     /// directory creation, or file write failures).
     pub fn export_policy_files(&self, paths: SandboxPaths) -> std::io::Result<()> {
-        let ctx = MergeContext {
+        let ctx = ResolvedRequestContext {
             paths,
             ids: ProcessIds::default(),
             sandbox_session_id: None,

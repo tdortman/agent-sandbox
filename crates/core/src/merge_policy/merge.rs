@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hosts::{NetworkRuleKey, host_pattern_matches};
+use crate::hosts::host_pattern_matches;
 use crate::policy::{
     FilesystemRule, FilesystemRuleKey, FilesystemSection, NetworkRule, NetworkSection, Policy,
     ResourceRule, ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
@@ -28,43 +28,31 @@ fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {
     host_pattern_matches(&deny.host, &allow.host) || host_pattern_matches(&allow.host, &deny.host)
 }
 
-fn merge_network(layers: &[Policy]) -> NetworkSection {
-    let mut allow: BTreeMap<NetworkRuleKey, NetworkRule> = BTreeMap::new();
-    let mut deny: BTreeMap<NetworkRuleKey, NetworkRule> = BTreeMap::new();
+fn merge_rules<R, K, Allow, Deny, Key, Overlap>(
+    layers: &[Policy],
+    allow_rules: Allow,
+    deny_rules: Deny,
+    key: Key,
+    overlaps: Overlap,
+) -> (Vec<R>, Vec<R>)
+where
+    R: Clone,
+    K: Ord,
+    Allow: Fn(&Policy) -> &[R],
+    Deny: Fn(&Policy) -> &[R],
+    Key: Fn(&R) -> Option<K>,
+    Overlap: Fn(&R, &R) -> bool,
+{
+    let mut allow: BTreeMap<K, R> = BTreeMap::new();
+    let mut deny: BTreeMap<K, R> = BTreeMap::new();
     for layer in layers {
-        for rule in &layer.network.allow {
-            allow.insert(rule.key(), rule.clone());
-        }
-        for rule in &layer.network.deny {
-            deny.insert(rule.key(), rule.clone());
-        }
-    }
-    allow.retain(|_, allow_rule| {
-        !deny
-            .values()
-            .any(|deny_rule| network_rules_overlap(deny_rule, allow_rule))
-    });
-    NetworkSection {
-        allow: allow.into_values().collect(),
-        deny: deny.into_values().collect(),
-    }
-}
-
-fn sudo_rules_overlap(deny: &SudoRule, allow: &SudoRule) -> bool {
-    deny.matches(&allow.argv) || allow.matches(&deny.argv)
-}
-
-fn merge_sudo(layers: &[Policy]) -> SudoSection {
-    let mut allow: BTreeMap<Vec<String>, SudoRule> = BTreeMap::new();
-    let mut deny: BTreeMap<Vec<String>, SudoRule> = BTreeMap::new();
-    for layer in layers {
-        for rule in &layer.sudo.allow {
-            if let Some(key) = rule.key() {
+        for rule in allow_rules(layer) {
+            if let Some(key) = key(rule) {
                 allow.insert(key, rule.clone());
             }
         }
-        for rule in &layer.sudo.deny {
-            if let Some(key) = rule.key() {
+        for rule in deny_rules(layer) {
+            if let Some(key) = key(rule) {
                 deny.insert(key, rule.clone());
             }
         }
@@ -72,12 +60,35 @@ fn merge_sudo(layers: &[Policy]) -> SudoSection {
     allow.retain(|_, allow_rule| {
         !deny
             .values()
-            .any(|deny_rule| sudo_rules_overlap(deny_rule, allow_rule))
+            .any(|deny_rule| overlaps(deny_rule, allow_rule))
     });
-    SudoSection {
-        allow: allow.into_values().collect(),
-        deny: deny.into_values().collect(),
-    }
+    (allow.into_values().collect(), deny.into_values().collect())
+}
+
+fn merge_network(layers: &[Policy]) -> NetworkSection {
+    let (allow, deny) = merge_rules(
+        layers,
+        |policy| &policy.network.allow,
+        |policy| &policy.network.deny,
+        |rule| Some(rule.key()),
+        network_rules_overlap,
+    );
+    NetworkSection { allow, deny }
+}
+
+fn sudo_rules_overlap(deny: &SudoRule, allow: &SudoRule) -> bool {
+    deny.matches(&allow.argv) || allow.matches(&deny.argv)
+}
+
+fn merge_sudo(layers: &[Policy]) -> SudoSection {
+    let (allow, deny) = merge_rules(
+        layers,
+        |policy| &policy.sudo.allow,
+        |policy| &policy.sudo.deny,
+        SudoRule::key,
+        sudo_rules_overlap,
+    );
+    SudoSection { allow, deny }
 }
 
 fn filesystem_rule_key(rule: &FilesystemRule) -> FilesystemRuleKey {
@@ -89,25 +100,14 @@ fn filesystem_rules_overlap(deny: &FilesystemRule, allow: &FilesystemRule) -> bo
 }
 
 fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
-    let mut allow: BTreeMap<FilesystemRuleKey, FilesystemRule> = BTreeMap::new();
-    let mut deny: BTreeMap<FilesystemRuleKey, FilesystemRule> = BTreeMap::new();
-    for layer in layers {
-        for rule in &layer.filesystem.allow {
-            allow.insert(filesystem_rule_key(rule), rule.clone());
-        }
-        for rule in &layer.filesystem.deny {
-            deny.insert(filesystem_rule_key(rule), rule.clone());
-        }
-    }
-    allow.retain(|_, allow_rule| {
-        !deny
-            .values()
-            .any(|deny_rule| filesystem_rules_overlap(deny_rule, allow_rule))
-    });
-    FilesystemSection {
-        allow: allow.into_values().collect(),
-        deny: deny.into_values().collect(),
-    }
+    let (allow, deny) = merge_rules(
+        layers,
+        |policy| &policy.filesystem.allow,
+        |policy| &policy.filesystem.deny,
+        |rule| Some(filesystem_rule_key(rule)),
+        filesystem_rules_overlap,
+    );
+    FilesystemSection { allow, deny }
 }
 
 fn resource_rule_key(rule: &ResourceRule) -> ResourceRuleKey {
@@ -120,23 +120,94 @@ fn resource_rules_overlap(deny: &ResourceRule, allow: &ResourceRule) -> bool {
 }
 
 fn merge_resources(layers: &[Policy]) -> ResourceSection {
-    let mut allow: BTreeMap<ResourceRuleKey, ResourceRule> = BTreeMap::new();
-    let mut deny: BTreeMap<ResourceRuleKey, ResourceRule> = BTreeMap::new();
-    for layer in layers {
-        for rule in &layer.resources.allow {
-            allow.insert(resource_rule_key(rule), rule.clone());
-        }
-        for rule in &layer.resources.deny {
-            deny.insert(resource_rule_key(rule), rule.clone());
-        }
+    let (allow, deny) = merge_rules(
+        layers,
+        |policy| &policy.resources.allow,
+        |policy| &policy.resources.deny,
+        |rule| Some(resource_rule_key(rule)),
+        resource_rules_overlap,
+    );
+    ResourceSection { allow, deny }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_layers;
+    use crate::policy::{Policy, ResourceAccess, ResourceKind, ResourceRule, ResourceSection};
+
+    fn empty_policy() -> Policy {
+        Policy::default()
     }
-    allow.retain(|_, allow_rule| {
-        !deny
-            .values()
-            .any(|deny_rule| resource_rules_overlap(deny_rule, allow_rule))
-    });
-    ResourceSection {
-        allow: allow.into_values().collect(),
-        deny: deny.into_values().collect(),
+
+    #[test]
+    fn resource_deny_shadows_overlapping_allow_on_merge() {
+        let low = Policy {
+            resources: ResourceSection {
+                allow: vec![ResourceRule::new(
+                    ResourceKind::Device,
+                    "/dev/fd",
+                    ResourceAccess::OpenReadWrite,
+                    "",
+                )],
+                deny: vec![],
+            },
+            ..empty_policy()
+        };
+        let high = Policy {
+            resources: ResourceSection {
+                allow: vec![],
+                deny: vec![ResourceRule::new(
+                    ResourceKind::Device,
+                    "/dev/fd/3",
+                    ResourceAccess::OpenRead,
+                    "",
+                )],
+            },
+            ..empty_policy()
+        };
+
+        let merged = merge_layers(&[low, high]);
+
+        assert!(
+            merged.resources.allow.is_empty(),
+            "deny on /dev/fd/3 must shadow broader /dev/fd allow"
+        );
+        assert_eq!(merged.resources.deny.len(), 1);
+    }
+
+    #[test]
+    fn resource_trailing_slash_paths_merge_as_one_rule() {
+        let low = Policy {
+            resources: ResourceSection {
+                allow: vec![ResourceRule::new(
+                    ResourceKind::Device,
+                    "/dev/fd/",
+                    ResourceAccess::OpenRead,
+                    "",
+                )],
+                deny: vec![],
+            },
+            ..empty_policy()
+        };
+        let high = Policy {
+            resources: ResourceSection {
+                allow: vec![ResourceRule::new(
+                    ResourceKind::Device,
+                    "/dev/fd",
+                    ResourceAccess::OpenRead,
+                    "",
+                )],
+                deny: vec![],
+            },
+            ..empty_policy()
+        };
+
+        let merged = merge_layers(&[low, high]);
+
+        assert_eq!(merged.resources.allow.len(), 1);
+        assert_eq!(
+            merged.resources.allow[0].path.as_path(),
+            std::path::Path::new("/dev/fd")
+        );
     }
 }

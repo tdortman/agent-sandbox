@@ -1,8 +1,9 @@
+use std::borrow::Cow;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use std::fmt;
-
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::policy::{FileAccess, Policy, ResourceAccess, ResourceKind};
 
@@ -14,7 +15,7 @@ use super::{message::RpcMessage, scope::ApprovalScope};
 /// serde does not greedily match them as `Error`. `Simple` must be last:
 /// it only has `ok`, so it would otherwise accept any `{"ok": true, ...}`
 /// object and drop fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RpcReply {
     RegisterUi(RegisterUiReply),
@@ -27,6 +28,44 @@ pub enum RpcReply {
     Status(StatusReply),
     Error(ErrorReply),
     Simple(SimpleOkReply),
+}
+
+impl<'de> Deserialize<'de> for RpcReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        macro_rules! try_variant {
+            ($variant:ident, $ty:ty) => {
+                match serde_json::from_value::<$ty>(value.clone()) {
+                    Ok(reply) => return Ok(Self::$variant(reply)),
+                    Err(err) => {
+                        let err = err.to_string();
+                        if err.contains("invalid source") {
+                            return Err(serde::de::Error::custom(err));
+                        }
+                    }
+                }
+            };
+        }
+
+        try_variant!(RegisterUi, RegisterUiReply);
+        try_variant!(FilesystemCheck, FilesystemCheckReply);
+        try_variant!(ResourceCheck, ResourceCheckReply);
+        try_variant!(FilesystemMonitor, FilesystemMonitorReply);
+        try_variant!(Check, CheckReply);
+        try_variant!(Elevate, ElevateReply);
+        try_variant!(ScopeAction, ScopeActionReply);
+        try_variant!(Status, StatusReply);
+        try_variant!(Error, ErrorReply);
+        try_variant!(Simple, SimpleOkReply);
+
+        Err(serde::de::Error::custom(
+            "data did not match any RpcReply variant",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,30 +112,181 @@ pub struct RegisterUiReply {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckReply {
-    pub ok: bool,
-    pub allowed: bool,
-    pub source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VerdictSource {
+    Policy { comment: Option<String> },
+    Scope(ApprovalScope),
+    User,
+    Blocked,
+    Static,
+    Infrastructure,
+    PortZero,
 }
 
-impl CheckReply {
-    pub fn allowed(source: impl Into<String>) -> Self {
-        Self {
-            ok: true,
-            allowed: true,
-            source: source.into(),
-            error: None,
+impl VerdictSource {
+    #[must_use]
+    pub const fn policy() -> Self {
+        Self::Policy { comment: None }
+    }
+
+    #[must_use]
+    pub fn policy_with_comment(comment: impl Into<String>) -> Self {
+        Self::Policy {
+            comment: Some(comment.into()),
         }
     }
 
-    pub fn denied(source: impl Into<String>) -> Self {
+    #[must_use]
+    pub const fn blocked() -> Self {
+        Self::Blocked
+    }
+
+    #[must_use]
+    pub const fn is_once(&self) -> bool {
+        matches!(self, Self::Scope(ApprovalScope::Once))
+    }
+
+    fn to_wire(&self, allowed: bool) -> Result<Cow<'_, str>, &'static str> {
+        match (allowed, self) {
+            (
+                true,
+                Self::Policy {
+                    comment: Some(comment),
+                },
+            ) => Ok(Cow::Owned(format!("allow:{comment}"))),
+            (true, Self::Policy { comment: None }) => Ok(Cow::Borrowed("allow")),
+            (false, Self::Policy { .. }) => Ok(Cow::Borrowed("deny")),
+            (true, Self::Scope(scope)) => Ok(Cow::Borrowed(scope.as_str())),
+            (false, Self::User) => Ok(Cow::Borrowed("denied")),
+            (false, Self::Blocked) => Ok(Cow::Borrowed("blocked")),
+            (true, Self::Static) => Ok(Cow::Borrowed("static")),
+            (true, Self::Infrastructure) => Ok(Cow::Borrowed("infrastructure")),
+            (false, Self::PortZero) => Ok(Cow::Borrowed("port-zero")),
+            _ => Err("inconsistent verdict source for allowed flag"),
+        }
+    }
+
+    fn from_wire(allowed: bool, value: &str) -> Result<Self, String> {
+        if allowed {
+            if value == "allow" {
+                return Ok(Self::policy());
+            }
+            if let Some(comment) = value.strip_prefix("allow:") {
+                return Ok(Self::policy_with_comment(comment));
+            }
+        }
+        match (allowed, value) {
+            (false, "deny") => Ok(Self::policy()),
+            (false, "denied") => Ok(Self::User),
+            (false, "blocked") => Ok(Self::Blocked),
+            (true, "once") => Ok(Self::Scope(ApprovalScope::Once)),
+            (true, "session") => Ok(Self::Scope(ApprovalScope::Session)),
+            (true, "project") => Ok(Self::Scope(ApprovalScope::Project)),
+            (true, "global") => Ok(Self::Scope(ApprovalScope::Global)),
+            (true, "static") => Ok(Self::Static),
+            (true, "infrastructure") => Ok(Self::Infrastructure),
+            (false, "port-zero") => Ok(Self::PortZero),
+            _ => Err(format!("invalid source `{value}` for allowed={allowed}")),
+        }
+    }
+}
+
+impl fmt::Display for VerdictSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Policy {
+                comment: Some(comment),
+            } => write!(f, "policy:{comment}"),
+            Self::Policy { comment: None } => f.write_str("policy"),
+            Self::Scope(scope) => f.write_str(scope.as_str()),
+            Self::User => f.write_str("user"),
+            Self::Blocked => f.write_str("blocked"),
+            Self::Static => f.write_str("static"),
+            Self::Infrastructure => f.write_str("infrastructure"),
+            Self::PortZero => f.write_str("port-zero"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Verdict {
+    pub allowed: bool,
+    pub source: VerdictSource,
+}
+
+impl Verdict {
+    #[must_use]
+    pub const fn allowed(source: VerdictSource) -> Self {
+        Self {
+            allowed: true,
+            source,
+        }
+    }
+
+    #[must_use]
+    pub const fn denied(source: VerdictSource) -> Self {
+        Self {
+            allowed: false,
+            source,
+        }
+    }
+
+    #[must_use]
+    pub const fn blocked() -> Self {
+        Self::denied(VerdictSource::Blocked)
+    }
+
+    #[must_use]
+    pub const fn is_policy_denied(&self) -> bool {
+        !self.allowed && matches!(self.source, VerdictSource::Policy { .. })
+    }
+
+    #[must_use]
+    pub const fn is_once(&self) -> bool {
+        self.allowed && matches!(self.source, VerdictSource::Scope(ApprovalScope::Once))
+    }
+}
+
+impl From<ApprovalScope> for VerdictSource {
+    fn from(value: ApprovalScope) -> Self {
+        Self::Scope(value)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckReply {
+    pub ok: bool,
+    pub allowed: bool,
+    pub source: VerdictSource,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireCheckReply {
+    ok: bool,
+    allowed: bool,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl CheckReply {
+    #[must_use]
+    pub fn allowed(source: VerdictSource) -> Self {
+        Self::from_verdict(Verdict::allowed(source))
+    }
+
+    #[must_use]
+    pub fn denied(source: VerdictSource) -> Self {
+        Self::from_verdict(Verdict::denied(source))
+    }
+
+    #[must_use]
+    pub fn from_verdict(verdict: Verdict) -> Self {
         Self {
             ok: true,
-            allowed: false,
-            source: source.into(),
+            allowed: verdict.allowed,
+            source: verdict.source,
             error: None,
         }
     }
@@ -105,9 +295,46 @@ impl CheckReply {
         Self {
             ok: true,
             allowed: false,
-            source: "blocked".into(),
+            source: VerdictSource::blocked(),
             error: Some(message.into()),
         }
+    }
+}
+
+impl Serialize for CheckReply {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let source = self
+            .source
+            .to_wire(self.allowed)
+            .map_err(serde::ser::Error::custom)?;
+        let field_count = if self.error.is_some() { 4 } else { 3 };
+        let mut state = serializer.serialize_struct("CheckReply", field_count)?;
+        state.serialize_field("ok", &self.ok)?;
+        state.serialize_field("allowed", &self.allowed)?;
+        state.serialize_field("source", source.as_ref())?;
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireCheckReply::deserialize(deserializer)?;
+        Ok(Self {
+            ok: wire.ok,
+            allowed: wire.allowed,
+            source: VerdictSource::from_wire(wire.allowed, &wire.source)
+                .map_err(serde::de::Error::custom)?,
+            error: wire.error,
+        })
     }
 }
 
@@ -154,34 +381,44 @@ impl ElevateReply {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FilesystemCheckReply {
     pub ok: bool,
     pub allowed: bool,
-    pub source: String,
+    pub source: VerdictSource,
     pub path: PathBuf,
     pub access: FileAccess,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireFilesystemCheckReply {
+    ok: bool,
+    allowed: bool,
+    source: String,
+    path: PathBuf,
+    access: FileAccess,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 impl FilesystemCheckReply {
-    pub fn allowed(source: impl Into<String>, path: PathBuf, access: FileAccess) -> Self {
-        Self {
-            ok: true,
-            allowed: true,
-            source: source.into(),
-            path,
-            access,
-            error: None,
-        }
+    #[must_use]
+    pub fn allowed(source: VerdictSource, path: PathBuf, access: FileAccess) -> Self {
+        Self::from_verdict(Verdict::allowed(source), path, access)
     }
 
-    pub fn denied(source: impl Into<String>, path: PathBuf, access: FileAccess) -> Self {
+    #[must_use]
+    pub fn denied(source: VerdictSource, path: PathBuf, access: FileAccess) -> Self {
+        Self::from_verdict(Verdict::denied(source), path, access)
+    }
+
+    #[must_use]
+    pub fn from_verdict(verdict: Verdict, path: PathBuf, access: FileAccess) -> Self {
         Self {
             ok: true,
-            allowed: false,
-            source: source.into(),
+            allowed: verdict.allowed,
+            source: verdict.source,
             path,
             access,
             error: None,
@@ -192,7 +429,7 @@ impl FilesystemCheckReply {
         Self {
             ok: true,
             allowed: false,
-            source: "blocked".into(),
+            source: VerdictSource::blocked(),
             path,
             access,
             error: Some(message.into()),
@@ -200,46 +437,102 @@ impl FilesystemCheckReply {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Serialize for FilesystemCheckReply {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let source = self
+            .source
+            .to_wire(self.allowed)
+            .map_err(serde::ser::Error::custom)?;
+        let field_count = if self.error.is_some() { 6 } else { 5 };
+        let mut state = serializer.serialize_struct("FilesystemCheckReply", field_count)?;
+        state.serialize_field("ok", &self.ok)?;
+        state.serialize_field("allowed", &self.allowed)?;
+        state.serialize_field("source", source.as_ref())?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("access", &self.access)?;
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for FilesystemCheckReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireFilesystemCheckReply::deserialize(deserializer)?;
+        Ok(Self {
+            ok: wire.ok,
+            allowed: wire.allowed,
+            source: VerdictSource::from_wire(wire.allowed, &wire.source)
+                .map_err(serde::de::Error::custom)?,
+            path: wire.path,
+            access: wire.access,
+            error: wire.error,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ResourceCheckReply {
     pub ok: bool,
     pub allowed: bool,
-    pub source: String,
+    pub source: VerdictSource,
     pub kind: ResourceKind,
     pub path: PathBuf,
     pub access: ResourceAccess,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireResourceCheckReply {
+    ok: bool,
+    allowed: bool,
+    source: String,
+    kind: ResourceKind,
+    path: PathBuf,
+    access: ResourceAccess,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 impl ResourceCheckReply {
+    #[must_use]
     pub fn allowed(
-        source: impl Into<String>,
+        source: VerdictSource,
         kind: ResourceKind,
         path: PathBuf,
         access: ResourceAccess,
     ) -> Self {
-        Self {
-            ok: true,
-            allowed: true,
-            source: source.into(),
-            kind,
-            path,
-            access,
-            error: None,
-        }
+        Self::from_verdict(Verdict::allowed(source), kind, path, access)
     }
 
+    #[must_use]
     pub fn denied(
-        source: impl Into<String>,
+        source: VerdictSource,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+    ) -> Self {
+        Self::from_verdict(Verdict::denied(source), kind, path, access)
+    }
+
+    #[must_use]
+    pub fn from_verdict(
+        verdict: Verdict,
         kind: ResourceKind,
         path: PathBuf,
         access: ResourceAccess,
     ) -> Self {
         Self {
             ok: true,
-            allowed: false,
-            source: source.into(),
+            allowed: verdict.allowed,
+            source: verdict.source,
             kind,
             path,
             access,
@@ -256,12 +549,55 @@ impl ResourceCheckReply {
         Self {
             ok: true,
             allowed: false,
-            source: "blocked".into(),
+            source: VerdictSource::blocked(),
             kind,
             path,
             access,
             error: Some(message.into()),
         }
+    }
+}
+
+impl Serialize for ResourceCheckReply {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let source = self
+            .source
+            .to_wire(self.allowed)
+            .map_err(serde::ser::Error::custom)?;
+        let field_count = if self.error.is_some() { 7 } else { 6 };
+        let mut state = serializer.serialize_struct("ResourceCheckReply", field_count)?;
+        state.serialize_field("ok", &self.ok)?;
+        state.serialize_field("allowed", &self.allowed)?;
+        state.serialize_field("source", source.as_ref())?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("access", &self.access)?;
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceCheckReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireResourceCheckReply::deserialize(deserializer)?;
+        Ok(Self {
+            ok: wire.ok,
+            allowed: wire.allowed,
+            source: VerdictSource::from_wire(wire.allowed, &wire.source)
+                .map_err(serde::de::Error::custom)?,
+            kind: wire.kind,
+            path: wire.path,
+            access: wire.access,
+            error: wire.error,
+        })
     }
 }
 

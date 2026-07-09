@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ProcessIds, SandboxPaths};
+use crate::{ProcessIds, ResolvedRequestContext, SandboxPaths};
 
 use super::scope::ApprovalScope;
 
@@ -58,6 +58,18 @@ impl RequestContext {
             sandbox_session_id: None,
         }
     }
+
+    #[must_use]
+    pub fn from_resolved(ctx: &ResolvedRequestContext) -> Self {
+        Self {
+            cwd: ctx.paths.cwd_path(),
+            home: ctx.paths.home_path(),
+            project_root: ctx.paths.project_root_path(),
+            pid: ctx.ids.pid(),
+            uid: ctx.ids.uid(),
+            sandbox_session_id: ctx.sandbox_session_id.clone(),
+        }
+    }
 }
 
 impl From<&SandboxPaths> for RequestContext {
@@ -70,6 +82,18 @@ impl From<&SandboxPaths> for RequestContext {
             uid: None,
             sandbox_session_id: None,
         }
+    }
+}
+
+impl From<ResolvedRequestContext> for RequestContext {
+    fn from(ctx: ResolvedRequestContext) -> Self {
+        Self::from_resolved(&ctx)
+    }
+}
+
+impl From<&ResolvedRequestContext> for RequestContext {
+    fn from(ctx: &ResolvedRequestContext) -> Self {
+        Self::from_resolved(ctx)
     }
 }
 
@@ -286,8 +310,8 @@ const fn default_once_scope() -> ApprovalScope {
 #[cfg(test)]
 mod tests {
     use super::{ApprovalTarget, RequestContext, RpcRequest};
-    use crate::{ProcessIds, SandboxPaths};
-    use std::path::{Path, PathBuf};
+    use crate::{ProcessIds, ResolvedRequestContext, SandboxPaths};
+    use std::path::PathBuf;
 
     #[test]
     fn attach_check_aliases_roundtrip() {
@@ -324,13 +348,25 @@ mod tests {
     }
 
     #[test]
-    fn request_context_roundtrips_paths_and_ids() {
-        let paths = SandboxPaths::new("/cwd", "/home/user", "/repo");
-        let ctx = RequestContext::from_paths_and_ids(&paths, ProcessIds::new(42, 1000));
-        assert_eq!(ctx.sandbox_paths().cwd(), Some(Path::new("/cwd")));
-        assert_eq!(ctx.sandbox_paths().home(), Some(Path::new("/home/user")));
-        assert_eq!(ctx.ids().pid(), Some(42));
-        assert_eq!(ctx.ids().uid(), Some(1000));
+    fn request_context_preserves_resolved_context_fields() {
+        let resolved = ResolvedRequestContext::new(
+            SandboxPaths::new("/cwd", "/home/user", "/repo"),
+            ProcessIds::new(42, 1000),
+            Some("sandbox-a".into()),
+        );
+        let bridged = RequestContext::from(&resolved);
+        assert_eq!(bridged.cwd.as_deref(), Some(std::path::Path::new("/cwd")));
+        assert_eq!(
+            bridged.home.as_deref(),
+            Some(std::path::Path::new("/home/user"))
+        );
+        assert_eq!(
+            bridged.project_root.as_deref(),
+            Some(std::path::Path::new("/repo"))
+        );
+        assert_eq!(bridged.pid, Some(42));
+        assert_eq!(bridged.uid, Some(1000));
+        assert_eq!(bridged.sandbox_session_id.as_deref(), Some("sandbox-a"));
     }
 
     #[test]

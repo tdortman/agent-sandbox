@@ -26,6 +26,7 @@ dependencies = [
  "dns-lookup",
  "globset",
  "hickory-proto",
+ "libc",
  "nix",
  "serde",
  "serde_json",

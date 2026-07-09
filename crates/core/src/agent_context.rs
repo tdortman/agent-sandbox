@@ -155,6 +155,29 @@ impl ProcessIds {
     }
 }
 
+/// Canonical daemon-side sandbox context after applying trust and enrichment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedRequestContext {
+    pub paths: SandboxPaths,
+    pub ids: ProcessIds,
+    pub sandbox_session_id: Option<String>,
+}
+
+impl ResolvedRequestContext {
+    #[must_use]
+    pub const fn new(
+        paths: SandboxPaths,
+        ids: ProcessIds,
+        sandbox_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            paths,
+            ids,
+            sandbox_session_id,
+        }
+    }
+}
+
 /// Resolve sandbox paths from peer env, session file, and `/proc` (never the process cwd).
 #[must_use]
 pub fn resolve_sandbox_paths(

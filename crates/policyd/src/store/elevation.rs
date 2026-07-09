@@ -13,7 +13,6 @@ use crate::error::PolicydError;
 use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
 
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
-use super::ui_route::UiRoute;
 
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
@@ -122,21 +121,16 @@ impl PolicyStore {
     pub async fn request_elevation(&self, req: ElevationRequest) -> ElevateReply {
         let ElevationRequest { argv, ctx } = req;
         let argv: Vec<String> = argv.into_iter().collect();
-        let resolved = self.resolve_context(&ctx);
-        let wire_ids = resolved.ids;
-        let cwd = resolved.paths.cwd_path();
-        let home = resolved.paths.home_path();
-        let project_root = resolved.paths.project_root_path();
-        let sandbox_session_id = resolved.sandbox_session_id.clone();
-        if self.sudo_policy_denied(&argv, &resolved)
-            || self.session_sudo_denied(&argv, &resolved).await
-        {
+        let wire_ids = ctx.ids;
+        let cwd = ctx.paths.cwd_path();
+        let home = ctx.paths.home_path();
+        let project_root = ctx.paths.project_root_path();
+        let sandbox_session_id = ctx.sandbox_session_id.clone();
+        if self.sudo_policy_denied(&argv, &ctx) || self.session_sudo_denied(&argv, &ctx).await {
             tracing::info!(argv = %argv.join(" "), "sudo deny (policy)");
             return ElevateReply::denied();
         }
-        if self.sudo_policy_allowed(&argv, &resolved)
-            || self.session_sudo_allowed(&argv, &resolved).await
-        {
+        if self.sudo_policy_allowed(&argv, &ctx) || self.session_sudo_allowed(&argv, &ctx).await {
             return match self
                 .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
                 .await
@@ -176,10 +170,8 @@ impl PolicyStore {
             };
         };
 
-        let route = UiRoute::new(cwd.clone(), project_root.clone())
-            .with_sandbox_session(sandbox_session_id.clone());
-        self.notify_ui(
-            &route,
+        self.notify_general_ui(
+            &ctx,
             &UiPush::ElevationRequest {
                 id: entry.id.clone(),
                 argv: Some(argv.clone()),
@@ -190,7 +182,7 @@ impl PolicyStore {
         )
         .await;
         self.maybe_spawn_elevation_ui(
-            &route,
+            &ctx,
             &wire_ids,
             home.as_deref(),
             cwd.as_deref(),
@@ -199,7 +191,7 @@ impl PolicyStore {
         )
         .await;
 
-        self.await_elevation_verdict(&route, &entry.id, entry.rx)
+        self.await_elevation_verdict(&ctx, &entry.id, entry.rx)
             .await
     }
     async fn create_pending_elevation_entry(
@@ -244,14 +236,14 @@ impl PolicyStore {
 
     async fn maybe_spawn_elevation_ui(
         &self,
-        route: &UiRoute,
+        ctx: &agent_sandbox_core::ResolvedRequestContext,
         wire_ids: &ProcessIds,
         home: Option<&Path>,
         cwd: Option<&Path>,
         project_root: Option<&Path>,
         sandbox_session_id: Option<&str>,
     ) {
-        if self.has_ui_for_route(route).await {
+        if self.has_ui_for_context(ctx).await {
             return;
         }
         let mut spawn_uid = wire_ids.uid();
@@ -278,7 +270,7 @@ impl PolicyStore {
 
     async fn await_elevation_verdict(
         &self,
-        route: &UiRoute,
+        ctx: &agent_sandbox_core::ResolvedRequestContext,
         pending_id: &str,
         rx: oneshot::Receiver<ElevateReply>,
     ) -> ElevateReply {
@@ -290,7 +282,7 @@ impl PolicyStore {
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
         loop {
-            if self.has_ui_for_route(route).await {
+            if self.has_ui_for_context(ctx).await {
                 break;
             }
             let now = Instant::now();
@@ -344,8 +336,8 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use crate::store::types::{PolicyStore, PolicydArgs};
-    use crate::wire::{ElevationRequest, MergeContext};
-    use agent_sandbox_core::{ElevateReply, ProcessIds, SandboxPaths};
+    use crate::wire::ElevationRequest;
+    use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     fn test_store() -> PolicyStore {
@@ -366,7 +358,7 @@ mod tests {
     fn elevation_request(argv: Vec<String>) -> ElevationRequest {
         ElevationRequest {
             argv,
-            ctx: MergeContext {
+            ctx: ResolvedRequestContext {
                 paths: SandboxPaths::from_wire(
                     Some("/repo".into()),
                     Some("/home/user".into()),
@@ -456,7 +448,7 @@ mod tests {
 
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
-        let forged = MergeContext {
+        let forged = crate::wire::MergeContext {
             paths: SandboxPaths::from_wire(Some(evil.clone()), Some(evil.clone()), Some(evil)),
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,

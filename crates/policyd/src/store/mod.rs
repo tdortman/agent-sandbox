@@ -4,6 +4,7 @@ mod access;
 mod context;
 mod decisions;
 mod elevation;
+pub(crate) mod evaluator;
 mod filesystem;
 mod network;
 pub(crate) mod persist;

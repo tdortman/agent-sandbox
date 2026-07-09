@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use agent_sandbox_core::{
-    CheckReply, RequestContext, RpcReply, is_ip_literal, normalize_host, policy_host_for_connect,
+    CheckReply, ResolvedRequestContext, RpcReply, Verdict, VerdictSource, is_ip_literal,
+    normalize_host, policy_host_for_connect,
 };
 
 use crate::error::PolicydError;
 use crate::store::PolicyStore;
-use crate::wire::{MergeContext, NetworkCheckRequest};
+use crate::wire::NetworkCheckRequest;
 
 /// Inputs for `handle_check`, grouped to keep the call signature small.
 pub struct CheckArgs {
@@ -18,7 +19,7 @@ pub struct CheckArgs {
     pub scheme: String,
     pub url: Option<String>,
     pub aliases: Vec<String>,
-    pub ctx: RequestContext,
+    pub ctx: ResolvedRequestContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +78,7 @@ pub async fn handle_check(
     // probes) never produces a `tcp://host:0` prompt.
     if port == 0 {
         tracing::debug!(%policy_host, "check deny (port 0)");
-        return Ok(RpcReply::Check(CheckReply::denied("port-zero")));
+        return Ok(RpcReply::Check(CheckReply::denied(VerdictSource::PortZero)));
     }
     let prompt_host = if policy_host.is_empty() || is_ip_literal(&policy_host) {
         let resolution = policy_host_for_connect(&connect_host, None);
@@ -87,27 +88,26 @@ pub async fn handle_check(
         PromptHost::AsProvided
     };
     let url = prompt_url(&scheme, url, &policy_host, port, prompt_host);
-    let merge = MergeContext::from(&ctx);
-    if let Some(source) = store.allow_source(&policy_host, port, &merge).await {
-        if source == "deny" {
-            tracing::info!(%policy_host, port, "check deny (project policy)");
-            return Ok(RpcReply::Check(CheckReply::denied("deny")));
-        }
-        if source == "once" {
-            let allowed = store.is_allowed(&policy_host, port, &merge, true).await;
-            if allowed {
-                tracing::info!(%policy_host, port, %source, "check allow");
+    if let Some(verdict) = store.allow_verdict(&policy_host, port, &ctx).await {
+        if verdict.is_once() {
+            let verdict = store
+                .policy_evaluation(&ctx)
+                .network_verdict(&policy_host, port, true)
+                .await
+                .unwrap_or_else(Verdict::blocked);
+            if verdict.allowed {
+                tracing::info!(%policy_host, port, source = %verdict.source, "check allow");
             } else {
-                tracing::info!(%policy_host, port, %source, "check deny (once grant consumed)");
+                tracing::info!(%policy_host, port, source = %verdict.source, "check deny (once grant consumed)");
             }
-            return Ok(RpcReply::Check(if allowed {
-                CheckReply::allowed(source)
-            } else {
-                CheckReply::denied(source)
-            }));
+            return Ok(RpcReply::Check(CheckReply::from_verdict(verdict)));
         }
-        tracing::info!(%policy_host, port, %source, "check allow");
-        return Ok(RpcReply::Check(CheckReply::allowed(source)));
+        if verdict.is_policy_denied() {
+            tracing::info!(%policy_host, port, "check deny (project policy)");
+        } else {
+            tracing::info!(%policy_host, port, source = %verdict.source, "check allow");
+        }
+        return Ok(RpcReply::Check(CheckReply::from_verdict(verdict)));
     }
     Ok(RpcReply::Check(
         store
@@ -117,7 +117,7 @@ pub async fn handle_check(
                     port,
                     scheme,
                     url,
-                    ctx: merge,
+                    ctx,
                 },
                 aliases,
             )
@@ -129,15 +129,22 @@ pub async fn handle_check(
 mod tests {
     use super::{CheckArgs, PromptHost, handle_check, prompt_url};
     use crate::store::{PolicyStore, PolicydArgs};
-    use agent_sandbox_core::{ProcessIds, RequestContext, RpcReply, SandboxPaths};
+    use agent_sandbox_core::{
+        ApprovalScope, ProcessIds, ResolvedRequestContext, RpcReply, SandboxPaths, VerdictSource,
+    };
     use std::sync::Arc;
     use std::time::Duration;
+    use uuid::Uuid;
+
     fn test_store() -> PolicyStore {
+        let base =
+            std::env::temp_dir().join(format!("agent-sandbox-check-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&base).expect("create temp test dir");
         PolicyStore::new(PolicydArgs {
-            host_socket: std::path::PathBuf::from("/tmp/host.sock"),
-            sandbox_socket: std::path::PathBuf::from("/tmp/sandbox.sock"),
-            declarative: std::path::PathBuf::from("/tmp/policy.json"),
-            export_json: std::path::PathBuf::from("/tmp/export.json"),
+            host_socket: base.join("host.sock"),
+            sandbox_socket: base.join("sandbox.sock"),
+            declarative: base.join("policy.json"),
+            export_json: base.join("export.json"),
             export_nix: None,
             approval_timeout: Duration::from_secs(1),
             interactive_approval: false,
@@ -147,10 +154,11 @@ mod tests {
         })
     }
 
-    fn empty_context() -> RequestContext {
-        RequestContext::from_paths_and_ids(
-            &SandboxPaths::default(),
+    fn empty_context() -> ResolvedRequestContext {
+        ResolvedRequestContext::new(
+            SandboxPaths::default(),
             ProcessIds::from_options(Some(0), Some(1000)),
+            None,
         )
     }
 
@@ -163,6 +171,27 @@ mod tests {
             url: Some(format!("tcp://{host}:443")),
             aliases: Vec::new(),
             ctx: empty_context(),
+        }
+    }
+
+    fn isolated_check_args(base: &std::path::Path, host: &str, port: Option<u16>) -> CheckArgs {
+        let home = base.join("home-user");
+        let project_root = base.join("repo");
+        std::fs::create_dir_all(&home).expect("create isolated home");
+        std::fs::create_dir_all(&project_root).expect("create isolated project root");
+        let ctx = ResolvedRequestContext::new(
+            SandboxPaths::from_wire(Some(project_root.clone()), Some(home), Some(project_root)),
+            ProcessIds::default(),
+            None,
+        );
+        CheckArgs {
+            host: Some(host.into()),
+            connect_host: Some("104.18.32.47".into()),
+            port,
+            scheme: "tcp".into(),
+            url: Some(format!("tcp://{host}:443")),
+            aliases: Vec::new(),
+            ctx,
         }
     }
 
@@ -199,10 +228,6 @@ mod tests {
     #[tokio::test]
     async fn handle_check_denies_port_zero_before_prompting() {
         let store = Arc::new(test_store());
-        // Hostname path: the broker would never let this through (port-0
-        // skip in `sockaddr_target`), but NFQUEUE forwards whatever the
-        // packet header says. A `tcp://chatgpt.com:0` prompt must never
-        // reach the user.
         let reply = handle_check(&store, check_args("chatgpt.com", Some(0)))
             .await
             .expect("handle_check returns Ok");
@@ -210,7 +235,8 @@ mod tests {
             RpcReply::Check(check) => {
                 assert!(!check.allowed, "port 0 must be denied");
                 assert_eq!(
-                    check.source, "port-zero",
+                    check.source,
+                    VerdictSource::PortZero,
                     "port 0 source must be 'port-zero'"
                 );
             }
@@ -227,7 +253,52 @@ mod tests {
         match reply {
             RpcReply::Check(check) => {
                 assert!(!check.allowed, "port None must be denied");
-                assert_eq!(check.source, "port-zero");
+                assert_eq!(check.source, VerdictSource::PortZero);
+            }
+            other => panic!("expected Check reply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_check_consumes_once_allow_exactly_once() {
+        let store = Arc::new(test_store());
+        let base = std::env::temp_dir().join(format!(
+            "agent-sandbox-once-check-{}",
+            Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("create isolated test base");
+        {
+            let mut inner = store.inner.lock().await;
+            inner
+                .once_allow
+                .insert(agent_sandbox_core::NetworkRuleKey::new("chatgpt.com", 443));
+        }
+
+        let first = handle_check(&store, isolated_check_args(&base, "chatgpt.com", Some(443)))
+            .await
+            .expect("first handle_check returns Ok");
+        match first {
+            RpcReply::Check(check) => {
+                assert!(check.allowed, "first once approval must allow");
+                assert_eq!(check.source, VerdictSource::Scope(ApprovalScope::Once));
+            }
+            other => panic!("expected Check reply, got {other:?}"),
+        }
+        assert!(
+            store.inner.lock().await.once_allow.is_empty(),
+            "once approval must be consumed after the first check"
+        );
+
+        let second = handle_check(&store, isolated_check_args(&base, "chatgpt.com", Some(443)))
+            .await
+            .expect("second handle_check returns Ok");
+        match second {
+            RpcReply::Check(check) => {
+                assert!(
+                    !check.allowed,
+                    "second check must not reuse consumed once approval"
+                );
+                assert_eq!(check.source, VerdictSource::Blocked);
             }
             other => panic!("expected Check reply, got {other:?}"),
         }

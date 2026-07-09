@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
-    ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SudoRule, approval_host_patterns,
+    ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SudoRule, VerdictSource,
+    approval_host_patterns,
 };
 
 use super::super::types::{
@@ -12,7 +13,6 @@ use super::super::types::{
 };
 use super::DecisionAction;
 use crate::error::PolicydError;
-use crate::store::ui_route::UiRoute;
 use crate::wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp};
 
 impl PolicyStore {
@@ -105,7 +105,7 @@ impl PolicyStore {
             self.finish_network(
                 &pending_id,
                 true,
-                "once",
+                VerdictSource::Scope(ApprovalScope::Once),
                 Some(NetworkVerdictKey {
                     host: resolved.host.clone(),
                     port: resolved.port,
@@ -135,7 +135,7 @@ impl PolicyStore {
         if result.scope_succeeded() {
             match action {
                 DecisionAction::Approve => {
-                    let source = result.scope_label().unwrap_or(scope.as_str());
+                    let source = VerdictSource::from(scope);
                     self.finish_network(
                         &pending_id,
                         true,
@@ -151,7 +151,7 @@ impl PolicyStore {
                     self.finish_network(
                         &pending_id,
                         false,
-                        "denied",
+                        VerdictSource::User,
                         Some(NetworkVerdictKey {
                             host: resolved.host.clone(),
                             port: resolved.port,
@@ -164,7 +164,7 @@ impl PolicyStore {
             self.finish_network(
                 &pending_id,
                 false,
-                "blocked",
+                VerdictSource::Blocked,
                 Some(NetworkVerdictKey {
                     host: resolved.host.clone(),
                     port: resolved.port,
@@ -318,8 +318,14 @@ impl PolicyStore {
                 fs.access
             );
             Self::audit(action.audit_verb(), None, None, &detail);
-            self.finish_filesystem(&pending_id, path.clone(), fs.access, true, "once")
-                .await;
+            self.finish_filesystem(
+                &pending_id,
+                path.clone(),
+                fs.access,
+                true,
+                VerdictSource::Scope(ApprovalScope::Once),
+            )
+            .await;
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
                 path.clone(),
                 fs.access,
@@ -335,8 +341,14 @@ impl PolicyStore {
         if action == DecisionAction::Deny && scope == ApprovalScope::Once {
             let detail = format!("id={pending_id} path={}", path.display());
             Self::audit(action.audit_verb(), None, None, &detail);
-            self.finish_filesystem(&pending_id, path.clone(), fs.access, false, "denied")
-                .await;
+            self.finish_filesystem(
+                &pending_id,
+                path.clone(),
+                fs.access,
+                false,
+                VerdictSource::User,
+            )
+            .await;
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
                 path.clone(),
                 fs.access,
@@ -358,7 +370,7 @@ impl PolicyStore {
             .await;
 
         if result.scope_succeeded() {
-            let source = result.scope_label().unwrap_or(scope.as_str());
+            let source = VerdictSource::from(scope);
             self.finish_filesystem(
                 &pending_id,
                 path.clone(),
@@ -368,7 +380,7 @@ impl PolicyStore {
             )
             .await;
         } else if action == DecisionAction::Approve {
-            self.finish_filesystem(&pending_id, path, fs.access, false, "blocked")
+            self.finish_filesystem(&pending_id, path, fs.access, false, VerdictSource::Blocked)
                 .await;
         } else {
             self.inner
@@ -391,9 +403,9 @@ impl PolicyStore {
             return scope_wire;
         }
 
-        let route = UiRoute::new(fs.cwd.clone(), fs.project_root.clone())
-            .with_sandbox_session(fs.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let session_ids = self
+            .standalone_session_ids_for_filesystem_pending(fs)
+            .await;
         if scope_wire
             .session_id
             .as_ref()
@@ -471,7 +483,11 @@ impl PolicyStore {
 
         if scope == ApprovalScope::Once {
             let allowed = matches!(action, DecisionAction::Approve);
-            let source = if allowed { "once" } else { "denied" };
+            let source = if allowed {
+                VerdictSource::Scope(ApprovalScope::Once)
+            } else {
+                VerdictSource::User
+            };
             let detail = if allowed {
                 format!(
                     "id={pending_id} kind={:?} path={} access={:?}",
@@ -519,7 +535,7 @@ impl PolicyStore {
             .await;
 
         if result.scope_succeeded() {
-            let source = result.scope_label().unwrap_or(scope.as_str());
+            let source = VerdictSource::from(scope);
             self.finish_resource(
                 &pending_id,
                 res.kind,
@@ -530,8 +546,15 @@ impl PolicyStore {
             )
             .await;
         } else if action == DecisionAction::Approve {
-            self.finish_resource(&pending_id, res.kind, path, res.access, false, "blocked")
-                .await;
+            self.finish_resource(
+                &pending_id,
+                res.kind,
+                path,
+                res.access,
+                false,
+                VerdictSource::Blocked,
+            )
+            .await;
         } else {
             self.inner
                 .lock()
@@ -553,9 +576,9 @@ impl PolicyStore {
             return scope_wire;
         }
 
-        let route = UiRoute::new(res.cwd.clone(), res.project_root.clone())
-            .with_sandbox_session(res.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let session_ids = self
+            .standalone_session_ids_for_resource_pending(res)
+            .await;
         if scope_wire
             .session_id
             .as_ref()
@@ -684,7 +707,7 @@ mod tests {
         Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource, PolicyStore,
         PolicydArgs,
     };
-    use crate::wire::{MergeContext, PendingDecision, ScopeWire};
+    use crate::wire::{PendingDecision, ScopeWire};
 
     #[test]
     fn network_target_accepts_parent_domain_patterns() {
@@ -1241,8 +1264,8 @@ mod tests {
         assert!(reply.scope_succeeded());
     }
 
-    fn merge_context(pid: Option<u32>) -> MergeContext {
-        MergeContext {
+    fn merge_context(pid: Option<u32>) -> agent_sandbox_core::ResolvedRequestContext {
+        agent_sandbox_core::ResolvedRequestContext {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::from_options(pid, None),
             sandbox_session_id: None,
@@ -1532,7 +1555,7 @@ mod tests {
                 .session_allowed(
                     "api.example.com",
                     443,
-                    &MergeContext {
+                    &agent_sandbox_core::ResolvedRequestContext {
                         paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                         ids: ProcessIds::default(),
                         sandbox_session_id: Some("sandbox-a".into()),
@@ -1545,7 +1568,7 @@ mod tests {
                 .session_allowed(
                     "api.example.com",
                     443,
-                    &MergeContext {
+                    &agent_sandbox_core::ResolvedRequestContext {
                         paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                         ids: ProcessIds::default(),
                         sandbox_session_id: Some("sandbox-b".into()),

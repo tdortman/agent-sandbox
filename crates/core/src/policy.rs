@@ -45,6 +45,32 @@ impl FileAccess {
         }
     }
 
+    /// Smallest access that conservatively represents both observations.
+    ///
+    /// This is stricter than [`Self::union`]: combining an observed read with an
+    /// observed `read_write` must stay `read_write`, not collapse to `write`
+    /// through policy coverage semantics.
+    #[must_use]
+    pub fn combine_observed(self, other: Self) -> Self {
+        if self == other {
+            return self;
+        }
+        if self == Self::All || other == Self::All {
+            return Self::All;
+        }
+        if self == Self::ReadWrite || other == Self::ReadWrite {
+            return Self::ReadWrite;
+        }
+        if matches!(
+            (self, other),
+            (Self::Read, Self::Write) | (Self::Write, Self::Read)
+        ) {
+            Self::ReadWrite
+        } else {
+            Self::All
+        }
+    }
+
     /// Smallest policy access that covers both access levels.
     #[must_use]
     pub fn union(self, other: Self) -> Self {
@@ -82,6 +108,25 @@ pub fn normalize_directory_traverse_access(path: &Path, access: FileAccess) -> F
     }
 }
 
+/// Map `open(2)`/`openat(2)` flag bits to [`FileAccess`].
+///
+/// Uses `O_ACCMODE` per `fcntl(2)`, but creation/truncation still count as
+/// write semantics even when the access mode bits alone say read-only.
+/// `creat(2)` is therefore naturally classified as write-equivalent.
+#[must_use]
+pub fn open_flags_to_file_access(flags: i32) -> FileAccess {
+    let access = match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => FileAccess::Read,
+        libc::O_WRONLY => FileAccess::Write,
+        _ => FileAccess::ReadWrite,
+    };
+    if flags & (libc::O_CREAT | libc::O_TRUNC) != 0 {
+        access.combine_observed(FileAccess::Write)
+    } else {
+        access
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FilesystemRuleKey {
     pub path: PathBuf,
@@ -114,13 +159,35 @@ enum CompiledPath {
     Glob(GlobMatcher),
 }
 
+fn expand_match_path(path: &Path, project_root: Option<&Path>, canonicalize: bool) -> PathBuf {
+    if canonicalize {
+        return expand_policy_path(path, None, project_root);
+    }
+    project_root.map_or_else(
+        || expand_home_path(path, None),
+        |root| expand_project_relative(&expand_home_path(path, None), root),
+    )
+}
+
 impl CompiledPath {
     /// Compile a policy path into a matcher.
     ///
     /// If the path (after `./` expansion) contains `*` or `?`, it becomes a `Glob`.
     /// Otherwise it is treated as a literal `Prefix` path.
     fn compile(path: &Path, project_root: Option<&Path>) -> Result<Self, globset::Error> {
-        let expanded = expand_policy_path(path, None, project_root);
+        Self::compile_with_aliases(path, project_root, true)
+    }
+
+    fn compile_raw(path: &Path, project_root: Option<&Path>) -> Result<Self, globset::Error> {
+        Self::compile_with_aliases(path, project_root, false)
+    }
+
+    fn compile_with_aliases(
+        path: &Path,
+        project_root: Option<&Path>,
+        canonicalize: bool,
+    ) -> Result<Self, globset::Error> {
+        let expanded = expand_match_path(path, project_root, canonicalize);
         let expanded_str = expanded.to_string_lossy();
 
         if expanded_str.contains('*') || expanded_str.contains('?') {
@@ -130,6 +197,53 @@ impl CompiledPath {
             Ok(Self::Prefix(normalize_rule_path(&expanded)))
         }
     }
+}
+
+fn prefix_matches(rule_path: &Path, requested: &Path, require_directory_boundary: bool) -> bool {
+    if rule_path == Path::new("/") {
+        return requested.starts_with("/");
+    }
+    if rule_path == requested {
+        return true;
+    }
+    let Ok(rest) = requested.strip_prefix(rule_path) else {
+        return false;
+    };
+    !require_directory_boundary || rest.starts_with("/")
+}
+
+fn compiled_matches(
+    compiled: CompiledPath,
+    requested: &Path,
+    require_directory_boundary: bool,
+) -> bool {
+    match compiled {
+        CompiledPath::Prefix(rule_path) => {
+            prefix_matches(&rule_path, requested, require_directory_boundary)
+        }
+        CompiledPath::Glob(matcher) => matcher.is_match(requested),
+    }
+}
+
+fn path_matches_rule(
+    rule_path: &Path,
+    requested: &Path,
+    project_root: Option<&Path>,
+    require_directory_boundary: bool,
+) -> bool {
+    let requested = normalize_rule_path(requested);
+    let raw = CompiledPath::compile_raw(rule_path, project_root);
+    if let Ok(compiled) = raw
+        && compiled_matches(compiled, &requested, require_directory_boundary)
+    {
+        return true;
+    }
+    let Ok(compiled) = CompiledPath::compile(rule_path, project_root) else {
+        // A malformed glob saved as a rule (user-typed, free-form) cannot match.
+        // Previously a panic via .expect; now degrades gracefully.
+        return false;
+    };
+    compiled_matches(compiled, &requested, require_directory_boundary)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -172,7 +286,7 @@ impl FilesystemRule {
     /// a user types a free-form path into the approval text field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        if self.path_matches_inner(requested, project_root) {
+        if path_matches_rule(&self.path, requested, project_root, false) {
             return true;
         }
         // Symlink alias fallback: e.g. /var/run → /run. Only runs on a
@@ -180,37 +294,8 @@ impl FilesystemRule {
         // stat() syscall. Falls back to the raw path if canonicalization
         // fails (socket deleted between checks).
         let canonical = expand_policy_path(requested, None, project_root);
-        if canonical.as_path() != requested {
-            return self.path_matches_inner(&canonical, project_root);
-        }
-        false
-    }
-
-    fn path_matches_inner(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        // ponytail: recompile on every match. globset compile is ~10us; add a sidecar
-        // cache if profiling shows the matcher is hot. Replaces the previous OnceLock
-        // field, which forced manual PartialEq/Eq impls.
-        let Ok(compiled) = CompiledPath::compile(&self.path, project_root) else {
-            // A malformed glob saved as a rule (user-typed, free-form) cannot match.
-            // Previously a panic via .expect; now degrades gracefully.
-            return false;
-        };
-        match compiled {
-            CompiledPath::Prefix(rule_path) => {
-                let requested = normalize_rule_path(requested);
-                if rule_path == Path::new("/") {
-                    return requested.starts_with("/");
-                }
-                if rule_path == requested {
-                    return true;
-                }
-                // Path::strip_prefix is component-aware: "/home/user".strip_prefix("/home")
-                // succeeds (descendant), "/homepage".strip_prefix("/home") fails (boundary).
-                // Unlike str::strip_prefix it consumes the separator, so no "/"-prefix check.
-                requested.strip_prefix(&rule_path).is_ok()
-            }
-            CompiledPath::Glob(matcher) => matcher.is_match(requested),
-        }
+        canonical.as_path() != requested
+            && path_matches_rule(&self.path, &canonical, project_root, false)
     }
 
     /// Whether this rule matches the given path and access request.
@@ -572,7 +657,7 @@ impl ResourceRule {
     /// a user types a free-form path into the approval text field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        if self.path_matches_inner(requested, project_root) {
+        if path_matches_rule(&self.path, requested, project_root, false) {
             return true;
         }
         // Symlink alias fallback: e.g. /var/run → /run. Only runs on a
@@ -580,33 +665,8 @@ impl ResourceRule {
         // stat() syscall. Falls back to the raw path if canonicalization
         // fails (socket deleted between checks).
         let canonical = expand_policy_path(requested, None, project_root);
-        if canonical.as_path() != requested {
-            return self.path_matches_inner(&canonical, project_root);
-        }
-        false
-    }
-
-    fn path_matches_inner(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        let Ok(compiled) = CompiledPath::compile(&self.path, project_root) else {
-            // A malformed glob saved as a rule (user-typed, free-form) cannot match.
-            // Previously a panic via .expect; now degrades gracefully.
-            return false;
-        };
-        match compiled {
-            CompiledPath::Prefix(rule_path) => {
-                let requested = normalize_rule_path(requested);
-                if rule_path == Path::new("/") {
-                    return requested.starts_with("/");
-                }
-                if rule_path == requested {
-                    return true;
-                }
-                requested
-                    .strip_prefix(&rule_path)
-                    .is_ok_and(|rest| rest.starts_with("/"))
-            }
-            CompiledPath::Glob(matcher) => matcher.is_match(requested),
-        }
+        canonical.as_path() != requested
+            && path_matches_rule(&self.path, &canonical, project_root, false)
     }
 
     /// Whether this rule matches the given kind, path, and access request.
@@ -745,8 +805,8 @@ impl InodeIdentity {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileAccess, FilesystemRule, SudoRule, contract_home_path, expand_home_path,
-        filesystem_approval_paths,
+        FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule, SudoRule,
+        contract_home_path, expand_home_path, filesystem_approval_paths, open_flags_to_file_access,
     };
     use std::path::{Path, PathBuf};
 
@@ -836,6 +896,44 @@ mod tests {
             FileAccess::All
         );
         assert_eq!(FileAccess::All.union(FileAccess::Read), FileAccess::All);
+    }
+
+    #[test]
+    fn file_access_combine_observed_keeps_conservative_runtime_access() {
+        assert_eq!(
+            FileAccess::Read.combine_observed(FileAccess::Write),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            FileAccess::Read.combine_observed(FileAccess::Execute),
+            FileAccess::All
+        );
+        assert_eq!(
+            FileAccess::Read.combine_observed(FileAccess::ReadWrite),
+            FileAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn open_flags_classify_to_file_access() {
+        assert_eq!(open_flags_to_file_access(libc::O_RDONLY), FileAccess::Read);
+        assert_eq!(open_flags_to_file_access(libc::O_WRONLY), FileAccess::Write);
+        assert_eq!(
+            open_flags_to_file_access(libc::O_RDWR),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            open_flags_to_file_access(libc::O_RDWR | libc::O_APPEND),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            open_flags_to_file_access(libc::O_RDONLY | libc::O_CREAT),
+            FileAccess::ReadWrite
+        );
+        assert_eq!(
+            open_flags_to_file_access(libc::O_RDONLY | libc::O_TRUNC),
+            FileAccess::ReadWrite
+        );
     }
     #[test]
     fn filesystem_rule_matches_exact_path() {
@@ -1130,5 +1228,52 @@ mod tests {
         );
         let expanded = expand_home_path(&contracted, Some(home));
         assert_eq!(expanded, original);
+    }
+
+    #[test]
+    fn resource_rule_matches_descendants_with_access_hierarchy() {
+        let rule = ResourceRule::new(
+            ResourceKind::Device,
+            "/dev/fd",
+            ResourceAccess::OpenReadWrite,
+            "",
+        );
+        assert!(rule.matches(
+            ResourceKind::Device,
+            Path::new("/dev/fd/3"),
+            ResourceAccess::OpenRead,
+            None
+        ));
+        assert!(rule.matches(
+            ResourceKind::Device,
+            Path::new("/dev/fd/3"),
+            ResourceAccess::OpenWrite,
+            None
+        ));
+        assert!(!rule.matches(
+            ResourceKind::Device,
+            Path::new("/dev/fd/3"),
+            ResourceAccess::Connect,
+            None
+        ));
+        assert!(!rule.matches(
+            ResourceKind::UnixSocket,
+            Path::new("/dev/fd/3"),
+            ResourceAccess::OpenRead,
+            None
+        ));
+    }
+
+    #[test]
+    fn resource_rule_trailing_slash_matches_descendants() {
+        let rule = ResourceRule::new(
+            ResourceKind::UnixSocket,
+            "/run/user/1000/bus/",
+            ResourceAccess::Connect,
+            "",
+        );
+        assert!(rule.path_matches(Path::new("/run/user/1000/bus"), None));
+        assert!(rule.path_matches(Path::new("/run/user/1000/bus/socket"), None));
+        assert!(!rule.path_matches(Path::new("/run/user/1000/bus-other"), None));
     }
 }

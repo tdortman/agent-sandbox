@@ -1,9 +1,11 @@
 use super::{
-    CheckReply, ElevateReply, FilesystemCheckReply, FilesystemMonitorReply, RegisterUiReply,
-    RpcMessage, RpcReply, RpcRequest, StatusReply, UiPush,
+    ApprovalScope, CheckReply, ElevateReply, FilesystemCheckReply, FilesystemMonitorReply,
+    RegisterUiReply, ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
+    StatusReply, UiPush, VerdictSource,
 };
-use crate::policy::FileAccess;
-use std::path::Path;
+use crate::ResourceKind;
+use crate::policy::{FileAccess, ResourceAccess};
+use std::path::{Path, PathBuf};
 
 #[test]
 fn check_request_deserializes() {
@@ -72,9 +74,15 @@ fn status_reply_includes_merged_policy() {
 
 #[test]
 fn check_reply_deserializes_as_check_not_simple() {
-    let line = serde_json::to_string(&CheckReply::allowed("once")).expect("serialize rpc reply");
+    let line = serde_json::to_string(&CheckReply::allowed(VerdictSource::Scope(
+        ApprovalScope::Once,
+    )))
+    .expect("serialize rpc reply");
     let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
-    assert!(matches!(reply, RpcReply::Check(c) if c.allowed && c.source == "once"));
+    assert!(matches!(
+        reply,
+        RpcReply::Check(c) if c.allowed && c.source == VerdictSource::Scope(ApprovalScope::Once)
+    ));
 }
 
 #[test]
@@ -104,10 +112,15 @@ fn filesystem_check_reply_roundtrip() {
 }
 
 #[test]
-fn filesystem_check_reply_allowed() {
-    let reply = FilesystemCheckReply::allowed("deny", "/tmp".into(), FileAccess::ReadWrite);
+fn filesystem_check_reply_denied_preserves_deny_wire_string() {
+    let reply = FilesystemCheckReply::denied(
+        VerdictSource::policy(),
+        "/tmp".into(),
+        FileAccess::ReadWrite,
+    );
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");
-    assert_eq!(json["allowed"], true);
+    assert_eq!(json["allowed"], false);
+    assert_eq!(json["source"], "deny");
     assert_eq!(json["path"], "/tmp");
     assert_eq!(json["access"], "read_write");
 }
@@ -123,15 +136,84 @@ fn filesystem_monitor_reply_roundtrip() {
 #[test]
 fn filesystem_check_reply_deserializes_as_filesystem_check() {
     let line = serde_json::to_string(&FilesystemCheckReply::allowed(
-        "once",
+        VerdictSource::Scope(ApprovalScope::Once),
         "/data".into(),
         FileAccess::All,
     ))
     .expect("serialize rpc reply");
     let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
-    assert!(
-        matches!(reply, RpcReply::FilesystemCheck(c) if c.allowed && c.source == "once" && c.path == Path::new("/data"))
+    assert!(matches!(
+        reply,
+        RpcReply::FilesystemCheck(c)
+            if c.allowed
+                && c.source == VerdictSource::Scope(ApprovalScope::Once)
+                && c.path == Path::new("/data")
+    ));
+}
+
+#[test]
+fn check_reply_roundtrips_allow_comment_wire_string() {
+    let line = r#"{"ok":true,"allowed":true,"source":"allow:trusted policy file"}"#;
+    let reply: RpcReply = serde_json::from_str(line).expect("deserialize rpc reply");
+    assert!(matches!(
+        &reply,
+        RpcReply::Check(CheckReply {
+            allowed: true,
+            source,
+            error: None,
+            ..
+        }) if source == &VerdictSource::policy_with_comment("trusted policy file")
+    ));
+    let json = serde_json::to_value(&reply).expect("serialize rpc reply");
+    assert_eq!(json["source"], "allow:trusted policy file");
+}
+
+#[test]
+fn check_reply_rejects_allowed_false_with_allow_source() {
+    let err = serde_json::from_str::<CheckReply>(
+        r#"{"ok":true,"allowed":false,"source":"allow:trusted policy file"}"#,
+    )
+    .expect_err("mismatched allowed/source must fail");
+    assert!(err.to_string().contains("allow"));
+}
+
+#[test]
+fn check_reply_rejects_allowed_true_with_denied_source() {
+    let err = serde_json::from_str::<CheckReply>(r#"{"ok":true,"allowed":true,"source":"denied"}"#)
+        .expect_err("mismatched allowed/source must fail");
+    assert!(err.to_string().contains("denied"));
+}
+
+#[test]
+fn filesystem_check_reply_rejects_allowed_false_with_once_source() {
+    let err = serde_json::from_str::<FilesystemCheckReply>(
+        r#"{"ok":true,"allowed":false,"source":"once","path":"/data","access":"read"}"#,
+    )
+    .expect_err("mismatched allowed/source must fail");
+    assert!(err.to_string().contains("once"));
+}
+
+#[test]
+fn resource_and_scope_replies_preserve_wire_strings() {
+    let resource = ResourceCheckReply::allowed(
+        VerdictSource::Infrastructure,
+        ResourceKind::Device,
+        PathBuf::from("/dev/fd/3"),
+        ResourceAccess::OpenRead,
     );
+    let resource_json = serde_json::to_value(&resource).expect("serialize resource reply");
+    assert_eq!(resource_json["source"], "infrastructure");
+
+    let scope = ScopeActionReply::ok_network(
+        "example.com".into(),
+        443,
+        ApprovalScope::Global,
+        Some(PathBuf::from(
+            "/home/user/.config/agent-sandbox/policy.json",
+        )),
+    );
+    let scope_json = serde_json::to_value(&scope).expect("serialize scope reply");
+    assert_eq!(scope_json["scope"], "global");
 }
 
 #[test]

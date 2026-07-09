@@ -14,7 +14,7 @@ pub use push::{PendingSummary, UiPush};
 pub use reply::{
     CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
     FilesystemScopeActionReply, RegisterUiReply, ResourceCheckReply, ResourceScopeActionReply,
-    RpcReply, ScopeActionReply, SimpleOkReply, StatusReply,
+    RpcReply, ScopeActionReply, SimpleOkReply, StatusReply, Verdict, VerdictSource,
 };
 pub use request::{
     AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,

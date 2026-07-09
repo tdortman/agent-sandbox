@@ -3,12 +3,9 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity, NetworkRuleKey, Policy,
-    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, allow_keys,
-    discover_git_project_root, expand_policy_path, normalize_host,
+    ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, Verdict,
+    allow_keys, discover_git_project_root, expand_policy_path, normalize_host,
 };
-
-use crate::store::ui_route::UiRoute;
-use crate::wire::MergeContext;
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
 
@@ -33,7 +30,7 @@ fn session_sudo_matches(bucket: &HashSet<Vec<String>>, argv: &[String]) -> bool 
         .any(|rule| !rule.is_empty() && argv.starts_with(rule))
 }
 
-fn sandbox_filesystem_static_allow_key(ctx: &MergeContext) -> String {
+fn sandbox_filesystem_static_allow_key(ctx: &ResolvedRequestContext) -> String {
     if let Some(id) = &ctx.sandbox_session_id {
         return format!("sandbox:{id}");
     }
@@ -52,7 +49,7 @@ fn sandbox_filesystem_static_allow_key(ctx: &MergeContext) -> String {
 
 /// Host-managed runtime paths under `/run/agent-sandbox` are infrastructure,
 /// not agent actions. Fanotify must allow them without loading merged policy.
-fn is_sandbox_infrastructure_path(path: &Path) -> bool {
+pub(super) fn is_sandbox_infrastructure_path(path: &Path) -> bool {
     path.starts_with("/run/agent-sandbox")
 }
 
@@ -69,14 +66,13 @@ impl PolicyStore {
         matched
     }
 
-    pub(crate) async fn session_allowed(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+    pub(crate) async fn session_allowed(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
         if session_ids.is_empty() {
             return false;
         }
@@ -89,14 +85,13 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn session_denied(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+    pub(crate) async fn session_denied(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
         if session_ids.is_empty() {
             return false;
         }
@@ -109,7 +104,12 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) fn policy_denied(&self, host: &str, port: u16, ctx: &MergeContext) -> bool {
+    pub(crate) fn policy_denied(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
         let host = normalize_host(host);
         let merged = self.merged_for(ctx);
         merged
@@ -119,24 +119,26 @@ impl PolicyStore {
             .any(|rule| Self::host_matches(&rule.host, &host) && rule.port == port)
     }
 
-    pub(crate) fn sudo_policy_denied(&self, argv: &[String], ctx: &MergeContext) -> bool {
+    pub(crate) fn sudo_policy_denied(&self, argv: &[String], ctx: &ResolvedRequestContext) -> bool {
         let merged = self.merged_for(ctx);
         merged.sudo.deny.iter().any(|rule| rule.matches(argv))
     }
 
-    pub(crate) fn sudo_policy_allowed(&self, argv: &[String], ctx: &MergeContext) -> bool {
+    pub(crate) fn sudo_policy_allowed(
+        &self,
+        argv: &[String],
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
         let merged = self.merged_for(ctx);
         merged.sudo.allow.iter().any(|rule| rule.matches(argv))
     }
 
-    pub(crate) async fn session_sudo_denied(&self, argv: &[String], ctx: &MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+    pub(crate) async fn session_sudo_denied(
+        &self,
+        argv: &[String],
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -146,14 +148,12 @@ impl PolicyStore {
         })
     }
 
-    pub(crate) async fn session_sudo_allowed(&self, argv: &[String], ctx: &MergeContext) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.session_ids_for_route(&route).await;
+    pub(crate) async fn session_sudo_allowed(
+        &self,
+        argv: &[String],
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -163,62 +163,27 @@ impl PolicyStore {
         })
     }
 
-    pub async fn allow_source(&self, host: &str, port: u16, ctx: &MergeContext) -> Option<String> {
-        let host = normalize_host(host);
-        let resolved = self.resolve_context(ctx);
-        if self.policy_denied(&host, port, &resolved) {
-            return Some("deny".into());
-        }
-        if self.session_denied(&host, port, &resolved).await {
-            return Some("deny".into());
-        }
-        if self.once_allowed(&host, port, false).await {
-            return Some("once".into());
-        }
-        if self.session_allowed(&host, port, &resolved).await {
-            return Some("session".into());
-        }
-        let merged = self.merged_for(&resolved);
-        for rule in &merged.network.allow {
-            if Self::host_matches(&rule.host, &host) && rule.port == port {
-                if let Some(comment) = &rule.comment
-                    && !comment.is_empty()
-                {
-                    return Some(format!("allow:{comment}"));
-                }
-                return Some("allow".into());
-            }
-        }
-        None
+    pub async fn allow_verdict(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: &ResolvedRequestContext,
+    ) -> Option<Verdict> {
+        self.policy_evaluation(ctx)
+            .network_verdict(host, port, false)
+            .await
     }
 
     pub async fn is_allowed(
         &self,
         host: &str,
         port: u16,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
         consume_once: bool,
     ) -> bool {
-        let host = normalize_host(host);
-        let resolved = self.resolve_context(ctx);
-        if self.policy_denied(&host, port, &resolved) {
-            return false;
-        }
-        if self.session_denied(&host, port, &resolved).await {
-            return false;
-        }
-        if self.once_allowed(&host, port, consume_once).await {
-            return true;
-        }
-        if self.session_allowed(&host, port, &resolved).await {
-            return true;
-        }
-        let merged = self.merged_for(&resolved);
-        merged
-            .network
-            .allow
-            .iter()
-            .any(|rule| Self::host_matches(&rule.host, &host) && rule.port == port)
+        self.policy_evaluation(ctx)
+            .network_allowed(host, port, consume_once)
+            .await
     }
 }
 
@@ -255,7 +220,7 @@ fn project_roots_for_allow(ctx_root: Option<&Path>, path: &Path) -> Vec<PathBuf>
     roots
 }
 
-fn filesystem_rules_match_allow(
+pub(super) fn filesystem_rules_match_allow(
     rules: &[FilesystemRule],
     path: &Path,
     access: FileAccess,
@@ -292,7 +257,7 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
         let access = agent_sandbox_core::normalize_directory_traverse_access(path, access);
         let project_root = ctx.paths.project_root();
@@ -315,16 +280,10 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
-        let project_root = resolved.paths.project_root();
+        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -340,16 +299,10 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
-        let project_root = resolved.paths.project_root();
+        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -368,18 +321,12 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
         let Some(identity) = InodeIdentity::from_path(path) else {
             return false;
         };
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -399,11 +346,10 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let key = sandbox_filesystem_static_allow_key(&resolved);
-        let project_root = resolved.paths.project_root();
+        let key = sandbox_filesystem_static_allow_key(ctx);
+        let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
         inner
             .sandbox_filesystem_static_allow
@@ -417,14 +363,13 @@ impl PolicyStore {
 
     pub(crate) async fn store_sandbox_static_allow(
         &self,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
         rules: Vec<FilesystemRule>,
     ) {
         if rules.is_empty() {
             return;
         }
-        let resolved = self.resolve_context(ctx);
-        let key = sandbox_filesystem_static_allow_key(&resolved);
+        let key = sandbox_filesystem_static_allow_key(ctx);
         self.inner
             .lock()
             .await
@@ -436,50 +381,14 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: &MergeContext,
-    ) -> Option<String> {
-        let access = agent_sandbox_core::normalize_directory_traverse_access(path, access);
-        if is_sandbox_infrastructure_path(path) {
-            return Some("infrastructure".into());
-        }
-        let ctx_for_merge = ctx.clone();
-        let merged = self.merged_for_worker(&ctx_for_merge);
-        let project_root = ctx.paths.project_root();
-        let home = ctx.paths.home();
-        let path_denied = merged
-            .filesystem
-            .deny
-            .iter()
-            .any(|rule| rule.matches(path, access, project_root));
-        if path_denied {
-            return Some("deny".into());
-        }
-        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
-        if self.deny_inode_denied(path, access, &fingerprint).await {
-            return Some("deny".into());
-        }
-        if self.session_filesystem_denied(path, access, ctx).await {
-            return Some("deny".into());
-        }
-        if self.session_filesystem_allowed(path, access, ctx).await {
-            return Some("session".into());
-        }
-        if self
-            .session_filesystem_allowed_by_inode(path, access, ctx)
+        ctx: &ResolvedRequestContext,
+    ) -> Option<Verdict> {
+        self.policy_evaluation(ctx)
+            .filesystem_allow_source(path, access)
             .await
-        {
-            return Some("session".into());
-        }
-        if self.static_filesystem_allowed(path, access, ctx).await {
-            return Some("static".into());
-        }
-        if filesystem_rules_match_allow(&merged.filesystem.allow, path, access, project_root) {
-            return Some("allow".into());
-        }
-        None
     }
 
-    async fn deny_inode_denied(
+    pub(super) async fn deny_inode_denied(
         &self,
         path: &Path,
         access: FileAccess,
@@ -519,7 +428,7 @@ impl PolicyStore {
     /// Compute a fingerprint for the deny rules: one `DenyFingerprint` per
     /// concrete (non-glob) deny rule path. When this changes the inode
     /// cache must be rebuilt.
-    fn deny_fingerprint(
+    pub(super) fn deny_fingerprint(
         merged: &Policy,
         home: Option<&Path>,
         project_root: Option<&Path>,
@@ -691,7 +600,7 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
         let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
@@ -719,7 +628,7 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
         let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
@@ -735,15 +644,9 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -758,15 +661,9 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> bool {
-        let resolved = self.resolve_context(ctx);
-        let route = UiRoute::new(
-            resolved.paths.cwd_path(),
-            resolved.paths.project_root_path(),
-        )
-        .with_sandbox_session(resolved.sandbox_session_id.clone());
-        let session_ids = self.filesystem_session_ids_for_route(&route).await;
+        let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
         session_ids.iter().any(|sid| {
             inner
@@ -781,21 +678,11 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &MergeContext,
-    ) -> Option<String> {
-        if self.resource_policy_denied(kind, path, access, ctx).await {
-            return Some("deny".into());
-        }
-        if self.session_resource_denied(kind, path, access, ctx).await {
-            return Some("deny".into());
-        }
-        if self.session_resource_allowed(kind, path, access, ctx).await {
-            return Some("session".into());
-        }
-        if self.resource_policy_allowed(kind, path, access, ctx) {
-            return Some("allow".into());
-        }
-        None
+        ctx: &ResolvedRequestContext,
+    ) -> Option<Verdict> {
+        self.policy_evaluation(ctx)
+            .resource_allow_source(kind, path, access)
+            .await
     }
 }
 #[cfg(test)]
@@ -807,7 +694,8 @@ mod tests {
         session_sudo_matches,
     };
     use agent_sandbox_core::{
-        FileAccess, FilesystemRuleKey, NetworkRuleKey, ResourceAccess, ResourceKind,
+        FileAccess, FilesystemRuleKey, NetworkRuleKey, ResourceAccess, ResourceKind, Verdict,
+        VerdictSource,
     };
 
     #[test]
@@ -918,7 +806,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -984,7 +872,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1046,7 +934,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1104,7 +992,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1152,7 +1040,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1205,12 +1093,12 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
-        let with_root = crate::wire::MergeContext {
+        let with_root = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
         };
-        let without_root = crate::wire::MergeContext {
+        let without_root = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, ""),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1223,9 +1111,8 @@ mod tests {
                     agent_sandbox_core::FileAccess::ReadWrite,
                     &with_root,
                 )
-                .await
-                .as_deref(),
-            Some("allow"),
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy())),
             "global ./.git* should match .git/config when project_root is set"
         );
         assert_eq!(
@@ -1235,9 +1122,8 @@ mod tests {
                     agent_sandbox_core::FileAccess::ReadWrite,
                     &without_root,
                 )
-                .await
-                .as_deref(),
-            Some("allow"),
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy())),
             "global ./.git* should still match via git-discovered project root when ctx project_root is empty"
         );
     }
@@ -1279,7 +1165,7 @@ mod tests {
         });
 
         let home_s = home.to_string_lossy().into_owned();
-        let stale_root = crate::wire::MergeContext {
+        let stale_root = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new("/tmp", &home_s, "/tmp"),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1292,9 +1178,8 @@ mod tests {
                     agent_sandbox_core::FileAccess::ReadWrite,
                     &stale_root,
                 )
-                .await
-                .as_deref(),
-            Some("allow"),
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy())),
             "git root inferred from path should match ./.git* even when launcher project_root is stale"
         );
     }
@@ -1337,7 +1222,7 @@ mod tests {
 
         let root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: None,
@@ -1346,9 +1231,8 @@ mod tests {
         assert_eq!(
             store
                 .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Execute, &ctx,)
-                .await
-                .as_deref(),
-            Some("allow"),
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy())),
             "opendir on .git/objects/pack is directory traverse (Execute), not binary exec"
         );
     }
@@ -1427,7 +1311,7 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some(session_id.into()),
@@ -1436,9 +1320,8 @@ mod tests {
         assert_eq!(
             store
                 .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Read, &ctx,)
-                .await
-                .as_deref(),
-            Some("deny"),
+                .await,
+            Some(Verdict::denied(VerdictSource::policy())),
             "session deny on ./.git blocks the tree even when global ./.git* allows"
         );
     }
@@ -1483,7 +1366,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some("sandbox-test".into()),
@@ -1504,7 +1387,7 @@ mod tests {
             store
                 .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
                 .await,
-            Some("deny".into())
+            Some(Verdict::denied(VerdictSource::policy()))
         );
     }
 
@@ -1550,7 +1433,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some("sandbox-inode".into()),
@@ -1571,7 +1454,7 @@ mod tests {
             store
                 .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Read, &ctx)
                 .await,
-            Some("deny".into())
+            Some(Verdict::denied(VerdictSource::policy()))
         );
     }
 
@@ -1590,7 +1473,7 @@ mod tests {
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
         });
-        let ctx = crate::wire::MergeContext::default();
+        let ctx = agent_sandbox_core::ResolvedRequestContext::default();
         assert_eq!(
             store
                 .filesystem_allow_source(
@@ -1599,7 +1482,7 @@ mod tests {
                     &ctx,
                 )
                 .await,
-            Some("infrastructure".into())
+            Some(Verdict::allowed(VerdictSource::Infrastructure))
         );
     }
 
@@ -1628,7 +1511,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some("sandbox-allow".into()),
@@ -1649,7 +1532,7 @@ mod tests {
             store
                 .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
                 .await,
-            Some("static".into())
+            Some(Verdict::allowed(VerdictSource::Static))
         );
     }
 
@@ -1696,7 +1579,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob".into()),
@@ -1717,7 +1600,7 @@ mod tests {
             store
                 .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Write, &ctx)
                 .await,
-            Some("deny".into()),
+            Some(Verdict::denied(VerdictSource::policy())),
             "static allow globs must not bypass inode deny checks"
         );
     }
@@ -1747,7 +1630,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob-allow".into()),
@@ -1768,7 +1651,7 @@ mod tests {
             store
                 .filesystem_allow_source(&nested_path, agent_sandbox_core::FileAccess::Read, &ctx)
                 .await,
-            Some("static".into())
+            Some(Verdict::allowed(VerdictSource::Static))
         );
     }
 
@@ -1812,7 +1695,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = crate::wire::MergeContext {
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
             paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: agent_sandbox_core::ProcessIds::default(),
             sandbox_session_id: Some("sandbox-broad-glob-deny".into()),
@@ -1833,7 +1716,7 @@ mod tests {
             store
                 .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
                 .await,
-            Some("deny".into()),
+            Some(Verdict::denied(VerdictSource::policy())),
             "broad user-defined globs must not bypass concrete policy deny"
         );
     }

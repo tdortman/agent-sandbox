@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use agent_sandbox_core::{
     CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRule, FilesystemRuleKey,
     NetworkRuleKey, ResourceAccess, ResourceCheckReply, ResourceKind, ResourceRuleKey,
+    VerdictSource,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
@@ -74,7 +75,7 @@ pub struct ResourceVerdictKey {
 #[derive(Debug, Clone)]
 pub struct VerdictEntry {
     pub allowed: bool,
-    pub source: String,
+    pub source: VerdictSource,
     pub time: Instant,
 }
 
@@ -316,10 +317,9 @@ impl MergedPolicyCache {
         self.entries.get(key).cloned()
     }
 
-    #[allow(clippy::map_entry)]
     pub fn insert(&mut self, key: MergedCacheKey, policy: agent_sandbox_core::Policy) {
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key, policy);
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = policy;
             return;
         }
         while self.order.len() >= Self::MAX_ENTRIES {

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, InodeIdentity,
-    UiPush, expand_policy_path,
+    ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
 };
 use tokio::sync::oneshot;
 use tokio::time;
@@ -17,7 +17,6 @@ use super::types::{
     FilesystemVerdictKey, MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING,
     Pending, PendingFilesystem, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::store::ui_route::UiRoute;
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext, UiSpawnGate};
 
 /// Timeout for waiting for the fsmon `ready` line.
@@ -97,7 +96,7 @@ impl PolicyStore {
             return FilesystemMonitorReply::failed("too many filesystem static allow rules");
         }
 
-        let ctx = self.resolve_context(&req.ctx);
+        let ctx = req.ctx.clone();
         let cwd = ctx.paths.cwd_path();
         let home = ctx.paths.home_path();
         let project_root = ctx.paths.project_root_path();
@@ -183,21 +182,13 @@ impl PolicyStore {
     }
 
     pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
-        let path = req.path;
-        let access = agent_sandbox_core::normalize_directory_traverse_access(&path, req.access);
-        let resolved = self.resolve_context(&req.ctx);
-        if let Some(source) = self.filesystem_allow_source(&path, access, &resolved).await {
-            if source == "deny" {
-                return FilesystemCheckReply::denied("deny", path, access);
-            }
-            return FilesystemCheckReply::allowed(source, path, access);
+        let FilesystemCheckRequest { path, access, ctx } = req;
+        let access = agent_sandbox_core::normalize_directory_traverse_access(&path, access);
+        if let Some(verdict) = self.filesystem_allow_source(&path, access, &ctx).await {
+            return FilesystemCheckReply::from_verdict(verdict, path, access);
         }
-        self.request_filesystem_approval(FilesystemCheckRequest {
-            path,
-            access,
-            ctx: resolved,
-        })
-        .await
+        self.request_filesystem_approval(FilesystemCheckRequest { path, access, ctx })
+            .await
     }
 
     pub async fn request_filesystem_approval(
@@ -205,20 +196,16 @@ impl PolicyStore {
         req: FilesystemCheckRequest,
     ) -> FilesystemCheckReply {
         let FilesystemCheckRequest { path, access, ctx } = req;
-        let resolved = self.resolve_context(&ctx);
-        let wire_ids = resolved.ids;
-        let cwd = resolved.paths.cwd_path();
-        let home = resolved.paths.home_path();
-        let project_root = resolved.paths.project_root_path();
-        let sandbox_session_id = resolved.sandbox_session_id.clone();
-        if self
-            .filesystem_policy_denied(&path, access, &resolved)
-            .await
-        {
-            return FilesystemCheckReply::denied("deny", path.clone(), access);
+        let wire_ids = ctx.ids;
+        let cwd = ctx.paths.cwd_path();
+        let home = ctx.paths.home_path();
+        let project_root = ctx.paths.project_root_path();
+        let sandbox_session_id = ctx.sandbox_session_id.clone();
+        if self.filesystem_policy_denied(&path, access, &ctx).await {
+            return FilesystemCheckReply::denied(VerdictSource::policy(), path.clone(), access);
         }
         if !self.args.interactive_approval {
-            return FilesystemCheckReply::denied("blocked", path.clone(), access);
+            return FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), access);
         }
 
         if let Some(reply) = self.check_filesystem_verdict_cache(&path, access).await {
@@ -240,9 +227,6 @@ impl PolicyStore {
             Err(reply) => return reply,
         };
 
-        let route = UiRoute::new(cwd.clone(), project_root.clone())
-            .with_sandbox_session(sandbox_session_id.clone());
-
         if result.is_new {
             tracing::info!(
                 pending_id = %result.id,
@@ -259,9 +243,9 @@ impl PolicyStore {
                 home: home.clone(),
                 project_root: project_root.clone(),
             };
-            self.notify_standalone_ui(&route, &push).await;
+            self.notify_standalone_ui(&ctx, &push).await;
 
-            if !self.has_standalone_ui_for_route(&route).await {
+            if !self.has_standalone_ui_for_context(&ctx).await {
                 let mut spawn_uid = wire_ids.uid();
                 if spawn_uid.is_none_or(|u| u == 0)
                     && let Some(h) = &home
@@ -296,7 +280,7 @@ impl PolicyStore {
             }
         }
 
-        self.await_filesystem_verdict(&route, &result.id, path, access, result.rx)
+        self.await_filesystem_verdict(&ctx, &result.id, path, access, result.rx)
             .await
     }
     async fn check_filesystem_verdict_cache(
@@ -418,7 +402,7 @@ impl PolicyStore {
 
     async fn await_filesystem_verdict(
         &self,
-        route: &UiRoute,
+        ctx: &ResolvedRequestContext,
         pending_id: &str,
         path: PathBuf,
         access: FileAccess,
@@ -433,7 +417,7 @@ impl PolicyStore {
         tokio::pin!(rx);
         let mut logged_ui_wait = false;
         loop {
-            if self.has_standalone_ui_for_route(route).await {
+            if self.has_standalone_ui_for_context(ctx).await {
                 tracing::info!(
                     pending_id,
                     path = %path.display(),
@@ -468,14 +452,16 @@ impl PolicyStore {
                 biased;
                 () = time::sleep(sleep_dur) => {}
                 result = &mut rx => {
-                    return result.unwrap_or_else(|_| FilesystemCheckReply::denied("blocked", path.clone(), access));
+                    return result.unwrap_or_else(|_| FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), access));
                 }
             }
         }
 
         match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
-            Ok(Err(_)) => FilesystemCheckReply::denied("blocked", path.clone(), access),
+            Ok(Err(_)) => {
+                FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), access)
+            }
             Err(_) => {
                 let mut inner = self.inner.lock().await;
                 inner.pending.remove(pending_id);
@@ -496,14 +482,14 @@ impl PolicyStore {
         path: PathBuf,
         access: FileAccess,
         allowed: bool,
-        source: &str,
+        source: VerdictSource,
     ) {
         let mut inner = self.inner.lock().await;
         if let Some(waiters) = inner.filesystem_futures.remove(pending_id) {
             let reply = if allowed {
-                FilesystemCheckReply::allowed(source, path.clone(), access)
+                FilesystemCheckReply::allowed(source.clone(), path.clone(), access)
             } else {
-                FilesystemCheckReply::denied(source, path.clone(), access)
+                FilesystemCheckReply::denied(source.clone(), path.clone(), access)
             };
             for tx in waiters {
                 let _ = tx.send(reply.clone());
@@ -516,7 +502,7 @@ impl PolicyStore {
                 FilesystemVerdictKey { path, access },
                 VerdictEntry {
                     allowed: false,
-                    source: source.to_string(),
+                    source,
                     time: Instant::now(),
                 },
             );
@@ -527,13 +513,15 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use agent_sandbox_core::{FileAccess, ProcessIds, SandboxPaths};
+    use agent_sandbox_core::{
+        ApprovalScope, FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, VerdictSource,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use crate::store::types::{PolicyStore, PolicydArgs};
-    use crate::wire::{FilesystemCheckRequest, MergeContext};
+    use crate::wire::FilesystemCheckRequest;
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
@@ -554,7 +542,7 @@ mod tests {
         FilesystemCheckRequest {
             path: path.into(),
             access,
-            ctx: MergeContext {
+            ctx: ResolvedRequestContext {
                 paths: SandboxPaths::from_wire(
                     Some("/repo".into()),
                     Some("/home/user".into()),
@@ -606,7 +594,7 @@ mod tests {
                 "/repo/file.txt".into(),
                 FileAccess::Read,
                 true,
-                "cli",
+                VerdictSource::policy_with_comment("cli"),
             )
             .await;
         let reply = tokio::time::timeout(Duration::from_secs(2), task)
@@ -621,7 +609,13 @@ mod tests {
         let store = test_store();
         let path = PathBuf::from("/tmp/agent-sandbox-allow-not-cached");
         store
-            .finish_filesystem("fs:test", path.clone(), FileAccess::Read, true, "once")
+            .finish_filesystem(
+                "fs:test",
+                path.clone(),
+                FileAccess::Read,
+                true,
+                VerdictSource::Scope(ApprovalScope::Once),
+            )
             .await;
         assert!(
             store
@@ -637,7 +631,13 @@ mod tests {
         let store = test_store();
         let path = PathBuf::from("/tmp/agent-sandbox-deny-cached");
         store
-            .finish_filesystem("fs:test", path.clone(), FileAccess::Read, false, "denied")
+            .finish_filesystem(
+                "fs:test",
+                path.clone(),
+                FileAccess::Read,
+                false,
+                VerdictSource::User,
+            )
             .await;
         let reply = store
             .check_filesystem_verdict_cache(&path, FileAccess::Read)
@@ -696,7 +696,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = MergeContext {
+        let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::from_options(Some(0), Some(1000)),
             sandbox_session_id: Some("sandbox-mutation".into()),
@@ -776,7 +776,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = MergeContext {
+        let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::from_options(Some(0), Some(1000)),
             sandbox_session_id: Some("sandbox-symlink".into()),
@@ -832,7 +832,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = MergeContext {
+        let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob-check".into()),
@@ -862,7 +862,8 @@ mod tests {
             "broad static-allow globs must remain functional when not denied, got: {reply:?}"
         );
         assert_eq!(
-            reply.source, "static",
+            reply.source,
+            VerdictSource::Static,
             "static allow should be evaluated through policyd after deny/inode checks"
         );
     }
@@ -907,7 +908,7 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = MergeContext {
+        let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-broad-glob-check-deny".into()),
@@ -936,7 +937,7 @@ mod tests {
             !reply.allowed,
             "policyd must deny before broad static-allow globs can allow, got: {reply:?}"
         );
-        assert_eq!(reply.source, "deny");
+        assert_eq!(reply.source, VerdictSource::policy());
     }
 
     #[test]

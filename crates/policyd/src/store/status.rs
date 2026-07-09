@@ -2,20 +2,13 @@
 
 use std::sync::Arc;
 
-use agent_sandbox_core::{PendingSummary, ProcessIds, SandboxPaths, StatusReply};
-
-use crate::wire::MergeContext;
+use agent_sandbox_core::{PendingSummary, ResolvedRequestContext, StatusReply};
 
 use super::types::{Pending, PolicyStore};
 
 impl PolicyStore {
-    pub async fn status(self: &Arc<Self>, paths: SandboxPaths) -> StatusReply {
+    pub async fn status(self: &Arc<Self>, ctx: ResolvedRequestContext) -> StatusReply {
         let pending = self.pending_summaries().await;
-        let ctx = MergeContext {
-            paths,
-            ids: ProcessIds::default(),
-            sandbox_session_id: None,
-        };
         let merged = self.merged_for_async(&ctx).await;
         StatusReply {
             ok: true,
@@ -26,7 +19,7 @@ impl PolicyStore {
 
     pub(crate) async fn merged_for_async(
         self: &Arc<Self>,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
     ) -> agent_sandbox_core::Policy {
         let store = Arc::clone(self);
         let ctx = ctx.clone();
