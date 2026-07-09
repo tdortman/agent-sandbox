@@ -255,6 +255,7 @@ lib.mkIf policyEnabled (
           );
           StateDirectory = "agent-sandbox";
           RuntimeDirectory = "agent-sandbox";
+          RuntimeDirectoryPreserve = "yes";
           Restart = "on-failure";
         };
         path = [
@@ -354,6 +355,7 @@ lib.mkIf policyEnabled (
             Restart = "on-failure";
             KillMode = "control-group";
             RuntimeDirectory = "agent-sandbox";
+            RuntimeDirectoryPreserve = "yes";
           };
         };
 
@@ -389,6 +391,7 @@ lib.mkIf policyEnabled (
               "/run/agent-sandbox/dns-push.sock"
             ];
             RuntimeDirectory = "agent-sandbox";
+            RuntimeDirectoryPreserve = "yes";
           };
           environment = {
             AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
