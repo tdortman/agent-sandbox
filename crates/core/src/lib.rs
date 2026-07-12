@@ -51,6 +51,6 @@ pub use rpc::{
     RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply, UiPush, Verdict,
     VerdictSource, attach_check_aliases, attach_ui_aliases, split_check_aliases, split_ui_aliases,
 };
-pub use rpc_client::{RpcClientError, RpcConnection, policy_rpc};
+pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
 pub use session_context::{SessionContext, read_session_context, write_session_context};
