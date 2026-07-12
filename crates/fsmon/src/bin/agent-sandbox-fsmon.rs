@@ -665,6 +665,14 @@ fn run_event_loop(
 ) -> ! {
     use std::os::fd::AsFd;
     let mut buf = vec![0u8; 4096];
+    let mut rpc = match rpc_client::PersistentClient::connect(socket_path) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "initial policyd connection failed; will retry on demand");
+            rpc_client::PersistentClient::new(socket_path)
+        }
+    };
+
     loop {
         let n = match nix::unistd::read(fan_fd.as_fd(), &mut buf) {
             Ok(n) => n,
@@ -730,8 +738,7 @@ fn run_event_loop(
 
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
-                let reply =
-                    rpc_client::check_filesystem(socket_path, Path::new(&path), access, event_ctx);
+                let reply = rpc.check_filesystem(Path::new(&path), access, event_ctx);
 
                 let verdict = match &reply {
                     Ok(r) if r.allowed => FAN_ALLOW,
