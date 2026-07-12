@@ -403,9 +403,7 @@ impl PolicyStore {
             return scope_wire;
         }
 
-        let session_ids = self
-            .standalone_session_ids_for_filesystem_pending(fs)
-            .await;
+        let session_ids = self.standalone_session_ids_for_filesystem_pending(fs).await;
         if scope_wire
             .session_id
             .as_ref()
@@ -576,9 +574,7 @@ impl PolicyStore {
             return scope_wire;
         }
 
-        let session_ids = self
-            .standalone_session_ids_for_resource_pending(res)
-            .await;
+        let session_ids = self.standalone_session_ids_for_resource_pending(res).await;
         if scope_wire
             .session_id
             .as_ref()
