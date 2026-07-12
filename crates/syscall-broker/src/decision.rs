@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, NetworkTarget, ResourceTarget, SeccompNotif, SyscallTarget,
-    target_from_notification,
+    FilesystemTarget, NetworkTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif,
+    SyscallTarget, target_from_notification,
 };
 
 /// Facts extracted from a raw seccomp notification before policy evaluation.
@@ -116,9 +116,9 @@ pub trait PolicyAdapter {
 }
 
 /// Configuration for the production policy adapter.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct RpcPolicyAdapter<'a> {
-    pub policy_socket: &'a Path,
+    pub client: &'a PersistentPolicyClient,
     pub sandbox_session_id: Option<&'a str>,
     pub pid: u32,
     pub timeout: Duration,
@@ -129,8 +129,7 @@ impl PolicyAdapter for RpcPolicyAdapter<'_> {
         &'a self,
         target: &'a NetworkTarget,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(agent_sandbox_syscall_broker::check_target(
-            self.policy_socket,
+        Box::pin(self.client.check_target(
             target,
             self.sandbox_session_id.map(str::to_owned),
             self.pid,
@@ -141,8 +140,7 @@ impl PolicyAdapter for RpcPolicyAdapter<'_> {
         &'a self,
         target: &'a ResourceTarget,
     ) -> Pin<Box<dyn Future<Output = io::Result<ResourceCheckReply>> + Send + 'a>> {
-        Box::pin(agent_sandbox_syscall_broker::check_resource(
-            self.policy_socket,
+        Box::pin(self.client.check_resource(
             target,
             self.sandbox_session_id.map(str::to_owned),
             self.pid,
@@ -154,8 +152,7 @@ impl PolicyAdapter for RpcPolicyAdapter<'_> {
         path: &'a Path,
         access: FileAccess,
     ) -> Pin<Box<dyn Future<Output = io::Result<FilesystemCheckReply>> + Send + 'a>> {
-        Box::pin(agent_sandbox_syscall_broker::check_filesystem(
-            self.policy_socket,
+        Box::pin(self.client.check_filesystem(
             path,
             access,
             self.sandbox_session_id.map(str::to_owned),

@@ -8,8 +8,8 @@ use std::time::Duration;
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    ResourceTarget, SeccompNotif, recv_notification, send_addfd, send_continue, send_errno,
-    send_result,
+    PersistentPolicyClient, ResourceTarget, SeccompNotif, recv_notification, send_addfd,
+    send_continue, send_errno, send_result,
 };
 use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
 use clap::Parser;
@@ -75,6 +75,8 @@ async fn main() -> std::io::Result<()> {
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
+    let policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());
+
     // Don't SIGCONT the child until the broker is inside its notification
     // loop and ready to receive. The child traps from the first openat onward
     // (dynamic linker), and if the kernel finds a USER_NOTIF filter with no
@@ -134,6 +136,7 @@ async fn main() -> std::io::Result<()> {
         };
         dispatch::dispatch_notification(
             &cli.policy_socket,
+            &policy_client,
             cli.sandbox_session_id.as_deref(),
             cli.listener_fd,
             &notif,

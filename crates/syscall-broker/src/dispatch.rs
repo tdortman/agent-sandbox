@@ -6,13 +6,14 @@ use super::decision::{
 };
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall_broker::{
-    SeccompNotif, notification_arch_valid, revalidate_filesystem_mutation, send_continue,
-    send_errno,
+    PersistentPolicyClient, SeccompNotif, notification_arch_valid, revalidate_filesystem_mutation,
+    send_continue, send_errno,
 };
 use tracing::{debug, info, warn};
 
 pub async fn dispatch_notification(
     policy_socket: &Path,
+    client: &PersistentPolicyClient,
     sandbox_session_id: Option<&str>,
     listener_fd: i32,
     notif: &SeccompNotif,
@@ -59,7 +60,7 @@ pub async fn dispatch_notification(
     );
 
     let adapter = RpcPolicyAdapter {
-        policy_socket,
+        client,
         sandbox_session_id,
         pid: notif.pid,
         timeout,
