@@ -173,7 +173,12 @@ let
         inherit fsArmPkg;
       }
       //
-        lib.optionalAttrs ((cfg.gates.syscalls.enable && cfg.network.enable) || cfg.gates.resources.enable)
+        lib.optionalAttrs
+          (
+            cfg.gates.filesystem.enable
+            || (cfg.gates.syscalls.enable && cfg.network.enable)
+            || cfg.gates.resources.enable
+          )
           {
             inherit syscallArmPkg;
           }
@@ -366,8 +371,13 @@ in
           kernel-mediated dynamic filesystem access approval via fanotify.
           Controls filesystem access at runtime using path-based allow/deny rules.
           The first process inside each sandbox becomes agent-sandbox-fs-arm,
-          which requests a fanotify monitor from policyd before execing the real entry.
-          Static bubblewrap mounts remain the structural write boundary.
+          Dynamic filesystem mode traps unsupported directory/device/metadata,
+          timestamp, and fallocate mutations before tracee-pointer classification.
+          Legacy rename/link/symlink/unlink/truncate operations remain policy-gated
+          with revalidation and ``CONTINUE`` for compatibility, with a residual
+          directory-entry TOCTOU risk. Use static bubblewrap mounts and predeclared
+          writable directories for workloads such as package installs. Static
+          bubblewrap mounts remain the structural read-only/read-write boundary.
           Disabled by default. When disabled, no fs-arm helper or fsmon process
           is used and there is no kernel-level filesystem mediation.
         '';
