@@ -327,6 +327,11 @@ fn resolve_blocked_open_path(
     })
 }
 
+/// Convert an unresolved fanotify path into a fail-closed verdict.
+fn path_resolution_verdict(path: Option<String>) -> Result<String, u32> {
+    path.ok_or(FAN_DENY)
+}
+
 fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32> {
     let content = host_proc.read_to_string(pid, &format!("fdinfo/{fd_name}"))?;
     let flags = content
@@ -703,15 +708,19 @@ fn run_event_loop(
                 }
                 let event_fd =
                     agent_sandbox_sysutil::take_fanotify_event_fd(meta.fd).expect("event fd");
-                let path = resolve_blocked_open_path(host_proc, meta.pid, meta.fd);
-                let Some(path) = path else {
-                    tracing::warn!(
-                        pid = meta.pid,
-                        "path resolution failed, allowing (fail-open)"
-                    );
-                    respond(fan_fd, &event_fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
+                let path = match path_resolution_verdict(resolve_blocked_open_path(
+                    host_proc, meta.pid, meta.fd,
+                )) {
+                    Ok(path) => path,
+                    Err(verdict) => {
+                        tracing::warn!(
+                            pid = meta.pid,
+                            "path resolution failed, denying (fail-closed)"
+                        );
+                        respond(fan_fd, &event_fd, verdict);
+                        offset += event_len;
+                        continue;
+                    }
                 };
                 let access = agent_sandbox_core::normalize_directory_traverse_access(
                     Path::new(&path),
@@ -1177,8 +1186,9 @@ mod tests {
     }
 
     #[test]
-    fn path_resolution_failure_is_fail_open() {
+    fn path_resolution_failure_is_fail_closed() {
         assert!(resolve_event_path(-1).is_err());
+        assert_eq!(path_resolution_verdict(None), Err(FAN_DENY));
     }
 
     #[test]
