@@ -21,9 +21,6 @@ fn suggest_filesystem_rule_path(path: &Path, project_root: Option<&Path>) -> Str
             let rel = canonical_path
                 .strip_prefix(&canonical_root)
                 .map_or(path, |rel| rel);
-            if rel.components().any(|c| c.as_os_str() == ".git") {
-                return "./.git".into();
-            }
             let rel = rel.to_string_lossy().trim_start_matches('/').to_string();
             if !rel.is_empty() {
                 return format!("./{rel}");
@@ -541,13 +538,13 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn suggest_filesystem_rule_path_prefers_git_directory_for_config() {
+    fn suggest_filesystem_rule_path_shows_relative_file_path() {
         assert_eq!(
             suggest_filesystem_rule_path(
                 Path::new("/home/user/repo/.git/config"),
                 Some(Path::new("/home/user/repo")),
             ),
-            "./.git"
+            "./.git/config"
         );
     }
 
