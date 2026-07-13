@@ -289,17 +289,24 @@ impl PolicyStore {
             }
         }
         let mut merged = merge_layers(&layers);
-        // Implicit deny-write for trusted policy files. Covers O_WRONLY
-        // (Write) and O_RDWR (ReadWrite) but NOT O_RDONLY (Read), so the
-        // agent can still read its policy. The DenyInodeCache fingerprints
-        // these by inode, so hardlinks at any path are caught.
-        if let Some(home) = home_path {
-            merged.filesystem.deny.push(FilesystemRule {
-                path: home
-                    .join(".config")
+        // Implicit deny-all for trusted policy files. Hides the policy from
+        // the sandboxed agent so it cannot learn pre-approved paths and
+        // craft bypasses. The DenyInodeCache fingerprints these by inode,
+        // so hardlinks and symlink targets at any path are caught.
+        for path in [
+            Some(self.args.declarative.clone()),
+            home_path.map(|home| {
+                home.join(".config")
                     .join("agent-sandbox")
-                    .join("policy.json"),
-                access: FileAccess::Write,
+                    .join("policy.json")
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            merged.filesystem.deny.push(FilesystemRule {
+                path,
+                access: FileAccess::All,
                 comment: Some("trusted policy file".into()),
             });
         }
@@ -308,7 +315,7 @@ impl PolicyStore {
         {
             merged.filesystem.deny.push(FilesystemRule {
                 path: trusted,
-                access: FileAccess::Write,
+                access: FileAccess::All,
                 comment: Some("trusted policy file".into()),
             });
         }
@@ -517,6 +524,26 @@ mod tests {
         assert_eq!(resolved.ids.pid(), Some(pid));
     }
 
+    #[tokio::test]
+    async fn declarative_policy_is_denied_to_sandbox_requests() {
+        let store = test_store();
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new("/home/user/project", "/home/user", "/home/user/project"),
+            ids: ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert!(
+            store
+                .filesystem_policy_denied(
+                    Path::new("/tmp/declarative.json"),
+                    FileAccess::Read,
+                    &ctx,
+                )
+                .await,
+            "sandbox reads of declarative policy must be denied"
+        );
+    }
     #[test]
     fn forged_home_does_not_load_policy_from_attacker_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
