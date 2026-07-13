@@ -45,6 +45,24 @@ impl FileAccess {
         }
     }
 
+    /// Whether `self` covers every access level that `other` covers.
+    ///
+    /// Used by merge to decide whether a deny rule fully shadows an allow
+    /// rule. `Write` does NOT supersede `ReadWrite` because `ReadWrite`
+    /// covers `Read` while `Write` does not.
+    #[must_use]
+    pub fn access_superset(self, other: Self) -> bool {
+        [
+            Self::Read,
+            Self::Write,
+            Self::ReadWrite,
+            Self::Execute,
+            Self::All,
+        ]
+        .iter()
+        .all(|&v| !other.covers(v) || self.covers(v))
+    }
+
     /// Smallest access that conservatively represents both observations.
     ///
     /// This is stricter than [`Self::union`]: combining an observed read with an
@@ -537,6 +555,20 @@ impl ResourceAccess {
             Self::OpenWrite => "open_write",
             Self::OpenReadWrite => "open_read_write",
         }
+    }
+
+    /// Whether `self` covers every access level that `other` covers.
+    #[must_use]
+    pub fn access_superset(self, other: Self) -> bool {
+        [
+            Self::Connect,
+            Self::Send,
+            Self::OpenRead,
+            Self::OpenWrite,
+            Self::OpenReadWrite,
+        ]
+        .iter()
+        .all(|&v| !other.covers(v) || self.covers(v))
     }
 
     /// Whether this access level covers the requested access.

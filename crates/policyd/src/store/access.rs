@@ -1129,6 +1129,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_git_slash_prefix_matches_head_with_project_root() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(project_root.join(".git")).expect("create git dir");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+        let policy_path = policy_dir.join("policy.json");
+        let head_path = project_root.join(".git/HEAD");
+        std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
+
+        let mut policy = agent_sandbox_core::Policy::default();
+        policy
+            .filesystem
+            .allow
+            .push(agent_sandbox_core::FilesystemRule::new(
+                "./.git/",
+                agent_sandbox_core::FileAccess::ReadWrite,
+                "global",
+            ));
+        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
+            .expect("write policy");
+
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
+        });
+
+        let home_s = home.to_string_lossy().into_owned();
+        let root_s = project_root.to_string_lossy().into_owned();
+        let with_root = agent_sandbox_core::ResolvedRequestContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+        let without_root = agent_sandbox_core::ResolvedRequestContext {
+            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, ""),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &head_path,
+                    agent_sandbox_core::FileAccess::Read,
+                    &with_root,
+                )
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy())),
+            "./.git/ prefix should match .git/HEAD when project_root is set"
+        );
+        assert_eq!(
+            store
+                .filesystem_allow_source(
+                    &head_path,
+                    agent_sandbox_core::FileAccess::Read,
+                    &without_root,
+                )
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy())),
+            "./.git/ prefix should match via git-discovered project root when ctx project_root is empty"
+        );
+    }
+
+    #[tokio::test]
     async fn global_git_star_matches_objects_when_ctx_project_root_is_stale() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("agent-sandbox");
