@@ -4,7 +4,8 @@ use std::path::Path;
 
 use super::io::policy_json;
 use super::*;
-use crate::policy::{FileAccess, FilesystemRule, NetworkRule, Policy, SudoRule};
+use crate::HttpRule;
+use crate::policy::{FileAccess, FilesystemRule, HttpSection, NetworkRule, Policy, SudoRule};
 
 fn empty_policy() -> Policy {
     Policy::default()
@@ -14,21 +15,27 @@ fn empty_policy() -> Policy {
 fn deny_removes_allow_from_earlier_layer() {
     let low = Policy {
         network: crate::policy::NetworkSection {
-            allow: vec![NetworkRule::new("example.com", 443, "")],
-            deny: vec![],
+            direct: crate::policy::DirectNetworkSection {
+                allow: vec![NetworkRule::new("example.com", 443, "")],
+                deny: vec![],
+            },
+            http: HttpSection::default(),
         },
         ..empty_policy()
     };
     let high = Policy {
         network: crate::policy::NetworkSection {
-            allow: vec![],
-            deny: vec![NetworkRule::new("example.com", 443, "")],
+            direct: crate::policy::DirectNetworkSection {
+                allow: vec![],
+                deny: vec![NetworkRule::new("example.com", 443, "")],
+            },
+            http: HttpSection::default(),
         },
         ..empty_policy()
     };
     let merged = merge_layers(&[low, high]);
-    assert!(merged.network.allow.is_empty());
-    assert_eq!(merged.network.deny.len(), 1);
+    assert!(merged.network.direct.allow.is_empty());
+    assert_eq!(merged.network.direct.deny.len(), 1);
 }
 
 #[test]
@@ -45,11 +52,11 @@ fn atomic_write_preserves_symlink() {
     let link = tmp.path().join("policy.json");
     std::os::unix::fs::symlink(&real_policy, &link).expect("symlink");
     let mut data = empty_policy();
-    data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
+    data.network.direct.allow = vec![NetworkRule::new("example.com", 443, "")];
     atomic_write_policy(&link, &data, None, None, None).expect("write policy");
     assert!(link.is_symlink());
     let loaded = load_policy(&real_policy, None, None);
-    assert_eq!(loaded.network.allow[0].host, "example.com");
+    assert_eq!(loaded.network.direct.allow[0].host, "example.com");
 }
 
 #[test]
@@ -63,13 +70,13 @@ fn atomic_write_preserves_relative_symlink_to_missing_target() {
     std::os::unix::fs::symlink("../../dot_config/agent-sandbox/policy.json", &link)
         .expect("symlink");
     let mut data = empty_policy();
-    data.network.allow = vec![NetworkRule::new("example.com", 443, "")];
+    data.network.direct.allow = vec![NetworkRule::new("example.com", 443, "")];
 
     atomic_write_policy(&link, &data, None, None, None).expect("write policy");
 
     assert!(link.is_symlink());
     let loaded = load_policy(&real_dir.join("policy.json"), None, None);
-    assert_eq!(loaded.network.allow[0].host, "example.com");
+    assert_eq!(loaded.network.direct.allow[0].host, "example.com");
 }
 
 #[test]
@@ -107,7 +114,7 @@ fn atomic_write_keeps_each_rule_on_one_line() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let policy_path = tmp.path().join("policy.json");
     let mut policy = empty_policy();
-    policy.network.allow = vec![
+    policy.network.direct.allow = vec![
         NetworkRule::new("example.com", 443, "first"),
         NetworkRule::new("api.example.com", 443, "second"),
     ];
@@ -123,11 +130,17 @@ fn atomic_write_keeps_each_rule_on_one_line() {
         json,
         r#"{
     "network": {
-        "allow": [
-            { "host": "example.com", "port": 443, "comment": "first" },
-            { "host": "api.example.com", "port": 443, "comment": "second" }
-        ],
-        "deny": []
+        "direct": {
+            "allow": [
+                { "host": "example.com", "port": 443, "comment": "first" },
+                { "host": "api.example.com", "port": 443, "comment": "second" }
+            ],
+            "deny": []
+        },
+        "http": {
+            "allow": [],
+            "deny": []
+        }
     },
     "sudo": {
         "allow": [],
@@ -149,9 +162,112 @@ fn atomic_write_keeps_each_rule_on_one_line() {
 }
 
 #[test]
+fn load_policy_ignores_top_level_http_rules() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("policy.json");
+    fs::write(
+        &path,
+        r#"{
+    "network": { "allow": [], "deny": [] },
+    "http": {
+        "allow": [{ "method": "GET", "url": "https://api.example.com/v1" }],
+        "deny": [{ "url": "https://api.example.com/v1/telemetry" }]
+    },
+    "sudo": { "allow": [], "deny": [] },
+    "filesystem": { "allow": [], "deny": [] },
+    "resources": { "allow": [], "deny": [] }
+}"#,
+    )
+    .expect("write file");
+
+    let policy = load_policy(&path, None, None);
+    assert!(policy.network.http.allow.is_empty());
+    assert!(policy.network.http.deny.is_empty());
+}
+
+#[test]
+fn legacy_direct_network_fields_deserialize_to_canonical_direct() {
+    let policy: Policy = serde_json::from_str(
+        r#"{
+    "network": {
+        "allow": [{ "host": "example.com", "port": 443 }],
+        "deny": []
+    }
+}"#,
+    )
+    .expect("legacy direct policy");
+    assert_eq!(policy.network.direct.allow.len(), 1);
+    assert!(policy.network.direct.deny.is_empty());
+    let json = serde_json::to_value(policy).expect("serialize canonical policy");
+    let network = json
+        .get("network")
+        .and_then(serde_json::Value::as_object)
+        .expect("network object");
+    assert!(network.contains_key("direct"));
+    assert!(!network.contains_key("allow"));
+    assert!(!network.contains_key("deny"));
+}
+
+#[test]
+fn migrate_policy_rewrites_legacy_network_fields_on_disk() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("policy.json");
+    fs::write(
+        &path,
+        r#"{
+    "network": {
+        "allow": [{ "host": "example.com", "port": 443 }],
+        "deny": []
+    }
+}"#,
+    )
+    .expect("write legacy policy");
+
+    assert!(migrate_policy(&path, None, None).expect("migrate policy"));
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read migrated policy"))
+            .expect("parse migrated policy");
+    let network = value
+        .get("network")
+        .and_then(serde_json::Value::as_object)
+        .expect("network object");
+    assert!(network.contains_key("direct"));
+    assert!(!network.contains_key("allow"));
+    assert!(!network.contains_key("deny"));
+    assert_eq!(
+        network["direct"]["allow"][0]["host"],
+        serde_json::Value::String("example.com".into())
+    );
+}
+
+#[test]
+fn migrate_policy_reports_invalid_http_without_rewriting() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("policy.json");
+    let legacy = r#"{
+    "network": {
+        "allow": [{ "host": "example.com", "port": 443 }],
+        "http": {
+            "allow": [{ "method": "GET", "url": "not a URL" }]
+        }
+    }
+}"#;
+    fs::write(&path, legacy).expect("write legacy policy");
+    let before = fs::read(&path).expect("read original policy");
+
+    let loaded = load_policy(&path, None, None);
+    assert_eq!(loaded.network.direct.allow.len(), 1);
+    assert!(loaded.network.http.allow.is_empty());
+
+    let error = migrate_policy(&path, None, None).expect_err("invalid HTTP rule must fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&path).expect("read unchanged policy"), before);
+}
+
+#[test]
 fn policy_json_one_rule_per_line_invariant() {
     let mut p = empty_policy();
-    p.network.allow = vec![
+    p.network.direct.allow = vec![
         NetworkRule::new("first.com", 80, "alpha"),
         NetworkRule::new("second.org", 443, "beta"),
     ];
@@ -161,7 +277,7 @@ fn policy_json_one_rule_per_line_invariant() {
     // Every rule appears as exactly one line, not spread across many.
     let rule_lines: Vec<&str> = json
         .lines()
-        .filter(|l| l.starts_with("            {"))
+        .filter(|line| line.trim_start().starts_with("{ "))
         .collect();
     assert_eq!(
         rule_lines.len(),
@@ -282,21 +398,27 @@ fn old_policy_without_filesystem_still_loads() {
 fn global_deny_beats_project_allow() {
     let low = Policy {
         network: crate::policy::NetworkSection {
-            allow: vec![NetworkRule::new("example.com", 443, "")],
-            deny: vec![],
+            direct: crate::policy::DirectNetworkSection {
+                allow: vec![NetworkRule::new("example.com", 443, "")],
+                deny: vec![],
+            },
+            http: HttpSection::default(),
         },
         ..empty_policy()
     };
     let high = Policy {
         network: crate::policy::NetworkSection {
-            allow: vec![],
-            deny: vec![NetworkRule::new("example.com", 443, "")],
+            direct: crate::policy::DirectNetworkSection {
+                allow: vec![],
+                deny: vec![NetworkRule::new("example.com", 443, "")],
+            },
+            http: HttpSection::default(),
         },
         ..empty_policy()
     };
     let merged = merge_layers(&[low, high]);
-    assert!(merged.network.allow.is_empty());
-    assert_eq!(merged.network.deny.len(), 1);
+    assert!(merged.network.direct.allow.is_empty());
+    assert_eq!(merged.network.direct.deny.len(), 1);
 }
 
 #[test]
@@ -324,21 +446,27 @@ fn sudo_deny_beats_later_allow() {
 fn deny_wins_over_wildcard_allow_on_merge() {
     let low = Policy {
         network: crate::policy::NetworkSection {
-            allow: vec![NetworkRule::new("*.evil.com", 443, "")],
-            deny: vec![],
+            direct: crate::policy::DirectNetworkSection {
+                allow: vec![NetworkRule::new("*.evil.com", 443, "")],
+                deny: vec![],
+            },
+            http: HttpSection::default(),
         },
         ..empty_policy()
     };
     let high = Policy {
         network: crate::policy::NetworkSection {
-            allow: vec![],
-            deny: vec![NetworkRule::new("evil.com", 443, "")],
+            direct: crate::policy::DirectNetworkSection {
+                allow: vec![],
+                deny: vec![NetworkRule::new("evil.com", 443, "")],
+            },
+            http: HttpSection::default(),
         },
         ..empty_policy()
     };
     let merged = merge_layers(&[low, high]);
     assert!(
-        merged.network.allow.is_empty(),
+        merged.network.direct.allow.is_empty(),
         "deny evil.com must shadow allow *.evil.com"
     );
 }
@@ -362,4 +490,144 @@ fn filesystem_deny_beats_later_allow() {
     let merged = merge_layers(&[low, high]);
     assert!(merged.filesystem.allow.is_empty());
     assert_eq!(merged.filesystem.deny.len(), 1);
+}
+
+#[test]
+fn http_merge_removes_only_exact_opposite_target() {
+    let mut allow = empty_policy();
+    allow.network.http = HttpSection {
+        allow: vec![HttpRule::new(
+            vec![],
+            "https://example.com/api",
+            "all methods",
+        )],
+        deny: vec![],
+    };
+    let mut deny = empty_policy();
+    deny.network.http = HttpSection {
+        allow: vec![],
+        deny: vec![HttpRule::new(
+            vec!["GET".into()],
+            "https://example.com/api",
+            "GET only",
+        )],
+    };
+    let merged = merge_layers(&[allow, deny]);
+    assert_eq!(merged.network.http.allow.len(), 1);
+    assert_eq!(merged.network.http.deny.len(), 1);
+}
+
+#[test]
+fn http_merge_removes_an_exact_equal_target() {
+    let mut allow = empty_policy();
+    allow.network.http.allow = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://example.com/api",
+        "allow",
+    )];
+    let mut deny = empty_policy();
+    deny.network.http.deny = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://example.com/api",
+        "deny",
+    )];
+    let merged = merge_layers(&[allow, deny]);
+    assert!(merged.network.http.allow.is_empty());
+    assert_eq!(merged.network.http.deny.len(), 1);
+}
+
+#[test]
+fn http_merge_unions_methods_for_same_url() {
+    let mut first = empty_policy();
+    first.network.http.allow = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://example.com/api",
+        "GET",
+    )];
+    let mut second = empty_policy();
+    second.network.http.allow = vec![HttpRule::new(
+        vec!["POST".into()],
+        "https://example.com/api",
+        "POST",
+    )];
+
+    let merged = merge_layers(&[first, second]);
+    assert_eq!(merged.network.http.allow.len(), 1);
+    assert_eq!(
+        merged.network.http.allow[0].methods,
+        vec!["GET".to_string(), "POST".to_string()]
+    );
+}
+
+#[test]
+fn http_merge_deny_covers_allow_path_and_methods() {
+    let mut allow = empty_policy();
+    allow.network.http.allow = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://example.com/api/v1",
+        "allow",
+    )];
+    let mut deny = empty_policy();
+    deny.network.http.deny = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://example.com/api",
+        "deny",
+    )];
+
+    let merged = merge_layers(&[allow, deny]);
+    assert!(merged.network.http.allow.is_empty());
+}
+
+#[test]
+fn http_merge_partial_method_deny_keeps_allow() {
+    let mut allow = empty_policy();
+    allow.network.http.allow = vec![HttpRule::new(
+        vec!["GET".into(), "POST".into()],
+        "https://example.com/api",
+        "allow",
+    )];
+    let mut deny = empty_policy();
+    deny.network.http.deny = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://example.com/api",
+        "deny",
+    )];
+
+    let merged = merge_layers(&[allow, deny]);
+    assert_eq!(merged.network.http.allow.len(), 1);
+    assert_eq!(
+        merged.network.http.allow[0].methods,
+        vec!["GET".to_string(), "POST".to_string()]
+    );
+}
+#[test]
+fn direct_merge_keeps_partially_overlapping_globs() {
+    let mut allow = empty_policy();
+    allow.network.direct.allow = vec![NetworkRule::new("api.*.example.com", 443, "allow")];
+    let mut deny = empty_policy();
+    deny.network.direct.deny = vec![NetworkRule::new("api.?.example.com", 443, "deny")];
+
+    let merged = merge_layers(&[allow, deny]);
+    assert_eq!(merged.network.direct.allow.len(), 1);
+    assert_eq!(merged.network.direct.deny.len(), 1);
+}
+
+#[test]
+fn http_glob_deny_covers_concrete_allow() {
+    let mut allow = empty_policy();
+    allow.network.http.allow = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://api.github.com/repos/owner/repo",
+        "allow",
+    )];
+    let mut deny = empty_policy();
+    deny.network.http.deny = vec![HttpRule::new(
+        vec!["GET".into()],
+        "https://api.github.com/repos/*/*",
+        "deny",
+    )];
+
+    let merged = merge_layers(&[allow, deny]);
+    assert!(merged.network.http.allow.is_empty());
+    assert_eq!(merged.network.http.deny.len(), 1);
 }

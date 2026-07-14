@@ -3,9 +3,11 @@
 use std::collections::BTreeMap;
 
 use crate::hosts::host_pattern_matches;
+use crate::http::{HttpMethodMatcher, HttpRule, HttpRuleTarget, HttpUrl};
 use crate::policy::{
-    FilesystemRule, FilesystemRuleKey, FilesystemSection, NetworkRule, NetworkSection, Policy,
-    ResourceRule, ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
+    DirectNetworkSection, FilesystemRule, FilesystemRuleKey, FilesystemSection, HttpSection,
+    NetworkRule, NetworkSection, Policy, ResourceRule, ResourceRuleKey, ResourceSection, SudoRule,
+    SudoSection,
 };
 
 #[must_use]
@@ -25,7 +27,14 @@ fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {
     if deny.port != allow.port {
         return false;
     }
+    if has_host_glob(&deny.host) && has_host_glob(&allow.host) {
+        return deny.host.eq_ignore_ascii_case(&allow.host);
+    }
     host_pattern_matches(&deny.host, &allow.host) || host_pattern_matches(&allow.host, &deny.host)
+}
+
+fn has_host_glob(host: &str) -> bool {
+    host.contains(['*', '?'])
 }
 
 fn merge_rules<R, K, Allow, Deny, Key, Overlap>(
@@ -65,15 +74,77 @@ where
     (allow.into_values().collect(), deny.into_values().collect())
 }
 
+fn merge_http_rules(layers: &[Policy], allow_rules: bool) -> Vec<HttpRule> {
+    let mut merged: BTreeMap<HttpUrl, (HttpMethodMatcher, Option<String>)> = BTreeMap::new();
+    for layer in layers {
+        let rules = if allow_rules {
+            &layer.network.http.allow
+        } else {
+            &layer.network.http.deny
+        };
+        for rule in rules {
+            let Ok(target) = rule.target() else {
+                continue;
+            };
+            let url = target.url;
+            if let Some((methods, comment)) = merged.get_mut(&url) {
+                *methods = methods.union(&target.method);
+                comment.clone_from(&rule.comment);
+            } else {
+                merged.insert(url, (target.method, rule.comment.clone()));
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(url, (methods, comment))| HttpRule {
+            methods: methods
+                .to_methods()
+                .into_iter()
+                .map(|method| method.as_str().to_owned())
+                .collect(),
+            url: url.to_string(),
+            comment,
+        })
+        .collect()
+}
+
+fn http_rule_target(rule: &HttpRule) -> Option<HttpRuleTarget> {
+    rule.target().ok()
+}
+
 fn merge_network(layers: &[Policy]) -> NetworkSection {
-    let (allow, deny) = merge_rules(
+    let (direct_allow, direct_deny) = merge_rules(
         layers,
-        |policy| &policy.network.allow,
-        |policy| &policy.network.deny,
+        |policy| &policy.network.direct.allow,
+        |policy| &policy.network.direct.deny,
         |rule| Some(rule.key()),
         network_rules_overlap,
     );
-    NetworkSection { allow, deny }
+    let http_allow = merge_http_rules(layers, true);
+    let http_deny = merge_http_rules(layers, false);
+    let http_deny_targets: Vec<_> = http_deny.iter().filter_map(http_rule_target).collect();
+    let http_allow = http_allow
+        .into_iter()
+        .filter(|allow| {
+            let Some(allow_target) = http_rule_target(allow) else {
+                return true;
+            };
+            !http_deny_targets
+                .iter()
+                .any(|deny_target| deny_target.covers(&allow_target))
+        })
+        .collect();
+    NetworkSection {
+        direct: DirectNetworkSection {
+            allow: direct_allow,
+            deny: direct_deny,
+        },
+        http: HttpSection {
+            allow: http_allow,
+            deny: http_deny,
+        },
+    }
 }
 
 fn sudo_rules_overlap(deny: &SudoRule, allow: &SudoRule) -> bool {

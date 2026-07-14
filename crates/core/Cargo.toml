@@ -10,13 +10,17 @@ workspace = true
 [dependencies]
 dns-lookup.workspace    = true
 globset.workspace       = true
+idna.workspace          = true
 hickory-proto.workspace = true
 libc.workspace          = true
 nix                     = { workspace = true, features = ["fs", "socket", "user"] }
+getrandom.workspace      = true
 serde.workspace         = true
 serde_json.workspace    = true
 thiserror.workspace     = true
 tokio                   = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+uuid                    = { workspace = true }
+url                     = { workspace = true }
 which.workspace         = true
 
 [dev-dependencies]

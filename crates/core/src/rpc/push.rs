@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::http::{HttpRequest, PendingHttpId};
 use crate::policy::{FileAccess, ResourceAccess, ResourceKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,14 @@ pub enum PendingSummary {
         url: Option<String>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
+    },
+    Http {
+        id: PendingHttpId,
+        request: HttpRequest,
+        cwd: Option<PathBuf>,
+        home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+        sandbox_session_id: Option<String>,
     },
     Elevation {
         id: String,
@@ -54,6 +63,14 @@ pub enum UiPush {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
+    },
+    HttpRequest {
+        id: PendingHttpId,
+        request: HttpRequest,
+        cwd: Option<PathBuf>,
+        home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+        sandbox_session_id: Option<String>,
     },
     ElevationRequest {
         id: String,

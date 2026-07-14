@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::hosts::NetworkRuleKey;
+use crate::http::HttpRule;
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -721,7 +722,7 @@ pub struct ResourceSection {
     pub deny: Vec<ResourceRule>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Policy {
     #[serde(default)]
     pub network: NetworkSection,
@@ -733,12 +734,85 @@ pub struct Policy {
     pub resources: ResourceSection,
 }
 
+#[derive(Deserialize)]
+struct PolicyWire {
+    #[serde(default)]
+    network: NetworkSection,
+    #[serde(default)]
+    sudo: SudoSection,
+    #[serde(default)]
+    filesystem: FilesystemSection,
+    #[serde(default)]
+    resources: ResourceSection,
+}
+
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = PolicyWire::deserialize(deserializer)?;
+        Ok(Self {
+            network: wire.network,
+            sudo: wire.sudo,
+            filesystem: wire.filesystem,
+            resources: wire.resources,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkSection {
+pub struct DirectNetworkSection {
     #[serde(default)]
     pub allow: Vec<NetworkRule>,
     #[serde(default)]
     pub deny: Vec<NetworkRule>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct NetworkSection {
+    #[serde(default)]
+    pub direct: DirectNetworkSection,
+    #[serde(default)]
+    pub http: HttpSection,
+}
+
+#[derive(Deserialize)]
+struct NetworkSectionWire {
+    #[serde(default)]
+    direct: Option<DirectNetworkSection>,
+    #[serde(default)]
+    allow: Vec<NetworkRule>,
+    #[serde(default)]
+    deny: Vec<NetworkRule>,
+    #[serde(default)]
+    http: HttpSection,
+}
+
+impl<'de> Deserialize<'de> for NetworkSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = NetworkSectionWire::deserialize(deserializer)?;
+        let mut direct = wire.direct.unwrap_or_default();
+        // Accept legacy `network.allow` and `network.deny` fields and
+        // normalize them into the canonical `network.direct` section.
+        direct.allow.extend(wire.allow);
+        direct.deny.extend(wire.deny);
+        Ok(Self {
+            direct,
+            http: wire.http,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpSection {
+    #[serde(default)]
+    pub allow: Vec<HttpRule>,
+    #[serde(default)]
+    pub deny: Vec<HttpRule>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

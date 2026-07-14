@@ -1,9 +1,11 @@
 use super::{
     ApprovalScope, CheckReply, ElevateReply, FilesystemCheckReply, FilesystemMonitorReply,
-    RegisterUiReply, ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply,
-    StatusReply, UiPush, VerdictSource,
+    HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RegisterUiReply,
+    ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
+    StatusReply, UiPush, Verdict, VerdictSource,
 };
 use crate::ResourceKind;
+use crate::http::HttpRequest;
 use crate::policy::{FileAccess, ResourceAccess};
 use std::path::{Path, PathBuf};
 
@@ -55,6 +57,85 @@ fn check_reply_roundtrip() {
     assert_eq!(json["allowed"], false);
     assert_eq!(json["source"], "blocked");
     assert_eq!(json["error"], "timeout");
+}
+
+#[test]
+fn proxy_reply_envelopes_preserve_request_id_and_body() {
+    let request_id = ProxyRequestId::new();
+    let request =
+        HttpRequest::from_parts("GET", "https", "example.com", "/api").expect("valid HTTP request");
+    let replies = [
+        ProxyReplyBody::HttpCheck(HttpCheckReply::from_verdict(
+            request,
+            Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)),
+        )),
+        ProxyReplyBody::NetworkFlow(CheckReply::blocked("denied")),
+        ProxyReplyBody::Canceled(SimpleOkReply::OK),
+        ProxyReplyBody::Error(super::ErrorReply::new("failed")),
+    ];
+
+    for body in replies {
+        let wire = serde_json::to_string(&RpcReply::Proxy(ProxyReply {
+            request_id,
+            reply: body,
+        }))
+        .expect("serialize proxy reply");
+        let value: serde_json::Value = serde_json::from_str(&wire).expect("parse proxy reply wire");
+        assert_eq!(value["request_id"], request_id.to_string());
+        assert!(value["reply"]["kind"].is_string());
+        let parsed: RpcReply = serde_json::from_str(&wire).expect("deserialize proxy reply");
+        let RpcReply::Proxy(parsed) = parsed else {
+            panic!("proxy reply envelope was not selected");
+        };
+        assert_eq!(parsed.request_id, request_id);
+    }
+}
+
+#[test]
+fn proxy_replies_can_be_reordered_without_losing_identity() {
+    let first = ProxyRequestId::new();
+    let second = ProxyRequestId::new();
+    let first_wire = serde_json::to_string(&RpcReply::Proxy(ProxyReply {
+        request_id: first,
+        reply: ProxyReplyBody::NetworkFlow(CheckReply::blocked("first")),
+    }))
+    .expect("serialize first reply");
+    let second_wire = serde_json::to_string(&RpcReply::Proxy(ProxyReply {
+        request_id: second,
+        reply: ProxyReplyBody::NetworkFlow(CheckReply::blocked("second")),
+    }))
+    .expect("serialize second reply");
+
+    let reordered = [second_wire, first_wire]
+        .into_iter()
+        .map(|wire| serde_json::from_str::<RpcReply>(&wire).expect("deserialize proxy reply"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &reordered[..],
+        [RpcReply::Proxy(second_reply), RpcReply::Proxy(first_reply)]
+            if second_reply.request_id == second && first_reply.request_id == first
+    ));
+}
+
+#[test]
+fn blocked_http_reply_without_request_deserializes() {
+    let reply: HttpCheckReply = serde_json::from_str(
+        r#"{"ok":false,"allowed":false,"source":"blocked","error":"cancelled"}"#,
+    )
+    .expect("blocked HTTP reply without request");
+    assert!(reply.request.is_none());
+}
+
+#[test]
+fn filesystem_monitor_error_reply_deserializes_as_monitor() {
+    let reply: RpcReply = serde_json::from_str(
+        r#"{"ok":true,"active":false,"error":"fs_monitor_cmd not configured"}"#,
+    )
+    .expect("deserialize monitor reply");
+    assert!(matches!(
+        reply,
+        RpcReply::FilesystemMonitor(FilesystemMonitorReply { active: false, .. })
+    ));
 }
 
 #[test]

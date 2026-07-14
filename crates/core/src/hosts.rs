@@ -3,6 +3,11 @@
 use std::net::IpAddr;
 use std::path::Path;
 
+use globset::GlobBuilder;
+use hickory_proto::rr::Name;
+use idna::domain_to_ascii;
+use thiserror::Error;
+
 use crate::dns_cache::lookup_dns_cache;
 #[must_use]
 pub fn is_ip_literal(host: &str) -> bool {
@@ -16,6 +21,54 @@ pub fn normalize_host(host: &str) -> String {
     // Strip surrounding brackets from IPv6 literals for policy matching.
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host.to_lowercase().trim_end_matches('.').to_string()
+}
+
+/// Error returned when a DNS name cannot be canonicalized safely.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum DnsNameError {
+    #[error("DNS name is empty")]
+    Empty,
+    #[error("DNS name is not a valid IDNA name")]
+    Invalid,
+    #[error("DNS name exceeds the 253-byte wire limit")]
+    TooLong,
+    #[error("DNS label exceeds the 63-byte wire limit")]
+    LabelTooLong,
+}
+
+/// Canonicalize a DNS name to lowercase ASCII without a terminal dot.
+///
+/// # Errors
+///
+/// Returns [`DnsNameError`] when the input is empty, invalid, or exceeds DNS
+/// wire-format limits.
+pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err(DnsNameError::Empty);
+    }
+    let ascii = domain_to_ascii(trimmed).map_err(|_| DnsNameError::Invalid)?;
+    let canonical = ascii.trim_end_matches('.');
+    if canonical.is_empty() {
+        return Err(DnsNameError::Empty);
+    }
+    if canonical.len() > 253 {
+        return Err(DnsNameError::TooLong);
+    }
+    for label in canonical.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(if label.is_empty() {
+                DnsNameError::Invalid
+            } else {
+                DnsNameError::LabelTooLong
+            });
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(DnsNameError::Invalid);
+        }
+    }
+    let name = Name::from_ascii(format!("{canonical}.")).map_err(|_| DnsNameError::Invalid)?;
+    Ok(name.to_ascii().trim_end_matches('.').to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -161,7 +214,7 @@ pub fn allow_keys(host: &str, port: u16) -> Vec<NetworkRuleKey> {
     vec![NetworkRuleKey::new(&host, port)]
 }
 
-/// Whether `host` matches a policy `pattern` (exact, `*.suffix`, or IP prefix wildcards).
+/// Whether `host` matches a policy `pattern` using suffix, IP-prefix, or glob matching.
 #[must_use]
 pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_lowercase();
@@ -181,6 +234,11 @@ pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
         host.parse::<std::net::IpAddr>(),
     ) {
         return ip_pat == ip_host;
+    }
+    if (pattern.contains('*') || pattern.contains('?'))
+        && let Ok(glob) = GlobBuilder::new(&pattern).literal_separator(true).build()
+    {
+        return glob.compile_matcher().is_match(&host);
     }
     pattern == host
 }
@@ -319,6 +377,30 @@ mod tests {
                 "*.baz.com".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn host_pattern_matches_general_globs() {
+        assert!(host_pattern_matches(
+            "api.*.example.com",
+            "API.V1.EXAMPLE.COM"
+        ));
+        assert!(!host_pattern_matches(
+            "api.*.example.com",
+            "api.example.com"
+        ));
+        assert!(!host_pattern_matches(
+            "api.*.example.com",
+            "api.v1.example.net"
+        ));
+    }
+
+    #[test]
+    fn host_pattern_matches_preserves_existing_wildcards() {
+        assert!(host_pattern_matches("*.example.com", "example.com"));
+        assert!(host_pattern_matches("*.example.com", "api.example.com"));
+        assert!(host_pattern_matches("34.230.*", "34.230.40.69"));
+        assert!(!host_pattern_matches("34.230.*", "34.231.40.69"));
     }
 
     #[test]

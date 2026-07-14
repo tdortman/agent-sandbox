@@ -7,6 +7,7 @@ pub mod dns_wire;
 pub mod error;
 pub mod graphical_env;
 pub mod hosts;
+pub mod http;
 pub mod merge_policy;
 pub mod policy;
 pub mod proc_context;
@@ -14,6 +15,7 @@ pub mod rpc;
 pub mod rpc_client;
 pub mod scope_target;
 pub mod session_context;
+pub mod socket_owner;
 
 pub use agent_context::{
     ProcessIds, ResolvedRequestContext, SandboxPaths, peer_sandbox_paths, persist_session_paths,
@@ -25,19 +27,25 @@ pub use dns_wire::{DnsMapping, mappings_from_response};
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 pub use hosts::{
-    HostResolution, NetworkRuleKey, NetworkSortKey, allow_keys, approval_host_patterns,
-    host_pattern_matches, is_ip_literal, normalize_host, policy_host_for_connect, reverse_hostname,
+    DnsNameError, HostResolution, NetworkRuleKey, NetworkSortKey, allow_keys,
+    approval_host_patterns, host_pattern_matches, is_ip_literal, normalize_dns_name,
+    normalize_host, policy_host_for_connect, reverse_hostname,
+};
+pub use http::{
+    HttpAuthority, HttpContextKey, HttpHost, HttpMethod, HttpMethodMatcher, HttpParseError,
+    HttpRequest, HttpRule, HttpRuleTarget, HttpScheme, HttpTarget, HttpUrl, NormalizedHttpPath,
+    PendingHttpId,
 };
 pub use merge_policy::{
-    ProjectPolicyContext, atomic_write_policy, load_policy, merge_layers,
-    resolve_policy_write_path, trusted_project_policy_path,
+    ProjectPolicyContext, atomic_write_policy, chown_policy_path, load_policy, merge_layers,
+    migrate_policy, resolve_policy_write_path, trusted_project_policy_path,
 };
 pub use policy::{
-    FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection, FilesystemSortKey,
-    InodeIdentity, NetworkRule, NetworkSection, Policy, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, ResourceSection, ResourceSortKey, SudoRule, SudoSection, contract_home_path,
-    expand_home_path, expand_policy_path, filesystem_approval_paths,
-    normalize_directory_traverse_access, open_flags_to_file_access,
+    DirectNetworkSection, FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection,
+    FilesystemSortKey, HttpSection, InodeIdentity, NetworkRule, NetworkSection, Policy,
+    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, ResourceSection, ResourceSortKey,
+    SudoRule, SudoSection, contract_home_path, expand_home_path, expand_policy_path,
+    filesystem_approval_paths, normalize_directory_traverse_access, open_flags_to_file_access,
 };
 pub use proc_context::{
     PeerCredentials, ProcContext, context_from_pid, discover_git_project_root, home_from_uid,
@@ -45,12 +53,21 @@ pub use proc_context::{
     sandbox_session_id_from_pid, trusted_context_from_pid,
 };
 pub use rpc::{
-    AliasSplit, ApprovalScope, ApprovalTarget, CheckReply, ElevateReply, ErrorReply,
-    FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply, PendingSummary,
-    RegisterUiReply, RequestContext, ResourceCheckReply, ResourceScopeActionReply, RpcMessage,
-    RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply, UiPush, Verdict,
-    VerdictSource, attach_check_aliases, attach_ui_aliases, split_check_aliases, split_ui_aliases,
+    AliasSplit, ApprovalScope, ApprovalTarget, AttributionToken, CheckReply, ElevateReply,
+    ErrorReply, FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply,
+    FlowClaimReply, FlowContext, FlowProtocol, FlowRegistration, HttpApprovalRequest,
+    HttpCheckReply, HttpCheckRequest, HttpScopeActionReply, NetworkFlowCheckReply, NetworkFlowKey,
+    NormalizedPolicyHost, PendingSummary, ProcessIdentity, ProcessStartTimeTicks,
+    ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
+    ProxySessionToken, RegisterUiReply, RequestContext, ResourceCheckReply,
+    ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
+    SocketIdentity, SocketInode, StatusReply, UiPush, Verdict, VerdictSource, attach_check_aliases,
+    attach_ui_aliases, split_check_aliases, split_ui_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
 pub use session_context::{SessionContext, read_session_context, write_session_context};
+pub use socket_owner::{
+    OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner,
+    resolve_owner_snapshot,
+};

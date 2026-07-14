@@ -5,9 +5,49 @@ use std::path::{Path, PathBuf};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::http::{HttpRequest, HttpRuleTarget};
 use crate::policy::{FileAccess, Policy, ResourceAccess, ResourceKind};
 
-use super::{message::RpcMessage, scope::ApprovalScope};
+use super::{
+    message::RpcMessage,
+    proxy::{AttributionToken, ProxyRequestId, ProxySessionToken},
+    scope::ApprovalScope,
+};
+/// Response envelope for pipelined proxy checks and cancellations.
+///
+/// The request identifier is part of the response rather than relying on
+/// response ordering, because proxy checks may complete out of order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyReply {
+    pub request_id: ProxyRequestId,
+    pub reply: ProxyReplyBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "reply", rename_all = "snake_case")]
+pub enum ProxyReplyBody {
+    HttpCheck(HttpCheckReply),
+    NetworkFlow(CheckReply),
+    Canceled(SimpleOkReply),
+    Error(ErrorReply),
+}
+
+impl ProxyReply {
+    #[must_use]
+    pub fn from_reply(request_id: ProxyRequestId, reply: RpcReply) -> Self {
+        let reply = match reply {
+            RpcReply::HttpCheck(reply) => ProxyReplyBody::HttpCheck(reply),
+            RpcReply::Check(reply) => ProxyReplyBody::NetworkFlow(reply),
+            RpcReply::Simple(reply) => ProxyReplyBody::Canceled(reply),
+            RpcReply::Error(reply) => ProxyReplyBody::Error(reply),
+            _ => ProxyReplyBody::Error(ErrorReply::new(
+                "invalid reply for a pipelined proxy request",
+            )),
+        };
+        Self { request_id, reply }
+    }
+}
 
 /// policyd → client response line.
 ///
@@ -19,9 +59,13 @@ use super::{message::RpcMessage, scope::ApprovalScope};
 #[serde(untagged)]
 pub enum RpcReply {
     RegisterUi(RegisterUiReply),
+    Proxy(ProxyReply),
+    ProxySession(ProxySessionReply),
+    FlowClaim(FlowClaimReply),
     FilesystemCheck(FilesystemCheckReply),
     ResourceCheck(ResourceCheckReply),
     FilesystemMonitor(FilesystemMonitorReply),
+    HttpCheck(HttpCheckReply),
     Check(CheckReply),
     Elevate(ElevateReply),
     ScopeAction(ScopeActionReply),
@@ -50,12 +94,16 @@ impl<'de> Deserialize<'de> for RpcReply {
                 }
             };
         }
+        try_variant!(Proxy, ProxyReply);
+        try_variant!(ProxySession, ProxySessionReply);
+        try_variant!(FlowClaim, FlowClaimReply);
 
         try_variant!(RegisterUi, RegisterUiReply);
         try_variant!(FilesystemCheck, FilesystemCheckReply);
         try_variant!(ResourceCheck, ResourceCheckReply);
         try_variant!(FilesystemMonitor, FilesystemMonitorReply);
         try_variant!(Check, CheckReply);
+        try_variant!(HttpCheck, HttpCheckReply);
         try_variant!(Elevate, ElevateReply);
         try_variant!(ScopeAction, ScopeActionReply);
         try_variant!(Status, StatusReply);
@@ -262,6 +310,7 @@ pub struct CheckReply {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireCheckReply {
     ok: bool,
     allowed: bool,
@@ -336,6 +385,122 @@ impl<'de> Deserialize<'de> for CheckReply {
             error: wire.error,
         })
     }
+}
+
+/// HTTP request verdict with the exact normalized request echoed on success.
+#[derive(Debug, Clone)]
+pub struct HttpCheckReply {
+    pub ok: bool,
+    pub allowed: bool,
+    pub source: VerdictSource,
+    pub error: Option<String>,
+    pub request: Option<HttpRequest>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireHttpCheckReply {
+    ok: bool,
+    allowed: bool,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default)]
+    request: Option<HttpRequest>,
+}
+
+impl HttpCheckReply {
+    #[must_use]
+    pub fn from_verdict(request: HttpRequest, verdict: Verdict) -> Self {
+        Self {
+            ok: true,
+            allowed: verdict.allowed,
+            source: verdict.source,
+            error: None,
+            request: Some(request),
+        }
+    }
+
+    #[must_use]
+    pub fn blocked(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            allowed: false,
+            source: VerdictSource::blocked(),
+            error: Some(message.into()),
+            request: None,
+        }
+    }
+}
+
+impl Serialize for HttpCheckReply {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let source = self
+            .source
+            .to_wire(self.allowed)
+            .map_err(serde::ser::Error::custom)?;
+        let mut field_count = 3;
+        if self.error.is_some() {
+            field_count += 1;
+        }
+        if self.request.is_some() {
+            field_count += 1;
+        }
+        let mut state = serializer.serialize_struct("HttpCheckReply", field_count)?;
+        state.serialize_field("ok", &self.ok)?;
+        state.serialize_field("allowed", &self.allowed)?;
+        state.serialize_field("source", source.as_ref())?;
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        if let Some(request) = &self.request {
+            state.serialize_field("request", request)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for HttpCheckReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireHttpCheckReply::deserialize(deserializer)?;
+        Ok(Self {
+            ok: wire.ok,
+            allowed: wire.allowed,
+            source: VerdictSource::from_wire(wire.allowed, &wire.source)
+                .map_err(serde::de::Error::custom)?,
+            error: wire.error,
+            request: wire.request,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxySessionReply {
+    pub ok: bool,
+    pub proxy_session: ProxySessionToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowClaimReply {
+    pub ok: bool,
+    pub attribution_token: AttributionToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkFlowCheckReply {
+    pub ok: bool,
+    pub allowed: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,10 +798,20 @@ impl FilesystemMonitorReply {
 #[serde(untagged)]
 pub enum ScopeActionReply {
     Network(NetworkScopeActionReply),
+    Http(HttpScopeActionReply),
     Sudo(SudoScopeActionReply),
     Elevation(ElevationScopeActionReply),
     Filesystem(FilesystemScopeActionReply),
     Resource(ResourceScopeActionReply),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpScopeActionReply {
+    pub ok: bool,
+    pub target: HttpRuleTarget,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -694,6 +869,15 @@ pub struct ResourceScopeActionReply {
 }
 
 impl ScopeActionReply {
+    #[must_use]
+    pub fn ok_http(target: HttpRuleTarget, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
+        Self::Http(HttpScopeActionReply {
+            ok: true,
+            target,
+            scope: scope.to_string(),
+            path,
+        })
+    }
     #[must_use]
     pub fn ok_network(
         host: String,
@@ -768,6 +952,7 @@ impl ScopeActionReply {
         match self {
             Self::Network(reply) => reply.ok,
             Self::Sudo(reply) => reply.ok,
+            Self::Http(reply) => reply.ok,
             Self::Elevation(reply) => reply.ok,
             Self::Filesystem(reply) => reply.ok,
             Self::Resource(reply) => reply.ok,
@@ -777,6 +962,7 @@ impl ScopeActionReply {
     #[must_use]
     pub fn scope_label(&self) -> &str {
         match self {
+            Self::Http(reply) => &reply.scope,
             Self::Network(reply) => &reply.scope,
             Self::Sudo(reply) => &reply.scope,
             Self::Elevation(reply) => &reply.scope,
@@ -788,6 +974,7 @@ impl ScopeActionReply {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match self {
+            Self::Http(reply) => reply.path.as_deref(),
             Self::Network(reply) => reply.path.as_deref(),
             Self::Sudo(reply) => reply.path.as_deref(),
             Self::Elevation(reply) => reply.path.as_deref(),
@@ -807,7 +994,16 @@ pub struct StatusReply {
 impl RpcReply {
     #[must_use]
     pub const fn is_ok(&self) -> bool {
-        !matches!(self, Self::Error(_))
+        match self {
+            Self::Proxy(reply) => match &reply.reply {
+                ProxyReplyBody::HttpCheck(reply) => reply.ok,
+                ProxyReplyBody::NetworkFlow(reply) => reply.ok,
+                ProxyReplyBody::Canceled(reply) => reply.ok,
+                ProxyReplyBody::Error(_) => false,
+            },
+            Self::Error(_) => false,
+            _ => true,
+        }
     }
 
     #[must_use]

@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::hosts::NetworkSortKey;
+use crate::http::HttpRule;
 use crate::policy::{
     FilesystemRule, FilesystemSortKey, NetworkRule, Policy, ResourceRule, ResourceSortKey,
     SudoRule, contract_home_path, expand_policy_path,
@@ -13,10 +14,11 @@ pub const MAX_POLICY_JSON_BYTES: usize = 1 << 20;
 
 /// Maximum total allow+deny rules per policy section aggregate.
 pub const MAX_POLICY_RULES: usize = 8192;
-
 const fn policy_rule_count(policy: &Policy) -> usize {
-    policy.network.allow.len()
-        + policy.network.deny.len()
+    policy.network.direct.allow.len()
+        + policy.network.direct.deny.len()
+        + policy.network.http.allow.len()
+        + policy.network.http.deny.len()
         + policy.sudo.allow.len()
         + policy.sudo.deny.len()
         + policy.filesystem.allow.len()
@@ -27,40 +29,142 @@ const fn policy_rule_count(policy: &Policy) -> usize {
 
 #[must_use]
 pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
-    // Containment check: if project_root is given, reject policies outside it.
+    let Ok(Some((mut policy, _))) = load_policy_inner(path, project_root, false) else {
+        return Policy::default();
+    };
+    expand_policy_paths(&mut policy, home, project_root);
+    policy
+}
+
+/// Rewrite legacy direct network fields into the canonical
+/// `network.direct` section.
+///
+/// # Errors
+///
+/// Returns an error when the policy cannot be read, parsed, validated, or
+/// atomically rewritten.
+pub fn migrate_policy(
+    path: &Path,
+    home: Option<&Path>,
+    project_root: Option<&Path>,
+) -> std::io::Result<bool> {
+    let Some((policy, needs_migration)) = load_policy_inner(path, project_root, true)? else {
+        return Ok(false);
+    };
+    if needs_migration {
+        atomic_write_policy(path, &policy, home, None, project_root)?;
+    }
+    Ok(needs_migration)
+}
+
+fn validate_http_rules(policy: &Policy) -> std::io::Result<()> {
+    for rule in policy
+        .network
+        .http
+        .allow
+        .iter()
+        .chain(policy.network.http.deny.iter())
+    {
+        rule.target().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid HTTP rule: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn load_policy_inner(
+    path: &Path,
+    project_root: Option<&Path>,
+    strict_http: bool,
+) -> std::io::Result<Option<(Policy, bool)>> {
     if let Some(root) = project_root
         && let Ok(canonical_path) = path.canonicalize()
         && let Ok(canonical_root) = root.canonicalize()
         && !canonical_path.starts_with(&canonical_root)
     {
-        return Policy::default();
+        return Ok(None);
     }
-    let read_path =
-        resolve_policy_write_path(path, project_root).unwrap_or_else(|_| path.to_path_buf());
+    let read_path = resolve_policy_write_path(path, project_root)?;
     if !read_path.is_file() {
-        return Policy::default();
+        return Ok(None);
     }
-    let Ok(meta) = std::fs::metadata(&read_path) else {
-        return Policy::default();
-    };
+    let meta = std::fs::metadata(&read_path)?;
     if meta.len() > MAX_POLICY_JSON_BYTES as u64 {
-        return Policy::default();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "policy JSON exceeds the maximum size",
+        ));
     }
-    let Ok(data) = std::fs::read_to_string(&read_path) else {
-        return Policy::default();
-    };
-    let Ok(mut policy) = serde_json::from_str::<Policy>(&data) else {
-        return Policy::default();
-    };
+    let data = std::fs::read_to_string(&read_path)?;
+    let value = serde_json::from_str::<serde_json::Value>(&data).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid policy JSON: {error}"),
+        )
+    })?;
+    let legacy_direct = value
+        .get("network")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|network| network.contains_key("allow") || network.contains_key("deny"));
+    let legacy_http_methods = value
+        .get("network")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|network| network.get("http"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|http| {
+            ["allow", "deny"].into_iter().any(|name| {
+                http.get(name)
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|rules| {
+                        rules.iter().any(|rule| {
+                            rule.as_object()
+                                .is_some_and(|rule| rule.contains_key("method"))
+                        })
+                    })
+            })
+        });
+    let needs_migration = legacy_direct || legacy_http_methods;
+    let mut policy = serde_json::from_value::<Policy>(value).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid policy fields: {error}"),
+        )
+    })?;
     if policy_rule_count(&policy) > MAX_POLICY_RULES {
-        return Policy::default();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "policy contains too many rules",
+        ));
     }
-    expand_policy_paths(&mut policy, home, project_root);
-    policy
+    if strict_http {
+        validate_http_rules(&policy)?;
+    } else {
+        policy
+            .network
+            .http
+            .allow
+            .retain(|rule| rule.target().is_ok());
+        policy
+            .network
+            .http
+            .deny
+            .retain(|rule| rule.target().is_ok());
+    }
+    Ok(Some((policy, needs_migration)))
 }
 
 fn network_rule_sort_key(rule: &NetworkRule) -> NetworkSortKey {
     NetworkSortKey::new(&rule.host, rule.port)
+}
+
+fn http_rule_sort_key(rule: &HttpRule) -> (String, Vec<String>) {
+    let url = rule
+        .target()
+        .map_or_else(|_| rule.url.clone(), |target| target.url.to_string());
+    (url, rule.methods.clone())
 }
 
 fn sudo_rule_sort_key(rule: &SudoRule) -> Vec<String> {
@@ -75,8 +179,10 @@ fn resource_rule_sort_key(rule: &ResourceRule, home: Option<&Path>) -> ResourceS
 }
 fn sorted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
-    out.network.allow.sort_by_key(network_rule_sort_key);
-    out.network.deny.sort_by_key(network_rule_sort_key);
+    out.network.direct.allow.sort_by_key(network_rule_sort_key);
+    out.network.direct.deny.sort_by_key(network_rule_sort_key);
+    out.network.http.allow.sort_by_key(http_rule_sort_key);
+    out.network.http.deny.sort_by_key(http_rule_sort_key);
     out.sudo.allow.sort_by_key(sudo_rule_sort_key);
     out.sudo.deny.sort_by_key(sudo_rule_sort_key);
     out.filesystem
@@ -253,11 +359,15 @@ pub fn atomic_write_policy(
 
 pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     let mut json = String::new();
-    json.push_str("{\n    \"network\": {\n");
-    push_rules(&mut json, "allow", &policy.network.allow)?;
+    json.push_str("{\n    \"network\": {\n        \"direct\": {\n");
+    push_nested_rules(&mut json, "allow", &policy.network.direct.allow)?;
     json.push_str(",\n");
-    push_rules(&mut json, "deny", &policy.network.deny)?;
-    json.push_str("\n    },\n    \"sudo\": {\n");
+    push_nested_rules(&mut json, "deny", &policy.network.direct.deny)?;
+    json.push_str("\n        },\n        \"http\": {\n");
+    push_nested_rules(&mut json, "allow", &policy.network.http.allow)?;
+    json.push_str(",\n");
+    push_nested_rules(&mut json, "deny", &policy.network.http.deny)?;
+    json.push_str("\n        }\n    },\n    \"sudo\": {\n");
     push_rules(&mut json, "allow", &policy.sudo.allow)?;
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.sudo.deny)?;
@@ -313,6 +423,31 @@ fn push_rules<T: serde::Serialize>(
         out.push('\n');
     }
     out.push_str("        ]");
+    Ok(())
+}
+
+fn push_nested_rules<T: serde::Serialize>(
+    out: &mut String,
+    name: &str,
+    rules: &[T],
+) -> serde_json::Result<()> {
+    out.push_str("            \"");
+    out.push_str(name);
+    out.push_str("\": ");
+    if rules.is_empty() {
+        out.push_str("[]");
+        return Ok(());
+    }
+    out.push_str("[\n");
+    for (index, rule) in rules.iter().enumerate() {
+        out.push_str("                ");
+        push_spaced_json(out, &serde_json::to_string(rule)?);
+        if index + 1 != rules.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("            ]");
     Ok(())
 }
 
@@ -405,7 +540,7 @@ mod tests {
     #[test]
     fn policy_json_sorts_network_by_domain_hierarchy() {
         let mut policy = crate::policy::Policy::default();
-        policy.network.allow = vec![
+        policy.network.direct.allow = vec![
             NetworkRule::new("docs.developer.apple.com", 443, "global"),
             NetworkRule::new("api.z.ai", 443, "global"),
             NetworkRule::new("developer.apple.com", 443, "global"),
@@ -420,6 +555,7 @@ mod tests {
         let loaded = load_policy(&path, Some(Path::new("/home/user")), None);
         let hosts: Vec<&str> = loaded
             .network
+            .direct
             .allow
             .iter()
             .map(|rule| rule.host.as_str())
