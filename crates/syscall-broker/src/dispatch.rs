@@ -6,18 +6,36 @@ use super::decision::{
 };
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, SeccompNotif, notification_arch_valid, revalidate_filesystem_mutation,
-    send_continue, send_errno,
+    NetworkMode, PersistentPolicyClient, SeccompNotif, SyscallTarget, notification_arch_valid,
+    revalidate_filesystem_mutation, send_continue, send_errno,
 };
 use tracing::{debug, info, warn};
 
-pub async fn dispatch_notification(
+fn should_bypass_network_policy(network_mode: NetworkMode, facts: &NormalizedNotification) -> bool {
+    let NormalizedNotification::Target {
+        target: SyscallTarget::Network(target),
+    } = facts
+    else {
+        return false;
+    };
+    if network_mode != NetworkMode::Proxy {
+        return false;
+    }
+
+    matches!(
+        (target.scheme.as_str(), target.port),
+        ("tcp", 80 | 443 | 8008 | 8080 | 8443) | ("udp", 443)
+    )
+}
+
+pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
     client: &PersistentPolicyClient,
     sandbox_session_id: Option<&str>,
     listener_fd: i32,
     notif: &SeccompNotif,
     timeout: Duration,
+    network_mode: NetworkMode,
 ) {
     if !notification_arch_valid(notif) {
         warn!(
@@ -65,7 +83,14 @@ pub async fn dispatch_notification(
         pid: notif.pid,
         timeout,
     };
-    let plan = decide(&adapter, facts).await;
+    let plan = if should_bypass_network_policy(network_mode, &facts) {
+        // In proxy mode, only transparent-proxy service ports bypass the
+        // transport policy check; direct ports stay blocked in seccomp until
+        // their transport approval completes.
+        ResponsePlan::Continue
+    } else {
+        decide(&adapter, facts).await
+    };
     execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
 }
 
@@ -137,5 +162,48 @@ fn execute_response_plan(
                 super::log_notification_response(send_continue(listener_fd, notif.id));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
+    use agent_sandbox_syscall_broker::NetworkTarget;
+
+    #[test]
+    fn proxy_mode_bypasses_only_transparent_proxy_ports() {
+        let target = |scheme: &str, port| {
+            NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
+                host: "example.test".to_owned(),
+                connect_host: "192.0.2.10".to_owned(),
+                port,
+                scheme: scheme.to_owned(),
+            }))
+        };
+
+        assert!(should_bypass_network_policy(
+            NetworkMode::Proxy,
+            &target("tcp", 443)
+        ));
+        assert!(should_bypass_network_policy(
+            NetworkMode::Proxy,
+            &target("udp", 443)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            &target("tcp", 853)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            &target("udp", 853)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Direct,
+            &target("tcp", 443)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            &NormalizedNotification::continue_()
+        ));
     }
 }

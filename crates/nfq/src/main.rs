@@ -11,7 +11,8 @@ mod packet;
 mod policy;
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
-    lookup_dns_cache, mappings_from_response, sandbox_session_id_from_pid,
+    FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost,
+    SandboxPaths, lookup_dns_cache, mappings_from_response, sandbox_session_id_from_pid,
 };
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
@@ -86,6 +87,17 @@ struct Cli {
     )]
     push_socket: PathBuf,
 
+    /// Check transport policy before registering owner-identified flows for
+    /// mitmproxy. Direct mode leaves proxy flow registration disabled.
+    #[arg(long)]
+    proxy_mode: bool,
+
+    /// Readiness marker written only after NFQUEUE bind succeeds. The marker
+    /// contains the systemd `INVOCATION_ID` so stale daemon state cannot be
+    /// mistaken for the current queue owner.
+    #[arg(long, value_name = "PATH")]
+    ready_file: Option<PathBuf>,
+
     /// Only accept DNS push frames from this peer uid (default: root / the host DNS forwarder).
     #[arg(long, value_name = "UID", default_value_t = 0)]
     push_trusted_uid: u32,
@@ -97,6 +109,7 @@ struct NfqState {
     cache_path: Option<PathBuf>,
     dns_server_ip: IpAddr,
     nft_binary: String,
+    proxy_mode: bool,
 }
 
 impl NfqState {
@@ -122,6 +135,7 @@ impl NfqState {
             ))),
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
+            proxy_mode: cli.proxy_mode,
         }
     }
 
@@ -197,6 +211,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let _ready_marker = cli.ready_file.as_deref().map(write_ready_marker_or_exit);
     info!(queue = cli.queue, "nfqueue listening");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -369,6 +384,66 @@ fn open_queue(queue_num: u16, queue_len: u32) -> std::io::Result<Queue> {
     Ok(queue)
 }
 
+struct ReadyMarker(PathBuf);
+
+impl Drop for ReadyMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn validate_invocation_id(value: &str) -> std::io::Result<()> {
+    if value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "INVOCATION_ID must be exactly 32 lowercase hexadecimal characters",
+    ))
+}
+
+fn write_ready_marker_or_exit(path: &Path) -> ReadyMarker {
+    match write_ready_marker(path) {
+        Ok(marker) => marker,
+        Err(err) => {
+            eprintln!(
+                "agent-sandbox-nfq: failed to write readiness marker {}: {err}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn write_ready_marker(path: &Path) -> std::io::Result<ReadyMarker> {
+    let invocation_id = std::env::var("INVOCATION_ID").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "INVOCATION_ID is required when --ready-file is configured",
+        )
+    })?;
+    validate_invocation_id(&invocation_id)?;
+
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, invocation_id.as_bytes())?;
+    let mut permissions = std::fs::metadata(&temporary)?.permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o644);
+    }
+    if let Err(error) = std::fs::set_permissions(&temporary, permissions)
+        .and_then(|()| std::fs::rename(&temporary, path))
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(ReadyMarker(path.to_path_buf()))
+}
+
 /// Whether a packet to the given destination should bypass policy checks entirely.
 fn is_bypass_traffic(dst_ip: IpAddr, dst_port: u16, dns_server_ip: IpAddr) -> bool {
     // DNS forwarder traffic on port 53 only
@@ -441,15 +516,121 @@ where
         }
     }
 }
+const fn proxy_flow_port(protocol: packet::TransportProtocol, port: u16) -> bool {
+    matches!(
+        (protocol, port),
+        (
+            packet::TransportProtocol::Tcp,
+            80 | 443 | 8008 | 8080 | 8443
+        ) | (packet::TransportProtocol::Udp, 443)
+    )
+}
+
+fn register_proxy_flow(
+    state: &NfqState,
+    meta: packet::PacketMeta,
+    register: &mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>,
+) -> Verdict {
+    let Some(owner) = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port) else {
+        warn!(
+            src = %meta.src_ip,
+            port = meta.src_port,
+            protocol = meta.protocol.as_str(),
+            "dropping proxy flow with no unique socket owner"
+        );
+        return Verdict::Drop;
+    };
+    let session_id = sandbox_session_id_from_pid(owner.pid_value());
+    let dst_ip = meta.dst_ip.to_string();
+    let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
+    let Ok(policy_host) = NormalizedPolicyHost::parse(&hostname) else {
+        warn!(host = %hostname, "dropping proxy flow with invalid policy host");
+        return Verdict::Drop;
+    };
+    let protocol = match meta.protocol {
+        packet::TransportProtocol::Tcp => FlowProtocol::Tcp,
+        packet::TransportProtocol::Udp => FlowProtocol::Udp,
+    };
+    let Ok(flow) = NetworkFlowKey::try_new(
+        protocol,
+        meta.src_ip,
+        meta.src_port,
+        meta.dst_ip,
+        meta.dst_port,
+    ) else {
+        warn!(
+            src = %meta.src_ip,
+            src_port = meta.src_port,
+            dst = %meta.dst_ip,
+            dst_port = meta.dst_port,
+            "dropping proxy flow with invalid typed tuple"
+        );
+        return Verdict::Drop;
+    };
+    let registration = FlowRegistration::new(
+        flow,
+        owner.identity(),
+        policy_host,
+        FlowContext::new(SandboxPaths::default(), session_id),
+    );
+    match register(registration) {
+        Ok(true) => {
+            info!(
+                protocol = meta.protocol.as_str(),
+                src = %meta.src_ip,
+                dst = %meta.dst_ip,
+                port = meta.dst_port,
+                "registered proxy flow"
+            );
+            Verdict::Accept
+        }
+        Ok(false) => {
+            warn!("policyd rejected proxy flow registration");
+            Verdict::Drop
+        }
+        Err(error) => {
+            warn!(%error, "proxy flow registration failed");
+            Verdict::Drop
+        }
+    }
+}
+
+#[cfg(test)]
 /// Core packet handling logic, parameterized over the policy check function.
 ///
-/// Seam for unit testing: inject a mock `check` to verify policy is consulted
+/// This compatibility wrapper preserves direct-mode unit tests and callers.
 fn handle_packet_payload<F>(
     state: &NfqState,
     policy_socket: &str,
     timeout: Duration,
     payload: &[u8],
     check: &mut F,
+) -> Verdict
+where
+    F: FnMut(
+        &str,
+        &str,
+        &str,
+        u16,
+        packet::TransportProtocol,
+        Option<u32>,
+        &[String],
+        Duration,
+    ) -> std::io::Result<policy::PolicyResult>,
+{
+    handle_packet_payload_with_registration(state, policy_socket, timeout, payload, check, None)
+}
+
+/// Core packet handling logic, parameterized over policy and proxy registration.
+///
+/// Seam for unit testing: inject a mock `check` to verify policy is consulted.
+fn handle_packet_payload_with_registration<F>(
+    state: &NfqState,
+    policy_socket: &str,
+    timeout: Duration,
+    payload: &[u8],
+    check: &mut F,
+    register: Option<&mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>>,
 ) -> Verdict
 where
     F: FnMut(
@@ -492,20 +673,32 @@ where
         return Verdict::Accept;
     }
 
-    if !meta.is_policy_boundary() {
-        return Verdict::Accept;
-    }
-
     if is_bypass_traffic(meta.dst_ip, meta.dst_port, state.dns_server_ip) {
         debug!(ip = %meta.dst_ip, port = meta.dst_port, "bypass policy");
         return Verdict::Accept;
     }
 
-    // Resolve hostname and ask policyd for every policy-boundary packet.
-    // No long-lived per-host verdict cache: policy file edits take effect
-    // on the next connection within the same daemon session.
+    if !meta.is_policy_boundary() {
+        return Verdict::Accept;
+    }
+
+    // Loopback traffic never traverses the proxy WireGuard route. Proxy-mode
+    // HTTP(S) flows are registered and accepted here so mitmproxy can decode
+    // them; all other destinations stay on the ordinary kernel route and are
+    // checked synchronously below.
     let src_pid = owner::pid_from_src_port(meta.protocol, meta.src_ip, meta.src_port);
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
+    if state.proxy_mode
+        && !meta.dst_ip.is_loopback()
+        && proxy_flow_port(meta.protocol, meta.dst_port)
+    {
+        let Some(register) = register else {
+            warn!("proxy mode has no registration RPC handler");
+            return Verdict::Drop;
+        };
+        return register_proxy_flow(state, meta, register);
+    }
+
     let dst_ip = meta.dst_ip.to_string();
     let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
     let aliases = state
@@ -539,20 +732,7 @@ where
         }
     };
 
-    if allowed {
-        if let Ok(mut bindings) = state.approved_bindings.lock() {
-            bindings.record(&hostname, &dst_ip);
-            let _ = bindings.save();
-        }
-        info!(
-            protocol = meta.protocol.as_str(),
-            host = %hostname,
-            dst = %dst_ip,
-            port = meta.dst_port,
-            "accept"
-        );
-        Verdict::Accept
-    } else {
+    if !allowed {
         info!(
             protocol = meta.protocol.as_str(),
             host = %hostname,
@@ -562,8 +742,21 @@ where
         );
         // Add a transient nft reject element so the client fails fast instead
         // of hanging. Falls back to Drop if nft add fails.
-        nft_reject_and_repeat(&state.nft_binary, meta.dst_ip, meta.dst_port, meta.protocol)
+        return nft_reject_and_repeat(&state.nft_binary, meta.dst_ip, meta.dst_port, meta.protocol);
     }
+
+    if let Ok(mut bindings) = state.approved_bindings.lock() {
+        bindings.record(&hostname, &dst_ip);
+        let _ = bindings.save();
+    }
+    info!(
+        protocol = meta.protocol.as_str(),
+        host = %hostname,
+        dst = %dst_ip,
+        port = meta.dst_port,
+        "accept"
+    );
+    Verdict::Accept
 }
 
 /// Production wrapper: calls `policy::check_destination` via the tokio runtime.
@@ -596,7 +789,21 @@ fn handle_packet(
             to,
         ))
     };
-    handle_packet_payload(state, policy_socket, timeout, payload, &mut check)
+    let mut register = |registration: FlowRegistration| {
+        runtime.block_on(policy::register_network_flow(
+            policy_socket,
+            registration,
+            timeout,
+        ))
+    };
+    handle_packet_payload_with_registration(
+        state,
+        policy_socket,
+        timeout,
+        payload,
+        &mut check,
+        Some(&mut register),
+    )
 }
 
 #[cfg(test)]
@@ -641,9 +848,20 @@ mod tests {
             cache_path: None,
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
+            proxy_mode: false,
         }
     }
 
+    #[test]
+    fn proxy_flow_ports_match_routed_protocols() {
+        for port in [80, 443, 8008, 8080, 8443] {
+            assert!(proxy_flow_port(packet::TransportProtocol::Tcp, port));
+        }
+        assert!(proxy_flow_port(packet::TransportProtocol::Udp, 443));
+        assert!(!proxy_flow_port(packet::TransportProtocol::Udp, 80));
+        assert!(!proxy_flow_port(packet::TransportProtocol::Udp, 8080));
+        assert!(!proxy_flow_port(packet::TransportProtocol::Tcp, 853));
+    }
     #[test]
     fn loopback_127_0_0_1_is_policy_bound() {
         assert!(!is_bypass_traffic(
@@ -713,6 +931,138 @@ mod tests {
     }
 
     #[test]
+    fn proxy_mode_registers_public_flow_without_transport_check() {
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
+        let listener_addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(listener_addr).expect("connect client");
+        let (_server, _) = listener.accept().expect("accept client");
+        let client_addr = client.local_addr().expect("client address");
+
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
+        state.nft_binary = "true".to_string();
+        let mut packet = build_loopback_tcp_syn_packet();
+        packet[12..16].copy_from_slice(
+            &client_addr
+                .ip()
+                .to_string()
+                .parse::<Ipv4Addr>()
+                .expect("IPv4 client")
+                .octets(),
+        );
+        packet[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+
+        let check_count = std::cell::Cell::new(0_u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: true })
+        };
+        let registration = std::cell::RefCell::new(None);
+        let mut register = |flow: FlowRegistration| {
+            assert_eq!(
+                check_count.get(),
+                0,
+                "proxy registration must precede transport fallback checks"
+            );
+            *registration.borrow_mut() = Some(flow);
+            Ok(true)
+        };
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+        assert_eq!(verdict, Verdict::Accept);
+        assert_eq!(
+            check_count.get(),
+            0,
+            "proxy mode must defer transport checks to decoded HTTP or fallback"
+        );
+        let registration = registration
+            .into_inner()
+            .expect("proxy mode must register the flow");
+        assert_eq!(registration.flow.protocol, FlowProtocol::Tcp);
+        assert_eq!(registration.flow.source_ip, client_addr.ip());
+        assert_eq!(
+            registration.flow.destination_ip,
+            "93.184.216.34".parse::<Ipv4Addr>().expect("valid IPv4")
+        );
+        assert_eq!(registration.policy_host.as_str(), "example.test");
+    }
+
+    #[test]
+    fn proxy_mode_checks_loopback_transport_without_proxy_registration() {
+        let state = {
+            let mut state = state_for_tests();
+            state.proxy_mode = true;
+            state
+                .dns_cache
+                .lock()
+                .expect("lock dns cache")
+                .remember_ephemeral("127.0.0.1", "localhost", DEFAULT_MAX_TTL);
+            state
+        };
+        let packet = build_loopback_tcp_syn_packet();
+        let check_count = std::cell::Cell::new(0_u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: false })
+        };
+        let registration_count = std::cell::Cell::new(0_u32);
+        let mut register = |_: FlowRegistration| {
+            registration_count.set(registration_count.get() + 1);
+            Ok(true)
+        };
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(
+            check_count.get(),
+            1,
+            "proxy mode must check loopback transport"
+        );
+        assert_eq!(
+            registration_count.get(),
+            0,
+            "loopback must not register for proxy interception"
+        );
+    }
+
+    #[test]
     fn loopback_ipv6_tcp_syn_invokes_policy_check() {
         let state = state_for_tests();
         state
@@ -741,6 +1091,56 @@ mod tests {
             call_count.get(),
             1,
             "loopback IPv6 must go through policy check, not bypass"
+        );
+    }
+
+    #[test]
+    fn proxy_mode_checks_ipv6_loopback_transport_without_proxy_registration() {
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("::1", "localhost", DEFAULT_MAX_TTL);
+        let packet = build_ipv6_loopback_tcp_syn_packet();
+        let check_count = std::cell::Cell::new(0_u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            Ok(policy::PolicyResult { allowed: false })
+        };
+        let registration_count = std::cell::Cell::new(0_u32);
+        let mut register = |_: FlowRegistration| {
+            registration_count.set(registration_count.get() + 1);
+            Ok(true)
+        };
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(
+            check_count.get(),
+            1,
+            "proxy mode must check IPv6 loopback transport"
+        );
+        assert_eq!(
+            registration_count.get(),
+            0,
+            "IPv6 loopback must not register for proxy interception"
         );
     }
 
@@ -1487,6 +1887,14 @@ mod tests {
             "UDP/53 to loopback must invoke policy check"
         );
     }
+    #[test]
+    fn readiness_marker_requires_lowercase_32_hex_invocation_id() {
+        assert!(validate_invocation_id("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_invocation_id("0123456789ABCDEF0123456789abcdef").is_err());
+        assert!(validate_invocation_id("0123456789abcdef").is_err());
+        assert!(validate_invocation_id("0123456789abcdef0123456789abcdeg").is_err());
+    }
+
     #[test]
     fn cli_defaults_preserve_standalone_fallbacks() {
         let cli = Cli::try_parse_from(["agent-sandbox-nfq"])

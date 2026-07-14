@@ -54,6 +54,14 @@ struct Args {
     max_ttl: u32,
     #[arg(long, default_value = "/run/agent-sandbox/dns-push.sock")]
     push_socket: PathBuf,
+    /// Cache DNS attribution only for clients from this exact IP address.
+    ///
+    /// When omitted, responses from every client are eligible for attribution
+    /// for standalone deployments. Proxy-mode launches must set this to the
+    /// sandbox namespace address so an unrelated DNS client cannot poison the
+    /// policy cache.
+    #[arg(long)]
+    cache_client_ip: Option<IpAddr>,
     #[arg(long, default_value = "127.0.0.53:53")]
     forward_target: SocketAddr,
     #[arg(long, default_value_t = 5_000)]
@@ -69,6 +77,7 @@ struct DnsForwarder {
     verbose: bool,
     push_socket: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixDatagram>>>,
     push_socket_path: PathBuf,
+    cache_client_ip: Option<IpAddr>,
     forward_target: SocketAddr,
     forward_timeout: Duration,
 }
@@ -108,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verbose: args.verbose,
         push_socket: push_socket.clone(),
         push_socket_path: args.push_socket.clone(),
+        cache_client_ip: args.cache_client_ip,
         forward_target: args.forward_target,
         forward_timeout: Duration::from_millis(args.forward_timeout_ms),
     };
@@ -149,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let forwarder = tcp_forwarder.clone();
             tokio::spawn(async move {
-                if let Err(err) = forwarder.handle_tcp(stream).await {
+                if let Err(err) = forwarder.handle_tcp(stream, peer).await {
                     warn!(%peer, error = %err, "dns tcp error");
                 }
             });
@@ -179,12 +189,16 @@ impl DnsForwarder {
                 }
             }
         };
-        self.record_mappings_from_response(&resp);
+        self.record_mappings_from_response(&resp, peer);
         sock.send_to(&resp, peer).await?;
         Ok(())
     }
 
-    async fn handle_tcp(&self, mut stream: TcpStream) -> Result<(), DnsForwarderError> {
+    async fn handle_tcp(
+        &self,
+        mut stream: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), DnsForwarderError> {
         loop {
             let len = match stream.read_u16().await {
                 Ok(0) => continue,
@@ -208,7 +222,7 @@ impl DnsForwarder {
                     }
                 }
             };
-            self.record_mappings_from_response(&resp);
+            self.record_mappings_from_response(&resp, peer);
             let resp_len = u16::try_from(resp.len()).unwrap_or(0);
             stream.write_u16(resp_len).await?;
             stream.write_all(&resp).await?;
@@ -259,7 +273,17 @@ impl DnsForwarder {
             .map_err(|_| DnsForwarderError::Timeout)?
     }
 
-    fn record_mappings_from_response(&self, response: &[u8]) {
+    fn record_mappings_from_response(&self, response: &[u8], peer: SocketAddr) {
+        if let Some(expected) = self.cache_client_ip
+            && peer.ip() != expected
+        {
+            debug!(
+                %peer,
+                %expected,
+                "ignoring DNS response from an untrusted client peer"
+            );
+            return;
+        }
         let mappings = mappings_from_response(response);
         if mappings.is_empty() {
             return;
@@ -351,6 +375,7 @@ mod tests {
             verbose: false,
             push_socket: Arc::new(std::sync::Mutex::new(None)),
             push_socket_path: PathBuf::from("/nonexistent/dns-push.sock"),
+            cache_client_ip: None,
             forward_target,
             forward_timeout: Duration::from_secs(2),
         }
@@ -467,8 +492,11 @@ mod tests {
         let query = example_query(RecordType::A);
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            forwarder.handle_tcp(stream).await.expect("handle tcp");
+            let (stream, peer) = listener.accept().await.expect("accept");
+            forwarder
+                .handle_tcp(stream, peer)
+                .await
+                .expect("handle tcp");
         });
 
         let mut client = TcpStream::connect(listener_addr)
@@ -514,6 +542,46 @@ mod tests {
         assert_eq!(mappings[0].ip, "93.184.216.34");
         assert_eq!(mappings[1].ip, "93.184.216.35");
     }
+    #[test]
+    fn cache_client_ip_filters_attribution_to_exact_udp_and_tcp_peer() {
+        let name = Name::from_ascii("example.com.").expect("valid name");
+        let mut message = Message::new(0x4321, MessageType::Response, OpCode::Query);
+        message
+            .add_query(Query::query(name.clone(), RecordType::A))
+            .add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 20))),
+            ));
+        let response = message.to_vec().expect("encode response");
+
+        let mut forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let trusted = SocketAddr::from(([192, 0, 2, 10], 5353));
+        let untrusted = SocketAddr::from(([192, 0, 2, 11], 5353));
+        forwarder.cache_client_ip = Some(trusted.ip());
+
+        forwarder.record_mappings_from_response(&response, untrusted);
+        assert!(
+            forwarder
+                .cache
+                .lock()
+                .expect("cache lock")
+                .lookup("192.0.2.20")
+                .is_none(),
+            "untrusted UDP/TCP peer must not mutate attribution"
+        );
+
+        forwarder.record_mappings_from_response(&response, trusted);
+        assert_eq!(
+            forwarder
+                .cache
+                .lock()
+                .expect("cache lock")
+                .lookup("192.0.2.20"),
+            Some("example.com".to_owned())
+        );
+    }
+
     #[test]
     fn cli_defaults_preserve_standalone_fallbacks() {
         let args = Args::try_parse_from(["agent-sandbox-dns-forwarder"])

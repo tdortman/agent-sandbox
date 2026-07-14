@@ -8,8 +8,8 @@ use std::time::Duration;
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, ResourceTarget, SeccompNotif, recv_notification, send_addfd,
-    send_continue, send_errno, send_result,
+    PersistentPolicyClient, ResourceTarget, SeccompNotif, parse_network_mode, recv_notification,
+    send_addfd, send_continue, send_errno, send_result,
 };
 use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
 use clap::Parser;
@@ -38,6 +38,13 @@ use tracing::{debug, info, warn};
             --child-pid 12345"
 )]
 struct Cli {
+    /// Trusted network mediation mode. `direct` keeps transport policy RPC
+    /// checks; `proxy` delegates Internet transport to the transparent proxy.
+    /// If omitted, `AGENT_SANDBOX_NETWORK_MODE` is consulted and missing or
+    /// unknown values fail closed at startup.
+    #[arg(long, value_name = "MODE")]
+    network_mode: Option<String>,
+
     /// Inherited seccomp user-notification file descriptor. The arm uses `SCM_RIGHTS` to pass this fd across exec. The broker sets it non-blocking and loops on `SECCOMP_IOCTL_NOTIF_RECV`.
     #[arg(long, value_name = "FD")]
     listener_fd: i32,
@@ -72,6 +79,11 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let network_mode_value = cli
+        .network_mode
+        .or_else(|| std::env::var("AGENT_SANDBOX_NETWORK_MODE").ok());
+    let network_mode =
+        parse_network_mode(network_mode_value.as_deref()).map_err(std::io::Error::other)?;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
@@ -134,13 +146,14 @@ async fn main() -> std::io::Result<()> {
                 }
             },
         };
-        dispatch::dispatch_notification(
+        dispatch::dispatch_notification_with_mode(
             &cli.policy_socket,
             &policy_client,
             cli.sandbox_session_id.as_deref(),
             cli.listener_fd,
             &notif,
             timeout,
+            network_mode,
         )
         .await;
     }

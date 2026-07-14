@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use agent_sandbox_core::{
-    ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths, attach_check_aliases,
-    policy_rpc,
+    FlowRegistration, ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths,
+    attach_check_aliases, policy_rpc,
 };
 
 use crate::packet::TransportProtocol;
@@ -62,6 +62,33 @@ pub async fn check_destination(
     Ok(PolicyResult { allowed })
 }
 
+/// Register one owner-identified flow with policyd before proxy forwarding.
+///
+/// Registration is deliberately separate from transport `Check`: proxy mode
+/// asks policyd to validate the typed owner snapshot and stores the flow for
+/// mitmproxy to claim later. Any malformed reply is an RPC failure and must be
+/// treated as a failed registration by callers.
+pub async fn register_network_flow(
+    socket: &str,
+    registration: FlowRegistration,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let response = policy_rpc(
+        socket,
+        RpcRequest::RegisterNetworkFlow { registration },
+        timeout,
+    )
+    .await
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    match response {
+        RpcReply::Simple(reply) => Ok(reply.ok),
+        RpcReply::Error(error) => Err(std::io::Error::other(error.error)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "policyd returned an unexpected reply for RegisterNetworkFlow",
+        )),
+    }
+}
 /// Resolve sandbox paths and process IDs from a PID by reading
 /// `/proc/<pid>/environ`.
 fn resolve_context(pid: Option<u32>) -> PolicyContext {

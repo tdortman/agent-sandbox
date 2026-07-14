@@ -77,6 +77,45 @@ pub struct SeccompNotifResp {
     pub flags: u32,
 }
 
+/// Network mediation mode selected by the trusted launcher.
+///
+/// `Direct` preserves transport policy RPC checks. `Proxy` lets the
+/// transparent proxy own only the configured HTTP(S) service-port
+/// `AF_INET`/`AF_INET6` connect/send decisions; other network destinations
+/// remain gated by seccomp user notification. Unix resources and filesystem
+/// mediation remain unchanged in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    Direct,
+    Proxy,
+}
+
+impl std::str::FromStr for NetworkMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "direct" => Ok(Self::Direct),
+            "proxy" => Ok(Self::Proxy),
+            _ => Err(format!(
+                "invalid network mode {value:?}; expected exactly \"direct\" or \"proxy\""
+            )),
+        }
+    }
+}
+
+/// Parse the required launcher mode, failing closed for missing or unknown
+/// values instead of silently selecting a transport policy.
+///
+/// # Errors
+///
+/// Returns an error when `value` is missing or is not `direct` or `proxy`.
+pub fn parse_network_mode(value: Option<&str>) -> Result<NetworkMode, String> {
+    value
+        .ok_or_else(|| "network mode is required (direct or proxy)".to_owned())?
+        .parse()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkTarget {
     pub host: String,
@@ -1183,11 +1222,27 @@ mod tests {
         resolve_tracee_path, revalidate_filesystem_mutation, scheme_for_socket_type,
         target_from_notification, tracee_fd_path, tracee_open_dir_base,
     };
+
     use agent_sandbox_syscall::policy::nr;
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn network_mode_requires_exact_trusted_values() {
+        assert_eq!(
+            super::parse_network_mode(Some("direct")),
+            Ok(super::NetworkMode::Direct)
+        );
+        assert_eq!(
+            super::parse_network_mode(Some("proxy")),
+            Ok(super::NetworkMode::Proxy)
+        );
+        assert!(super::parse_network_mode(None).is_err());
+        assert!(super::parse_network_mode(Some("DIRECT")).is_err());
+        assert!(super::parse_network_mode(Some("sandbox")).is_err());
+    }
 
     #[test]
     fn transient_tracee_io_err_classifies_expected_errno() {
