@@ -644,19 +644,6 @@ impl NormalizedPolicyHost {
     }
 
     #[must_use]
-    pub fn as_str(&self) -> String {
-        match &self.0 {
-            NormalizedPolicyHostValue::Ip(ip) => ip.to_string(),
-            NormalizedPolicyHostValue::Dns(name) => name.to_string(),
-        }
-    }
-
-    #[must_use]
-    pub fn to_canonical_string(&self) -> String {
-        self.as_str()
-    }
-
-    #[must_use]
     pub fn dns_name(&self) -> Option<&str> {
         match &self.0 {
             NormalizedPolicyHostValue::Dns(name) => Some(name),

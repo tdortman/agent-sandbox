@@ -1006,7 +1006,7 @@ mod tests {
             registration.flow.destination_ip,
             "93.184.216.34".parse::<Ipv4Addr>().expect("valid IPv4")
         );
-        assert_eq!(registration.policy_host.as_str(), "example.test");
+        assert_eq!(registration.policy_host.to_string(), "example.test");
     }
 
     #[test]
