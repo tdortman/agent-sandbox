@@ -5,9 +5,10 @@ Sandbox AI agent CLIs in a bubblewrap jail on NixOS. Intercepts network, filesys
 ## What it gates
 
 - **Network** (NFQUEUE + seccomp): each sandbox gets its own netns. Outbound TCP/UDP is captured at the kernel level. A seccomp broker also traps `connect`, `sendto`, `sendmsg`, `sendmmsg` so a short-timeout UDP client blocks inside the kernel until you answer the prompt, not before.
+- **Decoded HTTP (optional)**: `network.httpProxy.enable` routes HTTP/1.1, HTTP/2, and HTTP/3 through the trusted mitmproxy WireGuard service. HTTP rules match method, authority, effective port, and normalized path; query strings and fragments are never persisted or sent to policyd. Destinations that remain local, including loopback, receive the transport policy check instead of HTTP interception. Generic TCP/UDP remains transport-gated and unsupported or failed interception is denied.
 - **Filesystem** (fanotify): in dynamic mode (`gates.filesystem.enable`), fanotify mediates every file open. Access is classified as read, write, read-write, or execute by reading the blocked tracee's syscall arguments from `/proc/{pid}/syscall`. Stale verdicts in fanotify's event fd are avoided this way. Static bwrap mounts still define the structural read-only/read-write boundary.
 - **Resources** (seccomp): `gates.resources.enable` traps `connect`, `open`, `openat`, `openat2`, `creat` to gate AF_UNIX sockets under `/run` and device nodes under `/dev`. The broker emulates the syscall itself via `pidfd_getfd` so the tracee never touches the gated resource directly (no TOCTOU).
-- **Sudo**: `sudoPolicy = "approve"` intercepts `sudo` inside the sandbox. Approved commands run as root on the host, not inside the jail.
+- **Sudo**: `sudoPolicy = "approve"` intercepts `sudo` inside the sandbox. Approved commands run as root on the host, not inside the jail. Sudo rules match by argv prefix, so approving `["systemctl"]` permits any subcommand. Approving interpreters like `["bash"]` grants arbitrary code execution as root. Bare argv[0] names resolve through `/run/current-system/sw/bin`; absolute argv[0] paths must be under `/run/current-system`. After canonicalization, the target must be a regular file under `/nix/store`. Symlinks from outside the system profile are rejected, preventing path traversal and multi-call binary spoofing.
 
 ## Policy
 
@@ -24,8 +25,16 @@ Both policy files are write-protected: policyd injects implicit deny-write rules
 ```json
 {
   "network": {
-    "allow": [{ "host": "api.example.com", "port": 443 }],
-    "deny": []
+    "direct": {
+      "allow": [{ "host": "api.example.com", "port": 443 }],
+      "deny": []
+    },
+    "http": {
+      "allow": [
+        { "methods": ["GET"], "url": "https://api.example.com/v1" },
+        { "methods": ["GET"], "url": "https://api.github.com/repos/*/*" }
+      ],
+      "deny": [{ "methods": [], "url": "https://api.example.com/v1/telemetry" }]
   },
   "sudo": {
     "allow": [{ "argv": ["systemctl", "restart"] }],
@@ -42,7 +51,7 @@ Both policy files are write-protected: policyd injects implicit deny-write rules
 }
 ```
 
-Filesystem paths support `~/` (home-relative), `./` (project-relative), and `**` glob matching. Network rules support wildcard domains (`*.example.com`) and IP prefixes (`34.230.40.*`). Sudo rules match by argv prefix. Resource kinds: `unix_socket`, `device`. Resource access: `connect`, `send`, `open_read`, `open_write`, `open_read_write`.
+Filesystem paths support `~/` (home-relative), `./` (project-relative), and `**` glob matching. Direct network rules support wildcard domains (`*.example.com`), IP prefixes (`34.230.40.*`), and general `*`/`?` globs (for example, `api-?.example.*`). HTTP `url` rules can be exact URLs or globs: exact URLs are canonicalized, while literal paths retain prefix/segment-boundary behavior (`/v1` matches `/v1/...` but not `/v10`). URL globs match canonical URL strings; `*` matches within one slash-delimited segment and `**` can cross `/` segments. For example, `https://api.github.com/repos/*/*` matches one repository path level after `/repos/`. Query strings and fragments are disallowed. Sudo rules match by argv prefix: a rule authorizes the full prefix and all trailing arguments, so broad prefixes like `["bash"]` grant unrestricted root execution. Resource kinds: `unix_socket`, `device`. Resource access: `connect`, `send`, `open_read`, `open_write`, `open_read_write`.
 
 See `nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for the full option reference.
 
@@ -73,34 +82,62 @@ See `nix/modules/nixos/agent-sandbox/agent-sandbox.nix` for the full option refe
 
 `agent-sandbox-ui` connects to policyd's host socket and shows approval prompts. It tries `agent-sandbox-qt-dialog` (standalone Qt6, no KDE/GTK dependency) then `zenity` as fallback. Set `uiBackend = "none"` for headless setups and use `agent-sandbox-approve` from a terminal instead.
 
+
 ## Architecture
 
 ```mermaid
-sequenceDiagram
-    participant Agent as Sandboxed Agent
-    participant NFQ as NFQUEUE
-    participant SEC as Seccomp Broker
-    participant FAN as Fanotify (fsmon)
-    participant Daemon as policyd
-    participant UI as UI
+flowchart LR
+    Agent["Sandboxed Agent"]
+    Network["Network enforcement"]
+    SEC["Seccomp broker"]
+    FS["Filesystem monitor"]
+    Daemon["policyd"]
+    UI["Approval UI"]
+    Upstream["Permitted upstream traffic"]
 
-    Agent->>NFQ: TCP SYN / UDP packet
-    NFQ->>Daemon: Check(host, port)
-    Daemon->>UI: Prompt
-    UI-->>Daemon: Verdict
-    Daemon-->>NFQ: Allow / Drop
-
-    Agent->>SEC: connect / sendto / sendmsg
-    SEC->>Daemon: Check(target)
-    Daemon->>UI: Prompt
-    UI-->>Daemon: Verdict
-    Daemon-->>SEC: Allow / EACCES
-
-    Agent->>FAN: open / exec
-    FAN->>Daemon: CheckFilesystem(path, access)
-    Daemon-->>FAN: Allow / Deny
-    FAN-->>Agent: FAN_ALLOW / FAN_DENY
+    Agent --> Network
+    Agent --> SEC
+    Agent --> FS
+    Network <--> Daemon
+    SEC <--> Daemon
+    FS <--> Daemon
+    Daemon <--> UI
+    Network -->|"permitted traffic"| Upstream
 ```
+
+The network path has two modes:
+
+```mermaid
+    flowchart LR
+    Agent["Sandboxed Agent"] --> Mode{"Proxy service port"}
+    Mode -->|no| Seccomp["Seccomp USER_NOTIF transport check"]
+    Seccomp --> Daemon["policyd"]
+    Daemon -->|deny| Seccomp
+    Daemon -->|allow| Direct["Kernel route"]
+
+    Mode -->|yes| NFQ["NFQUEUE RegisterNetworkFlow"]
+    NFQ --> Proxy["Per-port WireGuard and mitmproxy"]
+    Proxy --> Addon["Proxy policy addon"]
+    Addon --> Protocol{"Decoded HTTP"}
+    Protocol -->|CheckHttp| Daemon
+    Protocol -->|CheckNetworkFlow| Daemon
+    Daemon -->|verdict| Addon
+    Addon -->|approved| Proxy
+    Proxy --> Internet["Internet"]
+    Direct --> Internet
+```
+In proxy mode, only public TCP ports 80, 443, 8008, 8080, and 8443 plus
+UDP/443 are routed through WireGuard, registered, and checked by NFQUEUE.
+All other traffic keeps the namespace's ordinary kernel route and is gated
+by the seccomp user-notification broker. The calling thread remains blocked
+inside its network syscall while the transport approval is pending, so its
+application-level request timer does not expire first. This lets decoded
+HTTP/HTTPS reach the addon without a duplicate `tcp://host:port` transport
+prompt. The addon opens one liveness session at startup and claims each
+registered flow. Decoded HTTP requests use `CheckHttp`; raw fallback uses
+deferred cancellable `CheckNetworkFlow`, except opaque TCP/TLS on ports 443
+and 8443, which is killed fail-closed. UDP/443 is treated as an HTTP/3-over-
+QUIC transport check.
 
 ## Repository
 

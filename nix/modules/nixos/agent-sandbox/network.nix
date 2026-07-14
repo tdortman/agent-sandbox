@@ -47,11 +47,13 @@ let
   # responses were queued on the output hook, they would stall behind any
   # pending policy check, breaking name resolution for every new hostname.
   #
-  # There is no allow fast-path. NFQUEUE handles policy-bound TCP SYN and
-  # UDP packets. Denied destinations get a short reject-set entry only so
-  # client calls fail quickly instead of retrying until TCP timeout.
-  # Established/related conntrack entries, DNS traffic to the forwarder,
-  # and transient reject entries bypass NFQUEUE.
+  # There is no allow fast-path for NFQUEUE-owned traffic. In proxy mode,
+  # NFQUEUE handles only the transparently proxied service ports; direct
+  # destinations are gated by seccomp user notification and then accepted by
+  # the kernel route. Denied destinations get a short reject-set entry only
+  # so client calls fail quickly instead of retrying until TCP timeout.
+  # Established/related conntrack entries, DNS traffic to the forwarder, and
+  # transient reject entries bypass NFQUEUE.
   nftRules = ''
     table inet agent_sandbox {
       # Transient reject sets for denied destinations.
@@ -72,6 +74,7 @@ let
       }
 
       chain output {
+        ${lib.optionalString cfg.httpProxy.enable "    fib daddr type != local tcp dport { 80, 443, 8008, 8080, 8443 } oifname != \"${proxyInterface}\" reject\n    fib daddr type != local udp dport 443 oifname != \"${proxyInterface}\" reject\n"}
         type filter hook output priority 0; policy drop;
         ct state established,related accept
         # DNS traffic to the forwarder bypasses NFQUEUE
@@ -79,6 +82,8 @@ let
         ip daddr ${runtime.hostIp} tcp dport 53 accept
         ip6 daddr ${runtime.hostIp6} udp dport 53 accept
         ip6 daddr ${runtime.hostIp6} tcp dport 53 accept
+        # Kernel-generated WireGuard handshakes have no socket owner; bypass NFQUEUE only in proxy mode.
+        ${lib.optionalString cfg.httpProxy.enable "    ip daddr ${cfg.httpProxy.proxyHostIp} udp dport ${toString cfg.httpProxy.wireguardPort} accept\n"}
         # NDP only: neighbor and router discovery for the veth gateway.
         icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
         # Reject denied destinations from transient reject sets
@@ -86,11 +91,15 @@ let
         ip daddr . udp dport @reject_v4 reject
         ip6 daddr . tcp dport @reject_v6 reject with tcp reset
         ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
-        # Queue TCP SYN and UDP for policy enforcement
-        ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
-        ip protocol udp queue num ${toString runtime.queueNumber}
-        meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
-        meta nfproto ipv6 meta l4proto udp queue num ${toString runtime.queueNumber}
+        # In proxy mode, only transparently proxied service ports go through
+        # NFQUEUE. Other network destinations remain gated by seccomp user
+        # notification, which keeps the originating process blocked while an
+        # approval is pending.
+        ${lib.optionalString cfg.httpProxy.enable "    ip protocol tcp tcp dport { 80, 443, 8008, 8080, 8443 } tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    ip protocol udp udp dport 443 queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto tcp tcp dport { 80, 443, 8008, 8080, 8443 } tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto udp udp dport 443 queue num ${toString runtime.queueNumber}\n"}
+        ${lib.optionalString (!cfg.httpProxy.enable)
+          "    ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    ip protocol udp queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto udp queue num ${toString runtime.queueNumber}\n"
+        }
+        ${lib.optionalString cfg.httpProxy.enable "    # Direct ports were approved by seccomp user notification; keep them on the kernel route.\n    ip protocol tcp accept\n    ip protocol udp accept\n    meta nfproto ipv6 meta l4proto tcp accept\n    meta nfproto ipv6 meta l4proto udp accept\n"}
       }
     }
   '';
@@ -167,6 +176,101 @@ let
         ]
         (builtins.readFile ./netns/down.sh);
   };
+  proxyStateDir = "/var/lib/agent-sandbox/proxy";
+  proxyBundlePath = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
+  proxyReadyPath = "${proxyStateDir}/proxy-ready";
+  nfqReadyPath = "/run/agent-sandbox/nfq-ready";
+  proxyInterface = "asbx-proxy";
+  proxyCidrsPath = "/etc/agent-sandbox/proxy-upstream-cidrs.json";
+  proxyUser = "agent-sandbox-proxy";
+  proxyGroup = "agent-sandbox-proxy";
+  proxyCaCertificate = cfg.httpProxy.caCertificateFile;
+  proxyCaPrivateKey = cfg.httpProxy.caPrivateKeyFile;
+  proxyGroupLookupPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-group-gid";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.glibc.bin
+      pkgs.getent
+    ];
+    text = builtins.readFile ./proxy-group-gid.sh;
+  };
+  proxyInitPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-init";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.gnugrep
+      pkgs.jq
+      pkgs.openssl
+      pkgs.wireguard-tools
+    ];
+    text = builtins.readFile ./proxy-init.sh;
+  };
+  proxyFirewallPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-firewall";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.gnugrep
+      pkgs.jq
+      pkgs.nftables
+      pkgs.shadow
+    ];
+    text = builtins.readFile ./proxy-firewall.sh;
+  };
+  proxyRoutePkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-route";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.iproute2
+      pkgs.gawk
+      pkgs.jq
+      pkgs.systemd
+      pkgs.wireguard-tools
+    ];
+    text = builtins.readFile ./proxy-route.sh;
+  };
+  readinessMarkerPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-readiness-marker";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.gnugrep
+      pkgs.iproute2
+    ];
+    text = builtins.readFile ./readiness-marker.sh;
+  };
+  proxyPolicyLauncher = pkgs.writeShellApplication {
+    name = "agent-sandbox-policy-launch";
+    runtimeInputs = [ proxyGroupLookupPkg ];
+    text = ''
+      set -euo pipefail
+      proxy_gid="''${AGENT_SANDBOX_PROXY_GID_OVERRIDE:-}"
+      if [[ -z "$proxy_gid" ]]; then
+        proxy_gid="$(${proxyGroupLookupPkg}/bin/agent-sandbox-proxy-group-gid ${lib.escapeShellArg proxyGroup})"
+      fi
+      [[ "$proxy_gid" =~ ^[1-9][0-9]*$ ]] || {
+        echo "agent-sandbox policy: proxy group ID is invalid" >&2
+        exit 1
+      }
+      exec ${policyPkg}/bin/agent-sandbox-policyd "$@" --proxy-gid "$proxy_gid"
+    '';
+  };
+  proxyLaunchPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-launch";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.shadow
+    ];
+    text = ''
+      set -euo pipefail
+      proxy_gid="$(id -g ${proxyGroup})"
+      [[ "$proxy_gid" =~ ^[1-9][0-9]*$ ]] || {
+        echo "agent-sandbox proxy: invalid proxy group ID" >&2
+        exit 1
+      }
+      export AGENT_SANDBOX_PROXY_GID="$proxy_gid"
+      exec ${policyPkg}/bin/agent-sandbox-mitmdump "$@"
+    '';
+  };
 
 in
 lib.mkIf policyEnabled (
@@ -175,8 +279,10 @@ lib.mkIf policyEnabled (
       environment.etc."agent-sandbox/declarative.json".text = builtins.toJSON (
         {
           network = {
-            allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
-            deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+            direct = {
+              allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
+              deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+            };
           };
           sudo = {
             allow = [ ];
@@ -214,7 +320,12 @@ lib.mkIf policyEnabled (
           Type = "simple";
           ExecStart = lib.escapeShellArgs (
             [
-              "${policyPkg}/bin/agent-sandbox-policyd"
+              (
+                if runtime.httpProxy.enable then
+                  "${proxyPolicyLauncher}/bin/agent-sandbox-policy-launch"
+                else
+                  "${policyPkg}/bin/agent-sandbox-policyd"
+              )
               "--socket"
               runtime.policySocket
               "--sandbox-socket"
@@ -232,6 +343,10 @@ lib.mkIf policyEnabled (
             ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
               "--ui-spawn-cmd"
               "${policyPkg}/bin/agent-sandbox-ui"
+            ]
+            ++ lib.optionals runtime.httpProxy.enable [
+              "--proxy-socket"
+              runtime.httpProxy.socketPath
             ]
             ++ lib.optionals (runtime.exportedNix != "") [
               "--export-nix"
@@ -273,6 +388,9 @@ lib.mkIf policyEnabled (
           AGENT_SANDBOX_UI_BACKEND = runtime.uiBackend;
           AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
         }
+        // lib.optionalAttrs (runtime.httpProxy.enable && runtime.httpProxy.gid != null) {
+          AGENT_SANDBOX_PROXY_GID_OVERRIDE = toString runtime.httpProxy.gid;
+        }
         // lib.optionalAttrs (runtime.uiBackend == "zenity") {
           AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
         };
@@ -294,8 +412,14 @@ lib.mkIf policyEnabled (
         allowedUDPPorts = lib.mkAfter [ 53 ];
       };
 
-      environment.etc."agent-sandbox/resolv.conf".text = resolvConfText;
-      environment.etc."agent-sandbox/nsswitch.conf".text = nsswitchConfText;
+      environment.etc = {
+        "agent-sandbox/resolv.conf".text = resolvConfText;
+        "agent-sandbox/nsswitch.conf".text = nsswitchConfText;
+      }
+      // lib.optionalAttrs cfg.httpProxy.enable {
+        "agent-sandbox/proxy-upstream-cidrs.json".text = builtins.toJSON cfg.httpProxy.upstreamAllowCidrs;
+        "agent-sandbox/proxy-upstream-cidrs.json".mode = "0644";
+      };
 
       security.wrappers.agent-sandbox-enter = {
         source = "${enterBin}/bin/agent-sandbox-enter";
@@ -305,6 +429,14 @@ lib.mkIf policyEnabled (
         group = "root";
         setuid = false;
         setgid = false;
+      };
+      users.groups.${proxyGroup} = lib.mkIf cfg.httpProxy.enable { };
+      users.users.${proxyUser} = lib.mkIf cfg.httpProxy.enable {
+        isSystemUser = true;
+        group = proxyGroup;
+        home = "/var/empty";
+        createHome = false;
+        description = "agent-sandbox transparent HTTP proxy";
       };
 
       systemd.services = {
@@ -339,19 +471,25 @@ lib.mkIf policyEnabled (
           ];
           serviceConfig = {
             Type = "simple";
-            ExecStart = lib.escapeShellArgs [
-              "${policyPkg}/bin/agent-sandbox-dns-forwarder"
-              "--listen-host"
-              runtime.hostIp
-              "--listen-port"
-              "53"
-              "--forward-target"
-              runtime.dnsForwardTarget
-              "--cache-path"
-              "/run/agent-sandbox/dns-cache.json"
-              "--push-socket"
-              "/run/agent-sandbox/dns-push.sock"
-            ];
+            ExecStart = lib.escapeShellArgs (
+              [
+                "${policyPkg}/bin/agent-sandbox-dns-forwarder"
+                "--listen-host"
+                runtime.hostIp
+                "--listen-port"
+                "53"
+                "--forward-target"
+                runtime.dnsForwardTarget
+                "--cache-path"
+                "/run/agent-sandbox/dns-cache.json"
+                "--push-socket"
+                "/run/agent-sandbox/dns-push.sock"
+              ]
+              ++ lib.optionals cfg.httpProxy.enable [
+                "--cache-client-ip"
+                runtime.network.netnsIp
+              ]
+            );
             Restart = "on-failure";
             KillMode = "control-group";
             RuntimeDirectory = "agent-sandbox";
@@ -375,26 +513,254 @@ lib.mkIf policyEnabled (
           serviceConfig = {
             Type = "simple";
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
-            ExecStart = lib.escapeShellArgs [
-              "${policyPkg}/bin/agent-sandbox-nfq"
-              "--queue"
-              (toString runtime.queueNumber)
-              "--policy-socket"
-              runtime.sandboxPolicySocket
-              "--policy-timeout"
-              (toString runtime.policyTimeout)
-              "--nft-binary"
-              "${pkgs.nftables}/bin/nft"
-              "--dns-server-ip"
-              runtime.hostIp
-              "--push-socket"
-              "/run/agent-sandbox/dns-push.sock"
-            ];
+            ExecStart = lib.escapeShellArgs (
+              [
+                "${policyPkg}/bin/agent-sandbox-nfq"
+                "--queue"
+                (toString runtime.queueNumber)
+                "--policy-socket"
+                runtime.sandboxPolicySocket
+                "--policy-timeout"
+                (toString runtime.policyTimeout)
+                "--nft-binary"
+                "${pkgs.nftables}/bin/nft"
+                "--dns-server-ip"
+                runtime.hostIp
+                "--push-socket"
+                "/run/agent-sandbox/dns-push.sock"
+              ]
+              ++ lib.optionals cfg.httpProxy.enable [
+                "--proxy-mode"
+                "--ready-file"
+                nfqReadyPath
+              ]
+            );
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryPreserve = "yes";
+            ExecStartPre = lib.optionals cfg.httpProxy.enable [
+              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${nfqReadyPath}"
+            ];
+            ExecStopPost = lib.optionals cfg.httpProxy.enable [
+              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${nfqReadyPath}"
+            ];
           };
           environment = {
             AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
+          };
+        };
+      }
+      // lib.optionalAttrs cfg.httpProxy.enable {
+        agent-sandbox-proxy-init = {
+          description = "Initialize agent-sandbox interception CA and WireGuard credentials";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network-pre.target" ];
+          before = [
+            "agent-sandbox-proxy-firewall.service"
+            "agent-sandbox-proxy.service"
+          ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = lib.escapeShellArgs [
+              "${proxyInitPkg}/bin/agent-sandbox-proxy-init"
+              proxyStateDir
+              proxyBundlePath
+              "/etc/ssl/certs/ca-bundle.crt"
+            ];
+            ExecStartPost = "${pkgs.coreutils}/bin/chown -R ${proxyUser}:${proxyGroup} ${proxyStateDir}";
+            StateDirectory = "agent-sandbox/proxy";
+            StateDirectoryMode = "0700";
+            RuntimeDirectory = "agent-sandbox";
+            RuntimeDirectoryPreserve = "yes";
+            LoadCredential =
+              lib.optionals (proxyCaCertificate != null) [
+                "mitmproxy-ca-cert:${proxyCaCertificate}"
+              ]
+              ++ lib.optionals (proxyCaPrivateKey != null) [
+                "mitmproxy-ca-key:${proxyCaPrivateKey}"
+              ];
+          };
+        };
+
+        agent-sandbox-proxy-firewall = {
+          description = "Restrictive egress firewall for agent-sandbox transparent proxy";
+          wantedBy = [ "multi-user.target" ];
+          requires = [ "agent-sandbox-proxy-init.service" ];
+          bindsTo = [ "agent-sandbox-proxy.service" ];
+          after = [
+            "agent-sandbox-proxy-init.service"
+            "network.target"
+          ];
+          before = [ "agent-sandbox-proxy.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = lib.escapeShellArgs [
+              "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+              proxyUser
+              proxyGroup
+              cfg.httpProxy.proxyHostIp
+              runtime.hostIp
+              (toString cfg.httpProxy.wireguardPort)
+              proxyCidrsPath
+              "agent_sandbox_proxy"
+            ];
+            ExecStop = lib.escapeShellArgs [
+              "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+              proxyUser
+              proxyGroup
+              cfg.httpProxy.proxyHostIp
+              runtime.hostIp
+              (toString cfg.httpProxy.wireguardPort)
+              proxyCidrsPath
+              "agent_sandbox_proxy"
+              "cleanup"
+            ];
+            ExecStopPost = lib.escapeShellArgs [
+              "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+              proxyUser
+              proxyGroup
+              cfg.httpProxy.proxyHostIp
+              runtime.hostIp
+              (toString cfg.httpProxy.wireguardPort)
+              proxyCidrsPath
+              "agent_sandbox_proxy"
+              "cleanup"
+            ];
+          };
+        };
+
+        agent-sandbox-proxy = {
+          description = "Fail-closed mitmproxy WireGuard HTTP interceptor";
+          wantedBy = [ "multi-user.target" ];
+          requires = [
+            "agent-sandbox-proxy-init.service"
+            "agent-sandbox-proxy-firewall.service"
+            "agent-sandbox-policy.service"
+            "agent-sandbox-netns.service"
+            "agent-sandbox-dns.service"
+          ];
+          bindsTo = [ "agent-sandbox-proxy-firewall.service" ];
+          after = [
+            "agent-sandbox-proxy-init.service"
+            "agent-sandbox-proxy-firewall.service"
+            "agent-sandbox-policy.service"
+            "agent-sandbox-netns.service"
+            "agent-sandbox-dns.service"
+          ];
+          before = [ "agent-sandbox-proxy-route.service" ];
+          wants = [ "agent-sandbox-proxy-route.service" ];
+          serviceConfig = {
+            Type = "simple";
+            User = proxyUser;
+            Group = proxyGroup;
+            ExecStartPre = [
+              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${proxyReadyPath}"
+            ];
+            ExecStart = lib.escapeShellArgs [
+              "${proxyLaunchPkg}/bin/agent-sandbox-proxy-launch"
+              "--mode"
+              "wireguard@${toString cfg.httpProxy.wireguardPort}"
+              "--set"
+              "confdir=${proxyStateDir}"
+            ];
+            ExecStopPost = [
+              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${proxyReadyPath}"
+            ];
+            Restart = "always";
+            RestartSec = 1;
+            RuntimeDirectory = "agent-sandbox";
+            RuntimeDirectoryMode = "0755";
+            RuntimeDirectoryPreserve = "yes";
+            ReadWritePaths = [ proxyStateDir ];
+            ReadOnlyPaths = [
+              proxyBundlePath
+              "/run/agent-sandbox"
+            ];
+            BindReadOnlyPaths = [ "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf" ];
+            ProtectSystem = "strict";
+            ProtectHome = true;
+            PrivateTmp = true;
+            NoNewPrivileges = true;
+            RestrictSUIDSGID = true;
+            LockPersonality = true;
+            ProtectKernelTunables = true;
+            ProtectControlGroups = true;
+            RestrictAddressFamilies = [
+              "AF_UNIX"
+              "AF_INET"
+              "AF_INET6"
+            ];
+          };
+          environment = {
+            SSL_CERT_FILE = proxyBundlePath;
+            REQUESTS_CA_BUNDLE = proxyBundlePath;
+            CURL_CA_BUNDLE = proxyBundlePath;
+            AGENT_SANDBOX_PROXY_SOCKET = runtime.httpProxy.socketPath;
+            AGENT_SANDBOX_PROXY_SESSION_READY = proxyReadyPath;
+          };
+        };
+
+        agent-sandbox-proxy-route = {
+          description = "Install fail-closed per-port WireGuard routes for the proxy generation";
+          wantedBy = [ "multi-user.target" ];
+          requires = [
+            "agent-sandbox-proxy.service"
+            "agent-sandbox-proxy-firewall.service"
+          ];
+          bindsTo = [ "agent-sandbox-proxy.service" ];
+          after = [
+            "agent-sandbox-proxy.service"
+            "agent-sandbox-proxy-firewall.service"
+          ];
+          partOf = [ "agent-sandbox-proxy.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
+            RemainAfterExit = true;
+            ExecStart = lib.escapeShellArgs [
+              "${proxyRoutePkg}/bin/agent-sandbox-proxy-route"
+              proxyInterface
+              "10.0.0.1"
+              cfg.httpProxy.proxyHostIp
+              (toString cfg.httpProxy.wireguardPort)
+              "${proxyStateDir}/wireguard.conf"
+              "agent-sandbox-proxy.service"
+              "agent-sandbox-nfq.service"
+              proxyReadyPath
+              nfqReadyPath
+              runtime.hostIp
+            ];
+            ExecStop = lib.escapeShellArgs [
+              "${proxyRoutePkg}/bin/agent-sandbox-proxy-route"
+              proxyInterface
+              "10.0.0.1"
+              cfg.httpProxy.proxyHostIp
+              (toString cfg.httpProxy.wireguardPort)
+              "${proxyStateDir}/wireguard.conf"
+              "agent-sandbox-proxy.service"
+              "agent-sandbox-nfq.service"
+              proxyReadyPath
+              nfqReadyPath
+              runtime.hostIp
+              "cleanup"
+            ];
+            ExecStopPost = lib.escapeShellArgs [
+              "${proxyRoutePkg}/bin/agent-sandbox-proxy-route"
+              proxyInterface
+              "10.0.0.1"
+              cfg.httpProxy.proxyHostIp
+              (toString cfg.httpProxy.wireguardPort)
+              "${proxyStateDir}/wireguard.conf"
+              "agent-sandbox-proxy.service"
+              "agent-sandbox-nfq.service"
+              proxyReadyPath
+              nfqReadyPath
+              runtime.hostIp
+              "cleanup"
+            ];
+            Restart = "on-failure";
+            RestartSec = 1;
           };
         };
       };

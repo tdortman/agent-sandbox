@@ -186,6 +186,11 @@ let
         resourceGate = true;
       }
     );
+  credentialPathValid =
+    path:
+    path == null || (lib.hasPrefix "/" path && !(lib.hasInfix "\n" path) && !(lib.hasInfix "\r" path));
+  cidrValid = value: builtins.match "^.+/.+$" value != null;
+
 in
 {
   options.agent-sandbox = {
@@ -364,6 +369,53 @@ in
           forwarding. Defaults to the systemd-resolved stub on the host.
         '';
       };
+      httpProxy = {
+        enable = lib.mkEnableOption "transparent HTTP interception through the trusted proxy RPC";
+
+        wireguardPort = lib.mkOption {
+          type = lib.types.ints.between 1 65535;
+          default = 51820;
+          description = "UDP port used by mitmproxy's WireGuard listener.";
+        };
+
+        proxyHostIp = lib.mkOption {
+          type = lib.types.str;
+          default = "169.254.100.1";
+          description = "Host IPv4 address at which the proxy WireGuard peer is reachable.";
+        };
+
+        upstreamAllowCidrs = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          description = "Additional CIDRs the dedicated proxy UID may reach directly.";
+        };
+
+        caCertificateFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Absolute path to a supplied interception CA certificate or chain.";
+        };
+
+        caPrivateKeyFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Absolute path to a supplied unencrypted interception CA private key.";
+        };
+
+        socketPath = lib.mkOption {
+          type = lib.types.str;
+          default = "/run/agent-sandbox/proxy-policy.sock";
+          description = "Unix socket exposed to the trusted transparent HTTP proxy.";
+
+        };
+
+        gid = lib.mkOption {
+          type = lib.types.nullOr lib.types.int;
+          default = null;
+          description = "Optional explicit group ID allowed to connect to the trusted proxy socket; null uses the dedicated proxy group.";
+        };
+
+      };
     };
     gates = {
       filesystem = {
@@ -428,6 +480,32 @@ in
       {
         assertion = !(cfg.gates.resources.enable && !cfg.gates.filesystem.enable);
         message = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
+      }
+      {
+        assertion = !cfg.network.httpProxy.enable || cfg.network.enable;
+        message = "agent-sandbox.network.httpProxy.enable requires network.enable";
+      }
+      {
+        assertion =
+          let
+            proxy = cfg.network.httpProxy;
+          in
+          (proxy.caCertificateFile == null) == (proxy.caPrivateKeyFile == null)
+          && credentialPathValid proxy.caCertificateFile
+          && credentialPathValid proxy.caPrivateKeyFile;
+        message = "agent-sandbox HTTP proxy CA certificate and key must be supplied together and use absolute paths";
+      }
+      {
+        assertion =
+          let
+            proxy = cfg.network.httpProxy;
+          in
+          lib.all cidrValid proxy.upstreamAllowCidrs;
+        message = "agent-sandbox.network.httpProxy.upstreamAllowCidrs entries must be non-empty CIDR strings";
+      }
+      {
+        assertion = cfg.network.httpProxy.gid == null || cfg.network.httpProxy.gid > 0;
+        message = "agent-sandbox.network.httpProxy.gid must be nonzero when explicitly configured";
       }
     ];
     environment.systemPackages = (map wrapOne cfg.packages) ++ [

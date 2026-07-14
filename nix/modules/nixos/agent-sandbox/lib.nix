@@ -103,6 +103,7 @@ let
       inherit (network) queueNumber hostIp hostIp6;
       policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
       inherit (network) dnsForwardTarget;
+      httpProxy = network.httpProxy or { enable = false; };
     };
 
   buildPermissions =
@@ -227,6 +228,11 @@ in
       # sandbox, then execs its argv tail. The chain is composable with the
       # fs-arm helper so dynamic-FS and syscall-gate can both be active.
       syscallGate = syscallArmPkg != null;
+      proxyMode = runtime != null && runtime.httpProxy.enable;
+      networkMode = if proxyMode then "proxy" else "direct";
+      proxyTrustBundle = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
+      runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
+
       dynamicFs = fsArmPkg != null;
 
       entryBase =
@@ -303,10 +309,10 @@ in
             sudoGuard
             fsArmPkg
             syscallArmPkg
-            runtimeReadonlyDirs
             commonPkgs
             devicePaths
             ;
+          runtimeReadonlyDirs = runtimeReadonlyDirs';
         }
         ++ lib.optionals (fsArmPkg != null) [
           (builtinCombinators.compose [
@@ -314,6 +320,21 @@ in
             (builtinCombinators.add-runtime ''
               RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
             '')
+          ])
+        ]
+        ++ lib.optionals syscallGate [
+          (builtinCombinators.compose [
+            (builtinCombinators.set-env "AGENT_SANDBOX_NETWORK_MODE" networkMode)
+            (builtinCombinators.add-runtime ''
+              RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
+            '')
+          ])
+        ]
+        ++ lib.optionals proxyMode [
+          (builtinCombinators.compose [
+            (builtinCombinators.set-env "SSL_CERT_FILE" proxyTrustBundle)
+            (builtinCombinators.set-env "REQUESTS_CA_BUNDLE" proxyTrustBundle)
+            (builtinCombinators.set-env "CURL_CA_BUNDLE" proxyTrustBundle)
           ])
         ];
 
@@ -538,6 +559,21 @@ in
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
+      networkModeScript = lib.optionalString syscallGate ''
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
+      '';
+      proxyTrustScript = lib.optionalString proxyMode ''
+        [[ -f ${proxyTrustBundle} ]] || {
+          echo "agent-sandbox proxy trust bundle is unavailable" >&2
+          exit 1
+        }
+        RUNTIME_ARGS+=(--tmpfs /var/lib/agent-sandbox/proxy)
+        RUNTIME_ARGS+=(--ro-bind ${proxyTrustBundle} ${proxyTrustBundle})
+        RUNTIME_ARGS+=(--setenv SSL_CERT_FILE ${proxyTrustBundle})
+        RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE ${proxyTrustBundle})
+        RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
+      '';
+
       # Mask paths so the sandbox cannot see their contents even though the
       # dynamic-FS wrapper binds the whole host root. Directories are shadowed
       # with an empty tmpfs, files with /dev/null. Appended after all other
@@ -625,8 +661,11 @@ in
           fi
           ${lib.optionalString (!resourceGate) deviceBindScript}
 
+          ${networkModeScript}
           ${fsArmScript}
           ${hidePathsScript}
+          ${proxyTrustScript}
+
 
           exec ${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \

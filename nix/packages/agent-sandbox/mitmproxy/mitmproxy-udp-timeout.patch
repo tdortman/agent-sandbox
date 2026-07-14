@@ -1,0 +1,45 @@
+diff --git a/mitmproxy/options.py b/mitmproxy/options.py
+--- a/mitmproxy/options.py
++++ b/mitmproxy/options.py
+@@ -245,5 +245,11 @@
+             Timeout in seconds for inactive TCP connections. Connections will be closed after this period of inactivity.
+             """,
+         )
++        self.add_option(
++            "udp_timeout",
++            int,
++            20,
++            "Timeout in seconds for inactive UDP connections. Connections will be closed after this period of inactivity.",
++        )
+ 
+         self.update(**kwargs)
+diff --git a/mitmproxy/addons/proxyserver.py b/mitmproxy/addons/proxyserver.py
+--- a/mitmproxy/addons/proxyserver.py
++++ b/mitmproxy/addons/proxyserver.py
+@@ -236,3 +236,8 @@
+                     f"{ctx.options.body_size_limit}"
+                 )
++        if "udp_timeout" in updated and ctx.options.udp_timeout <= 0:
++            raise exceptions.OptionsError(
++                "Invalid udp_timeout specification: "
++                f"{ctx.options.udp_timeout}. Specify a positive integer."
++            )
+         if "connect_addr" in updated:
+diff --git a/mitmproxy/proxy/server.py b/mitmproxy/proxy/server.py
+--- a/mitmproxy/proxy/server.py
++++ b/mitmproxy/proxy/server.py
+@@ -44,7 +44,4 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-UDP_TIMEOUT = 20
+-
+-
+ class TimeoutWatchdog:
+@@ -115,5 +115,5 @@
+         if self.client.transport_protocol == "tcp":
+             timeout = context.options.tcp_timeout
+         else:
+-            timeout = UDP_TIMEOUT
++            timeout = context.options.udp_timeout
+         self.timeout_watchdog = TimeoutWatchdog(timeout, self.on_timeout)

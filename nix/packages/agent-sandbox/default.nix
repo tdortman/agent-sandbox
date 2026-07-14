@@ -21,6 +21,16 @@ let
   };
   src = inputs.self;
   workspacePackage = (fromTOML (builtins.readFile "${src}/Cargo.toml")).workspace.package;
+  mitmproxyRsPatched = pkgs.python3Packages.mitmproxy-rs.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [ ./mitmproxy/mitmproxy-rs-liveness.patch ];
+  });
+  mitmproxyPinned =
+    (pkgs.mitmproxy.override {
+      mitmproxy-rs = mitmproxyRsPatched;
+    }).overrideAttrs
+      (old: {
+        patches = (old.patches or [ ]) ++ [ ./mitmproxy/mitmproxy-udp-timeout.patch ];
+      });
 in
 rust.rustPlatform.buildRustPackage {
   pname = "agent-sandbox";
@@ -50,6 +60,23 @@ rust.rustPlatform.buildRustPackage {
     # Copy the Qt dialog helper into the package.
     cp ${qtDialog}/bin/agent-sandbox-qt-dialog $out/bin/
 
+
+    # Install the fail-closed transparent-proxy policy addon and wrapper.
+    install -Dm644 ${./mitmproxy/mitmproxy-policy.py} $out/share/agent-sandbox/mitmproxy-policy.py
+    makeWrapper ${mitmproxyPinned}/bin/mitmdump $out/bin/agent-sandbox-mitmdump \
+      --add-flags "-s $out/share/agent-sandbox/mitmproxy-policy.py" \
+      --add-flags "--set connection_strategy=lazy" \
+      --add-flags "--set upstream_cert=false" \
+      --add-flags "--set http2=true" \
+      --add-flags "--set http3=true" \
+      --add-flags "--set validate_inbound_headers=true" \
+      --add-flags "--set ssl_insecure=false" \
+      --add-flags "--set ssl_verify_upstream_trusted_ca=/run/agent-sandbox/mitmproxy-ca-bundle.pem" \
+      --add-flags "--set flow_detail=0" \
+      --add-flags "--set termlog_verbosity=warn"
+    # Exercise the generated wrapper so duplicate option assignments fail
+    # during the package build instead of when the service starts.
+    $out/bin/agent-sandbox-mitmdump --mode wireguard@51820 --options >/dev/null
     # Wrap the UI: expose the packaged Qt6 helper as the default
     # `qt-dialog` backend. Zenity remains module-selected, not bundled here.
     wrapProgram $out/bin/agent-sandbox-ui \

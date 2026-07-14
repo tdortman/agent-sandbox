@@ -1,0 +1,89 @@
+diff --git a/src/messages.rs b/src/messages.rs
+--- a/src/messages.rs
++++ b/src/messages.rs
+@@ -98,4 +98,5 @@ pub enum TransportCommand {
+     WriteData(ConnectionId, Vec<u8>),
+     DrainWriter(ConnectionId, oneshot::Sender<()>),
+     CloseConnection(ConnectionId, bool),
++    WaitPeerGone(ConnectionId, oneshot::Sender<()>),
+ }
+@@ -108,5 +108,6 @@ impl TransportCommand {
+             TransportCommand::WriteData(id, _) => id,
+             TransportCommand::DrainWriter(id, _) => id,
+             TransportCommand::CloseConnection(id, _) => id,
++            TransportCommand::WaitPeerGone(id, _) => id,
+         }
+     }
+ }
+diff --git a/src/network/tcp.rs b/src/network/tcp.rs
+--- a/src/network/tcp.rs
++++ b/src/network/tcp.rs
+@@ -40,3 +40,5 @@ struct SocketData {
+     drain_waiter: Vec<oneshot::Sender<()>>,
++    // Gets notified exactly once when the peer closes or resets the socket.
++    peer_gone_waiter: Option<oneshot::Sender<()>>,
+     addr_tuple: (SocketAddr, SocketAddr),
+ }
+@@ -145,2 +145,3 @@ impl TcpHandler<'_> {
+                 drain_waiter: Vec::new(),
++                peer_gone_waiter: None,
+                 addr_tuple: (src_addr, dst_addr),
+@@ -178,1 +178,2 @@ impl TcpHandler<'_> {
+             }
++            TransportCommand::WaitPeerGone(id, tx) => self.wait_peer_gone(id, tx),
+@@ -224,0 +225,8 @@ impl TcpHandler<'_> {
++
++    pub fn wait_peer_gone(&mut self, id: ConnectionId, tx: oneshot::Sender<()>) {
++        if let Some(data) = self.socket_data.get_mut(&id) {
++            data.peer_gone_waiter = Some(tx);
++        } else {
++            let _ = tx.send(());
++        }
++    }
+@@ -319,4 +328,5 @@ impl TcpHandler<'_> {
+         for connection_id in self.remove_conns.drain(..) {
+             let data = self.socket_data.remove(&connection_id).unwrap();
++            if let Some(waiter) = data.peer_gone_waiter { let _ = waiter.send(()); }
+             self.sockets.remove(data.handle);
+             self.active_connections.remove(&data.addr_tuple);
+         }
+diff --git a/src/network/udp.rs b/src/network/udp.rs
+--- a/src/network/udp.rs
++++ b/src/network/udp.rs
+@@ -84,6 +84,7 @@ impl UdpHandler {
+             TransportCommand::DrainWriter(id, tx) => {
+                 self.drain_writer(id, tx);
+                 None
+             }
++            TransportCommand::WaitPeerGone(_, tx) => { drop(tx); None }
+             TransportCommand::CloseConnection(id, _) => {
+                 self.close_connection(id);
+                 None
+             }
+diff --git a/mitmproxy-rs/src/udp_client.rs b/mitmproxy-rs/src/udp_client.rs
+--- a/mitmproxy-rs/src/udp_client.rs
++++ b/mitmproxy-rs/src/udp_client.rs
+@@ -152,1 +152,2 @@
+                    },
++                        TransportCommand::WaitPeerGone(_, tx) => { let _ = tx.send(()); }
+diff --git a/mitmproxy-rs/src/stream.rs b/mitmproxy-rs/src/stream.rs
+--- a/mitmproxy-rs/src/stream.rs
++++ b/mitmproxy-rs/src/stream.rs
+@@ -128,3 +128,17 @@ impl Stream {
+     }
+ 
++    /// Wait until the peer has closed or reset a TCP stream without consuming
++    /// application data. The future resolves immediately for an already-removed
++    /// stream and is cancelled when the Rust network task shuts down.
++    #[pyo3(name = "wait_peer_gone")]
++    fn wait_peer_gone<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
++        let (tx, rx) = oneshot::channel();
++        self.command_tx
++            .send(TransportCommand::WaitPeerGone(self.connection_id, tx))
++            .map_err(event_queue_unavailable)?;
++        pyo3_async_runtimes::tokio::future_into_py(py, async move {
++            rx.await.map_err(|_| PyOSError::new_err("network task stopped"))
++        })
++    }
++
+     /// Check whether this stream is being closed.
