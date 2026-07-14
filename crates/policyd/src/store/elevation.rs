@@ -1,7 +1,7 @@
 //! Policy store: elevation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
@@ -59,19 +59,51 @@ impl PolicyStore {
         ])
     }
 
-    fn resolve_elevation_argv(argv: &[String]) -> Result<PathBuf, PolicydError> {
+    fn resolve_elevation_argv(argv: &[String]) -> Result<(PathBuf, String), PolicydError> {
         let Some(program) = argv.first() else {
             return Err(PolicydError::ArgvRequired);
         };
         let path = Path::new(program);
-        if path.is_absolute() {
-            return Ok(path.to_path_buf());
+        let candidate = if path.is_absolute() {
+            // Reject absolute paths outside the trusted system profile before
+            // following links. The suffix must contain only normal
+            // components, so traversal and dot aliases cannot escape it.
+            let Some(relative) = program.strip_prefix("/run/current-system/") else {
+                return Err(PolicydError::ElevationArgvNotAbsolute);
+            };
+            if relative
+                .split('/')
+                .any(|component| matches!(component, "." | ".."))
+                || relative.is_empty()
+                || !Path::new(relative)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            {
+                return Err(PolicydError::ElevationArgvNotAbsolute);
+            }
+            path.to_path_buf()
+        } else {
+            let mut components = path.components();
+            if !matches!(
+                (components.next(), components.next()),
+                (Some(Component::Normal(_)), None)
+            ) {
+                return Err(PolicydError::ElevationArgvNotAbsolute);
+            }
+            Path::new(ELEVATION_PATH).join(program)
+        };
+        // Preserve the trusted candidate's name for multi-call binaries
+        // (e.g. coreutils), which dispatch on argv[0], rather than the
+        // canonical store path's name.
+        let arg0_name = candidate.to_string_lossy().into_owned();
+        // Canonicalize and require a regular file in the immutable Nix store.
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|_| PolicydError::ElevationArgvNotAbsolute)?;
+        if !canonical.is_file() || !canonical.starts_with("/nix/store/") {
+            return Err(PolicydError::ElevationArgvNotAbsolute);
         }
-        let candidate = Path::new(ELEVATION_PATH).join(program);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        Err(PolicydError::ElevationArgvNotAbsolute)
+        Ok((canonical, arg0_name))
     }
 
     pub(crate) async fn exec_elevation(
@@ -80,13 +112,16 @@ impl PolicyStore {
         cwd: Option<&Path>,
         home: Option<&Path>,
     ) -> Result<ElevateReply, PolicydError> {
-        let prog = Self::resolve_elevation_argv(argv)?;
+        let (prog, arg0_name) = Self::resolve_elevation_argv(argv)?;
         let work_dir = cwd
             .and_then(|dir| dir.canonicalize().ok())
             .filter(|dir| dir.is_dir())
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut cmd = tokio::process::Command::new(&prog);
-        cmd.args(&argv[1..])
+        // Preserve the original argv[0] for multi-call binaries (e.g.
+        // coreutils) that dispatch on the program name.
+        cmd.arg0(&arg0_name)
+            .args(&argv[1..])
             .current_dir(work_dir)
             .env_clear()
             .envs(Self::elevation_env(home))
@@ -141,8 +176,9 @@ impl PolicyStore {
                     allowed: false,
                     exit_code: 1,
                     stdout: String::new(),
-                    stderr: "agent-sandbox: elevation argv[0] must be absolute or in trusted PATH"
-                        .into(),
+                    stderr:
+                        "agent-sandbox: elevation argv[0] must be a bare command resolved via /run/current-system/sw/bin or an absolute path under /run/current-system, with a regular canonical target under /nix/store"
+                            .into(),
                 },
                 Err(err) => {
                     tracing::warn!(error = %err, "elevation exec rejected");
@@ -335,11 +371,18 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use super::ELEVATION_PATH;
     use crate::store::types::{PolicyStore, PolicydArgs};
     use crate::wire::ElevationRequest;
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn system_profile_true() -> Option<PathBuf> {
+        let path = Path::new(ELEVATION_PATH).join("true");
+        path.is_file().then_some(path)
+    }
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
             host_socket: "/tmp/test.sock".into(),
@@ -352,6 +395,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         })
     }
 
@@ -430,7 +475,7 @@ mod tests {
         std::fs::create_dir_all(evil.join(".config/agent-sandbox")).expect("evil config");
         std::fs::write(
             real_home.join(".config/agent-sandbox/policy.json"),
-            r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]},"filesystem":{"allow":[],"deny":[]},"resources":{"allow":[],"deny":[]}}"#,
+            r#"{"network":{"direct":{"allow":[],"deny":[]},"http":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]},"filesystem":{"allow":[],"deny":[]},"resources":{"allow":[],"deny":[]}}"#,
         )
         .expect("real policy");
         std::fs::write(
@@ -457,6 +502,143 @@ mod tests {
         assert!(
             !store.sudo_policy_allowed(&["id".into()], &resolved),
             "forged home must not auto-approve elevation via attacker sudo policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevation_rejects_executable_outside_nix_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fake_bin = tmp.path().join("evil");
+        std::fs::write(&fake_bin, b"#!/bin/sh\necho pwned\n").expect("write fake binary");
+        let store = test_store();
+        let err = store
+            .exec_elevation(&[fake_bin.to_string_lossy().into_owned()], None, None)
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
+            "expected ElevationArgvNotAbsolute, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevation_rejects_direct_nix_store_path() {
+        let Some(profile_true) = system_profile_true() else {
+            return;
+        };
+        let store_path = profile_true
+            .canonicalize()
+            .expect("system-profile true must resolve");
+        assert!(store_path.starts_with("/nix/store/"));
+        let store = test_store();
+        let err = store
+            .exec_elevation(&[store_path.to_string_lossy().into_owned()], None, None)
+            .await
+            .expect_err("direct Nix store paths must be rejected");
+        assert!(
+            matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
+            "expected ElevationArgvNotAbsolute, got {err:?}"
+        );
+    }
+    #[tokio::test]
+    async fn elevation_resolves_bare_system_profile_binary() {
+        let Some(profile_true) = system_profile_true() else {
+            return;
+        };
+        let canonical = profile_true
+            .canonicalize()
+            .expect("system-profile true must resolve");
+        assert!(
+            canonical.is_file() && canonical.starts_with("/nix/store/"),
+            "system-profile true must be a regular Nix-store file: {canonical:?}"
+        );
+        let store = test_store();
+        let reply = store
+            .exec_elevation(&["true".into()], None, None)
+            .await
+            .expect("true must resolve and execute");
+        assert_eq!(reply.exit_code, 0, "true must exit 0, got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn elevation_accepts_absolute_system_profile_binary() {
+        let Some(profile_true) = system_profile_true() else {
+            return;
+        };
+        let store = test_store();
+        let reply = store
+            .exec_elevation(&[profile_true.to_string_lossy().into_owned()], None, None)
+            .await
+            .expect("absolute system-profile true must resolve and execute");
+        assert_eq!(
+            reply.exit_code, 0,
+            "absolute system-profile true must exit 0, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevation_rejects_traversal_symlink_alias() {
+        let tmp = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let alias = tmp.path().join("rm");
+        std::os::unix::fs::symlink("/nix/store/fake-coreutils/bin/true", &alias)
+            .expect("create symlink alias");
+        let name = tmp
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy();
+        let traversal = format!("../../../../tmp/{name}/rm");
+        let store = test_store();
+        let err = store
+            .exec_elevation(&[traversal], None, None)
+            .await
+            .expect_err("relative symlink alias must be rejected");
+        assert!(
+            matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
+            "expected ElevationArgvNotAbsolute for traversal alias, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevation_rejects_absolute_traversal_symlink_alias() {
+        let tmp = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let alias = tmp.path().join("rm");
+        std::os::unix::fs::symlink("/nix/store/fake-coreutils/bin/true", &alias)
+            .expect("create symlink alias");
+        let name = tmp
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy();
+        let traversal = format!("/run/current-system/../../../../tmp/{name}/rm");
+        let store = test_store();
+        let err = store
+            .exec_elevation(&[traversal], None, None)
+            .await
+            .expect_err("absolute traversal alias must be rejected");
+        assert!(
+            matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
+            "expected ElevationArgvNotAbsolute for absolute traversal alias, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevation_rejects_symlink_alias_outside_trusted_root() {
+        // A symlink outside the trusted root must be rejected before links
+        // are followed. Otherwise an attacker could create /tmp/rm pointing
+        // at a multi-call binary and spoof its applet dispatch via argv[0].
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let alias = tmp.path().join("rm");
+        std::os::unix::fs::symlink("/nix/store/fake-coreutils/bin/true", &alias)
+            .expect("create symlink alias");
+        let store = test_store();
+        let err = store
+            .exec_elevation(&[alias.to_string_lossy().into_owned()], None, None)
+            .await
+            .expect_err("symlink alias must be rejected");
+        assert!(
+            matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
+            "expected ElevationArgvNotAbsolute for symlink alias, got {err:?}"
         );
     }
 }

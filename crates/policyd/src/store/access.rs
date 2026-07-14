@@ -114,6 +114,7 @@ impl PolicyStore {
         let merged = self.merged_for(ctx);
         merged
             .network
+            .direct
             .deny
             .iter()
             .any(|rule| Self::host_matches(&rule.host, &host) && rule.port == port)
@@ -782,6 +783,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
+            .direct
             .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "34.230.40.*",
@@ -802,6 +804,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -848,6 +852,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
+            .direct
             .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "2001:db8:*",
@@ -868,6 +873,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -910,6 +917,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
+            .direct
             .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "example.com",
@@ -930,6 +938,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -968,6 +978,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
+            .direct
             .deny
             .push(agent_sandbox_core::NetworkRule::new(
                 "34.230.40.*",
@@ -988,6 +999,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -1016,6 +1029,7 @@ mod tests {
         let mut policy = agent_sandbox_core::Policy::default();
         policy
             .network
+            .direct
             .allow
             .push(agent_sandbox_core::NetworkRule::new(
                 "example.com",
@@ -1036,6 +1050,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root = project_root.to_string_lossy().into_owned();
@@ -1089,6 +1105,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let home_s = home.to_string_lossy().into_owned();
@@ -1163,6 +1181,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_gid: None,
+            proxy_socket: None,
         });
 
         let home_s = home.to_string_lossy().into_owned();
@@ -1236,6 +1256,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let home_s = home.to_string_lossy().into_owned();
@@ -1292,6 +1314,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let root_s = project_root.to_string_lossy().into_owned();
@@ -1345,6 +1369,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let session_id = "sandbox-git-session";
@@ -1436,6 +1462,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -1503,6 +1531,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -1546,6 +1576,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
         let ctx = agent_sandbox_core::ResolvedRequestContext::default();
         assert_eq!(
@@ -1581,6 +1613,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -1649,6 +1683,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -1700,6 +1736,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -1765,6 +1803,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();

@@ -21,6 +21,121 @@ pub async fn handle(
     peer: ClientPeer,
     req: ResolvedRpcRequest,
 ) -> Result<RpcReply, PolicydError> {
+    if is_proxy_request(&req) {
+        return handle_proxy_request(store, client.id, req).await;
+    }
+    handle_non_proxy_request(store, client, peer, req).await
+}
+
+const fn is_proxy_request(req: &ResolvedRpcRequest) -> bool {
+    matches!(
+        req,
+        ResolvedRpcRequest::OpenProxySession
+            | ResolvedRpcRequest::RegisterNetworkFlow { .. }
+            | ResolvedRpcRequest::ClaimNetworkFlow { .. }
+            | ResolvedRpcRequest::CheckHttp { .. }
+            | ResolvedRpcRequest::CheckNetworkFlow { .. }
+            | ResolvedRpcRequest::CancelCheck { .. }
+            | ResolvedRpcRequest::ReleaseNetworkFlow { .. }
+    )
+}
+
+async fn handle_proxy_request(
+    store: &Arc<PolicyStore>,
+    client_id: u64,
+    req: ResolvedRpcRequest,
+) -> Result<RpcReply, PolicydError> {
+    match req {
+        ResolvedRpcRequest::OpenProxySession => Ok(RpcReply::ProxySession(
+            store.open_proxy_session(client_id).await?,
+        )),
+        ResolvedRpcRequest::RegisterNetworkFlow { registration } => {
+            store.register_network_flow(registration).await?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+        ResolvedRpcRequest::ClaimNetworkFlow {
+            proxy_session,
+            flow,
+            connection_id,
+        } => Ok(RpcReply::FlowClaim(
+            store
+                .claim_network_flow(proxy_session, flow, connection_id)
+                .await?,
+        )),
+        ResolvedRpcRequest::CheckHttp {
+            proxy_session,
+            request_id,
+            attribution_token,
+            request,
+        } => Ok(RpcReply::HttpCheck(
+            store
+                .check_http(proxy_session, request_id, attribution_token, request)
+                .await?,
+        )),
+        ResolvedRpcRequest::CheckNetworkFlow {
+            proxy_session,
+            request_id,
+            attribution_token,
+        } => Ok(RpcReply::Check(
+            store
+                .check_network_flow(proxy_session, request_id, attribution_token)
+                .await?,
+        )),
+        ResolvedRpcRequest::CancelCheck {
+            proxy_session,
+            request_id,
+        } => {
+            store.cancel_check(proxy_session, request_id).await?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+        ResolvedRpcRequest::ReleaseNetworkFlow {
+            proxy_session,
+            attribution_token,
+        } => {
+            store
+                .release_network_flow(proxy_session, attribution_token)
+                .await?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+        _ => unreachable!("non-proxy request passed to proxy handler"),
+    }
+}
+
+async fn handle_network_check(
+    store: &Arc<PolicyStore>,
+    args: CheckArgs,
+) -> Result<RpcReply, PolicydError> {
+    let CheckArgs {
+        host,
+        connect_host,
+        port,
+        scheme,
+        url,
+        ctx,
+        ..
+    } = args;
+    let result = split_check_aliases(url);
+    handle_check(
+        store,
+        CheckArgs {
+            host,
+            connect_host,
+            port,
+            scheme,
+            url: result.url,
+            aliases: result.aliases,
+            ctx,
+        },
+    )
+    .await
+}
+
+async fn handle_non_proxy_request(
+    store: &Arc<PolicyStore>,
+    client: &crate::store::UiClientHandle,
+    peer: ClientPeer,
+    req: ResolvedRpcRequest,
+) -> Result<RpcReply, PolicydError> {
     match req {
         ResolvedRpcRequest::RegisterUi { ctx } => {
             handle_register_ui(store, client, peer, ctx).await
@@ -37,16 +152,15 @@ pub async fn handle(
             url,
             ctx,
         } => {
-            let result = split_check_aliases(url);
-            handle_check(
+            handle_network_check(
                 store,
                 CheckArgs {
                     host,
                     connect_host,
                     port,
                     scheme,
-                    url: result.url,
-                    aliases: result.aliases,
+                    url,
+                    aliases: Vec::new(),
                     ctx,
                 },
             )
@@ -68,6 +182,17 @@ pub async fn handle(
             ctx,
             static_allow,
         } => handle_start_filesystem_monitor(store, peer_pid, ctx, static_allow).await,
+        req => handle_non_proxy_tail(store, client, peer, req).await,
+    }
+}
+
+async fn handle_non_proxy_tail(
+    store: &Arc<PolicyStore>,
+    client: &crate::store::UiClientHandle,
+    peer: ClientPeer,
+    req: ResolvedRpcRequest,
+) -> Result<RpcReply, PolicydError> {
+    match req {
         ResolvedRpcRequest::Elevate { argv, ctx } => handle_elevate_request(store, argv, ctx).await,
         ResolvedRpcRequest::Approve {
             id,
@@ -92,6 +217,14 @@ pub async fn handle(
             session_id,
             ctx,
         } => handle_approve_host(store, host, port, scope, session_id, ctx).await,
+        ResolvedRpcRequest::ApproveHttp {
+            target,
+            scope,
+            session_id,
+            ctx,
+        } => Ok(RpcReply::ScopeAction(
+            store.approve_http(target, scope, session_id, ctx).await?,
+        )),
         ResolvedRpcRequest::Deny {
             id,
             scope,
@@ -108,14 +241,12 @@ pub async fn handle(
                 approver_uid: (peer.uid > 0).then_some(peer.uid),
             })
             .await),
-        ResolvedRpcRequest::Status { ctx } => {
-            let body = store.status(ctx).await;
-            Ok(RpcReply::Status(body))
-        }
-        ResolvedRpcRequest::Reload { ctx } => {
-            store.export_policy_files(ctx.paths)?;
-            Ok(RpcReply::Simple(SimpleOkReply::OK))
-        }
+        ResolvedRpcRequest::Status { ctx } => Ok(RpcReply::Status(store.status(ctx).await)),
+        ResolvedRpcRequest::Reload { ctx } => store
+            .export_policy_files(ctx.paths)
+            .map_err(PolicydError::from)
+            .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
+        _ => unreachable!("proxy request passed to non-proxy handler"),
     }
 }
 
@@ -259,6 +390,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         })
     }
 

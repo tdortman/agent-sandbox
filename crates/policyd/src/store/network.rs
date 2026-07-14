@@ -14,8 +14,8 @@ use uuid::Uuid;
 use crate::wire::{NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
 use super::types::{
-    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkVerdictKey, Pending, PendingKind,
-    PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkVerdictKey, NetworkWaiter, Pending,
+    PendingKind, PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
 
 /// How long a network verdict is cached after the first policy check for the
@@ -48,6 +48,14 @@ struct PendingNetResult {
     id: String,
     is_new: bool,
     rx: oneshot::Receiver<CheckReply>,
+}
+
+struct NetworkWaitTarget<'a> {
+    ctx: &'a ResolvedRequestContext,
+    pending_id: &'a str,
+    policy_host: String,
+    port: u16,
+    scheme: &'a str,
 }
 
 impl PolicyStore {
@@ -121,8 +129,8 @@ impl PolicyStore {
             } else {
                 CheckReply::denied(source.clone())
             };
-            for tx in waiters {
-                let _ = tx.send(reply.clone());
+            for waiter in waiters {
+                let _ = waiter.tx.send(reply.clone());
             }
         }
         // Cache the verdict for deduplication of multiple IPs from the same
@@ -150,6 +158,20 @@ impl PolicyStore {
         req: NetworkCheckRequest,
         aliases: Vec<String>,
     ) -> CheckReply {
+        self.request_network_approval_with_aliases_cancellable(req, aliases, None, None)
+            .await
+    }
+
+    pub(crate) async fn request_network_approval_with_aliases_cancellable(
+        &self,
+        req: NetworkCheckRequest,
+        aliases: Vec<String>,
+        waiter: Option<(
+            agent_sandbox_core::ProxySessionToken,
+            agent_sandbox_core::ProxyRequestId,
+        )>,
+        cancel: Option<oneshot::Receiver<()>>,
+    ) -> CheckReply {
         let NetworkCheckRequest {
             host,
             port,
@@ -166,6 +188,13 @@ impl PolicyStore {
         if self.policy_denied(&policy_host, port, &ctx) {
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return CheckReply::denied(VerdictSource::policy());
+        }
+        if let Some(verdict) = self
+            .policy_evaluation(&ctx)
+            .network_verdict(&policy_host, port, true)
+            .await
+        {
+            return CheckReply::from_verdict(verdict);
         }
         if !self.args.interactive_approval {
             return CheckReply::denied(VerdictSource::Blocked);
@@ -188,7 +217,7 @@ impl PolicyStore {
             sandbox_session_id: sandbox_session_id.as_deref(),
         };
         let result = match self
-            .dedup_or_create_pending_network(&identity, &scheme, &url, &aliases)
+            .dedup_or_create_pending_network(&identity, &scheme, &url, &aliases, waiter.as_ref())
             .await
         {
             Ok(r) => r,
@@ -237,8 +266,19 @@ impl PolicyStore {
             }
         }
 
-        self.await_network_verdict(&ctx, &result.id, policy_host, port, &scheme, result.rx)
-            .await
+        self.await_network_verdict(
+            NetworkWaitTarget {
+                ctx: &ctx,
+                pending_id: &result.id,
+                policy_host,
+                port,
+                scheme: &scheme,
+            },
+            result.rx,
+            cancel,
+            waiter,
+        )
+        .await
     }
     async fn check_network_verdict_cache(
         &self,
@@ -267,10 +307,25 @@ impl PolicyStore {
         scheme: &str,
         url: &str,
         aliases: &[String],
+        waiter: Option<&(
+            agent_sandbox_core::ProxySessionToken,
+            agent_sandbox_core::ProxyRequestId,
+        )>,
     ) -> Result<PendingNetResult, CheckReply> {
         let (tx, rx) = oneshot::channel();
-
         let mut inner = self.inner.lock().await;
+        if let Some(proxy) = waiter
+            && inner
+                .network_futures
+                .values()
+                .flatten()
+                .any(|entry| entry.proxy.as_ref() == Some(proxy))
+        {
+            return Err(CheckReply::blocked(
+                "agent-sandbox: duplicate in-flight network request ID",
+            ));
+        }
+        let proxy = waiter.cloned();
         if let Some(existing_id) = inner.pending.values().find_map(|pending| {
             let Pending::Network(net) = pending else {
                 return None;
@@ -278,22 +333,16 @@ impl PolicyStore {
             identity.matches(net).then(|| net.id.clone())
         }) {
             let waiter_count = inner.network_futures.get(&existing_id).map_or(0, Vec::len);
-            tracing::error!(waiter_count, MAX_WAITERS_PER_PENDING, host = %identity.host, "dedup found existing pending, waiter count");
             if waiter_count >= MAX_WAITERS_PER_PENDING {
                 return Err(CheckReply::blocked(
                     "agent-sandbox: too many waiters for one network approval",
                 ));
             }
-            tracing::error!(
-                waiter_count,
-                MAX_WAITERS_PER_PENDING,
-                "waiter count check failed"
-            );
             inner
                 .network_futures
                 .entry(existing_id.clone())
                 .or_default()
-                .push(tx);
+                .push(NetworkWaiter { proxy, tx });
             drop(inner);
             return Ok(PendingNetResult {
                 id: existing_id,
@@ -302,16 +351,14 @@ impl PolicyStore {
             });
         }
         if inner.pending.len() >= MAX_PENDING_APPROVALS {
-            tracing::warn!(
-                pending_count = inner.pending.len(),
-                "network approval blocked (too many pending approvals)"
-            );
             return Err(CheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
             ));
         }
         let pending_id = format!("net:{}", Uuid::now_v7().simple());
-        inner.network_futures.insert(pending_id.clone(), vec![tx]);
+        inner
+            .network_futures
+            .insert(pending_id.clone(), vec![NetworkWaiter { proxy, tx }]);
         inner.pending.insert(
             pending_id.clone(),
             Pending::Network(PendingNetwork {
@@ -338,45 +385,114 @@ impl PolicyStore {
         })
     }
 
+    fn remove_network_waiter_locked(
+        inner: &mut super::types::StoreInner,
+        pending_id: &str,
+        proxy: Option<&(
+            agent_sandbox_core::ProxySessionToken,
+            agent_sandbox_core::ProxyRequestId,
+        )>,
+    ) -> Vec<oneshot::Sender<CheckReply>> {
+        let Some(mut waiters) = inner.network_futures.remove(pending_id) else {
+            return Vec::new();
+        };
+        let mut canceled = Vec::new();
+        if let Some(proxy) = proxy {
+            if let Some(index) = waiters
+                .iter()
+                .position(|waiter| waiter.proxy.as_ref() == Some(proxy))
+            {
+                canceled.push(waiters.remove(index).tx);
+            }
+            if waiters.is_empty() {
+                inner.pending.remove(pending_id);
+            } else {
+                inner.network_futures.insert(pending_id.to_owned(), waiters);
+            }
+        } else {
+            canceled.extend(waiters.into_iter().map(|waiter| waiter.tx));
+            inner.pending.remove(pending_id);
+        }
+        canceled
+    }
+
+    async fn cancel_network_wait(
+        &self,
+        pending_id: &str,
+        proxy: Option<&(
+            agent_sandbox_core::ProxySessionToken,
+            agent_sandbox_core::ProxyRequestId,
+        )>,
+    ) -> Vec<oneshot::Sender<CheckReply>> {
+        let mut inner = self.inner.lock().await;
+        let canceled = Self::remove_network_waiter_locked(&mut inner, pending_id, proxy);
+        drop(inner);
+        canceled
+    }
+
+    async fn expire_network_wait(
+        &self,
+        target: &NetworkWaitTarget<'_>,
+        proxy: Option<&(
+            agent_sandbox_core::ProxySessionToken,
+            agent_sandbox_core::ProxyRequestId,
+        )>,
+    ) -> (Vec<oneshot::Sender<CheckReply>>, bool) {
+        let mut inner = self.inner.lock().await;
+        let canceled = Self::remove_network_waiter_locked(&mut inner, target.pending_id, proxy);
+        let last = !inner.network_futures.contains_key(target.pending_id);
+        if last {
+            inner.network_verdict_cache.insert(
+                NetworkVerdictKey {
+                    host: target.policy_host.clone(),
+                    port: target.port,
+                },
+                VerdictEntry {
+                    allowed: false,
+                    source: VerdictSource::Blocked,
+                    time: Instant::now(),
+                },
+            );
+            enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
+        }
+        drop(inner);
+        (canceled, last)
+    }
+
     async fn await_network_verdict(
         &self,
-        ctx: &ResolvedRequestContext,
-        pending_id: &str,
-        policy_host: String,
-        port: u16,
-        scheme: &str,
+        target: NetworkWaitTarget<'_>,
         rx: oneshot::Receiver<CheckReply>,
+        cancel: Option<oneshot::Receiver<()>>,
+        proxy: Option<(
+            agent_sandbox_core::ProxySessionToken,
+            agent_sandbox_core::ProxyRequestId,
+        )>,
     ) -> CheckReply {
-        // Race UI registration against the verdict channel so a CLI approval
-        // can unblock the request even if no policy UI ever appears.
-        // Preserve the existing two-timeout contract: a short wait for the
-        // UI to register, then a full approval_timeout for the verdict.
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
+        let (_fallback_cancel_tx, fallback_cancel_rx) = oneshot::channel();
+        let cancel_rx = cancel.unwrap_or(fallback_cancel_rx);
+        tokio::pin!(cancel_rx);
         loop {
-            if self.has_ui_for_context(ctx).await {
+            if self.has_ui_for_context(target.ctx).await {
                 break;
             }
             let now = Instant::now();
             if now >= ui_deadline {
-                let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
-                inner.network_futures.remove(pending_id);
-                inner.network_verdict_cache.insert(
-                    NetworkVerdictKey {
-                        host: policy_host.clone(),
-                        port,
-                    },
-                    VerdictEntry {
-                        allowed: false,
-                        source: VerdictSource::Blocked,
-                        time: Instant::now(),
-                    },
+                let (canceled, last) = self.expire_network_wait(&target, proxy.as_ref()).await;
+                for tx in canceled {
+                    let _ = tx.send(CheckReply::blocked(
+                        "agent-sandbox: no policy UI registered",
+                    ));
+                }
+                tracing::warn!(
+                    host = %target.policy_host,
+                    port = target.port,
+                    last,
+                    "network approval blocked (no policy UI)"
                 );
-                enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
-                tracing::warn!(%policy_host, port, "network approval blocked (no policy UI)");
-                drop(inner);
                 return CheckReply::blocked(
                     "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
                 );
@@ -388,39 +504,59 @@ impl PolicyStore {
                 result = &mut rx => {
                     return result.unwrap_or_else(|_| CheckReply::denied(VerdictSource::Blocked));
                 }
+                _ = &mut cancel_rx => {
+                    let canceled = self
+                        .cancel_network_wait(target.pending_id, proxy.as_ref())
+                        .await;
+                    for tx in canceled {
+                        let _ = tx.send(CheckReply::blocked("agent-sandbox: network check cancelled"));
+                    }
+                    return CheckReply::blocked("agent-sandbox: network check cancelled");
+                }
             }
         }
 
-        match time::timeout(self.args.approval_timeout, &mut rx).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => CheckReply::denied(VerdictSource::Blocked),
-            Err(_) => {
-                let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
-                inner.network_futures.remove(pending_id);
-                inner.network_verdict_cache.insert(
-                    NetworkVerdictKey {
-                        host: policy_host.clone(),
-                        port,
-                    },
-                    VerdictEntry {
-                        allowed: false,
-                        source: VerdictSource::Blocked,
-                        time: Instant::now(),
-                    },
-                );
-                enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
-                Self::audit("timeout", Some(&policy_host), Some(port), scheme);
-                tracing::warn!(%policy_host, port, "network approval timed out");
-                drop(inner);
-                CheckReply::blocked(
-                    "agent-sandbox: network approval timed out (no response from policy UI)",
-                )
+        let verdict = time::timeout(self.args.approval_timeout, &mut rx);
+        tokio::pin!(verdict);
+        tokio::select! {
+            result = &mut verdict => match result {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_)) => CheckReply::denied(VerdictSource::Blocked),
+                Err(_) => {
+                    let (canceled, last) =
+                        self.expire_network_wait(&target, proxy.as_ref()).await;
+                    for tx in canceled {
+                        let _ = tx.send(CheckReply::blocked("agent-sandbox: network approval timed out"));
+                    }
+                    Self::audit(
+                        "timeout",
+                        Some(&target.policy_host),
+                        Some(target.port),
+                        target.scheme,
+                    );
+                    tracing::warn!(
+                        host = %target.policy_host,
+                        port = target.port,
+                        last,
+                        "network approval timed out"
+                    );
+                    CheckReply::blocked(
+                        "agent-sandbox: network approval timed out (no response from policy UI)",
+                    )
+                }
+            },
+            _ = &mut cancel_rx => {
+                let canceled = self
+                    .cancel_network_wait(target.pending_id, proxy.as_ref())
+                    .await;
+                for tx in canceled {
+                    let _ = tx.send(CheckReply::blocked("agent-sandbox: network check cancelled"));
+                }
+                CheckReply::blocked("agent-sandbox: network check cancelled")
             }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -488,6 +624,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         })
     }
 
@@ -509,6 +647,123 @@ mod tests {
                 sandbox_session_id: Some("sandbox-cap".into()),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn session_allow_is_reused_without_creating_second_prompt() {
+        let store = test_store();
+        let (a, _b) = UnixStream::pair().expect("UI stream pair");
+        let (_, ui_write) = a.into_split();
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                UiClient {
+                    session_id: "ui1".into(),
+                    writer: Arc::new(Mutex::new(ui_write)),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                "ui1".into(),
+                UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-cap".into()),
+                    ..Default::default()
+                },
+            );
+            inner
+                .session_allow
+                .entry("ui1".into())
+                .or_default()
+                .insert(agent_sandbox_core::NetworkRuleKey::new("example.com", 443));
+        }
+
+        let first = store
+            .request_network_approval(unique_request("example.com", 443))
+            .await;
+        assert!(first.allowed, "session approval should allow first request");
+        assert_eq!(
+            first.source,
+            VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
+        );
+        assert!(
+            store.inner.lock().await.pending.is_empty(),
+            "session approval must not create a pending prompt"
+        );
+
+        let second = store
+            .request_network_approval(unique_request("example.com", 443))
+            .await;
+        assert!(
+            second.allowed,
+            "session approval should allow second request"
+        );
+        assert_eq!(
+            second.source,
+            VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
+        );
+        assert!(
+            store.inner.lock().await.pending.is_empty(),
+            "second session-approved request must not create a prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn once_allow_is_consumed_before_second_network_prompt() {
+        let store = Arc::new(test_store());
+        {
+            let mut inner = store.inner.lock().await;
+            inner
+                .once_allow
+                .insert(agent_sandbox_core::NetworkRuleKey::new("example.com", 443));
+        }
+
+        let first = store
+            .request_network_approval(unique_request("example.com", 443))
+            .await;
+        assert!(first.allowed, "Once grant should allow the first request");
+        assert_eq!(
+            first.source,
+            VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once)
+        );
+        assert!(
+            store.inner.lock().await.once_allow.is_empty(),
+            "Once grant must be consumed by the pre-prompt check"
+        );
+
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .request_network_approval(unique_request("example.com", 443))
+                .await
+        });
+        let pending_id = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let inner = store.inner.lock().await;
+                if let Some(id) = inner
+                    .pending
+                    .keys()
+                    .find(|id| id.starts_with("net:"))
+                    .cloned()
+                {
+                    break id;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "second request did not create pending"
+                );
+                drop(inner);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        store
+            .finish_network(&pending_id, false, VerdictSource::User, None)
+            .await;
+        let second = task.await.expect("second request should not panic");
+        assert!(!second.allowed, "second request must not reuse Once grant");
     }
 
     fn pending_network_owned(host: String) -> PendingNetwork {
@@ -573,7 +828,7 @@ mod tests {
                     .network_futures
                     .entry("net:open".into())
                     .or_default()
-                    .push(tx);
+                    .push(super::super::types::NetworkWaiter { proxy: None, tx });
             }
         }
         let reply = store

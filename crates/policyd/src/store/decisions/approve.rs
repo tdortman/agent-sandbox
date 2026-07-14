@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
     ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SudoRule, VerdictSource,
-    approval_host_patterns,
+    host_pattern_matches,
 };
 
 use super::super::types::{
@@ -70,6 +70,31 @@ impl PolicyStore {
                     action,
                 )
                 .await
+            }
+            Pending::Http(http) => {
+                let target = match decision.target {
+                    Some(ApprovalTarget::Http { target }) => Some(target),
+                    None => None,
+                    Some(_) => {
+                        return RpcReply::from(crate::error::PolicydError::InvalidDecisionTarget);
+                    }
+                };
+                let wire = decision.wire;
+                let ctx = agent_sandbox_core::ResolvedRequestContext::new(
+                    wire.paths.clone(),
+                    agent_sandbox_core::ProcessIds::from_options(None, wire.owner_uid),
+                    wire.sandbox_session_id.clone(),
+                );
+                self.apply_pending_http(
+                    http,
+                    decision.scope,
+                    target,
+                    wire.session_id,
+                    ctx,
+                    action == DecisionAction::Approve,
+                )
+                .await
+                .map_or_else(RpcReply::from, RpcReply::ScopeAction)
             }
         }
     }
@@ -647,9 +672,7 @@ impl PolicyStore {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
         };
-        let valid_host = approval_host_patterns(pending_host)
-            .into_iter()
-            .any(|candidate| candidate == host);
+        let valid_host = host_pattern_matches(&host, pending_host);
         if !valid_host {
             return Err(PolicydError::InvalidDecisionTarget);
         }
@@ -737,6 +760,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn network_target_accepts_user_defined_glob() {
+        let pending = PendingNetwork {
+            id: "p1".into(),
+            created_at: 0.0,
+            host: "api.v1.example.com".into(),
+            port: 443,
+            scheme: "https".into(),
+            url: "https://api.v1.example.com".into(),
+            aliases: Vec::new(),
+            cwd: None,
+            home: None,
+            project_root: None,
+            sandbox_session_id: None,
+        };
+        let target = ApprovalTarget::NetworkHost {
+            host: "api.*.example.com".into(),
+        };
+        assert_eq!(
+            PolicyStore::resolve_pending_network_target(
+                &pending,
+                ApprovalScope::Project,
+                Some(&target),
+            )
+            .expect("resolve custom network glob"),
+            NetworkRuleKey::new("api.*.example.com", 443)
+        );
+    }
     #[test]
     fn sudo_target_accepts_command_prefixes() {
         let pending = Pending::Elevation(PendingElevation {
@@ -1173,6 +1224,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         })
     }
 

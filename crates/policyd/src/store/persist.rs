@@ -1,12 +1,13 @@
 //! Policy store persistence.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, FilesystemSortKey, NetworkRule, NetworkSortKey, ResourceAccess,
-    ResourceKind, ResourceRule, ResourceSortKey, SudoRule, atomic_write_policy, contract_home_path,
-    load_policy, normalize_host, trusted_project_policy_path,
+    FileAccess, FilesystemRule, FilesystemSortKey, HttpRule, HttpRuleTarget, NetworkRule,
+    NetworkSortKey, ResourceAccess, ResourceKind, ResourceRule, ResourceSortKey, SudoRule,
+    atomic_write_policy, contract_home_path, load_policy, normalize_host,
+    trusted_project_policy_path,
 };
 
 use super::types::PolicyStore;
@@ -150,7 +151,138 @@ fn sort_resource_rules(rules: &mut [ResourceRule], home: Option<&Path>) {
     rules.sort_by_key(|rule| resource_rule_sort_key(rule, home));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HttpMethods {
+    All,
+    Some(BTreeSet<String>),
+}
+
+impl HttpMethods {
+    fn from_target(target: &HttpRuleTarget) -> Self {
+        match &target.method {
+            agent_sandbox_core::HttpMethodMatcher::All => Self::All,
+            agent_sandbox_core::HttpMethodMatcher::Exact(method) => {
+                Self::Some(BTreeSet::from([method.as_str().to_owned()]))
+            }
+            agent_sandbox_core::HttpMethodMatcher::AnyOf(methods) => Self::Some(
+                methods
+                    .iter()
+                    .map(|method| method.as_str().to_owned())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn from_rule(rule: &HttpRule) -> Self {
+        if rule.methods.is_empty() {
+            Self::All
+        } else {
+            Self::Some(rule.methods.iter().cloned().collect())
+        }
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        if matches!(self, Self::All) || matches!(other, Self::All) {
+            *self = Self::All;
+        } else if let (Self::Some(current), Self::Some(other)) = (self, other) {
+            current.extend(other.iter().cloned());
+        }
+    }
+
+    fn subtract(&self, selected: &Self) -> Option<Self> {
+        match (self, selected) {
+            (Self::All, Self::Some(_)) => Some(Self::All),
+            (Self::All | Self::Some(_), Self::All) => None,
+            (Self::Some(current), Self::Some(selected)) => {
+                let remaining = current
+                    .iter()
+                    .filter(|method| !selected.contains(*method))
+                    .cloned()
+                    .collect::<BTreeSet<String>>();
+                (!remaining.is_empty()).then_some(Self::Some(remaining))
+            }
+        }
+    }
+
+    fn into_methods(self) -> Vec<String> {
+        match self {
+            Self::All => Vec::new(),
+            Self::Some(methods) => methods.into_iter().collect(),
+        }
+    }
+}
+
+fn same_http_url(rule: &HttpRule, target: &HttpRuleTarget) -> bool {
+    rule.target().is_ok_and(|value| value.url == target.url)
+}
+
+fn subtract_http_methods(
+    rules: &mut Vec<HttpRule>,
+    target: &HttpRuleTarget,
+    selected: &HttpMethods,
+) {
+    let mut retained = Vec::with_capacity(rules.len());
+    for mut rule in rules.drain(..) {
+        if !same_http_url(&rule, target) {
+            retained.push(rule);
+            continue;
+        }
+        let Some(methods) = HttpMethods::from_rule(&rule).subtract(selected) else {
+            continue;
+        };
+        rule.methods = methods.into_methods();
+        retained.push(rule);
+    }
+    *rules = retained;
+}
+
+fn union_http_methods(
+    rules: &mut Vec<HttpRule>,
+    target: &HttpRuleTarget,
+    selected: &HttpMethods,
+    label: &str,
+) {
+    let mut merged = selected.clone();
+    let mut insert_index = None;
+    let mut retained = Vec::with_capacity(rules.len() + 1);
+    for rule in rules.drain(..) {
+        if same_http_url(&rule, target) {
+            merged.union_with(&HttpMethods::from_rule(&rule));
+            insert_index.get_or_insert(retained.len());
+        } else {
+            retained.push(rule);
+        }
+    }
+    let rule = HttpRule::new(merged.into_methods(), target.url.to_string(), label);
+    if let Some(index) = insert_index {
+        retained.insert(index, rule);
+    } else {
+        retained.push(rule);
+    }
+    *rules = retained;
+}
+
 impl PolicyStore {
+    pub(crate) fn persist_http_rule(
+        path: &Path,
+        target: &HttpRuleTarget,
+        label: &str,
+        allow_rule: bool,
+        home: Option<&Path>,
+        owner_uid: Option<u32>,
+    ) -> std::io::Result<()> {
+        let mut current = load_policy(path, home, None);
+        let selected = HttpMethods::from_target(target);
+        if allow_rule {
+            subtract_http_methods(&mut current.network.http.deny, target, &selected);
+            union_http_methods(&mut current.network.http.allow, target, &selected, label);
+        } else {
+            subtract_http_methods(&mut current.network.http.allow, target, &selected);
+            union_http_methods(&mut current.network.http.deny, target, &selected, label);
+        }
+        atomic_write_policy(path, &current, home, owner_uid, None)
+    }
+
     fn persist_network_rule(
         path: &Path,
         host: &str,
@@ -165,12 +297,14 @@ impl PolicyStore {
         let key = network_sort_key(&host_norm, port);
         let mut allow: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network
+            .direct
             .allow
             .iter()
             .map(|r| (network_rule_sort_key(r), r.clone()))
             .collect();
         let mut deny: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network
+            .direct
             .deny
             .iter()
             .map(|r| (network_rule_sort_key(r), r.clone()))
@@ -184,8 +318,8 @@ impl PolicyStore {
             allow.remove(&key);
         }
 
-        current.network.allow = allow.into_values().collect();
-        current.network.deny = deny.into_values().collect();
+        current.network.direct.allow = allow.into_values().collect();
+        current.network.direct.deny = deny.into_values().collect();
         atomic_write_policy(path, &current, home, owner_uid, None)
     }
 
@@ -330,5 +464,48 @@ impl PolicyStore {
             .values()
             .map(|c| c.session_id.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_sandbox_core::{
+        HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, Policy, atomic_write_policy,
+    };
+
+    fn target(method: &str) -> HttpRuleTarget {
+        HttpRuleTarget::new(
+            HttpMethodMatcher::Exact(HttpMethod::parse(method).expect("valid method")),
+            HttpUrl::parse("https://example.com/api").expect("valid URL"),
+        )
+        .expect("valid target")
+    }
+
+    #[test]
+    fn persist_http_rules_unions_methods_and_subtracts_denies() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("policy.json");
+        atomic_write_policy(&path, &Policy::default(), None, None, None).expect("write policy");
+
+        PolicyStore::persist_http_rule(&path, &target("GET"), "get", true, None, None)
+            .expect("persist GET allow");
+        PolicyStore::persist_http_rule(&path, &target("POST"), "post", true, None, None)
+            .expect("persist POST allow");
+
+        let policy = load_policy(&path, None, None);
+        assert_eq!(policy.network.http.allow.len(), 1);
+        assert_eq!(
+            policy.network.http.allow[0].methods,
+            vec!["GET".to_owned(), "POST".to_owned()]
+        );
+
+        PolicyStore::persist_http_rule(&path, &target("POST"), "deny post", false, None, None)
+            .expect("persist POST deny");
+        let policy = load_policy(&path, None, None);
+        assert_eq!(policy.network.http.allow.len(), 1);
+        assert_eq!(policy.network.http.allow[0].methods, vec!["GET".to_owned()]);
+        assert_eq!(policy.network.http.deny.len(), 1);
+        assert_eq!(policy.network.http.deny[0].methods, vec!["POST".to_owned()]);
     }
 }

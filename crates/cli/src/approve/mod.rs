@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_sandbox_core::{
-    ApprovalScope, PendingSummary, RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
+    ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
+    RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
 use clap::{Parser, Subcommand};
 
@@ -93,6 +94,28 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         project_root: Option<PathBuf>,
     },
+    /// Pre-approve a decoded HTTP method and URL target.
+    ApproveHttp {
+        /// URL or URL pattern without a query string or fragment.
+        url: String,
+        /// Where to persist the HTTP rule.
+        #[arg(value_name = "SCOPE")]
+        scope: ApprovalScope,
+        /// Exact HTTP method. Mutually exclusive with --all-methods.
+        #[arg(long, value_name = "METHOD", conflicts_with = "all_methods")]
+        method: Option<String>,
+        /// Match every HTTP method at this URL.
+        #[arg(long, conflicts_with = "method")]
+        all_methods: bool,
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        home: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        project_root: Option<PathBuf>,
+    },
     /// Deny a pending request and persist the deny rule at the requested scope.
     Deny {
         /// Request id printed by "pending".
@@ -122,12 +145,16 @@ enum Command {
 /// or [`ApproveCliError::Policyd`] when policyd returns a denial or error response.
 pub async fn run() -> Result<(), ApproveCliError> {
     let cli = Cli::parse();
-    match cli.cmd {
+    dispatch(&cli.socket, cli.cmd).await
+}
+
+async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError> {
+    match command {
         Command::Pending {
             home,
             cwd,
             project_root,
-        } => handle_pending(&cli.socket, home, cwd, project_root).await,
+        } => handle_pending(socket, home, cwd, project_root).await,
         Command::Approve {
             id,
             scope,
@@ -136,15 +163,8 @@ pub async fn run() -> Result<(), ApproveCliError> {
             cwd,
             project_root,
         } => {
-            let p = SandboxPaths::from_wire(cwd, home, project_root);
-            let req = RpcRequest::Approve {
-                id,
-                scope,
-                session_id,
-                target: None,
-                ctx: RequestContext::from(&p),
-            };
-            print_json(&rpc(&cli.socket, req).await?)
+            let ctx = request_context(cwd, home, project_root);
+            handle_approve(socket, id, scope, session_id, ctx).await
         }
         Command::ApproveHost {
             host,
@@ -155,15 +175,21 @@ pub async fn run() -> Result<(), ApproveCliError> {
             cwd,
             project_root,
         } => {
-            let p = SandboxPaths::from_wire(cwd, home, project_root);
-            let req = RpcRequest::ApproveHost {
-                host,
-                port,
-                scope,
-                session_id,
-                ctx: RequestContext::from(&p),
-            };
-            print_json(&rpc(&cli.socket, req).await?)
+            let ctx = request_context(cwd, home, project_root);
+            handle_approve_host(socket, host, port, scope, session_id, ctx).await
+        }
+        Command::ApproveHttp {
+            url,
+            scope,
+            method,
+            all_methods,
+            session_id,
+            home,
+            cwd,
+            project_root,
+        } => {
+            let ctx = request_context(cwd, home, project_root);
+            handle_approve_http(socket, url, scope, method, all_methods, session_id, ctx).await
         }
         Command::Deny {
             id,
@@ -173,17 +199,114 @@ pub async fn run() -> Result<(), ApproveCliError> {
             cwd,
             project_root,
         } => {
-            let p = SandboxPaths::from_wire(cwd, home, project_root);
-            let req = RpcRequest::Deny {
-                id,
-                scope,
-                session_id,
-                target: None,
-                ctx: RequestContext::from(&p),
-            };
-            print_json(&rpc(&cli.socket, req).await?)
+            let ctx = request_context(cwd, home, project_root);
+            handle_deny(socket, id, scope, session_id, ctx).await
         }
     }
+}
+
+fn request_context(
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+) -> RequestContext {
+    let paths = SandboxPaths::from_wire(cwd, home, project_root);
+    RequestContext::from(&paths)
+}
+
+async fn handle_approve(
+    socket: &Path,
+    id: String,
+    scope: ApprovalScope,
+    session_id: Option<String>,
+    ctx: RequestContext,
+) -> Result<(), ApproveCliError> {
+    let req = RpcRequest::Approve {
+        id,
+        scope,
+        session_id,
+        target: None,
+        ctx,
+    };
+    print_json(&rpc(socket, req).await?)
+}
+
+async fn handle_approve_host(
+    socket: &Path,
+    host: String,
+    port: u16,
+    scope: ApprovalScope,
+    session_id: Option<String>,
+    ctx: RequestContext,
+) -> Result<(), ApproveCliError> {
+    let req = RpcRequest::ApproveHost {
+        host,
+        port,
+        scope,
+        session_id,
+        ctx,
+    };
+    print_json(&rpc(socket, req).await?)
+}
+
+async fn handle_approve_http(
+    socket: &Path,
+    url: String,
+    scope: ApprovalScope,
+    method: Option<String>,
+    all_methods: bool,
+    session_id: Option<String>,
+    ctx: RequestContext,
+) -> Result<(), ApproveCliError> {
+    if scope == ApprovalScope::Once {
+        return Err(ApproveCliError::Policyd(
+            "HTTP pre-approval requires a persistent scope".into(),
+        ));
+    }
+    if scope == ApprovalScope::Session && session_id.is_none() {
+        return Err(ApproveCliError::Policyd(
+            "session scope requires --session-id".into(),
+        ));
+    }
+    let matcher = match (method, all_methods) {
+        (Some(method), false) => HttpMethod::parse(&method)
+            .map(HttpMethodMatcher::Exact)
+            .map_err(|error| ApproveCliError::Policyd(error.to_string()))?,
+        (None, true) => HttpMethodMatcher::All,
+        _ => {
+            return Err(ApproveCliError::Policyd(
+                "specify exactly one of --method or --all-methods".into(),
+            ));
+        }
+    };
+    let url = HttpUrl::parse_pattern(&url)
+        .map_err(|error| ApproveCliError::Policyd(error.to_string()))?;
+    let target = HttpRuleTarget::new(matcher, url)
+        .map_err(|error| ApproveCliError::Policyd(error.to_string()))?;
+    let req = RpcRequest::ApproveHttp {
+        target,
+        scope,
+        session_id,
+        ctx,
+    };
+    print_json(&rpc(socket, req).await?)
+}
+
+async fn handle_deny(
+    socket: &Path,
+    id: String,
+    scope: ApprovalScope,
+    session_id: Option<String>,
+    ctx: RequestContext,
+) -> Result<(), ApproveCliError> {
+    let req = RpcRequest::Deny {
+        id,
+        scope,
+        session_id,
+        target: None,
+        ctx,
+    };
+    print_json(&rpc(socket, req).await?)
 }
 /// Fetch and display the list of pending approval requests.
 async fn handle_pending(
@@ -214,6 +337,9 @@ async fn handle_pending(
                 let host = host.unwrap_or_default();
                 let port = port.unwrap_or(0);
                 println!("{id}\tnetwork\t\t{host}:{port}");
+            }
+            PendingSummary::Http { id, request, .. } => {
+                println!("{id}\thttp\t{}\t{}", request.method.as_str(), request.url);
             }
             PendingSummary::Filesystem {
                 id, path, access, ..

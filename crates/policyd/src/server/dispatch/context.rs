@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, RequestContext,
-    ResolvedRequestContext, ResourceAccess, ResourceKind, RpcRequest,
+    ApprovalScope, ApprovalTarget, AttributionToken, FileAccess, FilesystemRule, FlowRegistration,
+    HttpRequest, HttpRuleTarget, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
+    ProxySessionToken, RequestContext, ResolvedRequestContext, ResourceAccess, ResourceKind,
+    RpcRequest,
 };
 
 use crate::server::dispatch::SocketRole;
@@ -17,6 +19,35 @@ pub(super) enum ResolvedRpcRequest {
         ctx: ResolvedRequestContext,
     },
     UnregisterUi,
+
+    OpenProxySession,
+    RegisterNetworkFlow {
+        registration: FlowRegistration,
+    },
+    ClaimNetworkFlow {
+        proxy_session: ProxySessionToken,
+        flow: NetworkFlowKey,
+        connection_id: ProxyConnectionId,
+    },
+    CheckHttp {
+        proxy_session: ProxySessionToken,
+        request_id: ProxyRequestId,
+        attribution_token: AttributionToken,
+        request: HttpRequest,
+    },
+    CheckNetworkFlow {
+        proxy_session: ProxySessionToken,
+        request_id: ProxyRequestId,
+        attribution_token: AttributionToken,
+    },
+    CancelCheck {
+        proxy_session: ProxySessionToken,
+        request_id: ProxyRequestId,
+    },
+    ReleaseNetworkFlow {
+        proxy_session: ProxySessionToken,
+        attribution_token: AttributionToken,
+    },
     Check {
         host: Option<String>,
         connect_host: Option<String>,
@@ -59,6 +90,12 @@ pub(super) enum ResolvedRpcRequest {
         session_id: Option<String>,
         ctx: ResolvedRequestContext,
     },
+    ApproveHttp {
+        target: HttpRuleTarget,
+        scope: ApprovalScope,
+        session_id: Option<String>,
+        ctx: ResolvedRequestContext,
+    },
     Deny {
         id: String,
         scope: ApprovalScope,
@@ -78,6 +115,7 @@ fn resolve_request_context(
     store: &Arc<PolicyStore>,
     peer: ClientPeer,
     role: SocketRole,
+
     ctx: &RequestContext,
 ) -> ResolvedRequestContext {
     if role == SocketRole::Sandbox
@@ -101,17 +139,137 @@ fn resolve_request_context(
     )
 }
 
-pub fn plan(
+fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
+    match req {
+        RpcRequest::UnregisterUi => Ok(ResolvedRpcRequest::UnregisterUi),
+        RpcRequest::OpenProxySession => Ok(ResolvedRpcRequest::OpenProxySession),
+        RpcRequest::RegisterNetworkFlow { registration } => {
+            Ok(ResolvedRpcRequest::RegisterNetworkFlow { registration })
+        }
+        RpcRequest::ClaimNetworkFlow {
+            proxy_session,
+            flow,
+            connection_id,
+        } => Ok(ResolvedRpcRequest::ClaimNetworkFlow {
+            proxy_session,
+            flow,
+            connection_id,
+        }),
+        RpcRequest::CheckHttp {
+            proxy_session,
+            request_id,
+            attribution_token,
+            request,
+        } => Ok(ResolvedRpcRequest::CheckHttp {
+            proxy_session,
+            request_id,
+            attribution_token,
+            request,
+        }),
+        RpcRequest::CheckNetworkFlow {
+            proxy_session,
+            request_id,
+            attribution_token,
+        } => Ok(ResolvedRpcRequest::CheckNetworkFlow {
+            proxy_session,
+            request_id,
+            attribution_token,
+        }),
+        RpcRequest::CancelCheck {
+            proxy_session,
+            request_id,
+        } => Ok(ResolvedRpcRequest::CancelCheck {
+            proxy_session,
+            request_id,
+        }),
+        RpcRequest::ReleaseNetworkFlow {
+            proxy_session,
+            attribution_token,
+        } => Ok(ResolvedRpcRequest::ReleaseNetworkFlow {
+            proxy_session,
+            attribution_token,
+        }),
+        req => Err(Box::new(req)),
+    }
+}
+
+fn plan_approval_context(
+    store: &Arc<PolicyStore>,
+    peer: ClientPeer,
+    role: SocketRole,
+    req: RpcRequest,
+) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
+    let resolve = |ctx: RequestContext| resolve_request_context(store, peer, role, &ctx);
+    match req {
+        RpcRequest::Approve {
+            id,
+            scope,
+            session_id,
+            target,
+            ctx,
+        } => Ok(ResolvedRpcRequest::Approve {
+            id,
+            scope,
+            session_id,
+            target,
+            ctx: resolve(ctx),
+        }),
+        RpcRequest::ApproveHost {
+            host,
+            port,
+            scope,
+            session_id,
+            ctx,
+        } => Ok(ResolvedRpcRequest::ApproveHost {
+            host,
+            port,
+            scope,
+            session_id,
+            ctx: resolve(ctx),
+        }),
+        RpcRequest::ApproveHttp {
+            target,
+            scope,
+            session_id,
+            ctx,
+        } => Ok(ResolvedRpcRequest::ApproveHttp {
+            target,
+            scope,
+            session_id,
+            ctx: resolve(ctx),
+        }),
+        RpcRequest::Deny {
+            id,
+            scope,
+            session_id,
+            target,
+            ctx,
+        } => Ok(ResolvedRpcRequest::Deny {
+            id,
+            scope,
+            session_id,
+            target,
+            ctx: resolve(ctx),
+        }),
+        req => Err(Box::new(req)),
+    }
+}
+
+fn plan_context(
     store: &Arc<PolicyStore>,
     peer: ClientPeer,
     role: SocketRole,
     req: RpcRequest,
 ) -> ResolvedRpcRequest {
+    let req = match plan_approval_context(store, peer, role, req) {
+        Ok(resolved) => return resolved,
+        Err(req) => *req,
+    };
+    let resolve = |ctx: RequestContext| resolve_request_context(store, peer, role, &ctx);
     match req {
-        RpcRequest::RegisterUi { ui_client: _, ctx } => ResolvedRpcRequest::RegisterUi {
-            ctx: resolve_request_context(store, peer, role, &ctx),
-        },
-        RpcRequest::UnregisterUi => ResolvedRpcRequest::UnregisterUi,
+        RpcRequest::RegisterUi { ui_client: _, ctx } => {
+            ResolvedRpcRequest::RegisterUi { ctx: resolve(ctx) }
+        }
         RpcRequest::Check {
             host,
             connect_host,
@@ -125,12 +283,12 @@ pub fn plan(
             port,
             scheme,
             url,
-            ctx: resolve_request_context(store, peer, role, &ctx),
+            ctx: resolve(ctx),
         },
         RpcRequest::CheckFilesystem { path, access, ctx } => ResolvedRpcRequest::CheckFilesystem {
             path,
             access,
-            ctx: resolve_request_context(store, peer, role, &ctx),
+            ctx: resolve(ctx),
         },
         RpcRequest::CheckResource {
             kind,
@@ -141,10 +299,10 @@ pub fn plan(
             kind,
             path,
             access,
-            ctx: resolve_request_context(store, peer, role, &ctx),
+            ctx: resolve(ctx),
         },
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
-            let ctx = resolve_request_context(store, peer, role, &ctx);
+            let ctx = resolve(ctx);
             let peer_pid = if peer.pid > 0 {
                 peer.pid
             } else {
@@ -158,53 +316,23 @@ pub fn plan(
         }
         RpcRequest::Elevate { argv, ctx } => ResolvedRpcRequest::Elevate {
             argv,
-            ctx: resolve_request_context(store, peer, role, &ctx),
+            ctx: resolve(ctx),
         },
-        RpcRequest::Approve {
-            id,
-            scope,
-            session_id,
-            target,
-            ctx,
-        } => ResolvedRpcRequest::Approve {
-            id,
-            scope,
-            session_id,
-            target,
-            ctx: resolve_request_context(store, peer, role, &ctx),
-        },
-        RpcRequest::ApproveHost {
-            host,
-            port,
-            scope,
-            session_id,
-            ctx,
-        } => ResolvedRpcRequest::ApproveHost {
-            host,
-            port,
-            scope,
-            session_id,
-            ctx: resolve_request_context(store, peer, role, &ctx),
-        },
-        RpcRequest::Deny {
-            id,
-            scope,
-            session_id,
-            target,
-            ctx,
-        } => ResolvedRpcRequest::Deny {
-            id,
-            scope,
-            session_id,
-            target,
-            ctx: resolve_request_context(store, peer, role, &ctx),
-        },
-        RpcRequest::Status { ctx } => ResolvedRpcRequest::Status {
-            ctx: resolve_request_context(store, peer, role, &ctx),
-        },
-        RpcRequest::Reload { ctx } => ResolvedRpcRequest::Reload {
-            ctx: resolve_request_context(store, peer, role, &ctx),
-        },
+        RpcRequest::Status { ctx } => ResolvedRpcRequest::Status { ctx: resolve(ctx) },
+        RpcRequest::Reload { ctx } => ResolvedRpcRequest::Reload { ctx: resolve(ctx) },
+        req => unreachable!("unhandled non-context request: {req:?}"),
+    }
+}
+
+pub fn plan(
+    store: &Arc<PolicyStore>,
+    peer: ClientPeer,
+    role: SocketRole,
+    req: RpcRequest,
+) -> ResolvedRpcRequest {
+    match plan_simple(req) {
+        Ok(req) => req,
+        Err(req) => plan_context(store, peer, role, *req),
     }
 }
 
@@ -232,6 +360,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         }))
     }
 

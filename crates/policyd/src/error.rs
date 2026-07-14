@@ -39,9 +39,13 @@ pub enum PolicydError {
     UnauthorizedUiRegistration,
     #[error("too many connections for this uid")]
     TooManyConnections,
+    #[error("proxy request failed: {0}")]
+    Proxy(String),
     #[error("RPC line too large")]
     RpcLineTooLarge,
-    #[error("elevation argv[0] must be absolute or resolvable in trusted PATH")]
+    #[error(
+        "elevation argv[0] must be a bare command resolved via /run/current-system/sw/bin or an absolute path under /run/current-system, with a regular canonical target under /nix/store"
+    )]
     ElevationArgvNotAbsolute,
 }
 

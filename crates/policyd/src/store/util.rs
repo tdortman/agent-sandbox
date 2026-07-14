@@ -57,8 +57,8 @@ mod tests {
     }
 
     #[test]
-    fn host_matches_trailing_star_only_applies_to_ipv4_prefixes() {
-        assert!(!PolicyStore::host_matches("example.*", "example.com"));
+    fn host_matches_general_globs_after_ipv4_prefix_checks() {
+        assert!(PolicyStore::host_matches("example.*", "example.com"));
         assert!(!PolicyStore::host_matches("34.230.40.69.*", "34.230.40.69"));
     }
 

@@ -535,6 +535,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         })
     }
 
@@ -692,6 +694,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -772,6 +776,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -828,6 +834,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();
@@ -904,6 +912,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         });
 
         let project_root_s = project_root.to_string_lossy().into_owned();

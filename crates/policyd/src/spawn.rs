@@ -111,6 +111,7 @@ impl PolicyStore {
         if spawn.gate.has_matching_ui {
             return;
         }
+        let _ui_spawn_guard = self.ui_spawn_lock.lock().await;
         let args = self.args.clone();
         let sandbox_session_id = spawn.sandbox_session_id.map(str::to_owned);
         let home = spawn.home.map(PathBuf::from);

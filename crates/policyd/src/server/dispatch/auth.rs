@@ -9,6 +9,7 @@ pub enum SocketRole {
     Host,
     Sandbox,
     UiFd,
+    Proxy,
 }
 
 /// Whether the request is allowed on the sandbox socket.
@@ -26,6 +27,9 @@ pub enum SocketRole {
 /// approval channel from inside the sandbox is the inherited fd pre-opened by
 /// `agent-sandbox-open-ui-fd` against the host socket before bwrap exec; see
 /// `open_ui_fd.rs`.
+///
+/// The privileged NFQ daemon also uses the sandbox socket for flow
+/// registration; dispatch separately restricts that request to root peers.
 #[must_use]
 pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
     matches!(
@@ -35,9 +39,23 @@ pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
             | RpcRequest::CheckFilesystem { .. }
             | RpcRequest::CheckResource { .. }
             | RpcRequest::StartFilesystemMonitor { .. }
+            | RpcRequest::RegisterNetworkFlow { .. }
     )
 }
 
+/// Whether the request is allowed on the trusted proxy socket.
+#[must_use]
+pub const fn is_proxy_request(req: &RpcRequest) -> bool {
+    matches!(
+        req,
+        RpcRequest::OpenProxySession
+            | RpcRequest::ClaimNetworkFlow { .. }
+            | RpcRequest::CheckHttp { .. }
+            | RpcRequest::CheckNetworkFlow { .. }
+            | RpcRequest::CancelCheck { .. }
+            | RpcRequest::ReleaseNetworkFlow { .. }
+    )
+}
 /// Whether the request is allowed on an inherited UI fd (already-registered UI connection).
 #[must_use]
 pub const fn is_uifd_request(req: &RpcRequest) -> bool {
@@ -45,6 +63,7 @@ pub const fn is_uifd_request(req: &RpcRequest) -> bool {
         req,
         RpcRequest::Approve { .. }
             | RpcRequest::ApproveHost { .. }
+            | RpcRequest::ApproveHttp { .. }
             | RpcRequest::Deny { .. }
             | RpcRequest::Status { .. }
             | RpcRequest::Reload { .. }
@@ -54,6 +73,10 @@ pub const fn is_uifd_request(req: &RpcRequest) -> bool {
 
 pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), PolicydError> {
     match role {
+        SocketRole::Proxy if !is_proxy_request(req) => Err(PolicydError::UnauthorizedRequest),
+        SocketRole::Host | SocketRole::Sandbox | SocketRole::UiFd if is_proxy_request(req) => {
+            Err(PolicydError::UnauthorizedRequest)
+        }
         SocketRole::Sandbox if !is_sandbox_request(req) => Err(PolicydError::UnauthorizedRequest),
         SocketRole::UiFd if !is_uifd_request(req) => Err(PolicydError::UnauthorizedUiFdRequest),
         _ => Ok(()),
@@ -64,7 +87,11 @@ pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), Po
 mod tests {
     use super::{SocketRole, ensure_allowed};
     use crate::error::PolicydError;
-    use agent_sandbox_core::{ApprovalScope, FileAccess, RequestContext, RpcRequest};
+    use agent_sandbox_core::{
+        ApprovalScope, FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
+        NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
+        SocketInode,
+    };
 
     #[test]
     fn sandbox_socket_allows_request_ops() {
@@ -97,6 +124,31 @@ mod tests {
                 std::mem::discriminant(&req)
             );
         }
+    }
+    #[test]
+    fn sandbox_socket_allows_network_flow_registration() {
+        let registration = FlowRegistration::new(
+            NetworkFlowKey::try_new(
+                FlowProtocol::Tcp,
+                "127.0.0.1".parse().expect("valid test source address"),
+                12345,
+                "192.0.2.1".parse().expect("valid test destination address"),
+                443,
+            )
+            .expect("test flow ports are non-zero"),
+            SocketIdentity::new(
+                ProcessIdentity::new(1, 0, 1).expect("test process identity is non-zero"),
+                SocketInode::new(1).expect("test socket inode is non-zero"),
+            ),
+            NormalizedPolicyHost::parse("example.com").expect("valid test policy host"),
+            FlowContext::default(),
+        );
+        let request = RpcRequest::RegisterNetworkFlow { registration };
+
+        assert!(
+            ensure_allowed(SocketRole::Sandbox, &request).is_ok(),
+            "sandbox socket should allow privileged flow registration"
+        );
     }
 
     #[test]

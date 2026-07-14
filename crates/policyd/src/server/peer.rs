@@ -24,9 +24,9 @@ impl ClientPeer {
     #[must_use]
     pub const fn unknown() -> Self {
         Self {
-            pid: 0,
-            uid: 0,
-            gid: 0,
+            pid: u32::MAX,
+            uid: u32::MAX,
+            gid: -1,
         }
     }
 }

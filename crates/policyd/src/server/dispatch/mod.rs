@@ -22,6 +22,9 @@ pub async fn dispatch(
     req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     auth::ensure_allowed(role, &req)?;
+    if matches!(&req, RpcRequest::RegisterNetworkFlow { .. }) && peer.uid != 0 {
+        return Err(PolicydError::UnauthorizedRequest);
+    }
     let req = context::plan(store, peer, role, req);
     handlers::handle(store, client, peer, req).await
 }
@@ -32,7 +35,11 @@ mod tests {
     use crate::error::PolicydError;
     use crate::server::peer::ClientPeer;
     use crate::store::{PolicyStore, PolicydArgs};
-    use agent_sandbox_core::{FileAccess, RequestContext, RpcRequest};
+    use agent_sandbox_core::{
+        FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
+        NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
+        SocketInode,
+    };
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UnixStream;
@@ -50,6 +57,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         }))
     }
 
@@ -61,6 +70,25 @@ mod tests {
                 .into_split()
                 .1,
         ))
+    }
+
+    fn test_registration() -> FlowRegistration {
+        FlowRegistration::new(
+            NetworkFlowKey::try_new(
+                FlowProtocol::Tcp,
+                "127.0.0.1".parse().expect("valid test source address"),
+                12345,
+                "192.0.2.1".parse().expect("valid test destination address"),
+                443,
+            )
+            .expect("test flow ports are non-zero"),
+            SocketIdentity::new(
+                ProcessIdentity::new(1, 0, 1).expect("test process identity is non-zero"),
+                SocketInode::new(1).expect("test socket inode is non-zero"),
+            ),
+            NormalizedPolicyHost::parse("example.com").expect("valid test policy host"),
+            FlowContext::default(),
+        )
     }
 
     #[tokio::test]
@@ -115,6 +143,33 @@ mod tests {
         assert!(
             matches!(result, Err(PolicydError::UnauthorizedUiRegistration)),
             "dispatch must reject cross-uid UI registration after planning sandbox ownership, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_dispatch_rejects_unprivileged_network_flow_registration() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = test_store(&dir);
+        let client = PolicyStore::new_client_handle(writer());
+
+        let result = dispatch(
+            &store,
+            &client,
+            ClientPeer {
+                pid: std::process::id(),
+                uid: 1000,
+                gid: 0,
+            },
+            SocketRole::Sandbox,
+            RpcRequest::RegisterNetworkFlow {
+                registration: test_registration(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PolicydError::UnauthorizedRequest)),
+            "sandbox socket must reject unprivileged flow registration, got: {result:?}"
         );
     }
 }

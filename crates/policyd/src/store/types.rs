@@ -7,13 +7,14 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{
-    CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRule, FilesystemRuleKey,
-    NetworkRuleKey, ResourceAccess, ResourceCheckReply, ResourceKind, ResourceRuleKey,
-    VerdictSource,
+    AttributionToken, CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRule,
+    FilesystemRuleKey, FlowRegistration, HttpCheckReply, HttpContextKey, HttpRequest,
+    HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId, ProxyConnectionId,
+    ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
+    ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
-
 /// Hard cap on the number of pending approval requests held in memory.
 /// Beyond this cap new prompts are blocked instead of being added.
 pub const MAX_PENDING_APPROVALS: usize = 512;
@@ -35,6 +36,8 @@ pub const MAX_CONNECTIONS_PER_UID: usize = 64;
 
 /// Maximum JSON-line RPC payload size.
 pub const MAX_RPC_LINE_BYTES: usize = 1 << 20;
+/// Hard cap on registered proxy flow identities.
+pub const MAX_PROXY_FLOWS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedPeer {
@@ -54,6 +57,26 @@ pub struct SandboxSessionRegistration {
 pub struct NetworkVerdictKey {
     pub host: String,
     pub port: u16,
+}
+/// Exact HTTP request and context used for pending approval deduplication.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct HttpPendingKey {
+    pub request: HttpRequest,
+    pub context: HttpContextKey,
+}
+
+/// Exact HTTP request and context used for a short-lived verdict cache.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct HttpVerdictKey {
+    pub request: HttpRequest,
+    pub context: HttpContextKey,
+}
+
+/// HTTP scope rule and context used for session/project/global state.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct HttpScopeKey {
+    pub target: HttpRuleTarget,
+    pub context: HttpContextKey,
 }
 
 /// Key for the filesystem verdict cache: path and access type.
@@ -102,6 +125,8 @@ pub static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct PolicydArgs {
     pub host_socket: PathBuf,
     pub sandbox_socket: PathBuf,
+    pub proxy_socket: Option<PathBuf>,
+    pub proxy_gid: Option<u32>,
     pub declarative: PathBuf,
     pub export_json: PathBuf,
     pub export_nix: Option<PathBuf>,
@@ -139,6 +164,15 @@ pub struct PendingNetwork {
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
+#[derive(Debug, Clone)]
+pub struct PendingHttp {
+    /// Wire/display identifier. The typed ID is retained in `pending_id`.
+    pub id: String,
+    pub pending_id: PendingHttpId,
+    pub created_at: f64,
+    pub request: HttpRequest,
+    pub context: HttpContextKey,
+}
 
 #[derive(Debug, Clone)]
 pub struct PendingFilesystem {
@@ -169,6 +203,7 @@ pub struct PendingResource {
 pub enum PendingKind {
     Elevation,
     Network,
+    Http,
     Filesystem,
     Resource,
 }
@@ -181,6 +216,7 @@ pub enum PendingKind {
 pub enum Pending {
     Elevation(PendingElevation),
     Network(PendingNetwork),
+    Http(PendingHttp),
     Filesystem(PendingFilesystem),
     Resource(PendingResource),
 }
@@ -191,16 +227,17 @@ impl Pending {
         match self {
             Self::Elevation(_) => PendingKind::Elevation,
             Self::Network(_) => PendingKind::Network,
+            Self::Http(_) => PendingKind::Http,
             Self::Filesystem(_) => PendingKind::Filesystem,
             Self::Resource(_) => PendingKind::Resource,
         }
     }
-
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
             Self::Elevation(p) => &p.id,
             Self::Network(p) => &p.id,
+            Self::Http(p) => &p.id,
             Self::Filesystem(p) => &p.id,
             Self::Resource(p) => &p.id,
         }
@@ -211,6 +248,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.created_at,
             Self::Network(p) => p.created_at,
+            Self::Http(p) => p.created_at,
             Self::Filesystem(p) => p.created_at,
             Self::Resource(p) => p.created_at,
         }
@@ -221,6 +259,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.cwd.as_deref(),
             Self::Network(p) => p.cwd.as_deref(),
+            Self::Http(p) => p.context.cwd.as_deref(),
             Self::Filesystem(p) => p.cwd.as_deref(),
             Self::Resource(p) => p.cwd.as_deref(),
         }
@@ -231,6 +270,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.home.as_deref(),
             Self::Network(p) => p.home.as_deref(),
+            Self::Http(p) => p.context.home.as_deref(),
             Self::Filesystem(p) => p.home.as_deref(),
             Self::Resource(p) => p.home.as_deref(),
         }
@@ -241,6 +281,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.project_root.as_deref(),
             Self::Network(p) => p.project_root.as_deref(),
+            Self::Http(p) => p.context.project_root.as_deref(),
             Self::Filesystem(p) => p.project_root.as_deref(),
             Self::Resource(p) => p.project_root.as_deref(),
         }
@@ -251,6 +292,7 @@ impl Pending {
         match self {
             Self::Elevation(p) => p.sandbox_session_id.as_deref(),
             Self::Network(p) => p.sandbox_session_id.as_deref(),
+            Self::Http(p) => p.context.sandbox_session_id.as_deref(),
             Self::Filesystem(p) => p.sandbox_session_id.as_deref(),
             Self::Resource(p) => p.sandbox_session_id.as_deref(),
         }
@@ -267,6 +309,7 @@ pub struct UiSessionContext {
     pub client_id: u64,
 }
 
+#[derive(Clone)]
 pub struct UiClientHandle {
     pub id: u64,
     pub(crate) writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
@@ -284,6 +327,9 @@ pub struct PolicyStore {
     /// filesystem checks must wait for one rebuild instead of each starting
     /// their own recursive directory walk.
     pub(crate) deny_inode_rebuild: Mutex<()>,
+    /// Serializes UI spawn decisions so concurrent requests cannot launch
+    /// duplicate clients from the same throttle snapshot.
+    pub(crate) ui_spawn_lock: Mutex<()>,
     pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
     pub(crate) merged_cache: std::sync::Mutex<MergedPolicyCache>,
 }
@@ -332,19 +378,56 @@ impl MergedPolicyCache {
     }
 }
 
+#[derive(Debug)]
+pub struct ProxySessionState {
+    pub token: ProxySessionToken,
+    pub connection_id: u64,
+    pub opened_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct ProxyFlowState {
+    pub registration: FlowRegistration,
+    pub owner: SocketIdentity,
+    pub context: ResolvedRequestContext,
+    pub attribution_token: Option<AttributionToken>,
+    pub connection_id: Option<ProxyConnectionId>,
+    pub claimed_at: Option<Instant>,
+    pub last_check: Instant,
+}
+/// One decoded HTTP check waiting for the policy UI.
+pub struct HttpWaiter {
+    pub request_id: ProxyRequestId,
+    pub proxy_session: ProxySessionToken,
+    pub attribution_token: AttributionToken,
+    pub tx: oneshot::Sender<HttpCheckReply>,
+}
+/// One transport fallback check waiting for a policy verdict.
+pub struct NetworkWaiter {
+    pub proxy: Option<(ProxySessionToken, ProxyRequestId)>,
+    pub tx: oneshot::Sender<CheckReply>,
+}
+pub enum ProxyCancellation {
+    Active(oneshot::Sender<()>),
+    Canceled,
+}
 pub struct StoreInner {
     pub session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
     pub once_allow: HashSet<NetworkRuleKey>,
     pub pending: HashMap<String, Pending>,
     pub elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
-    pub network_futures: HashMap<String, Vec<oneshot::Sender<CheckReply>>>,
+    pub network_futures: HashMap<String, Vec<NetworkWaiter>>,
     pub filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
     pub resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,
+    pub http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
+    pub http_waiters: HashMap<(ProxySessionToken, ProxyRequestId), PendingHttpId>,
+    pub proxy_cancellations: HashMap<(ProxySessionToken, ProxyRequestId), ProxyCancellation>,
     pub ui_clients: HashMap<u64, UiClient>,
     pub ui_context_by_session: HashMap<String, UiSessionContext>,
     pub network_verdict_cache: HashMap<NetworkVerdictKey, VerdictEntry>,
     pub filesystem_verdict_cache: HashMap<FilesystemVerdictKey, VerdictEntry>,
     pub resource_verdict_cache: HashMap<ResourceVerdictKey, VerdictEntry>,
+    pub http_verdict_cache: HashMap<HttpVerdictKey, VerdictEntry>,
     pub ui_spawn_last: HashMap<String, Instant>,
     pub session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
     pub session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
@@ -353,6 +436,10 @@ pub struct StoreInner {
     pub session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
     pub session_resource_allow: HashMap<String, HashSet<ResourceRuleKey>>,
     pub session_resource_deny: HashMap<String, HashSet<ResourceRuleKey>>,
+    pub http_once_allow: HashSet<HttpPendingKey>,
+    pub http_once_deny: HashSet<HttpPendingKey>,
+    pub http_session_allow: HashMap<String, HashSet<HttpScopeKey>>,
+    pub http_session_deny: HashMap<String, HashSet<HttpScopeKey>>,
     /// Static filesystem allow rules registered by `StartFilesystemMonitor`,
     /// keyed by sandbox session id (or cwd/project-root context fallback).
     pub sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
@@ -363,10 +450,13 @@ pub struct StoreInner {
     pub deny_inode_cache: DenyInodeCache,
     /// Active RPC connections per peer uid.
     pub connections_by_uid: HashMap<u32, usize>,
+    /// Registered flow identities and active claims.
+    pub proxy_flows: HashMap<NetworkFlowKey, ProxyFlowState>,
+    /// The one active trusted proxy session, if any.
+    pub proxy_session: Option<ProxySessionState>,
 }
 
-/// Fingerprint entry for a single deny rule path.
-/// When any entry's path or mtime changes, the inode cache is rebuilt.
+/// Fingerprint entry for one concrete deny rule path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyFingerprint {
     pub path: PathBuf,

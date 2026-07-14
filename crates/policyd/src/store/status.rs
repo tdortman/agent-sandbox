@@ -46,6 +46,14 @@ impl PolicyStore {
                     cwd: net.cwd.clone(),
                     home: net.home.clone(),
                 },
+                Pending::Http(http) => PendingSummary::Http {
+                    id: http.pending_id,
+                    request: http.request.clone(),
+                    cwd: http.context.cwd.clone(),
+                    home: http.context.home.clone(),
+                    project_root: http.context.project_root.clone(),
+                    sandbox_session_id: http.context.sandbox_session_id.clone(),
+                },
                 Pending::Elevation(elev) => PendingSummary::Elevation {
                     id: elev.id.clone(),
                     argv: Some(elev.argv.clone()),

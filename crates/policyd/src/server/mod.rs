@@ -6,6 +6,8 @@ mod peer;
 
 pub use peer::ClientPeer;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,7 +34,7 @@ impl PolicyServer {
         }
     }
 
-    fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+    fn bind_socket(path: &Path, mode: u32, group: Option<u32>) -> std::io::Result<UnixListener> {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -42,7 +44,14 @@ impl PolicyServer {
         let listener = UnixListener::bind(path)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            if let Some(group) = group {
+                nix::unistd::chown(
+                    path,
+                    Some(nix::unistd::Uid::from_raw(0)),
+                    Some(nix::unistd::Gid::from_raw(group)),
+                )
+                .map_err(std::io::Error::other)?;
+            }
             let mut perms = std::fs::metadata(path)?.permissions();
             perms.set_mode(mode);
             std::fs::set_permissions(path, perms)?;
@@ -91,27 +100,68 @@ impl PolicyServer {
             ));
         }
 
+        let proxy_path = self.store.args().proxy_socket.clone();
+        let proxy_gid = self.store.args().proxy_gid;
+        if let Some(proxy_path) = proxy_path.as_ref()
+            && (proxy_path == &self.host_socket_path || proxy_path == &self.sandbox_socket_path)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proxy socket must differ from policy sockets",
+            ));
+        }
+        if proxy_path.is_some() && proxy_gid.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proxy group is required when proxy socket is enabled",
+            ));
+        }
+
         // Host socket: world-accessible like the pre-hardening default. policyd runs
         // as root, so 0600 would mean only root can connect and the desktop user's
         // UI/approve CLI could never register. Sensitive ops still bind to
         // SO_PEERCRED. Sandbox socket: same mode; RPC auth limits it to request ops.
-        let host_listener = Self::bind_socket(&self.host_socket_path, 0o666)?;
-        let sandbox_listener = Self::bind_socket(&self.sandbox_socket_path, 0o666)?;
+        let host_listener = Self::bind_socket(&self.host_socket_path, 0o666, None)?;
+        let sandbox_listener = Self::bind_socket(&self.sandbox_socket_path, 0o666, None)?;
 
-        tokio::join!(
-            Self::accept_loop(
-                host_listener,
-                self.store.clone(),
-                dispatch::SocketRole::Host,
-                self.host_socket_path,
-            ),
-            Self::accept_loop(
-                sandbox_listener,
-                self.store.clone(),
-                dispatch::SocketRole::Sandbox,
-                self.sandbox_socket_path,
-            ),
-        );
+        if let Some(proxy_path) = proxy_path {
+            let proxy_listener = Self::bind_socket(&proxy_path, 0o660, proxy_gid)?;
+            tokio::join!(
+                Self::accept_loop(
+                    host_listener,
+                    self.store.clone(),
+                    dispatch::SocketRole::Host,
+                    self.host_socket_path,
+                ),
+                Self::accept_loop(
+                    sandbox_listener,
+                    self.store.clone(),
+                    dispatch::SocketRole::Sandbox,
+                    self.sandbox_socket_path,
+                ),
+                Self::accept_loop(
+                    proxy_listener,
+                    self.store,
+                    dispatch::SocketRole::Proxy,
+                    proxy_path,
+                ),
+            );
+        } else {
+            tokio::join!(
+                Self::accept_loop(
+                    host_listener,
+                    self.store.clone(),
+                    dispatch::SocketRole::Host,
+                    self.host_socket_path,
+                ),
+                Self::accept_loop(
+                    sandbox_listener,
+                    self.store,
+                    dispatch::SocketRole::Sandbox,
+                    self.sandbox_socket_path,
+                ),
+            );
+        }
 
         Ok(())
     }
@@ -138,6 +188,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         }
     }
 

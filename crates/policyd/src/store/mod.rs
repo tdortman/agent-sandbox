@@ -6,10 +6,13 @@ mod decisions;
 mod elevation;
 pub(crate) mod evaluator;
 mod filesystem;
+mod http;
 mod network;
 pub(crate) mod persist;
+mod proxy;
 mod resource;
 mod scope_filesystem;
+mod scope_http;
 mod scope_network;
 mod scope_sudo;
 mod status;
@@ -17,11 +20,12 @@ mod types;
 mod ui;
 mod ui_route;
 mod util;
-
 pub use types::{
-    DenyFingerprint, DenyInodeCache, MAX_CONNECTIONS_PER_UID, MAX_RPC_LINE_BYTES, Pending,
-    PendingElevation, PendingFilesystem, PendingKind, PendingNetwork, PendingResource, PolicyStore,
-    PolicydArgs, ResourceVerdictKey, TrustedPeer, UiClientHandle, UiSessionContext,
+    DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, HttpVerdictKey,
+    MAX_CONNECTIONS_PER_UID, MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation,
+    PendingFilesystem, PendingHttp, PendingKind, PendingNetwork, PendingResource, PolicyStore,
+    PolicydArgs, ProxyFlowState, ProxySessionState, ResourceVerdictKey, TrustedPeer,
+    UiClientHandle, UiSessionContext,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -42,6 +46,9 @@ impl PolicyStore {
                 elevation_futures: HashMap::new(),
                 network_futures: HashMap::new(),
                 filesystem_futures: HashMap::new(),
+                http_futures: HashMap::new(),
+                http_waiters: HashMap::new(),
+                proxy_cancellations: HashMap::new(),
                 resource_futures: HashMap::new(),
                 ui_clients: HashMap::new(),
                 ui_context_by_session: HashMap::new(),
@@ -53,14 +60,22 @@ impl PolicyStore {
                 session_filesystem_deny: HashMap::new(),
                 session_resource_allow: HashMap::new(),
                 session_resource_deny: HashMap::new(),
+                http_once_allow: HashSet::new(),
+                http_once_deny: HashSet::new(),
+                http_session_allow: HashMap::new(),
+                http_session_deny: HashMap::new(),
                 sandbox_filesystem_static_allow: HashMap::new(),
+                http_verdict_cache: HashMap::new(),
                 network_verdict_cache: HashMap::new(),
                 filesystem_verdict_cache: HashMap::new(),
                 resource_verdict_cache: HashMap::new(),
                 deny_inode_cache: DenyInodeCache::default(),
                 connections_by_uid: HashMap::new(),
+                proxy_flows: HashMap::new(),
+                proxy_session: None,
             }),
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
+            ui_spawn_lock: tokio::sync::Mutex::new(()),
             merged_cache: std::sync::Mutex::new(MergedPolicyCache::default()),
         }
     }

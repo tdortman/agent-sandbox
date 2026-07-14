@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, FileAccess, ResourceAccess, ResourceKind, UiPush,
-    approval_host_patterns, is_ip_literal, split_check_aliases,
+    ApprovalScope, ApprovalTarget, FileAccess, HttpMethodMatcher, HttpRuleTarget, HttpUrl,
+    ResourceAccess, ResourceKind, UiPush, is_ip_literal, split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
@@ -11,6 +11,7 @@ use super::error::UiCliError;
 use super::options::{
     ACTION_OPTIONS, PromptAction, ScopeOption, scope_only_options, sudo_target_options,
 };
+use tracing::warn;
 
 /// Default rule path shown in the filesystem approval text field.
 fn suggest_filesystem_rule_path(path: &Path, project_root: Option<&Path>) -> String {
@@ -37,6 +38,15 @@ struct NetworkPush {
     port: Option<u16>,
     scheme: Option<String>,
     url: Option<String>,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+}
+
+/// Extracted fields from [`UiPush::HttpRequest`].
+struct HttpPush {
+    id: String,
+    request: agent_sandbox_core::HttpRequest,
     cwd: Option<PathBuf>,
     home: Option<PathBuf>,
     project_root: Option<PathBuf>,
@@ -82,18 +92,23 @@ async fn handle_network_push(
 ) -> Result<(), UiCliError> {
     let host = net.host.unwrap_or_default();
     let port = net.port.unwrap_or(0);
-    let scheme = net.scheme.unwrap_or_else(|| "https".into());
+    let transport = net.scheme.unwrap_or_else(|| "https".into());
+    let scheme = network_prompt_scheme(&transport, port);
     let result = split_check_aliases(net.url);
-    let url = network_prompt_with_aliases(
-        &host,
+    let url = network_prompt_with_transport_hint(
+        network_prompt_with_aliases(
+            &host,
+            port,
+            scheme,
+            result.url,
+            if result.aliases.is_empty() {
+                None
+            } else {
+                Some(result.aliases)
+            },
+        ),
+        &transport,
         port,
-        &scheme,
-        result.url,
-        if result.aliases.is_empty() {
-            None
-        } else {
-            Some(result.aliases)
-        },
     );
     let paths = paths.merged_with(net.cwd, net.home, net.project_root);
 
@@ -112,17 +127,16 @@ async fn handle_network_push(
         return deny_cancellation(socket, &paths, sandbox_session_id, &net.id).await;
     };
 
-    // Step 3: for non-Once scopes, choose target level
     let target = if scope == ApprovalScope::Once {
         None
     } else {
-        match choose_target_level(
-            &format!("agent-sandbox: {} {url} target?", action.verb()),
-            network_target_options(&host, scope),
-        )
-        .await?
-        {
-            Some(t) => Some(t),
+        let title = format!("agent-sandbox: {} {url} target?", action.verb());
+        let default_host = host.clone();
+        let entered = tokio::task::spawn_blocking(move || pick_text(&title, &default_host))
+            .await
+            .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
+        match entered {
+            Some(host) => Some(ApprovalTarget::NetworkHost { host }),
             None => return deny_cancellation(socket, &paths, sandbox_session_id, &net.id).await,
         }
     };
@@ -137,6 +151,93 @@ async fn handle_network_push(
         session_id,
         sandbox_session_id,
         &net.id,
+        action,
+        Some(choice),
+    )
+    .await
+}
+
+/// Prompt the user for a decoded HTTP request approval.
+async fn handle_http_push(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
+    push: HttpPush,
+) -> Result<(), UiCliError> {
+    let HttpPush {
+        id,
+        request,
+        cwd,
+        home,
+        project_root,
+    } = push;
+    let paths = paths.merged_with(cwd, home, project_root);
+    let title = format!("agent-sandbox: {} {}", request.method.as_str(), request.url);
+    let Some(action) = choose_action(&title).await? else {
+        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
+    };
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} HTTP scope?", action.verb()),
+        session_id.is_some(),
+    )
+    .await?
+    else {
+        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
+    };
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        let exact = HttpRuleTarget::new(
+            HttpMethodMatcher::Exact(request.method.clone()),
+            request.url.clone(),
+        )
+        .map_err(|error| UiCliError::Register(format!("invalid HTTP request target: {error}")))?;
+        let all_methods = HttpRuleTarget::new(HttpMethodMatcher::All, request.url.clone())
+            .map_err(|error| {
+                UiCliError::Register(format!("invalid HTTP request target: {error}"))
+            })?;
+        let Some(ApprovalTarget::Http {
+            target: method_target,
+        }) = choose_target_level(
+            &format!("agent-sandbox: {} HTTP method?", action.verb()),
+            vec![
+                ScopeOption {
+                    label: request.method.as_str().to_owned(),
+                    scope,
+                    target: Some(ApprovalTarget::Http { target: exact }),
+                },
+                ScopeOption {
+                    label: "All methods".into(),
+                    scope,
+                    target: Some(ApprovalTarget::Http {
+                        target: all_methods,
+                    }),
+                },
+            ],
+        )
+        .await?
+        else {
+            return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
+        };
+        choose_http_target(
+            &format!("agent-sandbox: {} HTTP path?", action.verb()),
+            &request,
+            method_target.method,
+        )
+        .await?
+    };
+    let choice = ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+    };
+    resolve_choice(
+        socket,
+        &paths,
+        session_id,
+        sandbox_session_id,
+        &id,
         action,
         Some(choice),
     )
@@ -200,6 +301,183 @@ async fn handle_elevation_push(
     )
     .await
 }
+async fn handle_network_variant(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
+    push: UiPush,
+) -> Result<(), UiCliError> {
+    let UiPush::NetworkRequest {
+        id,
+        host,
+        port,
+        scheme,
+        url,
+        cwd,
+        home,
+        project_root,
+    } = push
+    else {
+        unreachable!("network variant was validated by the dispatcher")
+    };
+    handle_network_push(
+        socket,
+        paths,
+        session_id,
+        sandbox_session_id,
+        NetworkPush {
+            id,
+            host,
+            port,
+            scheme,
+            url,
+            cwd,
+            home,
+            project_root,
+        },
+    )
+    .await
+}
+
+async fn handle_http_variant(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    push: UiPush,
+) -> Result<(), UiCliError> {
+    let UiPush::HttpRequest {
+        id,
+        request,
+        cwd,
+        home,
+        project_root,
+        sandbox_session_id,
+    } = push
+    else {
+        unreachable!("HTTP variant was validated by the dispatcher")
+    };
+    handle_http_push(
+        socket,
+        paths,
+        session_id,
+        sandbox_session_id.as_deref(),
+        HttpPush {
+            id: id.to_string(),
+            request,
+            cwd,
+            home,
+            project_root,
+        },
+    )
+    .await
+}
+
+async fn handle_elevation_variant(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
+    push: UiPush,
+) -> Result<(), UiCliError> {
+    let UiPush::ElevationRequest {
+        id,
+        argv,
+        cwd,
+        home,
+        project_root,
+    } = push
+    else {
+        unreachable!("elevation variant was validated by the dispatcher")
+    };
+    handle_elevation_push(
+        socket,
+        paths,
+        session_id,
+        sandbox_session_id,
+        ElevationPush {
+            id,
+            argv,
+            cwd,
+            home,
+            project_root,
+        },
+    )
+    .await
+}
+
+async fn handle_filesystem_variant(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
+    push: UiPush,
+) -> Result<(), UiCliError> {
+    let UiPush::FilesystemRequest {
+        id,
+        path,
+        access,
+        cwd,
+        home,
+        project_root,
+    } = push
+    else {
+        unreachable!("filesystem variant was validated by the dispatcher")
+    };
+    handle_filesystem_push(
+        socket,
+        paths,
+        session_id,
+        sandbox_session_id,
+        FilesystemPush {
+            id,
+            path,
+            access,
+            cwd,
+            home,
+            project_root,
+        },
+    )
+    .await
+}
+
+async fn handle_resource_variant(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
+    push: UiPush,
+) -> Result<(), UiCliError> {
+    let UiPush::ResourceRequest {
+        id,
+        kind,
+        path,
+        access,
+        cwd,
+        home,
+        project_root,
+    } = push
+    else {
+        unreachable!("resource variant was validated by the dispatcher")
+    };
+    handle_resource_push(
+        socket,
+        paths,
+        session_id,
+        sandbox_session_id,
+        ResourcePush {
+            id,
+            kind,
+            path,
+            access,
+            cwd,
+            home,
+            project_root,
+        },
+    )
+    .await
+}
+
 /// Handle an incoming UI push: parse the variant, prompt the user, and resolve the choice.
 ///
 /// # Errors
@@ -212,81 +490,20 @@ pub async fn handle_push(
     push: UiPush,
 ) -> Result<(), UiCliError> {
     match push {
-        UiPush::NetworkRequest {
-            id,
-            host,
-            port,
-            scheme,
-            url,
-            cwd,
-            home,
-            project_root,
-        } => {
-            let net = NetworkPush {
-                id,
-                host,
-                port,
-                scheme,
-                url,
-                cwd,
-                home,
-                project_root,
-            };
-            handle_network_push(socket, paths, session_id, sandbox_session_id, net).await?;
+        push @ UiPush::NetworkRequest { .. } => {
+            handle_network_variant(socket, paths, session_id, sandbox_session_id, push).await?;
         }
-        UiPush::ElevationRequest {
-            id,
-            argv,
-            cwd,
-            home,
-            project_root,
-        } => {
-            let elev = ElevationPush {
-                id,
-                argv,
-                cwd,
-                home,
-                project_root,
-            };
-            handle_elevation_push(socket, paths, session_id, sandbox_session_id, elev).await?;
+        push @ UiPush::HttpRequest { .. } => {
+            handle_http_variant(socket, paths, session_id, push).await?;
         }
-        UiPush::FilesystemRequest {
-            id,
-            path,
-            access,
-            cwd,
-            home,
-            project_root,
-        } => {
-            let fs = FilesystemPush {
-                id,
-                path,
-                access,
-                cwd,
-                home,
-                project_root,
-            };
-            handle_filesystem_push(socket, paths, session_id, sandbox_session_id, fs).await?;
+        push @ UiPush::ElevationRequest { .. } => {
+            handle_elevation_variant(socket, paths, session_id, sandbox_session_id, push).await?;
         }
-        UiPush::ResourceRequest {
-            id,
-            kind,
-            path,
-            access,
-            cwd,
-            home,
-            project_root,
-        } => {
-            let res = ResourcePush {
-                id,
-                kind,
-                path,
-                access,
-                cwd,
-                home,
-                project_root,
-            };
-            handle_resource_push(socket, paths, session_id, sandbox_session_id, res).await?;
+        push @ UiPush::FilesystemRequest { .. } => {
+            handle_filesystem_variant(socket, paths, session_id, sandbox_session_id, push).await?;
+        }
+        push @ UiPush::ResourceRequest { .. } => {
+            handle_resource_variant(socket, paths, session_id, sandbox_session_id, push).await?;
         }
     }
     Ok(())
@@ -433,6 +650,44 @@ async fn choose_action(title: &str) -> Result<Option<PromptAction>, UiCliError> 
         .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
     Ok(choice.as_deref().and_then(PromptAction::from_label))
 }
+async fn choose_http_target(
+    title: &str,
+    request: &agent_sandbox_core::HttpRequest,
+    method: HttpMethodMatcher,
+) -> Result<Option<ApprovalTarget>, UiCliError> {
+    let title = title.to_owned();
+    let default_url = request.url.to_string();
+    loop {
+        let prompt_title = title.clone();
+        let default_url = default_url.clone();
+        let Some(raw_url) =
+            tokio::task::spawn_blocking(move || pick_text(&prompt_title, &default_url))
+                .await
+                .map_err(|_| UiCliError::Register("prompt join failed".into()))?
+        else {
+            return Ok(None);
+        };
+        let url = match HttpUrl::parse(&raw_url) {
+            Ok(url) => url,
+            Err(error) => {
+                warn!(%error, "rejecting invalid HTTP approval target");
+                continue;
+            }
+        };
+        let target = match HttpRuleTarget::new(method.clone(), url) {
+            Ok(target) => target,
+            Err(error) => {
+                warn!(%error, "rejecting invalid HTTP approval target");
+                continue;
+            }
+        };
+        if !target.matches(request) {
+            warn!("rejecting HTTP approval target outside the observed request");
+            continue;
+        }
+        return Ok(Some(ApprovalTarget::Http { target }));
+    }
+}
 
 async fn choose_scope(
     title: &str,
@@ -482,6 +737,22 @@ async fn choose_target_level(
     Ok(choice.and_then(|opt| opt.target))
 }
 
+fn network_prompt_scheme(transport: &str, port: u16) -> &str {
+    match (transport, port) {
+        ("tcp", 80 | 8008 | 8080) => "http",
+        ("tcp", 443 | 8443) | ("udp" | "http3", 443) => "https",
+        _ => transport,
+    }
+}
+
+fn network_prompt_with_transport_hint(base: String, transport: &str, port: u16) -> String {
+    if (transport == "udp" || transport == "http3") && port == 443 {
+        format!("{base} (HTTP/3 over QUIC)")
+    } else {
+        base
+    }
+}
+
 fn network_prompt_url(host: &str, port: u16, scheme: &str, fallback_url: Option<String>) -> String {
     if host.trim().is_empty() {
         fallback_url.unwrap_or_else(|| format!("{scheme}://{host}:{port}"))
@@ -515,26 +786,12 @@ fn network_prompt_with_aliases(
     format!("{base} (previously seen as: {})", hints.join(", "))
 }
 
-fn network_target_options(host: &str, scope: ApprovalScope) -> Vec<ScopeOption> {
-    let hosts = approval_host_patterns(host);
-    let mut options = Vec::with_capacity(hosts.len());
-    for host_pattern in hosts {
-        options.push(ScopeOption {
-            label: host_pattern.clone(),
-            scope,
-            target: Some(ApprovalTarget::NetworkHost { host: host_pattern }),
-        });
-    }
-    options
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        network_prompt_url, network_prompt_with_aliases, network_target_options,
-        suggest_filesystem_rule_path,
+        network_prompt_scheme, network_prompt_url, network_prompt_with_aliases,
+        network_prompt_with_transport_hint, suggest_filesystem_rule_path,
     };
-    use agent_sandbox_core::{ApprovalScope, ApprovalTarget};
     use std::path::Path;
 
     #[test]
@@ -545,6 +802,31 @@ mod tests {
                 Some(Path::new("/home/user/repo")),
             ),
             "./.git/config"
+        );
+    }
+
+    #[test]
+    fn network_prompt_scheme_uses_registered_http_service_ports() {
+        assert_eq!(network_prompt_scheme("tcp", 80), "http");
+        assert_eq!(network_prompt_scheme("tcp", 8008), "http");
+        assert_eq!(network_prompt_scheme("tcp", 8080), "http");
+        assert_eq!(network_prompt_scheme("tcp", 443), "https");
+        assert_eq!(network_prompt_scheme("tcp", 8443), "https");
+        assert_eq!(network_prompt_scheme("udp", 443), "https");
+        assert_eq!(network_prompt_scheme("udp", 853), "udp");
+    }
+
+    #[test]
+    fn network_prompt_marks_udp_443_as_http3_without_inventing_uri_scheme() {
+        let base = network_prompt_url(
+            "example.com",
+            443,
+            network_prompt_scheme("http3", 443),
+            None,
+        );
+        assert_eq!(
+            network_prompt_with_transport_hint(base, "http3", 443),
+            "https://example.com:443 (HTTP/3 over QUIC)"
         );
     }
 
@@ -563,17 +845,6 @@ mod tests {
     fn network_prompt_url_falls_back_when_host_missing() {
         let url = network_prompt_url("", 443, "tcp", Some("tcp://104.18.32.47:443".to_string()));
         assert_eq!(url, "tcp://104.18.32.47:443");
-    }
-
-    #[test]
-    fn network_target_options_use_ipv4_prefix_wildcards() {
-        let options = network_target_options("34.230.40.69", ApprovalScope::Session);
-        let labels: Vec<_> = options.iter().map(|option| option.label.as_str()).collect();
-        assert_eq!(labels, ["34.230.40.69", "34.230.40.*", "34.230.*", "34.*"]);
-        assert!(matches!(
-            options.get(1).and_then(|option| option.target.as_ref()),
-            Some(ApprovalTarget::NetworkHost { host }) if host == "34.230.40.*"
-        ));
     }
 
     #[test]
@@ -619,19 +890,5 @@ mod tests {
             url,
             "tcp://104.18.32.47:443 (previously seen as: chatgpt.com, www.chatgpt.com)"
         );
-    }
-    #[test]
-    fn network_target_options_use_ipv6_prefix_wildcards() {
-        let options = network_target_options("2001:db8::1", ApprovalScope::Session);
-        let labels: Vec<_> = options.iter().map(|option| option.label.as_str()).collect();
-        assert_eq!(labels[0], "2001:db8::1");
-        assert!(labels.contains(&"2001:db8:0:0:0:0:0:*"));
-        assert!(labels.contains(&"2001:db8:*"));
-        assert!(labels.contains(&"2001:*"));
-        assert_eq!(labels.len(), 8);
-        assert!(matches!(
-            options.iter().find(|o| o.label == "2001:db8:*").and_then(|option| option.target.as_ref()),
-            Some(ApprovalTarget::NetworkHost { host }) if host == "2001:db8:*"
-        ));
     }
 }

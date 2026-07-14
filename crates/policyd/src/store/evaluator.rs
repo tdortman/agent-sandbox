@@ -45,7 +45,7 @@ impl PolicyEvaluation<'_> {
             )));
         }
         let merged = self.store.merged_for(&self.ctx);
-        for rule in &merged.network.allow {
+        for rule in &merged.network.direct.allow {
             if PolicyStore::host_matches(&rule.host, &host) && rule.port == port {
                 if let Some(comment) = &rule.comment
                     && !comment.is_empty()
@@ -200,6 +200,8 @@ mod tests {
             ui_spawn_cmd: None,
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
         })
     }
 
@@ -297,6 +299,7 @@ mod tests {
         let mut policy = Policy::default();
         policy
             .network
+            .direct
             .allow
             .push(agent_sandbox_core::NetworkRule::new(
                 "example.com",
