@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
-    RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
+    RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
 use clap::{Parser, Subcommand};
 
@@ -356,7 +356,7 @@ async fn handle_pending(
                 ..
             } => {
                 let kind = resource_kind.to_string();
-                let path = path.unwrap_or_default();
+                let path = contract_project_path(&path.unwrap_or_default(), p.project_root());
                 let access = access.map_or_else(String::new, |value| value.to_string());
                 println!("{id}\tresource\t{kind}\t{access}\t{}", path.display());
             }

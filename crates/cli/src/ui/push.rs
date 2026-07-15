@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, HttpMethodMatcher, HttpRuleTarget,
-    HttpUrl, ResourceAccess, ResourceKind, ResourceRule, UiPush, host_pattern_matches,
-    is_ip_literal, normalize_dns_name, split_check_aliases,
+    HttpUrl, ResourceAccess, ResourceKind, ResourceRule, UiPush, contract_project_path,
+    host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
@@ -17,22 +17,11 @@ use super::options::{
 };
 use tracing::warn;
 
-/// Default rule path shown in the filesystem approval text field.
-fn suggest_filesystem_rule_path(path: &Path, project_root: Option<&Path>) -> String {
-    if let Some(root) = project_root.filter(|r| !r.as_os_str().is_empty()) {
-        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        if canonical_path.starts_with(&canonical_root) {
-            let rel = canonical_path
-                .strip_prefix(&canonical_root)
-                .map_or(path, |rel| rel);
-            let rel = rel.to_string_lossy().trim_start_matches('/').to_string();
-            if !rel.is_empty() {
-                return format!("./{rel}");
-            }
-        }
-    }
-    path.display().to_string()
+/// Default project-relative rule path shown in approval prompts.
+fn suggest_project_rule_path(path: &Path, project_root: Option<&Path>) -> String {
+    contract_project_path(path, project_root)
+        .display()
+        .to_string()
 }
 
 /// Extracted fields from [`UiPush::NetworkRequest`].
@@ -1025,7 +1014,7 @@ async fn handle_filesystem_push(
     } = fs;
     let paths = paths.merged_with(cwd, home, project_root.clone());
     let title = format!("agent-sandbox: filesystem {access} {}", path.display());
-    let default_rule_path = suggest_filesystem_rule_path(&path, paths.project_root());
+    let default_rule_path = suggest_project_rule_path(&path, paths.project_root());
     let review = ApprovalFormRequest {
         summary: format!("Filesystem {access} request for {}", path.display()),
         context: approval_context(&paths, session_id),
@@ -1143,16 +1132,17 @@ async fn handle_resource_push(
         project_root,
     } = res;
     let paths = paths.merged_with(cwd, home, project_root);
+    let display_path = suggest_project_rule_path(&path, paths.project_root());
     let review = ApprovalFormRequest {
-        summary: format!("{kind} {access} request for {}", path.display()),
+        summary: format!("{kind} {access} request for {display_path}"),
         context: approval_context(&paths, session_id),
-        presentation: Some(resource_presentation(access, kind, &path)),
+        presentation: Some(resource_presentation(
+            access,
+            kind,
+            Path::new(&display_path),
+        )),
         scopes: approval_scopes(session_id.is_some()),
-        fields: vec![text_field(
-            "target",
-            "Path or pattern",
-            path.display().to_string(),
-        )],
+        fields: vec![text_field("target", "Path or pattern", display_path)],
     };
     let validator_kind = kind;
     let validator_path = path.clone();
@@ -1218,7 +1208,8 @@ async fn resource_push_cli_fallback(
     prompt: ResourcePrompt<'_>,
 ) -> Result<(), UiCliError> {
     let ResourcePrompt { kind, access, path } = prompt;
-    let title = format!("agent-sandbox: {kind} {access} {}", path.display());
+    let display_path = suggest_project_rule_path(path, paths.project_root());
+    let title = format!("agent-sandbox: {kind} {access} {display_path}");
     let Some(action) = choose_action(&title).await? else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
@@ -1235,7 +1226,7 @@ async fn resource_push_cli_fallback(
     } else {
         match choose_path_target(
             &format!("agent-sandbox: allow {kind} {access} path?"),
-            &path.display().to_string(),
+            &display_path,
             move |rule_path| ApprovalTarget::ResourcePath {
                 resource_kind: kind,
                 path: rule_path,
@@ -1414,7 +1405,7 @@ mod tests {
         elevation_presentation, http_presentation, network_presentation, network_prompt_scheme,
         network_prompt_url, network_prompt_with_aliases, network_prompt_with_transport_hint,
         parse_filesystem_target, parse_network_target, parse_resource_target,
-        resource_presentation, reviewed_choice, suggest_filesystem_rule_path, valid_network_host,
+        resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
     use crate::ui::options::ApprovalFormAction;
@@ -1463,13 +1454,13 @@ mod tests {
     }
 
     #[test]
-    fn suggest_filesystem_rule_path_shows_relative_file_path() {
+    fn suggest_project_rule_path_shows_relative_unix_socket_path() {
         assert_eq!(
-            suggest_filesystem_rule_path(
-                Path::new("/home/user/repo/.git/config"),
+            suggest_project_rule_path(
+                Path::new("/home/user/repo/.agent.sock"),
                 Some(Path::new("/home/user/repo")),
             ),
-            "./.git/config"
+            "./.agent.sock"
         );
     }
     #[test]
