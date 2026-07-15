@@ -53,6 +53,62 @@ let
     networks: files
   '';
 
+  # These daemons do not execute approved host commands, so they can be
+  # confined without changing the policy daemon's executor namespace.
+  networkDaemonHardening = {
+    PrivateTmp = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    NoNewPrivileges = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    ProtectControlGroups = true;
+    ReadWritePaths = [ "/run/agent-sandbox" ];
+    RestrictAddressFamilies = [
+      "AF_UNIX"
+      "AF_NETLINK"
+      "AF_INET"
+      "AF_INET6"
+    ];
+  };
+
+  # Setup units retain their existing root capabilities for netlink/nftables
+  # operations, but do not need host home directories or a shared /tmp.
+  networkSetupHardening = {
+    PrivateTmp = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    ProtectControlGroups = true;
+    ReadWritePaths = [
+      "/run/agent-sandbox"
+      "/run/netns"
+      "/var/lib/agent-sandbox"
+    ];
+    RestrictAddressFamilies = [
+      "AF_UNIX"
+      "AF_NETLINK"
+      "AF_INET"
+      "AF_INET6"
+    ];
+  };
+
+  # The namespace creator must publish its /run/netns bind mount to PID 1.
+  # Mount/filesystem isolation here would leave only an empty path behind when
+  # the oneshot exits, so keep only restrictions that do not create a private
+  # mount namespace.
+  networkNamespaceSetupHardening = {
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    RestrictAddressFamilies = [
+      "AF_UNIX"
+      "AF_NETLINK"
+      "AF_INET"
+      "AF_INET6"
+    ];
+  };
+
   # The DNS forwarder runs on the host and listens on the veth gateway. It
   # forwards raw DNS queries to the upstream resolver (configured via
   # `agent-sandbox.network.dnsForwardTarget`) and writes IP->hostname mappings
@@ -142,6 +198,7 @@ let
   netnsUpPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-netns-up";
     runtimeInputs = [
+      pkgs.coreutils
       pkgs.iproute2
       pkgs.nftables
       hostNatPkg
@@ -468,7 +525,7 @@ lib.mkIf policyEnabled (
             "agent-sandbox-policy.service"
             "agent-sandbox-nfq.service"
           ];
-          serviceConfig = {
+          serviceConfig = networkNamespaceSetupHardening // {
             Type = "oneshot";
             RemainAfterExit = true;
             ExecStart = "${netnsUpPkg}/bin/agent-sandbox-netns-up";
@@ -489,7 +546,7 @@ lib.mkIf policyEnabled (
             "agent-sandbox-policy.service"
             "agent-sandbox-nfq.service"
           ];
-          serviceConfig = {
+          serviceConfig = networkDaemonHardening // {
             Type = "simple";
             ExecStart = lib.escapeShellArgs (
               [
@@ -530,7 +587,7 @@ lib.mkIf policyEnabled (
             "agent-sandbox-netns.service"
             "agent-sandbox-dns.service"
           ];
-          serviceConfig = {
+          serviceConfig = networkDaemonHardening // {
             Type = "simple";
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             ExecStart = lib.escapeShellArgs (
@@ -578,7 +635,7 @@ lib.mkIf policyEnabled (
             "agent-sandbox-proxy-firewall.service"
             "agent-sandbox-proxy.service"
           ];
-          serviceConfig = {
+          serviceConfig = networkSetupHardening // {
             Type = "oneshot";
             RemainAfterExit = true;
             ExecStart = lib.escapeShellArgs [
@@ -606,13 +663,13 @@ lib.mkIf policyEnabled (
           description = "Restrictive egress firewall for agent-sandbox transparent proxy";
           wantedBy = [ "multi-user.target" ];
           requires = [ "agent-sandbox-proxy-init.service" ];
-          bindsTo = [ "agent-sandbox-proxy.service" ];
+          partOf = [ "agent-sandbox-proxy.service" ];
           after = [
             "agent-sandbox-proxy-init.service"
             "network.target"
           ];
           before = [ "agent-sandbox-proxy.service" ];
-          serviceConfig = {
+          serviceConfig = networkSetupHardening // {
             Type = "oneshot";
             RemainAfterExit = true;
             ExecStart = lib.escapeShellArgs [
@@ -660,7 +717,6 @@ lib.mkIf policyEnabled (
             "agent-sandbox-netns.service"
             "agent-sandbox-dns.service"
           ];
-          bindsTo = [ "agent-sandbox-proxy-firewall.service" ];
           after = [
             "agent-sandbox-proxy-init.service"
             "agent-sandbox-proxy-firewall.service"
@@ -734,7 +790,7 @@ lib.mkIf policyEnabled (
             "agent-sandbox-proxy-firewall.service"
           ];
           partOf = [ "agent-sandbox-proxy.service" ];
-          serviceConfig = {
+          serviceConfig = networkSetupHardening // {
             Type = "oneshot";
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             RemainAfterExit = true;
@@ -779,6 +835,9 @@ lib.mkIf policyEnabled (
               runtime.hostIp
               "cleanup"
             ];
+            # The switch transaction may stop the proxy while this helper is
+            # waiting for readiness; its termination trap still performs cleanup.
+            SuccessExitStatus = [ "143" ];
             Restart = "on-failure";
             RestartSec = 1;
           };

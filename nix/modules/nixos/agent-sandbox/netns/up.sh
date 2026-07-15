@@ -11,7 +11,10 @@ HOST_IP6="@hostIp6@"
 HOST_IP6_CIDR="@hostIp6Cidr@"
 NETNS_IP6_CIDR="@netnsIp6Cidr@"
 
-ip netns add "$NETNS" 2>/dev/null || true
+if ! ip netns exec "$NETNS" true 2>/dev/null; then
+  ip netns del "$NETNS" 2>/dev/null || rm -f "/run/netns/$NETNS"
+  ip netns add "$NETNS"
+fi
 ip link del "$HOST_IF" 2>/dev/null || true
 ip link add "$HOST_IF" type veth peer name "$NS_IF"
 ip link set "$NS_IF" netns "$NETNS"

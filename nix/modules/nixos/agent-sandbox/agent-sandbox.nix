@@ -514,7 +514,7 @@ in
       };
       resources = {
         enable = lib.mkEnableOption ''
-          seccomp-backed resource gates for AF_UNIX sockets under /run and
+          seccomp-backed resource gates for all AF_UNIX sockets and
           broker-opened host device nodes under /dev in dynamic filesystem mode.
           Requires gates.filesystem.enable.
         '';
