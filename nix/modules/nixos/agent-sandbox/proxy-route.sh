@@ -97,6 +97,14 @@ systemctl_ready() {
   [[ -f "$marker" && ! -L "$marker" ]] || return 1
   [[ "$(cat -- "$marker")" == "$invocation" ]] || return 1
 }
+# WireGuard reports handshake timestamps with one-second resolution, so a
+# handshake in the setup second is already fresh for this interface.
+fresh_handshake() {
+  local handshake="$1"
+  local start_second="$2"
+  [[ "$handshake" =~ ^[0-9]+$ && "$handshake" -ge "$start_second" ]]
+}
+
 
 ready_for_route() {
   systemctl_ready "$proxy_unit" "$proxy_ready" && systemctl_ready "$nfq_unit" "$nfq_ready"
@@ -143,7 +151,7 @@ for _attempt in $(seq 1 60); do
     exit 1
   fi
   handshake="$(wg show "$interface" latest-handshakes | awk 'NR == 1 { print $2 }')"
-  if [[ "$handshake" =~ ^[0-9]+$ && "$handshake" -gt "$start_second" ]]; then
+  if fresh_handshake "$handshake" "$start_second"; then
     # Route only HTTP(S) service ports through WireGuard. All other
     # destinations keep the namespace's ordinary kernel route.
     ip route replace default dev "$interface" table "$ROUTE_TABLE"
