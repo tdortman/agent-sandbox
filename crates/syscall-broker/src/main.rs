@@ -525,7 +525,7 @@ mod tests {
         ResourceTarget {
             kind: ResourceKind::UnixSocket,
             path: PathBuf::from(path),
-            access: ResourceAccess::Connect,
+            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
             raw: path.as_bytes().to_vec(),
             open_flags: 0,
             open_mode: 0,
@@ -623,7 +623,7 @@ mod tests {
         let target = ResourceTarget {
             kind: ResourceKind::Device,
             path: PathBuf::from("/run/agent-sandbox/policy.sock"),
-            access: ResourceAccess::OpenRead,
+            access: ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
             raw: b"/run/agent-sandbox/policy.sock".to_vec(),
             open_flags: 0,
             open_mode: 0,

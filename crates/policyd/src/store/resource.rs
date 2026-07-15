@@ -360,7 +360,7 @@ mod tests {
         ResourceCheckRequest {
             kind: ResourceKind::UnixSocket,
             path: PathBuf::from(path),
-            access: ResourceAccess::Connect,
+            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
             ctx: ResolvedRequestContext {
                 paths: SandboxPaths::from_wire(
                     Some("/repo".into()),
@@ -433,7 +433,7 @@ mod tests {
                 &pending_id,
                 ResourceKind::UnixSocket,
                 PathBuf::from("/repo/fast.sock"),
-                ResourceAccess::Connect,
+                ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
                 true,
                 VerdictSource::policy_with_comment("test"),
             )
@@ -480,7 +480,7 @@ mod tests {
                 &pending_id,
                 ResourceKind::UnixSocket,
                 PathBuf::from("/repo/slow.sock"),
-                ResourceAccess::Connect,
+                ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
                 true,
                 VerdictSource::policy_with_comment("cli"),
             )

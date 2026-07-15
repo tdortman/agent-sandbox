@@ -532,77 +532,140 @@ impl std::fmt::Display for ResourceKind {
     }
 }
 
-/// Access mode for a resource gate request.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceAccess {
+/// Access mode for a Unix-domain socket resource.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SocketAccess {
     #[default]
     Connect,
     Send,
-    OpenRead,
-    OpenWrite,
-    OpenReadWrite,
+    All,
+}
+
+/// Access mode for a broker-opened device resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeviceAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Access mode for a capability-granting resource.
+///
+/// Serialization remains flat for policy files and RPC compatibility:
+/// `connect`, `send`, `all`, `open_read`, `open_write`, and `open_read_write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResourceAccess {
+    Socket(SocketAccess),
+    Device(DeviceAccess),
+}
+
+impl Default for ResourceAccess {
+    fn default() -> Self {
+        Self::Socket(SocketAccess::Connect)
+    }
 }
 
 impl ResourceAccess {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Connect => "connect",
-            Self::Send => "send",
-            Self::OpenRead => "open_read",
-            Self::OpenWrite => "open_write",
-            Self::OpenReadWrite => "open_read_write",
+            Self::Socket(SocketAccess::Connect) => "connect",
+            Self::Socket(SocketAccess::Send) => "send",
+            Self::Socket(SocketAccess::All) => "all",
+            Self::Device(DeviceAccess::Read) => "open_read",
+            Self::Device(DeviceAccess::Write) => "open_write",
+            Self::Device(DeviceAccess::ReadWrite) => "open_read_write",
         }
     }
 
-    /// Whether `self` covers every access level that `other` covers.
     #[must_use]
-    pub fn access_superset(self, other: Self) -> bool {
-        [
-            Self::Connect,
-            Self::Send,
-            Self::OpenRead,
-            Self::OpenWrite,
-            Self::OpenReadWrite,
-        ]
-        .iter()
-        .all(|&v| !other.covers(v) || self.covers(v))
+    pub const fn kind(self) -> ResourceKind {
+        match self {
+            Self::Socket(_) => ResourceKind::UnixSocket,
+            Self::Device(_) => ResourceKind::Device,
+        }
+    }
+
+    /// Whether this access level covers every access level that `other` covers.
+    #[must_use]
+    pub const fn access_superset(self, other: Self) -> bool {
+        self.covers(other)
     }
 
     /// Whether this access level covers the requested access.
-    ///
-    /// `OpenReadWrite` covers `OpenRead`, `OpenWrite`, and `OpenReadWrite`.
-    /// Other variants cover only themselves.
     #[must_use]
-    pub fn covers(self, requested: Self) -> bool {
-        match self {
-            Self::OpenReadWrite => matches!(
-                requested,
-                Self::OpenRead | Self::OpenWrite | Self::OpenReadWrite
-            ),
-            _ => self == requested,
-        }
+    pub const fn covers(self, requested: Self) -> bool {
+        matches!(
+            (self, requested),
+            (Self::Socket(SocketAccess::All), Self::Socket(_))
+                | (
+                    Self::Socket(SocketAccess::Connect),
+                    Self::Socket(SocketAccess::Connect)
+                )
+                | (
+                    Self::Socket(SocketAccess::Send),
+                    Self::Socket(SocketAccess::Send)
+                )
+                | (Self::Device(DeviceAccess::ReadWrite), Self::Device(_))
+                | (
+                    Self::Device(DeviceAccess::Read),
+                    Self::Device(DeviceAccess::Read)
+                )
+                | (
+                    Self::Device(DeviceAccess::Write),
+                    Self::Device(DeviceAccess::Write)
+                )
+        )
     }
 
     /// Smallest policy access that covers both access levels, or `None` if
-    /// the two accesses are from incompatible classes (e.g. socket connect
-    /// vs. device open) and must remain as separate rules.
+    /// the two accesses are incompatible.
     #[must_use]
-    pub fn union(self, other: Self) -> Option<Self> {
+    pub const fn union(self, other: Self) -> Option<Self> {
         if self.covers(other) {
             Some(self)
         } else if other.covers(self) {
             Some(other)
-        } else if matches!(
-            (self, other),
-            (Self::OpenRead, Self::OpenWrite) | (Self::OpenWrite, Self::OpenRead)
-        ) {
-            Some(Self::OpenReadWrite)
         } else {
-            None
+            match (self, other) {
+                (Self::Socket(SocketAccess::Connect), Self::Socket(SocketAccess::Send))
+                | (Self::Socket(SocketAccess::Send), Self::Socket(SocketAccess::Connect)) => {
+                    Some(Self::Socket(SocketAccess::All))
+                }
+                (Self::Device(DeviceAccess::Read), Self::Device(DeviceAccess::Write))
+                | (Self::Device(DeviceAccess::Write), Self::Device(DeviceAccess::Read)) => {
+                    Some(Self::Device(DeviceAccess::ReadWrite))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+impl Serialize for ResourceAccess {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceAccess {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "connect" => Ok(Self::Socket(SocketAccess::Connect)),
+            "send" => Ok(Self::Socket(SocketAccess::Send)),
+            "all" => Ok(Self::Socket(SocketAccess::All)),
+            "open_read" => Ok(Self::Device(DeviceAccess::Read)),
+            "open_write" => Ok(Self::Device(DeviceAccess::Write)),
+            "open_read_write" => Ok(Self::Device(DeviceAccess::ReadWrite)),
+            value => Err(serde::de::Error::custom(format!(
+                "invalid resource access {value:?}"
+            ))),
         }
     }
 }
@@ -612,7 +675,6 @@ impl std::fmt::Display for ResourceAccess {
         f.write_str(self.as_str())
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceRuleKey {
     pub kind: ResourceKind,
@@ -711,7 +773,10 @@ impl ResourceRule {
         access: ResourceAccess,
         project_root: Option<&Path>,
     ) -> bool {
-        self.kind == kind && self.path_matches(path, project_root) && self.access.covers(access)
+        self.kind == kind
+            && self.access.kind() == self.kind
+            && self.path_matches(path, project_root)
+            && self.access.covers(access)
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -911,8 +976,9 @@ impl InodeIdentity {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule, SudoRule,
-        contract_home_path, expand_home_path, filesystem_approval_paths, open_flags_to_file_access,
+        DeviceAccess, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule,
+        SocketAccess, SudoRule, contract_home_path, expand_home_path, filesystem_approval_paths,
+        open_flags_to_file_access,
     };
     use std::path::{Path, PathBuf};
 
@@ -1341,33 +1407,90 @@ mod tests {
         let rule = ResourceRule::new(
             ResourceKind::Device,
             "/dev/fd",
-            ResourceAccess::OpenReadWrite,
+            ResourceAccess::Device(DeviceAccess::ReadWrite),
             "",
         );
         assert!(rule.matches(
             ResourceKind::Device,
             Path::new("/dev/fd/3"),
-            ResourceAccess::OpenRead,
+            ResourceAccess::Device(DeviceAccess::Read),
             None
         ));
         assert!(rule.matches(
             ResourceKind::Device,
             Path::new("/dev/fd/3"),
-            ResourceAccess::OpenWrite,
+            ResourceAccess::Device(DeviceAccess::Write),
             None
         ));
         assert!(!rule.matches(
             ResourceKind::Device,
             Path::new("/dev/fd/3"),
-            ResourceAccess::Connect,
+            ResourceAccess::Socket(SocketAccess::Connect),
             None
         ));
         assert!(!rule.matches(
             ResourceKind::UnixSocket,
             Path::new("/dev/fd/3"),
-            ResourceAccess::OpenRead,
+            ResourceAccess::Device(DeviceAccess::Read),
             None
         ));
+    }
+
+    #[test]
+    fn resource_socket_connect_and_send_are_distinct() {
+        let connect_rule = ResourceRule::new(
+            ResourceKind::UnixSocket,
+            "/tmp/example.sock",
+            ResourceAccess::Socket(SocketAccess::Connect),
+            "",
+        );
+        assert!(connect_rule.matches(
+            ResourceKind::UnixSocket,
+            Path::new("/tmp/example.sock"),
+            ResourceAccess::Socket(SocketAccess::Connect),
+            None
+        ));
+        assert!(!connect_rule.matches(
+            ResourceKind::UnixSocket,
+            Path::new("/tmp/example.sock"),
+            ResourceAccess::Socket(SocketAccess::Send),
+            None
+        ));
+
+        let send_rule = ResourceRule::new(
+            ResourceKind::UnixSocket,
+            "/tmp/example.sock",
+            ResourceAccess::Socket(SocketAccess::Send),
+            "",
+        );
+        assert!(send_rule.matches(
+            ResourceKind::UnixSocket,
+            Path::new("/tmp/example.sock"),
+            ResourceAccess::Socket(SocketAccess::Send),
+            None
+        ));
+        assert!(!send_rule.matches(
+            ResourceKind::UnixSocket,
+            Path::new("/tmp/example.sock"),
+            ResourceAccess::Socket(SocketAccess::Connect),
+            None
+        ));
+        let all = ResourceAccess::Socket(SocketAccess::All);
+        assert!(all.covers(ResourceAccess::Socket(SocketAccess::Connect)));
+        assert!(all.covers(ResourceAccess::Socket(SocketAccess::Send)));
+        assert_eq!(
+            ResourceAccess::Socket(SocketAccess::Connect)
+                .union(ResourceAccess::Socket(SocketAccess::Send)),
+            Some(all)
+        );
+        assert_eq!(
+            serde_json::to_string(&all).expect("serialize socket all"),
+            "\"all\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ResourceAccess>("\"all\"").expect("deserialize socket all"),
+            all
+        );
     }
 
     #[test]
@@ -1375,7 +1498,7 @@ mod tests {
         let rule = ResourceRule::new(
             ResourceKind::UnixSocket,
             "/run/user/1000/bus/",
-            ResourceAccess::Connect,
+            ResourceAccess::Socket(SocketAccess::Connect),
             "",
         );
         assert!(rule.path_matches(Path::new("/run/user/1000/bus"), None));

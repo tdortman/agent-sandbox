@@ -41,11 +41,12 @@ pub use merge_policy::{
     migrate_policy, resolve_policy_write_path, trusted_project_policy_path,
 };
 pub use policy::{
-    DirectNetworkSection, FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection,
-    FilesystemSortKey, HttpSection, InodeIdentity, NetworkRule, NetworkSection, Policy,
-    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, ResourceSection, ResourceSortKey,
-    SudoRule, SudoSection, contract_home_path, expand_home_path, expand_policy_path,
-    filesystem_approval_paths, normalize_directory_traverse_access, open_flags_to_file_access,
+    DeviceAccess, DirectNetworkSection, FileAccess, FilesystemRule, FilesystemRuleKey,
+    FilesystemSection, FilesystemSortKey, HttpSection, InodeIdentity, NetworkRule, NetworkSection,
+    Policy, ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, ResourceSection,
+    ResourceSortKey, SocketAccess, SudoRule, SudoSection, contract_home_path, expand_home_path,
+    expand_policy_path, filesystem_approval_paths, normalize_directory_traverse_access,
+    open_flags_to_file_access,
 };
 pub use proc_context::{
     PeerCredentials, ProcContext, context_from_pid, discover_git_project_root, home_from_uid,

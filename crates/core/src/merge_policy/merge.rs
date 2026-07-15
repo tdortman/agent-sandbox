@@ -217,8 +217,8 @@ fn merge_resources(layers: &[Policy]) -> ResourceSection {
 mod tests {
     use super::merge_layers;
     use crate::policy::{
-        FileAccess, FilesystemRule, FilesystemSection, Policy, ResourceAccess, ResourceKind,
-        ResourceRule, ResourceSection,
+        DeviceAccess, FileAccess, FilesystemRule, FilesystemSection, Policy, ResourceAccess,
+        ResourceKind, ResourceRule, ResourceSection,
     };
 
     fn empty_policy() -> Policy {
@@ -236,7 +236,7 @@ mod tests {
                 allow: vec![ResourceRule::new(
                     ResourceKind::Device,
                     "/dev/fd",
-                    ResourceAccess::OpenReadWrite,
+                    ResourceAccess::Device(DeviceAccess::ReadWrite),
                     "",
                 )],
                 deny: vec![],
@@ -249,7 +249,7 @@ mod tests {
                 deny: vec![ResourceRule::new(
                     ResourceKind::Device,
                     "/dev/fd/3",
-                    ResourceAccess::OpenRead,
+                    ResourceAccess::Device(DeviceAccess::Read),
                     "",
                 )],
             },
@@ -274,7 +274,7 @@ mod tests {
                 allow: vec![ResourceRule::new(
                     ResourceKind::Device,
                     "/dev/fd/3",
-                    ResourceAccess::OpenRead,
+                    ResourceAccess::Device(DeviceAccess::Read),
                     "",
                 )],
                 deny: vec![],
@@ -287,7 +287,7 @@ mod tests {
                 deny: vec![ResourceRule::new(
                     ResourceKind::Device,
                     "/dev/fd/3",
-                    ResourceAccess::OpenReadWrite,
+                    ResourceAccess::Device(DeviceAccess::ReadWrite),
                     "",
                 )],
             },
@@ -310,7 +310,7 @@ mod tests {
                 allow: vec![ResourceRule::new(
                     ResourceKind::Device,
                     "/dev/fd/",
-                    ResourceAccess::OpenRead,
+                    ResourceAccess::Device(DeviceAccess::Read),
                     "",
                 )],
                 deny: vec![],
@@ -322,7 +322,7 @@ mod tests {
                 allow: vec![ResourceRule::new(
                     ResourceKind::Device,
                     "/dev/fd",
-                    ResourceAccess::OpenRead,
+                    ResourceAccess::Device(DeviceAccess::Read),
                     "",
                 )],
                 deny: vec![],

@@ -179,8 +179,8 @@ mod tests {
     use std::time::Duration;
 
     use agent_sandbox_core::{
-        NetworkRuleKey, Policy, ProcessIds, ResourceRule, ResourceRuleKey, SandboxPaths,
-        atomic_write_policy,
+        DeviceAccess, NetworkRuleKey, Policy, ProcessIds, ResourceRule, ResourceRuleKey,
+        SandboxPaths, atomic_write_policy,
     };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
@@ -345,7 +345,7 @@ mod tests {
         policy.resources.allow.push(ResourceRule::new(
             ResourceKind::Device,
             device_path.clone(),
-            ResourceAccess::OpenRead,
+            ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
             "policy allow",
         ));
         atomic_write_policy(&policy_dir.join("policy.json"), &policy, None, None, None)
@@ -367,7 +367,7 @@ mod tests {
                 HashSet::from([ResourceRuleKey::new(
                     ResourceKind::Device,
                     device_path.clone(),
-                    ResourceAccess::OpenRead,
+                    ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
                 )]),
             );
         }
@@ -386,10 +386,12 @@ mod tests {
                 .resource_allow_source(
                     ResourceKind::Device,
                     &device_path,
-                    ResourceAccess::OpenRead,
+                    ResourceAccess::Device(DeviceAccess::Read),
                 )
                 .await,
-            Some(Verdict::allowed(VerdictSource::Scope(ApprovalScope::Session)))
+            Some(Verdict::allowed(VerdictSource::Scope(
+                ApprovalScope::Session
+            )))
         );
     }
 }

@@ -576,22 +576,61 @@ fn session_resource_matches(
     })
 }
 
-fn is_session_bus_socket(kind: ResourceKind, path: &Path, access: ResourceAccess) -> bool {
-    if kind != ResourceKind::UnixSocket || !ResourceAccess::Connect.covers(access) {
+fn is_protected_abstract_socket(path: &str) -> bool {
+    [
+        "@abstract:/tmp/dbus-",
+        "@abstract:/org/freedesktop/DBus",
+        "@abstract:/org/freedesktop/systemd1",
+        "@abstract:org.freedesktop.DBus",
+        "@abstract:org.freedesktop.systemd1",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+}
+
+fn is_protected_host_ipc_socket(kind: ResourceKind, path: &Path, access: ResourceAccess) -> bool {
+    if kind != ResourceKind::UnixSocket
+        || !matches!(
+            access,
+            ResourceAccess::Socket(
+                agent_sandbox_core::SocketAccess::Connect
+                    | agent_sandbox_core::SocketAccess::Send
+                    | agent_sandbox_core::SocketAccess::All
+            )
+        )
+    {
         return false;
     }
-    let parts: Vec<_> = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect();
+    let path_string = path.to_string_lossy();
+    if is_protected_abstract_socket(&path_string) {
+        return true;
+    }
+    if path == Path::new("/run/dbus")
+        || path.starts_with("/run/dbus/")
+        || path == Path::new("/run/systemd")
+        || path.starts_with("/run/systemd/")
+    {
+        return true;
+    }
+    let mut components = path.components();
     matches!(
-        parts.as_slice(),
-        [root, run, user, uid, bus]
-            if root.as_ref() == "/"
-                && run.as_ref() == "run"
-                && user.as_ref() == "user"
-                && uid.chars().all(|c| c.is_ascii_digit())
-                && bus.as_ref() == "bus"
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (
+            Some(std::path::Component::RootDir),
+            Some(std::path::Component::Normal(run)),
+            Some(std::path::Component::Normal(user)),
+            Some(std::path::Component::Normal(uid)),
+            Some(std::path::Component::Normal(area)),
+        ) if run == "run"
+            && user == "user"
+            && uid.to_string_lossy().chars().all(|c| c.is_ascii_digit())
+            && (area == "bus" || area == "systemd")
     )
 }
 
@@ -606,7 +645,7 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
         let home = ctx.paths.home();
-        if is_session_bus_socket(kind, path, access) {
+        if is_protected_host_ipc_socket(kind, path, access) {
             return true;
         }
         let path_match = merged
@@ -691,12 +730,12 @@ mod tests {
     use std::{collections::HashSet, path::Path};
 
     use super::{
-        is_session_bus_socket, session_filesystem_matches, session_network_matches,
+        is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
         session_sudo_matches,
     };
     use agent_sandbox_core::{
-        FileAccess, FilesystemRuleKey, NetworkRuleKey, ResourceAccess, ResourceKind, Verdict,
-        VerdictSource,
+        DeviceAccess, FileAccess, FilesystemRuleKey, NetworkRuleKey, ResourceAccess, ResourceKind,
+        SocketAccess, Verdict, VerdictSource,
     };
 
     #[test]
@@ -719,21 +758,42 @@ mod tests {
     }
 
     #[test]
-    fn session_bus_socket_is_builtin_denied() {
-        assert!(is_session_bus_socket(
+    fn protected_host_ipc_socket_is_builtin_denied() {
+        for path in [
+            "/run/dbus/system_bus_socket",
+            "/run/dbus/custom.sock",
+            "/run/systemd/private",
+            "/run/systemd/notify",
+            "/run/user/1000/bus",
+            "/run/user/1000/systemd/private",
+            "@abstract:/tmp/dbus-1234",
+            "@abstract:org.freedesktop.systemd1",
+        ] {
+            assert!(is_protected_host_ipc_socket(
+                ResourceKind::UnixSocket,
+                Path::new(path),
+                ResourceAccess::Socket(SocketAccess::Connect)
+            ));
+            assert!(is_protected_host_ipc_socket(
+                ResourceKind::UnixSocket,
+                Path::new(path),
+                ResourceAccess::Socket(SocketAccess::Send)
+            ));
+        }
+        assert!(!is_protected_host_ipc_socket(
             ResourceKind::UnixSocket,
-            Path::new("/run/user/1000/bus"),
-            ResourceAccess::Connect
+            Path::new("@abstract:nv_target_process_1234"),
+            ResourceAccess::Socket(SocketAccess::Connect)
         ));
-        assert!(!is_session_bus_socket(
+        assert!(!is_protected_host_ipc_socket(
             ResourceKind::UnixSocket,
             Path::new("/run/user/1000/portal-bus"),
-            ResourceAccess::Connect
+            ResourceAccess::Socket(SocketAccess::Connect)
         ));
-        assert!(!is_session_bus_socket(
+        assert!(!is_protected_host_ipc_socket(
             ResourceKind::Device,
             Path::new("/run/user/1000/bus"),
-            ResourceAccess::OpenRead
+            ResourceAccess::Device(DeviceAccess::Read)
         ));
     }
     #[test]

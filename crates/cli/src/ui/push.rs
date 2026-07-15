@@ -263,11 +263,24 @@ fn resource_presentation(
         ResourceKind::Device => "device",
     };
     let heading = match access {
-        ResourceAccess::Connect => format!("Connect to this {kind_label}?"),
-        ResourceAccess::Send => format!("Send data to this {kind_label}?"),
-        ResourceAccess::OpenRead => format!("Read from this {kind_label}?"),
-        ResourceAccess::OpenWrite => format!("Write to this {kind_label}?"),
-        ResourceAccess::OpenReadWrite => format!("Read and write this {kind_label}?"),
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect) => {
+            format!("Connect to this {kind_label}?")
+        }
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send) => {
+            format!("Send data to this {kind_label}?")
+        }
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::All) => {
+            format!("Connect to and send data to this {kind_label}?")
+        }
+        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read) => {
+            format!("Read from this {kind_label}?")
+        }
+        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Write) => {
+            format!("Write to this {kind_label}?")
+        }
+        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::ReadWrite) => {
+            format!("Read and write this {kind_label}?")
+        }
     };
     ApprovalFormPresentation {
         heading,
@@ -359,8 +372,13 @@ fn parse_resource_target(
     project_root: Option<&Path>,
 ) -> Option<ApprovalTarget> {
     let path = valid_rule_path(result.values.get("target")?)?;
-    if !ResourceRule::new(kind, path.clone(), ResourceAccess::Connect, "")
-        .path_matches(requested_path, project_root)
+    if !ResourceRule::new(
+        kind,
+        path.clone(),
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+        "",
+    )
+    .path_matches(requested_path, project_root)
     {
         return None;
     }
@@ -1406,7 +1424,7 @@ mod tests {
     #[test]
     fn resource_presentation_uses_human_readable_unix_socket_label() {
         let presentation = resource_presentation(
-            ResourceAccess::Connect,
+            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
             ResourceKind::UnixSocket,
             Path::new("/run/example.sock"),
         );

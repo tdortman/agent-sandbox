@@ -6,7 +6,7 @@ use super::{
 };
 use crate::ResourceKind;
 use crate::http::HttpRequest;
-use crate::policy::{FileAccess, ResourceAccess};
+use crate::policy::{DeviceAccess, FileAccess, ResourceAccess};
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -280,7 +280,7 @@ fn resource_and_scope_replies_preserve_wire_strings() {
         VerdictSource::Infrastructure,
         ResourceKind::Device,
         PathBuf::from("/dev/fd/3"),
-        ResourceAccess::OpenRead,
+        ResourceAccess::Device(DeviceAccess::Read),
     );
     let resource_json = serde_json::to_value(&resource).expect("serialize resource reply");
     assert_eq!(resource_json["source"], "infrastructure");

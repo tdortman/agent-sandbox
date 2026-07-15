@@ -326,7 +326,7 @@ mod tests {
         ResourceTarget {
             kind: ResourceKind::Device,
             path: PathBuf::from("/dev/example"),
-            access: ResourceAccess::OpenRead,
+            access: ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
             raw: Vec::new(),
             open_flags: 0,
             open_mode: 0,

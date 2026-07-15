@@ -649,8 +649,13 @@ impl PolicyStore {
             return Ok(path);
         }
 
-        if ResourceRule::new(pending.kind, path.clone(), ResourceAccess::Connect, "")
-            .path_matches(pending_path.as_path(), project_root)
+        if ResourceRule::new(
+            pending.kind,
+            path.clone(),
+            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            "",
+        )
+        .path_matches(pending_path.as_path(), project_root)
         {
             return Ok(path);
         }
@@ -958,7 +963,7 @@ mod tests {
             created_at: 0.0,
             kind: ResourceKind::UnixSocket,
             path: "/home/user/repo/.sock".into(),
-            access: ResourceAccess::Connect,
+            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
             cwd: None,
             home: Some("/home/user".into()),
             project_root: Some("/home/user/repo".into()),
@@ -1155,7 +1160,7 @@ mod tests {
             created_at: 0.0,
             kind: ResourceKind::UnixSocket,
             path: "/dev/fd/3".into(),
-            access: ResourceAccess::Connect,
+            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
             cwd: None,
             home: Some(home.clone()),
             project_root: None,
@@ -1197,7 +1202,9 @@ mod tests {
         let found = policy.resources.allow.iter().any(|rule| {
             rule.kind == ResourceKind::UnixSocket
                 && rule.path == Path::new("/dev/fd/*")
-                && rule.access.covers(ResourceAccess::Connect)
+                && rule.access.covers(ResourceAccess::Socket(
+                    agent_sandbox_core::SocketAccess::Connect,
+                ))
         });
         assert!(
             found,

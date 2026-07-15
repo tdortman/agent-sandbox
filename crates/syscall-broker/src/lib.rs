@@ -464,7 +464,7 @@ pub fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<SyscallTar
         notif.data.args[1],
         notif.data.args[2],
         &scheme,
-        ResourceAccess::Connect,
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
     )
 }
 /// Extract a target from a `sendto` syscall notification.
@@ -486,7 +486,7 @@ pub fn target_from_sendto(notif: &SeccompNotif) -> io::Result<Option<SyscallTarg
         notif.data.args[4],
         notif.data.args[5],
         &scheme,
-        ResourceAccess::Send,
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send),
     )
 }
 
@@ -547,7 +547,7 @@ pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTar
         mhdr.name,
         u64::from(mhdr.name_len),
         &scheme,
-        ResourceAccess::Send,
+        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send),
     )
 }
 
@@ -1058,11 +1058,11 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
 
     let acc = open_flags & libc::O_ACCMODE;
     let access = if acc == libc::O_WRONLY {
-        ResourceAccess::OpenWrite
+        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Write)
     } else if acc == libc::O_RDWR {
-        ResourceAccess::OpenReadWrite
+        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::ReadWrite)
     } else {
-        ResourceAccess::OpenRead
+        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read)
     };
     Some(SyscallTarget::Resource(ResourceTarget {
         kind: ResourceKind::Device,

@@ -111,8 +111,12 @@ fn upsert_resource_rule(
 
     for rule in rules.drain(..) {
         if rule.kind == kind && resource_path_key(&rule.path) == key {
-            merged_access = merged_access.union(rule.access).unwrap_or(merged_access);
-            insert_index.get_or_insert(retained.len());
+            if let Some(union) = merged_access.union(rule.access) {
+                merged_access = union;
+                insert_index.get_or_insert(retained.len());
+            } else {
+                retained.push(rule);
+            }
         } else {
             retained.push(rule);
         }
@@ -471,7 +475,8 @@ impl PolicyStore {
 mod tests {
     use super::*;
     use agent_sandbox_core::{
-        HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, Policy, atomic_write_policy,
+        HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, Policy, ResourceAccess,
+        ResourceKind, SocketAccess, atomic_write_policy,
     };
 
     fn target(method: &str) -> HttpRuleTarget {
@@ -507,5 +512,28 @@ mod tests {
         assert_eq!(policy.network.http.allow[0].methods, vec!["GET".to_owned()]);
         assert_eq!(policy.network.http.deny.len(), 1);
         assert_eq!(policy.network.http.deny[0].methods, vec!["POST".to_owned()]);
+    }
+    #[test]
+    fn persist_resource_rules_merges_connect_and_send_into_all() {
+        let mut rules = Vec::new();
+        let path = Path::new("/tmp/example.sock");
+
+        upsert_resource_rule(
+            &mut rules,
+            ResourceKind::UnixSocket,
+            path,
+            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            "connect",
+        );
+        upsert_resource_rule(
+            &mut rules,
+            ResourceKind::UnixSocket,
+            path,
+            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send),
+            "send",
+        );
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].access, ResourceAccess::Socket(SocketAccess::All));
     }
 }
