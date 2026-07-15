@@ -72,6 +72,70 @@ let
     invoking user's ``$HOME``, or ``/…`` for absolute host paths.
   '';
 
+  httpUrlType = lib.types.addCheck lib.types.str (
+    url:
+    let
+      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[A-Za-z0-9*._-]+)(:[0-9]{1,5})?(/[^?#[:space:]]*)?$" url;
+      path = if match == null then null else builtins.elemAt match 2;
+      globSafe = path == null || builtins.match ".*[][{}\\\\].*" path == null;
+      port = if match == null then null else builtins.elemAt match 1;
+      portDigits =
+        if port == null then null else builtins.substring 1 (builtins.stringLength port - 1) port;
+      normalizedPort =
+        if portDigits == null then
+          null
+        else
+          let
+            normalized = builtins.match "0*([1-9][0-9]*|0)" portDigits;
+          in
+          if normalized == null then null else builtins.elemAt normalized 0;
+      portValue =
+        if normalizedPort == null then null else builtins.tryEval (builtins.fromJSON normalizedPort);
+    in
+    lib.assertMsg
+      (
+        match != null
+        && globSafe
+        && (port == null || (portValue.success && portValue.value >= 1 && portValue.value <= 65535))
+      )
+      "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with a valid port and no query or fragment, got: ${url}"
+  );
+
+  httpMethodType = lib.types.addCheck lib.types.str (
+    method:
+    lib.assertMsg (
+      builtins.stringLength method <= 64 && builtins.match "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" method != null
+    ) "agent-sandbox HTTP rule methods must contain valid HTTP method tokens, got: ${method}"
+  );
+
+  httpRuleType = lib.types.submodule {
+    options = {
+      url = lib.mkOption {
+        type = httpUrlType;
+        description = "Absolute HTTP(S) URL to match.";
+      };
+      methods = lib.mkOption {
+        type = lib.types.nullOr (lib.types.listOf httpMethodType);
+        default = null;
+        description = "HTTP method token list to match; empty means all methods only with allMethods = true.";
+      };
+      allMethods = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Match every HTTP method at this URL.";
+      };
+      comment = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional operator comment for this rule.";
+      };
+    };
+  };
+  httpRules = {
+    type = lib.types.listOf httpRuleType;
+    default = [ ];
+  };
+
   ruleType = lib.types.submodule {
     options = {
       host = lib.mkOption { type = lib.types.str; };
@@ -371,6 +435,20 @@ in
       };
       httpProxy = {
         enable = lib.mkEnableOption "transparent HTTP interception through the trusted proxy RPC";
+        declarativeAllow = lib.mkOption {
+          inherit (httpRules) type;
+          default = [ ];
+          description = ''
+            HTTP(S) URL rules allowed without interactive approval. Each rule
+            must set either a non-empty ``methods`` list or ``allMethods = true``.
+          '';
+        };
+
+        declarativeDeny = lib.mkOption {
+          inherit (httpRules) type;
+          default = [ ];
+          description = "HTTP(S) URL rules denied even when another policy allows them.";
+        };
 
         wireguardPort = lib.mkOption {
           type = lib.types.ints.between 1 65535;
@@ -485,6 +563,22 @@ in
         assertion = !cfg.network.httpProxy.enable || cfg.network.enable;
         message = "agent-sandbox.network.httpProxy.enable requires network.enable";
       }
+      {
+        assertion =
+          let
+            proxy = cfg.network.httpProxy;
+            rules = proxy.declarativeAllow ++ proxy.declarativeDeny;
+          in
+          proxy.enable || rules == [ ];
+        message =
+          let
+            proxy = cfg.network.httpProxy;
+            urls = map (rule: rule.url) (proxy.declarativeAllow ++ proxy.declarativeDeny);
+            suffix = lib.optionalString (urls != [ ]) " (configured URLs: ${lib.concatStringsSep ", " urls})";
+          in
+          "agent-sandbox.network.httpProxy.declarativeAllow/declarativeDeny require httpProxy.enable${suffix}";
+      }
+
       {
         assertion =
           let

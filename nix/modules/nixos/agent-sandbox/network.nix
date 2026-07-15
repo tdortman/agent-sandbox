@@ -10,6 +10,22 @@ let
 
   rootCfg = config.agent-sandbox;
   cfg = config.agent-sandbox.network;
+  httpRuleJson =
+    rule:
+    assert lib.assertMsg
+      (
+        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
+        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
+      )
+      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
+    {
+      inherit (rule) url;
+      methods = if rule.allMethods then [ ] else rule.methods;
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
+
   policyEnabled = cfg.enable || rootCfg.sudoPolicy == "approve" || rootCfg.gates.filesystem.enable;
   sandboxPkg = flake.package "agent-sandbox";
   agentSandboxLib = import ./lib.nix {
@@ -282,6 +298,10 @@ lib.mkIf policyEnabled (
             direct = {
               allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
               deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+            };
+            http = {
+              allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
+              deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
             };
           };
           sudo = {

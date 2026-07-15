@@ -69,11 +69,221 @@ let
     ];
     text = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-group-gid.sh;
   };
+  mkNixosSystem =
+    extraModule:
+    inputs.nixpkgs.lib.nixosSystem {
+      system = pkgs.stdenv.hostPlatform.system;
+      specialArgs = { inherit inputs; };
+      modules = [
+        ../../modules/nixos/agent-sandbox
+        {
+          nixpkgs.pkgs = pkgs;
+          agent-sandbox.enable = true;
+          agent-sandbox.network.enable = true;
+          system.stateVersion = "26.11";
+        }
+        extraModule
+      ];
+    };
+
+  validPolicySystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+      declarativeAllow = [
+        {
+          url = "https://api.example.com/v1";
+          allMethods = true;
+          comment = "API access";
+        }
+      ];
+      declarativeDeny = [
+        {
+          url = "https://api.example.com/v1/private";
+          methods = [ "POST" ];
+        }
+      ];
+    };
+  };
+  validPolicyJson =
+    builtins.fromJSON
+      validPolicySystem.config.environment.etc."agent-sandbox/declarative.json".text;
+  validPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com:65535/v1";
+        allMethods = true;
+      }
+    ];
+  };
+  validPortJson =
+    builtins.fromJSON
+      validPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+
+  invalidProxySystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com/v1";
+        allMethods = true;
+      }
+    ];
+  };
+  invalidModeSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com/v1";
+        methods = [ ];
+      }
+    ];
+  };
+  invalidMethodSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com/v1";
+        methods = [ (builtins.concatStringsSep "" (builtins.genList (_: "A") 65)) ];
+      }
+    ];
+  };
+  invalidUrlSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com/v1?token=secret";
+        allMethods = true;
+      }
+    ];
+  };
+  invalidFragmentSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com/v1#private";
+        allMethods = true;
+      }
+    ];
+  };
+  invalidPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com:99999/v1";
+        allMethods = true;
+      }
+    ];
+  };
+  validPaddedPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com:080/v1";
+        allMethods = true;
+      }
+    ];
+  };
+  validPaddedPortJson =
+    builtins.fromJSON
+      validPaddedPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+  validIpv6System = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://[::1]/v1";
+        allMethods = true;
+      }
+    ];
+  };
+  invalidZeroPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com:0/v1";
+        allMethods = true;
+      }
+    ];
+  };
+  invalidGlobSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://api.example.com/[";
+        allMethods = true;
+      }
+    ];
+  };
+
+  declarativeHttpContract =
+    assert
+      validPolicyJson.network.direct == {
+        allow = [ ];
+        deny = [ ];
+      };
+    assert
+      validPolicyJson.network.http.allow == [
+        {
+          url = "https://api.example.com/v1";
+          methods = [ ];
+          comment = "API access";
+        }
+      ];
+    assert
+      validPolicyJson.network.http.deny == [
+        {
+          url = "https://api.example.com/v1/private";
+          methods = [ "POST" ];
+        }
+      ];
+    assert !(lib.all (assertion: assertion.assertion) invalidProxySystem.config.assertions);
+    assert
+      !(builtins.tryEval invalidModeSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    assert
+      !(builtins.tryEval invalidMethodSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    assert
+      !(builtins.tryEval invalidUrlSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    assert
+      !(builtins.tryEval
+        invalidFragmentSystem.config.environment.etc."agent-sandbox/declarative.json".text
+      ).success;
+
+    assert
+      !(builtins.tryEval invalidPortSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    assert
+      validPortJson.network.http.allow == [
+        {
+          url = "https://api.example.com:65535/v1";
+          methods = [ ];
+        }
+      ];
+    assert
+      validPaddedPortJson.network.http.allow == [
+        {
+          url = "https://api.example.com:080/v1";
+          methods = [ ];
+        }
+      ];
+    assert
+      (builtins.tryEval validIpv6System.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    assert
+      !(builtins.tryEval
+        invalidZeroPortSystem.config.environment.etc."agent-sandbox/declarative.json".text
+      ).success;
+    assert
+      !(builtins.tryEval invalidGlobSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    true;
 
   script = wrapper: "$(readlink -f ${wrapper}/bin/hello)";
 in
 pkgs.runCommand "network-mode-wrapper-regression" { } ''
   fail() { echo "FAIL: $*" >&2; exit 1; }
+  test "${if declarativeHttpContract then "ok" else "failed"}" = ok
+
 
   static_direct=${script staticDirect}
   static_proxy=${script staticProxy}
