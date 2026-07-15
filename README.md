@@ -5,9 +5,9 @@ Sandbox AI agent CLIs in a bubblewrap jail on NixOS. Intercepts network, filesys
 ## What it gates
 
 - **Network** (NFQUEUE + seccomp): each sandbox gets its own netns. Outbound TCP/UDP is captured at the kernel level. A seccomp broker also traps `connect`, `sendto`, `sendmsg`, `sendmmsg` so a short-timeout UDP client blocks inside the kernel until you answer the prompt, not before.
-- **Decoded HTTP (optional)**: `network.httpProxy.enable` routes HTTP/1.1 and HTTP/2 through the trusted mitmproxy WireGuard service. UDP/443 (HTTP/3/QUIC) receives only a transport-level check, not decoded HTTP policy. HTTP rules match method, authority, effective port, and normalized path; query strings and fragments are never persisted or sent to policyd. Destinations that remain local, including loopback, receive the transport policy check instead of HTTP interception. Generic TCP/UDP remains transport-gated and unsupported or failed interception is denied.
+- **Decoded HTTP (optional)**: `network.httpProxy.enable` routes HTTP/1.1, HTTP/2, and HTTP/3 requests parsed by the trusted mitmproxy WireGuard service into decoded HTTP policy. HTTP rules match method, authority, effective port, and normalized path; query strings and fragments are never persisted or sent to policyd. Destinations that remain local, including loopback, receive the transport policy check instead of HTTP interception. Generic TCP/UDP remains transport-gated.
 - **Filesystem** (fanotify): in dynamic mode (`gates.filesystem.enable`), fanotify mediates every file open. Access is classified as read, write, read-write, or execute by reading the blocked tracee's syscall arguments from `/proc/{pid}/syscall`. Stale verdicts in fanotify's event fd are avoided this way. Static bwrap mounts still define the structural read-only/read-write boundary.
-- **Resources** (seccomp): `gates.resources.enable` traps `connect`, `open`, `openat`, `openat2`, `creat` to gate AF_UNIX sockets under `/run` and device nodes under `/dev`. The broker emulates the syscall itself via `pidfd_getfd` so the tracee never touches the gated resource directly (no TOCTOU).
+- **Resources** (seccomp): `gates.resources.enable` traps `connect`, `sendto`, `sendmsg`, `sendmmsg`, `open`, `openat`, `openat2`, and `creat` to gate all AF_UNIX sockets and device nodes under `/dev`. Socket `connect` and `send` permissions are distinct because unconnected datagram sockets can send directly; `all` grants both. Host control-plane IPC is hard-denied: system and user D-Bus buses, systemd manager sockets, and known systemd/D-Bus abstract endpoints cannot be approved; other abstract AF_UNIX sockets remain available for explicit policy.
 - **Sudo**: `sudoPolicy = "approve"` intercepts `sudo` inside the sandbox. Approved commands run as root on the host, not inside the jail. Sudo rules match by argv prefix, so approving `["systemctl"]` permits any subcommand. Approving interpreters like `["bash"]` grants arbitrary code execution as root. Bare argv[0] names resolve through `/run/current-system/sw/bin`; absolute argv[0] paths must be under `/run/current-system`. After canonicalization, the target must be a regular file under `/nix/store`. Symlinks from outside the system profile are rejected, preventing path traversal and multi-call binary spoofing.
 
 ## Policy
@@ -45,7 +45,7 @@ Both policy files are write-protected: policyd injects implicit deny-write rules
     "deny": [{ "path": "./**/.env", "access": "read_write" }]
   },
   "resources": {
-    "allow": [{ "kind": "unix_socket", "path": "/run/user/1000/bus", "access": "connect" }],
+    "allow": [{ "kind": "unix_socket", "path": "/tmp/example.sock", "access": "connect" }],
     "deny": [{ "kind": "device", "path": "/dev/mem", "access": "open_read_write" }]
   }
 }
@@ -134,7 +134,6 @@ All other traffic keeps the namespace's ordinary kernel route and is gated by th
 This lets decoded HTTP/HTTPS reach the addon without a duplicate `tcp://host:port` transport prompt.
 The addon opens one liveness session at startup and claims each registered flow.
 Decoded HTTP requests use `CheckHttp`; raw fallback uses deferred cancellable `CheckNetworkFlow`, except opaque TCP/TLS on ports 443 and 8443, which is killed fail-closed.
-UDP/443 is treated as an HTTP/3-over-QUIC transport check.
 
 ## Repository
 
