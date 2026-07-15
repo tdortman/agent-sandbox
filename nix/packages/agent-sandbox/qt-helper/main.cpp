@@ -1,28 +1,23 @@
 // Standalone Qt dialog helper for agent-sandbox policy prompts.
 // No KDE or GTK dependencies, just Qt Widgets.
-//
-// Usage:
-//   agent-sandbox-qt-dialog --title <window-title> --text <prompt-text> \
-//       --option <label> [--option <label> ...]
-//   agent-sandbox-qt-dialog --title <window-title> --text <prompt-text> \
-//       --input <default-text>
-//
-// Exactly one input mode is required: one or more --option (button mode) OR
-// exactly one --input (text-entry mode). They are mutually exclusive.
-//
-// Button mode: on user selection of an option, prints the exact label text to
-// stdout and exits 0. If the user closes the dialog or presses
-// Cancel/Escape, exits nonzero with no output.
-// Input mode: shows a text field pre-populated with <default-text>; on OK
-// (or Enter) prints the (possibly edited) text to stdout and exits 0; on
-// cancel/close/escape exits nonzero with no output.
 #include <getopt.h>
 #include <cstdio>
 #include <cstdlib>
 #include <QApplication>
+#include <QComboBox>
 #include <QDialog>
+#include <QFormLayout>
 #include <QFrame>
+#include <QGroupBox>
+#include <QHash>
 #include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonParseError>
+#include <QList>
+#include <QJsonObject>
+#include <QFontDatabase>
+#include <QLabel>
 #include <QLineEdit>
 #include <QPalette>
 #include <QPushButton>
@@ -30,35 +25,25 @@
 #include <QTextEdit>
 #include <QTextOption>
 #include <QVBoxLayout>
+#include <QStringList>
 #include <string>
 #include <vector>
+
+static constexpr qint64 MAX_REVIEW_REQUEST_BYTES = 64 * 1024;
 
 static void usage(FILE* fp, const char* argv0) {
     fprintf(
         fp,
-        "Usage: %s --title <title> --text <text> "
+        "Usage: %s --review | --title <title> --text <text> "
         "--option <label> [--option <label> ...] | --input <default-text>\n",
         argv0
     );
     std::exit(fp == stderr ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
-// Build a read-only text widget that reflows dynamically as the dialog is
-// resized. WrapAtWordBoundaryOrAnywhere prefers word boundaries but breaks
-// inside unbroken tokens (paths, base64 blobs) when a single word is wider
-// than the widget, so nothing overflows even on narrow windows.
-// Text widget sized to exactly fit its content so the dialog is only as tall as
-// the text needs. QTextEdit's sizeHint and minimumSizeHint are content-agnostic
-// (a ~3-line floor), so without these overrides a one-line prompt left the
-// dialog tall with empty space above/below the text and below the buttons.
-// hasHeightForWidth + heightForWidth let the layout size the dialog to the text
-// at any width; minimumSizeHint lifts the built-in floor so a single line is one
-// line tall. QTextEdit already relays the document to the viewport on resize, so
-// wrapped text (long domains/paths/commands) reflows without extra plumbing.
 class FitText : public QTextEdit {
    public:
     explicit FitText(const QString& text, QWidget* parent = nullptr) : QTextEdit(text, parent) {
-        // Content always fits, so scrollbars would just steal layout width.
         setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     }
@@ -66,42 +51,431 @@ class FitText : public QTextEdit {
     bool hasHeightForWidth() const override {
         return true;
     }
-
-    // QAbstractScrollArea floors the widget at ~3 lines via minimumSizeHint;
-    // the real minimum is the content height, so report 0 and let
-    // heightForWidth drive the size.
     QSize minimumSizeHint() const override {
         return QSize(QTextEdit::minimumSizeHint().width(), 0);
     }
-
     int heightForWidth(int w) const override {
         const int inner = w - 2 * frameWidth();
-        if (inner <= 0) {
-            return -1;
-        }
+        if (inner <= 0) return -1;
         auto* doc = const_cast<QTextDocument*>(document());
         doc->setTextWidth(qreal(inner));
         return qCeil(doc->size().height()) + 2 * frameWidth();
     }
 };
 
+static QByteArray readBoundedLine() {
+    QByteArray input;
+    char buffer[4096];
+    while (std::fgets(buffer, int(sizeof(buffer)), stdin) != nullptr) {
+        input.append(buffer);
+        if (input.size() > MAX_REVIEW_REQUEST_BYTES) return {};
+        if (input.endsWith('\n')) return input;
+    }
+    return {};
+}
+
+static int runReview() {
+    const QByteArray input = readBoundedLine();
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(input, &error);
+    if (input.isEmpty() || error.error != QJsonParseError::NoError || !document.isObject()) {
+        return EXIT_FAILURE;
+    }
+    const QJsonObject request = document.object();
+    if (request.value("version").toInt() != 1 || !request.value("summary").isString() ||
+        !request.value("context").isArray() || !request.value("scopes").isArray() ||
+        !request.value("fields").isArray()) {
+        return EXIT_FAILURE;
+    }
+
+    QDialog dialog;
+    dialog.setWindowTitle("agent-sandbox approval");
+    dialog.setMinimumWidth(520);
+    auto* layout = new QVBoxLayout(&dialog);
+
+    const QJsonValue rawPresentation = request.value("presentation");
+    if (!rawPresentation.isUndefined() &&
+        (!rawPresentation.isObject() ||
+         !rawPresentation.toObject().value("heading").isString() ||
+         !rawPresentation.toObject().value("subject").isString())) {
+        return EXIT_FAILURE;
+    }
+    const bool structured = !rawPresentation.isUndefined();
+    const QJsonObject presentation = rawPresentation.toObject();
+    if (structured) {
+        auto* heading = new QLabel(presentation.value("heading").toString(), &dialog);
+        heading->setTextFormat(Qt::PlainText);
+        heading->setWordWrap(true);
+        auto headingFont = heading->font();
+        headingFont.setBold(true);
+        headingFont.setPointSize(headingFont.pointSize() + 2);
+        heading->setFont(headingFont);
+        heading->setAccessibleName("Request heading");
+        heading->setFocusPolicy(Qt::NoFocus);
+        layout->addWidget(heading);
+
+        auto* subject = new QLabel(presentation.value("subject").toString(), &dialog);
+        subject->setTextFormat(Qt::PlainText);
+        subject->setWordWrap(true);
+        subject->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        subject->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        subject->setAccessibleName("Requested target");
+        subject->setFocusPolicy(Qt::NoFocus);
+        layout->addWidget(subject);
+    } else {
+        auto* summary = new QLabel(request.value("summary").toString(), &dialog);
+        summary->setTextFormat(Qt::PlainText);
+        summary->setWordWrap(true);
+        summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        summary->setAccessibleName("Request summary");
+        summary->setFocusPolicy(Qt::NoFocus);
+        layout->addWidget(summary);
+    }
+
+    const QJsonArray context = request.value("context").toArray();
+    if (!context.isEmpty()) {
+        if (structured) {
+            auto* contextLayout = new QFormLayout();
+            contextLayout->setContentsMargins(0, 4, 0, 0);
+            contextLayout->setHorizontalSpacing(12);
+            contextLayout->setVerticalSpacing(4);
+            contextLayout->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+            contextLayout->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
+            contextLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+            for (const QJsonValue& raw : context) {
+                const QJsonObject item = raw.toObject();
+                if (!item.value("label").isString() || !item.value("value").isString()) {
+                    return EXIT_FAILURE;
+                }
+                const QString label = item.value("label").toString();
+                const QString displayValue = item.value("value").toString();
+                auto* contextLabel = new QLabel(label, &dialog);
+                contextLabel->setTextFormat(Qt::PlainText);
+                contextLabel->setWordWrap(true);
+                contextLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                contextLabel->setAccessibleName(label);
+                contextLabel->setFocusPolicy(Qt::NoFocus);
+                auto* contextValue = new QLabel(displayValue, &dialog);
+                contextValue->setTextFormat(Qt::PlainText);
+                contextValue->setWordWrap(true);
+                contextValue->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                contextValue->setToolTip(displayValue);
+                contextValue->setAccessibleName(label);
+                contextValue->setAccessibleDescription(displayValue);
+                contextValue->setFocusPolicy(Qt::NoFocus);
+                contextLayout->addRow(contextLabel, contextValue);
+            }
+            layout->addLayout(contextLayout);
+        } else {
+            auto* contextLayout = new QVBoxLayout();
+            contextLayout->setSpacing(2);
+            for (const QJsonValue& raw : context) {
+                const QJsonObject item = raw.toObject();
+                if (!item.value("label").isString() || !item.value("value").isString()) {
+                    return EXIT_FAILURE;
+                }
+                const QString label = item.value("label").toString();
+                const QString displayValue = item.value("value").toString();
+                auto* contextLabel = new QLabel(label + ": " + displayValue, &dialog);
+                contextLabel->setTextFormat(Qt::PlainText);
+                contextLabel->setWordWrap(true);
+                contextLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                contextLabel->setToolTip(displayValue);
+                contextLabel->setAccessibleName(label);
+                contextLabel->setAccessibleDescription(displayValue);
+                contextLabel->setFocusPolicy(Qt::NoFocus);
+                contextLayout->addWidget(contextLabel);
+            }
+            layout->addLayout(contextLayout);
+        }
+    }
+
+    auto* scope = new QComboBox(&dialog);
+    const QJsonArray scopes = request.value("scopes").toArray();
+    for (const QJsonValue& raw : scopes) {
+        const QJsonObject item = raw.toObject();
+        if (!item.value("value").isString() || !item.value("label").isString()) {
+            return EXIT_FAILURE;
+        }
+        scope->addItem(item.value("label").toString(), item.value("value").toString());
+    }
+    if (scope->count() == 0 || scope->itemData(0).toString() != "once") return EXIT_FAILURE;
+    auto* scopeLayout = new QFormLayout();
+    scopeLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    scopeLayout->addRow(structured ? "Allow for:" : "Scope:", scope);
+    layout->addLayout(scopeLayout);
+
+    QWidget* targets = nullptr;
+    QFormLayout* targetLayout = nullptr;
+    if (structured) {
+        targets = new QWidget(&dialog);
+        auto* targetSection = new QVBoxLayout(targets);
+        targetSection->setContentsMargins(0, 6, 0, 0);
+        targetSection->setSpacing(4);
+        auto* targetHeading = new QLabel("Future request rule", targets);
+        targetHeading->setTextFormat(Qt::PlainText);
+        targetHeading->setAccessibleName("Future request rule");
+        targetHeading->setFocusPolicy(Qt::NoFocus);
+        auto targetHeadingFont = targetHeading->font();
+        targetHeadingFont.setBold(true);
+        targetHeading->setFont(targetHeadingFont);
+        targetSection->addWidget(targetHeading);
+        targetLayout = new QFormLayout();
+        targetLayout->setContentsMargins(0, 0, 0, 0);
+        targetLayout->setHorizontalSpacing(12);
+        targetLayout->setVerticalSpacing(4);
+        targetLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        targetSection->addLayout(targetLayout);
+    } else {
+        auto* group = new QGroupBox("Rule for future requests", &dialog);
+        targets = group;
+        targetLayout = new QFormLayout(group);
+        targetLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    }
+    QHash<QString, QWidget*> controls;
+    QList<QWidget*> fieldOrder;
+    const QJsonArray fields = request.value("fields").toArray();
+    for (const QJsonValue& raw : fields) {
+        const QJsonObject field = raw.toObject();
+        const QString id = field.value("id").toString();
+        const QString label = field.value("label").toString();
+        const QString kind = field.value("kind").toString();
+        if (id.isEmpty() || label.isEmpty() || controls.contains(id)) return EXIT_FAILURE;
+        QWidget* control = nullptr;
+        if (kind == "text" && field.value("value").isString()) {
+            control = new QLineEdit(field.value("value").toString(), targets);
+        } else if (
+            kind == "choice" && field.value("value").isString() && field.value("options").isArray()
+        ) {
+            auto* combo = new QComboBox(targets);
+            for (const QJsonValue& rawOption : field.value("options").toArray()) {
+                const QJsonObject option = rawOption.toObject();
+                if (!option.value("value").isString() || !option.value("label").isString()) {
+                    return EXIT_FAILURE;
+                }
+                combo->addItem(option.value("label").toString(), option.value("value").toString());
+            }
+            const int selected = combo->findData(field.value("value").toString());
+            if (combo->count() == 0 || selected < 0) return EXIT_FAILURE;
+            combo->setCurrentIndex(selected);
+            control = combo;
+        } else {
+            return EXIT_FAILURE;
+        }
+        control->setAccessibleName(label);
+        controls.insert(id, control);
+        fieldOrder.append(control);
+        targetLayout->addRow(label + ":", control);
+    }
+    layout->addWidget(targets);
+    auto* errorLabel = new QLabel(&dialog);
+    errorLabel->setWordWrap(true);
+    if (structured) {
+        auto errorPalette = errorLabel->palette();
+        errorPalette.setColor(
+            QPalette::WindowText, dialog.palette().color(QPalette::WindowText)
+        );
+        errorLabel->setPalette(errorPalette);
+    } else {
+        errorLabel->setStyleSheet("QLabel { color: red; }");
+    }
+    errorLabel->hide();
+    layout->addWidget(errorLabel);
+
+    auto* buttons = new QHBoxLayout();
+    auto* deny = new QPushButton("Deny", &dialog);
+    auto* allow = new QPushButton("Allow once", &dialog);
+    deny->setDefault(true);
+    deny->setAutoDefault(true);
+    deny->setFocus();
+    buttons->addStretch(1);
+    buttons->addWidget(deny);
+    buttons->addWidget(allow);
+    layout->addLayout(buttons);
+
+    QWidget* lastTab = scope;
+    for (QWidget* control : fieldOrder) {
+        QWidget::setTabOrder(lastTab, control);
+        lastTab = control;
+    }
+    QWidget::setTabOrder(lastTab, deny);
+    QWidget::setTabOrder(deny, allow);
+
+    QString action = "deny";
+    const auto buildResult = [&]() {
+        QJsonObject values;
+        for (auto it = controls.constBegin(); it != controls.constEnd(); ++it) {
+            if (auto* edit = qobject_cast<QLineEdit*>(it.value())) {
+                values.insert(it.key(), edit->text());
+            } else if (auto* combo = qobject_cast<QComboBox*>(it.value())) {
+                values.insert(it.key(), combo->currentData().toString());
+            }
+        }
+        const QJsonObject result{
+            {"action", action}, {"scope", scope->currentData().toString()}, {"values", values}
+        };
+        return QJsonDocument(result).toJson(QJsonDocument::Compact);
+    };
+    const auto writeResult = [&]() {
+        const QByteArray output = buildResult();
+        if (std::fwrite(output.constData(), 1, size_t(output.size()), stdout) !=
+                size_t(output.size()) ||
+            std::fputc('\n', stdout) == EOF) {
+            return false;
+        }
+        std::fflush(stdout);
+        return true;
+    };
+    const auto readValidation = [&]() {
+        char line[4096];
+        if (std::fgets(line, int(sizeof(line)), stdin) == nullptr) return -1;
+        QJsonParseError parseError;
+        const auto response =
+            QJsonDocument::fromJson(QByteArray(line).trimmed(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !response.isObject()) return -1;
+        const QJsonObject object = response.object();
+        if (object.value("valid").toBool()) return 1;
+        errorLabel->setText(object.value("error").toString("Invalid input."));
+        errorLabel->show();
+        return 0;
+    };
+    const auto submit = [&]() {
+        if (!writeResult()) {
+            dialog.done(QDialog::Rejected);
+            return;
+        }
+        const int validation = readValidation();
+        if (validation > 0) {
+            dialog.done(QDialog::Accepted);
+        } else if (validation < 0) {
+            dialog.done(QDialog::Rejected);
+        }
+    };
+
+    QObject::connect(deny, &QPushButton::clicked, &dialog, [&]() {
+        action = "deny";
+        submit();
+    });
+    QObject::connect(allow, &QPushButton::clicked, &dialog, [&]() {
+        action = "allow";
+        submit();
+    });
+    const auto updateScope = [&]() {
+        const QString scopeValue = scope->currentData().toString();
+        const bool once = scopeValue == "once";
+        targets->setEnabled(!once);
+        if (once) {
+            allow->setText("Allow once");
+        } else if (scopeValue == "global") {
+            allow->setText("Allow globally");
+        } else {
+            allow->setText("Allow for " + scope->currentText().toLower());
+        }
+    };
+    QObject::connect(scope, qOverload<int>(&QComboBox::currentIndexChanged), &dialog, [&](int) {
+        updateScope();
+    });
+    updateScope();
+
+    return dialog.exec() == QDialog::Accepted ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int runLegacy(
+    const std::string& title,
+    const std::string& text,
+    const std::vector<std::string>& options,
+    const std::string& inputDefault
+) {
+    QDialog dialog;
+    dialog.setWindowTitle(QString::fromStdString(title));
+    dialog.setMinimumWidth(400);
+    auto* mainLayout = new QVBoxLayout(&dialog);
+    auto* prompt = new FitText(QString::fromStdString(text), &dialog);
+    prompt->setReadOnly(true);
+    prompt->setFrameShape(QFrame::NoFrame);
+    prompt->setFocusPolicy(Qt::NoFocus);
+    QPalette promptPalette = prompt->palette();
+    promptPalette.setColor(QPalette::Base, dialog.palette().color(QPalette::Window));
+    prompt->setPalette(promptPalette);
+    prompt->setFont(dialog.font());
+    prompt->setLineWrapMode(QTextEdit::WidgetWidth);
+    prompt->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    mainLayout->addWidget(prompt);
+
+    QLineEdit* edit = nullptr;
+    auto* btnLayout = new QVBoxLayout();
+    mainLayout->addLayout(btnLayout);
+    std::string selected;
+    if (!options.empty()) {
+        for (const auto& opt : options) {
+            auto* btn = new QPushButton(QString::fromStdString(opt), &dialog);
+            btn->setStyleSheet("text-align: left; padding: 6px 12px;");
+            btn->setMinimumHeight(btn->fontMetrics().height() + 12 + 8);
+            btnLayout->addWidget(btn);
+            QObject::connect(btn, &QPushButton::clicked, [&dialog, &selected, opt]() {
+                selected = opt;
+                dialog.accept();
+            });
+        }
+    } else {
+        edit = new QLineEdit(QString::fromStdString(inputDefault), &dialog);
+        edit->selectAll();
+        edit->setFocus();
+        auto* btnRow = new QHBoxLayout();
+        btnRow->addStretch(1);
+        auto* okBtn = new QPushButton("OK", &dialog);
+        okBtn->setDefault(true);
+        auto* cancelBtn = new QPushButton("Cancel", &dialog);
+        btnRow->addWidget(okBtn);
+        btnRow->addWidget(cancelBtn);
+        QObject::connect(okBtn, &QPushButton::clicked, &dialog, &QDialog::accept);
+        QObject::connect(edit, &QLineEdit::returnPressed, &dialog, &QDialog::accept);
+        QObject::connect(cancelBtn, &QPushButton::clicked, &dialog, &QDialog::reject);
+        mainLayout->addWidget(edit);
+        mainLayout->addLayout(btnRow);
+    }
+
+    const int dlgW = qMax(dialog.sizeHint().width(), dialog.minimumWidth());
+    const int contentW =
+        dlgW - mainLayout->contentsMargins().left() - mainLayout->contentsMargins().right();
+    QTextDocument measureDoc(QString::fromStdString(text));
+    measureDoc.setDefaultFont(prompt->font());
+    QTextOption to = measureDoc.defaultTextOption();
+    to.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    measureDoc.setDefaultTextOption(to);
+    measureDoc.setTextWidth(qreal(contentW));
+    prompt->setMinimumHeight(qCeil(measureDoc.size().height()));
+    if (btnLayout->itemAt(0) != nullptr) {
+        if (auto* firstBtn = btnLayout->itemAt(0)->widget()) firstBtn->setFocus();
+    }
+    if (dialog.exec() != QDialog::Accepted) return EXIT_FAILURE;
+    std::string result;
+    if (!options.empty())
+        result = selected;
+    else if (edit != nullptr)
+        result = edit->text().toStdString();
+    if (result.empty()) return EXIT_FAILURE;
+    std::printf("%s\n", result.c_str());
+    std::fflush(stdout);
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char* argv[]) {
     std::string title;
     std::string text;
     std::vector<std::string> options;
     std::string inputDefault;
-
-    enum { OPT_TITLE = 256, OPT_TEXT, OPT_OPTION, OPT_INPUT };
-
+    bool review = false;
+    enum { OPT_TITLE = 256, OPT_TEXT, OPT_OPTION, OPT_INPUT, OPT_REVIEW };
     static struct option long_opts[] = {
         {"title", required_argument, nullptr, OPT_TITLE},
         {"text", required_argument, nullptr, OPT_TEXT},
         {"option", required_argument, nullptr, OPT_OPTION},
         {"input", required_argument, nullptr, OPT_INPUT},
+        {"review", no_argument, nullptr, OPT_REVIEW},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
-
     int ch;
     while ((ch = getopt_long(argc, argv, "h", long_opts, nullptr)) != -1) {
         switch (ch) {
@@ -117,6 +491,9 @@ int main(int argc, char* argv[]) {
             case OPT_INPUT:
                 inputDefault = optarg;
                 break;
+            case OPT_REVIEW:
+                review = true;
+                break;
             case 'h':
                 usage(stdout, argv[0]);
                 break;
@@ -124,132 +501,15 @@ int main(int argc, char* argv[]) {
                 usage(stderr, argv[0]);
         }
     }
-
-    // title and text are required in both modes; exactly one input mode
-    // (options xor inputDefault) is required.
     const bool haveOptions = !options.empty();
     const bool haveInput = !inputDefault.empty();
-    if (title.empty() || text.empty() || (haveOptions == haveInput)) {
+    if (review) {
+        if (!title.empty() || !text.empty() || haveOptions || haveInput) usage(stderr, argv[0]);
+    } else if (title.empty() || text.empty() || (haveOptions == haveInput)) {
         usage(stderr, argv[0]);
     }
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("agent-sandbox");
-
-    QDialog dialog;
-    dialog.setWindowTitle(QString::fromStdString(title));
-    dialog.setMinimumWidth(400);
-
-    auto* mainLayout = new QVBoxLayout(&dialog);
-
-    // Read-only text widget sized to exactly fit its content (see FitText).
-    auto* prompt = new FitText(QString::fromStdString(text), &dialog);
-    prompt->setReadOnly(true);
-    prompt->setFrameShape(QFrame::NoFrame);
-    prompt->setFocusPolicy(Qt::NoFocus);
-
-    // Use the dialog's default text palette and font so the prompt looks like
-    // a label, not an editable field.
-    QPalette promptPalette = prompt->palette();
-    promptPalette.setColor(QPalette::Base, dialog.palette().color(QPalette::Window));
-    prompt->setPalette(promptPalette);
-    prompt->setFont(dialog.font());
-    prompt->setLineWrapMode(QTextEdit::WidgetWidth);
-    prompt->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
-    mainLayout->addWidget(prompt);
-
-    QLineEdit* edit = nullptr;  // input mode (assigned below); nullptr in button mode
-    auto* btnLayout = new QVBoxLayout();
-    mainLayout->addLayout(btnLayout);
-
-    // Track which option was selected. Captured by the click lambda.
-    std::string selected;
-
-    if (!options.empty()) {
-        // BUTTON MODE: one QPushButton per option.
-        for (const auto& opt : options) {
-            auto* btn = new QPushButton(QString::fromStdString(opt), &dialog);
-            btn->setStyleSheet("text-align: left; padding: 6px 12px;");
-            // Comfortable height so the label clears the frame
-            // (12 = stylesheet vertical padding, 8 = frame slack).
-            btn->setMinimumHeight(btn->fontMetrics().height() + 12 + 8);
-            btnLayout->addWidget(btn);
-            QObject::connect(btn, &QPushButton::clicked, [&dialog, &selected, opt]() {
-                selected = opt;
-                dialog.accept();
-            });
-        }
-    } else {
-        // INPUT MODE: a bare QLineEdit plus an OK/Cancel row. Qt's QLineEdit
-        // already binds Ctrl+Backspace/Delete to DeleteStartOfWord/
-        // DeleteEndOfWord, so path-segment deletion works with no custom
-        // key handling here.
-        edit = new QLineEdit(QString::fromStdString(inputDefault), &dialog);
-        edit->selectAll();
-        edit->setFocus();
-
-        auto* btnRow = new QHBoxLayout();
-        btnRow->addStretch(1);
-        auto* okBtn = new QPushButton("OK", &dialog);
-        okBtn->setDefault(true);
-        auto* cancelBtn = new QPushButton("Cancel", &dialog);
-        btnRow->addWidget(okBtn);
-        btnRow->addWidget(cancelBtn);
-
-        QObject::connect(okBtn, &QPushButton::clicked, &dialog, &QDialog::accept);
-        QObject::connect(edit, &QLineEdit::returnPressed, &dialog, &QDialog::accept);
-        QObject::connect(cancelBtn, &QPushButton::clicked, &dialog, &QDialog::reject);
-
-        mainLayout->addWidget(edit);
-        mainLayout->addLayout(btnRow);
-    }
-
-    // Pin the prompt's minimum height to its real wrapped height. A top-level
-    // QDialog sizes itself from the layout's sizeHint, which under-counts a
-    // height-for-width child by ~1 wrapped line; that left the dialog a hair
-    // too short, so the layout crushed the inter-button spacing by a different
-    // amount per prompt stage, making the gaps look inconsistent. Measured
-    // with a throwaway QTextDocument at the dialog's actual width; setting the
-    // prompt's minimum (not the dialog's) keeps height-for-width sizing intact.
-    {
-        const int dlgW = qMax(dialog.sizeHint().width(), dialog.minimumWidth());
-        const int contentW =
-            dlgW - mainLayout->contentsMargins().left() - mainLayout->contentsMargins().right();
-        QTextDocument measureDoc(QString::fromStdString(text));
-        measureDoc.setDefaultFont(prompt->font());
-        QTextOption to = measureDoc.defaultTextOption();
-        to.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
-        measureDoc.setDefaultTextOption(to);
-        measureDoc.setTextWidth(qreal(contentW));
-        prompt->setMinimumHeight(qCeil(measureDoc.size().height()));
-    }
-
-    // In button mode, focus the first option so Enter accepts the default.
-    if (btnLayout->itemAt(0) != nullptr) {
-        if (auto* firstBtn = btnLayout->itemAt(0)->widget()) {
-            firstBtn->setFocus();
-        }
-    }
-
-    // QDialog::reject is called on window close or Escape key.
-    int ret = dialog.exec();
-
-    if (ret != QDialog::Accepted) {
-        return EXIT_FAILURE;
-    }
-
-    std::string result;
-    if (!options.empty()) {
-        result = selected;  // button mode: set by the click lambda
-    } else if (edit != nullptr) {
-        result = edit->text().toStdString();  // input mode: the edited text
-    }
-
-    if (result.empty()) {
-        return EXIT_FAILURE;
-    }
-
-    std::printf("%s\n", result.c_str());
-    std::fflush(stdout);
-    return EXIT_SUCCESS;
+    return review ? runReview() : runLegacy(title, text, options, inputDefault);
 }

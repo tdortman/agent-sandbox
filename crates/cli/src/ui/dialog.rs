@@ -1,10 +1,27 @@
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
+
+use super::options::{
+    ApprovalFormAction, ApprovalFormRequest, ApprovalFormResult, ReviewValidator,
+    scope_from_form_value,
+};
+
+const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_REVIEW_RESULT_BYTES: usize = 16 * 1024;
+const MAX_REVIEW_VALUE_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalReviewOutcome {
+    Unavailable,
+    Cancelled,
+    Submitted(ApprovalFormResult),
+}
 
 /// Mutex serialising graphical prompts: only one prompt UI at a time.
 static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
@@ -138,7 +155,137 @@ fn input_with_backends(title: &str, default_text: &str) -> Option<String> {
     let backends = graphical_backends(&env);
     first_input_text(backends.iter().map(Box::as_ref), title, default_text)
 }
+pub fn review_approval(
+    request: &ApprovalFormRequest,
+    validate: Option<&ReviewValidator>,
+) -> ApprovalReviewOutcome {
+    if !prefer_graphical() {
+        return ApprovalReviewOutcome::Unavailable;
+    }
+    let env = graphical_env();
+    if matches!(
+        env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str),
+        Some("zenity" | "none")
+    ) {
+        return ApprovalReviewOutcome::Unavailable;
+    }
+    let Some(binary) = resolve_qt_dialog(&env) else {
+        return ApprovalReviewOutcome::Unavailable;
+    };
+    qt_dialog_review(&binary, request, &env, validate).map_or(
+        ApprovalReviewOutcome::Cancelled,
+        ApprovalReviewOutcome::Submitted,
+    )
+}
 
+fn qt_dialog_review(
+    binary: &str,
+    request: &ApprovalFormRequest,
+    env: &HashMap<String, String>,
+    validate: Option<&ReviewValidator>,
+) -> Option<ApprovalFormResult> {
+    let mut encoded = serde_json::to_vec(&request.to_json()).ok()?;
+    encoded.push(b'\n');
+    if encoded.len() > MAX_REVIEW_REQUEST_BYTES {
+        return None;
+    }
+
+    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let mut child = Command::new(binary)
+        .arg("--review")
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let stdin = child.stdin.as_mut()?;
+    stdin.write_all(&encoded).ok()?;
+    stdin.flush().ok()?;
+
+    let stdout = child.stdout.take()?;
+    let mut reader = std::io::BufReader::new(stdout);
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            let _ = child.wait();
+            return None;
+        }
+        let result = parse_review_result(line.as_bytes())?;
+
+        // Cancel exits without validation. Deny with a persistent scope
+        // still needs a valid target to create the deny rule.
+        if result.action == ApprovalFormAction::Cancel {
+            if !child.wait().ok()?.success() {
+                return None;
+            }
+            return Some(result);
+        }
+
+        if validate.is_none() {
+            writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
+            stdin.flush().ok()?;
+            if !child.wait().ok()?.success() {
+                return None;
+            }
+            return Some(result);
+        }
+        let validator = validate?;
+
+        match validator(&result) {
+            Ok(()) => {
+                writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
+                stdin.flush().ok()?;
+                if !child.wait().ok()?.success() {
+                    return None;
+                }
+                return Some(result);
+            }
+            Err(error) => {
+                let response = serde_json::json!({"valid": false, "error": error});
+                writeln!(stdin, "{response}").ok()?;
+                stdin.flush().ok()?;
+            }
+        }
+    }
+}
+
+fn parse_review_result(raw: &[u8]) -> Option<ApprovalFormResult> {
+    if raw.len() > MAX_REVIEW_RESULT_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let object = value.as_object()?;
+    let action = match object.get("action")?.as_str()? {
+        "allow" => ApprovalFormAction::Allow,
+        "deny" => ApprovalFormAction::Deny,
+        "cancel" => ApprovalFormAction::Cancel,
+        _ => return None,
+    };
+    let scope = scope_from_form_value(object.get("scope")?.as_str()?)?;
+    let raw_values = object.get("values")?.as_object()?;
+    if raw_values.len() > 16 {
+        return None;
+    }
+    let mut values = HashMap::with_capacity(raw_values.len());
+    for (key, value) in raw_values {
+        let value = value.as_str()?;
+        if key.is_empty()
+            || key.len() > 64
+            || value.len() > MAX_REVIEW_VALUE_BYTES
+            || values.insert(key.clone(), value.to_owned()).is_some()
+        {
+            return None;
+        }
+    }
+    Some(ApprovalFormResult {
+        action,
+        scope,
+        values,
+    })
+}
 fn resolve_qt_dialog(env: &HashMap<String, String>) -> Option<String> {
     if let Some(p) = env.get("AGENT_SANDBOX_QT_DIALOG") {
         let path = std::path::Path::new(p);
@@ -319,7 +466,21 @@ fn zenity_input(
 
 #[cfg(test)]
 mod tests {
-    use super::{PolicyUiBackend, first_input_text, first_selected_option};
+    use super::{
+        ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
+        parse_review_result, qt_dialog_review,
+    };
+    use crate::ui::options::{ApprovalFormAction, ApprovalFormContext, ReviewValidator};
+    use agent_sandbox_core::ApprovalScope;
+    use std::collections::HashMap;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::{NamedTempFile, TempPath};
+
+    struct EofReviewHelper {
+        executable: TempPath,
+        pid_file: TempPath,
+    }
 
     struct FakeBackend {
         select_result: Option<String>,
@@ -346,6 +507,155 @@ mod tests {
         fn input_text(&self, _title: &str, _default_text: &str) -> Option<String> {
             None
         }
+    }
+    fn fake_review_helper() -> TempPath {
+        let mut helper = NamedTempFile::new().expect("create fake review helper");
+        helper
+            .write_all(
+                br#"#!/bin/sh
+IFS= read -r request || exit 10
+printf '%s\n' '{"action":"allow","scope":"project","values":{"target":"bad"}}'
+IFS= read -r response || exit 11
+if [ "$MODE" = "none" ]; then
+    case "$response" in
+        *'"valid":true'*) exit 0 ;;
+        *) exit 12 ;;
+    esac
+fi
+case "$response" in
+    *'"valid":false'*) ;;
+    *) exit 13 ;;
+esac
+printf '%s\n' '{"action":"allow","scope":"project","values":{"target":"good"}}'
+IFS= read -r response || exit 14
+case "$response" in
+    *'"valid":true'*) exit 0 ;;
+    *) exit 15 ;;
+esac
+"#,
+            )
+            .expect("write fake review helper");
+        let mut permissions = helper
+            .as_file()
+            .metadata()
+            .expect("stat fake review helper")
+            .permissions();
+        permissions.set_mode(0o700);
+        helper
+            .as_file()
+            .set_permissions(permissions)
+            .expect("make fake review helper executable");
+        helper.into_temp_path()
+    }
+    fn eof_review_helper() -> EofReviewHelper {
+        let mut helper = NamedTempFile::new().expect("create EOF review helper");
+        let pid_file = NamedTempFile::new().expect("create PID file");
+        helper
+            .write_all(
+                br#"#!/bin/sh
+IFS= read -r request || exit 10
+printf '%s' "$$" > "$PID_FILE"
+"#,
+            )
+            .expect("write EOF review helper");
+        let mut permissions = helper
+            .as_file()
+            .metadata()
+            .expect("stat EOF review helper")
+            .permissions();
+        permissions.set_mode(0o700);
+        helper
+            .as_file()
+            .set_permissions(permissions)
+            .expect("make EOF review helper executable");
+        EofReviewHelper {
+            executable: helper.into_temp_path(),
+            pid_file: pid_file.into_temp_path(),
+        }
+    }
+
+    fn review_request() -> ApprovalFormRequest {
+        ApprovalFormRequest {
+            summary: "test review".into(),
+            context: Vec::<ApprovalFormContext>::new(),
+            presentation: None,
+            scopes: vec![ApprovalScope::Once, ApprovalScope::Project],
+            fields: Vec::new(),
+        }
+    }
+
+    fn target_validator() -> ReviewValidator {
+        Box::new(|result| {
+            if result.values.get("target").map(String::as_str) == Some("good") {
+                Ok(())
+            } else {
+                Err("target mismatch".into())
+            }
+        })
+    }
+
+    #[test]
+    fn qt_dialog_review_retries_after_validation_error() {
+        let helper = fake_review_helper();
+        let mut env = HashMap::new();
+        env.insert("MODE".into(), "multi".into());
+        let request = review_request();
+        let result = qt_dialog_review(
+            helper.to_str().expect("helper path is UTF-8"),
+            &request,
+            &env,
+            Some(&target_validator()),
+        )
+        .expect("review helper should return corrected result");
+
+        assert_eq!(result.values["target"], "good");
+    }
+
+    #[test]
+    fn qt_dialog_review_acknowledges_without_validator() {
+        let helper = fake_review_helper();
+        let mut env = HashMap::new();
+        env.insert("MODE".into(), "none".into());
+        let request = review_request();
+        let result = qt_dialog_review(
+            helper.to_str().expect("helper path is UTF-8"),
+            &request,
+            &env,
+            None,
+        )
+        .expect("review helper should receive an automatic acknowledgement");
+
+        assert_eq!(result.values["target"], "bad");
+    }
+    #[test]
+    fn qt_dialog_review_reaps_helper_when_stdout_closes() {
+        let helper = eof_review_helper();
+        let mut env = HashMap::new();
+        env.insert(
+            "PID_FILE".into(),
+            helper
+                .pid_file
+                .to_str()
+                .expect("PID file path is UTF-8")
+                .into(),
+        );
+
+        let result = qt_dialog_review(
+            helper.executable.to_str().expect("helper path is UTF-8"),
+            &review_request(),
+            &env,
+            None,
+        );
+
+        assert!(result.is_none());
+        let pid = std::fs::read_to_string(&helper.pid_file)
+            .expect("helper should write its PID")
+            .parse::<u32>()
+            .expect("helper PID should be numeric");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "helper process {pid} should be reaped"
+        );
     }
 
     #[test]
@@ -394,5 +704,36 @@ mod tests {
         let result = first_selected_option(backends, "title", &["A", "B"]);
 
         assert_eq!(result, Some("A".to_string()));
+    }
+    #[test]
+    fn review_result_parses_typed_values() {
+        let result = parse_review_result(
+            br#"{"action":"allow","scope":"project","values":{"method":"get_head","url":"https://example.com/a"}}"#,
+        )
+        .expect("valid review result");
+
+        assert_eq!(result.action, ApprovalFormAction::Allow);
+        assert_eq!(result.scope, ApprovalScope::Project);
+        assert_eq!(result.values["method"], "get_head");
+    }
+
+    #[test]
+    fn review_result_rejects_unknown_action_scope_and_non_string_fields() {
+        assert!(
+            parse_review_result(br#"{"action":"approve","scope":"once","values":{}}"#).is_none()
+        );
+        assert!(
+            parse_review_result(br#"{"action":"deny","scope":"forever","values":{}}"#).is_none()
+        );
+        assert!(
+            parse_review_result(br#"{"action":"deny","scope":"once","values":{"target":42}}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_result_is_bounded() {
+        let oversized = vec![b' '; super::MAX_REVIEW_RESULT_BYTES + 1];
+        assert!(parse_review_result(&oversized).is_none());
     }
 }
