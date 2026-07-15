@@ -357,6 +357,25 @@ pub fn contract_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
     }
     path.to_path_buf()
 }
+/// Convert an absolute path under `project_root` to the `./...` shorthand.
+/// Paths outside `project_root` are returned unchanged.
+#[must_use]
+pub fn contract_project_path(path: &Path, project_root: Option<&Path>) -> PathBuf {
+    let Some(project_root) = project_root.filter(|root| !root.as_os_str().is_empty()) else {
+        return path.to_path_buf();
+    };
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let Some(relative) = canonical_path.strip_prefix(&canonical_root).ok() else {
+        return path.to_path_buf();
+    };
+    if relative.as_os_str().is_empty() {
+        return PathBuf::from(".");
+    }
+    PathBuf::from(".").join(relative)
+}
 
 /// Expand a `~/...` path to an absolute path under `home`.  Paths that do not
 /// start with `~/` are returned unchanged.  When `home` is `None`, `~/` paths
@@ -977,8 +996,8 @@ impl InodeIdentity {
 mod tests {
     use super::{
         DeviceAccess, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule,
-        SocketAccess, SudoRule, contract_home_path, expand_home_path, filesystem_approval_paths,
-        open_flags_to_file_access,
+        SocketAccess, SudoRule, contract_home_path, contract_project_path, expand_home_path,
+        filesystem_approval_paths, open_flags_to_file_access,
     };
     use std::path::{Path, PathBuf};
 
@@ -1323,6 +1342,19 @@ mod tests {
         assert_eq!(
             contract_home_path(Path::new("/home/user/"), Some(home)),
             PathBuf::from("~")
+        );
+    }
+
+    #[test]
+    fn contract_project_path_converts_unix_socket_under_project() {
+        let project = Path::new("/home/user/repo");
+        assert_eq!(
+            contract_project_path(Path::new("/home/user/repo/.agent.sock"), Some(project)),
+            PathBuf::from("./.agent.sock")
+        );
+        assert_eq!(
+            contract_project_path(Path::new("/tmp/agent.sock"), Some(project)),
+            PathBuf::from("/tmp/agent.sock")
         );
     }
 
