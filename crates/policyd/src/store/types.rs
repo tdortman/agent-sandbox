@@ -220,6 +220,14 @@ pub enum PendingKind {
     Dbus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PendingContext<'a> {
+    pub(super) cwd: Option<&'a Path>,
+    pub(super) home: Option<&'a Path>,
+    pub(super) project_root: Option<&'a Path>,
+    pub(super) sandbox_session_id: Option<&'a str>,
+}
+
 /// Discriminated union of pending approval requests.
 ///
 /// The variant determines which fields are meaningful:

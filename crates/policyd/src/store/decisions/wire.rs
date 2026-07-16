@@ -5,8 +5,8 @@ use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 use crate::wire::{PendingDecision, ScopeWire};
 
 use super::super::types::{
-    Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
-    PolicyStore,
+    Pending, PendingContext, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
+    PendingResource, PolicyStore,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionAction {
@@ -31,10 +31,7 @@ pub struct TakenPendingDecision {
 }
 
 impl PolicyStore {
-    pub(crate) fn scope_wire_for_pending_network(
-        wire: ScopeWire,
-        net: &PendingNetwork,
-    ) -> ScopeWire {
+    fn scope_wire_for_context(wire: ScopeWire, context: PendingContext<'_>) -> ScopeWire {
         let ScopeWire {
             paths,
             session_id,
@@ -43,96 +40,89 @@ impl PolicyStore {
             comment,
         } = wire;
         ScopeWire {
-            paths: paths.merged_with(net.cwd.clone(), net.home.clone(), net.project_root.clone()),
+            paths: paths.merged_with(
+                context.cwd.map(std::path::Path::to_path_buf),
+                context.home.map(std::path::Path::to_path_buf),
+                context.project_root.map(std::path::Path::to_path_buf),
+            ),
             session_id,
             owner_uid,
-            sandbox_session_id: sandbox_session_id.or_else(|| net.sandbox_session_id.clone()),
+            sandbox_session_id: sandbox_session_id
+                .or_else(|| context.sandbox_session_id.map(str::to_owned)),
             comment,
         }
+    }
+
+    pub(crate) fn scope_wire_for_pending_network(
+        wire: ScopeWire,
+        net: &PendingNetwork,
+    ) -> ScopeWire {
+        Self::scope_wire_for_context(
+            wire,
+            PendingContext {
+                cwd: net.cwd.as_deref(),
+                home: net.home.as_deref(),
+                project_root: net.project_root.as_deref(),
+                sandbox_session_id: net.sandbox_session_id.as_deref(),
+            },
+        )
     }
 
     pub(crate) fn scope_wire_for_pending_elevation(
         wire: ScopeWire,
         elev: &PendingElevation,
     ) -> ScopeWire {
-        let ScopeWire {
-            paths,
-            session_id,
-            owner_uid,
-            sandbox_session_id,
-            comment,
-        } = wire;
-        ScopeWire {
-            paths: paths.merged_with(
-                elev.cwd.clone(),
-                elev.home.clone(),
-                elev.project_root.clone(),
-            ),
-            session_id,
-            owner_uid,
-            sandbox_session_id: sandbox_session_id.or_else(|| elev.sandbox_session_id.clone()),
-            comment,
-        }
+        Self::scope_wire_for_context(
+            wire,
+            PendingContext {
+                cwd: elev.cwd.as_deref(),
+                home: elev.home.as_deref(),
+                project_root: elev.project_root.as_deref(),
+                sandbox_session_id: elev.sandbox_session_id.as_deref(),
+            },
+        )
     }
 
     pub(crate) fn scope_wire_for_pending_filesystem(
         wire: ScopeWire,
         fs: &PendingFilesystem,
     ) -> ScopeWire {
-        let ScopeWire {
-            paths,
-            session_id,
-            owner_uid,
-            sandbox_session_id,
-            comment,
-        } = wire;
-        ScopeWire {
-            paths: paths.merged_with(fs.cwd.clone(), fs.home.clone(), fs.project_root.clone()),
-            session_id,
-            owner_uid,
-            sandbox_session_id: sandbox_session_id.or_else(|| fs.sandbox_session_id.clone()),
-            comment,
-        }
+        Self::scope_wire_for_context(
+            wire,
+            PendingContext {
+                cwd: fs.cwd.as_deref(),
+                home: fs.home.as_deref(),
+                project_root: fs.project_root.as_deref(),
+                sandbox_session_id: fs.sandbox_session_id.as_deref(),
+            },
+        )
     }
 
     pub(crate) fn scope_wire_for_pending_resource(
         wire: ScopeWire,
         res: &PendingResource,
     ) -> ScopeWire {
-        let ScopeWire {
-            paths,
-            session_id,
-            owner_uid,
-            sandbox_session_id,
-            comment,
-        } = wire;
-        ScopeWire {
-            paths: paths.merged_with(res.cwd.clone(), res.home.clone(), res.project_root.clone()),
-            session_id,
-            owner_uid,
-            sandbox_session_id: sandbox_session_id.or_else(|| res.sandbox_session_id.clone()),
-            comment,
-        }
+        Self::scope_wire_for_context(
+            wire,
+            PendingContext {
+                cwd: res.cwd.as_deref(),
+                home: res.home.as_deref(),
+                project_root: res.project_root.as_deref(),
+                sandbox_session_id: res.sandbox_session_id.as_deref(),
+            },
+        )
     }
+
     pub(crate) fn scope_wire_for_pending_dbus(wire: ScopeWire, dbus: &PendingDbus) -> ScopeWire {
-        let ScopeWire {
-            paths,
-            session_id,
-            owner_uid,
-            sandbox_session_id,
-            comment,
-        } = wire;
-        ScopeWire {
-            paths: paths.merged_with(
-                dbus.cwd.clone(),
-                dbus.home.clone(),
-                dbus.project_root.clone(),
-            ),
-            session_id,
-            owner_uid,
-            sandbox_session_id: sandbox_session_id.or_else(|| dbus.sandbox_session_id.clone()),
-            comment,
-        }
+        Self::scope_wire_for_context(
+            wire,
+            PendingContext {
+                cwd: dbus.cwd.as_deref(),
+                home: dbus.home.as_deref(),
+                project_root: dbus.project_root.as_deref(),
+                sandbox_session_id: dbus.sandbox_session_id.as_deref(),
+            },
+        )
     }
 
     async fn approval_client_authorized(
