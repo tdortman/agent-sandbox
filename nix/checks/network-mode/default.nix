@@ -278,7 +278,15 @@ let
       .success;
     true;
 
-  script = wrapper: "$(readlink -f ${wrapper}/bin/hello)";
+  script = wrapper: ''
+    $(
+      _script=$(readlink -f ${wrapper}/bin/hello)
+      while _next=$(sed -n 's#.*-- \(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) .*#\1#p' "$_script") && test -n "$_next"; do
+        _script=$(readlink -f "$_next")
+      done
+      printf '%s' "$_script"
+    )
+  '';
 in
 pkgs.runCommand "network-mode-wrapper-regression" { } ''
   fail() { echo "FAIL: $*" >&2; exit 1; }

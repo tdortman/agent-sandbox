@@ -7,6 +7,7 @@ mod decisions;
 mod elevation;
 pub(crate) mod evaluator;
 mod filesystem;
+mod freeze;
 mod http;
 mod network;
 pub(crate) mod persist;
@@ -21,6 +22,7 @@ mod types;
 mod ui;
 mod ui_route;
 mod util;
+pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, HttpVerdictKey,
     MAX_CONNECTIONS_PER_UID, MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation,

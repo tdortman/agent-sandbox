@@ -236,6 +236,7 @@ in
       syscallGate = syscallArmPkg != null;
       proxyMode = runtime != null && runtime.httpProxy.enable;
       dbusMode = dbus != null && dbus.enable && dbusProxyPkg != null;
+      freezeNeedsScope = dbusMode || proxyMode;
       dbusSocketDirectory = if dbus != null then dbus.socketDirectory else "/run/user";
       dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;
       networkMode = if proxyMode then "proxy" else "direct";
@@ -657,6 +658,7 @@ in
         fi
       '') devicePaths;
       extraBwrapStr = lib.concatStringsSep " " extraBwrapArgs;
+      freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no --unit=\"agent-sandbox-$$_$RANDOM.scope\" -- ";
 
       dynamicInner = pkgs.writeShellApplication {
         name = sandboxedName;
@@ -723,7 +725,7 @@ in
           ${proxyTrustScript}
 
 
-          ${pkgs.bubblewrap}/bin/bwrap \
+          ${freezeLaunchPrefix}${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
             --tmpfs /tmp \
             --proc /proc \
@@ -773,7 +775,20 @@ in
           }
         else
           jailedDrv;
-      finalLauncher = launcher;
+      scopedLauncher =
+        if freezeNeedsScope && !dynamicFs then
+          pkgs.writeShellApplication {
+            name = sandboxedName;
+            runtimeInputs = [ pkgs.systemd ];
+            text = ''
+              set -euo pipefail
+              exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no \
+                --unit="agent-sandbox-$$_$RANDOM.scope" -- ${lib.getExe launcher} "$@"
+            '';
+          }
+        else
+          launcher;
+      finalLauncher = scopedLauncher;
 
     in
     pkgs.symlinkJoin {

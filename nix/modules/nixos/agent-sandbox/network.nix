@@ -481,6 +481,7 @@ lib.mkIf policyEnabled (
           RuntimeDirectory = "agent-sandbox";
           RuntimeDirectoryPreserve = "yes";
           Restart = "on-failure";
+          ExecStopPost = "+${policyPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
         };
         path = [
           pkgs.util-linux
