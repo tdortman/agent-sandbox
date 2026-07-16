@@ -117,8 +117,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id.clone(), Pending::Network(net));
+                    .insert_pending(Pending::Network(net));
                 return err.into();
             }
         };
@@ -203,8 +202,7 @@ impl PolicyStore {
             self.inner
                 .lock()
                 .await
-                .pending
-                .insert(pending_id, Pending::Network(net));
+                .insert_pending(Pending::Network(net));
         }
         result
     }
@@ -224,8 +222,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id.clone(), Pending::Elevation(elev));
+                    .insert_pending(Pending::Elevation(elev));
                 return err.into();
             }
         };
@@ -256,8 +253,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id, Pending::Elevation(elev));
+                    .insert_pending(Pending::Elevation(elev));
             }
             return result;
         }
@@ -279,8 +275,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id, Pending::Elevation(elev));
+                    .insert_pending(Pending::Elevation(elev));
                 return scope_result;
             }
             scope_result.scope_path()
@@ -301,8 +296,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id.clone(), Pending::Elevation(elev));
+                    .insert_pending(Pending::Elevation(elev));
                 return err.into();
             }
         };
@@ -333,8 +327,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id.clone(), Pending::Filesystem(fs));
+                    .insert_pending(Pending::Filesystem(fs));
                 return err.into();
             }
         };
@@ -414,8 +407,7 @@ impl PolicyStore {
             self.inner
                 .lock()
                 .await
-                .pending
-                .insert(pending_id, Pending::Filesystem(fs));
+                .insert_pending(Pending::Filesystem(fs));
         }
         result
     }
@@ -493,21 +485,13 @@ impl PolicyStore {
             None => res.target.clone(),
             Some(ApprovalTarget::Dbus { target }) => {
                 if !DbusRule::new(target.clone(), "").matches(&res.target) {
-                    self.inner
-                        .lock()
-                        .await
-                        .pending
-                        .insert(res.id.clone(), Pending::Dbus(res));
+                    self.inner.lock().await.insert_pending(Pending::Dbus(res));
                     return PolicydError::InvalidDecisionTarget.into();
                 }
                 target.clone()
             }
             Some(_) => {
-                self.inner
-                    .lock()
-                    .await
-                    .pending
-                    .insert(res.id.clone(), Pending::Dbus(res));
+                self.inner.lock().await.insert_pending(Pending::Dbus(res));
                 return PolicydError::InvalidDecisionTarget.into();
             }
         };
@@ -546,11 +530,7 @@ impl PolicyStore {
             )
             .await;
         } else {
-            self.inner
-                .lock()
-                .await
-                .pending
-                .insert(res.id.clone(), Pending::Dbus(res));
+            self.inner.lock().await.insert_pending(Pending::Dbus(res));
         }
         result
     }
@@ -575,8 +555,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
-                    .pending
-                    .insert(pending_id.clone(), Pending::Resource(res));
+                    .insert_pending(Pending::Resource(res));
                 return err.into();
             }
         };
@@ -659,8 +638,7 @@ impl PolicyStore {
             self.inner
                 .lock()
                 .await
-                .pending
-                .insert(pending_id, Pending::Resource(res));
+                .insert_pending(Pending::Resource(res));
         }
         result
     }
@@ -798,7 +776,8 @@ mod tests {
 
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
-        ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths, load_policy,
+        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
+        load_policy,
     };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
@@ -1120,8 +1099,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
             .approve(PendingDecision {
@@ -1176,8 +1154,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
             .approve(PendingDecision {
@@ -1250,8 +1227,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Resource(pending));
+            .insert_pending(Pending::Resource(pending));
 
         let reply = store
             .approve(PendingDecision {
@@ -1354,19 +1330,16 @@ mod tests {
         let pending_id = "dbus:once".to_owned();
         {
             let mut inner = store.inner.lock().await;
-            inner.pending.insert(
-                pending_id.clone(),
-                Pending::Dbus(PendingDbus {
-                    id: pending_id.clone(),
-                    created_at: 0.0,
-                    target: target.clone(),
-                    path: path.clone(),
-                    cwd: Some("/repo".into()),
-                    home: Some("/home/user".into()),
-                    project_root: Some("/repo".into()),
-                    sandbox_session_id: None,
-                }),
-            );
+            inner.insert_pending(Pending::Dbus(PendingDbus {
+                id: pending_id.clone(),
+                created_at: 0.0,
+                target: target.clone(),
+                path: path.clone(),
+                cwd: Some("/repo".into()),
+                home: Some("/home/user".into()),
+                project_root: Some("/repo".into()),
+                sandbox_session_id: None,
+            }));
         }
 
         let ctx = agent_sandbox_core::ResolvedRequestContext {
@@ -1437,19 +1410,16 @@ mod tests {
         let pending_id = "dbus-global-comment".to_owned();
         {
             let mut inner = store.inner.lock().await;
-            inner.pending.insert(
-                pending_id.clone(),
-                Pending::Dbus(PendingDbus {
-                    id: pending_id.clone(),
-                    created_at: 0.0,
-                    target: requested.clone(),
-                    path: PathBuf::from("@dbus:placeholder"),
-                    cwd: Some("/repo".into()),
-                    home: Some(home.clone()),
-                    project_root: None,
-                    sandbox_session_id: None,
-                }),
-            );
+            inner.insert_pending(Pending::Dbus(PendingDbus {
+                id: pending_id.clone(),
+                created_at: 0.0,
+                target: requested.clone(),
+                path: PathBuf::from("@dbus:placeholder"),
+                cwd: Some("/repo".into()),
+                home: Some(home.clone()),
+                project_root: None,
+                sandbox_session_id: None,
+            }));
         }
 
         add_ui_sessions(&store).await;
@@ -1538,8 +1508,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
         let reply = store
             .approve(PendingDecision {
                 pending_id,
@@ -1627,8 +1596,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
             .approve(PendingDecision {
@@ -1651,8 +1619,10 @@ mod tests {
             matches!(&reply, RpcReply::Error(e) if e.error == "approval not authorized for this connection"),
             "foreign uid host approval must be rejected, got: {reply:?}"
         );
+        let summaries = store.pending_summaries().await;
+        assert_eq!(summaries.len(), 1);
         assert!(
-            store.inner.lock().await.pending.contains_key(&pending_id),
+            matches!(&summaries[0], PendingSummary::Filesystem { id, .. } if id == &pending_id),
             "rejected approval must leave pending request intact"
         );
     }
@@ -1689,8 +1659,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
             .approve(PendingDecision {
@@ -1707,8 +1676,10 @@ mod tests {
             matches!(&reply, RpcReply::Error(e) if e.error == "approval not authorized for this connection"),
             "cross-sandbox Approve must be rejected, got: {reply:?}"
         );
+        let summaries = store.pending_summaries().await;
+        assert_eq!(summaries.len(), 1);
         assert!(
-            store.inner.lock().await.pending.contains_key(&pending_id),
+            matches!(&summaries[0], PendingSummary::Filesystem { id, .. } if id == &pending_id),
             "rejected approval must leave pending request intact"
         );
     }
@@ -1745,8 +1716,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
             .approve(PendingDecision {
@@ -1783,8 +1753,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert(pending_id.clone(), Pending::Filesystem(pending));
+            .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
             .approve(PendingDecision {

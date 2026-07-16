@@ -387,7 +387,7 @@ impl PolicyStore {
                     }
                 }
                 if retained.is_empty() {
-                    inner.pending.remove(&pending_id.to_string());
+                    inner.take_pending(&pending_id.to_string());
                 } else {
                     inner.http_futures.insert(pending_id, retained);
                 }
@@ -456,7 +456,7 @@ impl PolicyStore {
 }
 
 fn validate_session(
-    inner: &super::types::StoreInner,
+    inner: &super::types::PolicyDecisionState,
     token: &ProxySessionToken,
 ) -> Result<(), PolicydError> {
     if inner
@@ -623,7 +623,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some((id, Pending::Network(pending))) =
-                    inner.pending.iter().find(|(id, pending)| {
+                    inner.pending_entries().find(|(id, pending)| {
                         id.starts_with("net:") && matches!(pending, Pending::Network(_))
                     })
                 {

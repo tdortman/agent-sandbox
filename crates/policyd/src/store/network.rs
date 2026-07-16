@@ -65,8 +65,7 @@ impl PolicyStore {
             .inner
             .lock()
             .await
-            .pending
-            .values()
+            .pending_values()
             .filter(|p| p.kind() == PendingKind::Network)
             .cloned()
             .collect();
@@ -111,7 +110,7 @@ impl PolicyStore {
                 }),
             )
             .await;
-            self.inner.lock().await.pending.remove(p.id());
+            self.inner.lock().await.take_pending(p.id());
         }
     }
 
@@ -326,12 +325,13 @@ impl PolicyStore {
             ));
         }
         let proxy = waiter.cloned();
-        if let Some(existing_id) = inner.pending.values().find_map(|pending| {
+        let existing_id = inner.pending_values().find_map(|pending| {
             let Pending::Network(net) = pending else {
                 return None;
             };
             identity.matches(net).then(|| net.id.clone())
-        }) {
+        });
+        if let Some(existing_id) = existing_id {
             let waiter_count = inner.network_futures.get(&existing_id).map_or(0, Vec::len);
             if waiter_count >= MAX_WAITERS_PER_PENDING {
                 return Err(CheckReply::blocked(
@@ -350,7 +350,7 @@ impl PolicyStore {
                 rx,
             });
         }
-        if inner.pending.len() >= MAX_PENDING_APPROVALS {
+        if inner.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(CheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
             ));
@@ -359,24 +359,21 @@ impl PolicyStore {
         inner
             .network_futures
             .insert(pending_id.clone(), vec![NetworkWaiter { proxy, tx }]);
-        inner.pending.insert(
-            pending_id.clone(),
-            Pending::Network(PendingNetwork {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                host: identity.host.to_string(),
-                port: identity.port,
-                scheme: scheme.to_string(),
-                url: url.to_string(),
-                aliases: aliases.to_vec(),
-                cwd: identity.cwd.map(PathBuf::from),
-                home: identity.home.map(PathBuf::from),
-                project_root: identity.project_root.map(PathBuf::from),
-                sandbox_session_id: identity.sandbox_session_id.map(String::from),
-            }),
-        );
+        inner.insert_pending(Pending::Network(PendingNetwork {
+            id: pending_id.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64()),
+            host: identity.host.to_string(),
+            port: identity.port,
+            scheme: scheme.to_string(),
+            url: url.to_string(),
+            aliases: aliases.to_vec(),
+            cwd: identity.cwd.map(PathBuf::from),
+            home: identity.home.map(PathBuf::from),
+            project_root: identity.project_root.map(PathBuf::from),
+            sandbox_session_id: identity.sandbox_session_id.map(String::from),
+        }));
         drop(inner);
         Ok(PendingNetResult {
             id: pending_id,
@@ -386,7 +383,7 @@ impl PolicyStore {
     }
 
     fn remove_network_waiter_locked(
-        inner: &mut super::types::StoreInner,
+        inner: &mut super::types::PolicyDecisionState,
         pending_id: &str,
         proxy: Option<&(
             agent_sandbox_core::ProxySessionToken,
@@ -405,13 +402,13 @@ impl PolicyStore {
                 canceled.push(waiters.remove(index).tx);
             }
             if waiters.is_empty() {
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
             } else {
                 inner.network_futures.insert(pending_id.to_owned(), waiters);
             }
         } else {
             canceled.extend(waiters.into_iter().map(|waiter| waiter.tx));
-            inner.pending.remove(pending_id);
+            inner.take_pending(pending_id);
         }
         canceled
     }
@@ -689,7 +686,7 @@ mod tests {
             VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
         );
         assert!(
-            store.inner.lock().await.pending.is_empty(),
+            store.pending_summaries().await.is_empty(),
             "session approval must not create a pending prompt"
         );
 
@@ -705,8 +702,8 @@ mod tests {
             VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
         );
         assert!(
-            store.inner.lock().await.pending.is_empty(),
-            "second session-approved request must not create a prompt"
+            store.pending_summaries().await.is_empty(),
+            "second session-approved request must not create a pending prompt"
         );
     }
 
@@ -744,8 +741,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
-                    .pending
-                    .keys()
+                    .pending_keys()
                     .find(|id| id.starts_with("net:"))
                     .cloned()
                 {
@@ -789,10 +785,9 @@ mod tests {
             let mut inner = store.inner.lock().await;
             for i in 0..super::MAX_PENDING_APPROVALS {
                 let id = format!("net:seed{i}");
-                inner.pending.insert(
-                    id.clone(),
-                    Pending::Network(pending_network_owned(format!("host{i}.example"))),
-                );
+                let mut pending = pending_network_owned(format!("host{i}.example"));
+                pending.id = id;
+                inner.insert_pending(Pending::Network(pending));
             }
             drop(inner);
         }
@@ -805,7 +800,7 @@ mod tests {
         let err = reply.error.unwrap_or_default();
         assert!(err.contains("too many pending"), "got: {err}");
 
-        let pending_count = store.inner.lock().await.pending.len();
+        let pending_count = store.inner.lock().await.pending_len();
         assert_eq!(
             pending_count,
             super::MAX_PENDING_APPROVALS,
@@ -819,9 +814,8 @@ mod tests {
         {
             let mut inner = store.inner.lock().await;
             let mut net = pending_network("example.com", Some("sandbox-cap"));
-            let open_id = "net:open".to_string();
-            net.id = open_id.clone();
-            inner.pending.insert(open_id, Pending::Network(net));
+            net.id = "net:open".into();
+            inner.insert_pending(Pending::Network(net));
             for _ in 0..super::MAX_WAITERS_PER_PENDING {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
                 inner
@@ -1005,8 +999,7 @@ mod tests {
         let pending_id = {
             let inner = store.inner.lock().await;
             inner
-                .pending
-                .keys()
+                .pending_keys()
                 .find(|k| k.starts_with("net:"))
                 .cloned()
                 .expect("pending network request should be tracked")
@@ -1042,8 +1035,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
-                    .pending
-                    .keys()
+                    .pending_keys()
                     .find(|k| k.starts_with("net:"))
                     .cloned()
                 {
@@ -1114,12 +1106,7 @@ mod tests {
             project_root: Some("/repo".into()),
             sandbox_session_id: None,
         });
-        store
-            .inner
-            .lock()
-            .await
-            .pending
-            .insert("fs:1".into(), pending);
+        store.inner.lock().await.insert_pending(pending);
         store.flush_pending_to_ui().await;
 
         // Standalone should have received the filesystem request

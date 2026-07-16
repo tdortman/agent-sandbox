@@ -184,7 +184,7 @@ impl PolicyStore {
         } = decision;
         let pending = {
             let mut inner = self.inner.lock().await;
-            inner.pending.remove(&pending_id)
+            inner.take_pending(&pending_id)
         };
         let pending = pending.ok_or_else(|| {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
@@ -195,7 +195,7 @@ impl PolicyStore {
             .await
         {
             let mut inner = self.inner.lock().await;
-            inner.pending.insert(pending_id, pending);
+            inner.restore_pending(pending);
             drop(inner);
             return Err(crate::error::PolicydError::UnauthorizedApprovalClient.into());
         }

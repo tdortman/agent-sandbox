@@ -180,7 +180,7 @@ impl PolicyStore {
         if is_new {
             let pending = {
                 let inner = self.inner.lock().await;
-                match inner.pending.get(&pending_id.to_string()) {
+                match inner.pending_get(&pending_id.to_string()) {
                     Some(Pending::Http(value)) => value.clone(),
                     _ => {
                         return Ok(HttpCheckReply::blocked(
@@ -246,7 +246,7 @@ impl PolicyStore {
                 "duplicate in-flight HTTP request ID".into(),
             ));
         }
-        let existing = inner.pending.values().find_map(|pending| {
+        let existing = inner.pending_values().find_map(|pending| {
             let Pending::Http(value) = pending else {
                 return None;
             };
@@ -262,7 +262,7 @@ impl PolicyStore {
             }
             id
         } else {
-            if inner.pending.len() >= MAX_PENDING_APPROVALS {
+            if inner.pending_len() >= MAX_PENDING_APPROVALS {
                 return Err(PolicydError::Proxy("too many pending approvals".into()));
             }
             let id = PendingHttpId::new();
@@ -275,7 +275,7 @@ impl PolicyStore {
                 request: request.clone(),
                 context: key.context.clone(),
             };
-            inner.pending.insert(id.to_string(), Pending::Http(pending));
+            inner.insert_pending(Pending::Http(pending));
             inner.http_futures.insert(id, Vec::new());
             id
         };
@@ -384,7 +384,7 @@ impl PolicyStore {
     }
 
     fn remove_http_waiter_locked(
-        inner: &mut super::types::StoreInner,
+        inner: &mut super::types::PolicyDecisionState,
         proxy_session: &agent_sandbox_core::ProxySessionToken,
         request_id: agent_sandbox_core::ProxyRequestId,
     ) -> Option<tokio::sync::oneshot::Sender<HttpCheckReply>> {
@@ -398,12 +398,12 @@ impl PolicyStore {
         let waiter = waiters.remove(index);
         if waiters.is_empty() {
             inner.http_futures.remove(&pending_id);
-            inner.pending.remove(&pending_id.to_string());
+            inner.take_pending(&pending_id.to_string());
         }
         Some(waiter.tx)
     }
 
-    fn http_waiter_is_live(inner: &super::types::StoreInner, waiter: &HttpWaiter) -> bool {
+    fn http_waiter_is_live(inner: &super::types::PolicyDecisionState, waiter: &HttpWaiter) -> bool {
         !waiter.tx.is_closed()
             && inner
                 .proxy_session
@@ -424,7 +424,7 @@ impl PolicyStore {
         once: bool,
     ) -> bool {
         let mut inner = self.inner.lock().await;
-        let Some(Pending::Http(pending)) = inner.pending.remove(&pending_id.to_string()) else {
+        let Some(Pending::Http(pending)) = inner.take_pending(&pending_id.to_string()) else {
             return false;
         };
         let waiters = inner.http_futures.remove(&pending_id).unwrap_or_default();
@@ -475,7 +475,7 @@ impl PolicyStore {
         true
     }
 
-    pub(crate) fn clear_http_verdict_cache_locked(inner: &mut super::types::StoreInner) {
+    pub(crate) fn clear_http_verdict_cache_locked(inner: &mut super::types::PolicyDecisionState) {
         inner.http_verdict_cache.clear();
     }
 
@@ -561,10 +561,10 @@ mod tests {
 
         assert!(reply.allowed);
         assert_eq!(reply.source, VerdictSource::policy());
-        let inner = store.inner.lock().await;
-        assert!(inner.pending.is_empty(), "policy allow must not prompt");
-        assert!(inner.http_waiters.is_empty(), "policy allow must not wait");
-        drop(inner);
+        assert!(
+            store.pending_summaries().await.is_empty(),
+            "policy allow must not prompt"
+        );
     }
     #[test]
     fn partial_http_method_deny_preserves_allow_and_narrow_path() {
@@ -773,11 +773,11 @@ mod tests {
         assert_eq!(reply_1.allowed, reply_2.allowed);
         assert_eq!(reply_1.source, reply_2.source);
         assert_eq!(reply_1.request, reply_2.request);
-        let inner = store.inner.lock().await;
         assert!(
-            inner.pending.is_empty(),
+            store.pending_summaries().await.is_empty(),
             "once must not leave replacement pending"
         );
+        let inner = store.inner.lock().await;
         assert!(
             inner.http_futures.is_empty(),
             "once must remove all pending waiter futures"

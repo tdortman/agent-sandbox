@@ -34,7 +34,7 @@ pub use types::{
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use types::{MergedPolicyCache, StoreInner};
+use types::{MergedPolicyCache, PolicyDecisionState};
 
 impl PolicyStore {
     #[must_use]
@@ -42,7 +42,7 @@ impl PolicyStore {
         Self {
             args,
             sandbox_sessions: Arc::new(RwLock::new(HashMap::new())),
-            inner: tokio::sync::Mutex::new(StoreInner {
+            inner: tokio::sync::Mutex::new(PolicyDecisionState {
                 session_allow: HashMap::new(),
                 once_allow: HashSet::new(),
                 pending: HashMap::new(),

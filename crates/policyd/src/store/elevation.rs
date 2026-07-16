@@ -242,28 +242,25 @@ impl PolicyStore {
         let (tx, rx) = oneshot::channel();
         {
             let mut inner = self.inner.lock().await;
-            if inner.pending.len() >= MAX_PENDING_APPROVALS {
+            if inner.pending_len() >= MAX_PENDING_APPROVALS {
                 tracing::warn!(
-                    pending_count = inner.pending.len(),
+                    pending_count = inner.pending_len(),
                     "elevation approval blocked (too many pending approvals)"
                 );
                 return None;
             }
             inner.elevation_futures.insert(pending_id.clone(), tx);
-            inner.pending.insert(
-                pending_id.clone(),
-                Pending::Elevation(PendingElevation {
-                    id: pending_id.clone(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0.0, |d| d.as_secs_f64()),
-                    argv: argv.to_vec(),
-                    cwd: cwd.map(PathBuf::from),
-                    home: home.map(PathBuf::from),
-                    project_root: project_root.map(PathBuf::from),
-                    sandbox_session_id: sandbox_session_id.map(String::from),
-                }),
-            );
+            inner.insert_pending(Pending::Elevation(PendingElevation {
+                id: pending_id.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                argv: argv.to_vec(),
+                cwd: cwd.map(PathBuf::from),
+                home: home.map(PathBuf::from),
+                project_root: project_root.map(PathBuf::from),
+                sandbox_session_id: sandbox_session_id.map(String::from),
+            }));
         }
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
@@ -324,7 +321,7 @@ impl PolicyStore {
             let now = Instant::now();
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
                 inner.elevation_futures.remove(pending_id);
                 drop(inner);
                 return ElevateReply {
@@ -352,7 +349,7 @@ impl PolicyStore {
             Ok(Err(_)) => ElevateReply::denied(),
             Err(_) => {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
                 inner.elevation_futures.remove(pending_id);
                 drop(inner);
                 Self::audit("timeout", None, None, pending_id);
@@ -437,8 +434,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
-                    .pending
-                    .keys()
+                    .pending_keys()
                     .find(|k| k.starts_with("elev:"))
                     .cloned()
                 {

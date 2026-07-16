@@ -350,7 +350,7 @@ pub struct UiClient {
 
 pub struct PolicyStore {
     pub(crate) args: PolicydArgs,
-    pub(crate) inner: Mutex<StoreInner>,
+    pub(crate) inner: Mutex<PolicyDecisionState>,
     /// Single-flight guard for deny inode cache rebuilds: concurrent
     /// filesystem checks must wait for one rebuild instead of each starting
     /// their own recursive directory walk.
@@ -440,51 +440,87 @@ pub enum ProxyCancellation {
     Active(oneshot::Sender<()>),
     Canceled,
 }
-pub struct StoreInner {
-    pub session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
-    pub once_allow: HashSet<NetworkRuleKey>,
-    pub pending: HashMap<String, Pending>,
-    pub elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
-    pub network_futures: HashMap<String, Vec<NetworkWaiter>>,
-    pub filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
-    pub resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,
-    pub http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
-    pub http_waiters: HashMap<(ProxySessionToken, ProxyRequestId), PendingHttpId>,
-    pub proxy_cancellations: HashMap<(ProxySessionToken, ProxyRequestId), ProxyCancellation>,
-    pub ui_clients: HashMap<u64, UiClient>,
-    pub ui_context_by_session: HashMap<String, UiSessionContext>,
-    pub network_verdict_cache: HashMap<NetworkVerdictKey, VerdictEntry>,
-    pub filesystem_verdict_cache: HashMap<FilesystemVerdictKey, VerdictEntry>,
-    pub resource_verdict_cache: HashMap<ResourceVerdictKey, VerdictEntry>,
-    pub http_verdict_cache: HashMap<HttpVerdictKey, VerdictEntry>,
-    pub ui_spawn_last: HashMap<String, Instant>,
-    pub session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
-    pub session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
-    pub session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,
-    pub session_filesystem_allow: HashMap<String, HashSet<FilesystemRuleKey>>,
-    pub session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
-    pub session_resource_allow: HashMap<String, HashSet<ResourceRuleKey>>,
-    pub session_dbus_allow: HashMap<String, HashSet<DbusTarget>>,
-    pub session_dbus_deny: HashMap<String, HashSet<DbusTarget>>,
-    pub session_resource_deny: HashMap<String, HashSet<ResourceRuleKey>>,
-    pub http_once_allow: HashSet<HttpPendingKey>,
-    pub http_once_deny: HashSet<HttpPendingKey>,
-    pub http_session_allow: HashMap<String, HashSet<HttpScopeKey>>,
-    pub http_session_deny: HashMap<String, HashSet<HttpScopeKey>>,
+pub struct PolicyDecisionState {
+    pub(crate) session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
+    pub(crate) once_allow: HashSet<NetworkRuleKey>,
+    pub(super) pending: HashMap<String, Pending>,
+    pub(crate) elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
+    pub(crate) network_futures: HashMap<String, Vec<NetworkWaiter>>,
+    pub(crate) filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
+    pub(crate) resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,
+    pub(crate) http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
+    pub(crate) http_waiters: HashMap<(ProxySessionToken, ProxyRequestId), PendingHttpId>,
+    pub(crate) proxy_cancellations: HashMap<(ProxySessionToken, ProxyRequestId), ProxyCancellation>,
+    pub(crate) ui_clients: HashMap<u64, UiClient>,
+    pub(crate) ui_context_by_session: HashMap<String, UiSessionContext>,
+    pub(crate) network_verdict_cache: HashMap<NetworkVerdictKey, VerdictEntry>,
+    pub(crate) filesystem_verdict_cache: HashMap<FilesystemVerdictKey, VerdictEntry>,
+    pub(crate) resource_verdict_cache: HashMap<ResourceVerdictKey, VerdictEntry>,
+    pub(crate) http_verdict_cache: HashMap<HttpVerdictKey, VerdictEntry>,
+    pub(crate) ui_spawn_last: HashMap<String, Instant>,
+    pub(crate) session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
+    pub(crate) session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
+    pub(crate) session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,
+    pub(crate) session_filesystem_allow: HashMap<String, HashSet<FilesystemRuleKey>>,
+    pub(crate) session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
+    pub(crate) session_resource_allow: HashMap<String, HashSet<ResourceRuleKey>>,
+    pub(crate) session_dbus_allow: HashMap<String, HashSet<DbusTarget>>,
+    pub(crate) session_dbus_deny: HashMap<String, HashSet<DbusTarget>>,
+    pub(crate) session_resource_deny: HashMap<String, HashSet<ResourceRuleKey>>,
+    pub(crate) http_once_allow: HashSet<HttpPendingKey>,
+    pub(crate) http_once_deny: HashSet<HttpPendingKey>,
+    pub(crate) http_session_allow: HashMap<String, HashSet<HttpScopeKey>>,
+    pub(crate) http_session_deny: HashMap<String, HashSet<HttpScopeKey>>,
     /// Static filesystem allow rules registered by `StartFilesystemMonitor`,
     /// keyed by sandbox session id (or cwd/project-root context fallback).
-    pub sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
+    pub(crate) sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
     /// Inode cache for hardlink defense. Maps `(inode, device)` to canonical
     /// paths for files under deny rules. Built by walking deny directories and
     /// stat'ing concrete deny files. Fingerprinted by deny rule path mtimes.
     /// When the fingerprint changes the cache is rebuilt on next access.
-    pub deny_inode_cache: DenyInodeCache,
+    pub(crate) deny_inode_cache: DenyInodeCache,
     /// Active RPC connections per peer uid.
-    pub connections_by_uid: HashMap<u32, usize>,
+    pub(crate) connections_by_uid: HashMap<u32, usize>,
     /// Registered flow identities and active claims.
-    pub proxy_flows: HashMap<NetworkFlowKey, ProxyFlowState>,
+    pub(crate) proxy_flows: HashMap<NetworkFlowKey, ProxyFlowState>,
     /// The one active trusted proxy session, if any.
-    pub proxy_session: Option<ProxySessionState>,
+    pub(crate) proxy_session: Option<ProxySessionState>,
+}
+
+impl PolicyDecisionState {
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn pending_values(&self) -> impl Iterator<Item = &Pending> {
+        self.pending.values()
+    }
+    #[cfg(test)]
+    pub(crate) fn pending_keys(&self) -> impl Iterator<Item = &String> {
+        self.pending.keys()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_entries(&self) -> impl Iterator<Item = (&String, &Pending)> {
+        self.pending.iter()
+    }
+
+    pub(crate) fn pending_get(&self, pending_id: &str) -> Option<&Pending> {
+        self.pending.get(pending_id)
+    }
+
+    pub(crate) fn insert_pending(&mut self, pending: Pending) -> Option<Pending> {
+        let pending_id = pending.id().to_owned();
+        self.pending.insert(pending_id, pending)
+    }
+
+    pub(crate) fn take_pending(&mut self, pending_id: &str) -> Option<Pending> {
+        self.pending.remove(pending_id)
+    }
+
+    pub(crate) fn restore_pending(&mut self, pending: Pending) {
+        let _ = self.insert_pending(pending);
+    }
 }
 
 /// Fingerprint entry for one concrete deny rule path.

@@ -51,7 +51,7 @@ fn build_once_keys(
 }
 
 fn apply_http_memory_locked(
-    inner: &mut super::types::StoreInner,
+    inner: &mut super::types::PolicyDecisionState,
     target: &HttpRuleTarget,
     scope_target: &ScopeTarget,
     context: &agent_sandbox_core::HttpContextKey,
@@ -184,8 +184,7 @@ impl PolicyStore {
         let pending_ids = {
             let inner = self.inner.lock().await;
             inner
-                .pending
-                .values()
+                .pending_values()
                 .filter_map(|pending| {
                     let Pending::Http(value) = pending else {
                         return None;
@@ -253,9 +252,7 @@ impl PolicyStore {
         };
         {
             let mut inner = self.inner.lock().await;
-            inner
-                .pending
-                .insert(pending.id.clone(), Pending::Http(pending.clone()));
+            inner.insert_pending(Pending::Http(pending.clone()));
         }
         let reply = self
             .apply_http_scope_with_comment(

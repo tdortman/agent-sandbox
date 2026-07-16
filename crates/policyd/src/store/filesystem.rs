@@ -337,12 +337,13 @@ impl PolicyStore {
         let mut inner = self.inner.lock().await;
         // Deduplicate: if a pending already exists for the same file and
         // access type, join its waiters instead of creating a new prompt.
-        if let Some(existing_id) = inner.pending.values().find_map(|p| {
+        let existing_id = inner.pending_values().find_map(|p| {
             let Pending::Filesystem(fs) = p else {
                 return None;
             };
             (fs.path == path && fs.access == access).then(|| fs.id.clone())
-        }) {
+        });
+        if let Some(existing_id) = existing_id {
             let waiter_count = inner
                 .filesystem_futures
                 .get(&existing_id)
@@ -366,7 +367,7 @@ impl PolicyStore {
                 rx,
             });
         }
-        if inner.pending.len() >= MAX_PENDING_APPROVALS {
+        if inner.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(FilesystemCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 path.to_path_buf(),
@@ -377,21 +378,18 @@ impl PolicyStore {
         inner
             .filesystem_futures
             .insert(pending_id.clone(), vec![tx]);
-        inner.pending.insert(
-            pending_id.clone(),
-            Pending::Filesystem(PendingFilesystem {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                path: path.to_path_buf(),
-                access,
-                cwd: cwd.map(PathBuf::from),
-                home: home.map(PathBuf::from),
-                project_root: project_root.map(PathBuf::from),
-                sandbox_session_id: sandbox_session_id.map(String::from),
-            }),
-        );
+        inner.insert_pending(Pending::Filesystem(PendingFilesystem {
+            id: pending_id.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64()),
+            path: path.to_path_buf(),
+            access,
+            cwd: cwd.map(PathBuf::from),
+            home: home.map(PathBuf::from),
+            project_root: project_root.map(PathBuf::from),
+            sandbox_session_id: sandbox_session_id.map(String::from),
+        }));
         drop(inner);
         Ok(PendingFsResult {
             id: pending_id,
@@ -438,7 +436,7 @@ impl PolicyStore {
             let now = Instant::now();
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
                 inner.filesystem_futures.remove(pending_id);
                 drop(inner);
                 return FilesystemCheckReply::blocked(
@@ -464,7 +462,7 @@ impl PolicyStore {
             }
             Err(_) => {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
                 inner.filesystem_futures.remove(pending_id);
                 drop(inner);
                 FilesystemCheckReply::blocked(
@@ -577,7 +575,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 let inner = store.inner.lock().await;
-                if let Some(id) = inner.pending.keys().find(|k| k.starts_with("fs:")).cloned() {
+                if let Some(id) = inner.pending_keys().find(|k| k.starts_with("fs:")).cloned() {
                     break id;
                 }
                 assert!(

@@ -31,11 +31,10 @@ impl PolicyStore {
             })
     }
 
-    async fn pending_summaries(&self) -> Vec<PendingSummary> {
+    pub(crate) async fn pending_summaries(&self) -> Vec<PendingSummary> {
         let inner = self.inner.lock().await;
         inner
-            .pending
-            .values()
+            .pending_values()
             .map(|p| match p {
                 Pending::Network(net) => PendingSummary::Network {
                     id: net.id.clone(),

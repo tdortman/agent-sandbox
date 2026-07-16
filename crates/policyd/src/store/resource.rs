@@ -187,7 +187,7 @@ impl PolicyStore {
         // Deduplicate: if a pending already exists for the same resource
         // kind, path, and access type, join its waiters instead of creating
         // a new prompt.
-        if let Some(existing_id) = inner.pending.values().find_map(|p| match p {
+        let existing_id = inner.pending_values().find_map(|p| match p {
             Pending::Resource(res)
                 if dbus_target.is_none()
                     && res.kind == kind
@@ -203,7 +203,8 @@ impl PolicyStore {
                 Some(res.id.clone())
             }
             _ => None,
-        }) {
+        });
+        if let Some(existing_id) = existing_id {
             let waiter_count = inner.resource_futures.get(&existing_id).map_or(0, Vec::len);
             if waiter_count >= MAX_WAITERS_PER_PENDING {
                 return Err(ResourceCheckReply::blocked(
@@ -225,7 +226,7 @@ impl PolicyStore {
                 rx,
             });
         }
-        if inner.pending.len() >= MAX_PENDING_APPROVALS {
+        if inner.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(ResourceCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 kind,
@@ -265,7 +266,7 @@ impl PolicyStore {
                 })
             },
         );
-        inner.pending.insert(pending_id.clone(), pending);
+        inner.insert_pending(pending);
         drop(inner);
         Ok(PendingResResult {
             id: pending_id,
@@ -295,7 +296,7 @@ impl PolicyStore {
             let now = Instant::now();
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
                 inner.resource_futures.remove(pending_id);
                 drop(inner);
                 return ResourceCheckReply::blocked(
@@ -322,7 +323,7 @@ impl PolicyStore {
             }
             Err(_) => {
                 let mut inner = self.inner.lock().await;
-                inner.pending.remove(pending_id);
+                inner.take_pending(pending_id);
                 inner.resource_futures.remove(pending_id);
                 drop(inner);
                 ResourceCheckReply::blocked(
@@ -470,8 +471,7 @@ mod tests {
         let pending_id = {
             let inner = store.inner.lock().await;
             inner
-                .pending
-                .keys()
+                .pending_keys()
                 .find(|k| k.starts_with("res:"))
                 .cloned()
                 .expect("pending resource request should be tracked")
@@ -507,8 +507,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
-                    .pending
-                    .keys()
+                    .pending_keys()
                     .find(|k| k.starts_with("res:"))
                     .cloned()
                 {

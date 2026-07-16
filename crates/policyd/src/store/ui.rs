@@ -66,7 +66,7 @@ impl PolicyStore {
     }
 
     fn matching_ui_session_ids(
-        inner: &super::types::StoreInner,
+        inner: &super::types::PolicyDecisionState,
         route: &UiRoute,
         _kind: UiRoutingKind,
     ) -> HashSet<String> {
@@ -229,7 +229,10 @@ impl PolicyStore {
         self.remove_ui_client(client_id, true).await;
     }
 
-    fn remove_ui_client_locked(inner: &mut super::types::StoreInner, client_id: u64) -> bool {
+    fn remove_ui_client_locked(
+        inner: &mut super::types::PolicyDecisionState,
+        client_id: u64,
+    ) -> bool {
         inner.ui_clients.remove(&client_id).is_some_and(|client| {
             inner.session_allow.remove(&client.session_id);
             inner.session_deny.remove(&client.session_id);
@@ -256,7 +259,7 @@ impl PolicyStore {
 
     /// Re-notify pending requests that lost their UI, and spawn a UI when needed.
     pub(crate) async fn reroute_orphaned_pending(&self) {
-        let pending: Vec<Pending> = self.inner.lock().await.pending.values().cloned().collect();
+        let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
         let deadline = tokio::time::Instant::now() + UI_SPAWN_WAIT;
         let mut registration_flush_observed = false;
         for p in pending {
@@ -445,7 +448,7 @@ impl PolicyStore {
     }
 
     pub async fn flush_pending_to_ui(&self) {
-        let pending: Vec<Pending> = self.inner.lock().await.pending.values().cloned().collect();
+        let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
         for p in pending {
             self.notify_pending(&p).await;
         }
@@ -551,10 +554,8 @@ mod tests {
         let pending = pending_network("net:spawn-race");
         let pending_second = pending_network("net:spawn-race-second");
         let mut inner = store.inner.lock().await;
-        inner.pending.insert("net:spawn-race".into(), pending);
-        inner
-            .pending
-            .insert("net:spawn-race-second".into(), pending_second);
+        inner.insert_pending(pending);
+        inner.insert_pending(pending_second);
         drop(inner);
 
         let (read_tx, read_rx) = oneshot::channel();
@@ -615,8 +616,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert("net:reroute".into(), pending_network("net:reroute"));
+            .insert_pending(pending_network("net:reroute"));
 
         store.end_ui_session(1).await;
 
@@ -653,8 +653,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .pending
-            .insert("fs:reroute".into(), pending_filesystem("fs:reroute"));
+            .insert_pending(pending_filesystem("fs:reroute"));
 
         store.end_ui_session(1).await;
 
@@ -764,12 +763,8 @@ mod tests {
         }
         {
             let mut inner = store.inner.lock().await;
-            inner
-                .pending
-                .insert("net:dead".into(), dead_pending.clone());
-            inner
-                .pending
-                .insert("net:recovered".into(), recovered_pending);
+            inner.insert_pending(dead_pending.clone());
+            inner.insert_pending(recovered_pending);
         }
 
         store.notify_pending(&dead_pending).await;
