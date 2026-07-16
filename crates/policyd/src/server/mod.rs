@@ -549,13 +549,7 @@ mod tests {
         // rejected (still Sandbox role), proving the approval capability was
         // never granted.
         let reply = attacker
-            .request(RpcRequest::Approve {
-                id: "elev:fabricated".into(),
-                scope: ApprovalScope::Once,
-                session_id: None,
-                target: None,
-                ctx: RequestContext::default(),
-            })
+            .request(RpcRequest::Approve { id: "elev:fabricated".into(), scope: ApprovalScope::Once, session_id: None, target: None, comment: None, ctx: RequestContext::default() })
             .await
             .expect("sandbox Approve");
         assert!(

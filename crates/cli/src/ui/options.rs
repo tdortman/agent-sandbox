@@ -33,6 +33,7 @@ pub struct ScopeOption {
     pub(crate) label: String,
     pub(crate) scope: ApprovalScope,
     pub(crate) target: Option<ApprovalTarget>,
+    pub(crate) comment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,23 +202,27 @@ pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
         label: "Once".into(),
         scope: ApprovalScope::Once,
         target: None,
+        comment: None,
     }];
     if session_available {
         options.push(ScopeOption {
             label: "This session".into(),
             scope: ApprovalScope::Session,
             target: None,
+            comment: None,
         });
     }
     options.push(ScopeOption {
         label: "This project".into(),
         scope: ApprovalScope::Project,
         target: None,
+        comment: None,
     });
     options.push(ScopeOption {
         label: "Globally".into(),
         scope: ApprovalScope::Global,
         target: None,
+        comment: None,
     });
     options
 }
@@ -232,6 +237,7 @@ pub fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOp
             label: format_command(argv),
             scope,
             target: Some(ApprovalTarget::SudoCommand { argv: argv.clone() }),
+            comment: None,
         });
     }
     options

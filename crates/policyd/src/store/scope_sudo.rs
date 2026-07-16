@@ -43,6 +43,7 @@ impl PolicyStore {
             session_id,
             owner_uid,
             sandbox_session_id: _,
+            comment,
         } = wire;
         let cwd = paths.cwd_path();
         let home = paths.home();
@@ -55,7 +56,7 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return reply,
         };
-        let scope_label = scope.as_str();
+        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {

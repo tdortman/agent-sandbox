@@ -2,6 +2,7 @@
 
 mod access;
 mod context;
+mod dbus;
 mod decisions;
 mod elevation;
 pub(crate) mod evaluator;
@@ -60,6 +61,8 @@ impl PolicyStore {
                 session_filesystem_deny: HashMap::new(),
                 session_resource_allow: HashMap::new(),
                 session_resource_deny: HashMap::new(),
+                session_dbus_allow: HashMap::new(),
+                session_dbus_deny: HashMap::new(),
                 http_once_allow: HashSet::new(),
                 http_once_deny: HashSet::new(),
                 http_session_allow: HashMap::new(),

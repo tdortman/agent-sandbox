@@ -75,6 +75,14 @@ impl PolicyStore {
                     cwd: res.cwd.clone(),
                     home: res.home.clone(),
                 },
+                Pending::Dbus(dbus) => PendingSummary::Dbus {
+                    id: dbus.id.clone(),
+                    target: dbus.target.clone(),
+                    cwd: dbus.cwd.clone(),
+                    home: dbus.home.clone(),
+                    project_root: dbus.project_root.clone(),
+                    sandbox_session_id: dbus.sandbox_session_id.clone(),
+                },
             })
             .collect()
     }

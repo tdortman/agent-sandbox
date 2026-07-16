@@ -31,7 +31,9 @@ impl UiRoutingKind {
     const fn for_pending(pending: &Pending) -> Self {
         match pending {
             Pending::Filesystem(_) | Pending::Resource(_) => Self::Standalone,
-            Pending::Elevation(_) | Pending::Network(_) | Pending::Http(_) => Self::General,
+            Pending::Elevation(_) | Pending::Network(_) | Pending::Http(_) | Pending::Dbus(_) => {
+                Self::General
+            }
         }
     }
 }
@@ -234,6 +236,8 @@ impl PolicyStore {
             inner.session_sudo_allow.remove(&client.session_id);
             inner.session_sudo_deny.remove(&client.session_id);
             inner.session_filesystem_allow.remove(&client.session_id);
+            inner.session_dbus_allow.remove(&client.session_id);
+            inner.session_dbus_deny.remove(&client.session_id);
             inner.session_filesystem_deny.remove(&client.session_id);
             inner.ui_context_by_session.remove(&client.session_id);
             true
@@ -353,6 +357,14 @@ impl PolicyStore {
                 cwd: res.cwd.clone(),
                 home: res.home.clone(),
                 project_root: res.project_root.clone(),
+            },
+            Pending::Dbus(res) => UiPush::DbusRequest {
+                id: res.id.clone(),
+                target: res.target.clone(),
+                cwd: res.cwd.clone(),
+                home: res.home.clone(),
+                project_root: res.project_root.clone(),
+                sandbox_session_id: res.sandbox_session_id.clone(),
             },
         };
         let route = Self::route_for_pending(pending);

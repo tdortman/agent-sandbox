@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, ProcessIds, RequestContext,
-    ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
+    ApprovalScope, ApprovalTarget, DbusTarget, FileAccess, FilesystemRule, ProcessIds,
+    RequestContext, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
 };
 
 /// Attacker-controlled request context as received on the wire.
@@ -47,6 +47,7 @@ pub struct ScopeWire {
     pub session_id: Option<String>,
     pub owner_uid: Option<u32>,
     pub sandbox_session_id: Option<String>,
+    pub comment: Option<String>,
 }
 
 impl ScopeWire {
@@ -58,6 +59,7 @@ impl ScopeWire {
             session_id,
             owner_uid,
             sandbox_session_id: ctx.sandbox_session_id.clone(),
+            comment: None,
         }
     }
 }
@@ -132,6 +134,11 @@ pub struct ResourceCheckRequest {
     pub kind: ResourceKind,
     pub path: PathBuf,
     pub access: ResourceAccess,
+    pub ctx: ResolvedRequestContext,
+}
+#[derive(Debug, Clone)]
+pub struct DbusCheckRequest {
+    pub target: DbusTarget,
     pub ctx: ResolvedRequestContext,
 }
 

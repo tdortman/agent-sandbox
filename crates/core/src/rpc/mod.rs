@@ -18,11 +18,11 @@ pub use proxy::{
 };
 pub use push::{PendingSummary, UiPush};
 pub use reply::{
-    CheckReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
-    FilesystemScopeActionReply, FlowClaimReply, HttpCheckReply, HttpScopeActionReply,
-    NetworkFlowCheckReply, ProxyReply, ProxyReplyBody, ProxySessionReply, RegisterUiReply,
-    ResourceCheckReply, ResourceScopeActionReply, RpcReply, ScopeActionReply, SimpleOkReply,
-    StatusReply, Verdict, VerdictSource,
+    CheckReply, DbusCheckReply, DbusScopeActionReply, ElevateReply, ErrorReply,
+    FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply, FlowClaimReply,
+    HttpCheckReply, HttpScopeActionReply, NetworkFlowCheckReply, ProxyReply, ProxyReplyBody,
+    ProxySessionReply, RegisterUiReply, ResourceCheckReply, ResourceScopeActionReply, RpcReply,
+    ScopeActionReply, SimpleOkReply, StatusReply, Verdict, VerdictSource,
 };
 pub use request::{
     AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,

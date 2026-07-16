@@ -806,6 +806,122 @@ pub struct ResourceSection {
     pub deny: Vec<ResourceRule>,
 }
 
+/// D-Bus bus selected by a relay target.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DbusBus {
+    #[default]
+    Session,
+    System,
+}
+
+/// D-Bus message kind visible to the policy relay.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DbusMessageKind {
+    #[default]
+    MethodCall,
+    MethodReturn,
+    Error,
+    Signal,
+}
+
+/// Opaque metadata for one file descriptor carried by a D-Bus message.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DbusFdMetadata {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Structured identity of a D-Bus message.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DbusTarget {
+    pub bus: DbusBus,
+    pub destination: String,
+    pub object_path: String,
+    pub interface: String,
+    pub member: String,
+    pub message_kind: DbusMessageKind,
+    pub signature: String,
+    #[serde(default)]
+    pub fd_metadata: Vec<DbusFdMetadata>,
+}
+
+impl DbusTarget {
+    #[must_use]
+    pub fn session(
+        destination: impl Into<String>,
+        object_path: impl Into<String>,
+        interface: impl Into<String>,
+        member: impl Into<String>,
+        message_kind: DbusMessageKind,
+        signature: impl Into<String>,
+        fd_metadata: Vec<DbusFdMetadata>,
+    ) -> Self {
+        Self {
+            bus: DbusBus::Session,
+            destination: destination.into(),
+            object_path: object_path.into(),
+            interface: interface.into(),
+            member: member.into(),
+            message_kind,
+            signature: signature.into(),
+            fd_metadata,
+        }
+    }
+}
+
+/// Declarative D-Bus rule. String fields accept `*` and `?` glob patterns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DbusRule {
+    pub target: DbusTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+impl DbusRule {
+    #[must_use]
+    pub fn new(target: DbusTarget, comment: impl Into<String>) -> Self {
+        Self {
+            target,
+            comment: Some(comment.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, target: &DbusTarget) -> bool {
+        if self.target.bus != target.bus
+            || self.target.message_kind != target.message_kind
+            || self.target.fd_metadata != target.fd_metadata
+        {
+            return false;
+        }
+        glob_matches(&self.target.destination, &target.destination)
+            && glob_matches(&self.target.object_path, &target.object_path)
+            && glob_matches(&self.target.interface, &target.interface)
+            && glob_matches(&self.target.member, &target.member)
+            && glob_matches(&self.target.signature, &target.signature)
+    }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbusSection {
+    #[serde(default)]
+    pub allow: Vec<DbusRule>,
+    #[serde(default)]
+    pub deny: Vec<DbusRule>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Policy {
     #[serde(default)]
@@ -816,6 +932,8 @@ pub struct Policy {
     pub filesystem: FilesystemSection,
     #[serde(default)]
     pub resources: ResourceSection,
+    #[serde(default)]
+    pub dbus: DbusSection,
 }
 
 #[derive(Deserialize)]
@@ -828,6 +946,8 @@ struct PolicyWire {
     filesystem: FilesystemSection,
     #[serde(default)]
     resources: ResourceSection,
+    #[serde(default)]
+    dbus: DbusSection,
 }
 
 impl<'de> Deserialize<'de> for Policy {
@@ -841,6 +961,7 @@ impl<'de> Deserialize<'de> for Policy {
             sudo: wire.sudo,
             filesystem: wire.filesystem,
             resources: wire.resources,
+            dbus: wire.dbus,
         })
     }
 }
@@ -989,6 +1110,68 @@ impl InodeIdentity {
                 device: m.dev(),
             })
             .ok()
+    }
+}
+
+#[cfg(test)]
+mod dbus_tests {
+    use super::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusRule, DbusTarget};
+
+    fn target(member: &str) -> DbusTarget {
+        DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            member,
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn dbus_rules_accept_globs_by_default() {
+        let rule = DbusRule::new(target("Read*"), "glob");
+        assert!(rule.matches(&target("Read")));
+        assert!(rule.matches(&target("ReadAll")));
+        assert!(!rule.matches(&target("Write")));
+    }
+
+    #[test]
+    fn dbus_bus_is_structured() {
+        let mut system = target("Read");
+        system.bus = DbusBus::System;
+        assert!(!DbusRule::new(target("Read"), "").matches(&system));
+    }
+    #[test]
+    fn dbus_rules_match_all_structured_fields() {
+        let mut rule_target = target("Read");
+        rule_target.object_path = "/org/example/*".into();
+        rule_target.interface = "org.example.*".into();
+        rule_target.signature = "s*".into();
+        rule_target.fd_metadata = vec![DbusFdMetadata {
+            kind: "memfd".into(),
+            read_only: true,
+        }];
+        let fd_metadata = rule_target.fd_metadata.clone();
+        let rule = DbusRule::new(rule_target, "structured");
+
+        let matching = DbusTarget {
+            fd_metadata,
+            ..target("Read")
+        };
+        assert!(rule.matches(&matching));
+        let mutations: [fn(&mut DbusTarget); 4] = [
+            |target| target.object_path = "/other".into(),
+            |target| target.interface = "org.other.Interface".into(),
+            |target| target.signature = "a{sv}".into(),
+            |target| target.fd_metadata.clear(),
+        ];
+        for mutate in mutations {
+            let mut non_matching = matching.clone();
+            mutate(&mut non_matching);
+            assert!(!rule.matches(&non_matching));
+        }
     }
 }
 

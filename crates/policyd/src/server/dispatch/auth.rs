@@ -179,6 +179,7 @@ mod tests {
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
+                comment: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::ApproveHost {
@@ -193,6 +194,7 @@ mod tests {
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
+                comment: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::Status {
@@ -246,6 +248,7 @@ mod tests {
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
+                comment: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::ApproveHost {
@@ -260,6 +263,7 @@ mod tests {
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
+                comment: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::Status {
@@ -286,6 +290,7 @@ mod tests {
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
+                comment: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::ApproveHost {
@@ -300,6 +305,7 @@ mod tests {
                 scope: ApprovalScope::Once,
                 session_id: None,
                 target: None,
+                comment: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::Status {

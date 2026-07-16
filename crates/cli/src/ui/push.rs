@@ -1,9 +1,11 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, FileAccess, FilesystemRule, HttpMethodMatcher, HttpRuleTarget,
-    HttpUrl, ResourceAccess, ResourceKind, ResourceRule, UiPush, contract_project_path,
-    host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
+    ApprovalScope, ApprovalTarget, DbusBus, DbusMessageKind, DbusRule, DbusTarget, FileAccess,
+    FilesystemRule, HttpMethodMatcher, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
+    ResourceRule, UiPush, contract_project_path, host_pattern_matches, is_ip_literal,
+    normalize_dns_name, split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
@@ -75,6 +77,16 @@ struct ResourcePush {
     project_root: Option<PathBuf>,
 }
 
+/// Extracted fields from [`UiPush::DbusRequest`].
+struct DbusPush {
+    id: String,
+    target: DbusTarget,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+    sandbox_session_id: Option<String>,
+}
+
 fn approval_context(
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
@@ -144,12 +156,10 @@ fn build_elevation_review(
             context: approval_context(paths, session_id),
             presentation: Some(elevation_presentation(argv)),
             scopes: approval_scopes(session_id.is_some()),
-            fields: vec![choice_field(
-                "target",
-                "Command prefix",
-                "0",
-                prefix_options,
-            )],
+            fields: vec![
+                choice_field("target", "Command prefix", "0", prefix_options),
+                comment_field(),
+            ],
         },
         prefixes,
     }
@@ -178,6 +188,19 @@ fn validated_review_action(
     allowed.then_some(ReviewActionScope { action, scope })
 }
 
+fn persistent_comment(result: &ApprovalFormResult, scope: ApprovalScope) -> Option<String> {
+    if !matches!(scope, ApprovalScope::Project | ApprovalScope::Global) {
+        return None;
+    }
+    result
+        .values
+        .get("comment")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|comment| !comment.is_empty())
+        .map(str::to_owned)
+}
+
 fn reviewed_choice(
     result: &ApprovalFormResult,
     session_available: bool,
@@ -195,6 +218,7 @@ fn reviewed_choice(
             label: String::new(),
             scope,
             target,
+            comment: persistent_comment(result, scope),
         },
     })
 }
@@ -227,6 +251,10 @@ fn text_field(id: &'static str, label: &str, value: String) -> ApprovalFormField
         label: label.into(),
         control: ApprovalFormControl::Text { value },
     }
+}
+
+fn comment_field() -> ApprovalFormField {
+    text_field("comment", "Policy comment (optional)", String::new())
 }
 fn filesystem_presentation(access: FileAccess, subject: &str) -> ApprovalFormPresentation {
     let heading = match access {
@@ -295,6 +323,59 @@ fn elevation_presentation(argv: &[String]) -> ApprovalFormPresentation {
     ApprovalFormPresentation {
         heading: "Run this command with elevated privileges?".into(),
         subject: format_command(argv),
+    }
+}
+
+const fn dbus_bus_name(bus: DbusBus) -> &'static str {
+    match bus {
+        DbusBus::Session => "session",
+        DbusBus::System => "system",
+    }
+}
+
+const fn dbus_message_kind_name(kind: DbusMessageKind) -> &'static str {
+    match kind {
+        DbusMessageKind::MethodCall => "method_call",
+        DbusMessageKind::MethodReturn => "method_return",
+        DbusMessageKind::Error => "error",
+        DbusMessageKind::Signal => "signal",
+    }
+}
+
+const fn dbus_signature_display(signature: &str) -> &str {
+    if signature.is_empty() {
+        "<empty>"
+    } else {
+        signature
+    }
+}
+
+fn dbus_fd_display(target: &DbusTarget) -> String {
+    let mut value = format!("count={}", target.fd_metadata.len());
+    for (index, metadata) in target.fd_metadata.iter().enumerate() {
+        let _ = write!(
+            value,
+            "; {index}: kind={}, read_only={}",
+            metadata.kind, metadata.read_only
+        );
+    }
+    value
+}
+
+fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
+    ApprovalFormPresentation {
+        heading: "Allow this D-Bus message?".into(),
+        subject: format!(
+            "bus: {}\ndestination: {}\nobject path: {}\ninterface: {}\nmember: {}\nmessage kind: {}\nsignature: {}\nFDs: {}",
+            dbus_bus_name(target.bus),
+            target.destination,
+            target.object_path,
+            target.interface,
+            target.member,
+            dbus_message_kind_name(target.message_kind),
+            dbus_signature_display(&target.signature),
+            dbus_fd_display(target),
+        ),
     }
 }
 
@@ -376,6 +457,168 @@ fn parse_resource_target(
         path,
     })
 }
+
+/// Parse and validate an editable D-Bus target against the request.
+fn parse_dbus_target(
+    result: &ApprovalFormResult,
+    requested: &DbusTarget,
+) -> Option<ApprovalTarget> {
+    if result.values.get("bus")? != dbus_bus_name(requested.bus)
+        || result.values.get("message_kind")? != dbus_message_kind_name(requested.message_kind)
+        || result.values.get("fd_metadata")? != &dbus_fd_display(requested)
+    {
+        return None;
+    }
+    let target = DbusTarget {
+        bus: requested.bus,
+        destination: result.values.get("destination")?.clone(),
+        object_path: result.values.get("object_path")?.clone(),
+        interface: result.values.get("interface")?.clone(),
+        member: result.values.get("member")?.clone(),
+        message_kind: requested.message_kind,
+        signature: match result.values.get("signature")?.as_str() {
+            "<empty>" => String::new(),
+            signature => signature.to_owned(),
+        },
+        fd_metadata: requested.fd_metadata.clone(),
+    };
+    if !DbusRule::new(target.clone(), "").matches(requested) {
+        return None;
+    }
+    Some(ApprovalTarget::Dbus { target })
+}
+async fn handle_dbus_unavailable(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    sandbox_session_id: Option<&str>,
+    id: &str,
+    target: DbusTarget,
+) -> Result<(), UiCliError> {
+    let Some(action) = choose_action(&format!(
+        "agent-sandbox: D-Bus {} {}",
+        dbus_message_kind_name(target.message_kind),
+        target.member
+    ))
+    .await?
+    else {
+        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
+    };
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} D-Bus scope?", action.verb()),
+        session_id.is_some(),
+    )
+    .await?
+    else {
+        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
+    };
+    let target = (scope != ApprovalScope::Once).then_some(ApprovalTarget::Dbus { target });
+    resolve_choice(
+        socket,
+        paths,
+        session_id,
+        sandbox_session_id,
+        id,
+        action,
+        Some(ScopeOption {
+            label: String::new(),
+            scope,
+            target,
+            comment: None,
+        }),
+    )
+    .await
+}
+
+/// Prompt the user for a D-Bus message approval.
+async fn handle_dbus_push(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    push: DbusPush,
+) -> Result<(), UiCliError> {
+    let DbusPush {
+        id,
+        target,
+        cwd,
+        home,
+        project_root,
+        sandbox_session_id,
+    } = push;
+    let paths = paths.merged_with(cwd, home, project_root);
+    let review = ApprovalFormRequest {
+        summary: format!(
+            "D-Bus {} {}",
+            dbus_message_kind_name(target.message_kind),
+            target.member
+        ),
+        context: approval_context(&paths, session_id),
+        presentation: Some(dbus_presentation(&target)),
+        scopes: approval_scopes(session_id.is_some()),
+        fields: vec![
+            text_field("bus", "Bus", dbus_bus_name(target.bus).into()),
+            text_field("destination", "Destination", target.destination.clone()),
+            text_field("object_path", "Object path", target.object_path.clone()),
+            text_field("interface", "Interface", target.interface.clone()),
+            text_field("member", "Member", target.member.clone()),
+            text_field(
+                "message_kind",
+                "Message kind",
+                dbus_message_kind_name(target.message_kind).into(),
+            ),
+            text_field(
+                "signature",
+                "Signature",
+                dbus_signature_display(&target.signature).into(),
+            ),
+            text_field("fd_metadata", "FD metadata", dbus_fd_display(&target)),
+            comment_field(),
+        ],
+    };
+    let requested = target.clone();
+    match rich_review(
+        review,
+        Some(make_validator(session_id.is_some(), move |result| {
+            parse_dbus_target(result, &requested)
+        })),
+    )
+    .await?
+    {
+        ApprovalReviewOutcome::Submitted(result) => {
+            let Some(ReviewedChoice { action, choice }) =
+                reviewed_choice(&result, session_id.is_some(), |result| {
+                    parse_dbus_target(result, &target)
+                })
+            else {
+                return deny_cancellation(socket, &paths, sandbox_session_id.as_deref(), &id).await;
+            };
+            resolve_choice(
+                socket,
+                &paths,
+                session_id,
+                sandbox_session_id.as_deref(),
+                &id,
+                action,
+                Some(choice),
+            )
+            .await
+        }
+        ApprovalReviewOutcome::Cancelled => {
+            deny_cancellation(socket, &paths, sandbox_session_id.as_deref(), &id).await
+        }
+        ApprovalReviewOutcome::Unavailable => {
+            handle_dbus_unavailable(
+                socket,
+                &paths,
+                session_id,
+                sandbox_session_id.as_deref(),
+                &id,
+                target,
+            )
+            .await
+        }
+    }
+}
 /// Prompt the user for a network request approval.
 async fn handle_network_push(
     socket: &Path,
@@ -411,7 +654,10 @@ async fn handle_network_push(
         context: approval_context(&paths, session_id),
         presentation: Some(network_presentation(&url)),
         scopes: approval_scopes(session_id.is_some()),
-        fields: vec![text_field("target", "Host rule", host.clone())],
+        fields: vec![
+            text_field("target", "Host rule", host.clone()),
+            comment_field(),
+        ],
     };
     match rich_review(
         review,
@@ -495,6 +741,7 @@ async fn network_push_cli_fallback(
         label: String::new(),
         scope,
         target,
+        comment: None,
     };
     resolve_choice(
         socket,
@@ -534,6 +781,7 @@ async fn handle_http_review(
         fields: vec![
             choice_field("method", "Methods", "exact", method_options),
             text_field("url", "URL", request.url.to_string()),
+            comment_field(),
         ],
     };
     let method = request.method.clone();
@@ -659,6 +907,7 @@ async fn handle_http_push(
                     label: request.method.as_str().to_owned(),
                     scope,
                     target: Some(ApprovalTarget::Http { target: exact }),
+                    comment: None,
                 },
                 ScopeOption {
                     label: "All methods".into(),
@@ -666,6 +915,7 @@ async fn handle_http_push(
                     target: Some(ApprovalTarget::Http {
                         target: all_methods,
                     }),
+                    comment: None,
                 },
             ],
         )
@@ -684,6 +934,7 @@ async fn handle_http_push(
         label: String::new(),
         scope,
         target,
+        comment: None,
     };
     resolve_choice(
         socket,
@@ -776,6 +1027,7 @@ async fn handle_elevation_push(
         label: String::new(),
         scope,
         target,
+        comment: None,
     };
     resolve_choice(
         socket,
@@ -893,6 +1145,39 @@ async fn handle_elevation_variant(
     .await
 }
 
+async fn handle_dbus_variant(
+    socket: &Path,
+    paths: &agent_sandbox_core::SandboxPaths,
+    session_id: Option<&str>,
+    push: UiPush,
+) -> Result<(), UiCliError> {
+    let UiPush::DbusRequest {
+        id,
+        target,
+        cwd,
+        home,
+        project_root,
+        sandbox_session_id,
+    } = push
+    else {
+        unreachable!("D-Bus variant was validated by the dispatcher")
+    };
+    handle_dbus_push(
+        socket,
+        paths,
+        session_id,
+        DbusPush {
+            id,
+            target,
+            cwd,
+            home,
+            project_root,
+            sandbox_session_id,
+        },
+    )
+    .await
+}
+
 async fn handle_filesystem_variant(
     socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
@@ -989,6 +1274,9 @@ pub async fn handle_push(
         push @ UiPush::FilesystemRequest { .. } => {
             handle_filesystem_variant(socket, paths, session_id, sandbox_session_id, push).await?;
         }
+        push @ UiPush::DbusRequest { .. } => {
+            handle_dbus_variant(socket, paths, session_id, push).await?;
+        }
         push @ UiPush::ResourceRequest { .. } => {
             handle_resource_variant(socket, paths, session_id, sandbox_session_id, push).await?;
         }
@@ -1020,11 +1308,10 @@ async fn handle_filesystem_push(
         context: approval_context(&paths, session_id),
         presentation: Some(filesystem_presentation(access, &default_rule_path)),
         scopes: approval_scopes(session_id.is_some()),
-        fields: vec![text_field(
-            "target",
-            "Path or pattern",
-            default_rule_path.clone(),
-        )],
+        fields: vec![
+            text_field("target", "Path or pattern", default_rule_path.clone()),
+            comment_field(),
+        ],
     };
     match rich_review(
         review,
@@ -1095,6 +1382,7 @@ async fn handle_filesystem_push(
         label: String::new(),
         scope,
         target,
+        comment: None,
     };
     resolve_choice(
         socket,
@@ -1142,7 +1430,10 @@ async fn handle_resource_push(
             Path::new(&display_path),
         )),
         scopes: approval_scopes(session_id.is_some()),
-        fields: vec![text_field("target", "Path or pattern", display_path)],
+        fields: vec![
+            text_field("target", "Path or pattern", display_path),
+            comment_field(),
+        ],
     };
     let validator_kind = kind;
     let validator_path = path.clone();
@@ -1242,6 +1533,7 @@ async fn resource_push_cli_fallback(
         label: String::new(),
         scope,
         target,
+        comment: None,
     };
     resolve_choice(
         socket,
@@ -1404,12 +1696,14 @@ mod tests {
         ApprovalFormResult, ApprovalScope, ApprovalTarget, approval_context,
         elevation_presentation, http_presentation, network_presentation, network_prompt_scheme,
         network_prompt_url, network_prompt_with_aliases, network_prompt_with_transport_hint,
-        parse_filesystem_target, parse_network_target, parse_resource_target,
+        parse_dbus_target, parse_filesystem_target, parse_network_target, parse_resource_target,
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
     use crate::ui::options::ApprovalFormAction;
-    use agent_sandbox_core::{HttpRequest, ResourceAccess, ResourceKind, SandboxPaths};
+    use agent_sandbox_core::{
+        DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
+    };
     use std::collections::HashMap;
     use std::path::Path;
     #[test]
@@ -1630,6 +1924,46 @@ mod tests {
         assert_eq!(
             valid_rule_path(" ./src "),
             Some(Path::new("./src").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn dbus_target_wildcards_match_requested_message() {
+        let requested = DbusTarget::session(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            DbusMessageKind::MethodCall,
+            "",
+            Vec::new(),
+        );
+        let result = ApprovalFormResult {
+            action: ApprovalFormAction::Allow,
+            scope: ApprovalScope::Project,
+            values: HashMap::from([
+                ("bus".into(), "session".into()),
+                ("destination".into(), "*".into()),
+                ("object_path".into(), "*".into()),
+                (
+                    "interface".into(),
+                    "org.freedesktop.DBus.Introspectable".into(),
+                ),
+                ("member".into(), "Introspect".into()),
+                ("message_kind".into(), "method_call".into()),
+                ("signature".into(), "<empty>".into()),
+                ("fd_metadata".into(), "count=0".into()),
+            ]),
+        };
+        let expected = DbusTarget {
+            destination: "*".into(),
+            object_path: "*".into(),
+            ..requested.clone()
+        };
+
+        assert_eq!(
+            parse_dbus_target(&result, &requested),
+            Some(ApprovalTarget::Dbus { target: expected })
         );
     }
 

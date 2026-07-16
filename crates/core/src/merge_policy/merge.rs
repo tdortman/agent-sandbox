@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use crate::hosts::host_pattern_matches;
 use crate::http::{HttpMethodMatcher, HttpRule, HttpRuleTarget, HttpUrl};
 use crate::policy::{
-    DirectNetworkSection, FilesystemRule, FilesystemRuleKey, FilesystemSection, HttpSection,
-    NetworkRule, NetworkSection, Policy, ResourceRule, ResourceRuleKey, ResourceSection, SudoRule,
-    SudoSection,
+    DbusRule, DbusSection, DirectNetworkSection, FilesystemRule, FilesystemRuleKey,
+    FilesystemSection, HttpSection, NetworkRule, NetworkSection, Policy, ResourceRule,
+    ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
 };
 
 #[must_use]
@@ -20,7 +20,23 @@ pub fn merge_layers(layers: &[Policy]) -> Policy {
         sudo: merge_sudo(layers),
         filesystem: merge_filesystem(layers),
         resources: merge_resources(layers),
+        dbus: merge_dbus(layers),
     }
+}
+
+fn dbus_rules_overlap(deny: &DbusRule, allow: &DbusRule) -> bool {
+    deny.matches(&allow.target) && allow.matches(&deny.target)
+}
+
+fn merge_dbus(layers: &[Policy]) -> DbusSection {
+    let (allow, deny) = merge_rules(
+        layers,
+        |policy| &policy.dbus.allow,
+        |policy| &policy.dbus.deny,
+        |rule| Some(rule.clone()),
+        dbus_rules_overlap,
+    );
+    DbusSection { allow, deny }
 }
 
 fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {

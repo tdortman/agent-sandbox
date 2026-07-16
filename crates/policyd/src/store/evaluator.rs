@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use agent_sandbox_core::{
-    ApprovalScope, FileAccess, ResourceAccess, ResourceKind, Verdict, VerdictSource, normalize_host,
+    ApprovalScope, DbusTarget, FileAccess, ResourceAccess, ResourceKind, Verdict, VerdictSource,
+    normalize_host,
 };
 
 use agent_sandbox_core::ResolvedRequestContext;
@@ -168,6 +169,24 @@ impl PolicyEvaluation<'_> {
             return Some(Verdict::allowed(VerdictSource::policy()));
         }
         None
+    }
+
+    pub(crate) fn dbus_verdict(&self, target: &DbusTarget) -> Option<Verdict> {
+        let merged = self.store.merged_for(&self.ctx);
+        if merged.dbus.deny.iter().any(|rule| rule.matches(target)) {
+            return Some(Verdict::denied(VerdictSource::policy()));
+        }
+        merged
+            .dbus
+            .allow
+            .iter()
+            .find(|rule| rule.matches(target))
+            .map(|rule| {
+                rule.comment.as_deref().map_or_else(
+                    || Verdict::allowed(VerdictSource::policy()),
+                    |comment| Verdict::allowed(VerdictSource::policy_with_comment(comment)),
+                )
+            })
     }
 }
 
@@ -391,6 +410,53 @@ mod tests {
                 .await,
             Some(Verdict::allowed(VerdictSource::Scope(
                 ApprovalScope::Session
+            )))
+        );
+    }
+    #[tokio::test]
+    async fn dbus_policy_matches_structured_target() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home-user");
+        let project_root = dir.path().join("repo");
+        let policy_dir = home.join(".config/agent-sandbox");
+        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        let mut policy = Policy::default();
+        policy.dbus.allow.push(agent_sandbox_core::DbusRule::new(
+            agent_sandbox_core::DbusTarget::session(
+                "org.example.Service",
+                "/org/example/Object",
+                "org.example.Interface",
+                "Read",
+                agent_sandbox_core::DbusMessageKind::MethodCall,
+                "s",
+                Vec::new(),
+            ),
+            "trusted D-Bus method",
+        ));
+        atomic_write_policy(&policy_dir.join("policy.json"), &policy, None, None, None)
+            .expect("write policy");
+        let store = test_store(&dir);
+        let project_root_s = project_root.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+        let target = agent_sandbox_core::DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            agent_sandbox_core::DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+        assert_eq!(
+            store.policy_evaluation(&ctx).dbus_verdict(&target),
+            Some(Verdict::allowed(VerdictSource::policy_with_comment(
+                "trusted D-Bus method"
             )))
         );
     }

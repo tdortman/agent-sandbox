@@ -8,6 +8,7 @@ use agent_sandbox_core::{
 use super::http::http_context;
 use super::types::{HttpPendingKey, Pending, PendingHttp, PolicyStore};
 use crate::error::PolicydError;
+use crate::wire::ScopeWire;
 
 fn context_for_pending(pending: &PendingHttp, ids: ProcessIds) -> ResolvedRequestContext {
     ResolvedRequestContext::new(
@@ -124,6 +125,19 @@ impl PolicyStore {
         ctx: agent_sandbox_core::ResolvedRequestContext,
         allowed: bool,
     ) -> Result<ScopeActionReply, PolicydError> {
+        self.apply_http_scope_with_comment(target, scope, session_id, ctx, allowed, None)
+            .await
+    }
+
+    async fn apply_http_scope_with_comment(
+        &self,
+        target: HttpRuleTarget,
+        scope: ApprovalScope,
+        session_id: Option<String>,
+        ctx: agent_sandbox_core::ResolvedRequestContext,
+        allowed: bool,
+        comment: Option<&str>,
+    ) -> Result<ScopeActionReply, PolicydError> {
         if scope == ApprovalScope::Once && matches!(target.method, HttpMethodMatcher::All) {
             return Err(PolicydError::InvalidDecisionTarget);
         }
@@ -154,7 +168,7 @@ impl PolicyStore {
             Self::persist_http_rule(
                 policy_path,
                 &target,
-                scope.as_str(),
+                comment.unwrap_or_else(|| scope.as_str()),
                 allowed,
                 home.as_deref(),
                 ctx.ids.uid(),
@@ -218,11 +232,13 @@ impl PolicyStore {
         pending: PendingHttp,
         scope: ApprovalScope,
         target: Option<HttpRuleTarget>,
-        session_id: Option<String>,
-        ctx: agent_sandbox_core::ResolvedRequestContext,
+        wire: ScopeWire,
         allowed: bool,
     ) -> Result<ScopeActionReply, PolicydError> {
-        let pending_context = context_for_pending(&pending, ctx.ids);
+        let ids = ProcessIds::from_options(None, wire.owner_uid);
+        let pending_context = context_for_pending(&pending, ids);
+        let session_id = wire.session_id;
+        let comment = wire.comment.as_deref();
         let target = if scope == ApprovalScope::Once {
             if target.is_some() {
                 return Err(PolicydError::InvalidDecisionTarget);
@@ -242,7 +258,14 @@ impl PolicyStore {
                 .insert(pending.id.clone(), Pending::Http(pending.clone()));
         }
         let reply = self
-            .apply_http_scope(target, scope, session_id, pending_context, allowed)
+            .apply_http_scope_with_comment(
+                target,
+                scope,
+                session_id,
+                pending_context,
+                allowed,
+                comment,
+            )
             .await?;
         // A pending decision can carry a context that has no sandbox session.
         // Direct application above handles the scope state; ensure this exact
@@ -359,8 +382,7 @@ mod tests {
                 pending.clone(),
                 ApprovalScope::Once,
                 None,
-                None,
-                ui_context,
+                ScopeWire::from_resolved(&ui_context, None),
                 true,
             )
             .await
@@ -478,8 +500,7 @@ mod tests {
                 pending,
                 ApprovalScope::Global,
                 Some(target.clone()),
-                None,
-                ui_context,
+                ScopeWire::from_resolved(&ui_context, None),
                 true,
             )
             .await

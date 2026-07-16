@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, FilesystemSortKey, HttpRule, HttpRuleTarget, NetworkRule,
-    NetworkSortKey, ResourceAccess, ResourceKind, ResourceRule, ResourceSortKey, SudoRule,
-    atomic_write_policy, contract_home_path, load_policy, normalize_host,
+    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemSortKey, HttpRule, HttpRuleTarget,
+    NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind, ResourceRule, ResourceSortKey,
+    SudoRule, atomic_write_policy, contract_home_path, load_policy, normalize_host,
     trusted_project_policy_path,
 };
 
@@ -450,6 +450,34 @@ impl PolicyStore {
         sort_resource_rules(&mut policy.resources.deny, home);
         atomic_write_policy(path, &policy, home, owner_uid, None)
     }
+    pub(crate) fn persist_dbus_rule(
+        path: &Path,
+        target: &DbusTarget,
+        label: &str,
+        allow_rule: bool,
+        home: Option<&Path>,
+        owner_uid: Option<u32>,
+    ) -> std::io::Result<()> {
+        let mut policy = load_policy(path, home, None);
+        let rule = DbusRule::new(target.clone(), label);
+        let (selected, other) = if allow_rule {
+            (&mut policy.dbus.allow, &mut policy.dbus.deny)
+        } else {
+            (&mut policy.dbus.deny, &mut policy.dbus.allow)
+        };
+        other.retain(|existing| existing.target != *target);
+        if let Some(existing) = selected
+            .iter_mut()
+            .find(|existing| existing.target == *target)
+        {
+            *existing = rule;
+        } else {
+            selected.push(rule);
+        }
+        selected.sort_by_key(|entry| entry.target.clone());
+        other.sort_by_key(|entry| entry.target.clone());
+        atomic_write_policy(path, &policy, home, owner_uid, None)
+    }
 
     /// Return the on-disk path the project scope writes to. The path lives
     /// under `<project_root>/.agent-sandbox/policy.json` so
@@ -475,8 +503,8 @@ impl PolicyStore {
 mod tests {
     use super::*;
     use agent_sandbox_core::{
-        HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, Policy, ResourceAccess,
-        ResourceKind, SocketAccess, atomic_write_policy,
+        DbusMessageKind, DbusTarget, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl,
+        Policy, ResourceAccess, ResourceKind, SocketAccess, atomic_write_policy,
     };
 
     fn target(method: &str) -> HttpRuleTarget {
@@ -513,6 +541,33 @@ mod tests {
         assert_eq!(policy.network.http.deny.len(), 1);
         assert_eq!(policy.network.http.deny[0].methods, vec!["POST".to_owned()]);
     }
+    #[test]
+    fn persist_dbus_rules_replaces_matching_target_and_removes_opposite_rule() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("policy.json");
+        atomic_write_policy(&path, &Policy::default(), None, None, None).expect("write policy");
+        let target = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+
+        PolicyStore::persist_dbus_rule(&path, &target, "allow", true, None, None)
+            .expect("persist allow");
+        PolicyStore::persist_dbus_rule(&path, &target, "deny", false, None, None)
+            .expect("persist deny");
+
+        let policy = load_policy(&path, None, None);
+        assert!(policy.dbus.allow.is_empty());
+        assert_eq!(policy.dbus.deny.len(), 1);
+        assert_eq!(policy.dbus.deny[0].target, target);
+        assert_eq!(policy.dbus.deny[0].comment.as_deref(), Some("deny"));
+    }
+
     #[test]
     fn persist_resource_rules_merges_connect_and_send_into_all() {
         let mut rules = Vec::new();

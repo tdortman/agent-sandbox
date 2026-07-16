@@ -7,9 +7,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use agent_sandbox_core::{
-    AttributionToken, CheckReply, ElevateReply, FileAccess, FilesystemCheckReply, FilesystemRule,
-    FilesystemRuleKey, FlowRegistration, HttpCheckReply, HttpContextKey, HttpRequest,
-    HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId, ProxyConnectionId,
+    AttributionToken, CheckReply, DbusTarget, ElevateReply, FileAccess, FilesystemCheckReply,
+    FilesystemRule, FilesystemRuleKey, FlowRegistration, HttpCheckReply, HttpContextKey,
+    HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId, ProxyConnectionId,
     ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
 };
@@ -185,7 +185,6 @@ pub struct PendingFilesystem {
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
-
 #[derive(Debug, Clone)]
 pub struct PendingResource {
     pub id: String,
@@ -199,6 +198,18 @@ pub struct PendingResource {
     pub sandbox_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingDbus {
+    pub id: String,
+    pub created_at: f64,
+    pub target: DbusTarget,
+    pub path: PathBuf,
+    pub cwd: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
+    pub sandbox_session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
     Elevation,
@@ -206,12 +217,12 @@ pub enum PendingKind {
     Http,
     Filesystem,
     Resource,
+    Dbus,
 }
 
 /// Discriminated union of pending approval requests.
 ///
 /// The variant determines which fields are meaningful:
-/// - `Elevation`: `argv` is required. `host`/`port`/`scheme`/`url` absent.
 #[derive(Debug, Clone)]
 pub enum Pending {
     Elevation(PendingElevation),
@@ -219,6 +230,7 @@ pub enum Pending {
     Http(PendingHttp),
     Filesystem(PendingFilesystem),
     Resource(PendingResource),
+    Dbus(PendingDbus),
 }
 
 impl Pending {
@@ -230,8 +242,10 @@ impl Pending {
             Self::Http(_) => PendingKind::Http,
             Self::Filesystem(_) => PendingKind::Filesystem,
             Self::Resource(_) => PendingKind::Resource,
+            Self::Dbus(_) => PendingKind::Dbus,
         }
     }
+
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
@@ -240,6 +254,7 @@ impl Pending {
             Self::Http(p) => &p.id,
             Self::Filesystem(p) => &p.id,
             Self::Resource(p) => &p.id,
+            Self::Dbus(p) => &p.id,
         }
     }
 
@@ -251,6 +266,7 @@ impl Pending {
             Self::Http(p) => p.created_at,
             Self::Filesystem(p) => p.created_at,
             Self::Resource(p) => p.created_at,
+            Self::Dbus(p) => p.created_at,
         }
     }
 
@@ -262,6 +278,7 @@ impl Pending {
             Self::Http(p) => p.context.cwd.as_deref(),
             Self::Filesystem(p) => p.cwd.as_deref(),
             Self::Resource(p) => p.cwd.as_deref(),
+            Self::Dbus(p) => p.cwd.as_deref(),
         }
     }
 
@@ -273,6 +290,7 @@ impl Pending {
             Self::Http(p) => p.context.home.as_deref(),
             Self::Filesystem(p) => p.home.as_deref(),
             Self::Resource(p) => p.home.as_deref(),
+            Self::Dbus(p) => p.home.as_deref(),
         }
     }
 
@@ -284,6 +302,7 @@ impl Pending {
             Self::Http(p) => p.context.project_root.as_deref(),
             Self::Filesystem(p) => p.project_root.as_deref(),
             Self::Resource(p) => p.project_root.as_deref(),
+            Self::Dbus(p) => p.project_root.as_deref(),
         }
     }
 
@@ -295,6 +314,7 @@ impl Pending {
             Self::Http(p) => p.context.sandbox_session_id.as_deref(),
             Self::Filesystem(p) => p.sandbox_session_id.as_deref(),
             Self::Resource(p) => p.sandbox_session_id.as_deref(),
+            Self::Dbus(p) => p.sandbox_session_id.as_deref(),
         }
     }
 }
@@ -435,6 +455,8 @@ pub struct StoreInner {
     pub session_filesystem_allow: HashMap<String, HashSet<FilesystemRuleKey>>,
     pub session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
     pub session_resource_allow: HashMap<String, HashSet<ResourceRuleKey>>,
+    pub session_dbus_allow: HashMap<String, HashSet<DbusTarget>>,
+    pub session_dbus_deny: HashMap<String, HashSet<DbusTarget>>,
     pub session_resource_deny: HashMap<String, HashSet<ResourceRuleKey>>,
     pub http_once_allow: HashSet<HttpPendingKey>,
     pub http_once_deny: HashSet<HttpPendingKey>,

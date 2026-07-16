@@ -2,14 +2,15 @@
 use std::path::PathBuf;
 
 use agent_sandbox_core::{
-    ApprovalScope, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind, ResourceRuleKey,
-    RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
+    ApprovalScope, DbusTarget, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind,
+    ResourceRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
 };
 
 use crate::error::PolicydError;
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 
 use super::decisions::DecisionAction;
+
 use super::persist::PersistResourceRuleArgs;
 use super::types::PolicyStore;
 
@@ -57,6 +58,7 @@ impl PolicyStore {
             session_id,
             owner_uid,
             sandbox_session_id: _,
+            comment,
         } = wire;
         let home = paths.home();
         let project_root = paths.project_root();
@@ -67,7 +69,7 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return reply,
         };
-        let scope_label = scope.as_str();
+        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
@@ -192,6 +194,104 @@ impl PolicyStore {
             policy_path.map(PathBuf::from),
         ))
     }
+    pub(crate) async fn apply_dbus_scope(
+        &self,
+        target: DbusTarget,
+        scope: ApprovalScope,
+        wire: ScopeWire,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let ScopeWire {
+            paths,
+            session_id,
+            owner_uid,
+            sandbox_session_id: _,
+            comment,
+        } = wire;
+        let home = paths.home();
+        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+        let project_root = paths.project_root();
+        let scope_target = match self
+            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
+            .await
+        {
+            Ok(target) => target,
+            Err(reply) => return reply,
+        };
+        let policy_path = match scope_target {
+            ScopeTarget::Ephemeral => None,
+            ScopeTarget::Session { session_id } => {
+                self.apply_dbus_scope_session(action, session_id, target.clone())
+                    .await;
+                None
+            }
+            ScopeTarget::Global { policy_path, home } => {
+                if let Err(err) = Self::persist_dbus_rule(
+                    &policy_path,
+                    &target,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    Some(home.as_path()),
+                    owner_uid,
+                ) {
+                    return PolicydError::from(err).into();
+                }
+                Some(policy_path)
+            }
+            ScopeTarget::Project { policy_path, .. } => {
+                if let Err(err) = Self::persist_dbus_rule(
+                    &policy_path,
+                    &target,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    home,
+                    owner_uid,
+                ) {
+                    return PolicydError::from(err).into();
+                }
+                Some(policy_path)
+            }
+        };
+        let _ = self.export_policy_files(paths);
+        Self::audit(
+            action.audit_verb(),
+            None,
+            None,
+            &format!("D-Bus target={target:?} scope={scope_label}"),
+        );
+        RpcReply::ScopeAction(ScopeActionReply::ok_dbus(target, scope, policy_path))
+    }
+
+    pub(crate) async fn apply_dbus_scope_session(
+        &self,
+        action: DecisionAction,
+        session_id: String,
+        target: DbusTarget,
+    ) {
+        let mut inner = self.inner.lock().await;
+        match action {
+            DecisionAction::Approve => {
+                inner
+                    .session_dbus_allow
+                    .entry(session_id.clone())
+                    .or_default()
+                    .insert(target.clone());
+                if let Some(deny) = inner.session_dbus_deny.get_mut(&session_id) {
+                    deny.remove(&target);
+                }
+            }
+            DecisionAction::Deny => {
+                inner
+                    .session_dbus_deny
+                    .entry(session_id.clone())
+                    .or_default()
+                    .insert(target.clone());
+                if let Some(allow) = inner.session_dbus_allow.get_mut(&session_id) {
+                    allow.remove(&target);
+                }
+            }
+        }
+    }
 
     pub(crate) async fn apply_resource_scope(
         &self,
@@ -210,6 +310,7 @@ impl PolicyStore {
             session_id,
             owner_uid,
             sandbox_session_id: _,
+            comment,
         } = wire;
         let home = paths.home();
         let project_root = paths.project_root();
@@ -220,7 +321,7 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return reply,
         };
-        let scope_label = scope.as_str();
+        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {

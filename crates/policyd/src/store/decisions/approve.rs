@@ -2,13 +2,13 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, ElevateReply, FileAccess, FilesystemRule, NetworkRuleKey,
-    ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SudoRule, VerdictSource,
-    host_pattern_matches,
+    ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
+    NetworkRuleKey, ResourceAccess, ResourceKind, ResourceRule, RpcReply, ScopeActionReply,
+    SudoRule, VerdictSource, host_pattern_matches,
 };
 
 use super::super::types::{
-    NetworkVerdictKey, Pending, PendingElevation, PendingFilesystem, PendingNetwork,
+    NetworkVerdictKey, Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
     PendingResource, PolicyStore,
 };
 use super::DecisionAction;
@@ -71,6 +71,16 @@ impl PolicyStore {
                 )
                 .await
             }
+            Pending::Dbus(dbus) => {
+                self.apply_pending_dbus_decision(
+                    dbus,
+                    decision.wire,
+                    decision.scope,
+                    decision.target.as_ref(),
+                    action,
+                )
+                .await
+            }
             Pending::Http(http) => {
                 let target = match decision.target {
                     Some(ApprovalTarget::Http { target }) => Some(target),
@@ -79,18 +89,11 @@ impl PolicyStore {
                         return RpcReply::from(crate::error::PolicydError::InvalidDecisionTarget);
                     }
                 };
-                let wire = decision.wire;
-                let ctx = agent_sandbox_core::ResolvedRequestContext::new(
-                    wire.paths.clone(),
-                    agent_sandbox_core::ProcessIds::from_options(None, wire.owner_uid),
-                    wire.sandbox_session_id.clone(),
-                );
                 self.apply_pending_http(
                     http,
                     decision.scope,
                     target,
-                    wire.session_id,
-                    ctx,
+                    decision.wire,
                     action == DecisionAction::Approve,
                 )
                 .await
@@ -478,6 +481,80 @@ impl PolicyStore {
         Err(PolicydError::InvalidDecisionTarget)
     }
 
+    async fn apply_pending_dbus_decision(
+        &self,
+        res: PendingDbus,
+        wire: crate::wire::ScopeWire,
+        scope: ApprovalScope,
+        target: Option<&ApprovalTarget>,
+        action: DecisionAction,
+    ) -> RpcReply {
+        let dbus_target = match target {
+            None => res.target.clone(),
+            Some(ApprovalTarget::Dbus { target }) => {
+                if !DbusRule::new(target.clone(), "").matches(&res.target) {
+                    self.inner
+                        .lock()
+                        .await
+                        .pending
+                        .insert(res.id.clone(), Pending::Dbus(res));
+                    return PolicydError::InvalidDecisionTarget.into();
+                }
+                target.clone()
+            }
+            Some(_) => {
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert(res.id.clone(), Pending::Dbus(res));
+                return PolicydError::InvalidDecisionTarget.into();
+            }
+        };
+        let allowed = action == DecisionAction::Approve;
+        let source = if allowed {
+            VerdictSource::Scope(scope)
+        } else {
+            VerdictSource::User
+        };
+        let path = res.path.clone();
+        if scope == ApprovalScope::Once {
+            self.finish_resource(
+                &res.id,
+                ResourceKind::UnixSocket,
+                path,
+                ResourceAccess::default(),
+                allowed,
+                source,
+            )
+            .await;
+            return RpcReply::ScopeAction(ScopeActionReply::ok_dbus(dbus_target, scope, None));
+        }
+
+        let scope_wire = Self::scope_wire_for_pending_dbus(wire, &res);
+        let result = self
+            .apply_dbus_scope(dbus_target, scope, scope_wire, action)
+            .await;
+        if result.scope_succeeded() {
+            self.finish_resource(
+                &res.id,
+                ResourceKind::UnixSocket,
+                path,
+                ResourceAccess::default(),
+                allowed,
+                source,
+            )
+            .await;
+        } else {
+            self.inner
+                .lock()
+                .await
+                .pending
+                .insert(res.id.clone(), Pending::Dbus(res));
+        }
+        result
+    }
+
     async fn apply_pending_resource_decision(
         &self,
         res: PendingResource,
@@ -720,13 +797,13 @@ mod tests {
     use std::time::Duration;
 
     use agent_sandbox_core::{
-        ApprovalScope, ApprovalTarget, FileAccess, NetworkRuleKey, ProcessIds, ResourceAccess,
-        ResourceKind, RpcReply, SandboxPaths, load_policy,
+        ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
+        ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths, load_policy,
     };
     use tokio::net::UnixStream;
     use tokio::sync::Mutex;
 
-    use crate::store::types::{UiClient, UiSessionContext};
+    use crate::store::types::{PendingDbus, UiClient, UiSessionContext};
     use crate::store::{
         Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource, PolicyStore,
         PolicydArgs,
@@ -1062,6 +1139,7 @@ mod tests {
                     session_id: None,
                     owner_uid: Some(1000),
                     sandbox_session_id: None,
+                    comment: None,
                 },
                 client_id: 1,
                 approver_uid: None,
@@ -1117,6 +1195,7 @@ mod tests {
                     session_id: None,
                     owner_uid: Some(1000),
                     sandbox_session_id: None,
+                    comment: None,
                 },
                 client_id: 1,
                 approver_uid: None,
@@ -1187,6 +1266,7 @@ mod tests {
                     session_id: None,
                     owner_uid: Some(1000),
                     sandbox_session_id: None,
+                    comment: None,
                 },
                 client_id: 1,
                 approver_uid: None,
@@ -1257,6 +1337,160 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dbus_once_approval_caches_encoded_pending_path() {
+        let store = test_store("dbus-once");
+        let target = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+        let encoded = serde_json::to_string(&target).expect("encode D-Bus target");
+        let path = PathBuf::from(format!("@dbus:{encoded}"));
+        let pending_id = "dbus:once".to_owned();
+        {
+            let mut inner = store.inner.lock().await;
+            inner.pending.insert(
+                pending_id.clone(),
+                Pending::Dbus(PendingDbus {
+                    id: pending_id.clone(),
+                    created_at: 0.0,
+                    target: target.clone(),
+                    path: path.clone(),
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: None,
+                }),
+            );
+        }
+
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
+            paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+            ids: ProcessIds::from_options(Some(123), Some(1000)),
+            sandbox_session_id: None,
+        };
+        add_ui_sessions(&store).await;
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Once,
+                target: Some(ApprovalTarget::Dbus {
+                    target: target.clone(),
+                }),
+                wire: ScopeWire::from_resolved(&ctx, None),
+                client_id: 1,
+                approver_uid: Some(1000),
+            })
+            .await;
+
+        assert!(matches!(
+            reply,
+            RpcReply::ScopeAction(agent_sandbox_core::ScopeActionReply::Dbus(_))
+        ));
+        let inner = store.inner.lock().await;
+        assert!(inner.resource_verdict_cache.contains_key(
+            &crate::store::types::ResourceVerdictKey {
+                kind: ResourceKind::UnixSocket,
+                path: path.clone(),
+                access: ResourceAccess::default(),
+            }
+        ));
+        assert!(!inner.resource_verdict_cache.contains_key(
+            &crate::store::types::ResourceVerdictKey {
+                kind: ResourceKind::UnixSocket,
+                path: PathBuf::from("@dbus"),
+                access: ResourceAccess::default(),
+            }
+        ));
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn dbus_global_approval_with_comment_persists_edited_target() {
+        let store = test_store("dbus-global-comment");
+        let home = std::env::temp_dir().join(format!(
+            "agent-sandbox-home-dbus-comment-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create test home");
+        let requested = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "",
+            Vec::new(),
+        );
+        let edited = DbusTarget {
+            destination: "org.example.Service".into(),
+            object_path: "*".into(),
+            interface: "*".into(),
+            member: "*".into(),
+            ..requested.clone()
+        };
+        let pending_id = "dbus-global-comment".to_owned();
+        {
+            let mut inner = store.inner.lock().await;
+            inner.pending.insert(
+                pending_id.clone(),
+                Pending::Dbus(PendingDbus {
+                    id: pending_id.clone(),
+                    created_at: 0.0,
+                    target: requested.clone(),
+                    path: PathBuf::from("@dbus:placeholder"),
+                    cwd: Some("/repo".into()),
+                    home: Some(home.clone()),
+                    project_root: None,
+                    sandbox_session_id: None,
+                }),
+            );
+        }
+
+        add_ui_sessions(&store).await;
+
+        let reply = store
+            .approve(PendingDecision {
+                pending_id,
+                scope: ApprovalScope::Global,
+                target: Some(ApprovalTarget::Dbus {
+                    target: edited.clone(),
+                }),
+                wire: ScopeWire {
+                    paths: SandboxPaths::new("/repo", home.clone(), "/repo"),
+                    session_id: None,
+                    owner_uid: Some(1000),
+                    sandbox_session_id: None,
+                    comment: Some("allow introspect".into()),
+                },
+                client_id: 1,
+                approver_uid: Some(1000),
+            })
+            .await;
+
+        assert!(
+            reply.scope_succeeded(),
+            "global D-Bus wildcard approval should succeed, got {reply:?}"
+        );
+
+        let policy_path = home.join(".config/agent-sandbox/policy.json");
+        let policy = load_policy(&policy_path, Some(&home), None);
+        let found = policy.dbus.allow.iter().find(|rule| {
+            rule.target.destination == "org.example.Service" && rule.target.object_path == "*"
+        });
+        let found = found.expect("wildcard D-Bus rule persisted");
+        assert_eq!(
+            found.comment.as_deref(),
+            Some("allow introspect"),
+            "persisted rule should carry the user-supplied comment"
+        );
+    }
+
     async fn add_ui_sessions(store: &PolicyStore) {
         let mut inner = store.inner.lock().await;
         inner.ui_clients.insert(
@@ -1290,6 +1524,7 @@ mod tests {
             session_id: Some(session_id.into()),
             owner_uid: Some(1000),
             sandbox_session_id: None,
+            comment: None,
         }
     }
 
@@ -1405,6 +1640,7 @@ mod tests {
                     session_id: None,
                     owner_uid: Some(1001),
                     sandbox_session_id: Some("sandbox-a".into()),
+                    comment: None,
                 },
                 client_id: 99,
                 approver_uid: Some(1001),
@@ -1560,6 +1796,7 @@ mod tests {
                     session_id: None,
                     owner_uid: Some(1000),
                     sandbox_session_id: Some("sandbox-a".into()),
+                    comment: None,
                 },
                 client_id: 99,
                 approver_uid: Some(1000),

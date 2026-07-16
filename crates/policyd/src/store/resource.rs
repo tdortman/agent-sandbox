@@ -2,7 +2,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::{ResourceAccess, ResourceCheckReply, ResourceKind, UiPush, VerdictSource};
+use agent_sandbox_core::{
+    DbusTarget, ResourceAccess, ResourceCheckReply, ResourceKind, UiPush, VerdictSource,
+};
 use tokio::sync::oneshot;
 use tokio::time;
 use uuid::Uuid;
@@ -49,6 +51,14 @@ impl PolicyStore {
     }
 
     pub async fn request_resource_approval(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
+        self.request_resource_approval_with_target(req, None).await
+    }
+
+    pub(crate) async fn request_resource_approval_with_target(
+        &self,
+        req: ResourceCheckRequest,
+        dbus_target: Option<DbusTarget>,
+    ) -> ResourceCheckReply {
         let ResourceCheckRequest {
             kind,
             path,
@@ -60,7 +70,7 @@ impl PolicyStore {
         let home = ctx.paths.home_path();
         let project_root = ctx.paths.project_root_path();
         let sandbox_session_id = ctx.sandbox_session_id.clone();
-        if self.resource_policy_denied(kind, &path, access, &ctx).await {
+        if dbus_target.is_none() && self.resource_policy_denied(kind, &path, access, &ctx).await {
             return ResourceCheckReply::denied(VerdictSource::policy(), kind, path.clone(), access);
         }
         if !self.args.interactive_approval {
@@ -76,6 +86,7 @@ impl PolicyStore {
                 kind,
                 &path,
                 access,
+                dbus_target.as_ref(),
                 &PendingCtx {
                     cwd: cwd.as_deref(),
                     home: home.as_deref(),
@@ -90,14 +101,24 @@ impl PolicyStore {
         };
 
         if result.is_new {
-            let push = UiPush::ResourceRequest {
-                id: result.id.clone(),
-                kind,
-                path: path.clone(),
-                access,
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
+            let push = match dbus_target.as_ref() {
+                Some(target) => UiPush::DbusRequest {
+                    id: result.id.clone(),
+                    target: target.clone(),
+                    cwd: cwd.clone(),
+                    home: home.clone(),
+                    project_root: project_root.clone(),
+                    sandbox_session_id: sandbox_session_id.clone(),
+                },
+                None => UiPush::ResourceRequest {
+                    id: result.id.clone(),
+                    kind,
+                    path: path.clone(),
+                    access,
+                    cwd: cwd.clone(),
+                    home: home.clone(),
+                    project_root: project_root.clone(),
+                },
             };
             self.notify_standalone_ui(&ctx, &push).await;
 
@@ -158,6 +179,7 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
+        dbus_target: Option<&DbusTarget>,
         ctx: &PendingCtx<'_>,
     ) -> Result<PendingResResult, ResourceCheckReply> {
         let (tx, rx) = oneshot::channel();
@@ -165,11 +187,22 @@ impl PolicyStore {
         // Deduplicate: if a pending already exists for the same resource
         // kind, path, and access type, join its waiters instead of creating
         // a new prompt.
-        if let Some(existing_id) = inner.pending.values().find_map(|p| {
-            let Pending::Resource(res) = p else {
-                return None;
-            };
-            (res.kind == kind && res.path == path && res.access == access).then(|| res.id.clone())
+        if let Some(existing_id) = inner.pending.values().find_map(|p| match p {
+            Pending::Resource(res)
+                if dbus_target.is_none()
+                    && res.kind == kind
+                    && res.path == path
+                    && res.access == access =>
+            {
+                Some(res.id.clone())
+            }
+            Pending::Dbus(res)
+                if dbus_target == Some(&res.target)
+                    && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
+            {
+                Some(res.id.clone())
+            }
+            _ => None,
         }) {
             let waiter_count = inner.resource_futures.get(&existing_id).map_or(0, Vec::len);
             if waiter_count >= MAX_WAITERS_PER_PENDING {
@@ -202,22 +235,37 @@ impl PolicyStore {
         }
         let pending_id = format!("res:{}", Uuid::now_v7().simple());
         inner.resource_futures.insert(pending_id.clone(), vec![tx]);
-        inner.pending.insert(
-            pending_id.clone(),
-            Pending::Resource(PendingResource {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                kind,
-                path: path.to_path_buf(),
-                access,
-                cwd: ctx.cwd.map(PathBuf::from),
-                home: ctx.home.map(PathBuf::from),
-                project_root: ctx.project_root.map(PathBuf::from),
-                sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-            }),
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let pending = dbus_target.map_or_else(
+            || {
+                Pending::Resource(PendingResource {
+                    id: pending_id.clone(),
+                    created_at,
+                    kind,
+                    path: path.to_path_buf(),
+                    access,
+                    cwd: ctx.cwd.map(PathBuf::from),
+                    home: ctx.home.map(PathBuf::from),
+                    project_root: ctx.project_root.map(PathBuf::from),
+                    sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+                })
+            },
+            |target| {
+                Pending::Dbus(crate::store::types::PendingDbus {
+                    id: pending_id.clone(),
+                    created_at,
+                    target: target.clone(),
+                    path: path.to_path_buf(),
+                    cwd: ctx.cwd.map(PathBuf::from),
+                    home: ctx.home.map(PathBuf::from),
+                    project_root: ctx.project_root.map(PathBuf::from),
+                    sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+                })
+            },
         );
+        inner.pending.insert(pending_id.clone(), pending);
         drop(inner);
         Ok(PendingResResult {
             id: pending_id,

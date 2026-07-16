@@ -42,6 +42,7 @@ pub async fn resolve_choice(
             scope: choice.scope,
             session_id: session_id.map(str::to_owned),
             target: choice.target,
+            comment: choice.comment,
             ctx,
         },
         PromptAction::Deny => RpcRequest::Deny {
@@ -49,6 +50,7 @@ pub async fn resolve_choice(
             scope: choice.scope,
             session_id: session_id.map(str::to_owned),
             target: choice.target,
+            comment: choice.comment,
             ctx,
         },
     };
@@ -90,6 +92,7 @@ pub async fn deny_cancellation(
         scope: ApprovalScope::Once,
         session_id: None,
         target: None,
+        comment: None,
         ctx,
     };
     if let Err(err) = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await {

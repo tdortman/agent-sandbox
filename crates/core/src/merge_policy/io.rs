@@ -359,27 +359,35 @@ pub fn atomic_write_policy(
 
 pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     let mut json = String::new();
-    json.push_str("{\n    \"network\": {\n        \"direct\": {\n");
+    json.push_str("{\n  \"network\": {\n    \"direct\": {\n");
     push_nested_rules(&mut json, "allow", &policy.network.direct.allow)?;
     json.push_str(",\n");
     push_nested_rules(&mut json, "deny", &policy.network.direct.deny)?;
-    json.push_str("\n        },\n        \"http\": {\n");
+    json.push_str("\n    },\n    \"http\": {\n");
     push_nested_rules(&mut json, "allow", &policy.network.http.allow)?;
     json.push_str(",\n");
     push_nested_rules(&mut json, "deny", &policy.network.http.deny)?;
-    json.push_str("\n        }\n    },\n    \"sudo\": {\n");
+    json.push_str("\n    }\n  },\n  \"sudo\": {\n");
     push_rules(&mut json, "allow", &policy.sudo.allow)?;
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.sudo.deny)?;
-    json.push_str("\n    },\n    \"filesystem\": {\n");
+    json.push_str("\n  },\n  \"filesystem\": {\n");
     push_rules(&mut json, "allow", &policy.filesystem.allow)?;
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.filesystem.deny)?;
-    json.push_str("\n    },\n    \"resources\": {\n");
+    json.push_str("\n  },\n  \"resources\": {\n");
     push_rules(&mut json, "allow", &policy.resources.allow)?;
     json.push_str(",\n");
     push_rules(&mut json, "deny", &policy.resources.deny)?;
-    json.push_str("\n    }\n}");
+    if policy.dbus.allow.is_empty() && policy.dbus.deny.is_empty() {
+        json.push_str("\n  }\n}");
+        return Ok(json);
+    }
+    json.push_str("\n  },\n  \"dbus\": {\n");
+    push_pretty_rules(&mut json, "allow", &policy.dbus.allow)?;
+    json.push_str(",\n");
+    push_pretty_rules(&mut json, "deny", &policy.dbus.deny)?;
+    json.push_str("\n  }\n}");
     Ok(json)
 }
 /// Return a copy of `policy` with filesystem and resource allow/deny paths
@@ -406,7 +414,7 @@ fn push_rules<T: serde::Serialize>(
     name: &str,
     rules: &[T],
 ) -> serde_json::Result<()> {
-    out.push_str("        \"");
+    out.push_str("    \"");
     out.push_str(name);
     out.push_str("\": ");
     if rules.is_empty() {
@@ -415,15 +423,54 @@ fn push_rules<T: serde::Serialize>(
     }
     out.push_str("[\n");
     for (index, rule) in rules.iter().enumerate() {
-        out.push_str("            ");
+        out.push_str("      ");
         push_spaced_json(out, &serde_json::to_string(rule)?);
         if index + 1 != rules.len() {
             out.push(',');
         }
         out.push('\n');
     }
-    out.push_str("        ]");
+    out.push_str("    ]");
     Ok(())
+}
+fn push_pretty_rules<T: serde::Serialize>(
+    out: &mut String,
+    name: &str,
+    rules: &[T],
+) -> serde_json::Result<()> {
+    out.push_str("    \"");
+    out.push_str(name);
+    out.push_str("\": ");
+    if rules.is_empty() {
+        out.push_str("[]");
+        return Ok(());
+    }
+    out.push_str("[\n");
+    for (index, rule) in rules.iter().enumerate() {
+        push_indented_pretty_json(out, &serde_json::to_string_pretty(rule)?, 6);
+        if index + 1 != rules.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("    ]");
+    Ok(())
+}
+
+fn push_indented_pretty_json(out: &mut String, json: &str, base_indent: usize) {
+    for (index, line) in json.lines().enumerate() {
+        if index != 0 {
+            out.push('\n');
+        }
+        for _ in 0..base_indent {
+            out.push(' ');
+        }
+        let leading_spaces = line.len() - line.trim_start().len();
+        for _ in 0..leading_spaces {
+            out.push(' ');
+        }
+        out.push_str(line.trim_start());
+    }
 }
 
 fn push_nested_rules<T: serde::Serialize>(
@@ -431,7 +478,7 @@ fn push_nested_rules<T: serde::Serialize>(
     name: &str,
     rules: &[T],
 ) -> serde_json::Result<()> {
-    out.push_str("            \"");
+    out.push_str("      \"");
     out.push_str(name);
     out.push_str("\": ");
     if rules.is_empty() {
@@ -440,14 +487,14 @@ fn push_nested_rules<T: serde::Serialize>(
     }
     out.push_str("[\n");
     for (index, rule) in rules.iter().enumerate() {
-        out.push_str("                ");
+        out.push_str("        ");
         push_spaced_json(out, &serde_json::to_string(rule)?);
         if index + 1 != rules.len() {
             out.push(',');
         }
         out.push('\n');
     }
-    out.push_str("            ]");
+    out.push_str("      ]");
     Ok(())
 }
 
@@ -483,7 +530,35 @@ fn push_spaced_json(out: &mut String, compact: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{FileAccess, FilesystemRule, NetworkRule};
+    use crate::policy::{
+        DbusMessageKind, DbusRule, DbusTarget, FileAccess, FilesystemRule, NetworkRule,
+    };
+
+    #[test]
+    fn policy_json_formats_dbus_rules_multiline() {
+        let mut policy = crate::policy::Policy::default();
+        policy.dbus.allow = vec![DbusRule::new(
+            DbusTarget::session(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.Introspectable",
+                "Introspect",
+                DbusMessageKind::MethodCall,
+                "",
+                Vec::new(),
+            ),
+            "global",
+        )];
+
+        let json = policy_json(&policy).expect("serialize policy");
+        serde_json::from_str::<serde_json::Value>(&json).expect("valid policy JSON");
+        assert!(json.contains(
+            r#"      {
+        "target": {
+          "bus": "session""#
+        ));
+        assert!(!json.contains(r#""target": { "bus":"#));
+    }
 
     #[test]
     fn project_policy_chown_includes_parent_directory() {

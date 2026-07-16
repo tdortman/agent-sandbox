@@ -37,6 +37,7 @@ impl PolicyStore {
             session_id,
             owner_uid,
             sandbox_session_id: _,
+            comment,
         } = wire;
         let home = paths.home();
         let project_root = paths.project_root();
@@ -48,7 +49,7 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return reply,
         };
-        let scope_label = scope.as_str();
+        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {
             ScopeTarget::Ephemeral => {
                 if action == DecisionAction::Approve {

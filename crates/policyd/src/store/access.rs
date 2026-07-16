@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity, NetworkRuleKey, Policy,
-    ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, Verdict,
-    allow_keys, discover_git_project_root, expand_policy_path, normalize_host,
+    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
+    NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
+    ResourceRuleKey, Verdict, allow_keys, discover_git_project_root, expand_policy_path,
+    normalize_host,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -28,6 +29,12 @@ fn session_sudo_matches(bucket: &HashSet<Vec<String>>, argv: &[String]) -> bool 
     bucket
         .iter()
         .any(|rule| !rule.is_empty() && argv.starts_with(rule))
+}
+
+fn session_dbus_matches(bucket: &HashSet<DbusTarget>, target: &DbusTarget) -> bool {
+    bucket
+        .iter()
+        .any(|candidate| DbusRule::new(candidate.clone(), "").matches(target))
 }
 
 fn sandbox_filesystem_static_allow_key(ctx: &ResolvedRequestContext) -> String {
@@ -712,6 +719,35 @@ impl PolicyStore {
                 .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
         })
     }
+    pub(crate) async fn session_dbus_denied(
+        &self,
+        target: &DbusTarget,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_dbus_deny
+                .get(sid)
+                .is_some_and(|bucket| session_dbus_matches(bucket, target))
+        })
+    }
+
+    pub(crate) async fn session_dbus_allowed(
+        &self,
+        target: &DbusTarget,
+        ctx: &ResolvedRequestContext,
+    ) -> bool {
+        let session_ids = self.session_ids_for_context(ctx).await;
+        let inner = self.inner.lock().await;
+        session_ids.iter().any(|sid| {
+            inner
+                .session_dbus_allow
+                .get(sid)
+                .is_some_and(|bucket| session_dbus_matches(bucket, target))
+        })
+    }
 
     pub(crate) async fn resource_allow_source(
         &self,
@@ -727,16 +763,21 @@ impl PolicyStore {
 }
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::Path};
+    use std::{collections::HashSet, path::Path, sync::Arc};
 
     use super::{
         is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
         session_sudo_matches,
     };
     use agent_sandbox_core::{
-        DeviceAccess, FileAccess, FilesystemRuleKey, NetworkRuleKey, ResourceAccess, ResourceKind,
-        SocketAccess, Verdict, VerdictSource,
+        DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRuleKey, NetworkRuleKey,
+        ResourceAccess, ResourceKind, SocketAccess, Verdict, VerdictSource,
     };
+    use tokio::net::UnixStream;
+    use tokio::sync::Mutex;
+
+    use crate::store::UiSessionContext;
+    use crate::store::types::UiClient;
 
     #[test]
     fn session_filesystem_matches_honors_project_relative_paths() {
@@ -1893,5 +1934,105 @@ mod tests {
             Some(Verdict::denied(VerdictSource::policy())),
             "broad user-defined globs must not bypass concrete policy deny"
         );
+    }
+    async fn dbus_session_store() -> (
+        super::super::types::PolicyStore,
+        agent_sandbox_core::ResolvedRequestContext,
+    ) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
+            host_socket: dir.path().join("sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative: dir.path().join("declarative.json"),
+            export_json: dir.path().join("export.json"),
+            export_nix: None,
+            approval_timeout: std::time::Duration::from_mins(1),
+            interactive_approval: false,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
+        });
+        let ctx = agent_sandbox_core::ResolvedRequestContext {
+            paths: agent_sandbox_core::SandboxPaths::new("/repo", "/home/user", "/repo"),
+            ids: agent_sandbox_core::ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-dbus".into()),
+        };
+        let (stream, _) = UnixStream::pair().expect("unix stream pair");
+        let (_, writer) = stream.into_split();
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(
+                1,
+                UiClient {
+                    session_id: "general-ui".into(),
+                    writer: Arc::new(Mutex::new(writer)),
+                },
+            );
+            inner.ui_context_by_session.insert(
+                "general-ui".into(),
+                UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-dbus".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        (store, ctx)
+    }
+
+    #[tokio::test]
+    async fn dbus_session_allow_matches_exact_and_wildcard_targets() {
+        let (store, ctx) = dbus_session_store().await;
+        let concrete = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+        let other = DbusTarget::session(
+            "org.example.Other",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+
+        // Exact match: concrete target stored, concrete query allowed.
+        {
+            let mut inner = store.inner.lock().await;
+            inner
+                .session_dbus_allow
+                .insert("general-ui".into(), HashSet::from([concrete.clone()]));
+        }
+        assert!(store.session_dbus_allowed(&concrete, &ctx).await);
+        assert!(!store.session_dbus_allowed(&other, &ctx).await);
+
+        // Wildcard match: broad pattern stored, concrete query allowed, other bus rejected.
+        let wildcard = DbusTarget::session(
+            "org.example.Service",
+            "*",
+            "*",
+            "*",
+            DbusMessageKind::MethodCall,
+            "*",
+            Vec::new(),
+        );
+        {
+            let mut inner = store.inner.lock().await;
+            inner
+                .session_dbus_allow
+                .insert("general-ui".into(), HashSet::from([wildcard]));
+        }
+        assert!(store.session_dbus_allowed(&concrete, &ctx).await);
+        assert!(!store.session_dbus_allowed(&other, &ctx).await);
     }
 }

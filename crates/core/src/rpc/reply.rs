@@ -6,7 +6,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::http::{HttpRequest, HttpRuleTarget};
-use crate::policy::{FileAccess, Policy, ResourceAccess, ResourceKind};
+use crate::policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind};
 
 use super::{
     message::RpcMessage,
@@ -64,6 +64,7 @@ pub enum RpcReply {
     FlowClaim(FlowClaimReply),
     FilesystemCheck(FilesystemCheckReply),
     ResourceCheck(ResourceCheckReply),
+    DbusCheck(DbusCheckReply),
     FilesystemMonitor(FilesystemMonitorReply),
     HttpCheck(HttpCheckReply),
     Check(CheckReply),
@@ -102,6 +103,7 @@ impl<'de> Deserialize<'de> for RpcReply {
         try_variant!(FilesystemCheck, FilesystemCheckReply);
         try_variant!(ResourceCheck, ResourceCheckReply);
         try_variant!(FilesystemMonitor, FilesystemMonitorReply);
+        try_variant!(DbusCheck, DbusCheckReply);
         try_variant!(Check, CheckReply);
         try_variant!(HttpCheck, HttpCheckReply);
         try_variant!(Elevate, ElevateReply);
@@ -766,6 +768,98 @@ impl<'de> Deserialize<'de> for ResourceCheckReply {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DbusCheckReply {
+    pub ok: bool,
+    pub allowed: bool,
+    pub source: VerdictSource,
+    pub target: DbusTarget,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDbusCheckReply {
+    ok: bool,
+    allowed: bool,
+    source: String,
+    target: DbusTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl DbusCheckReply {
+    #[must_use]
+    pub fn from_verdict(verdict: Verdict, target: DbusTarget) -> Self {
+        Self {
+            ok: true,
+            allowed: verdict.allowed,
+            source: verdict.source,
+            target,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn allowed(source: VerdictSource, target: DbusTarget) -> Self {
+        Self::from_verdict(Verdict::allowed(source), target)
+    }
+
+    #[must_use]
+    pub fn denied(source: VerdictSource, target: DbusTarget) -> Self {
+        Self::from_verdict(Verdict::denied(source), target)
+    }
+
+    pub fn blocked(message: impl Into<String>, target: DbusTarget) -> Self {
+        Self {
+            ok: true,
+            allowed: false,
+            source: VerdictSource::blocked(),
+            target,
+            error: Some(message.into()),
+        }
+    }
+}
+
+impl Serialize for DbusCheckReply {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let source = self
+            .source
+            .to_wire(self.allowed)
+            .map_err(serde::ser::Error::custom)?;
+        let field_count = if self.error.is_some() { 5 } else { 4 };
+        let mut state = serializer.serialize_struct("DbusCheckReply", field_count)?;
+        state.serialize_field("ok", &self.ok)?;
+        state.serialize_field("allowed", &self.allowed)?;
+        state.serialize_field("source", source.as_ref())?;
+        state.serialize_field("target", &self.target)?;
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DbusCheckReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireDbusCheckReply::deserialize(deserializer)?;
+        Ok(Self {
+            ok: wire.ok,
+            allowed: wire.allowed,
+            source: VerdictSource::from_wire(wire.allowed, &wire.source)
+                .map_err(serde::de::Error::custom)?,
+            target: wire.target,
+            error: wire.error,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesystemMonitorReply {
     pub ok: bool,
@@ -803,6 +897,7 @@ pub enum ScopeActionReply {
     Elevation(ElevationScopeActionReply),
     Filesystem(FilesystemScopeActionReply),
     Resource(ResourceScopeActionReply),
+    Dbus(DbusScopeActionReply),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -866,6 +961,15 @@ pub struct ResourceScopeActionReply {
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_path: Option<PathBuf>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DbusScopeActionReply {
+    pub ok: bool,
+    pub target: DbusTarget,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 impl ScopeActionReply {
@@ -948,6 +1052,15 @@ impl ScopeActionReply {
         })
     }
     #[must_use]
+    pub fn ok_dbus(target: DbusTarget, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
+        Self::Dbus(DbusScopeActionReply {
+            ok: true,
+            target,
+            scope: scope.to_string(),
+            path,
+        })
+    }
+    #[must_use]
     pub const fn is_ok(&self) -> bool {
         match self {
             Self::Network(reply) => reply.ok,
@@ -956,6 +1069,7 @@ impl ScopeActionReply {
             Self::Elevation(reply) => reply.ok,
             Self::Filesystem(reply) => reply.ok,
             Self::Resource(reply) => reply.ok,
+            Self::Dbus(reply) => reply.ok,
         }
     }
 
@@ -968,6 +1082,7 @@ impl ScopeActionReply {
             Self::Elevation(reply) => &reply.scope,
             Self::Filesystem(reply) => &reply.scope,
             Self::Resource(reply) => &reply.scope,
+            Self::Dbus(reply) => &reply.scope,
         }
     }
 
@@ -978,8 +1093,9 @@ impl ScopeActionReply {
             Self::Network(reply) => reply.path.as_deref(),
             Self::Sudo(reply) => reply.path.as_deref(),
             Self::Elevation(reply) => reply.path.as_deref(),
-            Self::Filesystem(reply) => Some(&reply.path),
-            Self::Resource(reply) => Some(&reply.path),
+            Self::Filesystem(reply) => Some(reply.path.as_path()),
+            Self::Resource(reply) => Some(reply.path.as_path()),
+            Self::Dbus(reply) => reply.path.as_deref(),
         }
     }
 }
@@ -1035,7 +1151,10 @@ impl fmt::Display for RpcReply {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalScope, RpcReply, ScopeActionReply};
+    use super::{
+        ApprovalScope, DbusCheckReply, DbusTarget, RpcReply, ScopeActionReply, VerdictSource,
+    };
+    use crate::policy::DbusMessageKind;
 
     #[test]
     fn scope_action_reply_deserializes_as_scope_action() {
@@ -1065,5 +1184,23 @@ mod tests {
         assert!(json.get("argv").is_none());
         assert!(json.get("allowed").is_none());
         assert_eq!(json["host"], "ex.com");
+    }
+    #[test]
+    fn dbus_reply_round_trips_typed_target() {
+        let target = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+        let reply = DbusCheckReply::allowed(VerdictSource::Static, target.clone());
+        let value = serde_json::to_value(&reply).expect("D-Bus reply serializes");
+        let decoded: DbusCheckReply =
+            serde_json::from_value(value).expect("D-Bus reply deserializes");
+        assert_eq!(decoded.target, target);
+        assert!(decoded.allowed);
     }
 }

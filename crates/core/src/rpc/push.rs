@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::http::{HttpRequest, PendingHttpId};
-use crate::policy::{FileAccess, ResourceAccess, ResourceKind};
+use crate::policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -46,6 +46,14 @@ pub enum PendingSummary {
         access: Option<ResourceAccess>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
+    },
+    Dbus {
+        id: String,
+        target: DbusTarget,
+        cwd: Option<PathBuf>,
+        home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+        sandbox_session_id: Option<String>,
     },
 }
 /// UI push after `register_ui` (not a request response).
@@ -95,5 +103,13 @@ pub enum UiPush {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
+    },
+    DbusRequest {
+        id: String,
+        target: DbusTarget,
+        cwd: Option<PathBuf>,
+        home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+        sandbox_session_id: Option<String>,
     },
 }

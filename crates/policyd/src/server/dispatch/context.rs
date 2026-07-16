@@ -67,6 +67,10 @@ pub(super) enum ResolvedRpcRequest {
         access: ResourceAccess,
         ctx: ResolvedRequestContext,
     },
+    CheckDbus {
+        target: agent_sandbox_core::DbusTarget,
+        ctx: ResolvedRequestContext,
+    },
     StartFilesystemMonitor {
         peer_pid: u32,
         ctx: ResolvedRequestContext,
@@ -81,6 +85,7 @@ pub(super) enum ResolvedRpcRequest {
         scope: ApprovalScope,
         session_id: Option<String>,
         target: Option<ApprovalTarget>,
+        comment: Option<String>,
         ctx: ResolvedRequestContext,
     },
     ApproveHost {
@@ -101,6 +106,7 @@ pub(super) enum ResolvedRpcRequest {
         scope: ApprovalScope,
         session_id: Option<String>,
         target: Option<ApprovalTarget>,
+        comment: Option<String>,
         ctx: ResolvedRequestContext,
     },
     Status {
@@ -206,12 +212,14 @@ fn plan_approval_context(
             scope,
             session_id,
             target,
+            comment,
             ctx,
         } => Ok(ResolvedRpcRequest::Approve {
             id,
             scope,
             session_id,
             target,
+            comment,
             ctx: resolve(ctx),
         }),
         RpcRequest::ApproveHost {
@@ -243,12 +251,14 @@ fn plan_approval_context(
             scope,
             session_id,
             target,
+            comment,
             ctx,
         } => Ok(ResolvedRpcRequest::Deny {
             id,
             scope,
             session_id,
             target,
+            comment,
             ctx: resolve(ctx),
         }),
         req => Err(Box::new(req)),
@@ -299,6 +309,10 @@ fn plan_context(
             kind,
             path,
             access,
+            ctx: resolve(ctx),
+        },
+        RpcRequest::CheckDbus { target, ctx } => ResolvedRpcRequest::CheckDbus {
+            target,
             ctx: resolve(ctx),
         },
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {

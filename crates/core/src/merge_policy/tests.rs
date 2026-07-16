@@ -129,33 +129,33 @@ fn atomic_write_keeps_each_rule_on_one_line() {
     assert_eq!(
         json,
         r#"{
-    "network": {
-        "direct": {
-            "allow": [
-                { "host": "example.com", "port": 443, "comment": "first" },
-                { "host": "api.example.com", "port": 443, "comment": "second" }
-            ],
-            "deny": []
-        },
-        "http": {
-            "allow": [],
-            "deny": []
-        }
+  "network": {
+    "direct": {
+      "allow": [
+        { "host": "example.com", "port": 443, "comment": "first" },
+        { "host": "api.example.com", "port": 443, "comment": "second" }
+      ],
+      "deny": []
     },
-    "sudo": {
-        "allow": [],
-        "deny": [
-            { "argv": ["systemctl", "restart", "nginx"], "comment": "restart nginx" }
-        ]
-    },
-    "filesystem": {
-        "allow": [],
-        "deny": []
-    },
-    "resources": {
-        "allow": [],
-        "deny": []
+    "http": {
+      "allow": [],
+      "deny": []
     }
+  },
+  "sudo": {
+    "allow": [],
+    "deny": [
+      { "argv": ["systemctl", "restart", "nginx"], "comment": "restart nginx" }
+    ]
+  },
+  "filesystem": {
+    "allow": [],
+    "deny": []
+  },
+  "resources": {
+    "allow": [],
+    "deny": []
+  }
 }
 "#
     );

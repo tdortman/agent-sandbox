@@ -44,6 +44,7 @@ impl PolicyStore {
                     session_id,
                     owner_uid: wire_ids.uid(),
                     sandbox_session_id: ctx.sandbox_session_id,
+                    comment: None,
                 },
             },
             DecisionAction::Approve,

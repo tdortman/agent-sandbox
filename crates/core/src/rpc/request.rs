@@ -122,6 +122,9 @@ pub enum ApprovalTarget {
         resource_kind: crate::policy::ResourceKind,
         path: PathBuf,
     },
+    Dbus {
+        target: crate::policy::DbusTarget,
+    },
 }
 
 /// Incoming RPC request (`op` tag).
@@ -193,6 +196,11 @@ pub enum RpcRequest {
         #[serde(default)]
         ctx: RequestContext,
     },
+    CheckDbus {
+        target: crate::policy::DbusTarget,
+        #[serde(default)]
+        ctx: RequestContext,
+    },
     StartFilesystemMonitor {
         #[serde(default)]
         ctx: RequestContext,
@@ -211,6 +219,8 @@ pub enum RpcRequest {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -239,6 +249,8 @@ pub enum RpcRequest {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -310,6 +322,11 @@ enum RpcRequestWire {
         #[serde(default)]
         ctx: RequestContext,
     },
+    CheckDbus {
+        target: crate::policy::DbusTarget,
+        #[serde(default)]
+        ctx: RequestContext,
+    },
     CheckResource {
         kind: crate::policy::ResourceKind,
         path: PathBuf,
@@ -336,6 +353,8 @@ enum RpcRequestWire {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -364,6 +383,8 @@ enum RpcRequestWire {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -513,7 +534,6 @@ impl RpcRequest {
             ctx,
         }
     }
-
     const fn start_filesystem_monitor(
         ctx: RequestContext,
         static_allow: Vec<crate::policy::FilesystemRule>,
@@ -526,6 +546,7 @@ impl RpcRequest {
         scope: ApprovalScope,
         session_id: Option<String>,
         target: Option<ApprovalTarget>,
+        comment: Option<String>,
         ctx: RequestContext,
     ) -> Self {
         Self::Approve {
@@ -533,6 +554,7 @@ impl RpcRequest {
             scope,
             session_id,
             target,
+            comment,
             ctx,
         }
     }
@@ -572,6 +594,7 @@ impl RpcRequest {
         scope: ApprovalScope,
         session_id: Option<String>,
         target: Option<ApprovalTarget>,
+        comment: Option<String>,
         ctx: RequestContext,
     ) -> Self {
         Self::Deny {
@@ -579,6 +602,7 @@ impl RpcRequest {
             scope,
             session_id,
             target,
+            comment,
             ctx,
         }
     }
@@ -634,6 +658,7 @@ impl From<RpcRequestWire> for RpcRequest {
                 access,
                 ctx,
             } => Self::check_resource(kind, path, access, ctx),
+            RpcRequestWire::CheckDbus { target, ctx } => Self::CheckDbus { target, ctx },
             RpcRequestWire::StartFilesystemMonitor { ctx, static_allow } => {
                 Self::start_filesystem_monitor(ctx, static_allow)
             }
@@ -643,8 +668,9 @@ impl From<RpcRequestWire> for RpcRequest {
                 scope,
                 session_id,
                 target,
+                comment,
                 ctx,
-            } => Self::approve(id, scope, session_id, target, ctx),
+            } => Self::approve(id, scope, session_id, target, comment, ctx),
             RpcRequestWire::ApproveHost {
                 host,
                 port,
@@ -663,8 +689,9 @@ impl From<RpcRequestWire> for RpcRequest {
                 scope,
                 session_id,
                 target,
+                comment,
                 ctx,
-            } => Self::deny(id, scope, session_id, target, ctx),
+            } => Self::deny(id, scope, session_id, target, comment, ctx),
             RpcRequestWire::Status { ctx } => Self::Status { ctx },
             RpcRequestWire::Reload { ctx } => Self::Reload { ctx },
         }
@@ -679,6 +706,7 @@ impl RpcRequest {
             | Self::Check { ctx, .. }
             | Self::CheckFilesystem { ctx, .. }
             | Self::CheckResource { ctx, .. }
+            | Self::CheckDbus { ctx, .. }
             | Self::StartFilesystemMonitor { ctx, .. }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }
@@ -703,6 +731,7 @@ impl RpcRequest {
             | Self::Check { ctx, .. }
             | Self::CheckFilesystem { ctx, .. }
             | Self::CheckResource { ctx, .. }
+            | Self::CheckDbus { ctx, .. }
             | Self::StartFilesystemMonitor { ctx, .. }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }

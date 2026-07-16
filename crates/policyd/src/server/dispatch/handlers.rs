@@ -177,6 +177,11 @@ async fn handle_non_proxy_request(
             access,
             ctx,
         } => handle_check_resource(store, kind, path, access, ctx).await,
+        ResolvedRpcRequest::CheckDbus { target, ctx } => Ok(RpcReply::DbusCheck(
+            store
+                .check_dbus(crate::wire::DbusCheckRequest { target, ctx })
+                .await,
+        )),
         ResolvedRpcRequest::StartFilesystemMonitor {
             peer_pid,
             ctx,
@@ -199,13 +204,17 @@ async fn handle_non_proxy_tail(
             scope,
             session_id,
             target,
+            comment,
             ctx,
         } => Ok(store
             .approve(PendingDecision {
                 pending_id: id,
                 scope,
                 target,
-                wire: ScopeWire::from_resolved(&ctx, session_id),
+                wire: ScopeWire {
+                    comment,
+                    ..ScopeWire::from_resolved(&ctx, session_id)
+                },
                 client_id: client.id,
                 approver_uid: (peer.uid > 0).then_some(peer.uid),
             })
@@ -230,13 +239,17 @@ async fn handle_non_proxy_tail(
             scope,
             session_id,
             target,
+            comment,
             ctx,
         } => Ok(store
             .deny(PendingDecision {
                 pending_id: id,
                 scope,
                 target,
-                wire: ScopeWire::from_resolved(&ctx, session_id),
+                wire: ScopeWire {
+                    comment,
+                    ..ScopeWire::from_resolved(&ctx, session_id)
+                },
                 client_id: client.id,
                 approver_uid: (peer.uid > 0).then_some(peer.uid),
             })
