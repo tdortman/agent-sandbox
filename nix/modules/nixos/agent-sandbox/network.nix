@@ -661,9 +661,13 @@ lib.mkIf policyEnabled (
       }
       // lib.optionalAttrs cfg.httpProxy.enable {
         agent-sandbox-proxy-init = {
+          requires = [ "agent-sandbox-netns.service" ];
+          after = [
+            "agent-sandbox-netns.service"
+            "network-pre.target"
+          ];
           description = "Initialize agent-sandbox interception CA and WireGuard credentials";
           wantedBy = [ "multi-user.target" ];
-          after = [ "network-pre.target" ];
           before = [
             "agent-sandbox-proxy-firewall.service"
             "agent-sandbox-proxy.service"
