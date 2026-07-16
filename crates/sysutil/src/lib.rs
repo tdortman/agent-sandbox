@@ -41,14 +41,34 @@ pub fn pidfd_getfd(pidfd: impl AsFd, fd: i32) -> io::Result<OwnedFd> {
     fd_from_syscall(raw)
 }
 
-/// Duplicate a tracee's fd into our fd table: `pidfd_open` then `pidfd_getfd`.
+fn tracee_process_id(thread_id: u32) -> io::Result<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{thread_id}/status"))?;
+    status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Tgid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing thread-group ID for thread {thread_id}"),
+            )
+        })
+}
+
+/// Duplicate a tracee thread's fd into our fd table.
 ///
-/// Convenience wrapper combining [`pidfd_open`] and [`pidfd_getfd`].
+/// Seccomp notifications identify the thread that made the syscall, while
+/// `pidfd_getfd` requires a pidfd for the thread-group leader. The process fd
+/// table is shared by all threads, so resolving the leader still addresses
+/// the requested descriptor.
 ///
 /// # Errors
-/// Returns the kernel error from either step.
-pub fn dup_tracee_fd(pid: u32, fd: i32) -> io::Result<OwnedFd> {
-    let pidfd = pidfd_open(pid)?;
+/// Returns the kernel error from either step or from resolving the thread ID.
+pub fn dup_tracee_fd(thread_id: u32, fd: i32) -> io::Result<OwnedFd> {
+    let process_id = tracee_process_id(thread_id)?;
+    let pidfd = pidfd_open(process_id)?;
     pidfd_getfd(&pidfd, fd)
 }
 
@@ -557,5 +577,32 @@ mod tests {
         let mut buf = [0u8; 1];
         let mut f = std::fs::File::from(dup);
         assert_eq!(f.read(&mut buf).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn dup_tracee_fd_accepts_notification_thread_id() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let devnull = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let thread_id = u32::try_from(nix::unistd::gettid().as_raw()).expect("valid thread ID");
+            ready_tx.send(thread_id).expect("send thread ID");
+            release_rx.recv().expect("wait for duplication");
+        });
+        let thread_id = ready_rx.recv().expect("receive thread ID");
+        let result = dup_tracee_fd(thread_id, devnull.as_fd().as_raw_fd());
+        release_tx.send(()).expect("release thread");
+        handle.join().expect("join tracee thread");
+        let dup = result.expect("duplicate fd from notification thread");
+
+        let mut buf = [0_u8; 1];
+        let mut file = std::fs::File::from(dup);
+        assert_eq!(std::io::Read::read(&mut file, &mut buf).unwrap_or(0), 0);
     }
 }
