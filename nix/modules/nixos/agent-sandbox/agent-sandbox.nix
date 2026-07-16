@@ -135,6 +135,58 @@ let
     type = lib.types.listOf httpRuleType;
     default = [ ];
   };
+  dbusFdMetadataType = lib.types.submodule {
+    options = {
+      kind = lib.mkOption {
+        type = lib.types.str;
+        default = "unknown";
+      };
+      readOnly = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+      };
+    };
+  };
+
+  dbusTargetType = lib.types.submodule {
+    options = {
+      bus = lib.mkOption {
+        type = lib.types.enum [
+          "session"
+          "system"
+        ];
+        default = "session";
+      };
+      destination = lib.mkOption { type = lib.types.str; };
+      objectPath = lib.mkOption { type = lib.types.str; };
+      interface = lib.mkOption { type = lib.types.str; };
+      member = lib.mkOption { type = lib.types.str; };
+      messageKind = lib.mkOption {
+        type = lib.types.enum [
+          "method_call"
+          "method_return"
+          "error"
+          "signal"
+        ];
+        default = "method_call";
+      };
+      signature = lib.mkOption { type = lib.types.str; };
+      fdMetadata = lib.mkOption {
+        type = lib.types.listOf dbusFdMetadataType;
+        default = [ ];
+      };
+    };
+  };
+
+  dbusRuleType = lib.types.submodule {
+    options = {
+      target = lib.mkOption { type = dbusTargetType; };
+      comment = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+      };
+    };
+  };
 
   ruleType = lib.types.submodule {
     options = {
@@ -230,7 +282,9 @@ let
           sandboxPolicySocket
           policyContext
           network
+          dbus
           ;
+        dbusProxyPkg = policyPkg;
         sudoGuard = sudoGuardPkg;
       }
       // lib.optionalAttrs cfg.gates.filesystem.enable {
@@ -354,6 +408,30 @@ in
           ``none`` disables auto-spawned prompts entirely; approve and deny
           manually with ``agent-sandbox-approve`` from a terminal.
         '';
+      };
+      dbus = {
+        enable = lib.mkEnableOption "filtered session D-Bus access for sandboxes (requires gates.resources.enable)";
+
+        declarativeAllow = lib.mkOption {
+          type = lib.types.listOf dbusRuleType;
+          default = [ ];
+          description = "D-Bus capabilities allowed without interactive approval.";
+        };
+        declarativeDeny = lib.mkOption {
+          type = lib.types.listOf dbusRuleType;
+          default = [ ];
+          description = "D-Bus capabilities denied even when another policy allows them.";
+        };
+        socketDirectory = lib.mkOption {
+          type = lib.types.str;
+          default = "/run/user";
+          description = "Host directory used for per-sandbox D-Bus relay sockets.";
+        };
+        upstreamAddress = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Optional D-Bus upstream address; defaults to DBUS_SESSION_BUS_ADDRESS.";
+        };
       };
     };
 
@@ -558,6 +636,10 @@ in
       {
         assertion = !(cfg.gates.resources.enable && !cfg.gates.filesystem.enable);
         message = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
+      }
+      {
+        assertion = !cfg.policy.dbus.enable || cfg.gates.resources.enable;
+        message = "agent-sandbox.policy.dbus.enable requires gates.resources.enable";
       }
       {
         assertion = !cfg.network.httpProxy.enable || cfg.network.enable;

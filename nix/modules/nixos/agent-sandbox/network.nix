@@ -25,8 +25,34 @@ let
     // lib.optionalAttrs (rule.comment != null) {
       inherit (rule) comment;
     };
+  dbusRuleJson =
+    rule:
+    {
+      target = {
+        inherit (rule.target)
+          bus
+          destination
+          interface
+          member
+          signature
+          ;
+        object_path = rule.target.objectPath;
+        message_kind = rule.target.messageKind;
+        fd_metadata = map (fd: {
+          inherit (fd) kind;
+          read_only = fd.readOnly;
+        }) rule.target.fdMetadata;
+      };
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
 
-  policyEnabled = cfg.enable || rootCfg.sudoPolicy == "approve" || rootCfg.gates.filesystem.enable;
+  policyEnabled =
+    cfg.enable
+    || rootCfg.policy.dbus.enable
+    || rootCfg.sudoPolicy == "approve"
+    || rootCfg.gates.filesystem.enable;
   sandboxPkg = flake.package "agent-sandbox";
   agentSandboxLib = import ./lib.nix {
     inherit lib;
@@ -364,6 +390,12 @@ lib.mkIf policyEnabled (
           sudo = {
             allow = [ ];
             deny = [ ];
+          };
+        }
+        // lib.optionalAttrs rootCfg.policy.dbus.enable {
+          dbus = {
+            allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
+            deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
           };
         }
         // lib.optionalAttrs config.agent-sandbox.gates.filesystem.enable {

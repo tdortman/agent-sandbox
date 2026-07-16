@@ -75,7 +75,10 @@ let
     let
       inherit (rootCfg) policy network;
       policyContext =
-        network.enable || rootCfg.gates.filesystem.enable || rootCfg.sudoPolicy == "approve";
+        network.enable
+        || policy.dbus.enable
+        || rootCfg.gates.filesystem.enable
+        || rootCfg.sudoPolicy == "approve";
     in
     {
       inherit policyContext;
@@ -104,6 +107,7 @@ let
       policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
       inherit (network) dnsForwardTarget;
       httpProxy = network.httpProxy or { enable = false; };
+      inherit (policy) dbus;
     };
 
   buildPermissions =
@@ -208,6 +212,8 @@ in
       policyContext ? false,
       network ? null,
       runtime ? null,
+      dbus ? null,
+      dbusProxyPkg ? null,
       sudoGuard ? null,
       fsArmPkg ? null,
       syscallArmPkg ? null,
@@ -229,6 +235,9 @@ in
       # fs-arm helper so dynamic-FS and syscall-gate can both be active.
       syscallGate = syscallArmPkg != null;
       proxyMode = runtime != null && runtime.httpProxy.enable;
+      dbusMode = dbus != null && dbus.enable && dbusProxyPkg != null;
+      dbusSocketDirectory = if dbus != null then dbus.socketDirectory else "/run/user";
+      dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;
       networkMode = if proxyMode then "proxy" else "direct";
       proxyTrustBundle = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
       runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
@@ -573,6 +582,52 @@ in
         RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
       '';
+      dbusScript = lib.optionalString dbusMode ''
+        _asbx_dbus_root="${dbusSocketDirectory}/''${UID}"
+        mkdir -p "$_asbx_dbus_root"
+        _asbx_dbus_dir="$(mktemp -d "$_asbx_dbus_root/agent-sandbox-dbus.XXXXXX")"
+        _asbx_dbus_socket="$_asbx_dbus_dir/session.sock"
+        _asbx_dbus_upstream=${
+          if dbusUpstreamAddress != null then
+            lib.escapeShellArg dbusUpstreamAddress
+          else
+            ''"''${DBUS_SESSION_BUS_ADDRESS:-}"''
+        }
+        [[ -n "$_asbx_dbus_upstream" ]] || {
+          echo "agent-sandbox D-Bus: DBUS_SESSION_BUS_ADDRESS is unset" >&2
+          rm -rf "$_asbx_dbus_dir"
+          exit 1
+        }
+        ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
+          --listen "$_asbx_dbus_socket" \
+          --upstream-address "$_asbx_dbus_upstream" \
+          --policy-socket ${lib.escapeShellArg policySocket} \
+          --bus session \
+          --cwd "$_agent_sandbox_cwd" \
+          --home "$_agent_sandbox_home" \
+          --project-root "$_agent_sandbox_project_root" \
+          --uid "$UID" \
+          --sandbox-session-id "$_agent_sandbox_session_id" &
+        _asbx_dbus_pid=$!
+        trap '${dbusCleanupScript}' EXIT
+        trap 'exit 143' INT TERM
+        while [[ ! -S "$_asbx_dbus_socket" ]]; do
+          if ! kill -0 "$_asbx_dbus_pid" 2>/dev/null; then
+            wait "$_asbx_dbus_pid" || true
+            echo "agent-sandbox D-Bus: relay failed to start" >&2
+            rm -rf "$_asbx_dbus_dir"
+            exit 1
+          fi
+          sleep 0.01
+        done
+        RUNTIME_ARGS+=(--ro-bind "$_asbx_dbus_dir" "$_asbx_dbus_dir")
+        RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_socket")
+      '';
+      dbusCleanupScript = lib.optionalString dbusMode ''
+        kill "$_asbx_dbus_pid" 2>/dev/null || true
+        wait "$_asbx_dbus_pid" 2>/dev/null || true
+        rm -rf "$_asbx_dbus_dir"
+      '';
 
       # Mask paths so the sandbox cannot see their contents even though the
       # dynamic-FS wrapper binds the whole host root. Directories are shadowed
@@ -638,6 +693,7 @@ in
           done < <(env -0)
 
           ${policyScript}
+          ${dbusScript}
           ${dnsScript}
 
           ${lib.optionalString (!resourceGate) ''
@@ -667,7 +723,7 @@ in
           ${proxyTrustScript}
 
 
-          exec ${pkgs.bubblewrap}/bin/bwrap \
+          ${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
             --tmpfs /tmp \
             --proc /proc \
@@ -685,6 +741,8 @@ in
             --setenv HOME "$HOME" \
             "''${RUNTIME_ARGS[@]}" \
             -- ${entryCmd} "$@"
+          _asbx_status=$?
+          exit "$_asbx_status"
         '';
       };
 

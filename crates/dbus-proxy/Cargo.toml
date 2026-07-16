@@ -1,0 +1,18 @@
+[package]
+name = "agent-sandbox-dbus-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-sandbox-core = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+zbus = { workspace = true }
+zvariant = { workspace = true }
+
+[lints]
+workspace = true

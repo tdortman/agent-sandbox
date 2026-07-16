@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/cli",
+    "crates/dbus-proxy",
     "crates/core",
     "crates/dns",
     "crates/enter",
@@ -27,26 +28,30 @@ agent-sandbox-sysutil = { path = "crates/sysutil" }
 
 # external
 caps               = "0.5.6"
-clap               = { version = "4.6.1", features = ["derive"] }
+clap               = { version = "4.6.2", features = ["derive"] }
+zbus               = { version = "5.17", default-features = false, features = ["bus-impl", "p2p", "tokio"] }
+futures-util       = "0.3.32"
 dns-lookup         = "3.0.1"
 idna               = "1.1.0"
 hickory-proto      = "0.26.1"
 libc               = "0.2.186"
 nfq-updated        = "0.2.6"
-getrandom           = "0.4.3"
+getrandom          = "0.4.3"
 nix                = "0.31.3"
 seccompiler        = { git = "https://github.com/rust-vmm/seccompiler.git", rev = "08587106340b8e3cb361c7561411510039436857" }
-serde              = { version = "1", features = ["derive"] }
+serde              = { version = "1.0.228", features = ["derive"] }
 serde_json         = "1.0.50"
 tempfile           = "3.27.0"
 thiserror          = "2.0.18"
 tokio              = "1.52.3"
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid               = { version = "1.23.5", features = ["v4", "v7"] }
+uuid               = { version = "1.24.0", features = ["v4", "v7"] }
 url                = "2.5.8"
-globset             = "0.4"
-which              = "8.0.4"
+globset            = "0.4.19"
+which              = "8.0.5"
+zvariant           = "5.13"
+
 
 [workspace.lints.rust]
 unsafe_code = "deny"
