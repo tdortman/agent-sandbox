@@ -78,7 +78,21 @@ impl PolicyStore {
         };
         self.resolve_from_peer(ctx, peer)
     }
-
+    pub(crate) fn resolve_dbus_proxy_context(
+        ctx: &MergeContext,
+        peer: TrustedPeer,
+    ) -> ResolvedRequestContext {
+        let pid = ctx
+            .ids
+            .pid()
+            .filter(|_| ctx.ids.uid().is_none_or(|uid| uid == peer.uid));
+        let ids = ProcessIds::from_options(pid, Some(peer.uid));
+        Self::resolve_trusted_context(&ResolvedRequestContext::new(
+            SandboxPaths::default(),
+            ids,
+            ctx.sandbox_session_id.clone(),
+        ))
+    }
     /// Re-resolve a context that was already sanitized upstream by
     /// [`Self::resolve_from_peer`]. Internal store methods invoke this without
     /// a peer. The incoming paths are trusted and only missing fields are

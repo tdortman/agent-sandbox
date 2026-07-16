@@ -40,6 +40,21 @@ impl PolicyStore {
                 );
             }
         };
+        let Some(pid) = ctx.ids.pid() else {
+            return DbusCheckReply::blocked(
+                "agent-sandbox: cannot identify sandbox process for D-Bus approval",
+                target,
+            );
+        };
+        let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
+            Ok(hold) => hold,
+            Err(error) => {
+                return DbusCheckReply::blocked(
+                    format!("agent-sandbox: cannot freeze sandbox for D-Bus approval: {error}"),
+                    target,
+                );
+            }
+        };
         let reply = self
             .request_resource_approval_with_target(
                 crate::wire::ResourceCheckRequest {

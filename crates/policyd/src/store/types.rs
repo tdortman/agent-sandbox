@@ -352,6 +352,7 @@ pub struct PolicyStore {
     pub(crate) ui_spawn_lock: Mutex<()>,
     pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
     pub(crate) merged_cache: std::sync::Mutex<MergedPolicyCache>,
+    pub(crate) cgroup_freeze: super::freeze::CgroupFreezeManager,
 }
 
 /// LRU-ish cache of merged policies keyed by context paths and source mtimes.

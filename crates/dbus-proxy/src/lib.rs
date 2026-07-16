@@ -9,6 +9,7 @@ use agent_sandbox_core::policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusT
 use agent_sandbox_core::rpc::{RequestContext, RpcReply, RpcRequest};
 use agent_sandbox_core::rpc_client::PersistentRpcClient;
 use futures_util::StreamExt;
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 use zbus::connection::Builder;
@@ -182,7 +183,15 @@ struct RelayChannels {
     upstream_connection: Connection,
 }
 
-async fn handle_client(client_socket: UnixStream, config: RelayConfig) -> Result<(), RelayError> {
+async fn handle_client(
+    client_socket: UnixStream,
+    mut config: RelayConfig,
+) -> Result<(), RelayError> {
+    let credentials = getsockopt(&client_socket, PeerCredentials).map_err(|error| {
+        RelayError::Message(format!("cannot read D-Bus peer credentials: {error}"))
+    })?;
+    config.context.pid = u32::try_from(credentials.pid()).ok();
+    config.context.uid = Some(credentials.uid());
     let client_stream = Builder::unix_stream(client_socket)
         .p2p()
         .server(Guid::generate())?

@@ -311,10 +311,20 @@ fn plan_context(
             access,
             ctx: resolve(ctx),
         },
-        RpcRequest::CheckDbus { target, ctx } => ResolvedRpcRequest::CheckDbus {
-            target,
-            ctx: resolve(ctx),
-        },
+        RpcRequest::CheckDbus { target, ctx } => {
+            let ctx = if role == SocketRole::Host {
+                crate::store::PolicyStore::resolve_dbus_proxy_context(
+                    &crate::wire::MergeContext::from(&ctx),
+                    TrustedPeer {
+                        pid: peer.pid,
+                        uid: peer.uid,
+                    },
+                )
+            } else {
+                resolve(ctx)
+            };
+            ResolvedRpcRequest::CheckDbus { target, ctx }
+        }
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
             let ctx = resolve(ctx);
             let peer_pid = if peer.pid > 0 {

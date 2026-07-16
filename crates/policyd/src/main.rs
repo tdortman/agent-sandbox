@@ -137,7 +137,9 @@ async fn main() -> Result<(), PolicydError> {
         syscall_broker_cmd: cli.syscall_broker_cmd,
     };
 
-    let store = Arc::new(PolicyStore::new(args));
+    let mut store = PolicyStore::new(args);
+    store.enable_cgroup_freezer();
+    let store = Arc::new(store);
     store.export_policy_files(agent_sandbox_core::SandboxPaths::default())?;
 
     let host_socket = store.args().host_socket.clone();

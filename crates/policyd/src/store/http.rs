@@ -154,6 +154,19 @@ impl PolicyStore {
                 "agent-sandbox: HTTP approval is disabled",
             ));
         }
+        let Some(pid) = ctx.ids.pid() else {
+            return Ok(HttpCheckReply::blocked(
+                "agent-sandbox: cannot identify sandbox process for HTTP approval",
+            ));
+        };
+        let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
+            Ok(hold) => hold,
+            Err(error) => {
+                return Ok(HttpCheckReply::blocked(format!(
+                    "agent-sandbox: cannot freeze sandbox for HTTP approval: {error}",
+                )));
+            }
+        };
 
         let (pending_id, is_new, rx) = self
             .dedup_or_create_http(
@@ -671,6 +684,35 @@ mod tests {
             .expect("claim flow")
             .attribution_token;
         (store, proxy_session, attribution_token)
+    }
+
+    #[tokio::test]
+    async fn http_approval_requires_process_identity_for_freezing() {
+        let (store, proxy_session, attribution_token) = test_http_store().await;
+        let request =
+            HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
+        let context = ResolvedRequestContext::new(
+            SandboxPaths::default(),
+            ProcessIds::default(),
+            Some("test-session".into()),
+        );
+
+        let reply = store
+            .request_http_approval(
+                proxy_session,
+                ProxyRequestId::new(),
+                attribution_token,
+                request,
+                context,
+            )
+            .await
+            .expect("HTTP approval response");
+
+        assert!(!reply.ok);
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("agent-sandbox: cannot identify sandbox process for HTTP approval")
+        );
     }
 
     #[tokio::test]

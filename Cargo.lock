@@ -47,6 +47,7 @@ dependencies = [
  "agent-sandbox-core",
  "clap",
  "futures-util",
+ "nix",
  "thiserror",
  "tokio",
  "tracing",

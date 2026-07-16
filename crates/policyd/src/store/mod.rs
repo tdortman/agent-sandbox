@@ -82,9 +82,13 @@ impl PolicyStore {
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
             ui_spawn_lock: tokio::sync::Mutex::new(()),
             merged_cache: std::sync::Mutex::new(MergedPolicyCache::default()),
+            cgroup_freeze: freeze::CgroupFreezeManager::new_without_recovery(),
         }
     }
 
+    pub fn enable_cgroup_freezer(&mut self) {
+        self.cgroup_freeze = freeze::CgroupFreezeManager::new();
+    }
     pub const fn args(&self) -> &PolicydArgs {
         &self.args
     }
