@@ -270,15 +270,7 @@ static int runReview() {
     layout->addWidget(targets);
     auto* errorLabel = new QLabel(&dialog);
     errorLabel->setWordWrap(true);
-    if (structured) {
-        auto errorPalette = errorLabel->palette();
-        errorPalette.setColor(
-            QPalette::WindowText, dialog.palette().color(QPalette::WindowText)
-        );
-        errorLabel->setPalette(errorPalette);
-    } else {
-        errorLabel->setStyleSheet("QLabel { color: red; }");
-    }
+    errorLabel->setStyleSheet("QLabel { color: red; }");
     errorLabel->hide();
     layout->addWidget(errorLabel);
 
