@@ -321,6 +321,7 @@ in
             blockEnvVars
             exposeWorkingDirectory
             extraBwrapArgs
+            extraPkgs
             runtime
             sudoGuard
             fsArmPkg
