@@ -1,11 +1,8 @@
 [package]
+name = "agent-sandbox-enter"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-name              = "agent-sandbox-enter"
-version.workspace = true
-
-[lints]
-workspace = true
 
 [[bin]]
 name = "agent-sandbox-enter"
@@ -15,4 +12,7 @@ path = "src/main.rs"
 agent-sandbox-sysutil = { workspace = true }
 caps.workspace = true
 clap.workspace = true
-nix            = { workspace = true, features = ["sched"] }
+nix = { workspace = true, features = ["sched"] }
+
+[lints]
+workspace = true

@@ -1,11 +1,8 @@
 [package]
+name = "agent-sandbox-fsmon"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-name              = "agent-sandbox-fsmon"
-version.workspace = true
-
-[lints]
-workspace = true
 
 [[bin]]
 name = "agent-sandbox-fs-arm"

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, ResourceAccess, ResourceKind, Verdict, VerdictSource,
-    normalize_host,
+    normalize_directory_traverse_access, normalize_host,
 };
 
 use agent_sandbox_core::ResolvedRequestContext;
@@ -72,7 +72,7 @@ impl PolicyEvaluation<'_> {
         path: &Path,
         access: FileAccess,
     ) -> Option<Verdict> {
-        let access = agent_sandbox_core::normalize_directory_traverse_access(path, access);
+        let access = normalize_directory_traverse_access(path, access);
         if is_sandbox_infrastructure_path(path) {
             return Some(Verdict::allowed(VerdictSource::Infrastructure));
         }

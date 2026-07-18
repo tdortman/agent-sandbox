@@ -1315,7 +1315,6 @@ mod tests {
         assert!(rule.path_matches(Path::new("/home/user"), None));
         assert!(!rule.path_matches(Path::new("/home/userx"), None));
     }
-
     #[test]
     fn filesystem_rule_matches_descendant() {
         let rule = FilesystemRule::new("/home", FileAccess::ReadWrite, "");

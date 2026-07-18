@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, InodeIdentity,
     ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
+    normalize_directory_traverse_access,
 };
 use tokio::sync::oneshot;
 use tokio::time;
@@ -183,7 +184,7 @@ impl PolicyStore {
 
     pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
         let FilesystemCheckRequest { path, access, ctx } = req;
-        let access = agent_sandbox_core::normalize_directory_traverse_access(&path, access);
+        let access = normalize_directory_traverse_access(&path, access);
         if let Some(verdict) = self.filesystem_allow_source(&path, access, &ctx).await {
             return FilesystemCheckReply::from_verdict(verdict, path, access);
         }
@@ -512,7 +513,8 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use agent_sandbox_core::{
-        ApprovalScope, FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, VerdictSource,
+        ApprovalScope, FileAccess, FilesystemRule, ProcessIds, ResolvedRequestContext,
+        SandboxPaths, VerdictSource,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -847,7 +849,7 @@ mod tests {
             let mut inner = store.inner.lock().await;
             inner.sandbox_filesystem_static_allow.insert(
                 "sandbox:sandbox-glob-check".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
+                vec![FilesystemRule::new(
                     project_root.join("vendor/**"),
                     FileAccess::Read,
                     "static allow vendor tree",
@@ -925,7 +927,7 @@ mod tests {
             let mut inner = store.inner.lock().await;
             inner.sandbox_filesystem_static_allow.insert(
                 "sandbox:sandbox-broad-glob-check-deny".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
+                vec![FilesystemRule::new(
                     project_root.join("**"),
                     FileAccess::All,
                     "broad static allow repo tree",
@@ -951,7 +953,6 @@ mod tests {
     #[test]
     fn expand_static_allow_rules_canonicalizes_home_symlinks() {
         use super::expand_static_allow_rules;
-        use agent_sandbox_core::FilesystemRule;
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
