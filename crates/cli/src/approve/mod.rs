@@ -471,8 +471,40 @@ fn approve_error(resp: &RpcReply) -> ApproveCliError {
 pub enum ApproveCliError {
     #[error(transparent)]
     Rpc(#[from] agent_sandbox_core::RpcClientError),
+
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
     #[error("{0}")]
     Policyd(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn context_arguments_declare_environment_defaults() {
+        let command = Cli::command();
+        for name in ["pending", "approve", "approve-host", "deny"] {
+            let subcommand = command
+                .find_subcommand(name)
+                .expect("context subcommand should exist");
+            for (argument, environment) in [
+                ("home", "AGENT_SANDBOX_HOME"),
+                ("cwd", "AGENT_SANDBOX_CWD"),
+                ("project_root", "AGENT_SANDBOX_PROJECT_ROOT"),
+            ] {
+                let argument = subcommand
+                    .get_arguments()
+                    .find(|candidate| candidate.get_id().as_str() == argument)
+                    .expect("context argument should exist");
+                assert_eq!(
+                    argument.get_env().and_then(|value| value.to_str()),
+                    Some(environment)
+                );
+            }
+        }
+    }
 }
