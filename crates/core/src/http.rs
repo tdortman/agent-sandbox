@@ -540,6 +540,7 @@ impl HttpUrl {
             pattern = pattern.replacen(&token, &metacharacter.to_string(), 1);
         }
         GlobBuilder::new(&pattern)
+            .backslash_escape(true)
             .literal_separator(true)
             .build()
             .map_err(|_| HttpParseError::InvalidUrl)?;
@@ -633,7 +634,9 @@ impl HttpUrl {
     #[must_use]
     pub fn matches(&self, request: &Self) -> bool {
         if let Some(pattern) = &self.pattern {
-            return GlobBuilder::new(pattern)
+            let pattern = glob_pattern_for_matching(self, pattern);
+            return GlobBuilder::new(&pattern)
+                .backslash_escape(true)
                 .literal_separator(true)
                 .build()
                 .is_ok_and(|glob| glob.compile_matcher().is_match(request.to_string()));
@@ -986,37 +989,86 @@ impl<'de> Deserialize<'de> for PendingHttpId {
 pub enum HttpParseError {
     #[error("invalid HTTP method")]
     InvalidMethod,
+
     #[error("unsupported HTTP URL scheme")]
     UnsupportedScheme,
+
     #[error("invalid HTTP authority")]
     InvalidAuthority,
+
     #[error("HTTP credentials are not allowed")]
     CredentialsNotAllowed,
+
     #[error("invalid HTTP port")]
     InvalidPort,
+
     #[error("invalid HTTP URL")]
     InvalidUrl,
+
     #[error("invalid HTTP path")]
     InvalidPath,
+
     #[error("query or fragment is not allowed in an HTTP policy target")]
     QueryOrFragmentNotAllowed,
+
     #[error("malformed percent escape in HTTP path")]
     MalformedEscape,
+
     #[error("encoded path separator, percent, control, or NUL is not allowed")]
     EncodedForbiddenByte,
+
     #[error("literal non-ASCII or control byte is not allowed in HTTP path")]
     InvalidPathByte,
+
     #[error("invalid pending HTTP identifier")]
     InvalidPendingId,
+
     #[error("OPTIONS is required for the HTTP asterisk target")]
     AsteriskRequiresOptions,
 }
+fn glob_pattern_for_matching(url: &HttpUrl, pattern: &str) -> String {
+    if !url.authority.host.is_ipv6() {
+        return pattern.to_owned();
+    }
+    let authority_start = format!("{}://", url.scheme.as_str()).len();
+    let open = pattern[authority_start..]
+        .find('[')
+        .map_or(authority_start, |offset| authority_start + offset);
+    let close = pattern[open..]
+        .find(']')
+        .map_or(open, |offset| open + offset);
+    if open == close {
+        return pattern.to_owned();
+    }
+    format!(
+        "{}\\[{}\\]{}",
+        &pattern[..open],
+        &pattern[open + 1..close],
+        &pattern[close + 1..]
+    )
+}
+
 fn replace_pattern_metacharacters(raw: &str) -> (String, Vec<(String, char)>) {
     let mut sanitized = String::with_capacity(raw.len());
     let mut replacements = Vec::new();
     let mut index = 0usize;
-    for character in raw.chars() {
-        if character != '*' {
+    let authority_start = raw.find("://").map_or(raw.len(), |offset| offset + 3);
+    let authority_end = raw[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(raw.len(), |offset| authority_start + offset);
+    let ipv6_end = raw[authority_start..authority_end]
+        .strip_prefix('[')
+        .and_then(|authority| {
+            authority
+                .find(']')
+                .filter(|offset| authority[..*offset].contains(':'))
+                .map(|offset| authority_start + offset + 1)
+        });
+
+    for (position, character) in raw.char_indices() {
+        let in_ipv6_literal =
+            position >= authority_start && ipv6_end.is_some_and(|end| position <= end);
+        if in_ipv6_literal || !matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
             sanitized.push(character);
             continue;
         }
@@ -1193,6 +1245,50 @@ mod tests {
         assert!(!single.target().expect("valid rule").matches(&nested));
         assert!(double.target().expect("valid rule").matches(&nested));
     }
+    #[test]
+    fn url_globset_supports_question_mark_classes_and_alternates() {
+        let question = HttpRule::new(vec![], "https://example.com/file?.txt", "");
+        let question_request = HttpRequest::parse_absolute("GET", "https://example.com/file1.txt")
+            .expect("valid request");
+        assert!(
+            question
+                .target()
+                .expect("valid rule")
+                .matches(&question_request)
+        );
+
+        let class = HttpRule::new(vec![], "https://[ab].example.com/{one,two}/file", "");
+        let class_request = HttpRequest::parse_absolute("GET", "https://a.example.com/two/file")
+            .expect("valid request");
+        let wrong_class_request =
+            HttpRequest::parse_absolute("GET", "https://c.example.com/two/file")
+                .expect("valid request");
+        assert!(class.target().expect("valid rule").matches(&class_request));
+        assert!(
+            !class
+                .target()
+                .expect("valid rule")
+                .matches(&wrong_class_request)
+        );
+    }
+
+    #[test]
+    fn url_globset_escapes_match_literal_metacharacters() {
+        let rule = HttpRule::new(vec![], r"https://example.com/file\*.txt", "");
+        let literal = HttpRequest::parse_absolute("GET", "https://example.com/file*.txt")
+            .expect("valid request");
+        let wildcard = HttpRequest::parse_absolute("GET", "https://example.com/file1.txt")
+            .expect("valid request");
+        assert!(rule.target().expect("valid rule").matches(&literal));
+        assert!(!rule.target().expect("valid rule").matches(&wildcard));
+    }
+    #[test]
+    fn url_globset_escapes_ipv6_authority_brackets() {
+        let rule = HttpRule::new(vec![], "https://[::1]/file?.txt", "");
+        let matching =
+            HttpRequest::parse_absolute("GET", "https://[::1]/file1.txt").expect("valid request");
+        assert!(rule.target().expect("valid rule").matches(&matching));
+    }
 
     #[test]
     fn concrete_request_url_accepts_literal_wildcards() {
@@ -1349,9 +1445,9 @@ mod tests {
     }
 
     #[test]
-    fn url_glob_query_and_fragment_are_rejected() {
-        assert!(HttpUrl::parse_pattern("https://example.com/path?query").is_err());
-        assert!(HttpUrl::parse_pattern("https://example.com/path/*?query").is_err());
+    fn url_glob_question_marks_are_patterns_and_fragments_are_rejected() {
+        assert!(HttpUrl::parse_pattern("https://example.com/path?query").is_ok());
+        assert!(HttpUrl::parse_pattern("https://example.com/path/*?query").is_ok());
         assert!(HttpUrl::parse_pattern("https://example.com/path/*#fragment").is_err());
     }
 }

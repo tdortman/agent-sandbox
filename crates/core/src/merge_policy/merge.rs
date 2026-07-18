@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hosts::host_pattern_matches;
+use crate::hosts::{host_pattern_has_glob, host_pattern_matches};
 use crate::http::{HttpMethodMatcher, HttpRule, HttpRuleTarget, HttpUrl};
 use crate::policy::{
     DbusRule, DbusSection, DirectNetworkSection, FilesystemRule, FilesystemRuleKey,
@@ -43,14 +43,10 @@ fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {
     if deny.port != allow.port {
         return false;
     }
-    if has_host_glob(&deny.host) && has_host_glob(&allow.host) {
+    if host_pattern_has_glob(&deny.host) && host_pattern_has_glob(&allow.host) {
         return deny.host.eq_ignore_ascii_case(&allow.host);
     }
     host_pattern_matches(&deny.host, &allow.host) || host_pattern_matches(&allow.host, &deny.host)
-}
-
-fn has_host_glob(host: &str) -> bool {
-    host.contains(['*', '?'])
 }
 
 fn merge_rules<R, K, Allow, Deny, Key, Overlap>(

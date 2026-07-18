@@ -147,15 +147,6 @@ let
       }
     ];
   };
-  invalidUrlSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy.enable = true;
-    agent-sandbox.network.httpProxy.declarativeAllow = [
-      {
-        url = "https://api.example.com/v1?token=secret";
-        allMethods = true;
-      }
-    ];
-  };
   invalidFragmentSystem = mkNixosSystem {
     agent-sandbox.network.httpProxy.enable = true;
     agent-sandbox.network.httpProxy.declarativeAllow = [
@@ -195,20 +186,20 @@ let
       }
     ];
   };
+  validFullGlobSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.enable = true;
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        url = "https://[ab].example.com/{one,two}/file?.txt";
+        allMethods = true;
+      }
+    ];
+  };
   invalidZeroPortSystem = mkNixosSystem {
     agent-sandbox.network.httpProxy.enable = true;
     agent-sandbox.network.httpProxy.declarativeAllow = [
       {
         url = "https://api.example.com:0/v1";
-        allMethods = true;
-      }
-    ];
-  };
-  invalidGlobSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy.enable = true;
-    agent-sandbox.network.httpProxy.declarativeAllow = [
-      {
-        url = "https://api.example.com/[";
         allMethods = true;
       }
     ];
@@ -243,9 +234,6 @@ let
       !(builtins.tryEval invalidMethodSystem.config.environment.etc."agent-sandbox/declarative.json".text)
       .success;
     assert
-      !(builtins.tryEval invalidUrlSystem.config.environment.etc."agent-sandbox/declarative.json".text)
-      .success;
-    assert
       !(builtins.tryEval
         invalidFragmentSystem.config.environment.etc."agent-sandbox/declarative.json".text
       ).success;
@@ -268,15 +256,15 @@ let
         }
       ];
     assert
+      (builtins.tryEval validFullGlobSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      .success;
+    assert
       (builtins.tryEval validIpv6System.config.environment.etc."agent-sandbox/declarative.json".text)
       .success;
     assert
       !(builtins.tryEval
         invalidZeroPortSystem.config.environment.etc."agent-sandbox/declarative.json".text
       ).success;
-    assert
-      !(builtins.tryEval invalidGlobSystem.config.environment.etc."agent-sandbox/declarative.json".text)
-      .success;
     true;
 
   script = wrapper: ''

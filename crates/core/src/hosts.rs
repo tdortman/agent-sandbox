@@ -28,10 +28,13 @@ pub fn normalize_host(host: &str) -> String {
 pub enum DnsNameError {
     #[error("DNS name is empty")]
     Empty,
+
     #[error("DNS name is not a valid IDNA name")]
     Invalid,
+
     #[error("DNS name exceeds the 253-byte wire limit")]
     TooLong,
+
     #[error("DNS label exceeds the 63-byte wire limit")]
     LabelTooLong,
 }
@@ -214,33 +217,49 @@ pub fn allow_keys(host: &str, port: u16) -> Vec<NetworkRuleKey> {
     vec![NetworkRuleKey::new(&host, port)]
 }
 
-/// Whether `host` matches a policy `pattern` using suffix, IP-prefix, or glob matching.
+/// Whether `host` matches a policy `pattern` using globset syntax and
+/// normalized IP-prefix aliases.
 #[must_use]
 pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_lowercase();
     let host = host.to_lowercase();
-    if let Some(bare) = pattern.strip_prefix("*.") {
+    if let Some(bare) = pattern.strip_prefix("*.")
+        && !host_pattern_has_glob(bare)
+    {
         let suffix = &pattern[1..];
         return host == bare || host.ends_with(suffix);
     }
+
+    if let Ok(glob) = GlobBuilder::new(&pattern)
+        .backslash_escape(true)
+        .literal_separator(true)
+        .build()
+        && glob.compile_matcher().is_match(&host)
+    {
+        return true;
+    }
+
     if let Some(matches) = ipv4_prefix_matches(&pattern, &host) {
         return matches;
     }
+
     if let Some(matches) = ipv6_prefix_matches(&pattern, &host) {
         return matches;
     }
+
     if let (Ok(ip_pat), Ok(ip_host)) = (
         pattern.parse::<std::net::IpAddr>(),
         host.parse::<std::net::IpAddr>(),
     ) {
         return ip_pat == ip_host;
     }
-    if (pattern.contains('*') || pattern.contains('?'))
-        && let Ok(glob) = GlobBuilder::new(&pattern).literal_separator(true).build()
-    {
-        return glob.compile_matcher().is_match(&host);
-    }
-    pattern == host
+
+    false
+}
+
+#[must_use]
+pub(crate) fn host_pattern_has_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', '{', '\\'])
 }
 
 /// Parsed IPv4 prefix octets and count for wildcard matching.
@@ -392,6 +411,33 @@ mod tests {
         assert!(!host_pattern_matches(
             "api.*.example.com",
             "api.v1.example.net"
+        ));
+    }
+    #[test]
+    fn host_pattern_matches_full_globset_syntax() {
+        assert!(host_pattern_matches(
+            "{api,cdn}.example.com",
+            "cdn.example.com"
+        ));
+        assert!(!host_pattern_matches(
+            "{api,cdn}.example.com",
+            "www.example.com"
+        ));
+        assert!(host_pattern_matches(
+            "[a-c]pi.example.com",
+            "api.example.com"
+        ));
+        assert!(!host_pattern_matches(
+            "[a-c]pi.example.com",
+            "dpi.example.com"
+        ));
+        assert!(host_pattern_matches(
+            r"api\*.example.com",
+            "api*.example.com"
+        ));
+        assert!(!host_pattern_matches(
+            r"api\*.example.com",
+            "api1.example.com"
         ));
     }
 

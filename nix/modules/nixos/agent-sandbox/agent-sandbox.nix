@@ -75,9 +75,7 @@ let
   httpUrlType = lib.types.addCheck lib.types.str (
     url:
     let
-      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[A-Za-z0-9*._-]+)(:[0-9]{1,5})?(/[^?#[:space:]]*)?$" url;
-      path = if match == null then null else builtins.elemAt match 2;
-      globSafe = path == null || builtins.match ".*[][{}\\\\].*" path == null;
+      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" url;
       port = if match == null then null else builtins.elemAt match 1;
       portDigits =
         if port == null then null else builtins.substring 1 (builtins.stringLength port - 1) port;
@@ -95,10 +93,9 @@ let
     lib.assertMsg
       (
         match != null
-        && globSafe
         && (port == null || (portValue.success && portValue.value >= 1 && portValue.value <= 65535))
       )
-      "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with a valid port and no query or fragment, got: ${url}"
+      "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with valid glob syntax and no fragment, got: ${url}"
   );
 
   httpMethodType = lib.types.addCheck lib.types.str (

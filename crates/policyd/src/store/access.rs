@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, Verdict, allow_keys, discover_git_project_root, expand_policy_path,
-    normalize_host,
+    ResourceRuleKey, Verdict, allow_keys, contains_glob_syntax, discover_git_project_root,
+    expand_policy_path, normalize_host,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -210,7 +210,7 @@ fn session_filesystem_matches(
 /// Candidate project roots for matching project-relative allow rules.
 ///
 /// Includes the resolved sandbox context root and, when the requested path lies
-/// inside a Git work tree, that repository's root so `./.git*` still matches
+/// inside a Git work tree, that repository's root so `./.git` still matches
 /// `.git/objects` after `cd` into another repo or a stale launcher root.
 fn project_roots_for_allow(ctx_root: Option<&Path>, path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -444,9 +444,7 @@ impl PolicyStore {
         let mut fps = Vec::new();
         for rule in &merged.filesystem.deny {
             let expanded = expand_policy_path(&rule.path, home, project_root);
-            if !expanded.to_string_lossy().contains('*')
-                && !expanded.to_string_lossy().contains('?')
-            {
+            if !contains_glob_syntax(&expanded.to_string_lossy()) {
                 let mtime = std::fs::metadata(&expanded).and_then(|m| m.modified()).ok();
                 fps.push(DenyFingerprint {
                     path: expanded,
@@ -457,9 +455,7 @@ impl PolicyStore {
         }
         for rule in &merged.resources.deny {
             let expanded = expand_policy_path(&rule.path, home, project_root);
-            if !expanded.to_string_lossy().contains('*')
-                && !expanded.to_string_lossy().contains('?')
-            {
+            if !contains_glob_syntax(&expanded.to_string_lossy()) {
                 let mtime = std::fs::metadata(&expanded).and_then(|m| m.modified()).ok();
                 fps.push(DenyFingerprint {
                     path: expanded,
@@ -1188,7 +1184,7 @@ mod tests {
             .filesystem
             .allow
             .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git*",
+                "./.git",
                 agent_sandbox_core::FileAccess::ReadWrite,
                 "global",
             ));
@@ -1232,7 +1228,7 @@ mod tests {
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
-            "global ./.git* should match .git/config when project_root is set"
+            "global ./.git should match .git/config when project_root is set"
         );
         assert_eq!(
             store
@@ -1243,7 +1239,7 @@ mod tests {
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
-            "global ./.git* should still match via git-discovered project root when ctx project_root is empty"
+            "global ./.git should still match via git-discovered project root when ctx project_root is empty"
         );
     }
 
@@ -1339,7 +1335,7 @@ mod tests {
             .filesystem
             .allow
             .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git*",
+                "./.git",
                 agent_sandbox_core::FileAccess::ReadWrite,
                 "global",
             ));
@@ -1377,7 +1373,7 @@ mod tests {
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
-            "git root inferred from path should match ./.git* even when launcher project_root is stale"
+            "git root inferred from path should match ./.git even when launcher project_root is stale"
         );
     }
 
@@ -1397,7 +1393,7 @@ mod tests {
             .filesystem
             .allow
             .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git*",
+                "./.git",
                 agent_sandbox_core::FileAccess::ReadWrite,
                 "global",
             ));
@@ -1452,7 +1448,7 @@ mod tests {
             .filesystem
             .allow
             .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git*",
+                "./.git",
                 agent_sandbox_core::FileAccess::ReadWrite,
                 "global",
             ));
@@ -1523,7 +1519,7 @@ mod tests {
                 .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Read, &ctx,)
                 .await,
             Some(Verdict::denied(VerdictSource::policy())),
-            "session deny on ./.git blocks the tree even when global ./.git* allows"
+            "session deny on ./.git blocks the tree even when global ./.git allows"
         );
     }
 
@@ -2019,7 +2015,7 @@ mod tests {
         // Wildcard match: broad pattern stored, concrete query allowed, other bus rejected.
         let wildcard = DbusTarget::session(
             "org.example.Service",
-            "*",
+            "**",
             "*",
             "*",
             DbusMessageKind::MethodCall,

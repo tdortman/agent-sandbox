@@ -46,7 +46,7 @@ Policy files merge in this order, with denies taking precedence:
 3. `<project>/.agent-sandbox/policy.json`.
 4. Runtime decisions for the current request or session.
 
-Filesystem paths, network hosts, HTTP URLs, and D-Bus fields support [globset syntax](https://docs.rs/globset/latest/globset/#syntax). Policy files are write-protected, including writes through hardlinks.
+Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields support [globset syntax](https://docs.rs/globset/0.4.19/globset/#syntax). Matching uses globset's `literal_separator` mode: `*` and `?` do not match `/`, use `**` for recursive path matching. Policy files are write-protected, including writes through hardlinks.
 
 ```json
 {

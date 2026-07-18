@@ -583,8 +583,7 @@ fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i3
         return FileAccess::Read;
     }
     if mask & FAN_OPEN_EXEC_PERM != 0 {
-        // Directories are never executed as programs; classifying them as
-        // Execute would miss read_write allow rules (e.g. global `./.git*`).
+        // Execute would miss read_write allow rules (e.g. global `./.git`).
         if event_fd_has_type(event_fd, SFlag::S_IFDIR) {
             return FileAccess::Read;
         }

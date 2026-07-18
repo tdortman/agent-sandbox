@@ -210,7 +210,7 @@ let
             "target": {
               "bus": "session",
               "destination": "*",
-              "object_path": "*",
+              "object_path": "**",
               "interface": "org.freedesktop.DBus.Introspectable",
               "member": "Introspect",
               "message_kind": "method_call",

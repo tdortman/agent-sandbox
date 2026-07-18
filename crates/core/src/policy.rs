@@ -1,9 +1,9 @@
 //! On-disk policy document (`network` / `sudo` / `filesystem` allow and deny rules).
 //!
 //! Paths can be absolute (`/foo`), home-relative (`~/foo`), or project-relative (`./foo`).
-//! Paths containing `*` or `?` are treated as glob patterns compiled with [`globset`].
+//! Paths containing glob syntax are compiled with [`globset`].
 
-use globset::{Glob, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -116,8 +116,8 @@ impl std::fmt::Display for FileAccess {
 
 /// Map directory `FAN_OPEN_EXEC_PERM` (traverse) to [`FileAccess::Read`].
 ///
-/// Fanotify reports search permission as execute; `read_write` rules (e.g.
-/// `./.git*`, `./crates`) must still cover `ls` / `opendir`.
+/// Fanotify reports search permission as execute; recursive glob rules (e.g.
+/// `./.git/**`, `./crates`) must still cover `ls` / `opendir`.
 #[must_use]
 pub fn normalize_directory_traverse_access(path: &Path, access: FileAccess) -> FileAccess {
     if access == FileAccess::Execute && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
@@ -191,8 +191,8 @@ fn expand_match_path(path: &Path, project_root: Option<&Path>, canonicalize: boo
 impl CompiledPath {
     /// Compile a policy path into a matcher.
     ///
-    /// If the path (after `./` expansion) contains `*` or `?`, it becomes a `Glob`.
-    /// Otherwise it is treated as a literal `Prefix` path.
+    /// Paths containing glob syntax become a `Glob`; otherwise they are
+    /// treated as literal `Prefix` paths.
     fn compile(path: &Path, project_root: Option<&Path>) -> Result<Self, globset::Error> {
         Self::compile_with_aliases(path, project_root, true)
     }
@@ -209,13 +209,23 @@ impl CompiledPath {
         let expanded = expand_match_path(path, project_root, canonicalize);
         let expanded_str = expanded.to_string_lossy();
 
-        if expanded_str.contains('*') || expanded_str.contains('?') {
-            let glob = Glob::new(&expanded_str)?.compile_matcher();
+        if contains_glob_syntax(&expanded_str) {
+            let glob = GlobBuilder::new(&expanded_str)
+                .backslash_escape(true)
+                .literal_separator(true)
+                .build()?
+                .compile_matcher();
             Ok(Self::Glob(glob))
         } else {
             Ok(Self::Prefix(normalize_rule_path(&expanded)))
         }
     }
+}
+
+/// Return whether a path contains glob syntax supported by policy matching.
+#[must_use]
+pub fn contains_glob_syntax(value: &str) -> bool {
+    value.contains(['*', '?', '[', '{', '\\'])
 }
 
 fn prefix_matches(rule_path: &Path, requested: &Path, require_directory_boundary: bool) -> bool {
@@ -446,9 +456,9 @@ pub fn expand_policy_path(
         expanded
     };
     let s = expanded.to_string_lossy();
-    // Only canonicalize absolute paths. Glob patterns (containing `*` or `?`)
-    // are left as-is since canonicalize would fail on them.
-    if s.starts_with('/') && !s.contains(['*', '?']) {
+    // Only canonicalize absolute literal paths. Glob patterns are left as-is
+    // since canonicalize would fail on them.
+    if s.starts_with('/') && !contains_glob_syntax(&s) {
         std::fs::canonicalize(&expanded).unwrap_or(expanded)
     } else {
         expanded
@@ -877,7 +887,7 @@ impl DbusTarget {
     }
 }
 
-/// Declarative D-Bus rule. String fields accept `*` and `?` glob patterns.
+/// Declarative D-Bus rule. Target string fields accept globset syntax.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DbusRule {
     pub target: DbusTarget,
@@ -911,7 +921,11 @@ impl DbusRule {
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
-    Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
+    GlobBuilder::new(pattern)
+        .backslash_escape(true)
+        .literal_separator(true)
+        .build()
+        .is_ok_and(|glob| glob.compile_matcher().is_match(value))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1135,6 +1149,53 @@ mod dbus_tests {
         assert!(rule.matches(&target("Read")));
         assert!(rule.matches(&target("ReadAll")));
         assert!(!rule.matches(&target("Write")));
+    }
+    #[test]
+    fn dbus_globset_supports_question_mark_and_character_classes() {
+        let question = DbusRule::new(target("Read?"), "");
+        assert!(question.matches(&target("Read1")));
+        assert!(!question.matches(&target("Read12")));
+
+        let class = DbusRule::new(target("[RW]ead"), "");
+        assert!(class.matches(&target("Read")));
+        assert!(class.matches(&target("Wead")));
+        assert!(!class.matches(&target("Xead")));
+    }
+
+    #[test]
+    fn dbus_globset_supports_alternates_and_escapes() {
+        let alternate = DbusRule::new(target("{Read,Write}"), "");
+        assert!(alternate.matches(&target("Read")));
+        assert!(alternate.matches(&target("Write")));
+        assert!(!alternate.matches(&target("Close")));
+
+        let escaped = DbusRule::new(target(r"Read\*"), "");
+        assert!(escaped.matches(&target("Read*")));
+        assert!(!escaped.matches(&target("ReadAll")));
+    }
+
+    #[test]
+    fn dbus_globset_literal_separator_requires_double_star_for_paths() {
+        let single = DbusRule::new(
+            DbusTarget {
+                object_path: "/org/*/Object".into(),
+                ..target("Read")
+            },
+            "",
+        );
+        let double = DbusRule::new(
+            DbusTarget {
+                object_path: "/org/**/Object".into(),
+                ..target("Read")
+            },
+            "",
+        );
+        let nested = DbusTarget {
+            object_path: "/org/example/team/Object".into(),
+            ..target("Read")
+        };
+        assert!(!single.matches(&nested));
+        assert!(double.matches(&nested));
     }
 
     #[test]
@@ -1380,6 +1441,43 @@ mod tests {
         assert!(!rule.path_matches(Path::new("/work/.env"), None));
         assert!(rule.path_matches(Path::new("/work/secret"), None));
     }
+    #[test]
+    fn filesystem_globset_question_mark_matches_one_character() {
+        let rule = FilesystemRule::new("/work/file?.txt", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/file1.txt"), None));
+        assert!(!rule.path_matches(Path::new("/work/file12.txt"), None));
+    }
+
+    #[test]
+    fn filesystem_globset_star_respects_literal_separator() {
+        let rule = FilesystemRule::new("/work/*.txt", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/file.txt"), None));
+        assert!(!rule.path_matches(Path::new("/work/sub/file.txt"), None));
+    }
+
+    #[test]
+    fn filesystem_globset_double_star_matches_nested_paths() {
+        let rule = FilesystemRule::new("/work/**/file.txt", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/file.txt"), None));
+        assert!(rule.path_matches(Path::new("/work/sub/file.txt"), None));
+        assert!(!rule.path_matches(Path::new("/work/file.bin"), None));
+    }
+
+    #[test]
+    fn filesystem_globset_alternates_and_character_classes_match() {
+        let rule = FilesystemRule::new("/work/{src,test}/[a-c][!x].rs", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/src/ab.rs"), None));
+        assert!(rule.path_matches(Path::new("/work/test/cd.rs"), None));
+        assert!(!rule.path_matches(Path::new("/work/doc/ab.rs"), None));
+        assert!(!rule.path_matches(Path::new("/work/src/ax.rs"), None));
+    }
+
+    #[test]
+    fn filesystem_globset_escapes_match_literal_metacharacters() {
+        let rule = FilesystemRule::new(r"/work/\*.txt", FileAccess::Read, "");
+        assert!(rule.path_matches(Path::new("/work/*.txt"), None));
+        assert!(!rule.path_matches(Path::new("/work/file.txt"), None));
+    }
 
     #[test]
     fn glob_dot_slash_prefix_expands_correctly() {
@@ -1390,10 +1488,8 @@ mod tests {
     }
 
     #[test]
-    fn git_star_glob_matches_inside_git_directory_with_project_root() {
-        // globset `*` can span `/`, so `./.git*` covers `.git/config` when the rule
-        // is expanded with project_root at check time (normal sandbox path).
-        let rule = FilesystemRule::new("./.git*", FileAccess::ReadWrite, "");
+    fn git_directory_prefix_matches_inside_git_directory_with_project_root() {
+        let rule = FilesystemRule::new("./.git", FileAccess::ReadWrite, "");
         let root = Path::new("/home/user/dotfiles");
         assert!(rule.matches(&root.join(".git"), FileAccess::ReadWrite, Some(root)));
         assert!(rule.matches(&root.join(".git/config"), FileAccess::ReadWrite, Some(root)));
@@ -1410,8 +1506,8 @@ mod tests {
     }
 
     #[test]
-    fn git_star_glob_without_project_root_does_not_match_absolute_git_paths() {
-        let rule = FilesystemRule::new("./.git*", FileAccess::ReadWrite, "");
+    fn git_directory_prefix_without_project_root_does_not_match_absolute_git_paths() {
+        let rule = FilesystemRule::new("./.git", FileAccess::ReadWrite, "");
         let root = Path::new("/home/user/dotfiles");
         assert!(!rule.matches(&root.join(".git/config"), FileAccess::ReadWrite, None));
     }

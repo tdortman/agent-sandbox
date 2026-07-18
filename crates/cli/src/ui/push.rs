@@ -1944,7 +1944,7 @@ mod tests {
             values: HashMap::from([
                 ("bus".into(), "session".into()),
                 ("destination".into(), "*".into()),
-                ("object_path".into(), "*".into()),
+                ("object_path".into(), "**".into()),
                 (
                     "interface".into(),
                     "org.freedesktop.DBus.Introspectable".into(),
@@ -1957,7 +1957,7 @@ mod tests {
         };
         let expected = DbusTarget {
             destination: "*".into(),
-            object_path: "*".into(),
+            object_path: "**".into(),
             ..requested.clone()
         };
 

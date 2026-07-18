@@ -144,7 +144,7 @@ pub fn trusted_context_from_pid(pid: u32, uid: Option<u32>) -> ProcContext {
 /// If `path` lies inside a Git work tree, return that tree's root directory.
 ///
 /// Walks upward from `path` looking for a `.git` directory or gitfile. Used when
-/// matching project-relative allow rules (e.g. `./.git*`) so Git metadata under
+/// matching project-relative allow rules (e.g. `./.git`) so Git metadata under
 /// `.git/objects` is allowed even if the sandbox launcher froze a stale
 /// `AGENT_SANDBOX_PROJECT_ROOT` or the tracee changed directory into another
 /// repository.

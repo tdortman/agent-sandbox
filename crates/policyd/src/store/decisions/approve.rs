@@ -1402,7 +1402,7 @@ mod tests {
         );
         let edited = DbusTarget {
             destination: "org.example.Service".into(),
-            object_path: "*".into(),
+            object_path: "**".into(),
             interface: "*".into(),
             member: "*".into(),
             ..requested.clone()
@@ -1451,7 +1451,7 @@ mod tests {
         let policy_path = home.join(".config/agent-sandbox/policy.json");
         let policy = load_policy(&policy_path, Some(&home), None);
         let found = policy.dbus.allow.iter().find(|rule| {
-            rule.target.destination == "org.example.Service" && rule.target.object_path == "*"
+            rule.target.destination == "org.example.Service" && rule.target.object_path == "**"
         });
         let found = found.expect("wildcard D-Bus rule persisted");
         assert_eq!(
