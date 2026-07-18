@@ -122,8 +122,10 @@ fn ensure_nl(s: &str) -> String {
 pub enum ElevateCliError {
     #[error("usage")]
     Usage,
+
     #[error("policyd error")]
     Policyd,
+
     #[error(transparent)]
     Rpc(#[from] agent_sandbox_core::RpcClientError),
 }

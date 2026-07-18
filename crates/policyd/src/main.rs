@@ -95,7 +95,7 @@ struct Cli {
     /// Path to the "agent-sandbox-syscall-broker" binary. If unset, the daemon falls back to the env var `AGENT_SANDBOX_SYSCALL_BROKER_CMD`. Used when an "agent-sandbox-syscall-arm" request needs a host-side seccomp user-notification handler to be spawned.
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_SYSCALL_BROKER_CMD")]
     syscall_broker_cmd: Option<PathBuf>,
-    
+
     /// Remove stale cgroup freezer state after the policy service stops.
     #[arg(long, hide = true)]
     cleanup_cgroup_freeze: bool,

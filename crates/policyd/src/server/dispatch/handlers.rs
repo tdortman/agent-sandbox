@@ -13,9 +13,7 @@ use crate::server::dispatch::check::{CheckArgs, handle_check};
 use crate::server::dispatch::context::ResolvedRpcRequest;
 use crate::server::peer::ClientPeer;
 use crate::store::{PolicyStore, UiClientHandle};
-use crate::wire::{
-    ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire,
-};
+use crate::wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire};
 
 pub async fn handle(
     store: &Arc<PolicyStore>,

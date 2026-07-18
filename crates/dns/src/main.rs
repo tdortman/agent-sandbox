@@ -46,14 +46,19 @@ fn servfail_response(query: &[u8]) -> Option<Vec<u8>> {
 struct Args {
     #[arg(long, default_value = "169.254.100.1")]
     listen_host: String,
+
     #[arg(long, default_value_t = 53)]
     listen_port: u16,
+
     #[arg(long, default_value = DEFAULT_CACHE_PATH)]
     cache_path: PathBuf,
+
     #[arg(long, default_value_t = DEFAULT_MAX_TTL)]
     max_ttl: u32,
+
     #[arg(long, default_value = "/run/agent-sandbox/dns-push.sock")]
     push_socket: PathBuf,
+
     /// Cache DNS attribution only for clients from this exact IP address.
     ///
     /// When omitted, responses from every client are eligible for attribution
@@ -62,10 +67,13 @@ struct Args {
     /// policy cache.
     #[arg(long)]
     cache_client_ip: Option<IpAddr>,
+
     #[arg(long, default_value = "127.0.0.53:53")]
     forward_target: SocketAddr,
+
     #[arg(long, default_value_t = 5_000)]
     forward_timeout_ms: u64,
+
     #[arg(long)]
     verbose: bool,
 }

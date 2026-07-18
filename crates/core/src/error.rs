@@ -8,6 +8,7 @@ use thiserror::Error;
 pub enum ProjectPolicyError {
     #[error("invalid project_root ({path:?}); set AGENT_SANDBOX_PROJECT_ROOT to the git root")]
     InvalidProjectRoot { path: PathBuf },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -31,12 +32,16 @@ impl InvalidScopeError {
 pub enum ScopeResolveError {
     #[error(transparent)]
     InvalidScope(#[from] InvalidScopeError),
+
     #[error("session_id required")]
     SessionRequired,
+
     #[error("home required for global scope")]
     HomeRequired,
+
     #[error("project_root required (set AGENT_SANDBOX_PROJECT_ROOT)")]
     ProjectRootRequired,
+
     #[error(transparent)]
     ProjectPolicy(#[from] ProjectPolicyError),
 }

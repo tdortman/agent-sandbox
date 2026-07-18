@@ -10,30 +10,39 @@ struct Args {
     /// Unix socket exposed to sandbox clients.
     #[arg(long)]
     listen: PathBuf,
+
     /// D-Bus address used for each upstream connection.
     #[arg(long)]
     upstream_address: String,
+
     /// Unix socket for policyd JSON-line RPC.
     #[arg(long)]
     policy_socket: PathBuf,
+
     /// Policy bus selection.
     #[arg(long, default_value = "session", value_parser = ["session", "system"])]
     bus: String,
+
     /// Request context current working directory.
     #[arg(long)]
     cwd: Option<PathBuf>,
+
     /// Request context home directory.
     #[arg(long)]
     home: Option<PathBuf>,
+
     /// Request context project root.
     #[arg(long)]
     project_root: Option<PathBuf>,
+
     /// Request context process id.
     #[arg(long)]
     pid: Option<u32>,
+
     /// Request context user id.
     #[arg(long)]
     uid: Option<u32>,
+
     /// Request context sandbox session identifier.
     #[arg(long)]
     sandbox_session_id: Option<String>,

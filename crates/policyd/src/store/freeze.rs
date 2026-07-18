@@ -16,20 +16,26 @@ const DEFAULT_REGISTRY: &str = "/run/agent-sandbox/cgroup-freeze";
 pub enum CgroupFreezeError {
     #[error("cannot read cgroup for pid {pid}: {source}")]
     ProcessCgroup { pid: u32, source: io::Error },
+
     #[error("pid {pid} is not in a cgroup v2 hierarchy")]
     NotCgroupV2 { pid: u32 },
+
     #[error("pid {pid} is not owned by uid {expected_uid} (actual uid {actual_uid})")]
     WrongOwner {
         pid: u32,
         expected_uid: u32,
         actual_uid: u32,
     },
+
     #[error("pid {pid} is not in an agent-sandbox systemd scope: {path}")]
     UnmanagedScope { pid: u32, path: PathBuf },
+
     #[error("cgroup freezer path is invalid: {0}")]
     InvalidPath(PathBuf),
+
     #[error("cannot freeze cgroup {path}: {source}")]
     Freeze { path: PathBuf, source: io::Error },
+
     #[error("cannot persist cgroup freeze state: {0}")]
     Registry(#[source] io::Error),
 }

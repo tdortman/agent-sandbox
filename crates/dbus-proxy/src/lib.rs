@@ -168,10 +168,13 @@ pub async fn run(config: RelayConfig) -> Result<(), RelayError> {
 pub enum RelayError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
     #[error("D-Bus error: {0}")]
     Dbus(#[from] zbus::Error),
+
     #[error("policy RPC error: {0}")]
     Policy(#[from] agent_sandbox_core::rpc_client::RpcClientError),
+
     #[error("invalid D-Bus message: {0}")]
     Message(String),
 }
