@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,13 +12,26 @@ use agent_sandbox_syscall_broker::{
 };
 use tracing::{debug, info, warn};
 
-fn should_bypass_network_policy(network_mode: NetworkMode, facts: &NormalizedNotification) -> bool {
+fn should_bypass_network_policy(
+    network_mode: NetworkMode,
+    dns_endpoint: Option<SocketAddr>,
+    facts: &NormalizedNotification,
+) -> bool {
     let NormalizedNotification::Target {
         target: SyscallTarget::Network(target),
     } = facts
     else {
         return false;
     };
+
+    let is_configured_dns = dns_endpoint.is_some_and(|endpoint| {
+        endpoint.port() == target.port && target.connect_host.parse() == Ok(endpoint.ip())
+    });
+
+    if is_configured_dns {
+        return true;
+    }
+
     if network_mode != NetworkMode::Proxy {
         return false;
     }
@@ -27,6 +41,11 @@ fn should_bypass_network_policy(network_mode: NetworkMode, facts: &NormalizedNot
         ("tcp", 80 | 443 | 8008 | 8080 | 8443) | ("udp", 443)
     )
 }
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkPolicyBypass {
+    pub mode: NetworkMode,
+    pub dns_endpoint: Option<SocketAddr>,
+}
 
 pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
@@ -35,7 +54,7 @@ pub async fn dispatch_notification_with_mode(
     listener_fd: i32,
     notif: &SeccompNotif,
     timeout: Duration,
-    network_mode: NetworkMode,
+    network_policy: NetworkPolicyBypass,
 ) {
     if !notification_arch_valid(notif) {
         warn!(
@@ -83,10 +102,15 @@ pub async fn dispatch_notification_with_mode(
         pid: notif.pid,
         timeout,
     };
-    let plan = if should_bypass_network_policy(network_mode, &facts) {
-        // In proxy mode, only transparent-proxy service ports bypass the
-        // transport policy check; direct ports stay blocked in seccomp until
-        // their transport approval completes.
+    let plan = if policy_socket_bypass {
+        // The broker must be able to service the policy RPC that authorizes
+        // every other notification; routing this infrastructure connection
+        // back through the resource policy would deadlock the gate.
+        ResponsePlan::Continue
+    } else if should_bypass_network_policy(network_policy.mode, network_policy.dns_endpoint, &facts)
+    {
+        // The configured DNS forwarder is sandbox infrastructure. Proxy mode
+        // also delegates only its transparent service ports.
         ResponsePlan::Continue
     } else {
         decide(&adapter, facts).await
@@ -167,42 +191,87 @@ fn execute_response_plan(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
     use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
     use agent_sandbox_syscall_broker::NetworkTarget;
 
+    fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
+        NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
+            host: host.to_owned(),
+            connect_host: host.to_owned(),
+            port,
+            scheme: scheme.to_owned(),
+        }))
+    }
+
     #[test]
-    fn proxy_mode_bypasses_only_transparent_proxy_ports() {
-        let target = |scheme: &str, port| {
-            NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
-                host: "example.test".to_owned(),
-                connect_host: "192.0.2.10".to_owned(),
-                port,
-                scheme: scheme.to_owned(),
-            }))
-        };
+    fn configured_dns_endpoint_bypasses_transport_policy() {
+        let dns_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1)), 53);
 
         assert!(should_bypass_network_policy(
-            NetworkMode::Proxy,
-            &target("tcp", 443)
+            NetworkMode::Direct,
+            Some(dns_endpoint),
+            &target("udp", "169.254.100.1", 53)
         ));
         assert!(should_bypass_network_policy(
             NetworkMode::Proxy,
-            &target("udp", 443)
+            Some(dns_endpoint),
+            &target("tcp", "169.254.100.1", 53)
         ));
+    }
+
+    #[test]
+    fn dns_bypass_requires_exact_configured_endpoint() {
+        let dns_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1)), 53);
+
         assert!(!should_bypass_network_policy(
-            NetworkMode::Proxy,
-            &target("tcp", 853)
-        ));
-        assert!(!should_bypass_network_policy(
-            NetworkMode::Proxy,
-            &target("udp", 853)
+            NetworkMode::Direct,
+            Some(dns_endpoint),
+            &target("udp", "169.254.100.2", 53)
         ));
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
-            &target("tcp", 443)
+            Some(dns_endpoint),
+            &target("udp", "169.254.100.1", 5353)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Direct,
+            None,
+            &target("udp", "169.254.100.1", 53)
+        ));
+    }
+
+    #[test]
+    fn proxy_mode_bypasses_only_transparent_proxy_ports() {
+        assert!(should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
+            &target("tcp", "192.0.2.10", 443)
+        ));
+        assert!(should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
+            &target("udp", "192.0.2.10", 443)
         ));
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
+            None,
+            &target("tcp", "192.0.2.10", 853)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
+            &target("udp", "192.0.2.10", 853)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Direct,
+            None,
+            &target("tcp", "192.0.2.10", 443)
+        ));
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
             &NormalizedNotification::continue_()
         ));
     }

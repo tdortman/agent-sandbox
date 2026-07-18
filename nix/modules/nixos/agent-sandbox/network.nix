@@ -375,6 +375,7 @@ in
 lib.mkIf policyEnabled (
   lib.mkMerge [
     {
+      networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
       environment.etc."agent-sandbox/declarative.json".text = builtins.toJSON (
         {
           network = {

@@ -28,6 +28,7 @@ let
   runtime = proxy: {
     policyContext = false;
     network = { };
+    hostIp = "169.254.100.1";
     httpProxy.enable = proxy;
   };
 
@@ -364,6 +365,14 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "dynamic direct wrapper does not set direct network mode"
   grep -F -q -- 'RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE proxy)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not set proxy network mode"
+  grep -F -q -- '--setenv AGENT_SANDBOX_DNS_ENDPOINT 169.254.100.1:53' "$static_direct" \
+    || fail "static direct wrapper does not set the configured DNS endpoint"
+  grep -F -q -- '--setenv AGENT_SANDBOX_DNS_ENDPOINT 169.254.100.1:53' "$static_proxy" \
+    || fail "static proxy wrapper does not set the configured DNS endpoint"
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT 169.254.100.1:53)' "$dynamic_direct" \
+    || fail "dynamic direct wrapper does not set the configured DNS endpoint"
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT 169.254.100.1:53)' "$dynamic_proxy" \
+    || fail "dynamic proxy wrapper does not set the configured DNS endpoint"
   if grep -F -q -- '/var/lib/agent-sandbox-proxy' "$static_proxy"; then
     fail "static proxy wrapper must not mount an absent proxy state path"
   fi

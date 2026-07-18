@@ -92,17 +92,21 @@ let
         autoSpawnPolicyUi
         uiBackend
         ;
-      network = lib.optionalAttrs network.enable {
-        inherit (network)
-          netnsName
-          vethHost
-          vethNetns
-          netnsIp
-          netnsIp6
-          netnsIp6Prefix
-          ;
-        inherit netnsEnter;
-      };
+      network =
+        if network.enable then
+          {
+            inherit (network)
+              netnsName
+              vethHost
+              vethNetns
+              netnsIp
+              netnsIp6
+              netnsIp6Prefix
+              ;
+            inherit netnsEnter;
+          }
+        else
+          null;
       inherit (network) queueNumber hostIp hostIp6;
       policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
       inherit (network) dnsForwardTarget;
@@ -167,7 +171,7 @@ let
     ++ lib.optionals (runtime != null && runtime.policyContext) [
       (agent-sandbox-context-env { inherit runtime; })
     ]
-    ++ lib.optionals (runtime != null && runtime.network != { }) [
+    ++ lib.optionals (runtime != null && runtime.network != null) [
       (if dynamicFs then c.agent-sandbox-restricted-net-dynamic else agent-sandbox-restricted-net)
     ]
     ++ lib.optionals (sudoGuard != null) [
@@ -240,6 +244,7 @@ in
       dbusSocketDirectory = if dbus != null then dbus.socketDirectory else "/run/user";
       dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;
       networkMode = if proxyMode then "proxy" else "direct";
+      dnsEndpoint = if runtime != null && runtime.network != null then "${runtime.hostIp}:53" else null;
       proxyTrustBundle = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
       runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
 
@@ -340,6 +345,14 @@ in
             '')
           ])
         ]
+        ++ lib.optionals (syscallGate && dnsEndpoint != null) [
+          (builtinCombinators.compose [
+            (builtinCombinators.set-env "AGENT_SANDBOX_DNS_ENDPOINT" dnsEndpoint)
+            (builtinCombinators.add-runtime ''
+              RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT ${lib.escapeShellArg dnsEndpoint})
+            '')
+          ])
+        ]
         ++ lib.optionals proxyMode [
           (builtinCombinators.compose [
             (builtinCombinators.set-env "SSL_CERT_FILE" proxyTrustBundle)
@@ -356,7 +369,7 @@ in
       # jail-nix bind-mount combinator is both redundant and broken (bwrap
       # cannot mkdir through symlinks on a root-bound tree).  Generate the
       # wrapper directly to guarantee zero unexpected bind mounts.
-      hasNetwork = network != null;
+      hasNetwork = network != null && network != { };
       sandboxPkgsList = lib.unique (
         [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
@@ -571,6 +584,9 @@ in
       '';
       networkModeScript = lib.optionalString syscallGate ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
+        ${lib.optionalString (dnsEndpoint != null) ''
+          RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT ${lib.escapeShellArg dnsEndpoint})
+        ''}
       '';
       proxyTrustScript = lib.optionalString proxyMode ''
         [[ -f ${proxyTrustBundle} ]] || {

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 HOST_IF="@vethHost@"
+DNS_TARGET_HOST="@dnsTargetHost@"
 
 # Same sysctl as interface-run/veth-setup.sh. Without rp_filter=0, replies to 169.254.100.1
 # from the netns are dropped and DNS connections time out.
@@ -13,7 +14,7 @@ sysctl -w "net.ipv4.conf.${HOST_IF}.rp_filter=0"
 sysctl -w net.ipv6.conf.all.forwarding=1
 sysctl -w "net.ipv6.conf.${HOST_IF}.forwarding=1"
 
-if [[ "@dnsTargetHost@" == 127.* ]]; then
+if [[ "$DNS_TARGET_HOST" == 127.* ]]; then
   sysctl -w net.ipv4.conf.all.route_localnet=1
   sysctl -w "net.ipv4.conf.${HOST_IF}.route_localnet=1"
   echo "agent-sandbox-host-nat: route_localnet enabled for ${HOST_IF}" >&2

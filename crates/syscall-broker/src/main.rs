@@ -1,6 +1,7 @@
 pub(crate) mod decision;
 pub(crate) mod dispatch;
 
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -45,9 +46,16 @@ struct Cli {
     #[arg(long, value_name = "MODE")]
     network_mode: Option<String>,
 
+    /// Trusted DNS forwarder endpoint inside the sandbox network namespace.
+    /// Only this exact TCP/UDP endpoint bypasses transport policy. If omitted,
+    /// `AGENT_SANDBOX_DNS_ENDPOINT` is consulted.
+    #[arg(long, value_name = "IP:PORT")]
+    dns_endpoint: Option<SocketAddr>,
+
     /// Inherited seccomp user-notification file descriptor. The arm uses `SCM_RIGHTS` to pass this fd across exec. The broker sets it non-blocking and loops on `SECCOMP_IOCTL_NOTIF_RECV`.
     #[arg(long, value_name = "FD")]
     listener_fd: i32,
+
     /// Path to the policyd Unix domain socket. Used to ask policyd for the verdict on each notified syscall.
     #[arg(
         long,
@@ -55,12 +63,15 @@ struct Cli {
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     policy_socket: PathBuf,
+
     /// Sandbox session id forwarded to policyd so per-session rules and audit logs are routed correctly. Falls back to the env var `AGENT_SANDBOX_SESSION_ID` if unset.
     #[arg(long, value_name = "ID")]
     sandbox_session_id: Option<String>,
+
     /// Max seconds to wait for a policyd verdict per notified syscall. Fractional values are accepted. The effective wait is clamped to at least 1 second. Larger values tolerate slow policyd startups but delay the sandboxed syscall.
     #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
     policy_timeout: f64,
+
     /// PID of the immediate child the broker is supervising. When the child exits the broker exits too and the seccomp listener is closed. Optional: omit for a broker that runs until its listener fd is revoked.
     #[arg(long, value_name = "PID")]
     child_pid: Option<i32>,
@@ -84,6 +95,15 @@ async fn main() -> std::io::Result<()> {
         .or_else(|| std::env::var("AGENT_SANDBOX_NETWORK_MODE").ok());
     let network_mode =
         parse_network_mode(network_mode_value.as_deref()).map_err(std::io::Error::other)?;
+    let dns_endpoint = if let Some(endpoint) = cli.dns_endpoint {
+        Some(endpoint)
+    } else {
+        match std::env::var("AGENT_SANDBOX_DNS_ENDPOINT") {
+            Ok(value) => Some(value.parse().map_err(std::io::Error::other)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(err) => return Err(std::io::Error::other(err)),
+        }
+    };
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
@@ -149,7 +169,10 @@ async fn main() -> std::io::Result<()> {
             cli.listener_fd,
             &notif,
             timeout,
-            network_mode,
+            dispatch::NetworkPolicyBypass {
+                mode: network_mode,
+                dns_endpoint,
+            },
         )
         .await;
     }
