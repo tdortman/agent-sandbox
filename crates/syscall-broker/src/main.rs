@@ -43,13 +43,13 @@ struct Cli {
     /// checks; `proxy` delegates Internet transport to the transparent proxy.
     /// If omitted, `AGENT_SANDBOX_NETWORK_MODE` is consulted and missing or
     /// unknown values fail closed at startup.
-    #[arg(long, value_name = "MODE")]
+    #[arg(long, value_name = "MODE", env = "AGENT_SANDBOX_NETWORK_MODE")]
     network_mode: Option<String>,
 
     /// Trusted DNS forwarder endpoint inside the sandbox network namespace.
     /// Only this exact TCP/UDP endpoint bypasses transport policy. If omitted,
     /// `AGENT_SANDBOX_DNS_ENDPOINT` is consulted.
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", env = "AGENT_SANDBOX_DNS_ENDPOINT")]
     dns_endpoint: Option<SocketAddr>,
 
     /// Inherited seccomp user-notification file descriptor. The arm uses `SCM_RIGHTS` to pass this fd across exec. The broker sets it non-blocking and loops on `SECCOMP_IOCTL_NOTIF_RECV`.
@@ -65,7 +65,7 @@ struct Cli {
     policy_socket: PathBuf,
 
     /// Sandbox session id forwarded to policyd so per-session rules and audit logs are routed correctly. Falls back to the env var `AGENT_SANDBOX_SESSION_ID` if unset.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", env = "AGENT_SANDBOX_SESSION_ID")]
     sandbox_session_id: Option<String>,
 
     /// Max seconds to wait for a policyd verdict per notified syscall. Fractional values are accepted. The effective wait is clamped to at least 1 second. Larger values tolerate slow policyd startups but delay the sandboxed syscall.
@@ -90,20 +90,9 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let network_mode_value = cli
-        .network_mode
-        .or_else(|| std::env::var("AGENT_SANDBOX_NETWORK_MODE").ok());
     let network_mode =
-        parse_network_mode(network_mode_value.as_deref()).map_err(std::io::Error::other)?;
-    let dns_endpoint = if let Some(endpoint) = cli.dns_endpoint {
-        Some(endpoint)
-    } else {
-        match std::env::var("AGENT_SANDBOX_DNS_ENDPOINT") {
-            Ok(value) => Some(value.parse().map_err(std::io::Error::other)?),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(err) => return Err(std::io::Error::other(err)),
-        }
-    };
+        parse_network_mode(cli.network_mode.as_deref()).map_err(std::io::Error::other)?;
+    let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
@@ -676,5 +665,27 @@ mod tests {
 
         let _ = std::fs::remove_file(&orig);
         let _ = std::fs::remove_file(&alias);
+    }
+
+    #[test]
+    fn environment_defaults_are_declared_on_cli_arguments() {
+        use super::Cli;
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for (argument, environment) in [
+            ("network_mode", "AGENT_SANDBOX_NETWORK_MODE"),
+            ("dns_endpoint", "AGENT_SANDBOX_DNS_ENDPOINT"),
+            ("sandbox_session_id", "AGENT_SANDBOX_SESSION_ID"),
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|candidate| candidate.get_id().as_str() == argument)
+                .expect("environment-backed argument should exist");
+            assert_eq!(
+                argument.get_env().and_then(|value| value.to_str()),
+                Some(environment)
+            );
+        }
     }
 }

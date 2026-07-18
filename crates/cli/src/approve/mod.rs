@@ -43,77 +43,96 @@ struct Cli {
 enum Command {
     /// List every pending approval request.
     Pending {
-        /// Home directory inside the sandbox. Used to scope "global" rules to the right "policy.json". Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
-        #[arg(long, value_name = "DIR")]
+        /// Home directory inside the sandbox. Used to scope "global" rules to the right "policy.json". Defaults to the env var `AGENT_SANDBOX_HOME`.
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
+
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
+
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
     /// Approve a pending request and persist the rule at the requested scope.
     Approve {
         /// Request id printed by "pending". Identifies the queued elevation, network, or filesystem request.
         id: String,
+
         /// Where to persist the rule: "once" (this request only, default for "deny"), "session", "project", or "global".
         #[arg(value_name = "SCOPE")]
         scope: ApprovalScope,
+
         /// Session id the request belongs to. Required when the scope is "session" and the policy is keyed by session.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
-        #[arg(long, value_name = "DIR")]
+
+        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME`.
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
+
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
+
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
     /// Pre-approve a single (host, port) pair without an outstanding request. Writes the rule directly to policyd.
     ApproveHost {
         /// Destination host. Either a literal IPv4/IPv6 address (e.g. "1.1.1.1") or a hostname (e.g. "example.com").
         host: String,
+
         /// Destination port. Use the well-known port for the scheme (e.g. 443 for HTTPS, 53 for DNS).
         port: u16,
+
         /// Where to persist the rule: "once", "session", "project", or "global".
         #[arg(value_name = "SCOPE")]
         scope: ApprovalScope,
+
         /// Session id the rule applies to. Required when the scope is "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
-        #[arg(long, value_name = "DIR")]
+        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME`.
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
+
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
+
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
     /// Pre-approve a decoded HTTP method and URL target.
     ApproveHttp {
         /// URL or URL pattern without a query string or fragment.
         url: String,
+
         /// Where to persist the HTTP rule.
         #[arg(value_name = "SCOPE")]
         scope: ApprovalScope,
+
         /// Exact HTTP method. Mutually exclusive with --all-methods.
         #[arg(long, value_name = "METHOD", conflicts_with = "all_methods")]
         method: Option<String>,
+
         /// Match every HTTP method at this URL.
         #[arg(long, conflicts_with = "method")]
         all_methods: bool,
+
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
+
         #[arg(long, value_name = "DIR")]
         home: Option<PathBuf>,
+
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
+
         #[arg(long, value_name = "DIR")]
         project_root: Option<PathBuf>,
     },
@@ -121,20 +140,25 @@ enum Command {
     Deny {
         /// Request id printed by "pending".
         id: String,
+
         /// Where to persist the deny rule. Defaults to "once" so a denial only affects this single request.
         #[arg(value_name = "SCOPE", default_value = "once")]
         scope: ApprovalScope,
+
         /// Session id the request belongs to. Required when the scope is "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME` or `$HOME`.
-        #[arg(long, value_name = "DIR")]
+
+        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME`.
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
+
         /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
+
         /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
 }

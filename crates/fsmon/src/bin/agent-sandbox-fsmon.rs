@@ -60,15 +60,15 @@ struct Cli {
     socket: PathBuf,
 
     /// Working directory inside the sandbox. Used to scope per-project policy and to pick which mounts are marked. Defaults to the env var `AGENT_SANDBOX_CWD` if unset.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
     cwd: Option<PathBuf>,
 
     /// Home directory inside the sandbox. Used to expand "~" in filesystem rules and to gate "global" scope. Defaults to the env var `AGENT_SANDBOX_HOME` if unset.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<PathBuf>,
 
     /// Project root directory inside the sandbox. Required for "project" scope approvals to land in the right per-project policy file. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<PathBuf>,
 }
 
@@ -1267,5 +1267,26 @@ mod tests {
         let host_proc = test_host_proc();
         let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
         assert!(is_descendant_of(&host_proc, pid, pid));
+    }
+
+    #[test]
+    fn context_arguments_declare_environment_defaults() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for (argument, environment) in [
+            ("cwd", "AGENT_SANDBOX_CWD"),
+            ("home", "AGENT_SANDBOX_HOME"),
+            ("project_root", "AGENT_SANDBOX_PROJECT_ROOT"),
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|candidate| candidate.get_id().as_str() == argument)
+                .expect("context argument should exist");
+            assert_eq!(
+                argument.get_env().and_then(|value| value.to_str()),
+                Some(environment)
+            );
+        }
     }
 }

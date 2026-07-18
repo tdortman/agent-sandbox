@@ -12,7 +12,7 @@ path = "src/main.rs"
 agent-sandbox-core.workspace = true
 agent-sandbox-syscall.workspace = true
 agent-sandbox-sysutil.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "process", "signal", "socket"] }
 tokio = {
