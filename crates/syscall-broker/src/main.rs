@@ -97,9 +97,7 @@ async fn main() -> std::io::Result<()> {
     let mut child_was_resumed = false;
 
     loop {
-        if child_exited(cli.child_pid) {
-            return Ok(());
-        }
+        propagate_child_exit(cli.child_pid);
         if !child_was_resumed {
             if let Some(pid) = cli.child_pid {
                 let _ = nix::sys::signal::kill(
@@ -129,17 +127,15 @@ async fn main() -> std::io::Result<()> {
                     // listener fd, turning every future trap into ENOSYS for
                     // the still-alive child.
                     //
-                    // If the child has truly exited, child_exited() above
-                    // catches it. Brief backoff so a signal-storm won't
+                    // If the child has truly exited, propagate_child_exit() above
+                    // propagates its status. Brief backoff so a signal-storm won't
                     // spin the loop.
                     debug!("notification withdrawn before processing");
                     time::sleep(Duration::from_millis(1)).await;
                     continue;
                 }
                 _ => {
-                    if child_exited(cli.child_pid) {
-                        return Ok(());
-                    }
+                    propagate_child_exit(cli.child_pid);
                     warn!(error = %err, "seccomp notification receive failed");
                     time::sleep(Duration::from_millis(50)).await;
                     continue;
@@ -176,20 +172,19 @@ fn is_open_family_syscall(nr: i32) -> bool {
     )
 }
 
-fn child_exited(child_pid: Option<i32>) -> bool {
+fn propagate_child_exit(child_pid: Option<i32>) {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::Pid;
     let Some(pid) = child_pid else {
-        return false;
+        return;
     };
-    // The original checked `rc == pid` (child reaped). With WNOHANG nix
-    // returns StillAlive when the child has not changed state. Any other
-    // variant (Exited, Signaled, etc.) means the child has terminated and
-    // been reaped.
-    matches!(
-        waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)),
-        Ok(status) if !matches!(status, WaitStatus::StillAlive)
-    )
+    match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::Exited(_, code)) => std::process::exit(code),
+        Ok(WaitStatus::Signaled(_, signal, _)) => {
+            std::process::exit(128 + signal as i32);
+        }
+        _ => {}
+    }
 }
 
 /// Return true if the target is a connect to the broker's own policyd
