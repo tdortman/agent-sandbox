@@ -143,7 +143,7 @@ let
       homeReadwrite = readwriteDirs'.home ++ readwriteFiles'.home;
 
       absReadonly = readonlyDirs'.abs ++ readonlyFiles'.abs;
-      absReadwrite = readonlyDirs'.abs ++ readwriteFiles'.abs;
+      absReadwrite = readwriteDirs'.abs ++ readwriteFiles'.abs;
       # sudoGuard must be in sandboxPkgs (add-pkg-deps), not only add-runtime PATH:
       # policyd-built shells build PATH from package deps, not the jail launcher exports.
       sandboxPkgs = lib.unique (
@@ -178,6 +178,7 @@ let
       (agent-sandbox-sudo-guard sudoGuard)
     ]
     ++ map unsafe-add-raw-args extraBwrapArgs
+    ++ lib.optionals (!dynamicFs && exposeWorkingDirectory) [ c.rebind-cwd ]
     ++ [
       agent-sandbox-nvidia-gpu
     ]
@@ -647,11 +648,14 @@ in
       '';
 
       # Mask paths so the sandbox cannot see their contents even though the
-      # dynamic-FS wrapper binds the whole host root. Directories are shadowed
-      # with an empty tmpfs, files with /dev/null. Appended after all other
-      # mounts so nothing re-exposes them. Entries may start with `~/` to
-      # refer to the invoking user's home (expanded at wrapper generation time
-      # so the runtime script never contains bare `~`, which shellcheck rejects).
+      # dynamic-FS wrapper binds the whole host root. Resolve existing symlinks
+      # before adding mounts because bubblewrap destinations cannot traverse a
+      # symlink; this also masks the object reached through aliases such as
+      # NixOS-managed files under /etc. Directories are shadowed with an empty
+      # tmpfs, files with /dev/null. Appended after all other mounts so nothing
+      # re-exposes them. Entries may start with `~/` to refer to the invoking
+      # user's home (expanded at wrapper generation time so the runtime script
+      # never contains bare `~`, which shellcheck rejects).
       hidePathAssignment =
         path:
         if path == "~" then
@@ -662,10 +666,14 @@ in
           "_asbx_hide=${lib.escapeShellArg path}";
       hidePathsScript = lib.concatMapStringsSep "\n" (path: ''
         ${hidePathAssignment path}
-        if [[ -d "$_asbx_hide" ]]; then
-          RUNTIME_ARGS+=(--tmpfs "$_asbx_hide")
-        elif [[ -e "$_asbx_hide" ]]; then
-          RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide")
+        _asbx_hide_target=""
+        if [[ -e "$_asbx_hide" ]]; then
+          _asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)" || _asbx_hide_target=""
+        fi
+        if [[ -d "$_asbx_hide_target" ]]; then
+          RUNTIME_ARGS+=(--tmpfs "$_asbx_hide_target")
+        elif [[ -e "$_asbx_hide_target" ]]; then
+          RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
         fi
       '') hiddenPaths;
       deviceBindScript = lib.concatMapStringsSep "\n" (path: ''

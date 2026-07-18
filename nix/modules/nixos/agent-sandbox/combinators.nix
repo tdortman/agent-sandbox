@@ -108,6 +108,10 @@ let
       if ! _asbx_real=$(readlink -f "$dir" 2>/dev/null); then
         return 0
       fi
+      # A common OLDPWD=/ must not expose the entire host filesystem.
+      if [[ "$_asbx_real" == "/" ]]; then
+        return 0
+      fi
       if _asbx_is_jail_tmpfs "$_asbx_real"; then
         return 0
       fi
@@ -160,10 +164,6 @@ let
     if (( _asbx_wants_store )); then
       RUNTIME_ARGS+=(--ro-bind /nix/store /nix/store)
     fi
-    # mount-cwd is earlier in bwrap argv; re-bind last so env path scans cannot override rw.
-    if [[ -n "$_asbx_pwd_root" ]]; then
-      RUNTIME_ARGS+=(--bind "$_asbx_pwd_root" "$_asbx_pwd_root")
-    fi
   '';
 
   # Dynamic-FS variant: forward env vars via --setenv but skip all --ro-bind
@@ -185,6 +185,15 @@ let
       esac
       RUNTIME_ARGS+=(--setenv "$_asbx_name" "$_asbx_val")
     done < <(env -0)
+  '';
+
+  rebind-cwd = add-runtime ''
+    if [[ -n "''${PWD:-}" && -d "$PWD" ]]; then
+      _asbx_cwd_root=$(readlink -f "$PWD" 2>/dev/null) || _asbx_cwd_root=""
+      if [[ -n "$_asbx_cwd_root" ]]; then
+        RUNTIME_ARGS+=(--bind "$_asbx_cwd_root" "$_asbx_cwd_root")
+      fi
+    fi
   '';
 
   # Shared bash: mount path at $hostPath, follow symlinks (chezmoi → dotfiles),
@@ -225,6 +234,7 @@ let
 in
 {
   inherit agent-sandbox-base agent-sandbox-dynamic-base;
+  inherit rebind-cwd;
 
   home-readonly-mounts =
     rels:
@@ -310,14 +320,13 @@ in
             [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
           fi
         fi
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET "''${sandboxPolicySocket}")
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
-        RUNTIME_ARGS+=(--ro-bind-try "''${sandboxPolicySocket}" "''${sandboxPolicySocket}")
+        RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
       '')
-      (lib.id sandboxPolicySocket)
     ];
 
   # GPU device nodes need --dev-bind (rw). try-readonly breaks NVML/CUDA ioctls.
@@ -367,8 +376,8 @@ in
 
   agent-sandbox-restricted-net = include-once "agent-sandbox-restricted-net" (compose [
     (share-ns "net")
-    (runtime-deep-ro-bind "/etc/hosts")
     (add-runtime ''
+      RUNTIME_ARGS+=(--dir /etc)
       if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
         RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf /etc/nsswitch.conf)
       else

@@ -37,12 +37,14 @@ pkgs.runCommand "hidden-paths-regression" { } ''
 
   grep -F -q '_asbx_hide="$HOME/.snapshots"' wrapper.sh \
     || fail "~/.snapshots must expand to \$HOME/.snapshots at generation time"
+  grep -F -q '_asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)"' wrapper.sh \
+    || fail "existing hidden paths must resolve symlink aliases before mounting"
 
-  grep -F -q 'RUNTIME_ARGS+=(--tmpfs "$_asbx_hide")' wrapper.sh \
-    || fail "directory hide must use --tmpfs"
+  grep -F -q 'RUNTIME_ARGS+=(--tmpfs "$_asbx_hide_target")' wrapper.sh \
+    || fail "directory hide must use --tmpfs at the resolved target"
 
-  grep -F -q 'RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide")' wrapper.sh \
-    || fail "file hide must bind /dev/null"
+  grep -F -q 'RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")' wrapper.sh \
+    || fail "file hide must bind /dev/null at the resolved target"
 
   # hidePathsScript must run after the broad host bind (via RUNTIME_ARGS tail).
   grep -F -q -- '--bind / /' wrapper.sh \
