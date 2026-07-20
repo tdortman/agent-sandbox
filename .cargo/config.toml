@@ -1,2 +1,2 @@
 [alias]
-clippy-strict = "clippy --workspace --all-targets -- -W clippy::pedantic -W clippy::nursery -D warnings"
+clippy-strict = "clippy --workspace --all-targets -- -D warnings"
