@@ -686,7 +686,8 @@ where
     // HTTP(S) flows are registered and accepted here so mitmproxy can decode
     // them; all other destinations stay on the ordinary kernel route and are
     // checked synchronously below.
-    let src_pid = owner::pid_from_src_port(meta.protocol, meta.src_ip, meta.src_port);
+    let src_pid = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port)
+        .map(agent_sandbox_core::OwnerSnapshot::pid_value);
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
     if state.proxy_mode
         && !meta.dst_ip.is_loopback()

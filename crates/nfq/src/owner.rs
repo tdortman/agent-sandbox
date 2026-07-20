@@ -29,26 +29,13 @@ pub fn owner_snapshot(
     }
 }
 
-/// Find the PID that owns the socket bound to `src_ip:src_port`.
-///
-/// NFQ historically attributed packets from the source endpoint alone. Keep
-/// that compatibility helper while deriving the PID from the same typed
-/// owner snapshot used by proxy registrations.
-pub fn pid_from_src_port(
-    protocol: TransportProtocol,
-    src_ip: IpAddr,
-    src_port: u16,
-) -> Option<u32> {
-    owner_snapshot(protocol, src_ip, src_port).map(agent_sandbox_core::OwnerSnapshot::pid_value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
     #[test]
-    fn pid_from_src_port_resolves_current_process_for_loopback_tcp_client() {
+    fn owner_snapshot_resolves_current_process_for_loopback_tcp_client() {
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
         let listener_addr = listener.local_addr().expect("listener address");
@@ -57,7 +44,8 @@ mod tests {
         let client_addr = client.local_addr().expect("client local address");
 
         let resolved_pid =
-            pid_from_src_port(TransportProtocol::Tcp, client_addr.ip(), client_addr.port());
+            owner_snapshot(TransportProtocol::Tcp, client_addr.ip(), client_addr.port())
+                .map(agent_sandbox_core::OwnerSnapshot::pid_value);
 
         assert_eq!(resolved_pid, Some(std::process::id()));
     }
