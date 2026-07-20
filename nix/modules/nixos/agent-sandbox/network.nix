@@ -202,23 +202,33 @@ let
     }
   '';
 
+  hostNatScript = pkgs.replaceVars ./netns/host-nat.sh {
+    vethHost = runtime.network.vethHost;
+    inherit dnsTargetHost;
+  };
+
   hostNatPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-host-nat";
     runtimeInputs = [
       pkgs.nftables
       pkgs.procps # sysctl
     ];
-    text =
-      builtins.replaceStrings
-        [
-          "@vethHost@"
-          "@dnsTargetHost@"
-        ]
-        [
-          runtime.network.vethHost
-          dnsTargetHost
-        ]
-        (builtins.readFile ./netns/host-nat.sh);
+    text = ''
+      exec ${pkgs.bash}/bin/bash ${hostNatScript} "$@"
+    '';
+  };
+
+  netnsUpScript = pkgs.replaceVars ./netns/up.sh {
+    netnsName = runtime.network.netnsName;
+    vethHost = runtime.network.vethHost;
+    vethNetns = runtime.network.vethNetns;
+    netnsIp = runtime.network.netnsIp;
+    inherit (runtime) hostIp hostIp6;
+    hostIpCidr = "${runtime.hostIp}/30";
+    hostIp6Cidr = "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}";
+    netnsIp6Cidr = "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}";
+    inherit nftRules;
+    hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
   };
 
   netnsUpPkg = pkgs.writeShellApplication {
@@ -229,51 +239,21 @@ let
       pkgs.nftables
       hostNatPkg
     ];
-    text =
-      builtins.replaceStrings
-        [
-          "@netnsName@"
-          "@vethHost@"
-          "@vethNetns@"
-          "@netnsIp@"
-          "@hostIp@"
-          "@hostIpCidr@"
-          "@hostIp6@"
-          "@hostIp6Cidr@"
-          "@netnsIp6Cidr@"
-          "@nftRules@"
-          "@hostNatBin@"
-        ]
-        [
-          runtime.network.netnsName
-          runtime.network.vethHost
-          runtime.network.vethNetns
-          runtime.network.netnsIp
-          runtime.hostIp
-          "${runtime.hostIp}/30"
-          runtime.hostIp6
-          "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}"
-          "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}"
-          nftRules
-          "${hostNatPkg}/bin/agent-sandbox-host-nat"
-        ]
-        (builtins.readFile ./netns/up.sh);
+    text = ''
+      exec ${pkgs.bash}/bin/bash ${netnsUpScript} "$@"
+    '';
   };
 
+  netnsDownScript = pkgs.replaceVars ./netns/down.sh {
+    netnsName = runtime.network.netnsName;
+    vethHost = runtime.network.vethHost;
+  };
   netnsDownPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-netns-down";
     runtimeInputs = [ pkgs.iproute2 ];
-    text =
-      builtins.replaceStrings
-        [
-          "@netnsName@"
-          "@vethHost@"
-        ]
-        [
-          runtime.network.netnsName
-          runtime.network.vethHost
-        ]
-        (builtins.readFile ./netns/down.sh);
+    text = ''
+      exec ${pkgs.bash}/bin/bash ${netnsDownScript} "$@"
+    '';
   };
   proxyStateDir = "/var/lib/agent-sandbox/proxy";
   proxyBundlePath = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
