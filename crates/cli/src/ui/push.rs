@@ -1,11 +1,12 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use super::{bus_name, message_kind_name, signature_display};
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, DbusBus, DbusMessageKind, DbusRule, DbusTarget, FileAccess,
-    FilesystemRule, HttpMethodMatcher, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
-    ResourceRule, UiPush, contract_project_path, host_pattern_matches, is_ip_literal,
-    normalize_dns_name, split_check_aliases,
+    ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, FileAccess, FilesystemRule,
+    HttpMethodMatcher, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind, ResourceRule, UiPush,
+    contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name,
+    split_check_aliases,
 };
 
 use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
@@ -326,30 +327,6 @@ fn elevation_presentation(argv: &[String]) -> ApprovalFormPresentation {
     }
 }
 
-const fn dbus_bus_name(bus: DbusBus) -> &'static str {
-    match bus {
-        DbusBus::Session => "session",
-        DbusBus::System => "system",
-    }
-}
-
-const fn dbus_message_kind_name(kind: DbusMessageKind) -> &'static str {
-    match kind {
-        DbusMessageKind::MethodCall => "method_call",
-        DbusMessageKind::MethodReturn => "method_return",
-        DbusMessageKind::Error => "error",
-        DbusMessageKind::Signal => "signal",
-    }
-}
-
-const fn dbus_signature_display(signature: &str) -> &str {
-    if signature.is_empty() {
-        "<empty>"
-    } else {
-        signature
-    }
-}
-
 fn dbus_fd_display(target: &DbusTarget) -> String {
     let mut value = format!("count={}", target.fd_metadata.len());
     for (index, metadata) in target.fd_metadata.iter().enumerate() {
@@ -367,13 +344,13 @@ fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
         heading: "Allow this D-Bus message?".into(),
         subject: format!(
             "bus: {}\ndestination: {}\nobject path: {}\ninterface: {}\nmember: {}\nmessage kind: {}\nsignature: {}\nFDs: {}",
-            dbus_bus_name(target.bus),
+            bus_name(target.bus),
             target.destination,
             target.object_path,
             target.interface,
             target.member,
-            dbus_message_kind_name(target.message_kind),
-            dbus_signature_display(&target.signature),
+            message_kind_name(target.message_kind),
+            signature_display(&target.signature),
             dbus_fd_display(target),
         ),
     }
@@ -463,8 +440,8 @@ fn parse_dbus_target(
     result: &ApprovalFormResult,
     requested: &DbusTarget,
 ) -> Option<ApprovalTarget> {
-    if result.values.get("bus")? != dbus_bus_name(requested.bus)
-        || result.values.get("message_kind")? != dbus_message_kind_name(requested.message_kind)
+    if result.values.get("bus")? != bus_name(requested.bus)
+        || result.values.get("message_kind")? != message_kind_name(requested.message_kind)
         || result.values.get("fd_metadata")? != &dbus_fd_display(requested)
     {
         return None;
@@ -497,8 +474,8 @@ async fn handle_dbus_unavailable(
 ) -> Result<(), UiCliError> {
     let Some(action) = choose_action(&format!(
         "agent-sandbox: D-Bus {} {}",
-        dbus_message_kind_name(target.message_kind),
-        target.member
+        message_kind_name(target.message_kind),
+        target.member,
     ))
     .await?
     else {
@@ -549,14 +526,14 @@ async fn handle_dbus_push(
     let review = ApprovalFormRequest {
         summary: format!(
             "D-Bus {} {}",
-            dbus_message_kind_name(target.message_kind),
+            message_kind_name(target.message_kind),
             target.member
         ),
         context: approval_context(&paths, session_id),
         presentation: Some(dbus_presentation(&target)),
         scopes: approval_scopes(session_id.is_some()),
         fields: vec![
-            text_field("bus", "Bus", dbus_bus_name(target.bus).into()),
+            text_field("bus", "Bus", bus_name(target.bus).into()),
             text_field("destination", "Destination", target.destination.clone()),
             text_field("object_path", "Object path", target.object_path.clone()),
             text_field("interface", "Interface", target.interface.clone()),
@@ -564,12 +541,12 @@ async fn handle_dbus_push(
             text_field(
                 "message_kind",
                 "Message kind",
-                dbus_message_kind_name(target.message_kind).into(),
+                message_kind_name(target.message_kind).into(),
             ),
             text_field(
                 "signature",
                 "Signature",
-                dbus_signature_display(&target.signature).into(),
+                signature_display(&target.signature).into(),
             ),
             text_field("fd_metadata", "FD metadata", dbus_fd_display(&target)),
             comment_field(),

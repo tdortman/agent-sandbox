@@ -13,12 +13,40 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_sandbox_core::{
-    RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, SandboxPaths, UiPush,
+    DbusBus, DbusMessageKind, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest,
+    SandboxPaths, UiPush,
 };
 use clap::Parser;
 pub use error::UiCliError;
 use nix::fcntl::{Flock, FlockArg};
 use tracing::{info, warn};
+
+#[must_use]
+pub const fn bus_name(bus: DbusBus) -> &'static str {
+    match bus {
+        DbusBus::Session => "session",
+        DbusBus::System => "system",
+    }
+}
+
+#[must_use]
+pub const fn message_kind_name(kind: DbusMessageKind) -> &'static str {
+    match kind {
+        DbusMessageKind::MethodCall => "method_call",
+        DbusMessageKind::MethodReturn => "method_return",
+        DbusMessageKind::Error => "error",
+        DbusMessageKind::Signal => "signal",
+    }
+}
+
+#[must_use]
+pub const fn signature_display(signature: &str) -> &str {
+    if signature.is_empty() {
+        "<empty>"
+    } else {
+        signature
+    }
+}
 
 const PROMPT_LOCK_FILE_NAME: &str = "agent-sandbox-ui.prompt.lock";
 

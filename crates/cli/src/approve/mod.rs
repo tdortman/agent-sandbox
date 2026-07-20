@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::ui::{bus_name, message_kind_name, signature_display};
 use agent_sandbox_core::{
-    ApprovalScope, DbusBus, DbusMessageKind, HttpMethod, HttpMethodMatcher, HttpRuleTarget,
-    HttpUrl, PendingSummary, RequestContext, RpcReply, RpcRequest, SandboxPaths,
-    contract_project_path, policy_rpc,
+    ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
+    RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
 use clap::{Parser, Subcommand};
 
@@ -390,13 +390,13 @@ async fn handle_pending(
             PendingSummary::Dbus { id, target, .. } => {
                 println!(
                     "{id}\tdbus\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    dbus_bus_name(target.bus),
+                    bus_name(target.bus),
                     target.destination,
                     target.object_path,
                     target.interface,
                     target.member,
-                    dbus_message_kind_name(target.message_kind),
-                    dbus_signature_display(&target.signature),
+                    message_kind_name(target.message_kind),
+                    signature_display(&target.signature),
                     target.fd_metadata.len(),
                     dbus_fd_metadata_display(&target),
                 );
@@ -404,30 +404,6 @@ async fn handle_pending(
         }
     }
     Ok(())
-}
-
-const fn dbus_bus_name(bus: DbusBus) -> &'static str {
-    match bus {
-        DbusBus::Session => "session",
-        DbusBus::System => "system",
-    }
-}
-
-const fn dbus_message_kind_name(kind: DbusMessageKind) -> &'static str {
-    match kind {
-        DbusMessageKind::MethodCall => "method_call",
-        DbusMessageKind::MethodReturn => "method_return",
-        DbusMessageKind::Error => "error",
-        DbusMessageKind::Signal => "signal",
-    }
-}
-
-const fn dbus_signature_display(signature: &str) -> &str {
-    if signature.is_empty() {
-        "<empty>"
-    } else {
-        signature
-    }
 }
 
 fn dbus_fd_metadata_display(target: &agent_sandbox_core::DbusTarget) -> String {
