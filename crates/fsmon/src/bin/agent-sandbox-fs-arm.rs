@@ -114,11 +114,3 @@ fn main() {
     );
     process::exit(1);
 }
-
-#[cfg(test)]
-mod tests {
-    // Reserved for future integration tests. The current implementation reads
-    // the policy socket from the environment, which is awkward to set up in a
-    // pure unit test, and the entrypoint is exercised end-to-end by the
-    // NixOS integration test harness.
-}

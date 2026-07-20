@@ -1,17 +1,5 @@
 //! Shared types for the fanotify-based filesystem monitor binaries.
 
-use std::path::PathBuf;
-
-/// Arguments passed from the arm helper to the fsmon binary via CLI flags.
-#[derive(Debug, Clone)]
-pub struct FsmonArgs {
-    pub pid: u32,
-    pub socket: PathBuf,
-    pub cwd: Option<PathBuf>,
-    pub home: Option<PathBuf>,
-    pub project_root: Option<PathBuf>,
-}
-
 /// Minimal RPC client for connecting to policyd over a Unix socket.
 pub mod rpc_client {
     use std::io::{BufRead, BufReader, Write};
