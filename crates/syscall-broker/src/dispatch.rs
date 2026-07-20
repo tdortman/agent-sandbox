@@ -2,9 +2,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use super::decision::{
-    NormalizedNotification, ResponsePlan, RpcPolicyAdapter, decide, normalize_or_failure,
-};
+use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SeccompNotif, SyscallTarget, notification_arch_valid,
@@ -96,12 +94,6 @@ pub async fn dispatch_notification_with_mode(
         } if super::is_policy_socket_bypass(target, policy_socket)
     );
 
-    let adapter = RpcPolicyAdapter {
-        client,
-        sandbox_session_id,
-        pid: notif.pid,
-        timeout,
-    };
     let plan = if policy_socket_bypass {
         // The broker must be able to service the policy RPC that authorizes
         // every other notification; routing this infrastructure connection
@@ -113,7 +105,7 @@ pub async fn dispatch_notification_with_mode(
         // also delegates only its transparent service ports.
         ResponsePlan::Continue
     } else {
-        decide(&adapter, facts).await
+        decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
     execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
 }

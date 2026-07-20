@@ -1,6 +1,6 @@
 mod policy_client;
 
-pub use policy_client::{PersistentPolicyClient, check_filesystem, check_resource, check_target};
+pub use policy_client::PersistentPolicyClient;
 
 use agent_sandbox_core::{FileAccess, ResourceAccess, ResourceKind};
 use agent_sandbox_syscall::policy::nr;

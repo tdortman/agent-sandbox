@@ -1,13 +1,11 @@
-use std::future::Future;
 use std::io;
 use std::path::Path;
-use std::pin::Pin;
 use std::time::Duration;
 
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, NetworkTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif,
-    SyscallTarget, target_from_notification,
+    FilesystemTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif, SyscallTarget,
+    target_from_notification,
 };
 
 /// Facts extracted from a raw seccomp notification before policy evaluation.
@@ -95,128 +93,11 @@ impl ResponsePlan {
     }
 }
 
-/// Policy backend used by the decision layer. Implementations may be RPC or in-memory.
-pub trait PolicyAdapter {
-    fn network<'a>(
-        &'a self,
-        target: &'a NetworkTarget,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
-    fn resource<'a>(
-        &'a self,
-        target: &'a ResourceTarget,
-    ) -> Pin<Box<dyn Future<Output = io::Result<ResourceCheckReply>> + Send + 'a>>;
-    fn filesystem<'a>(
-        &'a self,
-        path: &'a Path,
-        access: FileAccess,
-    ) -> Pin<Box<dyn Future<Output = io::Result<FilesystemCheckReply>> + Send + 'a>>;
-    fn preserve_diagnostics(&self) -> bool {
-        false
-    }
-}
-
-/// Configuration for the production policy adapter.
-#[derive(Clone, Copy)]
-pub struct RpcPolicyAdapter<'a> {
-    pub client: &'a PersistentPolicyClient,
-    pub sandbox_session_id: Option<&'a str>,
-    pub pid: u32,
-    pub timeout: Duration,
-}
-
-impl PolicyAdapter for RpcPolicyAdapter<'_> {
-    fn network<'a>(
-        &'a self,
-        target: &'a NetworkTarget,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(self.client.check_target(
-            target,
-            self.sandbox_session_id.map(str::to_owned),
-            self.pid,
-            self.timeout,
-        ))
-    }
-    fn resource<'a>(
-        &'a self,
-        target: &'a ResourceTarget,
-    ) -> Pin<Box<dyn Future<Output = io::Result<ResourceCheckReply>> + Send + 'a>> {
-        Box::pin(self.client.check_resource(
-            target,
-            self.sandbox_session_id.map(str::to_owned),
-            self.pid,
-            self.timeout,
-        ))
-    }
-    fn filesystem<'a>(
-        &'a self,
-        path: &'a Path,
-        access: FileAccess,
-    ) -> Pin<Box<dyn Future<Output = io::Result<FilesystemCheckReply>> + Send + 'a>> {
-        Box::pin(self.client.check_filesystem(
-            path,
-            access,
-            self.sandbox_session_id.map(str::to_owned),
-            self.pid,
-            self.timeout,
-        ))
-    }
-    fn preserve_diagnostics(&self) -> bool {
-        true
-    }
-}
-
-/// Deterministic adapter useful for decision tests.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy)]
-pub struct InMemoryPolicyAdapter {
-    pub network_allowed: bool,
-    pub resource_allowed: bool,
-    pub filesystem_allowed: bool,
-}
-
-#[cfg(test)]
-impl PolicyAdapter for InMemoryPolicyAdapter {
-    fn network<'a>(
-        &'a self,
-        _target: &'a NetworkTarget,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        let allowed = self.network_allowed;
-        Box::pin(async move { allowed })
-    }
-    fn resource<'a>(
-        &'a self,
-        target: &'a ResourceTarget,
-    ) -> Pin<Box<dyn Future<Output = io::Result<ResourceCheckReply>> + Send + 'a>> {
-        let reply = ResourceCheckReply {
-            ok: true,
-            allowed: self.resource_allowed,
-            source: agent_sandbox_core::VerdictSource::User,
-            kind: target.kind,
-            path: target.path.clone(),
-            access: target.access,
-            error: None,
-        };
-        Box::pin(async move { Ok(reply) })
-    }
-    fn filesystem<'a>(
-        &'a self,
-        path: &'a Path,
-        access: FileAccess,
-    ) -> Pin<Box<dyn Future<Output = io::Result<FilesystemCheckReply>> + Send + 'a>> {
-        let reply = FilesystemCheckReply {
-            ok: true,
-            allowed: self.filesystem_allowed,
-            source: agent_sandbox_core::VerdictSource::User,
-            path: path.to_path_buf(),
-            access,
-            error: None,
-        };
-        Box::pin(async move { Ok(reply) })
-    }
-}
-
-pub async fn decide<A: PolicyAdapter + Sync + ?Sized>(
-    adapter: &A,
+pub async fn decide(
+    client: &PersistentPolicyClient,
+    sandbox_session_id: Option<&str>,
+    pid: u32,
+    timeout: Duration,
     facts: NormalizedNotification,
 ) -> ResponsePlan {
     match facts {
@@ -236,50 +117,79 @@ pub async fn decide<A: PolicyAdapter + Sync + ?Sized>(
         } => ResponsePlan::deny(libc::EACCES),
         NormalizedNotification::Target {
             target: SyscallTarget::Network(target),
-        } => ResponsePlan::plan_network(adapter.network(&target).await),
+        } => ResponsePlan::plan_network(
+            client
+                .check_target(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
+                .await,
+        ),
         NormalizedNotification::Target {
             target: SyscallTarget::Resource(target),
-        } => match adapter.resource(&target).await {
-            Ok(reply) if reply.allowed => ResponsePlan::emulate_resource(target),
-            Ok(reply) if adapter.preserve_diagnostics() => ResponsePlan::ResourcePolicyDenied {
-                target,
-                source: reply.source,
-                error: reply.error,
-            },
-            Err(error) if adapter.preserve_diagnostics() => ResponsePlan::ResourceRpcFailure {
-                target,
-                error: error.to_string(),
-            },
-            Ok(_) | Err(_) => ResponsePlan::deny(libc::EACCES),
-        },
+        } => resource_plan(
+            target.clone(),
+            client
+                .check_resource(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
+                .await,
+        ),
         NormalizedNotification::Target {
             target: SyscallTarget::Filesystem(target),
         } => {
             for (path, access) in &target.checks {
-                match adapter.filesystem(path, *access).await {
-                    Ok(reply) if reply.allowed => {}
-                    Ok(reply) if adapter.preserve_diagnostics() => {
-                        return ResponsePlan::FilesystemPolicyDenied {
-                            errno: libc::EACCES,
-                            path: reply.path,
-                            access: reply.access,
-                            source: reply.source,
-                            error: reply.error,
-                        };
-                    }
-                    Err(error) if adapter.preserve_diagnostics() => {
-                        return ResponsePlan::FilesystemRpcFailure {
-                            errno: libc::EACCES,
-                            path: path.clone(),
-                            access: *access,
-                            error: error.to_string(),
-                        };
-                    }
-                    _ => return ResponsePlan::deny(libc::EACCES),
+                if let Some(plan) = filesystem_plan(
+                    path,
+                    *access,
+                    client
+                        .check_filesystem(
+                            path,
+                            *access,
+                            sandbox_session_id.map(str::to_owned),
+                            pid,
+                            timeout,
+                        )
+                        .await,
+                ) {
+                    return plan;
                 }
             }
             ResponsePlan::revalidate_filesystem(target)
         }
+    }
+}
+
+fn resource_plan(target: ResourceTarget, reply: io::Result<ResourceCheckReply>) -> ResponsePlan {
+    match reply {
+        Ok(reply) if reply.allowed => ResponsePlan::emulate_resource(target),
+        Ok(reply) => ResponsePlan::ResourcePolicyDenied {
+            target,
+            source: reply.source,
+            error: reply.error,
+        },
+        Err(error) => ResponsePlan::ResourceRpcFailure {
+            target,
+            error: error.to_string(),
+        },
+    }
+}
+
+fn filesystem_plan(
+    path: &Path,
+    access: FileAccess,
+    reply: io::Result<FilesystemCheckReply>,
+) -> Option<ResponsePlan> {
+    match reply {
+        Ok(reply) if reply.allowed => None,
+        Ok(reply) => Some(ResponsePlan::FilesystemPolicyDenied {
+            errno: libc::EACCES,
+            path: reply.path,
+            access: reply.access,
+            source: reply.source,
+            error: reply.error,
+        }),
+        Err(error) => Some(ResponsePlan::FilesystemRpcFailure {
+            errno: libc::EACCES,
+            path: path.to_path_buf(),
+            access,
+            error: error.to_string(),
+        }),
     }
 }
 
@@ -305,27 +215,20 @@ pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
 
 #[cfg(test)]
 mod tests {
-    use super::{InMemoryPolicyAdapter, NormalizedNotification, ResponsePlan, decide};
-    use agent_sandbox_core::{FileAccess, ResourceAccess, ResourceKind};
-    use agent_sandbox_syscall_broker::{
-        FilesystemTarget, NetworkTarget, ResourceTarget, SyscallTarget,
+    use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
+    use agent_sandbox_core::{
+        FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply, ResourceKind,
+        VerdictSource,
     };
+    use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
     use std::io;
-    use std::path::PathBuf;
-
-    fn network_target() -> NetworkTarget {
-        NetworkTarget {
-            host: "example.test".to_owned(),
-            connect_host: "example.test".to_owned(),
-            port: 443,
-            scheme: "https".to_owned(),
-        }
-    }
+    use std::path::Path;
+    use std::time::Duration;
 
     fn resource_target() -> ResourceTarget {
         ResourceTarget {
             kind: ResourceKind::Device,
-            path: PathBuf::from("/dev/example"),
+            path: "/dev/example".into(),
             access: ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
             raw: Vec::new(),
             open_flags: 0,
@@ -335,135 +238,150 @@ mod tests {
 
     fn filesystem_target() -> FilesystemTarget {
         FilesystemTarget {
-            checks: vec![(PathBuf::from("/tmp/example"), FileAccess::Write)],
-        }
-    }
-
-    fn adapter(
-        network_allowed: bool,
-        resource_allowed: bool,
-        filesystem_allowed: bool,
-    ) -> InMemoryPolicyAdapter {
-        InMemoryPolicyAdapter {
-            network_allowed,
-            resource_allowed,
-            filesystem_allowed,
+            checks: vec![("/tmp/example".into(), FileAccess::Write)],
         }
     }
 
     #[tokio::test]
-    async fn decision_routes_normalized_facts_to_semantic_plans() {
-        let network = network_target();
-        let resource = resource_target();
-        let filesystem = filesystem_target();
-        let cases = [
-            (
-                "continue fact",
-                NormalizedNotification::continue_(),
-                true,
-                true,
-                true,
-                ResponsePlan::Continue,
-            ),
-            (
-                "errno fact",
-                NormalizedNotification::deny(libc::ENOSYS),
-                true,
-                true,
-                true,
-                ResponsePlan::DenyErrno {
-                    errno: libc::ENOSYS,
-                },
-            ),
-            (
-                "network allowed",
-                NormalizedNotification::target(SyscallTarget::Network(network.clone())),
-                true,
-                true,
-                true,
-                ResponsePlan::Continue,
-            ),
-            (
-                "network denied",
-                NormalizedNotification::target(SyscallTarget::Network(network)),
-                false,
-                true,
-                true,
-                ResponsePlan::DenyErrno {
-                    errno: libc::EACCES,
-                },
-            ),
-            (
-                "resource allowed",
-                NormalizedNotification::target(SyscallTarget::Resource(resource.clone())),
-                true,
-                true,
-                true,
-                ResponsePlan::EmulateResource {
-                    target: resource.clone(),
-                },
-            ),
-            (
-                "resource denied",
-                NormalizedNotification::target(SyscallTarget::Resource(resource)),
-                true,
-                false,
-                true,
-                ResponsePlan::DenyErrno {
-                    errno: libc::EACCES,
-                },
-            ),
-            (
-                "filesystem allowed",
-                NormalizedNotification::target(SyscallTarget::Filesystem(filesystem.clone())),
-                true,
-                true,
-                true,
-                ResponsePlan::RevalidateFilesystemThenContinue {
-                    target: filesystem.clone(),
-                },
-            ),
-            (
-                "filesystem denied",
-                NormalizedNotification::target(SyscallTarget::Filesystem(filesystem)),
-                true,
-                true,
-                false,
-                ResponsePlan::DenyErrno {
-                    errno: libc::EACCES,
-                },
-            ),
-        ];
-
-        for (name, facts, network_allowed, resource_allowed, filesystem_allowed, expected) in cases
-        {
-            let actual = decide(
-                &adapter(network_allowed, resource_allowed, filesystem_allowed),
-                facts,
-            )
-            .await;
-            assert_eq!(actual, expected, "case {name}");
-        }
-    }
-
-    #[tokio::test]
-    async fn classification_failures_preserve_transient_continuation_boundary() {
-        let transient = NormalizedNotification::classification_failure(
-            io::Error::from_raw_os_error(libc::ESRCH),
-            true,
-        );
-        let permanent = NormalizedNotification::classification_failure(
-            io::Error::from_raw_os_error(libc::EINVAL),
-            false,
-        );
-        let policy = adapter(true, true, true);
-
-        assert_eq!(decide(&policy, transient).await, ResponsePlan::Continue);
+    async fn decision_routes_policy_independent_facts() {
+        let client = PersistentPolicyClient::new("/tmp/agent-sandbox-test-policy.sock");
         assert_eq!(
-            decide(&policy, permanent).await,
+            decide(
+                &client,
+                None,
+                0,
+                Duration::from_secs(1),
+                NormalizedNotification::continue_(),
+            )
+            .await,
+            ResponsePlan::Continue
+        );
+        assert_eq!(
+            decide(
+                &client,
+                None,
+                0,
+                Duration::from_secs(1),
+                NormalizedNotification::deny(libc::ENOSYS),
+            )
+            .await,
+            ResponsePlan::DenyErrno {
+                errno: libc::ENOSYS
+            }
+        );
+        assert_eq!(
+            decide(
+                &client,
+                None,
+                0,
+                Duration::from_secs(1),
+                NormalizedNotification::classification_failure(
+                    io::Error::from_raw_os_error(libc::EINVAL),
+                    false,
+                ),
+            )
+            .await,
             ResponsePlan::DenyErrno {
                 errno: libc::EACCES
             }
         );
+    }
+
+    #[test]
+    fn network_verdict_maps_to_plan() {
+        assert_eq!(ResponsePlan::plan_network(true), ResponsePlan::Continue);
+        assert_eq!(
+            ResponsePlan::plan_network(false),
+            ResponsePlan::DenyErrno {
+                errno: libc::EACCES
+            }
+        );
+    }
+
+    #[test]
+    fn resource_verdict_maps_to_plan() {
+        let target = resource_target();
+        let allowed = ResourceCheckReply {
+            ok: true,
+            allowed: true,
+            source: VerdictSource::User,
+            kind: target.kind,
+            path: target.path.clone(),
+            access: target.access,
+            error: None,
+        };
+        assert_eq!(
+            resource_plan(target.clone(), Ok(allowed)),
+            ResponsePlan::EmulateResource {
+                target: target.clone()
+            }
+        );
+
+        let denied = ResourceCheckReply {
+            ok: true,
+            allowed: false,
+            source: VerdictSource::Policy {
+                comment: Some("blocked".into()),
+            },
+            kind: target.kind,
+            path: target.path.clone(),
+            access: target.access,
+            error: Some("blocked".into()),
+        };
+        assert_eq!(
+            resource_plan(target.clone(), Ok(denied)),
+            ResponsePlan::ResourcePolicyDenied {
+                target: target.clone(),
+                source: VerdictSource::Policy {
+                    comment: Some("blocked".into())
+                },
+                error: Some("blocked".into()),
+            }
+        );
+        assert!(matches!(
+            resource_plan(
+                target,
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout")),
+            ),
+            ResponsePlan::ResourceRpcFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn filesystem_verdict_maps_to_plan() {
+        let target = filesystem_target();
+        let (path, access) = &target.checks[0];
+        let allowed = FilesystemCheckReply {
+            ok: true,
+            allowed: true,
+            source: VerdictSource::User,
+            path: path.clone(),
+            access: *access,
+            error: None,
+        };
+        assert!(filesystem_plan(path, *access, Ok(allowed)).is_none());
+
+        let denied = FilesystemCheckReply {
+            ok: true,
+            allowed: false,
+            source: VerdictSource::Policy {
+                comment: Some("blocked".into()),
+            },
+            path: path.clone(),
+            access: *access,
+            error: Some("blocked".into()),
+        };
+        assert!(matches!(
+            filesystem_plan(path, *access, Ok(denied)),
+            Some(ResponsePlan::FilesystemPolicyDenied { .. })
+        ));
+        assert!(matches!(
+            filesystem_plan(
+                Path::new("/tmp/example"),
+                FileAccess::Write,
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout")),
+            ),
+            Some(ResponsePlan::FilesystemRpcFailure { .. })
+        ));
     }
 }

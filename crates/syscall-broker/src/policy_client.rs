@@ -142,65 +142,6 @@ impl PersistentPolicyClient {
     }
 }
 
-pub async fn check_target(
-    policy_socket: &Path,
-    target: &NetworkTarget,
-    sandbox_session_id: Option<String>,
-    pid: u32,
-    timeout: Duration,
-) -> bool {
-    PersistentPolicyClient::new(policy_socket.to_path_buf())
-        .check_target(target, sandbox_session_id, pid, timeout)
-        .await
-}
-
-/// Ask policyd whether a resource-gated syscall is allowed.
-///
-/// Returns the `ResourceCheckReply` so the broker can distinguish a policy
-/// denial from a policyd error and log the source label policyd attached to
-/// the verdict.
-///
-/// # Errors
-///
-/// Returns an error if the RPC itself fails (policyd unreachable, timeout,
-/// malformed reply). A policy denial is returned as `Ok(ResourceCheckReply {
-/// allowed: false, .. })`, not as an error.
-pub async fn check_resource(
-    policy_socket: &Path,
-    target: &ResourceTarget,
-    sandbox_session_id: Option<String>,
-    pid: u32,
-    timeout: Duration,
-) -> io::Result<ResourceCheckReply> {
-    PersistentPolicyClient::new(policy_socket.to_path_buf())
-        .check_resource(target, sandbox_session_id, pid, timeout)
-        .await
-}
-
-/// Ask policyd whether a filesystem-gated syscall path/access pair is allowed.
-///
-/// Returns the `FilesystemCheckReply` so the broker can distinguish a policy
-/// denial from a policyd error and log the source label policyd attached to
-/// the verdict.
-///
-/// # Errors
-///
-/// Returns an error if the RPC itself fails (policyd unreachable, timeout,
-/// malformed reply). A policy denial is returned as `Ok(FilesystemCheckReply {
-/// allowed: false, .. })`, not as an error.
-pub async fn check_filesystem(
-    policy_socket: &Path,
-    path: &Path,
-    access: FileAccess,
-    sandbox_session_id: Option<String>,
-    pid: u32,
-    timeout: Duration,
-) -> io::Result<FilesystemCheckReply> {
-    PersistentPolicyClient::new(policy_socket.to_path_buf())
-        .check_filesystem(path, access, sandbox_session_id, pid, timeout)
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::PersistentPolicyClient;
