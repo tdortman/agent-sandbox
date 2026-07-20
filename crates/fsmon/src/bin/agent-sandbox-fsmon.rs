@@ -1,7 +1,7 @@
 //! Root fanotify monitor: setns into the sandbox mount namespace,
 //! mark each mountpoint, then event-loop handling permission events.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::mem::size_of;
@@ -205,25 +205,6 @@ fn is_synthetic_fs(fstype: &str) -> bool {
             | "fuse.gvfsd-fuse"
             | "fuse.portal"
     )
-}
-
-/// Open a fanotify fd suitable for pre-content permission events.
-///
-/// Returns `(fd, reports_tid)` where `reports_tid` is true when the kernel
-/// honours `FAN_REPORT_TID` and `meta.pid` is the thread id of the opener.
-fn fanotify_init_pre_content() -> io::Result<(std::os::fd::OwnedFd, bool)> {
-    agent_sandbox_sysutil::fanotify_init_pre_content()
-}
-
-/// Add a fanotify mark on a mount point path. Returns the mask that was
-/// actually applied. Kernels with `FAN_PRE_ACCESS` support also receive
-/// pre-content notification events for content reads.
-fn fanotify_mark(
-    fan_fd: impl std::os::fd::AsFd,
-    path: &CStr,
-    try_pre_access: bool,
-) -> io::Result<u64> {
-    agent_sandbox_sysutil::fanotify_mark(fan_fd, path, try_pre_access)
 }
 
 /// Parse mountinfo text and return all mount entries with their fstype.
@@ -648,7 +629,7 @@ fn mark_mountpoints(
 
         let mp_cstr =
             CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
-        match fanotify_mark(&fan_fd, &mp_cstr, true) {
+        match agent_sandbox_sysutil::fanotify_mark(&fan_fd, &mp_cstr, true) {
             Ok(actual_mask) => {
                 saw_pre_access_mark |= actual_mask & FAN_PRE_ACCESS != 0;
                 if home_covering_mount == Some(mount.mount_point.as_path()) {
@@ -863,10 +844,11 @@ fn main() {
     });
 
     // Open fanotify fd.
-    let (fan_fd, fanotify_reports_tid) = fanotify_init_pre_content().unwrap_or_else(|e| {
-        eprintln!("agent-sandbox-fsmon: fanotify_init failed: {e}");
-        process::exit(1);
-    });
+    let (fan_fd, fanotify_reports_tid) = agent_sandbox_sysutil::fanotify_init_pre_content()
+        .unwrap_or_else(|e| {
+            eprintln!("agent-sandbox-fsmon: fanotify_init failed: {e}");
+            process::exit(1);
+        });
     if fanotify_reports_tid {
         tracing::debug!("fanotify reports opener thread ids (FAN_REPORT_TID)");
     }
