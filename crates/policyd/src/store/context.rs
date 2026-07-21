@@ -366,6 +366,12 @@ impl PolicyStore {
         }
     }
 
+    pub(crate) fn invalidate_merged_policy_cache(&self) {
+        if let Ok(mut cache) = self.merged_cache.lock() {
+            cache.entries.clear();
+        }
+    }
+
     /// Export merged policy to JSON and optionally Nix-format files.
     ///
     /// # Errors

@@ -100,6 +100,7 @@ impl PolicyStore {
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
+                self.invalidate_merged_policy_cache();
             }
             ScopeTarget::Project {
                 policy_path,
@@ -128,6 +129,7 @@ impl PolicyStore {
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
+                self.invalidate_merged_policy_cache();
                 tracing::info!(path = ?policy_path, "project filesystem policy saved");
             }
         }
@@ -394,5 +396,85 @@ impl PolicyStore {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use agent_sandbox_core::{
+        ApprovalScope, FileAccess, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
+        SandboxPaths, Verdict, VerdictSource,
+    };
+
+    use super::*;
+    use crate::{
+        store::{decisions::DecisionAction, types::PolicydArgs},
+        wire::{FilesystemScopeOp, ScopeWire},
+    };
+
+    #[tokio::test]
+    async fn project_filesystem_persistence_invalidates_merged_cache() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        let scripts = project.join("scripts");
+        std::fs::create_dir_all(&scripts).expect("create project scripts");
+        let declarative = dir.path().join("declarative.json");
+        let export_json = dir.path().join("export.json");
+        let store = PolicyStore::new(PolicydArgs {
+            host_socket: dir.path().join("host.sock"),
+            sandbox_socket: dir.path().join("sandbox.sock"),
+            declarative,
+            export_json,
+            export_nix: None,
+            approval_timeout: Duration::from_secs(30),
+            interactive_approval: true,
+            ui_spawn_cmd: None,
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+            proxy_socket: None,
+            proxy_gid: None,
+        });
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project, &home, &project),
+            ids: ProcessIds::default(),
+            sandbox_session_id: None,
+        };
+        let requested = scripts.join("plot_utils.py");
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&requested, FileAccess::Read, &ctx)
+                .await,
+            None
+        );
+
+        let reply = store
+            .apply_filesystem_scope(
+                FilesystemScopeOp {
+                    path: PathBuf::from("./scripts"),
+                    access: FileAccess::ReadWrite,
+                    scope: ApprovalScope::Project,
+                    wire: ScopeWire::from_resolved(&ctx, None),
+                },
+                DecisionAction::Approve,
+            )
+            .await;
+        assert!(matches!(reply, RpcReply::ScopeAction(_)));
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&requested, FileAccess::Read, &ctx)
+                .await,
+            Some(Verdict::allowed(VerdictSource::policy()))
+        );
+        let policy: Policy = agent_sandbox_core::load_policy(
+            &project.join(".agent-sandbox/policy.json"),
+            Some(&home),
+            None,
+        );
+        assert_eq!(policy.filesystem.allow[0].path, PathBuf::from("./scripts"));
     }
 }
