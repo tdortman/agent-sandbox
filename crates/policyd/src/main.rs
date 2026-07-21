@@ -10,24 +10,24 @@ use clap::Parser;
     name = "agent-sandbox-policyd",
     version,
     about = "Policy daemon that brokers prompts between sandboxed agents and host UI clients",
-    long_about = r"Long-lived policy daemon for the agent sandbox stack.\n\n\
-        Listens on a host-side Unix socket for UI clients (agent-sandbox-approve, \
-        agent-sandbox-ui) and on a separate sandbox-side socket for components running \
-        inside the bwrap mount namespace (agent-sandbox-nfq, agent-sandbox-syscall-arm, \
-        agent-sandbox-fs-arm). Merges declarative policy, per-project policy, and \
-        per-session rules into a unified verdict store, then answers Check/Elevate/\
-        Filesystem requests and prompts the user for interactive approvals.\n\n\
-        EXAMPLES:\n\
-        # Run with default NixOS paths.\n\
-        agent-sandbox-policyd\n\n\
-        # Override the host socket and load policy from a custom JSON file.\n\
-        agent-sandbox-policyd \\\n\
-            --socket /run/agent-sandbox/policy.sock \\\n\
-            --declarative /home/user/.config/agent-sandbox/declarative.json\n\n\
-        # Use interactive approval with a longer timeout and a Nix expression export.\n\
-        agent-sandbox-policyd \\\n\
-            --approval-timeout 600 \\\n\
-            --export-nix /var/lib/agent-sandbox/exported-policy.nix"
+    long_about = r"Long-lived policy daemon for the agent sandbox stack.
+
+Listens on a host-side Unix socket for UI clients (agent-sandbox-approve, agent-sandbox-ui) and on a separate sandbox-side socket for components running inside the bwrap mount namespace (agent-sandbox-nfq, agent-sandbox-syscall-arm, agent-sandbox-fs-arm).
+Merges declarative policy, per-project policy, and per-session rules into a unified verdict store, then answers Check/Elevate/Filesystem requests and prompts the user for interactive approvals.
+
+EXAMPLES:
+# Run with default NixOS paths.
+agent-sandbox-policyd
+
+# Override the host socket and load policy from a custom JSON file.
+agent-sandbox-policyd \
+    --socket /run/agent-sandbox/policy.sock \
+    --declarative /home/user/.config/agent-sandbox/declarative.json
+
+# Use interactive approval with a longer timeout and a Nix expression export.
+agent-sandbox-policyd \
+    --approval-timeout 600 \
+    --export-nix /var/lib/agent-sandbox/exported-policy.nix"
 )]
 struct Cli {
     /// Host-side Unix socket path. UI clients (agent-sandbox-approve,

@@ -120,21 +120,20 @@ async fn acquire_prompt_lock(path: PathBuf) -> Result<Flock<File>, UiCliError> {
     name = "agent-sandbox-ui",
     version,
     about = "Long-lived policyd UI client that surfaces interactive approval prompts",
-    long_about = r#"Long-lived UI client for policyd. Connects to the policyd host socket, \
-        registers as a UI client for the current context, then loops on the connection to \
-        display incoming approval requests (network/elevation/filesystem) and forward the \
-        user's decisions back to policyd. Typically spawned by "agent-sandbox-open-ui-fd" or by \
-        policyd itself when no other UI is registered for a given request.\n\n\
-        EXAMPLES:\n\
-        # Start a UI client from launcher-provided env vars, including AGENT_SANDBOX_SESSION_ID.\n\
-        agent-sandbox-ui\n\n\
-        # Pass context explicitly and tag the session for policy routing.\n\
-        agent-sandbox-ui \\\n\
-            --socket /run/agent-sandbox/policy.sock \\\n\
-            --cwd /home/user/project \\\n\
-            --home /home/user \\\n\
-            --project-root /home/user/project \\\n\
-            --sandbox-session-id session-2024-05-01-abc"#
+    long_about = r#"Long-lived UI client for policyd. 
+Connects to the policyd host socket, registers as a UI client for the current context, then loops on the connection to display incoming approval requests (network/elevation/filesystem) and forward the user's decisions back to policyd. Typically spawned by "agent-sandbox-open-ui-fd" or by policyd itself when no other UI is registered for a given request.
+
+EXAMPLES:
+# Start a UI client from launcher-provided env vars, including AGENT_SANDBOX_SESSION_ID.
+agent-sandbox-ui
+
+# Pass context explicitly and tag the session for policy routing.
+agent-sandbox-ui \
+    --socket /run/agent-sandbox/policy.sock \
+    --cwd /home/user/project \
+    --home /home/user \
+    --project-root /home/user/project \
+    --sandbox-session-id session-2024-05-01-abc"#
 )]
 struct Cli {
     /// Path to the policyd Unix domain socket the UI registers on. Falls back

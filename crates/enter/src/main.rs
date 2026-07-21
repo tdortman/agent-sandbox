@@ -100,17 +100,14 @@ fn resolve_netns_path(name: &str) -> io::Result<PathBuf> {
     name = "agent-sandbox-enter",
     version,
     about = "Join a named network namespace, drop inherited capabilities, then exec the command",
-    long_about = r"Setuid-root wrapper (installed via security.wrappers) that joins the network \
-        namespace at /run/netns/<NETNS>, drops the inherited ambient and effective capabilities \
-        so bubblewrap does not inherit CAP_SYS_ADMIN / CAP_NET_ADMIN across exec, then execvp \
-        the command. The remaining caps in the effective set are cleared; permitted, inheritable, \
-        and bounding sets are not touched because the wrapper has no CAP_SETPCAP and dropping \
-        bounding bits would fail with EPERM.\n\n\
-    EXAMPLES:\n\
-        # Join the sandbox netns and exec python3. The `--` is optional.\n\
-        agent-sandbox-enter sandbox-netns-1 /usr/bin/python3 -i\n\n\
-        # Join the default netns and exec a wrapped agent.\n\
-        agent-sandbox-enter default-netns /home/user/bin/my-agent --verbose"
+    long_about = r"Setuid-root wrapper (installed via security.wrappers) that joins the network namespace at /run/netns/<NETNS>, drops the inherited ambient and effective capabilities so bubblewrap does not inherit CAP_SYS_ADMIN / CAP_NET_ADMIN across exec, then execvp the command. The remaining caps in the effective set are cleared; permitted, inheritable, and bounding sets are not touched because the wrapper has no CAP_SETPCAP and dropping bounding bits would fail with EPERM.
+
+EXAMPLES:
+# Join the sandbox netns and exec python3. The `--` is optional.
+agent-sandbox-enter sandbox-netns-1 /usr/bin/python3 -i
+
+# Join the default netns and exec a wrapped agent.
+agent-sandbox-enter default-netns /home/user/bin/my-agent --verbose"
 )]
 struct Cli {
     /// Name of the network namespace under /run/netns/. Capped at 200

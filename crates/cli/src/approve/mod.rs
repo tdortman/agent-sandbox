@@ -18,18 +18,21 @@ use crate::ui::{bus_name, message_kind_name, signature_display};
     name = "agent-sandbox-approve",
     version,
     about = "Inspect and resolve pending policy approval requests",
-    long_about = r#"Host-side helper for resolving pending policyd approval requests. Connects \
-        to the policyd Unix socket, lists requests waiting on user input, and approves or \
-        denies them at the chosen scope. Normally driven by "agent-sandbox-ui" (a long-lived UI client), but the same \
-        commands are usable from a terminal or from automation scripts.\n\n\
-        EXAMPLES:\n\
-        # Show every pending approval routed through this host.\n\
-        agent-sandbox-approve pending\n\n\
-        # Approve a network request for the current session only.\n\
-        agent-sandbox-approve approve <request-id> session --session-id session-2024-05-01-abc\n\n\
-        # Pre-approve 1.1.1.1 on port 53 globally so all sandboxes can use the Cloudflare DNS.\n\
-        agent-sandbox-approve approve-host 1.1.1.1 53 global --home /home/user"#
+    long_about = r#"Host-side helper for resolving pending policyd approval requests.
+Connects to the policyd Unix socket, lists requests waiting on user input, and approves or denies them at the chosen scope.
+Normally driven by "agent-sandbox-ui" (a long-lived UI client), but the same commands are usable from a terminal or from automation scripts.
+
+EXAMPLES:
+# Show every pending approval routed through this host.
+agent-sandbox-approve pending
+
+# Approve a network request for the current session only.
+agent-sandbox-approve approve <request-id> session --session-id session-2024-05-01-abc
+
+# Pre-approve 1.1.1.1 on port 53 globally so all sandboxes can use the Cloudflare DNS.
+agent-sandbox-approve approve-host 1.1.1.1 53 global --home /home/user"#
 )]
+
 struct Cli {
     /// Path to the policyd Unix domain socket the CLI talks to.
     #[arg(

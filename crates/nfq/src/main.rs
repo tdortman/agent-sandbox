@@ -36,22 +36,22 @@ const COPY_RANGE: u16 = u16::MAX;
     name = "agent-sandbox-nfq",
     version,
     about = "NFQUEUE-based packet policy enforcer for the sandbox network namespace",
-    long_about = r"NFQUEUE packet interceptor that runs inside the agent-sandbox network \
-        namespace. nftables queues outbound TCP SYN packets and all UDP packets here. \
-        For each queued packet the daemon resolves the destination hostname from the \
-        DNS forwarder in-memory cache (or the on-disk fallback), asks policyd for a \
-        verdict, and either accepts the packet or actively rejects it via a transient \
-        nftables set. Traffic to the local DNS forwarder on port 53 always bypasses \
-        policyd so name resolution can never be blocked.\n\n\
-        EXAMPLES:\n\
-        # Run inside the sandbox netns with the default nftables queue number.\n\
-        agent-sandbox-nfq\n\n\
-        # Bind to a different NFQUEUE and accept a larger kernel-side queue.\n\
-        agent-sandbox-nfq --queue 1 --queue-len 8192\n\n\
-        # Point at a custom policyd and DNS push socket.\n\
-        agent-sandbox-nfq \\\n\
-            --policy-socket /run/agent-sandbox/policy.sock \\\n\
-            --push-socket /run/agent-sandbox/dns-push.sock"
+    long_about = r"NFQUEUE packet interceptor that runs inside the agent-sandbox network namespace.
+nftables queues outbound TCP SYN packets and all UDP packets here.
+For each queued packet the daemon resolves the destination hostname from the DNS forwarder in-memory cache (or the on-disk fallback), asks policyd for a verdict, and either accepts the packet or actively rejects it via a transient nftables set. 
+Traffic to the local DNS forwarder on port 53 always bypasses policyd so name resolution can never be blocked.
+
+EXAMPLES:
+# Run inside the sandbox netns with the default nftables queue number.
+agent-sandbox-nfq
+
+# Bind to a different NFQUEUE and accept a larger kernel-side queue.
+agent-sandbox-nfq --queue 1 --queue-len 8192
+
+# Point at a custom policyd and DNS push socket.
+agent-sandbox-nfq \
+    --policy-socket /run/agent-sandbox/policy.sock \
+    --push-socket /run/agent-sandbox/dns-push.sock"
 )]
 struct Cli {
     /// NFQUEUE queue number. Must match the nftables "queue num" rule installed

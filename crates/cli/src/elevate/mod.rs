@@ -12,19 +12,17 @@ use clap::Parser;
     name = "agent-sandbox-elevate",
     version,
     about = "Request host-side root execution of a command via policyd",
-    long_about = r#"Wrapper that runs inside the sandbox to ask policyd to perform a one-shot \
-        privileged execution of the given command on the host. policyd prompts the user (via \
-        the registered UI) and, on approval, runs the command with full root capabilities, \
-        capturing stdout and stderr. The exit status of the elevated process is propagated to \
-        the caller.\n\n\
-        Reads the sandbox paths from the "AGENT_SANDBOX_CWD", "AGENT_SANDBOX_HOME", and \
-        "AGENT_SANDBOX_PROJECT_ROOT" env vars (set by the bwrap wrapper) and the session id \
-        from "AGENT_SANDBOX_SESSION_ID".\n\n\
-        EXAMPLES:\n\
-        # Run "apt install" as root on the host with no sandbox mediation.\n\
-        agent-sandbox-elevate -- apt install -y neovim\n\n\
-        # Point at a non-default policyd socket for local testing.\n\
-        agent-sandbox-elevate --socket /run/agent-sandbox/policy.sock -- apt update"#
+    long_about = r#"Wrapper that runs inside the sandbox to ask policyd to perform a one-shot privileged execution of the given command on the host. policyd prompts the user (via the registered UI) and, on approval, runs the command with full root capabilities, capturing stdout and stderr. 
+The exit status of the elevated process is propagated to the caller.
+
+Reads the sandbox paths from the "AGENT_SANDBOX_CWD", "AGENT_SANDBOX_HOME", and "AGENT_SANDBOX_PROJECT_ROOT" env vars (set by the bwrap wrapper) and the session id from "AGENT_SANDBOX_SESSION_ID".
+
+EXAMPLES:
+# Run "apt install" as root on the host with no sandbox mediation.
+agent-sandbox-elevate -- apt install -y neovim
+
+# Point at a non-default policyd socket for local testing.
+agent-sandbox-elevate --socket /run/agent-sandbox/policy.sock -- apt update"#
 )]
 struct Cli {
     /// Path to the policyd Unix domain socket. The elevate request is sent

@@ -20,19 +20,17 @@ use clap::Parser as _;
     version,
     about = "Connect to policyd, start the fanotify filesystem monitor, then execvp the real \
              command",
-    long_about = r"Runs INSIDE the sandbox as the first process in the dynamic-FS path. Connects \
-        to policyd over the policy socket, registers a fanotify filesystem monitor for the \
-        current sandbox session, then execvp the real command. The policy socket path comes \
-        from the env var AGENT_SANDBOX_POLICY_SOCKET (default /run/agent-sandbox/policy.sock). \
-        The session id, working directory, home, and project root come from \
-        AGENT_SANDBOX_SESSION_ID, AGENT_SANDBOX_CWD, AGENT_SANDBOX_HOME, and \
-        AGENT_SANDBOX_PROJECT_ROOT respectively. The static allow rule set is read from \
-        AGENT_SANDBOX_FS_STATIC_ALLOW as a JSON array of FilesystemRule objects.\n\n\
-    EXAMPLES:\n\
-        # Start the monitor, then exec python3. The `--` is optional.\n\
-        agent-sandbox-fs-arm /usr/bin/python3 -i\n\n\
-        # Start the monitor, then exec a wrapped agent.\n\
-        agent-sandbox-fs-arm /home/user/bin/my-agent --verbose"
+    long_about = r"Runs INSIDE the sandbox as the first process in the dynamic-FS path.
+Connects to policyd over the policy socket, registers a fanotify filesystem monitor for the current sandbox session, then execvp the real command. 
+The policy socket path comes from the env var AGENT_SANDBOX_POLICY_SOCKET (default /run/agent-sandbox/policy.sock).
+The session id, working directory, home, and project root come from AGENT_SANDBOX_SESSION_ID, AGENT_SANDBOX_CWD, AGENT_SANDBOX_HOME, and AGENT_SANDBOX_PROJECT_ROOT respectively. 
+
+EXAMPLES:
+# Start the monitor, then exec python3. The `--` is optional.
+agent-sandbox-fs-arm /usr/bin/python3 -i
+
+# Start the monitor, then exec a wrapped agent.
+agent-sandbox-fs-arm /home/user/bin/my-agent --verbose"
 )]
 struct Cli {
     /// The command to exec after the monitor is active. Everything after the

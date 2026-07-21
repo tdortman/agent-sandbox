@@ -24,21 +24,21 @@ use tracing::{debug, info, warn};
     name = "agent-sandbox-syscall-broker",
     version,
     about = "Host-side seccomp user-notification broker for sandboxed agents",
-    long_about = r"Runs OUTSIDE the sandbox (typically as the child of `agent-sandbox-syscall-arm`) \
-        and consumes the seccomp user-notification file descriptor the arm inherited from its \
-        parent. For each notification the broker asks policyd whether the target syscall is \
-        allowed, then writes a `SECCOMP_IOCTL_NOTIF_SEND` continue response with the chosen \
-        errno (or success). Optionally supervises the sandbox child PID and exits when the \
-        child does, tearing the listener down with it.\n\n\
-        Spawned by policyd, not invoked by hand.\n\n\
-        EXAMPLES:\n\
-        # Run with a 4 (the inherited listener fd) and the default policyd socket.\n\
-        agent-sandbox-syscall-broker --listener-fd 4\n\n\
-        # Tag the session for policy routing and watch the child pid for early exit.\n\
-        agent-sandbox-syscall-broker \\\n\
-            --listener-fd 4 \\\n\
-            --sandbox-session-id session-2024-05-01-abc \
-            --child-pid 12345"
+    long_about = r"Runs OUTSIDE the sandbox (typically as the child of `agent-sandbox-syscall-arm`) and consumes the seccomp user-notification file descriptor the arm inherited from its parent.
+For each notification the broker asks policyd whether the target syscall is allowed, then writes a `SECCOMP_IOCTL_NOTIF_SEND` continue response with the chosen errno (or success). 
+Optionally supervises the sandbox child PID and exits when the child does, tearing the listener down with it.
+
+Spawned by policyd, not invoked by hand.
+
+EXAMPLES:
+# Run with a 4 (the inherited listener fd) and the default policyd socket.
+agent-sandbox-syscall-broker --listener-fd 4
+
+# Tag the session for policy routing and watch the child pid for early exit.
+agent-sandbox-syscall-broker \
+    --listener-fd 4 \
+    --sandbox-session-id session-2024-05-01-abc \
+    --child-pid 12345"
 )]
 struct Cli {
     /// Trusted network mediation mode. `direct` keeps transport policy RPC

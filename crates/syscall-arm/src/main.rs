@@ -138,23 +138,22 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
     name = "agent-sandbox-syscall-arm",
     version,
     about = "Install a seccomp user-notification filter, then exec the command",
-    long_about = r"Runs INSIDE the sandbox as the first process in the syscall-gate path. \
-        Installs a seccomp user-notification filter on the immediate child, forks the child, \
-        sends the seccomp listener fd number to the parent over a `pipe2(O_CLOEXEC)` pair, \
-        raises SIGSTOP, and execs the command. The parent reads the fd number, re-acquires \
-        the listener fd from the sibling via `pidfd_open` + `pidfd_getfd`, kills the child \
-        SIGCONT, and execs `agent-sandbox-syscall-broker` with the listener fd and child \
-        pid, which talks to policyd over the policy socket to make per-syscall verdicts.\n\n\
-        Environment variables consumed from the bwrap wrapper:\n\
-          AGENT_SANDBOX_POLICY_SOCKET  policyd socket path \
-                                        (default /run/agent-sandbox/policy.sock)\n\
-          AGENT_SANDBOX_SESSION_ID     forwarded to the broker and policyd for per-session \
-                                        audit logging\n\n\
-    EXAMPLES:\n\
-        # Install the filter, then exec python3. The `--` is optional.\n\
-        agent-sandbox-syscall-arm /usr/bin/python3 -i\n\n\
-        # Install the filter, then exec a wrapped agent.\n\
-        agent-sandbox-syscall-arm /home/user/bin/my-agent --flag"
+    long_about = r"Runs INSIDE the sandbox as the first process in the syscall-gate path.
+Installs a seccomp user-notification filter on the immediate child, forks the child, sends the seccomp listener fd number to the parent over a `pipe2(O_CLOEXEC)` pair, raises SIGSTOP, and execs the command.
+The parent reads the fd number, re-acquires the listener fd from the sibling via `pidfd_open` + `pidfd_getfd`, kills the child SIGCONT, and execs `agent-sandbox-syscall-broker` with the listener fd and child pid, which talks to policyd over the policy socket to make per-syscall verdicts.
+
+Environment variables consumed from the bwrap wrapper:
+  AGENT_SANDBOX_POLICY_SOCKET  policyd socket path 
+    (default /run/agent-sandbox/policy.sock)
+  AGENT_SANDBOX_SESSION_ID     forwarded to the broker and policyd for per-session
+    audit logging
+
+EXAMPLES:
+# Install the filter, then exec python3. The `--` is optional.
+agent-sandbox-syscall-arm /usr/bin/python3 -i
+
+# Install the filter, then exec a wrapped agent.
+agent-sandbox-syscall-arm /home/user/bin/my-agent --flag"
 )]
 struct Cli {
     /// The command to exec after the seccomp filter is installed. Everything

@@ -38,23 +38,22 @@ use nix::{
     name = "agent-sandbox-fsmon",
     version,
     about = "fanotify filesystem policy monitor that brokers open() calls to policyd",
-    long_about = r#"fanotify-based filesystem monitor that runs in the host mount namespace. \
-        Given a target sandbox PID, it joins the sandbox mount namespace, marks every \
-        mount that overlaps the sandbox's working directory/home/project, and processes \
-        permission events for open/open-exec/access requests. Each event is forwarded \
-        to policyd over a Unix domain socket and the verdict (allow/deny) is written \
-        back to the kernel via the fanotify response fd.\n\n\
-        Normally spawned by policyd in response to an "agent-sandbox-fs-arm" request, \
-        not invoked directly.\n\n\
-        EXAMPLES:\n\
-        # Start a monitor for sandbox PID 12345 with the default policyd socket.\n\
-        agent-sandbox-fsmon --pid 12345\n\n\
-        # Override context for tools that do not export the AGENT_SANDBOX_* env vars.\n\
-        agent-sandbox-fsmon \\\n\
-            --pid 12345 \\\n\
-            --cwd /home/user/project \\\n\
-            --home /home/user \\\n\
-            --project-root /home/user/project"#
+    long_about = r#"fanotify-based filesystem monitor that runs in the host mount namespace.
+Given a target sandbox PID, it joins the sandbox mount namespace, marks every mount that overlaps the sandbox's working directory/home/project, and processes permission events for open/open-exec/access requests.
+Each event is forwarded to policyd over a Unix domain socket and the verdict (allow/deny) is written back to the kernel via the fanotify response fd.
+
+Normally spawned by policyd in response to an "agent-sandbox-fs-arm" request, not invoked directly.
+
+EXAMPLES:
+# Start a monitor for sandbox PID 12345 with the default policyd socket.
+agent-sandbox-fsmon --pid 12345
+
+# Override context for tools that do not export the AGENT_SANDBOX_* env vars.
+agent-sandbox-fsmon \
+    --pid 12345 \
+    --cwd /home/user/project \
+    --home /home/user \
+    --project-root /home/user/project"#
 )]
 struct Cli {
     /// PID of the sandbox arm helper. The monitor joins the mount namespace of
