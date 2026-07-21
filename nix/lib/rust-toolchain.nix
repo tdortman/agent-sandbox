@@ -5,14 +5,18 @@
   pkgs,
 }:
 let
-  toolchain = pkgs.rust-bin.stable.latest.default.override {
-    extensions = [
-      "rust-src"
-      "rustfmt"
-      "clippy"
-      "rust-analyzer"
-    ];
-  };
+  toolchain = pkgs.rust-bin.selectLatestNightlyWith (
+    toolchain:
+    toolchain.default.override {
+      extensions = [
+        "rust-src"
+        "rustfmt"
+        "clippy"
+        "rust-analyzer"
+      ];
+    }
+  );
+
 in
 {
   inherit toolchain;
