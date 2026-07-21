@@ -1,20 +1,21 @@
 //! Unix-socket D-Bus relay with policy checks.
 
-use std::collections::HashMap;
-use std::num::NonZeroU32;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, time::Duration};
 
-use agent_sandbox_core::policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusTarget};
-use agent_sandbox_core::rpc::{RequestContext, RpcReply, RpcRequest};
-use agent_sandbox_core::rpc_client::PersistentRpcClient;
+use agent_sandbox_core::{
+    policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusTarget},
+    rpc::{RequestContext, RpcReply, RpcRequest},
+    rpc_client::PersistentRpcClient,
+};
 use futures_util::StreamExt;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
-use zbus::connection::Builder;
-use zbus::message::{Builder as MessageBuilder, Flags, Message, Type};
-use zbus::{Connection, Guid, MessageStream};
+use zbus::{
+    Connection, Guid, MessageStream,
+    connection::Builder,
+    message::{Builder as MessageBuilder, Flags, Message, Type},
+};
 use zvariant::Fd;
 
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
@@ -87,6 +88,7 @@ impl SerialMap {
     pub fn allocate_untracked(&mut self) -> NonZeroU32 {
         self.next_serial()
     }
+
     pub fn take(&mut self, upstream_serial: NonZeroU32) -> Option<NonZeroU32> {
         self.replies.remove(&upstream_serial)
     }
@@ -425,10 +427,11 @@ fn build_raw_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{SerialMap, is_forbidden_bus_control, target_from_message};
     use std::num::NonZeroU32;
-    use zbus::message::Message;
-    use zbus::zvariant::Endian;
+
+    use zbus::{message::Message, zvariant::Endian};
+
+    use super::{SerialMap, is_forbidden_bus_control, target_from_message};
 
     #[test]
     fn serial_map_correlates_and_removes_replies() {

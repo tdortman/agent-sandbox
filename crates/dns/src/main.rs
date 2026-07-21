@@ -1,27 +1,32 @@
-//! DNS forwarder that records query→answer mappings for transport-layer policy checks.
+//! DNS forwarder that records query→answer mappings for transport-layer policy
+//! checks.
 //!
 //! Runs on the host, listens on the veth gateway address. Sandbox processes
 //! send DNS here via resolv.conf. Forwards raw DNS queries to the configured
 //! upstream resolver, records IP→hostname mappings from upstream responses for
 //! NFQUEUE prompts, and returns the upstream bytes unchanged.
 
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use agent_sandbox_core::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, mappings_from_response};
 use clap::Parser;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+};
 use tracing::{debug, info, warn};
 
 /// Build a DNS `SERVFAIL` response for a parseable query packet.
 ///
-/// Returns `None` when `query` is not a DNS query message. `handle_udp` sends the
-/// returned bytes directly to the client; `handle_tcp` writes them with the usual
-/// two-byte length prefix.
+/// Returns `None` when `query` is not a DNS query message. `handle_udp` sends
+/// the returned bytes directly to the client; `handle_tcp` writes them with the
+/// usual two-byte length prefix.
 fn servfail_response(query: &[u8]) -> Option<Vec<u8>> {
     let message = Message::from_vec(query).ok()?;
     if message.metadata.message_type != MessageType::Query {
@@ -83,7 +88,7 @@ struct DnsForwarder {
     cache: Arc<std::sync::Mutex<DnsCache>>,
     max_ttl: u32,
     verbose: bool,
-    push_socket: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixDatagram>>>,
+    push_socket: Arc<std::os::unix::net::UnixDatagram>,
     push_socket_path: PathBuf,
     cache_client_ip: Option<IpAddr>,
     forward_target: SocketAddr,
@@ -111,14 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = std::fs::create_dir_all(parent);
     }
-    let push_socket = match std::os::unix::net::UnixDatagram::unbound() {
-        Ok(s) => Some(s),
-        Err(err) => {
-            warn!(error = %err, "failed to create unbound push datagram socket");
-            None
-        }
-    };
-    let push_socket = Arc::new(std::sync::Mutex::new(push_socket));
+    let push_socket = Arc::new(std::os::unix::net::UnixDatagram::unbound()?);
     let forwarder = DnsForwarder {
         cache,
         max_ttl: args.max_ttl,
@@ -184,7 +182,7 @@ impl DnsForwarder {
         data: Vec<u8>,
         peer: SocketAddr,
         sock: Arc<UdpSocket>,
-    ) -> Result<(), DnsForwarderError> {
+    ) -> std::io::Result<()> {
         let resp = match self.forward_udp(&data).await {
             Ok(resp) => resp,
             Err(err) => {
@@ -202,11 +200,7 @@ impl DnsForwarder {
         Ok(())
     }
 
-    async fn handle_tcp(
-        &self,
-        mut stream: TcpStream,
-        peer: SocketAddr,
-    ) -> Result<(), DnsForwarderError> {
+    async fn handle_tcp(&self, mut stream: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
         loop {
             let len = match stream.read_u16().await {
                 Ok(0) => continue,
@@ -238,7 +232,7 @@ impl DnsForwarder {
         Ok(())
     }
 
-    async fn forward_udp(&self, data: &[u8]) -> Result<Vec<u8>, DnsForwarderError> {
+    async fn forward_udp(&self, data: &[u8]) -> std::io::Result<Vec<u8>> {
         let bind_addr = match self.forward_target.ip() {
             IpAddr::V4(_) => "0.0.0.0:0",
             IpAddr::V6(_) => "[::]:0",
@@ -252,16 +246,26 @@ impl DnsForwarder {
         };
         tokio::time::timeout(self.forward_timeout, forward_fut)
             .await
-            .map_err(|_| DnsForwarderError::Timeout)?
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dns upstream forward timed out",
+                )
+            })?
     }
 
-    async fn forward_tcp(&self, data: &[u8]) -> Result<Vec<u8>, DnsForwarderError> {
+    async fn forward_tcp(&self, data: &[u8]) -> std::io::Result<Vec<u8>> {
         let mut stream = tokio::time::timeout(
             self.forward_timeout,
             TcpStream::connect(self.forward_target),
         )
         .await
-        .map_err(|_| DnsForwarderError::Timeout)??;
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "dns upstream forward timed out",
+            )
+        })??;
         let forward_fut = async {
             let len = u16::try_from(data.len()).map_err(|_| {
                 std::io::Error::new(
@@ -278,7 +282,12 @@ impl DnsForwarder {
         };
         tokio::time::timeout(self.forward_timeout, forward_fut)
             .await
-            .map_err(|_| DnsForwarderError::Timeout)?
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dns upstream forward timed out",
+                )
+            })?
     }
 
     fn record_mappings_from_response(&self, response: &[u8], peer: SocketAddr) {
@@ -316,12 +325,8 @@ impl DnsForwarder {
                 });
                 if let Ok(mut line) = serde_json::to_string(&payload) {
                     line.push('\n');
-                    let send_result = self.push_socket.lock().ok().and_then(|guard| {
-                        guard
-                            .as_ref()
-                            .map(|s| s.send_to(line.as_bytes(), push_path))
-                    });
-                    if let Some(Err(err)) = send_result {
+                    let send_result = self.push_socket.send_to(line.as_bytes(), push_path);
+                    if let Err(err) = send_result {
                         match err.kind() {
                             std::io::ErrorKind::NotFound
                             | std::io::ErrorKind::ConnectionRefused => {
@@ -348,22 +353,16 @@ impl DnsForwarder {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-enum DnsForwarderError {
-    #[error("dns upstream forward timed out")]
-    Timeout,
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-    use hickory_proto::rr::rdata::TXT;
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RData, Record, RecordType, rdata::TXT},
+    };
+
+    use super::*;
 
     fn example_query(record_type: RecordType) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
@@ -381,7 +380,9 @@ mod tests {
             ))),
             max_ttl: DEFAULT_MAX_TTL,
             verbose: false,
-            push_socket: Arc::new(std::sync::Mutex::new(None)),
+            push_socket: Arc::new(
+                std::os::unix::net::UnixDatagram::unbound().expect("unbound push socket"),
+            ),
             push_socket_path: PathBuf::from("/nonexistent/dns-push.sock"),
             cache_client_ip: None,
             forward_target,

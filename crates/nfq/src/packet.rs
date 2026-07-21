@@ -60,7 +60,8 @@ impl PacketMeta {
     }
 }
 
-/// Parse an IPv4 packet payload into source/destination IPs, ports, and TCP SYN flag.
+/// Parse an IPv4 packet payload into source/destination IPs, ports, and TCP SYN
+/// flag.
 ///
 /// Returns `None` for non-IPv4, truncated, or non-TCP/UDP packets.
 pub fn parse_ipv4(payload: &[u8]) -> Option<PacketMeta> {
@@ -101,12 +102,13 @@ pub fn parse_ipv4(payload: &[u8]) -> Option<PacketMeta> {
         _ => None,
     }
 }
-/// Walk IPv6 extension headers to find the transport protocol and its total offset.
+/// Walk IPv6 extension headers to find the transport protocol and its total
+/// offset.
 ///
-/// Recognised extension headers: Hop-by-Hop (0), Routing (43), Destination Options (60),
-/// Fragment (44, first-fragment only), Authentication Header (51).
-/// Returns `None` for No Next Header (59), ESP (50), unknown headers, truncated
-/// extension headers, and non-first fragments.
+/// Recognised extension headers: Hop-by-Hop (0), Routing (43), Destination
+/// Options (60), Fragment (44, first-fragment only), Authentication Header
+/// (51). Returns `None` for No Next Header (59), ESP (50), unknown headers,
+/// truncated extension headers, and non-first fragments.
 fn walk_ipv6_ext_headers(payload: &[u8], packet_len: usize) -> Option<Ipv6ExtResult> {
     let mut next_header = payload[6];
     let mut offset = 40;
@@ -165,7 +167,8 @@ fn walk_ipv6_ext_headers(payload: &[u8], packet_len: usize) -> Option<Ipv6ExtRes
     }
 }
 
-/// Parse an IPv6 packet payload into source/destination IPs, ports, and TCP SYN flag.
+/// Parse an IPv6 packet payload into source/destination IPs, ports, and TCP SYN
+/// flag.
 ///
 /// Returns `None` for non-IPv6, truncated, or non-TCP/UDP packets.
 pub fn parse_ipv6(payload: &[u8]) -> Option<PacketMeta> {
@@ -259,7 +262,8 @@ fn parse_udp(
     })
 }
 
-/// Extract the UDP payload (bytes after the 8-byte UDP header) from a parsed packet.
+/// Extract the UDP payload (bytes after the 8-byte UDP header) from a parsed
+/// packet.
 ///
 /// Works for both IPv4 and IPv6. Returns `None` if the packet is shorter than
 /// the UDP data offset.
@@ -356,7 +360,7 @@ mod tests {
         pkt[6] = 6; // Next header: TCP
         pkt[7] = 64; // Hop limit
         // src_ip: bytes 8..23
-        pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         // dst_ip: bytes 24..39
         pkt[24..40].copy_from_slice(&dst_ip);
         // TCP header at byte 40
@@ -373,7 +377,7 @@ mod tests {
         pkt[4..6].copy_from_slice(&8_u16.to_be_bytes()); // UDP is 8 bytes
         pkt[6] = 17; // Next header: UDP
         pkt[7] = 64;
-        pkt[8..24].copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        pkt[8..24].copy_from_slice(&[0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         pkt[24..40].copy_from_slice(&dst_ip);
         pkt[40..42].copy_from_slice(&src_port.to_be_bytes());
         pkt[42..44].copy_from_slice(&dst_port.to_be_bytes());
@@ -388,7 +392,7 @@ mod tests {
         pkt[4..6].copy_from_slice(&28_u16.to_be_bytes());
         pkt[6] = 60; // Next header: Destination Options
         pkt[7] = 64;
-        pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         pkt[24..40].copy_from_slice(&dst_ip);
         // Destination Options header at byte 40 (hdr_ext_len = 0 -> 8 bytes)
         pkt[40] = 6; // Next header: TCP
@@ -419,7 +423,7 @@ mod tests {
         );
         pkt[6] = 60; // Next header: Destination Options
         pkt[7] = 64;
-        pkt[8..24].copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        pkt[8..24].copy_from_slice(&[0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         pkt[24..40].copy_from_slice(&dst_ip);
         // Destination Options header at byte 40
         pkt[40] = 17; // Next header: UDP
@@ -501,17 +505,17 @@ mod tests {
     #[test]
     fn parse_ipv6_tcp_syn_extracts_transport_tuple() {
         let dst = [
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
         ];
         let pkt = build_tcp_syn_v6(dst, 443, 54321);
         let meta = parse_ipv6(&pkt).expect("parse IPv6");
         assert_eq!(
             meta.src_ip,
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1))
         );
         assert_eq!(
             meta.dst_ip,
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x20))
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 0x20))
         );
         assert_eq!(meta.dst_port, 443);
         assert_eq!(meta.src_port, 54321);
@@ -539,7 +543,7 @@ mod tests {
         let meta = parse_ipv6(&pkt).expect("parse IPv6");
         assert_eq!(
             meta.src_ip,
-            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2))
+            IpAddr::V6(Ipv6Addr::new(0xFE80, 0, 0, 0, 0, 0, 0, 2))
         );
         assert_eq!(
             meta.dst_ip,
@@ -573,17 +577,17 @@ mod tests {
     #[test]
     fn parse_ipv6_tcp_syn_behind_dest_opts_is_policy_boundary() {
         let dst = [
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
         ];
         let pkt = build_tcp_syn_v6_with_dest_opts(dst, 443, 54321);
         let meta = parse_ipv6(&pkt).expect("parse IPv6 with DestOpts");
         assert_eq!(
             meta.src_ip,
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1))
         );
         assert_eq!(
             meta.dst_ip,
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x20))
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 0x20))
         );
         assert_eq!(meta.dst_port, 443);
         assert_eq!(meta.src_port, 54321);
@@ -649,7 +653,7 @@ mod tests {
         pkt[4..6].copy_from_slice(&12_u16.to_be_bytes()); // UDP len 8 + 4 payload
         pkt[6] = 17; // UDP
         pkt[7] = 64;
-        pkt[8..24].copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        pkt[8..24].copy_from_slice(&[0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         pkt[24..40].copy_from_slice(&[0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         pkt[40..42].copy_from_slice(&53000_u16.to_be_bytes());
         pkt[42..44].copy_from_slice(&53_u16.to_be_bytes());

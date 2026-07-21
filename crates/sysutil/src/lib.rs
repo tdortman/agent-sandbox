@@ -5,13 +5,17 @@
 //! of the audited functions in this crate. Callers never write their own
 //! `unsafe` syscall code.
 
-use std::ffi::CStr;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::path::Path;
+use std::{
+    ffi::CStr,
+    io::{self, Read, Seek, SeekFrom},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    path::Path,
+};
 
-use nix::sys::socket::{SockaddrStorage, getpeername};
-use nix::unistd::Pid;
+use nix::{
+    sys::socket::{SockaddrStorage, getpeername},
+    unistd::Pid,
+};
 
 /// Open a pidfd referring to `pid` (Linux 5.3+ `pidfd_open(2)`).
 ///
@@ -101,8 +105,9 @@ pub fn ioctl<T>(fd: std::os::fd::RawFd, request: libc::c_ulong, arg: &mut T) -> 
     }
 }
 
-/// Read `len` bytes from `pid`'s address space at `addr` via `process_vm_readv`,
-/// falling back to `/proc/<pid>/mem` when the syscall is unavailable.
+/// Read `len` bytes from `pid`'s address space at `addr` via
+/// `process_vm_readv`, falling back to `/proc/<pid>/mem` when the syscall is
+/// unavailable.
 ///
 /// # Errors
 /// Returns an error when both paths fail (process gone, address invalid, or
@@ -195,14 +200,18 @@ pub fn join_mount_namespace(target_pid: u32) -> io::Result<()> {
     nix::sched::setns(&ns_fd, nix::sched::CloneFlags::CLONE_NEWNS).map_err(io::Error::from)
 }
 
-/// Lower every ambient capability via `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, ...)`.
+/// Lower every ambient capability via `prctl(PR_CAP_AMBIENT,
+/// PR_CAP_AMBIENT_LOWER, ...)`.
 ///
-/// The loop stops when the kernel returns `EINVAL` (no more ambient caps to lower).
+/// The loop stops when the kernel returns `EINVAL` (no more ambient caps to
+/// lower).
 ///
 /// # Errors
-/// Returns the kernel error when `prctl` fails for a reason other than `EINVAL`.
+/// Returns the kernel error when `prctl` fails for a reason other than
+/// `EINVAL`.
 pub fn clear_ambient_capabilities() -> io::Result<()> {
-    // SAFETY: `PR_CAP_AMBIENT` + `PR_CAP_AMBIENT_LOWER`. Stop when the kernel returns EINVAL.
+    // SAFETY: `PR_CAP_AMBIENT` + `PR_CAP_AMBIENT_LOWER`. Stop when the kernel
+    // returns EINVAL.
     unsafe {
         for cap in 0_i32.. {
             if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_LOWER, cap, 0, 0) < 0 {
@@ -581,8 +590,7 @@ mod tests {
 
     #[test]
     fn dup_tracee_fd_accepts_notification_thread_id() {
-        use std::sync::mpsc;
-        use std::thread;
+        use std::{sync::mpsc, thread};
 
         let devnull = std::fs::OpenOptions::new()
             .read(true)

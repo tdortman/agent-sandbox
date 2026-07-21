@@ -39,7 +39,17 @@ pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         syscalls.iter().map(|&nr| (nr, Vec::new())).collect();
 
-    SeccompFilter::new(rules, SeccompAction::Allow, match_action(), target_arch())
+    let action = {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            SeccompAction::UserNotif
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            SeccompAction::Trap
+        }
+    };
+    SeccompFilter::new(rules, SeccompAction::Allow, action, target_arch())
         .expect("seccomp filter construction is total for non-empty rule maps")
         .try_into()
         .expect("seccomp filter length is bounded by seccompiler::BPF_MAX_LEN")
@@ -63,30 +73,13 @@ const fn target_arch() -> TargetArch {
     }
 }
 
-const fn match_action() -> SeccompAction {
-    #[cfg(target_arch = "x86_64")]
-    {
-        SeccompAction::UserNotif
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        SeccompAction::UserNotif
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        // `Trap` is a safe non-destructive default for the unreachable
-        // build-host path and avoids the `IdenticalActions` error from
-        // matching `Allow`.
-        SeccompAction::Trap
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use super::build_filter;
-    use crate::{RET_ALLOW, RET_KILL_PROCESS};
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const RET_ALLOW: u32 = 0x7FFF_0000;
     // `BPF_RET | BPF_K` per the BPF instruction encoding. The seccomp
     // program ends with a return of `SECCOMP_RET_ALLOW` as the default
     // action; we read the last instruction directly to verify. The

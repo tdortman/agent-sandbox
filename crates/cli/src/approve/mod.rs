@@ -1,23 +1,26 @@
 //! Host CLI for pending policy approvals.
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use crate::ui::{bus_name, message_kind_name, signature_display};
 use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
     RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
 use clap::{Parser, Subcommand};
 
+use crate::ui::{bus_name, message_kind_name, signature_display};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox-approve",
     version,
     about = "Inspect and resolve pending policy approval requests",
-    long_about = "Host-side helper for resolving pending policyd approval requests. Connects \
+    long_about = r#"Host-side helper for resolving pending policyd approval requests. Connects \
         to the policyd Unix socket, lists requests waiting on user input, and approves or \
-        denies them at the chosen scope. Normally driven by \"agent-sandbox-ui\" (a long-lived UI client), but the same \
+        denies them at the chosen scope. Normally driven by "agent-sandbox-ui" (a long-lived UI client), but the same \
         commands are usable from a terminal or from automation scripts.\n\n\
         EXAMPLES:\n\
         # Show every pending approval routed through this host.\n\
@@ -25,7 +28,7 @@ use clap::{Parser, Subcommand};
         # Approve a network request for the current session only.\n\
         agent-sandbox-approve approve <request-id> session --session-id session-2024-05-01-abc\n\n\
         # Pre-approve 1.1.1.1 on port 53 globally so all sandboxes can use the Cloudflare DNS.\n\
-        agent-sandbox-approve approve-host 1.1.1.1 53 global --home /home/user"
+        agent-sandbox-approve approve-host 1.1.1.1 53 global --home /home/user"#
 )]
 struct Cli {
     /// Path to the policyd Unix domain socket the CLI talks to.
@@ -43,67 +46,85 @@ struct Cli {
 enum Command {
     /// List every pending approval request.
     Pending {
-        /// Home directory inside the sandbox. Used to scope "global" rules to the right "policy.json". Defaults to the env var `AGENT_SANDBOX_HOME`.
+        /// Home directory inside the sandbox. Used to scope "global" rules to
+        /// the right "policy.json". Defaults to the env var
+        /// `AGENT_SANDBOX_HOME`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
 
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
+        /// Working directory inside the sandbox. Used to scope per-project
+        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
 
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
+        /// Project root inside the sandbox. Required for "project" scope.
+        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
     /// Approve a pending request and persist the rule at the requested scope.
     Approve {
-        /// Request id printed by "pending". Identifies the queued elevation, network, or filesystem request.
+        /// Request id printed by "pending". Identifies the queued elevation,
+        /// network, or filesystem request.
         id: String,
 
-        /// Where to persist the rule: "once" (this request only, default for "deny"), "session", "project", or "global".
+        /// Where to persist the rule: "once" (this request only, default for
+        /// "deny"), "session", "project", or "global".
         #[arg(value_name = "SCOPE")]
         scope: ApprovalScope,
 
-        /// Session id the request belongs to. Required when the scope is "session" and the policy is keyed by session.
+        /// Session id the request belongs to. Required when the scope is
+        /// "session" and the policy is keyed by session.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
 
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME`.
+        /// Home directory inside the sandbox. Used to scope "global" rules.
+        /// Defaults to the env var `AGENT_SANDBOX_HOME`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
 
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
+        /// Working directory inside the sandbox. Used to scope per-project
+        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
 
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
+        /// Project root inside the sandbox. Required for "project" scope.
+        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
-    /// Pre-approve a single (host, port) pair without an outstanding request. Writes the rule directly to policyd.
+    /// Pre-approve a single (host, port) pair without an outstanding request.
+    /// Writes the rule directly to policyd.
     ApproveHost {
-        /// Destination host. Either a literal IPv4/IPv6 address (e.g. "1.1.1.1") or a hostname (e.g. "example.com").
+        /// Destination host. Either a literal IPv4/IPv6 address (e.g.
+        /// "1.1.1.1") or a hostname (e.g. "example.com").
         host: String,
 
-        /// Destination port. Use the well-known port for the scheme (e.g. 443 for HTTPS, 53 for DNS).
+        /// Destination port. Use the well-known port for the scheme (e.g. 443
+        /// for HTTPS, 53 for DNS).
         port: u16,
 
-        /// Where to persist the rule: "once", "session", "project", or "global".
+        /// Where to persist the rule: "once", "session", "project", or
+        /// "global".
         #[arg(value_name = "SCOPE")]
         scope: ApprovalScope,
 
-        /// Session id the rule applies to. Required when the scope is "session".
+        /// Session id the rule applies to. Required when the scope is
+        /// "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME`.
+        /// Home directory inside the sandbox. Used to scope "global" rules.
+        /// Defaults to the env var `AGENT_SANDBOX_HOME`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
 
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
+        /// Working directory inside the sandbox. Used to scope per-project
+        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
 
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
+        /// Project root inside the sandbox. Required for "project" scope.
+        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
@@ -141,33 +162,40 @@ enum Command {
         /// Request id printed by "pending".
         id: String,
 
-        /// Where to persist the deny rule. Defaults to "once" so a denial only affects this single request.
+        /// Where to persist the deny rule. Defaults to "once" so a denial only
+        /// affects this single request.
         #[arg(value_name = "SCOPE", default_value = "once")]
         scope: ApprovalScope,
 
-        /// Session id the request belongs to. Required when the scope is "session".
+        /// Session id the request belongs to. Required when the scope is
+        /// "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
 
-        /// Home directory inside the sandbox. Used to scope "global" rules. Defaults to the env var `AGENT_SANDBOX_HOME`.
+        /// Home directory inside the sandbox. Used to scope "global" rules.
+        /// Defaults to the env var `AGENT_SANDBOX_HOME`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
         home: Option<PathBuf>,
 
-        /// Working directory inside the sandbox. Used to scope per-project rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
+        /// Working directory inside the sandbox. Used to scope per-project
+        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
         cwd: Option<PathBuf>,
 
-        /// Project root inside the sandbox. Required for "project" scope. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
+        /// Project root inside the sandbox. Required for "project" scope.
+        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
         #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
         project_root: Option<PathBuf>,
     },
 }
-/// Parse CLI args, dispatch to the matching subcommand handler, and print the result.
+/// Parse CLI args, dispatch to the matching subcommand handler, and print the
+/// result.
 ///
 /// # Errors
 /// Returns [`ApproveCliError::Rpc`] when the RPC to policyd fails,
 /// [`ApproveCliError::Json`] when JSON serialization fails,
-/// or [`ApproveCliError::Policyd`] when policyd returns a denial or error response.
+/// or [`ApproveCliError::Policyd`] when policyd returns a denial or error
+/// response.
 pub async fn run() -> Result<(), ApproveCliError> {
     let cli = Cli::parse();
     dispatch(&cli.socket, cli.cmd).await
@@ -457,8 +485,9 @@ pub enum ApproveCliError {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
     use clap::CommandFactory;
+
+    use super::Cli;
 
     #[test]
     fn context_arguments_declare_environment_defaults() {

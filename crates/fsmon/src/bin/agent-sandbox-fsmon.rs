@@ -1,15 +1,23 @@
 //! Root fanotify monitor: setns into the sandbox mount namespace,
 //! mark each mountpoint, then event-loop handling permission events.
 
-use std::ffi::CString;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::mem::size_of;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt};
-use std::path::{Path, PathBuf};
-use std::{fs, io, process};
+use std::{
+    ffi::CString,
+    fs,
+    fs::File,
+    io,
+    io::{Read, Write},
+    mem::size_of,
+    os::{
+        fd::{AsFd, AsRawFd, OwnedFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{FileExt, MetadataExt},
+        },
+    },
+    path::{Path, PathBuf},
+    process,
+};
 
 use agent_sandbox_core::{
     FileAccess, normalize_directory_traverse_access, open_flags_to_file_access,
@@ -19,22 +27,24 @@ use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
 };
 use clap::Parser;
-use nix::dir::Dir;
-use nix::fcntl::{AtFlags, OFlag, openat, readlinkat};
-use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
+use nix::{
+    dir::Dir,
+    fcntl::{AtFlags, OFlag, openat, readlinkat},
+    sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
+};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-sandbox-fsmon",
     version,
     about = "fanotify filesystem policy monitor that brokers open() calls to policyd",
-    long_about = "fanotify-based filesystem monitor that runs in the host mount namespace. \
+    long_about = r#"fanotify-based filesystem monitor that runs in the host mount namespace. \
         Given a target sandbox PID, it joins the sandbox mount namespace, marks every \
         mount that overlaps the sandbox's working directory/home/project, and processes \
         permission events for open/open-exec/access requests. Each event is forwarded \
         to policyd over a Unix domain socket and the verdict (allow/deny) is written \
         back to the kernel via the fanotify response fd.\n\n\
-        Normally spawned by policyd in response to an \"agent-sandbox-fs-arm\" request, \
+        Normally spawned by policyd in response to an "agent-sandbox-fs-arm" request, \
         not invoked directly.\n\n\
         EXAMPLES:\n\
         # Start a monitor for sandbox PID 12345 with the default policyd socket.\n\
@@ -44,14 +54,16 @@ use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
             --pid 12345 \\\n\
             --cwd /home/user/project \\\n\
             --home /home/user \\\n\
-            --project-root /home/user/project"
+            --project-root /home/user/project"#
 )]
 struct Cli {
-    /// PID of the sandbox arm helper. The monitor joins the mount namespace of this PID and marks its filesystems.
+    /// PID of the sandbox arm helper. The monitor joins the mount namespace of
+    /// this PID and marks its filesystems.
     #[arg(long, value_name = "PID")]
     pid: u32,
 
-    /// Path to the policyd Unix domain socket. fsmon forwards every fanotify permission event here and waits for an allow/deny verdict.
+    /// Path to the policyd Unix domain socket. fsmon forwards every fanotify
+    /// permission event here and waits for an allow/deny verdict.
     #[arg(
         long,
         value_name = "SOCKET",
@@ -59,15 +71,21 @@ struct Cli {
     )]
     socket: PathBuf,
 
-    /// Working directory inside the sandbox. Used to scope per-project policy and to pick which mounts are marked. Defaults to the env var `AGENT_SANDBOX_CWD` if unset.
+    /// Working directory inside the sandbox. Used to scope per-project policy
+    /// and to pick which mounts are marked. Defaults to the env var
+    /// `AGENT_SANDBOX_CWD` if unset.
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
     cwd: Option<PathBuf>,
 
-    /// Home directory inside the sandbox. Used to expand "~" in filesystem rules and to gate "global" scope. Defaults to the env var `AGENT_SANDBOX_HOME` if unset.
+    /// Home directory inside the sandbox. Used to expand "~" in filesystem
+    /// rules and to gate "global" scope. Defaults to the env var
+    /// `AGENT_SANDBOX_HOME` if unset.
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<PathBuf>,
 
-    /// Project root directory inside the sandbox. Required for "project" scope approvals to land in the right per-project policy file. Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
+    /// Project root directory inside the sandbox. Required for "project" scope
+    /// approvals to land in the right per-project policy file. Defaults to the
+    /// env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<PathBuf>,
 }
@@ -212,7 +230,8 @@ fn parse_mountinfo_content(content: &str) -> Vec<MountRecord> {
     let mut mounts = Vec::new();
 
     for line in content.lines() {
-        // Format: id parent_id major:minor root mount_point options ... - fstype source super_options
+        // Format: id parent_id major:minor root mount_point options ... - fstype source
+        // super_options
         let fields: Vec<&str> = line.split(' ').collect();
         if fields.len() < 9 {
             continue;
@@ -244,22 +263,11 @@ fn parse_mountinfo_for_pid(host_proc: &HostProc, pid: u32) -> io::Result<Vec<Mou
     ))
 }
 
-/// Returns true if `mount_point` is an ancestor of or equal to `target`
-/// (i.e., `target` resides at or under `mount_point`).
-fn mount_covers(mount_point: &Path, target: &Path) -> bool {
-    target.starts_with(mount_point)
-}
-
-/// Returns true if `mount_point` is at or under the `home` directory.
-fn is_under_home(mount_point: &Path, home: &Path) -> bool {
-    mount_point.starts_with(home)
-}
-
 /// Return the deepest mount point that contains `target`.
 fn deepest_covering_mount<'a>(mounts: &'a [MountRecord], target: &Path) -> Option<&'a Path> {
     mounts
         .iter()
-        .filter(|mount| mount_covers(&mount.mount_point, target))
+        .filter(|mount| target.starts_with(&mount.mount_point))
         .max_by_key(|mount| mount.mount_point.as_os_str().len())
         .map(|mount| mount.mount_point.as_path())
 }
@@ -308,7 +316,8 @@ fn resolve_relative_open_path(
     Some(base.join(path))
 }
 
-/// Parse the pathname from a blocked open-family syscall in `/proc/<tid>/syscall`.
+/// Parse the pathname from a blocked open-family syscall in
+/// `/proc/<tid>/syscall`.
 fn parse_open_syscall_path(host_proc: &HostProc, trace_pid: i32, content: &str) -> Option<PathBuf> {
     let content = content.trim();
     if content == "running" {
@@ -414,7 +423,7 @@ fn open_flags_from_proc_arg(word: &str) -> Option<i32> {
     let raw = parse_proc_syscall_arg(word)?;
     i32::try_from(raw)
         .ok()
-        .or_else(|| i32::try_from(raw & 0xffff_ffff).ok())
+        .or_else(|| i32::try_from(raw & 0xFFFF_FFFF).ok())
 }
 
 /// First eight bytes of `struct open_how` (`openat2(2)`): `__u64 flags`.
@@ -422,10 +431,11 @@ fn open_how_flags_from_bytes(bytes: &[u8]) -> Option<i32> {
     let raw = u64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?);
     i32::try_from(raw)
         .ok()
-        .or_else(|| i32::try_from(raw & 0xffff_ffff).ok())
+        .or_else(|| i32::try_from(raw & 0xFFFF_FFFF).ok())
 }
 
-/// `openat2` syscall arg2 (0-based) points at `struct open_how { flags, mode, resolve }`.
+/// `openat2` syscall arg2 (0-based) points at `struct open_how { flags, mode,
+/// resolve }`.
 fn read_tracee_open_how_flags(host_proc: &HostProc, pid: i32, how_ptr: u64) -> Option<i32> {
     if how_ptr == 0 {
         return None;
@@ -550,10 +560,6 @@ fn event_fd_has_type(event_fd: &impl AsFd, file_type: SFlag) -> bool {
     fstat(event_fd).is_ok_and(|meta| SFlag::from_bits_truncate(meta.st_mode).contains(file_type))
 }
 
-fn event_fd_is_regular_file(event_fd: &impl AsFd) -> bool {
-    event_fd_has_type(event_fd, SFlag::S_IFREG)
-}
-
 /// Translate a fanotify event mask to the corresponding `FileAccess`.
 fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i32) -> FileAccess {
     if mask & FAN_PRE_ACCESS != 0 {
@@ -594,8 +600,8 @@ struct MountpointMarks {
 }
 
 /// Mark each mount point, skipping synthetic filesystem types.
-/// Returns a [`MountpointMarks`] struct indicating whether a pre-access mark was seen
-/// and whether the home directory is covered.
+/// Returns a [`MountpointMarks`] struct indicating whether a pre-access mark
+/// was seen and whether the home directory is covered.
 fn mark_mountpoints(
     fan_fd: impl std::os::fd::AsFd,
     mounts: &[MountRecord],
@@ -639,7 +645,7 @@ fn mark_mountpoints(
             }
             Err(e) => {
                 if home_covering_mount == Some(mount.mount_point.as_path())
-                    || cli_home.is_some_and(|home| is_under_home(&mount.mount_point, home))
+                    || cli_home.is_some_and(|home| mount.mount_point.starts_with(home))
                 {
                     eprintln!(
                         "agent-sandbox-fsmon: fanotify_mark {} (under --home): {e}",
@@ -692,7 +698,8 @@ fn parent_pid(host_proc: &HostProc, pid: i32) -> Option<i32> {
     fields.next()?.parse().ok()
 }
 
-/// Event loop: read fanotify events and forward to policyd for allow/deny verdicts.
+/// Event loop: read fanotify events and forward to policyd for allow/deny
+/// verdicts.
 fn run_event_loop(
     fan_fd: &std::os::fd::OwnedFd,
     self_pid: i32,
@@ -889,8 +896,8 @@ fn main() {
         && !home_covered
     {
         eprintln!(
-            "agent-sandbox-fsmon: no successfully marked mount covers --home {}; \
-             cannot guarantee filesystem monitoring",
+            "agent-sandbox-fsmon: no successfully marked mount covers --home {}; cannot guarantee \
+             filesystem monitoring",
             home.display()
         );
         process::exit(1);
@@ -947,7 +954,9 @@ fn try_fast_path_allow(
         respond(fan_fd, event_fd, FAN_ALLOW);
         return true;
     }
-    if saw_pre_access_mark && meta.mask & FAN_ACCESS_PERM != 0 && event_fd_is_regular_file(event_fd)
+    if saw_pre_access_mark
+        && meta.mask & FAN_ACCESS_PERM != 0
+        && event_fd_has_type(event_fd, SFlag::S_IFREG)
     {
         respond(fan_fd, event_fd, FAN_ALLOW);
         return true;
@@ -972,9 +981,9 @@ fn respond(fan_fd: impl AsFd, event_fd: &OwnedFd, response: u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::File, io::Write};
+
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
 
     fn test_host_proc() -> HostProc {
         HostProc::open().expect("open host proc")

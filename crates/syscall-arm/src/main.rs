@@ -1,16 +1,25 @@
+use std::{
+    env,
+    ffi::{CStr, CString, OsString},
+    io::{BufRead, BufReader, Write},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
+    process,
+};
+
 use agent_sandbox_syscall::{build_filter, default_syscalls};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
-use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
-use nix::sys::prctl::set_no_new_privs;
-use nix::sys::signal::{Signal, raise};
-use nix::unistd::{ForkResult, Pid, execvp, pipe2};
-use std::env;
-use std::ffi::{CStr, CString, OsString};
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::process;
+use nix::{
+    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+    sys::{
+        prctl::set_no_new_privs,
+        signal::{Signal, raise},
+    },
+    unistd::{ForkResult, Pid, execvp, pipe2},
+};
 
 const DEFAULT_POLICY_SOCKET: &str = "/run/agent-sandbox/policy.sock";
 
@@ -71,28 +80,15 @@ fn write_listener_fd(write_end: OwnedFd, listener_fd: i32) {
 /// Read the listener fd number (decimal + newline) from the read end of
 /// the handoff pipe. The pipe fd closes on drop.
 fn read_listener_fd(read_end: OwnedFd) -> i32 {
-    let mut file = std::fs::File::from(read_end);
-    let mut buf = [0_u8; 32];
-    let mut filled = 0_usize;
-    while filled < buf.len() {
-        let n = file
-            .read(&mut buf[filled..])
-            .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
-        if n == 0 {
-            die("handoff pipe closed before listener fd was sent");
-        }
-        filled += n;
-        if buf[..filled].contains(&b'\n') {
-            break;
-        }
+    let file = std::fs::File::from(read_end);
+    let mut reader = BufReader::new(file);
+    let mut text = String::new();
+    let bytes_read = reader
+        .read_line(&mut text)
+        .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
+    if bytes_read == 0 {
+        die("handoff pipe closed before listener fd was sent");
     }
-    let newline = buf[..filled]
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(filled);
-    let text = std::str::from_utf8(&buf[..newline]).unwrap_or_else(|_| {
-        die("listener fd on handoff pipe was not valid UTF-8");
-    });
     let fd: i32 = text.trim().parse().unwrap_or_else(|_| {
         die("listener fd on handoff pipe was not a decimal integer");
     });
@@ -142,7 +138,7 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
     name = "agent-sandbox-syscall-arm",
     version,
     about = "Install a seccomp user-notification filter, then exec the command",
-    long_about = "Runs INSIDE the sandbox as the first process in the syscall-gate path. \
+    long_about = r"Runs INSIDE the sandbox as the first process in the syscall-gate path. \
         Installs a seccomp user-notification filter on the immediate child, forks the child, \
         sends the seccomp listener fd number to the parent over a `pipe2(O_CLOEXEC)` pair, \
         raises SIGSTOP, and execs the command. The parent reads the fd number, re-acquires \
@@ -161,7 +157,9 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
         agent-sandbox-syscall-arm /home/user/bin/my-agent --flag"
 )]
 struct Cli {
-    /// The command to exec after the seccomp filter is installed. Everything after the flags is forwarded verbatim to execvp, including values that look like flags. A `--` separator is accepted but not required.
+    /// The command to exec after the seccomp filter is installed. Everything
+    /// after the flags is forwarded verbatim to execvp, including values that
+    /// look like flags. A `--` separator is accepted but not required.
     #[arg(
         value_name = "COMMAND",
         trailing_var_arg = true,
@@ -175,10 +173,8 @@ fn main() {
     let command = cli.command;
     if command.is_empty() {
         eprintln!(
-            "agent-sandbox-syscall-arm: missing command\n\
-             \n\
-             USAGE:\n\
-                 agent-sandbox-syscall-arm [--] <command> [args...]"
+            "agent-sandbox-syscall-arm: missing command\n\nUSAGE:\nagent-sandbox-syscall-arm [--] \
+             <command> [args...]"
         );
         process::exit(2);
     }

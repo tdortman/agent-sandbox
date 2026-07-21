@@ -9,6 +9,13 @@ mod attribution;
 mod owner;
 mod packet;
 mod policy;
+use std::{
+    net::IpAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost,
@@ -16,10 +23,6 @@ use agent_sandbox_core::{
 };
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Number of bytes to copy from each queued packet.
@@ -33,7 +36,7 @@ const COPY_RANGE: u16 = u16::MAX;
     name = "agent-sandbox-nfq",
     version,
     about = "NFQUEUE-based packet policy enforcer for the sandbox network namespace",
-    long_about = "NFQUEUE packet interceptor that runs inside the agent-sandbox network \
+    long_about = r"NFQUEUE packet interceptor that runs inside the agent-sandbox network \
         namespace. nftables queues outbound TCP SYN packets and all UDP packets here. \
         For each queued packet the daemon resolves the destination hostname from the \
         DNS forwarder in-memory cache (or the on-disk fallback), asks policyd for a \
@@ -51,11 +54,14 @@ const COPY_RANGE: u16 = u16::MAX;
             --push-socket /run/agent-sandbox/dns-push.sock"
 )]
 struct Cli {
-    /// NFQUEUE queue number. Must match the nftables "queue num" rule installed in the sandbox netns. 0 (the default) is the convention used by the NixOS module.
+    /// NFQUEUE queue number. Must match the nftables "queue num" rule installed
+    /// in the sandbox netns. 0 (the default) is the convention used by the
+    /// NixOS module.
     #[arg(long, value_name = "NUM", default_value_t = 0)]
     queue: u16,
 
-    /// Unix domain socket path used to ask policyd for a verdict on each queued packet.
+    /// Unix domain socket path used to ask policyd for a verdict on each queued
+    /// packet.
     #[arg(
         long,
         value_name = "SOCKET",
@@ -63,23 +69,33 @@ struct Cli {
     )]
     policy_socket: String,
 
-    /// Max seconds to wait for a policyd verdict per packet check. Fractional values are accepted. The effective wait is clamped to at least 1 second. Larger values tolerate slow policyd startups but delay packet release.
+    /// Max seconds to wait for a policyd verdict per packet check. Fractional
+    /// values are accepted. The effective wait is clamped to at least 1 second.
+    /// Larger values tolerate slow policyd startups but delay packet release.
     #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
     policy_timeout: f64,
 
-    /// Maximum number of packets the kernel may hold while waiting for verdicts. Increase this if bursts of new outbound connections are getting dropped under load. 4096 is enough for typical agent traffic.
+    /// Maximum number of packets the kernel may hold while waiting for
+    /// verdicts. Increase this if bursts of new outbound connections are
+    /// getting dropped under load. 4096 is enough for typical agent traffic.
     #[arg(long, value_name = "PACKETS", default_value_t = 4096)]
     queue_len: u32,
 
-    /// Path to the "nft" binary used to add destination IPs to the transient reject set. Override this for testing or non-standard installations.
+    /// Path to the "nft" binary used to add destination IPs to the transient
+    /// reject set. Override this for testing or non-standard installations.
     #[arg(long, value_name = "PATH", default_value = "nft")]
     nft_binary: String,
 
-    /// DNS forwarder IP address (v4 or v6). Packets to this IP on port 53 are passed straight through without consulting policyd so the agent can always resolve names. 169.254.100.1 is the link-local address used by the default NixOS module.
+    /// DNS forwarder IP address (v4 or v6). Packets to this IP on port 53 are
+    /// passed straight through without consulting policyd so the agent can
+    /// always resolve names. 169.254.100.1 is the link-local address used by
+    /// the default NixOS module.
     #[arg(long, value_name = "IP", default_value = "169.254.100.1")]
     dns_server_ip: IpAddr,
 
-    /// Unix datagram socket path the DNS forwarder pushes fresh "{ip,host,ttl}" mappings to. If absent or unbindable the daemon falls back to the on-disk cache only.
+    /// Unix datagram socket path the DNS forwarder pushes fresh "{ip,host,ttl}"
+    /// mappings to. If absent or unbindable the daemon falls back to the
+    /// on-disk cache only.
     #[arg(
         long,
         value_name = "SOCKET",
@@ -98,7 +114,8 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     ready_file: Option<PathBuf>,
 
-    /// Only accept DNS push frames from this peer uid (default: root / the host DNS forwarder).
+    /// Only accept DNS push frames from this peer uid (default: root / the host
+    /// DNS forwarder).
     #[arg(long, value_name = "UID", default_value_t = 0)]
     push_trusted_uid: u32,
 }
@@ -106,7 +123,7 @@ struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
-    cache_path: Option<PathBuf>,
+    cache_path: PathBuf,
     dns_server_ip: IpAddr,
     nft_binary: String,
     proxy_mode: bool,
@@ -119,10 +136,8 @@ impl NfqState {
         // contending with the NFQUEUE recv loop.
         let dns_cache = DnsCache::new(None::<PathBuf>, DEFAULT_MAX_TTL);
         // Cache path for on-demand disk reloads from the DNS forwarder.
-        let cache_path: Option<PathBuf> = std::env::var("AGENT_SANDBOX_DNS_CACHE").map_or_else(
-            |_| Some(PathBuf::from(DEFAULT_CACHE_PATH)),
-            |p| Some(PathBuf::from(p)),
-        );
+        let cache_path = std::env::var_os("AGENT_SANDBOX_DNS_CACHE")
+            .map_or_else(|| PathBuf::from(DEFAULT_CACHE_PATH), PathBuf::from);
         let approved_bindings_path = std::env::var("AGENT_SANDBOX_APPROVED_BINDINGS")
             .map_or_else(|_| PathBuf::from(APPROVED_BINDINGS_PATH), PathBuf::from);
         let approved_bindings = ApprovedBindings::load(&approved_bindings_path);
@@ -175,7 +190,7 @@ impl NfqState {
         {
             return host.to_owned();
         }
-        let Some(host) = lookup_dns_cache(ip, self.cache_path.as_deref()) else {
+        let Some(host) = lookup_dns_cache(ip, Some(&self.cache_path)) else {
             return ip.to_string();
         };
         if let Ok(mut cache) = self.dns_cache.lock() {
@@ -324,9 +339,9 @@ fn recv_datagram_with_creds(
     sock: &std::os::unix::net::UnixDatagram,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, UnixPeerCred)> {
+    use std::{io::IoSliceMut, os::unix::io::AsRawFd};
+
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
-    use std::io::IoSliceMut;
-    use std::os::unix::io::AsRawFd;
 
     let mut cmsg = [0u8; 128];
     let mut iov = [IoSliceMut::new(buf)];
@@ -444,7 +459,8 @@ fn write_ready_marker(path: &Path) -> std::io::Result<ReadyMarker> {
     Ok(ReadyMarker(path.to_path_buf()))
 }
 
-/// Whether a packet to the given destination should bypass policy checks entirely.
+/// Whether a packet to the given destination should bypass policy checks
+/// entirely.
 fn is_bypass_traffic(dst_ip: IpAddr, dst_port: u16, dns_server_ip: IpAddr) -> bool {
     // DNS forwarder traffic on port 53 only
     dst_ip == dns_server_ip && dst_port == 53
@@ -595,33 +611,8 @@ fn register_proxy_flow(
     }
 }
 
-#[cfg(test)]
-/// Core packet handling logic, parameterized over the policy check function.
-///
-/// This compatibility wrapper preserves direct-mode unit tests and callers.
-fn handle_packet_payload<F>(
-    state: &NfqState,
-    policy_socket: &str,
-    timeout: Duration,
-    payload: &[u8],
-    check: &mut F,
-) -> Verdict
-where
-    F: FnMut(
-        &str,
-        &str,
-        &str,
-        u16,
-        packet::TransportProtocol,
-        Option<u32>,
-        &[String],
-        Duration,
-    ) -> std::io::Result<policy::PolicyResult>,
-{
-    handle_packet_payload_with_registration(state, policy_socket, timeout, payload, check, None)
-}
-
-/// Core packet handling logic, parameterized over policy and proxy registration.
+/// Core packet handling logic, parameterized over policy and proxy
+/// registration.
 ///
 /// Seam for unit testing: inject a mock `check` to verify policy is consulted.
 fn handle_packet_payload_with_registration<F>(
@@ -719,7 +710,7 @@ where
     );
 
     let allowed = match result {
-        Ok(result) => result.allowed,
+        Ok(result) => result.0,
         Err(err) => {
             warn!(
                 protocol = meta.protocol.as_str(),
@@ -809,15 +800,19 @@ fn handle_packet(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::os::unix::process::ExitStatusExt;
-    use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        os::unix::process::ExitStatusExt,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::rdata::A;
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType, rdata::A},
+    };
+
+    use super::*;
 
     const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
     fn state_for_tests() -> NfqState {
@@ -846,7 +841,7 @@ mod tests {
             approved_bindings: Arc::new(std::sync::Mutex::new(ApprovedBindings::load(
                 &approved_bindings_path,
             ))),
-            cache_path: None,
+            cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
             proxy_mode: false,
@@ -919,10 +914,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -971,7 +973,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
         let registration = std::cell::RefCell::new(None);
         let mut register = |flow: FlowRegistration| {
@@ -1033,7 +1035,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: false })
+            Ok(policy::PolicyResult(false))
         };
         let registration_count = std::cell::Cell::new(0_u32);
         let mut register = |_: FlowRegistration| {
@@ -1083,10 +1085,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -1115,7 +1124,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: false })
+            Ok(policy::PolicyResult(false))
         };
         let registration_count = std::cell::Cell::new(0_u32);
         let mut register = |_: FlowRegistration| {
@@ -1206,16 +1215,30 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
         // First check: policy consulted.
-        let v1 = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v1 = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v1, Verdict::Accept);
         assert_eq!(call_count.get(), 1);
 
         // Second check: policy consulted again (no NFQ-side verdict cache).
-        let v2 = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v2 = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v2, Verdict::Accept);
         assert_eq!(call_count.get(), 2);
     }
@@ -1515,7 +1538,7 @@ mod tests {
         let mut writer = DnsCache::new(Some(&path), DEFAULT_MAX_TTL);
         writer.remember("104.20.23.154", "example.com", 300);
         let mut state = state_for_tests();
-        state.cache_path = Some(path.clone());
+        state.cache_path = path.clone();
 
         let result = state.resolve_host_for_session("104.20.23.154", None);
 
@@ -1546,7 +1569,7 @@ mod tests {
         let mut writer = DnsCache::new(Some(&path), DEFAULT_MAX_TTL);
         writer.remember("104.20.23.154", "example.com", 300);
         let mut state = state_for_tests();
-        state.cache_path = Some(path.clone());
+        state.cache_path = path.clone();
 
         assert_eq!(
             state.resolve_host_for_session("104.20.23.154", Some("session-a")),
@@ -1617,10 +1640,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -1653,10 +1683,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -1689,10 +1726,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -1716,10 +1760,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),
@@ -1746,10 +1797,17 @@ mod tests {
                          aliases: &[String],
                          _: Duration| {
             *aliases_seen.borrow_mut() = aliases.to_vec();
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             aliases_seen.borrow().as_slice(),
@@ -1780,8 +1838,10 @@ mod tests {
 
     #[test]
     fn push_socket_rejects_untrusted_peer_uid() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1843,17 +1903,23 @@ mod tests {
             .remember_ephemeral("93.184.216.34", "example.com", 300);
         let pkt = build_udp_data_packet(443);
 
-        let mut check =
-            |_: &str,
-             _: &str,
-             _: &str,
-             _: u16,
-             _: packet::TransportProtocol,
-             _: Option<u32>,
-             _: &[String],
-             _: Duration| Ok(policy::PolicyResult { allowed: true });
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| Ok(policy::PolicyResult(true));
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         let aliases = state
             .approved_bindings
@@ -1877,10 +1943,17 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult { allowed: true })
+            Ok(policy::PolicyResult(true))
         };
 
-        let v = handle_packet_payload(&state, "", Duration::from_secs(1), &pkt, &mut check);
+        let v = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &pkt,
+            &mut check,
+            None,
+        );
         assert_eq!(v, Verdict::Accept);
         assert_eq!(
             call_count.get(),

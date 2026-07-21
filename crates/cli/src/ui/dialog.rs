@@ -1,8 +1,10 @@
-use std::collections::HashMap;
-use std::io::{BufRead, Write};
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::LazyLock;
+use std::{
+    collections::HashMap,
+    io::{BufRead, Write},
+    path::Path,
+    process::{Command, Stdio},
+    sync::LazyLock,
+};
 
 use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
@@ -70,8 +72,8 @@ pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
     None
 }
 
-/// Prompt for free-form text (e.g. an editable policy path). Returns the trimmed
-/// user input on success.
+/// Prompt for free-form text (e.g. an editable policy path). Returns the
+/// trimmed user input on success.
 pub fn pick_text(title: &str, default_text: &str) -> Option<String> {
     if prefer_graphical() {
         if let Some(c) = input_with_backends(title, default_text) {
@@ -390,7 +392,8 @@ fn zenity_select(
     options: &[&str],
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    // zenity --list --title "agent-sandbox" --text "..." --column "Options" <opt1> <opt2> ...
+    // zenity --list --title "agent-sandbox" --text "..." --column "Options" <opt1>
+    // <opt2> ...
     let mut args = vec![
         binary.to_string(),
         "--list".into(),
@@ -466,16 +469,16 @@ fn zenity_input(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, io::Write as _, os::unix::fs::PermissionsExt};
+
+    use agent_sandbox_core::ApprovalScope;
+    use tempfile::{NamedTempFile, TempPath};
+
     use super::{
         ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
         parse_review_result, qt_dialog_review,
     };
     use crate::ui::options::{ApprovalFormAction, ApprovalFormContext, ReviewValidator};
-    use agent_sandbox_core::ApprovalScope;
-    use std::collections::HashMap;
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::{NamedTempFile, TempPath};
 
     struct EofReviewHelper {
         executable: TempPath,

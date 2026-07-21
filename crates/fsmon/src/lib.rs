@@ -2,9 +2,11 @@
 
 /// Minimal RPC client for connecting to policyd over a Unix socket.
 pub mod rpc_client {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::path::{Path, PathBuf};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixStream,
+        path::{Path, PathBuf},
+    };
 
     use agent_sandbox_core::{
         FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, RequestContext,
@@ -157,8 +159,8 @@ pub mod rpc_client {
     ///
     /// # Errors
     /// Returns [`Error::Io`] on socket/stream I/O failure, [`Error::Json`] on
-    /// serialization failure, or [`Error::Reply`] if policyd returns an error or
-    /// an unexpected reply type.
+    /// serialization failure, or [`Error::Reply`] if policyd returns an error
+    /// or an unexpected reply type.
     pub fn start_monitor(
         socket_path: &Path,
         ctx: RequestContext,
@@ -168,31 +170,6 @@ pub mod rpc_client {
         let reply = send_request(socket_path, &req)?;
         match reply {
             RpcReply::FilesystemMonitor(r) => Ok(r),
-            RpcReply::Error(_) => Err(Error::Reply("policyd returned an error")),
-            _ => Err(Error::Reply("unexpected reply type from policyd")),
-        }
-    }
-
-    /// Send a `CheckFilesystem` request and return the reply.
-    ///
-    /// # Errors
-    /// Returns [`Error::Io`] on socket/stream I/O failure, [`Error::Json`] on
-    /// serialization failure, or [`Error::Reply`] if policyd returns an error or
-    /// an unexpected reply type.
-    pub fn check_filesystem(
-        socket_path: &Path,
-        path: &Path,
-        access: FileAccess,
-        ctx: RequestContext,
-    ) -> Result<FilesystemCheckReply, Error> {
-        let req = RpcRequest::CheckFilesystem {
-            path: path.to_path_buf(),
-            access,
-            ctx,
-        };
-        let reply = send_request(socket_path, &req)?;
-        match reply {
-            RpcReply::FilesystemCheck(r) => Ok(r),
             RpcReply::Error(_) => Err(Error::Reply("policyd returned an error")),
             _ => Err(Error::Reply("unexpected reply type from policyd")),
         }
@@ -213,15 +190,19 @@ pub mod rpc_client {
 
 #[cfg(test)]
 mod tests {
-    use super::rpc_client::PersistentClient;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+    };
+
     use agent_sandbox_core::{
         FileAccess, FilesystemCheckReply, RequestContext, RpcReply, VerdictSource,
     };
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
+
+    use super::rpc_client::PersistentClient;
 
     static SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

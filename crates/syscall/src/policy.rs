@@ -24,8 +24,8 @@ pub mod nr {
         SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE, SYS_write as WRITE,
         SYS_writev as WRITEV,
     };
-
-    /// Filesystem mutation syscalls, re-exported when `libc` defines them for the target.
+    /// Filesystem mutation syscalls, re-exported when `libc` defines them for
+    /// the target.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub use libc::{
         SYS_ftruncate as FTRUNCATE, SYS_link as LINK, SYS_linkat as LINKAT, SYS_rename as RENAME,
@@ -40,9 +40,9 @@ pub mod nr {
 /// the kernel in `struct seccomp_data.arch`.
 pub const AUDIT_ARCH_NATIVE: u32 = match () {
     #[cfg(target_arch = "x86_64")]
-    () => 0xc000_003e,
+    () => 0xC000_003E,
     #[cfg(target_arch = "aarch64")]
-    () => 0xc000_00b7,
+    () => 0xC000_00B7,
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     () => 0,
 };
@@ -77,9 +77,9 @@ pub const AUDIT_ARCH_I686: u32 = 0x4000_0003;
 /// thread/namespace syscalls (`clone3`, `unshare`). The broker is
 /// single-threaded, so trapping them serializes every I/O call and thread spawn
 /// and starves the sandboxed process until its runtime aborts. `SOCKET` is
-/// excluded because the broker duplicates tracee socket fds via `pidfd_getfd` to
-/// emulate connect/send. Trapping `socket` would deadlock that emulation path.
-/// `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
+/// excluded because the broker duplicates tracee socket fds via `pidfd_getfd`
+/// to emulate connect/send. Trapping `socket` would deadlock that emulation
+/// path. `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
 #[must_use]
 pub fn default_syscalls() -> BTreeSet<i64> {
     let mut syscalls = BTreeSet::from([

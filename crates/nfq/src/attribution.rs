@@ -1,7 +1,9 @@
 //! Session-scoped hostname attribution persisted across NFQUEUE restarts.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +39,8 @@ struct AttributionEntry {
     hostname: String,
 }
 
-/// Session-scoped retention of hostname mappings attributed to sandbox connections.
+/// Session-scoped retention of hostname mappings attributed to sandbox
+/// connections.
 #[derive(Debug)]
 pub struct SessionAttribution {
     path: Option<PathBuf>,
@@ -86,7 +89,8 @@ impl SessionAttribution {
         }
     }
 
-    /// Remember a mapping and persist changed state when this map is path-backed.
+    /// Remember a mapping and persist changed state when this map is
+    /// path-backed.
     ///
     /// A failed persistence leaves the map dirty. A later remember retries the
     /// complete snapshot, while clean unchanged mappings perform no write.
@@ -156,8 +160,9 @@ impl Default for SessionAttribution {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionAttribution;
     use std::path::PathBuf;
+
+    use super::SessionAttribution;
 
     fn test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

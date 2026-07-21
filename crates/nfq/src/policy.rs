@@ -10,9 +10,7 @@ use agent_sandbox_core::{
 use crate::packet::TransportProtocol;
 
 /// Result of a policy check for a queued packet.
-pub struct PolicyResult {
-    pub allowed: bool,
-}
+pub struct PolicyResult(pub bool);
 
 struct PolicyContext {
     paths: SandboxPaths,
@@ -59,7 +57,7 @@ pub async fn check_destination(
         .await
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     let allowed = matches!(resp, RpcReply::Check(check) if check.allowed);
-    Ok(PolicyResult { allowed })
+    Ok(PolicyResult(allowed))
 }
 
 /// Register one owner-identified flow with policyd before proxy forwarding.

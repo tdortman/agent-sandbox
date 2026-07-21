@@ -31,8 +31,9 @@ pub fn owner_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn owner_snapshot_resolves_current_process_for_loopback_tcp_client() {

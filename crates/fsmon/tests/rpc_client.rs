@@ -1,7 +1,9 @@
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
-use std::thread;
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixListener,
+    path::PathBuf,
+    thread,
+};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemMonitorReply, FilesystemRule, RequestContext, RpcReply,

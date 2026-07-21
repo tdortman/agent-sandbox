@@ -1,91 +1,36 @@
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
-use super::{bus_name, message_kind_name, signature_display};
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, FileAccess, FilesystemRule,
     HttpMethodMatcher, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind, ResourceRule, UiPush,
     contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name,
     split_check_aliases,
 };
-
-use super::choice::{deny_cancellation, format_elevation_title, resolve_choice};
-use super::dialog::{ApprovalReviewOutcome, pick_option, pick_text, review_approval};
-use super::error::UiCliError;
-use super::options::{
-    ACTION_OPTIONS, ApprovalFormContext, ApprovalFormControl, ApprovalFormField,
-    ApprovalFormOption, ApprovalFormPresentation, ApprovalFormRequest, ApprovalFormResult,
-    PromptAction, ReviewValidator, ScopeOption, format_command, scope_only_options,
-    sudo_target_options,
-};
 use tracing::warn;
+
+use super::{
+    bus_name,
+    choice::{deny_cancellation, format_elevation_title, resolve_choice},
+    dialog::{ApprovalReviewOutcome, pick_option, pick_text, review_approval},
+    error::UiCliError,
+    message_kind_name,
+    options::{
+        ACTION_OPTIONS, ApprovalFormContext, ApprovalFormControl, ApprovalFormField,
+        ApprovalFormOption, ApprovalFormPresentation, ApprovalFormRequest, ApprovalFormResult,
+        PromptAction, ReviewValidator, ScopeOption, format_command, scope_only_options,
+        sudo_target_options,
+    },
+    signature_display,
+};
 
 /// Default project-relative rule path shown in approval prompts.
 fn suggest_project_rule_path(path: &Path, project_root: Option<&Path>) -> String {
     contract_project_path(path, project_root)
         .display()
         .to_string()
-}
-
-/// Extracted fields from [`UiPush::NetworkRequest`].
-struct NetworkPush {
-    id: String,
-    host: Option<String>,
-    port: Option<u16>,
-    scheme: Option<String>,
-    url: Option<String>,
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-}
-
-/// Extracted fields from [`UiPush::HttpRequest`].
-struct HttpPush {
-    id: String,
-    request: agent_sandbox_core::HttpRequest,
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-}
-
-/// Extracted fields from [`UiPush::ElevationRequest`].
-struct ElevationPush {
-    id: String,
-    argv: Option<Vec<String>>,
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-}
-
-/// Extracted fields from [`UiPush::FilesystemRequest`].
-struct FilesystemPush {
-    id: String,
-    path: PathBuf,
-    access: FileAccess,
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-}
-
-/// Extracted fields from [`UiPush::ResourceRequest`].
-struct ResourcePush {
-    id: String,
-    kind: ResourceKind,
-    path: PathBuf,
-    access: ResourceAccess,
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-}
-
-/// Extracted fields from [`UiPush::DbusRequest`].
-struct DbusPush {
-    id: String,
-    target: DbusTarget,
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-    sandbox_session_id: Option<String>,
 }
 
 fn approval_context(
@@ -343,7 +288,8 @@ fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
     ApprovalFormPresentation {
         heading: "Allow this D-Bus message?".into(),
         subject: format!(
-            "bus: {}\ndestination: {}\nobject path: {}\ninterface: {}\nmember: {}\nmessage kind: {}\nsignature: {}\nFDs: {}",
+            "bus: {}\ndestination: {}\nobject path: {}\ninterface: {}\nmember: {}\nmessage kind: \
+             {}\nsignature: {}\nFDs: {}",
             bus_name(target.bus),
             target.destination,
             target.object_path,
@@ -512,16 +458,19 @@ async fn handle_dbus_push(
     socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
-    push: DbusPush,
+    push: UiPush,
 ) -> Result<(), UiCliError> {
-    let DbusPush {
+    let UiPush::DbusRequest {
         id,
         target,
         cwd,
         home,
         project_root,
         sandbox_session_id,
-    } = push;
+    } = push
+    else {
+        unreachable!("D-Bus variant was validated by the dispatcher")
+    };
     let paths = paths.merged_with(cwd, home, project_root);
     let review = ApprovalFormRequest {
         summary: format!(
@@ -602,13 +551,26 @@ async fn handle_network_push(
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
-    net: NetworkPush,
+    push: UiPush,
 ) -> Result<(), UiCliError> {
-    let host = net.host.unwrap_or_default();
-    let port = net.port.unwrap_or(0);
-    let transport = net.scheme.unwrap_or_else(|| "https".into());
+    let UiPush::NetworkRequest {
+        id,
+        host,
+        port,
+        scheme: transport,
+        url: requested_url,
+        cwd,
+        home,
+        project_root,
+    } = push
+    else {
+        unreachable!("network variant was validated by the dispatcher")
+    };
+    let host = host.unwrap_or_default();
+    let port = port.unwrap_or(0);
+    let transport = transport.unwrap_or_else(|| "https".into());
     let scheme = network_prompt_scheme(&transport, port);
-    let result = split_check_aliases(net.url);
+    let result = split_check_aliases(requested_url);
     let url = network_prompt_with_transport_hint(
         network_prompt_with_aliases(
             &host,
@@ -625,7 +587,7 @@ async fn handle_network_push(
         port,
     );
     let url = url.split(['?', '#']).next().unwrap_or_default().to_owned();
-    let paths = paths.merged_with(net.cwd, net.home, net.project_root);
+    let paths = paths.merged_with(cwd, home, project_root);
     let review = ApprovalFormRequest {
         summary: format!("Network request to {url}"),
         context: approval_context(&paths, session_id),
@@ -651,21 +613,21 @@ async fn handle_network_push(
                     parse_network_target(result, &host)
                 })
             else {
-                return deny_cancellation(socket, &paths, sandbox_session_id, &net.id).await;
+                return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
             };
             return resolve_choice(
                 socket,
                 &paths,
                 session_id,
                 sandbox_session_id,
-                &net.id,
+                &id,
                 action,
                 Some(choice),
             )
             .await;
         }
         ApprovalReviewOutcome::Cancelled => {
-            return deny_cancellation(socket, &paths, sandbox_session_id, &net.id).await;
+            return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
         }
         ApprovalReviewOutcome::Unavailable => {}
     }
@@ -674,7 +636,7 @@ async fn handle_network_push(
         &paths,
         session_id,
         sandbox_session_id,
-        &net.id,
+        &id,
         &url,
         &host,
     )
@@ -828,16 +790,21 @@ async fn handle_http_push(
     socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
-    sandbox_session_id: Option<&str>,
-    push: HttpPush,
+    push: UiPush,
 ) -> Result<(), UiCliError> {
-    let HttpPush {
+    let UiPush::HttpRequest {
         id,
         request,
         cwd,
         home,
         project_root,
-    } = push;
+        sandbox_session_id: push_session_id,
+    } = push
+    else {
+        unreachable!("HTTP variant was validated by the dispatcher")
+    };
+    let sandbox_session_id = push_session_id.as_deref();
+    let id = id.to_string();
     let paths = paths.merged_with(cwd, home, project_root);
     let title = format!("agent-sandbox: {} {}", request.method.as_str(), request.url);
     if handle_http_review(
@@ -931,11 +898,21 @@ async fn handle_elevation_push(
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
-    elev: ElevationPush,
+    push: UiPush,
 ) -> Result<(), UiCliError> {
-    let argv = elev.argv.unwrap_or_default();
-    let paths = paths.merged_with(elev.cwd, elev.home, elev.project_root);
-    let title = format_elevation_title(&argv, paths.cwd().unwrap_or_else(|| Path::new("?")));
+    let UiPush::ElevationRequest {
+        id,
+        argv,
+        cwd,
+        home,
+        project_root,
+    } = push
+    else {
+        unreachable!("elevation variant was validated by the dispatcher")
+    };
+    let argv = argv.unwrap_or_default();
+    let paths = paths.merged_with(cwd, home, project_root);
+    let title = format_elevation_title(&argv);
     let elevation_review = build_elevation_review(&argv, &paths, session_id, &title);
     let prefixes = elevation_review.prefixes;
     let prefixes_clone = prefixes.clone();
@@ -957,26 +934,26 @@ async fn handle_elevation_push(
                     Some(ApprovalTarget::SudoCommand { argv })
                 })
             else {
-                return deny_cancellation(socket, &paths, sandbox_session_id, &elev.id).await;
+                return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
             };
             return resolve_choice(
                 socket,
                 &paths,
                 session_id,
                 sandbox_session_id,
-                &elev.id,
+                &id,
                 action,
                 Some(choice),
             )
             .await;
         }
         ApprovalReviewOutcome::Cancelled => {
-            return deny_cancellation(socket, &paths, sandbox_session_id, &elev.id).await;
+            return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
         }
         ApprovalReviewOutcome::Unavailable => {}
     }
     let Some(action) = choose_action(&title).await? else {
-        return deny_cancellation(socket, &paths, sandbox_session_id, &elev.id).await;
+        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} sudo scope?", action.verb()),
@@ -984,7 +961,7 @@ async fn handle_elevation_push(
     )
     .await?
     else {
-        return deny_cancellation(socket, &paths, sandbox_session_id, &elev.id).await;
+        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
 
     let target = if scope == ApprovalScope::Once {
@@ -997,7 +974,7 @@ async fn handle_elevation_push(
         .await?
         {
             Some(t) => Some(t),
-            None => return deny_cancellation(socket, &paths, sandbox_session_id, &elev.id).await,
+            None => return deny_cancellation(socket, &paths, sandbox_session_id, &id).await,
         }
     };
     let choice = ScopeOption {
@@ -1011,151 +988,45 @@ async fn handle_elevation_push(
         &paths,
         session_id,
         sandbox_session_id,
-        &elev.id,
+        &id,
         action,
         Some(choice),
     )
     .await
 }
-async fn handle_network_variant(
+/// Returns [`UiCliError`] when RPC communication with policyd fails.
+pub async fn handle_push(
     socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     push: UiPush,
 ) -> Result<(), UiCliError> {
-    let UiPush::NetworkRequest {
-        id,
-        host,
-        port,
-        scheme,
-        url,
-        cwd,
-        home,
-        project_root,
-    } = push
-    else {
-        unreachable!("network variant was validated by the dispatcher")
-    };
-    handle_network_push(
-        socket,
-        paths,
-        session_id,
-        sandbox_session_id,
-        NetworkPush {
-            id,
-            host,
-            port,
-            scheme,
-            url,
-            cwd,
-            home,
-            project_root,
-        },
-    )
-    .await
+    match push {
+        push @ UiPush::NetworkRequest { .. } => {
+            handle_network_push(socket, paths, session_id, sandbox_session_id, push).await?;
+        }
+        push @ UiPush::HttpRequest { .. } => {
+            handle_http_push(socket, paths, session_id, push).await?;
+        }
+        push @ UiPush::ElevationRequest { .. } => {
+            handle_elevation_push(socket, paths, session_id, sandbox_session_id, push).await?;
+        }
+        push @ UiPush::FilesystemRequest { .. } => {
+            handle_filesystem_push(socket, paths, session_id, sandbox_session_id, push).await?;
+        }
+        push @ UiPush::DbusRequest { .. } => {
+            handle_dbus_push(socket, paths, session_id, push).await?;
+        }
+        push @ UiPush::ResourceRequest { .. } => {
+            handle_resource_push(socket, paths, session_id, sandbox_session_id, push).await?;
+        }
+    }
+    Ok(())
 }
 
-async fn handle_http_variant(
-    socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-    push: UiPush,
-) -> Result<(), UiCliError> {
-    let UiPush::HttpRequest {
-        id,
-        request,
-        cwd,
-        home,
-        project_root,
-        sandbox_session_id,
-    } = push
-    else {
-        unreachable!("HTTP variant was validated by the dispatcher")
-    };
-    handle_http_push(
-        socket,
-        paths,
-        session_id,
-        sandbox_session_id.as_deref(),
-        HttpPush {
-            id: id.to_string(),
-            request,
-            cwd,
-            home,
-            project_root,
-        },
-    )
-    .await
-}
-
-async fn handle_elevation_variant(
-    socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-    sandbox_session_id: Option<&str>,
-    push: UiPush,
-) -> Result<(), UiCliError> {
-    let UiPush::ElevationRequest {
-        id,
-        argv,
-        cwd,
-        home,
-        project_root,
-    } = push
-    else {
-        unreachable!("elevation variant was validated by the dispatcher")
-    };
-    handle_elevation_push(
-        socket,
-        paths,
-        session_id,
-        sandbox_session_id,
-        ElevationPush {
-            id,
-            argv,
-            cwd,
-            home,
-            project_root,
-        },
-    )
-    .await
-}
-
-async fn handle_dbus_variant(
-    socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-    push: UiPush,
-) -> Result<(), UiCliError> {
-    let UiPush::DbusRequest {
-        id,
-        target,
-        cwd,
-        home,
-        project_root,
-        sandbox_session_id,
-    } = push
-    else {
-        unreachable!("D-Bus variant was validated by the dispatcher")
-    };
-    handle_dbus_push(
-        socket,
-        paths,
-        session_id,
-        DbusPush {
-            id,
-            target,
-            cwd,
-            home,
-            project_root,
-            sandbox_session_id,
-        },
-    )
-    .await
-}
-
-async fn handle_filesystem_variant(
+/// Prompt the user for a filesystem access approval.
+async fn handle_filesystem_push(
     socket: &Path,
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
@@ -1173,110 +1044,6 @@ async fn handle_filesystem_variant(
     else {
         unreachable!("filesystem variant was validated by the dispatcher")
     };
-    handle_filesystem_push(
-        socket,
-        paths,
-        session_id,
-        sandbox_session_id,
-        FilesystemPush {
-            id,
-            path,
-            access,
-            cwd,
-            home,
-            project_root,
-        },
-    )
-    .await
-}
-
-async fn handle_resource_variant(
-    socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-    sandbox_session_id: Option<&str>,
-    push: UiPush,
-) -> Result<(), UiCliError> {
-    let UiPush::ResourceRequest {
-        id,
-        kind,
-        path,
-        access,
-        cwd,
-        home,
-        project_root,
-    } = push
-    else {
-        unreachable!("resource variant was validated by the dispatcher")
-    };
-    handle_resource_push(
-        socket,
-        paths,
-        session_id,
-        sandbox_session_id,
-        ResourcePush {
-            id,
-            kind,
-            path,
-            access,
-            cwd,
-            home,
-            project_root,
-        },
-    )
-    .await
-}
-
-/// Handle an incoming UI push: parse the variant, prompt the user, and resolve the choice.
-///
-/// # Errors
-/// Returns [`UiCliError`] when RPC communication with policyd fails.
-pub async fn handle_push(
-    socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-    sandbox_session_id: Option<&str>,
-    push: UiPush,
-) -> Result<(), UiCliError> {
-    match push {
-        push @ UiPush::NetworkRequest { .. } => {
-            handle_network_variant(socket, paths, session_id, sandbox_session_id, push).await?;
-        }
-        push @ UiPush::HttpRequest { .. } => {
-            handle_http_variant(socket, paths, session_id, push).await?;
-        }
-        push @ UiPush::ElevationRequest { .. } => {
-            handle_elevation_variant(socket, paths, session_id, sandbox_session_id, push).await?;
-        }
-        push @ UiPush::FilesystemRequest { .. } => {
-            handle_filesystem_variant(socket, paths, session_id, sandbox_session_id, push).await?;
-        }
-        push @ UiPush::DbusRequest { .. } => {
-            handle_dbus_variant(socket, paths, session_id, push).await?;
-        }
-        push @ UiPush::ResourceRequest { .. } => {
-            handle_resource_variant(socket, paths, session_id, sandbox_session_id, push).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Prompt the user for a filesystem access approval.
-async fn handle_filesystem_push(
-    socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-    sandbox_session_id: Option<&str>,
-    fs: FilesystemPush,
-) -> Result<(), UiCliError> {
-    let FilesystemPush {
-        id,
-        path,
-        access,
-        cwd,
-        home,
-        project_root,
-    } = fs;
     let paths = paths.merged_with(cwd, home, project_root.clone());
     let title = format!("agent-sandbox: filesystem {access} {}", path.display());
     let default_rule_path = suggest_project_rule_path(&path, paths.project_root());
@@ -1385,9 +1152,9 @@ async fn handle_resource_push(
     paths: &agent_sandbox_core::SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
-    res: ResourcePush,
+    push: UiPush,
 ) -> Result<(), UiCliError> {
-    let ResourcePush {
+    let UiPush::ResourceRequest {
         id,
         kind,
         path,
@@ -1395,7 +1162,10 @@ async fn handle_resource_push(
         cwd,
         home,
         project_root,
-    } = res;
+    } = push
+    else {
+        unreachable!("resource variant was validated by the dispatcher")
+    };
     let paths = paths.merged_with(cwd, home, project_root);
     let display_path = suggest_project_rule_path(&path, paths.project_root());
     let review = ApprovalFormRequest {
@@ -1669,6 +1439,12 @@ fn network_prompt_with_aliases(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, path::Path};
+
+    use agent_sandbox_core::{
+        DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
+    };
+
     use super::{
         ApprovalFormResult, ApprovalScope, ApprovalTarget, approval_context,
         elevation_presentation, http_presentation, network_presentation, network_prompt_scheme,
@@ -1678,11 +1454,6 @@ mod tests {
         valid_rule_path,
     };
     use crate::ui::options::ApprovalFormAction;
-    use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
-    };
-    use std::collections::HashMap;
-    use std::path::Path;
     #[test]
     fn resource_presentation_uses_human_readable_unix_socket_label() {
         let presentation = resource_presentation(

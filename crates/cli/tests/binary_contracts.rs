@@ -19,10 +19,9 @@ fn elevate_without_command_reports_usage_without_contacting_policyd() {
 
 #[test]
 fn approve_rejects_unknown_subcommand() {
-    let output = run(
-        env!("CARGO_BIN_EXE_agent-sandbox-approve"),
-        &["not-a-command"],
-    );
+    let output = run(env!("CARGO_BIN_EXE_agent-sandbox-approve"), &[
+        "not-a-command",
+    ]);
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);

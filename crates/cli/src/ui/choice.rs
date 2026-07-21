@@ -1,13 +1,14 @@
-use std::path::Path;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
 use tracing::info;
 
-use super::error::UiCliError;
-use super::options::{PromptAction, ScopeOption};
+use super::{
+    error::UiCliError,
+    options::{PromptAction, ScopeOption},
+};
 
-pub fn format_elevation_title(argv: &[String], _cwd: &Path) -> String {
+pub fn format_elevation_title(argv: &[String]) -> String {
     let cmd = argv.join(" ");
     format!("agent-sandbox: sudo {cmd}")
 }
@@ -104,8 +105,6 @@ pub async fn deny_cancellation(
 #[cfg(test)]
 mod tests {
     use super::format_elevation_title;
-    use std::path::Path;
-
     #[test]
     fn format_elevation_title_keeps_full_long_argv() {
         let argv: Vec<String> = std::iter::once("id".to_string())
@@ -114,7 +113,7 @@ mod tests {
                 20,
             ))
             .collect();
-        let title = format_elevation_title(&argv, Path::new("/work"));
+        let title = format_elevation_title(&argv);
         let expected_cmd = argv.join(" ");
         assert!(
             title.contains(&expected_cmd),
@@ -135,7 +134,7 @@ mod tests {
             "adsfsdafsdafdasadsfsdafsdafsadfasd".repeat(20),
             "BLOB=".to_string() + &"a".repeat(500),
         ];
-        let title = format_elevation_title(&argv, Path::new("/work"));
+        let title = format_elevation_title(&argv);
         assert!(
             !title.contains('\n'),
             "CLI must not insert newlines; the dialog reflows. got {title}"

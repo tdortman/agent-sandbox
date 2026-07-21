@@ -3,16 +3,19 @@
 //!
 //! **Security constraint:** the approval-capable UI socket and session id must
 //! never be passed into the sandboxed agent process. A prior version exported
-//! `AGENT_SANDBOX_UI_FD` / `AGENT_SANDBOX_UI_SESSION_ID` through bwrap `--setenv`,
-//! which let any in-jail process approve pending root elevations. This binary
-//! no longer injects those variables; use a host-side `agent-sandbox-ui` process
-//! (or a future sibling-process holder) for approvals instead.
+//! `AGENT_SANDBOX_UI_FD` / `AGENT_SANDBOX_UI_SESSION_ID` through bwrap
+//! `--setenv`, which let any in-jail process approve pending root elevations.
+//! This binary no longer injects those variables; use a host-side
+//! `agent-sandbox-ui` process (or a future sibling-process holder) for
+//! approvals instead.
 
-use std::ffi::CString;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process;
+use std::{
+    ffi::CString,
+    io::{self, Read, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    process,
+};
 
 use agent_sandbox_core::{RequestContext, RpcRequest};
 use clap::Parser;
@@ -130,8 +133,8 @@ fn main() {
         .write_all(line.as_bytes())
         .unwrap_or_else(|e| die("write RegisterUi", &e));
 
-    // 3. Read exactly one response line byte-by-byte (no BufReader — RegisterUi
-    //    may trigger pending UiPush lines and over-reading would drop them).
+    // 3. Read exactly one response line byte-by-byte (no BufReader — RegisterUi may
+    //    trigger pending UiPush lines and over-reading would drop them).
     let mut resp_buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {

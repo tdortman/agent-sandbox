@@ -3,20 +3,24 @@
 //! Connects to policyd, sends `StartFilesystemMonitor { ctx, static_allow }`,
 //! before the command is accepted but not required.
 
+use std::{
+    ffi::{CStr, CString, OsString},
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    process,
+};
+
 use agent_sandbox_core::{FilesystemRule, RequestContext};
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser as _;
-use std::ffi::{CStr, CString, OsString};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::process;
 
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "agent-sandbox-fs-arm",
     version,
-    about = "Connect to policyd, start the fanotify filesystem monitor, then execvp the real command",
-    long_about = "Runs INSIDE the sandbox as the first process in the dynamic-FS path. Connects \
+    about = "Connect to policyd, start the fanotify filesystem monitor, then execvp the real \
+             command",
+    long_about = r"Runs INSIDE the sandbox as the first process in the dynamic-FS path. Connects \
         to policyd over the policy socket, registers a fanotify filesystem monitor for the \
         current sandbox session, then execvp the real command. The policy socket path comes \
         from the env var AGENT_SANDBOX_POLICY_SOCKET (default /run/agent-sandbox/policy.sock). \
@@ -31,7 +35,9 @@ use std::process;
         agent-sandbox-fs-arm /home/user/bin/my-agent --verbose"
 )]
 struct Cli {
-    /// The command to exec after the monitor is active. Everything after the flags is forwarded verbatim to execvp, including values that look like flags. A `--` separator is accepted but not required.
+    /// The command to exec after the monitor is active. Everything after the
+    /// flags is forwarded verbatim to execvp, including values that look like
+    /// flags. A `--` separator is accepted but not required.
     #[arg(
         value_name = "COMMAND",
         trailing_var_arg = true,
