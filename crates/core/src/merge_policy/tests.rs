@@ -1,11 +1,10 @@
-use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
-use super::io::policy_json;
-use super::*;
-use crate::HttpRule;
-use crate::policy::{FileAccess, FilesystemRule, HttpSection, NetworkRule, Policy, SudoRule};
+use super::{io::policy_json, *};
+use crate::{
+    HttpRule,
+    policy::{FileAccess, FilesystemRule, HttpSection, NetworkRule, Policy, SudoRule},
+};
 
 fn empty_policy() -> Policy {
     Policy::default()
@@ -553,10 +552,10 @@ fn http_merge_unions_methods_for_same_url() {
 
     let merged = merge_layers(&[first, second]);
     assert_eq!(merged.network.http.allow.len(), 1);
-    assert_eq!(
-        merged.network.http.allow[0].methods,
-        vec!["GET".to_string(), "POST".to_string()]
-    );
+    assert_eq!(merged.network.http.allow[0].methods, vec![
+        "GET".to_string(),
+        "POST".to_string()
+    ]);
 }
 
 #[test]
@@ -595,10 +594,10 @@ fn http_merge_partial_method_deny_keeps_allow() {
 
     let merged = merge_layers(&[allow, deny]);
     assert_eq!(merged.network.http.allow.len(), 1);
-    assert_eq!(
-        merged.network.http.allow[0].methods,
-        vec!["GET".to_string(), "POST".to_string()]
-    );
+    assert_eq!(merged.network.http.allow[0].methods, vec![
+        "GET".to_string(),
+        "POST".to_string()
+    ]);
 }
 #[test]
 fn direct_merge_keeps_partially_overlapping_globs() {

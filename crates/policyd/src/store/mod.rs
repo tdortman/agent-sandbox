@@ -22,18 +22,19 @@ mod types;
 mod ui;
 mod ui_route;
 mod util;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
+    time::Instant,
+};
+
 pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, HttpVerdictKey,
     MAX_CONNECTIONS_PER_UID, MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation,
     PendingFilesystem, PendingHttp, PendingKind, PendingNetwork, PendingResource, PolicyStore,
-    PolicydArgs, ProxyFlowState, ProxySessionState, ResourceVerdictKey, TrustedPeer,
-    UiClientHandle, UiSessionContext,
+    PolicydArgs, ProxyFlowState, ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
-
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
 use types::{MergedPolicyCache, PolicyDecisionState};
 
 impl PolicyStore {
@@ -89,6 +90,7 @@ impl PolicyStore {
     pub fn enable_cgroup_freezer(&mut self) {
         self.cgroup_freeze = freeze::CgroupFreezeManager::new();
     }
+
     pub const fn args(&self) -> &PolicydArgs {
         &self.args
     }

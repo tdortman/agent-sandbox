@@ -80,7 +80,8 @@ mod tests {
 
     #[test]
     fn host_matches_ipv6_prefix_wildcard_hextet_boundary_respected() {
-        // "2001:db" is a valid 2-digit hex prefix. Need a case where a part is not 1-4 hex chars.
+        // "2001:db" is a valid 2-digit hex prefix. Need a case where a part is not 1-4
+        // hex chars.
         assert!(!PolicyStore::host_matches("2001:dbg:*", "2001:db8::1"));
     }
 

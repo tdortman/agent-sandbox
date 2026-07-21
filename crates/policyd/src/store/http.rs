@@ -11,8 +11,10 @@ use super::types::{
     HttpPendingKey, HttpVerdictKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING,
     Pending, PendingHttp, PolicyStore, enforce_verdict_cache_limit,
 };
-use crate::error::PolicydError;
-use crate::wire::{UiSpawnContext, UiSpawnGate};
+use crate::{
+    error::PolicydError,
+    wire::{UiSpawnContext, UiSpawnGate},
+};
 
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -189,17 +191,14 @@ impl PolicyStore {
                     }
                 }
             };
-            self.notify_general_ui(
-                &ctx,
-                &UiPush::HttpRequest {
-                    id: pending.pending_id,
-                    request: pending.request.clone(),
-                    cwd: pending.context.cwd.clone(),
-                    home: pending.context.home.clone(),
-                    project_root: pending.context.project_root.clone(),
-                    sandbox_session_id: pending.context.sandbox_session_id.clone(),
-                },
-            )
+            self.notify_general_ui(&ctx, &UiPush::HttpRequest {
+                id: pending.pending_id,
+                request: pending.request.clone(),
+                cwd: pending.context.cwd.clone(),
+                home: pending.context.home.clone(),
+                project_root: pending.context.project_root.clone(),
+                sandbox_session_id: pending.context.sandbox_session_id.clone(),
+            })
             .await;
             if !self.has_ui_for_context(&ctx).await {
                 let spawn = UiSpawnContext {
@@ -336,7 +335,8 @@ impl PolicyStore {
         }
     }
 
-    /// Cancel exactly one HTTP waiter identified by its proxy session and request ID.
+    /// Cancel exactly one HTTP waiter identified by its proxy session and
+    /// request ID.
     ///
     /// # Errors
     ///
@@ -415,7 +415,8 @@ impl PolicyStore {
             })
     }
 
-    /// Resolve a pending HTTP ID. `once` releases all live waiters already coalesced.
+    /// Resolve a pending HTTP ID. `once` releases all live waiters already
+    /// coalesced.
     pub(crate) async fn finish_http(
         &self,
         pending_id: PendingHttpId,
@@ -444,13 +445,10 @@ impl PolicyStore {
         if live_waiters.is_empty() {
             return false;
         }
-        let reply = HttpCheckReply::from_verdict(
-            pending.request.clone(),
-            Verdict {
-                allowed,
-                source: source.clone(),
-            },
-        );
+        let reply = HttpCheckReply::from_verdict(pending.request.clone(), Verdict {
+            allowed,
+            source: source.clone(),
+        });
         for waiter in live_waiters {
             inner
                 .http_waiters

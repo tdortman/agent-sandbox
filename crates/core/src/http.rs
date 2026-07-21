@@ -1,12 +1,13 @@
-//! Typed HTTP request and rule normalization shared by policy, RPC, and proxies.
+//! Typed HTTP request and rule normalization shared by policy, RPC, and
+//! proxies.
 
-use std::fmt;
-use std::net::IpAddr;
-use std::num::NonZeroU16;
+use std::{fmt, net::IpAddr, num::NonZeroU16};
 
 use globset::GlobBuilder;
-use serde::de::{Error as DeError, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as DeError, SeqAccess, Visitor},
+};
 use thiserror::Error;
 use url::Url;
 
@@ -77,11 +78,6 @@ pub enum HttpMethodMatcher {
 }
 
 impl HttpMethodMatcher {
-    #[must_use]
-    pub const fn all() -> Self {
-        Self::All
-    }
-
     /// Construct the matcher represented by a canonical `methods` array.
     ///
     /// An empty array means all methods. One method is represented as
@@ -152,15 +148,6 @@ impl HttpMethodMatcher {
             Self::Exact(method) => vec![method.clone()],
             Self::AnyOf(methods) => methods.clone(),
             Self::All => Vec::new(),
-        }
-    }
-
-    /// Return the legacy singular method when this is an exact matcher.
-    #[must_use]
-    pub const fn as_option(&self) -> Option<&HttpMethod> {
-        match self {
-            Self::Exact(method) => Some(method),
-            Self::AnyOf(_) | Self::All => None,
         }
     }
 }
@@ -293,7 +280,8 @@ impl<'de> Deserialize<'de> for HttpScheme {
     }
 }
 
-/// Canonical HTTP host, preserving whether the authority is an IP literal or DNS name.
+/// Canonical HTTP host, preserving whether the authority is an IP literal or
+/// DNS name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpHost {
     Ip(IpAddr),
@@ -472,6 +460,7 @@ impl NormalizedHttpPath {
             .strip_prefix(self.as_str())
             .is_some_and(|rest| rest.starts_with('/'))
     }
+
     /// Return whether this path is a prefix that covers `request`.
     #[must_use]
     pub fn covers(&self, request: &Self) -> bool {
@@ -613,6 +602,7 @@ impl HttpUrl {
             HttpTarget::Asterisk => None,
         }
     }
+
     #[must_use]
     pub fn covers(&self, request: &Self) -> bool {
         match (&self.pattern, &request.pattern) {
@@ -918,7 +908,6 @@ pub struct HttpContextKey {
     pub project_root: Option<std::path::PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
-
 /// Opaque pending HTTP request identifier encoded as `http:<simple-v7>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PendingHttpId(uuid::Uuid);
@@ -946,11 +935,6 @@ impl PendingHttpId {
             return Err(HttpParseError::InvalidPendingId);
         }
         Ok(Self(uuid))
-    }
-
-    #[must_use]
-    pub const fn uuid(self) -> uuid::Uuid {
-        self.0
     }
 }
 
@@ -1127,7 +1111,7 @@ fn decode_path(raw: &str) -> Result<String, HttpParseError> {
         let high = hex_value(bytes[index + 1]).ok_or(HttpParseError::MalformedEscape)?;
         let low = hex_value(bytes[index + 2]).ok_or(HttpParseError::MalformedEscape)?;
         let decoded = (high << 4) | low;
-        if matches!(decoded, b'/' | b'\\' | b'%' | 0..=0x1f | 0x7f) {
+        if matches!(decoded, b'/' | b'\\' | b'%' | 0..=0x1F | 0x7F) {
             return Err(HttpParseError::EncodedForbiddenByte);
         }
         if is_unreserved(decoded) {

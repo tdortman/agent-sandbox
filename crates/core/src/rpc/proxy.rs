@@ -1,17 +1,20 @@
 //! Typed capabilities and flow-registration wire values for the proxy socket.
 
-use std::fmt;
-use std::net::IpAddr;
-use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::path::PathBuf;
+use std::{
+    fmt,
+    net::IpAddr,
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    path::PathBuf,
+};
 
-use serde::de::Error as DeError;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use uuid::Uuid;
 
 use super::request::RequestContext;
-use crate::hosts::{normalize_dns_name, normalize_host};
-use crate::{HttpRequest, HttpRuleTarget, SandboxPaths};
+use crate::{
+    HttpRequest, HttpRuleTarget, SandboxPaths,
+    hosts::{normalize_dns_name, normalize_host},
+};
 
 /// A non-zero inode number identifying a local socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -30,18 +33,8 @@ impl SocketInode {
     }
 
     #[must_use]
-    pub const fn from_nonzero(value: NonZeroU64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
-    }
-
-    #[must_use]
-    pub const fn as_nonzero(self) -> NonZeroU64 {
-        self.0
     }
 }
 
@@ -70,18 +63,8 @@ impl ProcessStartTimeTicks {
     }
 
     #[must_use]
-    pub const fn from_nonzero(value: NonZeroU64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
-    }
-
-    #[must_use]
-    pub const fn as_nonzero(self) -> NonZeroU64 {
-        self.0
     }
 }
 
@@ -138,10 +121,6 @@ impl ProcessIdentity {
     }
 
     #[must_use]
-    pub const fn start_time(self) -> ProcessStartTimeTicks {
-        self.start_time
-    }
-    #[must_use]
     pub const fn process_start_time_ticks(self) -> ProcessStartTimeTicks {
         self.start_time
     }
@@ -182,15 +161,6 @@ impl SocketIdentity {
 
     #[must_use]
     pub const fn socket_inode(self) -> SocketInode {
-        self.inode
-    }
-    #[must_use]
-    pub const fn process(self) -> ProcessIdentity {
-        self.process
-    }
-
-    #[must_use]
-    pub const fn inode(self) -> SocketInode {
         self.inode
     }
 }
@@ -379,7 +349,7 @@ fn encode_token(bytes: &[u8; 32]) -> String {
     let mut encoded = String::with_capacity(64);
     for byte in bytes {
         encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        encoded.push(HEX[(byte & 0x0F) as usize] as char);
     }
     encoded
 }
@@ -555,6 +525,7 @@ impl NetworkFlowKey {
             destination_port,
         ))
     }
+
     #[must_use]
     pub const fn protocol(&self) -> FlowProtocol {
         self.protocol
@@ -739,6 +710,7 @@ impl FlowContext {
     pub fn sandbox_session_id(&self) -> Option<&str> {
         self.sandbox_session_id.as_deref()
     }
+
     #[must_use]
     pub fn sandbox_session_id_owned(&self) -> Option<String> {
         self.sandbox_session_id.clone()
@@ -859,9 +831,11 @@ pub struct HttpApprovalRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
     use std::net::{IpAddr, Ipv4Addr};
+
+    use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn proxy_ids_require_canonical_uuid_versions() {

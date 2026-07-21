@@ -1,7 +1,6 @@
 //! Resolve request context from an incoming RPC.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, AttributionToken, FileAccess, FilesystemRule, FlowRegistration,
@@ -10,9 +9,10 @@ use agent_sandbox_core::{
     RpcRequest,
 };
 
-use crate::server::dispatch::SocketRole;
-use crate::server::peer::ClientPeer;
-use crate::store::{PolicyStore, TrustedPeer};
+use crate::{
+    server::{dispatch::SocketRole, peer::ClientPeer},
+    store::{PolicyStore, TrustedPeer},
+};
 
 pub(super) enum ResolvedRpcRequest {
     RegisterUi {
@@ -362,15 +362,21 @@ pub fn plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedRpcRequest, plan};
-    use crate::server::{ClientPeer, dispatch::SocketRole};
-    use crate::store::{PolicyStore, PolicydArgs};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
     use agent_sandbox_core::{
         FileAccess, ProcessIds, RequestContext, ResolvedRequestContext, RpcRequest, home_from_uid,
     };
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
+
+    use super::{ResolvedRpcRequest, plan};
+    use crate::{
+        server::{ClientPeer, dispatch::SocketRole},
+        store::{PolicyStore, PolicydArgs},
+    };
 
     fn test_store(dir: &tempfile::TempDir) -> Arc<PolicyStore> {
         Arc::new(PolicyStore::new(PolicydArgs {

@@ -1,18 +1,20 @@
 //! Policy store: elevation.
 
-use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
-use tokio::sync::oneshot;
-use tokio::time;
+use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
-use crate::error::PolicydError;
-use crate::wire::{ElevationRequest, UiSpawnContext, UiSpawnGate};
-
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
+use crate::{
+    error::PolicydError,
+    wire::{ElevationRequest, UiSpawnContext, UiSpawnGate},
+};
 
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
@@ -176,9 +178,10 @@ impl PolicyStore {
                     allowed: false,
                     exit_code: 1,
                     stdout: String::new(),
-                    stderr:
-                        "agent-sandbox: elevation argv[0] must be a bare command resolved via /run/current-system/sw/bin or an absolute path under /run/current-system, with a regular canonical target under /nix/store"
-                            .into(),
+                    stderr: "agent-sandbox: elevation argv[0] must be a bare command resolved via \
+                             /run/current-system/sw/bin or an absolute path under \
+                             /run/current-system, with a regular canonical target under /nix/store"
+                        .into(),
                 },
                 Err(err) => {
                     tracing::warn!(error = %err, "elevation exec rejected");
@@ -206,16 +209,13 @@ impl PolicyStore {
             };
         };
 
-        self.notify_general_ui(
-            &ctx,
-            &UiPush::ElevationRequest {
-                id: entry.id.clone(),
-                argv: Some(argv.clone()),
-                cwd: cwd.clone(),
-                home: home.clone(),
-                project_root: project_root.clone(),
-            },
-        )
+        self.notify_general_ui(&ctx, &UiPush::ElevationRequest {
+            id: entry.id.clone(),
+            argv: Some(argv.clone()),
+            cwd: cwd.clone(),
+            home: home.clone(),
+            project_root: project_root.clone(),
+        })
         .await;
         self.maybe_spawn_elevation_ui(
             &ctx,
@@ -230,6 +230,7 @@ impl PolicyStore {
         self.await_elevation_verdict(&ctx, &entry.id, entry.rx)
             .await
     }
+
     async fn create_pending_elevation_entry(
         &self,
         argv: &[String],
@@ -329,9 +330,9 @@ impl PolicyStore {
                     allowed: false,
                     exit_code: 1,
                     stdout: String::new(),
-                    stderr:
-                        "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)"
-                            .into(),
+                    stderr: "agent-sandbox: no policy UI registered (agent-sandbox-ui or \
+                             auto-spawn)"
+                        .into(),
                 };
             }
             let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
@@ -368,13 +369,19 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::ELEVATION_PATH;
-    use crate::store::types::{PolicyStore, PolicydArgs};
-    use crate::wire::ElevationRequest;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+
+    use super::ELEVATION_PATH;
+    use crate::{
+        store::types::{PolicyStore, PolicydArgs},
+        wire::ElevationRequest,
+    };
 
     fn system_profile_true() -> Option<PathBuf> {
         let path = Path::new(ELEVATION_PATH).join("true");
@@ -461,8 +468,9 @@ mod tests {
 
     #[test]
     fn forged_home_does_not_auto_elevate_via_attacker_policy() {
-        use crate::store::types::TrustedPeer;
         use agent_sandbox_core::{Policy, SudoRule};
+
+        use crate::store::types::TrustedPeer;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_home = tmp.path().join("home/user");

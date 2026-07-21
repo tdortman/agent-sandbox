@@ -1,22 +1,22 @@
 //! Policy store: filesystem (fanotify monitor spawn and declarative checks).
-use std::path::{Path, PathBuf};
-
-use std::io::BufRead;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::{
+    io::BufRead,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, InodeIdentity,
-    ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
+    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
+    InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
     normalize_directory_traverse_access,
 };
-use tokio::sync::oneshot;
-use tokio::time;
+use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
 use super::types::{
-    FilesystemVerdictKey, MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING,
-    Pending, PendingFilesystem, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
+    PendingFilesystem, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext, UiSpawnGate};
 
@@ -284,13 +284,14 @@ impl PolicyStore {
         self.await_filesystem_verdict(&ctx, &result.id, path, access, result.rx)
             .await
     }
+
     async fn check_filesystem_verdict_cache(
         &self,
         path: &Path,
         access: FileAccess,
     ) -> Option<FilesystemCheckReply> {
         let inner = self.inner.lock().await;
-        if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemVerdictKey {
+        if let Some(entry) = inner.filesystem_verdict_cache.get(&FilesystemRuleKey {
             path: path.to_path_buf(),
             access,
         }) && !entry.allowed
@@ -441,7 +442,8 @@ impl PolicyStore {
                 inner.filesystem_futures.remove(pending_id);
                 drop(inner);
                 return FilesystemCheckReply::blocked(
-                    "agent-sandbox: no standalone filesystem policy UI registered (agent-sandbox-ui or auto-spawn)",
+                    "agent-sandbox: no standalone filesystem policy UI registered \
+                     (agent-sandbox-ui or auto-spawn)",
                     path.clone(),
                     access,
                 );
@@ -498,7 +500,7 @@ impl PolicyStore {
         // its hardlinks) fail closed without spamming prompts.
         if !allowed {
             inner.filesystem_verdict_cache.insert(
-                FilesystemVerdictKey { path, access },
+                FilesystemRuleKey { path, access },
                 VerdictEntry {
                     allowed: false,
                     source,
@@ -512,16 +514,21 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FilesystemRule, ProcessIds, ResolvedRequestContext,
         SandboxPaths, VerdictSource,
     };
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
-    use crate::store::types::{PolicyStore, PolicydArgs};
-    use crate::wire::FilesystemCheckRequest;
+    use crate::{
+        store::types::{PolicyStore, PolicydArgs},
+        wire::FilesystemCheckRequest,
+    };
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
@@ -952,8 +959,9 @@ mod tests {
 
     #[test]
     fn expand_static_allow_rules_canonicalizes_home_symlinks() {
-        use super::expand_static_allow_rules;
         use std::os::unix::fs::symlink;
+
+        use super::expand_static_allow_rules;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path();

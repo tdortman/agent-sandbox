@@ -2,12 +2,11 @@
 
 use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 
-use crate::wire::{PendingDecision, ScopeWire};
-
 use super::super::types::{
     Pending, PendingContext, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
     PendingResource, PolicyStore,
 };
+use crate::wire::{PendingDecision, ScopeWire};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionAction {
     Approve,
@@ -57,72 +56,57 @@ impl PolicyStore {
         wire: ScopeWire,
         net: &PendingNetwork,
     ) -> ScopeWire {
-        Self::scope_wire_for_context(
-            wire,
-            PendingContext {
-                cwd: net.cwd.as_deref(),
-                home: net.home.as_deref(),
-                project_root: net.project_root.as_deref(),
-                sandbox_session_id: net.sandbox_session_id.as_deref(),
-            },
-        )
+        Self::scope_wire_for_context(wire, PendingContext {
+            cwd: net.cwd.as_deref(),
+            home: net.home.as_deref(),
+            project_root: net.project_root.as_deref(),
+            sandbox_session_id: net.sandbox_session_id.as_deref(),
+        })
     }
 
     pub(crate) fn scope_wire_for_pending_elevation(
         wire: ScopeWire,
         elev: &PendingElevation,
     ) -> ScopeWire {
-        Self::scope_wire_for_context(
-            wire,
-            PendingContext {
-                cwd: elev.cwd.as_deref(),
-                home: elev.home.as_deref(),
-                project_root: elev.project_root.as_deref(),
-                sandbox_session_id: elev.sandbox_session_id.as_deref(),
-            },
-        )
+        Self::scope_wire_for_context(wire, PendingContext {
+            cwd: elev.cwd.as_deref(),
+            home: elev.home.as_deref(),
+            project_root: elev.project_root.as_deref(),
+            sandbox_session_id: elev.sandbox_session_id.as_deref(),
+        })
     }
 
     pub(crate) fn scope_wire_for_pending_filesystem(
         wire: ScopeWire,
         fs: &PendingFilesystem,
     ) -> ScopeWire {
-        Self::scope_wire_for_context(
-            wire,
-            PendingContext {
-                cwd: fs.cwd.as_deref(),
-                home: fs.home.as_deref(),
-                project_root: fs.project_root.as_deref(),
-                sandbox_session_id: fs.sandbox_session_id.as_deref(),
-            },
-        )
+        Self::scope_wire_for_context(wire, PendingContext {
+            cwd: fs.cwd.as_deref(),
+            home: fs.home.as_deref(),
+            project_root: fs.project_root.as_deref(),
+            sandbox_session_id: fs.sandbox_session_id.as_deref(),
+        })
     }
 
     pub(crate) fn scope_wire_for_pending_resource(
         wire: ScopeWire,
         res: &PendingResource,
     ) -> ScopeWire {
-        Self::scope_wire_for_context(
-            wire,
-            PendingContext {
-                cwd: res.cwd.as_deref(),
-                home: res.home.as_deref(),
-                project_root: res.project_root.as_deref(),
-                sandbox_session_id: res.sandbox_session_id.as_deref(),
-            },
-        )
+        Self::scope_wire_for_context(wire, PendingContext {
+            cwd: res.cwd.as_deref(),
+            home: res.home.as_deref(),
+            project_root: res.project_root.as_deref(),
+            sandbox_session_id: res.sandbox_session_id.as_deref(),
+        })
     }
 
     pub(crate) fn scope_wire_for_pending_dbus(wire: ScopeWire, dbus: &PendingDbus) -> ScopeWire {
-        Self::scope_wire_for_context(
-            wire,
-            PendingContext {
-                cwd: dbus.cwd.as_deref(),
-                home: dbus.home.as_deref(),
-                project_root: dbus.project_root.as_deref(),
-                sandbox_session_id: dbus.sandbox_session_id.as_deref(),
-            },
-        )
+        Self::scope_wire_for_context(wire, PendingContext {
+            cwd: dbus.cwd.as_deref(),
+            home: dbus.home.as_deref(),
+            project_root: dbus.project_root.as_deref(),
+            sandbox_session_id: dbus.sandbox_session_id.as_deref(),
+        })
     }
 
     async fn approval_client_authorized(

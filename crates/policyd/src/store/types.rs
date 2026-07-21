@@ -1,10 +1,11 @@
 //! Policy store types and shared state.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock, atomic::AtomicU64},
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::{
     AttributionToken, CheckReply, DbusTarget, ElevateReply, FileAccess, FilesystemCheckReply,
@@ -13,8 +14,10 @@ use agent_sandbox_core::{
     ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
 };
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, oneshot};
+use tokio::{
+    net::unix::OwnedWriteHalf,
+    sync::{Mutex, oneshot},
+};
 /// Hard cap on the number of pending approval requests held in memory.
 /// Beyond this cap new prompts are blocked instead of being added.
 pub const MAX_PENDING_APPROVALS: usize = 512;
@@ -28,7 +31,8 @@ pub const MAX_WAITERS_PER_PENDING: usize = 64;
 /// map) when the cap is exceeded.
 pub const MAX_VERDICT_CACHE_ENTRIES: usize = 1024;
 
-/// Cap on the number of static filesystem allow rules retained per sandbox session.
+/// Cap on the number of static filesystem allow rules retained per sandbox
+/// session.
 pub const MAX_STATIC_ALLOW_RULES: usize = 4096;
 
 /// Cap on concurrent RPC connections per local uid.
@@ -52,12 +56,6 @@ pub struct SandboxSessionRegistration {
     pub project_root: PathBuf,
 }
 
-/// Key for the network verdict cache: hostname and port.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct NetworkVerdictKey {
-    pub host: String,
-    pub port: u16,
-}
 /// Exact HTTP request and context used for pending approval deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HttpPendingKey {
@@ -77,21 +75,6 @@ pub struct HttpVerdictKey {
 pub struct HttpScopeKey {
     pub target: HttpRuleTarget,
     pub context: HttpContextKey,
-}
-
-/// Key for the filesystem verdict cache: path and access type.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct FilesystemVerdictKey {
-    pub path: PathBuf,
-    pub access: FileAccess,
-}
-
-/// Key for the resource verdict cache: kind, path, and access.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct ResourceVerdictKey {
-    pub kind: ResourceKind,
-    pub path: PathBuf,
-    pub access: ResourceAccess,
 }
 
 /// A cached verdict: whether it was allowed, from which source, and when.
@@ -453,9 +436,9 @@ pub struct PolicyDecisionState {
     pub(crate) proxy_cancellations: HashMap<(ProxySessionToken, ProxyRequestId), ProxyCancellation>,
     pub(crate) ui_clients: HashMap<u64, UiClient>,
     pub(crate) ui_context_by_session: HashMap<String, UiSessionContext>,
-    pub(crate) network_verdict_cache: HashMap<NetworkVerdictKey, VerdictEntry>,
-    pub(crate) filesystem_verdict_cache: HashMap<FilesystemVerdictKey, VerdictEntry>,
-    pub(crate) resource_verdict_cache: HashMap<ResourceVerdictKey, VerdictEntry>,
+    pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
+    pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
+    pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,
     pub(crate) http_verdict_cache: HashMap<HttpVerdictKey, VerdictEntry>,
     pub(crate) ui_spawn_last: HashMap<String, Instant>,
     pub(crate) session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
@@ -495,6 +478,7 @@ impl PolicyDecisionState {
     pub(crate) fn pending_values(&self) -> impl Iterator<Item = &Pending> {
         self.pending.values()
     }
+
     #[cfg(test)]
     pub(crate) fn pending_keys(&self) -> impl Iterator<Item = &String> {
         self.pending.keys()

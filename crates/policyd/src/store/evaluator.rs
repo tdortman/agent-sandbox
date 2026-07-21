@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use agent_sandbox_core::{
-    ApprovalScope, DbusTarget, FileAccess, ResourceAccess, ResourceKind, Verdict, VerdictSource,
-    normalize_directory_traverse_access, normalize_host,
+    ApprovalScope, DbusTarget, FileAccess, ResolvedRequestContext, ResourceAccess, ResourceKind,
+    Verdict, VerdictSource, normalize_directory_traverse_access, normalize_host,
 };
 
-use agent_sandbox_core::ResolvedRequestContext;
-
-use super::PolicyStore;
-use super::access::{filesystem_rules_match_allow, is_sandbox_infrastructure_path};
+use super::{
+    PolicyStore,
+    access::{filesystem_rules_match_allow, is_sandbox_infrastructure_path},
+};
 pub struct PolicyEvaluation<'a> {
     store: &'a PolicyStore,
     ctx: ResolvedRequestContext,
@@ -192,20 +192,18 @@ impl PolicyEvaluation<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
         DeviceAccess, NetworkRuleKey, Policy, ProcessIds, ResourceRule, ResourceRuleKey,
         SandboxPaths, atomic_write_policy,
     };
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use tokio::{net::UnixStream, sync::Mutex};
 
-    use super::super::types::{PolicydArgs, UiClient, UiSessionContext};
-    use super::*;
+    use super::{
+        super::types::{PolicydArgs, UiClient, UiSessionContext},
+        *,
+    };
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
         PolicyStore::new(PolicydArgs {
@@ -234,22 +232,18 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("unix stream pair");
         let (_, writer) = a.into_split();
         let mut inner = store.inner.lock().await;
-        inner.ui_clients.insert(
-            7,
-            UiClient {
-                session_id: session_id.into(),
-                writer: Arc::new(Mutex::new(writer)),
-            },
-        );
-        inner.ui_context_by_session.insert(
-            session_id.into(),
-            UiSessionContext {
+        inner.ui_clients.insert(7, UiClient {
+            session_id: session_id.into(),
+            writer: Arc::new(Mutex::new(writer)),
+        });
+        inner
+            .ui_context_by_session
+            .insert(session_id.into(), UiSessionContext {
                 cwd: Some(cwd),
                 home: Some(home),
                 project_root: Some(project_root),
                 ..Default::default()
-            },
-        );
+            });
     }
 
     #[tokio::test]

@@ -1,11 +1,13 @@
 //! Policy store persistence.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::Path,
+};
 
 use agent_sandbox_core::{
-    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemSortKey, HttpRule, HttpRuleTarget,
-    NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind, ResourceRule, ResourceSortKey,
+    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, HttpRule, HttpRuleTarget,
+    NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey,
     SudoRule, atomic_write_policy, contract_home_path, load_policy, normalize_host,
     trusted_project_policy_path,
 };
@@ -33,7 +35,7 @@ fn network_sort_key(host: &str, port: u16) -> NetworkSortKey {
     NetworkSortKey::new(host, port)
 }
 
-fn filesystem_path_key(path: &Path) -> String {
+fn path_key(path: &Path) -> String {
     let s = path.to_string_lossy();
     let trimmed = s.trim_end_matches('/');
     if trimmed.is_empty() && s.starts_with('/') {
@@ -49,13 +51,13 @@ fn upsert_filesystem_rule(
     access: FileAccess,
     label: &str,
 ) {
-    let key = filesystem_path_key(rule_path);
+    let key = path_key(rule_path);
     let mut merged_access = access;
     let mut insert_index = None;
     let mut retained = Vec::with_capacity(rules.len() + 1);
 
     for rule in rules.drain(..) {
-        if filesystem_path_key(&rule.path) == key {
+        if path_key(&rule.path) == key {
             merged_access = merged_access.union(rule.access);
             insert_index.get_or_insert(retained.len());
         } else {
@@ -73,28 +75,19 @@ fn upsert_filesystem_rule(
 }
 
 fn remove_filesystem_rule(rules: &mut Vec<FilesystemRule>, rule_path: &Path, access: FileAccess) {
-    let key = filesystem_path_key(rule_path);
-    rules.retain(|rule| filesystem_path_key(&rule.path) != key || rule.access != access);
+    let key = path_key(rule_path);
+    rules.retain(|rule| path_key(&rule.path) != key || rule.access != access);
 }
 
-fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemSortKey {
-    FilesystemSortKey::new(
-        contract_home_path(Path::new(&filesystem_path_key(&rule.path)), home),
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemRuleKey {
+    FilesystemRuleKey::new(
+        contract_home_path(Path::new(&path_key(&rule.path)), home),
         rule.access,
     )
 }
 
 fn sort_filesystem_rules(rules: &mut [FilesystemRule], home: Option<&Path>) {
     rules.sort_by_key(|rule| filesystem_rule_sort_key(rule, home));
-}
-fn resource_path_key(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let trimmed = s.trim_end_matches('/');
-    if trimmed.is_empty() && s.starts_with('/') {
-        "/".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
 }
 
 fn upsert_resource_rule(
@@ -104,13 +97,13 @@ fn upsert_resource_rule(
     access: ResourceAccess,
     label: &str,
 ) {
-    let key = resource_path_key(rule_path);
+    let key = path_key(rule_path);
     let mut merged_access = access;
     let mut insert_index = None;
     let mut retained = Vec::with_capacity(rules.len() + 1);
 
     for rule in rules.drain(..) {
-        if rule.kind == kind && resource_path_key(&rule.path) == key {
+        if rule.kind == kind && path_key(&rule.path) == key {
             if let Some(union) = merged_access.union(rule.access) {
                 merged_access = union;
                 insert_index.get_or_insert(retained.len());
@@ -137,16 +130,14 @@ fn remove_resource_rule(
     rule_path: &Path,
     access: ResourceAccess,
 ) {
-    let key = resource_path_key(rule_path);
-    rules.retain(|rule| {
-        rule.kind != kind || resource_path_key(&rule.path) != key || rule.access != access
-    });
+    let key = path_key(rule_path);
+    rules.retain(|rule| rule.kind != kind || path_key(&rule.path) != key || rule.access != access);
 }
 
-fn resource_rule_sort_key(rule: &ResourceRule, home: Option<&Path>) -> ResourceSortKey {
-    ResourceSortKey::new(
+fn resource_rule_sort_key(rule: &ResourceRule, home: Option<&Path>) -> ResourceRuleKey {
+    ResourceRuleKey::new(
         rule.kind,
-        contract_home_path(Path::new(&resource_path_key(&rule.path)), home),
+        contract_home_path(Path::new(&path_key(&rule.path)), home),
         rule.access,
     )
 }
@@ -450,6 +441,7 @@ impl PolicyStore {
         sort_resource_rules(&mut policy.resources.deny, home);
         atomic_write_policy(path, &policy, home, owner_uid, None)
     }
+
     pub(crate) fn persist_dbus_rule(
         path: &Path,
         target: &DbusTarget,
@@ -501,11 +493,12 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl,
         Policy, ResourceAccess, ResourceKind, SocketAccess, atomic_write_policy,
     };
+
+    use super::*;
 
     fn target(method: &str) -> HttpRuleTarget {
         HttpRuleTarget::new(
@@ -528,10 +521,10 @@ mod tests {
 
         let policy = load_policy(&path, None, None);
         assert_eq!(policy.network.http.allow.len(), 1);
-        assert_eq!(
-            policy.network.http.allow[0].methods,
-            vec!["GET".to_owned(), "POST".to_owned()]
-        );
+        assert_eq!(policy.network.http.allow[0].methods, vec![
+            "GET".to_owned(),
+            "POST".to_owned()
+        ]);
 
         PolicyStore::persist_http_rule(&path, &target("POST"), "deny post", false, None, None)
             .expect("persist POST deny");

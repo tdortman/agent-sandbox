@@ -1,7 +1,6 @@
 //! Shared session context for policyd and enforcement daemons.
 
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +11,7 @@ pub struct SessionContext {
     pub project_root: Option<PathBuf>,
 }
 
-pub fn session_context_path() -> PathBuf {
+fn session_context_path() -> PathBuf {
     env::var("AGENT_SANDBOX_SESSION_CONTEXT_PATH").map_or_else(
         |_| PathBuf::from("/run/agent-sandbox/session-context.json"),
         PathBuf::from,
@@ -20,7 +19,7 @@ pub fn session_context_path() -> PathBuf {
 }
 
 #[must_use]
-pub fn read_session_context() -> SessionContext {
+pub(crate) fn read_session_context() -> SessionContext {
     let path = session_context_path();
     let Ok(data) = std::fs::read_to_string(&path) else {
         return SessionContext::default();
@@ -28,7 +27,7 @@ pub fn read_session_context() -> SessionContext {
     serde_json::from_str(&data).unwrap_or_default()
 }
 
-pub fn write_session_context(ctx: &SessionContext) {
+pub(crate) fn write_session_context(ctx: &SessionContext) {
     let path = session_context_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

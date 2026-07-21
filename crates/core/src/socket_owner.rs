@@ -5,12 +5,14 @@
 //! identity. Every candidate is checked against the socket table's UID and
 //! inode, the process start-time ticks, and the descriptor's socket target.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroU32;
-use std::os::unix::fs::MetadataExt;
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZeroU32,
+    os::unix::fs::MetadataExt,
+};
 
 use crate::{FlowProtocol, ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
 
@@ -80,6 +82,7 @@ impl SocketTuple {
     pub const fn remote_port(self) -> u16 {
         self.remote_port
     }
+
     #[must_use]
     pub const fn local_addr(self) -> (IpAddr, u16) {
         (self.local_ip, self.local_port)
@@ -111,12 +114,6 @@ impl OwnerSnapshot {
     /// The typed process/socket identity captured by this snapshot.
     #[must_use]
     pub const fn identity(self) -> SocketIdentity {
-        self.identity
-    }
-
-    /// Alias for callers that name the capability explicitly.
-    #[must_use]
-    pub const fn socket_identity(self) -> SocketIdentity {
         self.identity
     }
 
@@ -154,20 +151,6 @@ impl OwnerSnapshot {
     #[must_use]
     pub const fn socket_inode(self) -> SocketInode {
         self.identity.socket_inode()
-    }
-    #[must_use]
-    pub const fn start_time(self) -> ProcessStartTimeTicks {
-        self.process_start_time_ticks()
-    }
-
-    #[must_use]
-    pub const fn inode(self) -> SocketInode {
-        self.socket_inode()
-    }
-
-    #[must_use]
-    pub const fn socket_fd(self) -> u32 {
-        self.fd()
     }
 }
 
@@ -486,7 +469,7 @@ mod tests {
 
     #[test]
     fn proc_addr_field_ipv6_little_endian_groups() {
-        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1));
         let field = proc_addr_field(ip, 443);
         assert_eq!(field, "B80D0120000000000000000001000000:01BB");
     }

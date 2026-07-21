@@ -1,10 +1,13 @@
 //! UI push payloads (after `register_ui`).
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::http::{HttpRequest, PendingHttpId};
-use crate::policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    http::{HttpRequest, PendingHttpId},
+    policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -58,7 +61,8 @@ pub enum PendingSummary {
 }
 /// UI push after `register_ui` (not a request response).
 ///
-/// `NetworkRequest` attribution hints may be embedded in `url` via `attach_ui_aliases`.
+/// `NetworkRequest` attribution hints may be embedded in `url` via
+/// `attach_ui_aliases`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiPush {

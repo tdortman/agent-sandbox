@@ -1,4 +1,5 @@
-//! Shared policy merge, host normalization, session context, and RPC types for agent-sandbox.
+//! Shared policy merge, host normalization, session context, and RPC types for
+//! agent-sandbox.
 
 pub mod agent_context;
 pub mod approved_bindings;
@@ -43,11 +44,11 @@ pub use merge_policy::{
 pub use policy::{
     DbusBus, DbusFdMetadata, DbusMessageKind, DbusRule, DbusSection, DbusTarget, DeviceAccess,
     DirectNetworkSection, FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection,
-    FilesystemSortKey, HttpSection, InodeIdentity, NetworkRule, NetworkSection, Policy,
-    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, ResourceSection, ResourceSortKey,
-    SocketAccess, SudoRule, SudoSection, contains_glob_syntax, contract_home_path,
-    contract_project_path, expand_home_path, expand_policy_path, filesystem_approval_paths,
-    normalize_directory_traverse_access, open_flags_to_file_access,
+    HttpSection, InodeIdentity, NetworkRule, NetworkSection, Policy, ResourceAccess, ResourceKind,
+    ResourceRule, ResourceRuleKey, ResourceSection, SocketAccess, SudoRule, SudoSection,
+    contains_glob_syntax, contract_home_path, contract_project_path, expand_home_path,
+    expand_policy_path, filesystem_approval_paths, normalize_directory_traverse_access,
+    open_flags_to_file_access,
 };
 pub use proc_context::{
     PeerCredentials, ProcContext, context_from_pid, discover_git_project_root, home_from_uid,
@@ -68,7 +69,7 @@ pub use rpc::{
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
-pub use session_context::{SessionContext, read_session_context, write_session_context};
+pub use session_context::SessionContext;
 pub use socket_owner::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner,
     resolve_owner_snapshot,

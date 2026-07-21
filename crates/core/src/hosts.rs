@@ -1,7 +1,6 @@
 //! Hostname normalization and policy host resolution.
 
-use std::net::IpAddr;
-use std::path::Path;
+use std::{net::IpAddr, path::Path};
 
 use globset::GlobBuilder;
 use hickory_proto::rr::Name;
@@ -147,7 +146,8 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
         }
     } else if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
         // IPv6 literals: generate hextet-prefix wildcards using trailing ":*".
-        // "2001:db8::1" -> ["2001:db8::1", "2001:db8:0:0:0:0:0:*", "2001:db8:0:0:0:0:*", ..., "2001:*"]
+        // "2001:db8::1" -> ["2001:db8::1", "2001:db8:0:0:0:0:0:*",
+        // "2001:db8:0:0:0:0:*", ..., "2001:*"]
         let segments: Vec<String> = ipv6.segments().iter().map(|s| format!("{s:x}")).collect();
         for len in (1..=7).rev() {
             let prefix = segments[..len].join(":");
@@ -192,9 +192,11 @@ impl HostResolution {
     }
 }
 
-/// Resolve a network destination into a policy host and original connect target.
+/// Resolve a network destination into a policy host and original connect
+/// target.
 ///
-/// For IP literals, tries the DNS forwarder cache first, then falls back to the raw IP.
+/// For IP literals, tries the DNS forwarder cache first, then falls back to the
+/// raw IP.
 #[must_use]
 pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) -> HostResolution {
     let connect_host = connect_host.trim();
@@ -213,8 +215,7 @@ pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) ->
 
 #[must_use]
 pub fn allow_keys(host: &str, port: u16) -> Vec<NetworkRuleKey> {
-    let host = normalize_host(host);
-    vec![NetworkRuleKey::new(&host, port)]
+    vec![NetworkRuleKey::new(host, port)]
 }
 
 /// Whether `host` matches a policy `pattern` using globset syntax and
@@ -338,15 +339,12 @@ mod tests {
 
     #[test]
     fn approval_host_patterns_ipv4_prefix_wildcards() {
-        assert_eq!(
-            approval_host_patterns("34.230.40.69"),
-            vec![
-                "34.230.40.69".to_string(),
-                "34.230.40.*".to_string(),
-                "34.230.*".to_string(),
-                "34.*".to_string(),
-            ]
-        );
+        assert_eq!(approval_host_patterns("34.230.40.69"), vec![
+            "34.230.40.69".to_string(),
+            "34.230.40.*".to_string(),
+            "34.230.*".to_string(),
+            "34.*".to_string(),
+        ]);
     }
 
     #[test]
@@ -376,26 +374,20 @@ mod tests {
     }
     #[test]
     fn approval_host_patterns_ipv4_loopback_prefix_wildcards() {
-        assert_eq!(
-            approval_host_patterns("127.0.0.1"),
-            vec![
-                "127.0.0.1".to_string(),
-                "127.0.0.*".to_string(),
-                "127.0.*".to_string(),
-                "127.*".to_string(),
-            ]
-        );
+        assert_eq!(approval_host_patterns("127.0.0.1"), vec![
+            "127.0.0.1".to_string(),
+            "127.0.0.*".to_string(),
+            "127.0.*".to_string(),
+            "127.*".to_string(),
+        ]);
     }
     #[test]
     fn approval_host_patterns_include_parent_domains() {
-        assert_eq!(
-            approval_host_patterns("Foo.Bar.Baz.com."),
-            vec![
-                "foo.bar.baz.com".to_string(),
-                "*.bar.baz.com".to_string(),
-                "*.baz.com".to_string(),
-            ]
-        );
+        assert_eq!(approval_host_patterns("Foo.Bar.Baz.com."), vec![
+            "foo.bar.baz.com".to_string(),
+            "*.bar.baz.com".to_string(),
+            "*.baz.com".to_string(),
+        ]);
     }
 
     #[test]

@@ -1,14 +1,17 @@
 //! Resolved approval scope: typestate after validating RPC context.
 //!
-//! Wire format uses [`ApprovalScope`] directly on requests. Call [`ScopeTarget::resolve`]
-//! so session/global/project requirements are enforced once, in one place.
+//! Wire format uses [`ApprovalScope`] directly on requests. Call
+//! [`ScopeTarget::resolve`] so session/global/project requirements are enforced
+//! once, in one place.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
-use crate::error::ScopeResolveError;
-use crate::merge_policy::trusted_project_policy_path;
-use crate::rpc::ApprovalScope;
+use crate::{
+    error::ScopeResolveError, merge_policy::trusted_project_policy_path, rpc::ApprovalScope,
+};
 
 /// Where an approved/denied rule is stored after scope + context validation.
 #[derive(Debug, Clone)]
@@ -42,12 +45,13 @@ impl ScopeTarget {
     /// [`ScopeTarget`].
     ///
     /// # Errors
-    /// Returns [`ScopeResolveError::SessionRequired`] if the session scope is used
-    /// but no valid session is provided, [`ScopeResolveError::ProjectRootRequired`]
-    /// if the project scope is used without a project root,
-    /// [`ScopeResolveError::HomeRequired`] if the global scope is used without a
-    /// home directory, or [`ScopeResolveError::ProjectPolicy`] if the project
-    /// policy path cannot be resolved.
+    /// Returns [`ScopeResolveError::SessionRequired`] if the session scope is
+    /// used but no valid session is provided,
+    /// [`ScopeResolveError::ProjectRootRequired`] if the project scope is
+    /// used without a project root, [`ScopeResolveError::HomeRequired`] if
+    /// the global scope is used without a home directory, or
+    /// [`ScopeResolveError::ProjectPolicy`] if the project policy path
+    /// cannot be resolved.
     pub fn resolve(ctx: &ScopeContext<'_>) -> Result<Self, ScopeResolveError> {
         match ctx.scope {
             ApprovalScope::Once => Ok(Self::Ephemeral),

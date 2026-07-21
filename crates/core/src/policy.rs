@@ -1,14 +1,15 @@
-//! On-disk policy document (`network` / `sudo` / `filesystem` allow and deny rules).
+//! On-disk policy document (`network` / `sudo` / `filesystem` allow and deny
+//! rules).
 //!
-//! Paths can be absolute (`/foo`), home-relative (`~/foo`), or project-relative (`./foo`).
-//! Paths containing glob syntax are compiled with [`globset`].
+//! Paths can be absolute (`/foo`), home-relative (`~/foo`), or project-relative
+//! (`./foo`). Paths containing glob syntax are compiled with [`globset`].
+
+use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
-use crate::hosts::NetworkRuleKey;
-use crate::http::HttpRule;
+use crate::{hosts::NetworkRuleKey, http::HttpRule};
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -66,9 +67,9 @@ impl FileAccess {
 
     /// Smallest access that conservatively represents both observations.
     ///
-    /// This is stricter than [`Self::union`]: combining an observed read with an
-    /// observed `read_write` must stay `read_write`, not collapse to `write`
-    /// through policy coverage semantics.
+    /// This is stricter than [`Self::union`]: combining an observed read with
+    /// an observed `read_write` must stay `read_write`, not collapse to
+    /// `write` through policy coverage semantics.
     #[must_use]
     pub fn combine_observed(self, other: Self) -> Self {
         if self == other {
@@ -275,21 +276,6 @@ fn path_matches_rule(
     compiled_matches(compiled, &requested, require_directory_boundary)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FilesystemSortKey {
-    pub path: PathBuf,
-    pub access: FileAccess,
-}
-
-impl FilesystemSortKey {
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>, access: FileAccess) -> Self {
-        Self {
-            path: path.into(),
-            access,
-        }
-    }
-}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FilesystemRule {
     pub path: PathBuf,
@@ -308,11 +294,13 @@ impl FilesystemRule {
         }
     }
 
-    /// Whether this rule's path matches the requested path (exact, descendant, or glob).
+    /// Whether this rule's path matches the requested path (exact, descendant,
+    /// or glob).
     ///
-    /// A rule whose `self.path` is a malformed glob pattern (e.g. an unclosed `[`)
-    /// is treated as non-matching rather than panicking. Such rules can arise when
-    /// a user types a free-form path into the approval text field.
+    /// A rule whose `self.path` is a malformed glob pattern (e.g. an unclosed
+    /// `[`) is treated as non-matching rather than panicking. Such rules
+    /// can arise when a user types a free-form path into the approval text
+    /// field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
         if path_matches_rule(&self.path, requested, project_root, false) {
@@ -421,8 +409,9 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
 
 /// Expand a `./...` path to an absolute path under `project_root`.
 ///
-/// Paths that do not start with `./` are returned unchanged. When `project_root`
-/// is `None`, `./` paths are kept as-is (matching will then fail closed).
+/// Paths that do not start with `./` are returned unchanged. When
+/// `project_root` is `None`, `./` paths are kept as-is (matching will then fail
+/// closed).
 #[must_use]
 pub fn expand_project_relative(path: &Path, project_root: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -441,8 +430,8 @@ pub fn expand_project_relative(path: &Path, project_root: &Path) -> PathBuf {
 /// in order.
 ///
 /// Symlinks are resolved so that a rule stored as `/run/nscd/socket`
-/// matches a request for `/var/run/nscd/socket`. Falls back to the expanded path
-/// if canonicalization fails (e.g. the file does not exist yet).
+/// matches a request for `/var/run/nscd/socket`. Falls back to the expanded
+/// path if canonicalization fails (e.g. the file does not exist yet).
 #[must_use]
 pub fn expand_policy_path(
     path: &Path,
@@ -731,24 +720,6 @@ impl ResourceRuleKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ResourceSortKey {
-    pub kind: ResourceKind,
-    pub path: PathBuf,
-    pub access: ResourceAccess,
-}
-
-impl ResourceSortKey {
-    #[must_use]
-    pub fn new(kind: ResourceKind, path: impl Into<PathBuf>, access: ResourceAccess) -> Self {
-        Self {
-            kind,
-            path: path.into(),
-            access,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceRule {
     pub kind: ResourceKind,
@@ -774,11 +745,13 @@ impl ResourceRule {
         }
     }
 
-    /// Whether this rule's path matches the requested path (exact, descendant, or glob).
+    /// Whether this rule's path matches the requested path (exact, descendant,
+    /// or glob).
     ///
-    /// A rule whose `self.path` is a malformed glob pattern (e.g. an unclosed `[`)
-    /// is treated as non-matching rather than panicking. Such rules can arise when
-    /// a user types a free-form path into the approval text field.
+    /// A rule whose `self.path` is a malformed glob pattern (e.g. an unclosed
+    /// `[`) is treated as non-matching rather than panicking. Such rules
+    /// can arise when a user types a free-form path into the approval text
+    /// field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
         if path_matches_rule(&self.path, requested, project_root, false) {
@@ -1238,12 +1211,13 @@ mod dbus_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::{
         DeviceAccess, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule,
         SocketAccess, SudoRule, contract_home_path, contract_project_path, expand_home_path,
         filesystem_approval_paths, open_flags_to_file_access,
     };
-    use std::path::{Path, PathBuf};
 
     #[test]
     fn expand_home_path_blocks_parent_traversal() {
@@ -1271,18 +1245,15 @@ mod tests {
     #[test]
     fn sudo_rule_approval_prefixes_descend_from_most_specific() {
         let argv = vec!["systemctl".into(), "restart".into(), "nginx".into()];
-        assert_eq!(
-            SudoRule::approval_prefixes(&argv),
+        assert_eq!(SudoRule::approval_prefixes(&argv), vec![
             vec![
-                vec![
-                    "systemctl".to_string(),
-                    "restart".to_string(),
-                    "nginx".to_string()
-                ],
-                vec!["systemctl".to_string(), "restart".to_string()],
-                vec!["systemctl".to_string()],
-            ]
-        );
+                "systemctl".to_string(),
+                "restart".to_string(),
+                "nginx".to_string()
+            ],
+            vec!["systemctl".to_string(), "restart".to_string()],
+            vec!["systemctl".to_string()],
+        ]);
     }
 
     #[test]
@@ -1554,15 +1525,12 @@ mod tests {
             Path::new("/home/user/.local/share/foo"),
             Some(Path::new("/home/user")),
         );
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/home/user/.local/share/foo"),
-                PathBuf::from("/home/user/.local/share"),
-                PathBuf::from("/home/user/.local"),
-                PathBuf::from("/home/user"),
-            ]
-        );
+        assert_eq!(paths, vec![
+            PathBuf::from("/home/user/.local/share/foo"),
+            PathBuf::from("/home/user/.local/share"),
+            PathBuf::from("/home/user/.local"),
+            PathBuf::from("/home/user"),
+        ]);
     }
 
     #[test]
@@ -1571,17 +1539,14 @@ mod tests {
             Path::new("/nix/store/abc123/bin/hello"),
             Some(Path::new("/home/user")),
         );
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/nix/store/abc123/bin/hello"),
-                PathBuf::from("/nix/store/abc123/bin"),
-                PathBuf::from("/nix/store/abc123"),
-                PathBuf::from("/nix/store"),
-                PathBuf::from("/nix"),
-                PathBuf::from("/"),
-            ]
-        );
+        assert_eq!(paths, vec![
+            PathBuf::from("/nix/store/abc123/bin/hello"),
+            PathBuf::from("/nix/store/abc123/bin"),
+            PathBuf::from("/nix/store/abc123"),
+            PathBuf::from("/nix/store"),
+            PathBuf::from("/nix"),
+            PathBuf::from("/"),
+        ]);
     }
 
     #[test]

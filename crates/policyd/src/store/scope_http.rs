@@ -5,10 +5,11 @@ use agent_sandbox_core::{
     ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
 };
 
-use super::http::http_context;
-use super::types::{HttpPendingKey, Pending, PendingHttp, PolicyStore};
-use crate::error::PolicydError;
-use crate::wire::ScopeWire;
+use super::{
+    http::http_context,
+    types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
+};
+use crate::{error::PolicydError, wire::ScopeWire};
 
 fn context_for_pending(pending: &PendingHttp, ids: ProcessIds) -> ResolvedRequestContext {
     ResolvedRequestContext::new(
@@ -283,8 +284,7 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use agent_sandbox_core::{
         HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingHttpId,

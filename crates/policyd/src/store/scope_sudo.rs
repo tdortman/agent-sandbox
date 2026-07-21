@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 
-use crate::error::PolicydError;
-use crate::wire::{ScopeWire, SudoScopeOp};
-
-use super::decisions::DecisionAction;
-use super::types::PolicyStore;
+use super::{decisions::DecisionAction, types::PolicyStore};
+use crate::{
+    error::PolicydError,
+    wire::{ScopeWire, SudoScopeOp},
+};
 
 impl PolicyStore {
     fn finalize_sudo_scope(
@@ -113,6 +113,7 @@ impl PolicyStore {
             action,
         )
     }
+
     pub(crate) async fn apply_sudo_scope_session(
         &self,
         action: DecisionAction,

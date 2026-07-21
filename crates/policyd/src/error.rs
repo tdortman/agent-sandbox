@@ -63,7 +63,8 @@ pub enum PolicydError {
     RpcLineTooLarge,
 
     #[error(
-        "elevation argv[0] must be a bare command resolved via /run/current-system/sw/bin or an absolute path under /run/current-system, with a regular canonical target under /nix/store"
+        "elevation argv[0] must be a bare command resolved via /run/current-system/sw/bin or an \
+         absolute path under /run/current-system, with a regular canonical target under /nix/store"
     )]
     ElevationArgvNotAbsolute,
 }

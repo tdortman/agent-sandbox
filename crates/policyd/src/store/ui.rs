@@ -1,22 +1,18 @@
 //! Policy store: ui.
-use std::collections::HashSet;
-use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
 
 use agent_sandbox_core::{ResolvedRequestContext, SessionContext, UiPush, attach_ui_aliases};
-use tokio::io::AsyncWriteExt;
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::Mutex;
+use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
 use uuid::Uuid;
 
-use crate::wire::{UiSpawnContext, UiSpawnGate};
-
-use super::types::{
-    CLIENT_ID, Pending, PendingFilesystem, PendingResource, PolicyStore, UiClient, UiClientHandle,
-    UiSessionContext,
+use super::{
+    types::{
+        CLIENT_ID, Pending, PendingFilesystem, PendingResource, PolicyStore, UiClient,
+        UiClientHandle, UiSessionContext,
+    },
+    ui_route::{UiRoute, paths_match},
 };
-use super::ui_route::{UiRoute, paths_match};
+use crate::wire::{UiSpawnContext, UiSpawnGate};
 
 #[derive(Clone, Copy)]
 enum UiRoutingKind {
@@ -82,6 +78,7 @@ impl PolicyStore {
             .map(|c| c.session_id.clone())
             .collect()
     }
+
     async fn session_ids_for_route(&self, route: &UiRoute, kind: UiRoutingKind) -> HashSet<String> {
         let inner = self.inner.lock().await;
         Self::matching_ui_session_ids(&inner, route, kind)
@@ -183,13 +180,10 @@ impl PolicyStore {
         if ctx.owner_uid.is_none() && peer.uid > 0 {
             ctx.owner_uid = Some(peer.uid);
         }
-        inner.ui_clients.insert(
-            handle.id,
-            UiClient {
-                session_id: session_id.clone(),
-                writer: handle.writer.clone(),
-            },
-        );
+        inner.ui_clients.insert(handle.id, UiClient {
+            session_id: session_id.clone(),
+            writer: handle.writer.clone(),
+        });
         inner.ui_context_by_session.insert(session_id.clone(), ctx);
         session_id
     }
@@ -257,7 +251,8 @@ impl PolicyStore {
         }
     }
 
-    /// Re-notify pending requests that lost their UI, and spawn a UI when needed.
+    /// Re-notify pending requests that lost their UI, and spawn a UI when
+    /// needed.
     pub(crate) async fn reroute_orphaned_pending(&self) {
         let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
         let deadline = tokio::time::Instant::now() + UI_SPAWN_WAIT;
@@ -457,17 +452,19 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use agent_sandbox_core::FileAccess;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::UnixStream;
-    use tokio::sync::{Mutex, oneshot};
+    use tokio::{
+        io::AsyncReadExt,
+        net::UnixStream,
+        sync::{Mutex, oneshot},
+    };
 
     use super::PolicyStore;
-    use crate::store::types::UiClient;
-    use crate::store::{Pending, PendingFilesystem, PendingNetwork, PolicydArgs, UiSessionContext};
+    use crate::store::{
+        Pending, PendingFilesystem, PendingNetwork, PolicydArgs, UiSessionContext, types::UiClient,
+    };
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
@@ -496,24 +493,20 @@ mod tests {
         let (_, write) = a.into_split();
         let (read, _) = b.into_split();
         let mut inner = store.inner.lock().await;
-        inner.ui_clients.insert(
-            client_id,
-            UiClient {
-                session_id: session_id.into(),
-                writer: Arc::new(Mutex::new(write)),
-            },
-        );
-        inner.ui_context_by_session.insert(
-            session_id.into(),
-            UiSessionContext {
+        inner.ui_clients.insert(client_id, UiClient {
+            session_id: session_id.into(),
+            writer: Arc::new(Mutex::new(write)),
+        });
+        inner
+            .ui_context_by_session
+            .insert(session_id.into(), UiSessionContext {
                 cwd: Some("/repo".into()),
                 home: Some("/home/user".into()),
                 project_root: Some("/repo".into()),
                 sandbox_session_id: Some(sandbox_session_id.into()),
                 client_id,
                 ..Default::default()
-            },
-        );
+            });
         read
     }
 

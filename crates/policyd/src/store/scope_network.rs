@@ -6,11 +6,11 @@ use agent_sandbox_core::{
     ScopeTarget, allow_keys,
 };
 
-use crate::error::PolicydError;
-use crate::wire::{NetworkScopeOp, ScopeWire};
-
-use super::decisions::DecisionAction;
-use super::types::PolicyStore;
+use super::{decisions::DecisionAction, types::PolicyStore};
+use crate::{
+    error::PolicydError,
+    wire::{NetworkScopeOp, ScopeWire},
+};
 
 fn session_network_entries(host: &str, port: u16) -> Vec<NetworkRuleKey> {
     if host.starts_with("*.") {
@@ -175,6 +175,7 @@ impl PolicyStore {
             path.map(PathBuf::from),
         ))
     }
+
     pub(crate) async fn resolve_scope_target(
         &self,
         scope: ApprovalScope,
@@ -198,14 +199,14 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::session_network_entries;
     use agent_sandbox_core::NetworkRuleKey;
+
+    use super::session_network_entries;
 
     #[test]
     fn wildcard_session_entry_is_kept_as_pattern() {
-        assert_eq!(
-            session_network_entries("*.baz.com", 443),
-            vec![NetworkRuleKey::new("*.baz.com", 443)]
-        );
+        assert_eq!(session_network_entries("*.baz.com", 443), vec![
+            NetworkRuleKey::new("*.baz.com", 443)
+        ]);
     }
 }

@@ -4,13 +4,11 @@ mod client;
 mod dispatch;
 mod peer;
 
-pub use peer::ClientPeer;
-
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
+pub use peer::ClientPeer;
 use tokio::net::UnixListener;
 
 use crate::store::PolicyStore;
@@ -89,9 +87,9 @@ impl PolicyServer {
 
     /// # Errors
     ///
-    /// Returns an error if the host and sandbox socket paths are identical, if socket
-    /// binding fails (permissions, path length, or filesystem issues), or if Unix-domain
-    /// socket setup fails.
+    /// Returns an error if the host and sandbox socket paths are identical, if
+    /// socket binding fails (permissions, path length, or filesystem
+    /// issues), or if Unix-domain socket setup fails.
     pub async fn run(self) -> std::io::Result<()> {
         if self.host_socket_path == self.sandbox_socket_path {
             return Err(std::io::Error::new(
@@ -169,12 +167,14 @@ impl PolicyServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::store::PolicydArgs;
+    use std::time::Duration;
+
     use agent_sandbox_core::{
         ApprovalScope, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, UiPush,
     };
-    use std::time::Duration;
+
+    use super::*;
+    use crate::store::PolicydArgs;
 
     fn test_args(dir: &tempfile::TempDir) -> PolicydArgs {
         PolicydArgs {
@@ -219,15 +219,12 @@ mod tests {
         // Allow sockets to be created.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // 1. RegisterUi to host socket without a sandbox session is rejected:
-        //    otherwise any host-local process could subscribe to prompts by path.
-        let reply = send_and_recv(
-            &args.host_socket,
-            RpcRequest::RegisterUi {
-                ui_client: Some("standalone".into()),
-                ctx: RequestContext::default(),
-            },
-        )
+        // 1. RegisterUi to host socket without a sandbox session is rejected: otherwise
+        //    any host-local process could subscribe to prompts by path.
+        let reply = send_and_recv(&args.host_socket, RpcRequest::RegisterUi {
+            ui_client: Some("standalone".into()),
+            ctx: RequestContext::default(),
+        })
         .await
         .expect("host RegisterUi");
         assert!(
@@ -235,18 +232,15 @@ mod tests {
             "host RegisterUi without sandbox_session_id must be rejected, got: {reply:?}"
         );
 
-        // 2. RegisterUi to sandbox socket must be REJECTED. The sandbox socket
-        //    is exposed inside the jail; if an attacker could register as the
-        //    UI on it they could approve their own Check/Elevate requests (and
-        //    Elevate runs approved commands as root on the host). See
+        // 2. RegisterUi to sandbox socket must be REJECTED. The sandbox socket is
+        //    exposed inside the jail; if an attacker could register as the UI on it
+        //    they could approve their own Check/Elevate requests (and Elevate runs
+        //    approved commands as root on the host). See
         //    `sandbox_socket_blocks_self_approval_escape` for the full chain.
-        let reply = send_and_recv(
-            &args.sandbox_socket,
-            RpcRequest::RegisterUi {
-                ui_client: Some("standalone".into()),
-                ctx: RequestContext::default(),
-            },
-        )
+        let reply = send_and_recv(&args.sandbox_socket, RpcRequest::RegisterUi {
+            ui_client: Some("standalone".into()),
+            ctx: RequestContext::default(),
+        })
         .await
         .expect("sandbox RegisterUi");
         assert!(
@@ -255,13 +249,10 @@ mod tests {
         );
 
         // 3. StartFilesystemMonitor to sandbox socket should reach handler.
-        let reply = send_and_recv(
-            &args.sandbox_socket,
-            RpcRequest::StartFilesystemMonitor {
-                ctx: RequestContext::default(),
-                static_allow: vec![],
-            },
-        )
+        let reply = send_and_recv(&args.sandbox_socket, RpcRequest::StartFilesystemMonitor {
+            ctx: RequestContext::default(),
+            static_allow: vec![],
+        })
         .await
         .expect("sandbox StartFilesystemMonitor");
         assert!(
@@ -308,8 +299,8 @@ mod tests {
             "RegisterUi should succeed, got: {reply:?}"
         );
 
-        // 2. On the same connection, Check should be rejected because
-        //    the connection transitioned to UiFd.
+        // 2. On the same connection, Check should be rejected because the connection
+        //    transitioned to UiFd.
         let reply = conn
             .request(RpcRequest::Check {
                 host: None,
@@ -561,7 +552,8 @@ mod tests {
             .expect("sandbox Approve");
         assert!(
             matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
-            "Approve must remain blocked on a sandbox connection that failed to register, got: {reply:?}"
+            "Approve must remain blocked on a sandbox connection that failed to register, got: \
+             {reply:?}"
         );
 
         server_task.abort();

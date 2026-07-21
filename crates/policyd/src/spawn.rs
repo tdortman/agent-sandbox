@@ -1,16 +1,20 @@
 //! Auto-spawn agent-sandbox-ui via runuser when no policy UI is connected.
 
-use std::collections::HashMap;
-use std::hash::BuildHasher;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    hash::BuildHasher,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::graphical_env::{graphical_session_env, tool_path};
 use nix::unistd::User;
 
-use crate::store::{PolicyStore, PolicydArgs};
-use crate::wire::{UiSpawnContext, UiSpawnGate};
+use crate::{
+    store::{PolicyStore, PolicydArgs},
+    wire::{UiSpawnContext, UiSpawnGate},
+};
 
 const MAX_UI_SPAWN_THROTTLES: usize = 1024;
 
@@ -100,7 +104,8 @@ pub fn ui_spawn_env(
     env
 }
 
-/// Convert an `Option<&Path>` to a lossy String, returning an empty String for None.
+/// Convert an `Option<&Path>` to a lossy String, returning an empty String for
+/// None.
 fn opt_path_str(path: Option<&Path>) -> String {
     path.map_or_else(String::new, |p| p.to_string_lossy().into_owned())
 }

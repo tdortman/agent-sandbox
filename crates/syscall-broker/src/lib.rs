@@ -1,15 +1,17 @@
 mod policy_client;
 
-pub use policy_client::PersistentPolicyClient;
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
+};
 
 use agent_sandbox_core::{FileAccess, ResourceAccess, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+pub use policy_client::PersistentPolicyClient;
 
-pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
-pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xC050_2100;
+pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
 /// `SECCOMP_IOW(2, __u64)` — not `IOWR` like SEND; argument is a single u64 id.
 pub const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
 pub const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
@@ -104,18 +106,6 @@ impl std::str::FromStr for NetworkMode {
     }
 }
 
-/// Parse the required launcher mode, failing closed for missing or unknown
-/// values instead of silently selecting a transport policy.
-///
-/// # Errors
-///
-/// Returns an error when `value` is missing or is not `direct` or `proxy`.
-pub fn parse_network_mode(value: Option<&str>) -> Result<NetworkMode, String> {
-    value
-        .ok_or_else(|| "network mode is required (direct or proxy)".to_owned())?
-        .parse()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkTarget {
     pub host: String,
@@ -198,7 +188,7 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         out.push(HEX[usize::from(b >> 4)] as char);
-        out.push(HEX[usize::from(b & 0x0f)] as char);
+        out.push(HEX[usize::from(b & 0x0F)] as char);
     }
     out
 }
@@ -212,7 +202,7 @@ fn format_abstract_name(name: &[u8]) -> String {
         return "@hex:".to_string();
     }
     if let Ok(s) = std::str::from_utf8(name)
-        && s.bytes().all(|b| b >= 0x20 && b != 0x7f)
+        && s.bytes().all(|b| b >= 0x20 && b != 0x7F)
     {
         return format!("@abstract:{s}");
     }
@@ -664,7 +654,7 @@ fn sockaddr_target(
         }),
         SockaddrTarget::Unix { address, raw } => {
             let path = match address {
-                UnixAddress::Path(p) => normalize_unix_path(Path::new(&p)),
+                UnixAddress::Path(p) => normalize_path(Path::new(&p)),
                 // Abstract namespace names are hex-encoded strings (@hex:...),
                 // not filesystem paths, but ride in the same PathBuf field and
                 // serde-serialize as strings for policyd's Path::New matching.
@@ -691,39 +681,35 @@ fn filesystem_target(checks: Vec<(PathBuf, FileAccess)>) -> Option<SyscallTarget
     }
 }
 
-fn normalize_check_path(path: &Path) -> PathBuf {
-    normalize_unix_path(path)
-}
-
 fn filesystem_checks_rename(old: &Path, new: &Path) -> Option<SyscallTarget> {
     filesystem_target(vec![
-        (normalize_check_path(old), FileAccess::ReadWrite),
-        (normalize_check_path(new), FileAccess::ReadWrite),
+        (normalize_path(old), FileAccess::ReadWrite),
+        (normalize_path(new), FileAccess::ReadWrite),
     ])
 }
 
 fn filesystem_checks_link(old: &Path, new: &Path) -> Option<SyscallTarget> {
     filesystem_target(vec![
-        (normalize_check_path(old), FileAccess::ReadWrite),
-        (normalize_check_path(new), FileAccess::ReadWrite),
+        (normalize_path(old), FileAccess::ReadWrite),
+        (normalize_path(new), FileAccess::ReadWrite),
     ])
 }
 
 fn filesystem_checks_symlink(target: Option<&Path>, linkpath: &Path) -> Option<SyscallTarget> {
     let mut checks = Vec::new();
     if let Some(target) = target {
-        checks.push((normalize_check_path(target), FileAccess::Read));
+        checks.push((normalize_path(target), FileAccess::Read));
     }
-    checks.push((normalize_check_path(linkpath), FileAccess::Write));
+    checks.push((normalize_path(linkpath), FileAccess::Write));
     filesystem_target(checks)
 }
 
 fn filesystem_checks_unlink(path: &Path) -> Option<SyscallTarget> {
-    filesystem_target(vec![(normalize_check_path(path), FileAccess::Write)])
+    filesystem_target(vec![(normalize_path(path), FileAccess::Write)])
 }
 
 fn filesystem_checks_truncate(path: &Path) -> Option<SyscallTarget> {
-    filesystem_target(vec![(normalize_check_path(path), FileAccess::Write)])
+    filesystem_target(vec![(normalize_path(path), FileAccess::Write)])
 }
 
 /// Read a NUL-terminated path pointer from the tracee. Returns `None` for a
@@ -759,7 +745,8 @@ fn resolve_symlink_target(target: Option<PathBuf>, linkpath: &Path) -> Option<Pa
     }
 }
 
-/// Resolve a tracee `(dirfd, path)` pair the same way the open-family helpers do.
+/// Resolve a tracee `(dirfd, path)` pair the same way the open-family helpers
+/// do.
 fn read_resolved_path_arg(pid: u32, dirfd: u64, path_ptr: u64) -> io::Result<Option<PathBuf>> {
     let Some(path) = read_tracee_path_ptr(pid, path_ptr)? else {
         return Ok(None);
@@ -965,7 +952,7 @@ pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<Sysca
 /// regardless of which symlink alias the tracee used (e.g. `/var/run`
 /// resolves to `/run`). Falls back to the original path if canonicalization
 /// fails (e.g. the socket file does not exist yet).
-fn normalize_unix_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -1046,7 +1033,7 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
     let Ok(Some(raw_path)) = read_tracee_open_path(notif) else {
         return None;
     };
-    let path = normalize_unix_path(&raw_path);
+    let path = normalize_path(&raw_path);
     if !is_device_node_for_resource_gate(&path) {
         return None;
     }
@@ -1211,6 +1198,15 @@ fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> (i32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        net::{IpAddr, Ipv4Addr},
+        os::fd::AsRawFd,
+        path::{Path, PathBuf},
+    };
+
+    use agent_sandbox_syscall::policy::nr;
+
     use super::{
         FileAccess, FilesystemTarget, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID,
         SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
@@ -1222,27 +1218,6 @@ mod tests {
         resolve_tracee_path, revalidate_filesystem_mutation, scheme_for_socket_type,
         target_from_notification, tracee_fd_path, tracee_open_dir_base,
     };
-
-    use agent_sandbox_syscall::policy::nr;
-    use std::fs;
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::os::fd::AsRawFd;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn network_mode_requires_exact_trusted_values() {
-        assert_eq!(
-            super::parse_network_mode(Some("direct")),
-            Ok(super::NetworkMode::Direct)
-        );
-        assert_eq!(
-            super::parse_network_mode(Some("proxy")),
-            Ok(super::NetworkMode::Proxy)
-        );
-        assert!(super::parse_network_mode(None).is_err());
-        assert!(super::parse_network_mode(Some("DIRECT")).is_err());
-        assert!(super::parse_network_mode(Some("sandbox")).is_err());
-    }
 
     #[test]
     fn transient_tracee_io_err_classifies_expected_errno() {
@@ -1395,7 +1370,7 @@ mod tests {
         // Non-UTF-8 or control-byte names keep the `@hex:` form so the key
         // stays byte-stable when there is no printable text to decode.
         let mut bytes = vec![1, 0, 0]; // family + abstract marker
-        bytes.extend_from_slice(&[0xff, 0xab, 0x01]);
+        bytes.extend_from_slice(&[0xFF, 0xAB, 0x01]);
         let parsed = parse_sockaddr(&bytes, bytes.len()).expect("AF_UNIX abstract parses");
         match parsed {
             SockaddrTarget::Unix { address, raw } => {
@@ -1418,7 +1393,7 @@ mod tests {
         // Ponytail: inlined encoder must match the canonical lowercase
         // hex alphabet so policyd's @hex: keys are byte-stable.
         assert_eq!(hex_encode_lower(b""), "");
-        assert_eq!(hex_encode_lower(&[0x00, 0xff, 0xab, 0x10]), "00ffab10");
+        assert_eq!(hex_encode_lower(&[0x00, 0xFF, 0xAB, 0x10]), "00ffab10");
         assert_eq!(hex_encode_lower(b"agent"), "6167656e74");
     }
 
@@ -1698,13 +1673,10 @@ mod tests {
         let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {
             panic!("expected filesystem target");
         };
-        assert_eq!(
-            checks,
-            vec![
-                (PathBuf::from("/tmp/src"), FileAccess::ReadWrite),
-                (PathBuf::from("/tmp/dst"), FileAccess::ReadWrite),
-            ]
-        );
+        assert_eq!(checks, vec![
+            (PathBuf::from("/tmp/src"), FileAccess::ReadWrite),
+            (PathBuf::from("/tmp/dst"), FileAccess::ReadWrite),
+        ]);
     }
 
     /// Mirrors `dispatch_filesystem_target`: every `(path, access)` must pass
@@ -1803,23 +1775,20 @@ mod tests {
         let SyscallTarget::Filesystem(FilesystemTarget { checks }) = symlink else {
             panic!("expected filesystem target");
         };
-        assert_eq!(
-            checks,
-            vec![
-                (PathBuf::from("/tmp/source"), FileAccess::Read),
-                (PathBuf::from("/tmp/link"), FileAccess::Write),
-            ]
-        );
+        assert_eq!(checks, vec![
+            (PathBuf::from("/tmp/source"), FileAccess::Read),
+            (PathBuf::from("/tmp/link"), FileAccess::Write),
+        ]);
 
         let symlink_without_target =
             filesystem_checks_symlink(None, Path::new("/tmp/link")).expect("symlink target");
         let SyscallTarget::Filesystem(FilesystemTarget { checks }) = symlink_without_target else {
             panic!("expected filesystem target");
         };
-        assert_eq!(
-            checks,
-            vec![(PathBuf::from("/tmp/link"), FileAccess::Write)]
-        );
+        assert_eq!(checks, vec![(
+            PathBuf::from("/tmp/link"),
+            FileAccess::Write
+        )]);
     }
 
     #[test]

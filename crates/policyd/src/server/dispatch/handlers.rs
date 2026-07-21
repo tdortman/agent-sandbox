@@ -1,19 +1,24 @@
 //! RPC request handlers after context resolution.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use agent_sandbox_core::{
     ApprovalScope, RegisterUiReply, ResolvedRequestContext, RpcReply, SimpleOkReply,
     split_check_aliases,
 };
 
-use crate::error::PolicydError;
-use crate::server::dispatch::check::{CheckArgs, handle_check};
-use crate::server::dispatch::context::ResolvedRpcRequest;
-use crate::server::peer::ClientPeer;
-use crate::store::{PolicyStore, UiClientHandle};
-use crate::wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire};
+use crate::{
+    error::PolicydError,
+    server::{
+        dispatch::{
+            check::{CheckArgs, handle_check},
+            context::ResolvedRpcRequest,
+        },
+        peer::ClientPeer,
+    },
+    store::{PolicyStore, UiClientHandle},
+    wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire},
+};
 
 pub async fn handle(
     store: &Arc<PolicyStore>,
@@ -115,18 +120,15 @@ async fn handle_network_check(
         ..
     } = args;
     let result = split_check_aliases(url);
-    handle_check(
-        store,
-        CheckArgs {
-            host,
-            connect_host,
-            port,
-            scheme,
-            url: result.url,
-            aliases: result.aliases,
-            ctx,
-        },
-    )
+    handle_check(store, CheckArgs {
+        host,
+        connect_host,
+        port,
+        scheme,
+        url: result.url,
+        aliases: result.aliases,
+        ctx,
+    })
     .await
 }
 
@@ -152,18 +154,15 @@ async fn handle_non_proxy_request(
             url,
             ctx,
         } => {
-            handle_network_check(
-                store,
-                CheckArgs {
-                    host,
-                    connect_host,
-                    port,
-                    scheme,
-                    url,
-                    aliases: Vec::new(),
-                    ctx,
-                },
-            )
+            handle_network_check(store, CheckArgs {
+                host,
+                connect_host,
+                port,
+                scheme,
+                url,
+                aliases: Vec::new(),
+                ctx,
+            })
             .await
         }
         ResolvedRpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
@@ -318,18 +317,14 @@ async fn handle_register_ui(
         }
     }
     let session_id = store
-        .start_ui_session(
-            client,
-            peer,
-            crate::store::UiSessionContext {
-                cwd: paths.cwd_path(),
-                home: paths.home_path(),
-                project_root: paths.project_root_path(),
-                sandbox_session_id: Some(sandbox_session_id),
-                owner_uid: (peer.uid > 0).then_some(peer.uid),
-                client_id: client.id,
-            },
-        )
+        .start_ui_session(client, peer, crate::store::UiSessionContext {
+            cwd: paths.cwd_path(),
+            home: paths.home_path(),
+            project_root: paths.project_root_path(),
+            sandbox_session_id: Some(sandbox_session_id),
+            owner_uid: (peer.uid > 0).then_some(peer.uid),
+            client_id: client.id,
+        })
         .await;
     if let Some(sess) = store.ui_context_for_session(&session_id).await
         && let Some(project_root) = &sess.project_root
@@ -382,14 +377,16 @@ async fn handle_approve_host(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::error::PolicydError;
-    use crate::store::{PolicyStore, PolicydArgs, TrustedPeer};
+    use std::{sync::Arc, time::Duration};
+
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use tokio::{net::UnixStream, sync::Mutex};
+
+    use super::*;
+    use crate::{
+        error::PolicydError,
+        store::{PolicyStore, PolicydArgs, TrustedPeer},
+    };
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {

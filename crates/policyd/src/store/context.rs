@@ -9,10 +9,11 @@ use agent_sandbox_core::{
     trusted_context_from_pid, trusted_project_policy_path,
 };
 
-use crate::store::types::{SandboxSessionRegistration, TrustedPeer};
-use crate::wire::MergeContext;
-
 use super::types::PolicyStore;
+use crate::{
+    store::types::{SandboxSessionRegistration, TrustedPeer},
+    wire::MergeContext,
+};
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     let target = resolve_policy_write_path(path, None)?;
@@ -78,6 +79,7 @@ impl PolicyStore {
         };
         self.resolve_from_peer(ctx, peer)
     }
+
     pub(crate) fn resolve_dbus_proxy_context(
         ctx: &MergeContext,
         peer: TrustedPeer,
@@ -93,6 +95,7 @@ impl PolicyStore {
             ctx.sandbox_session_id.clone(),
         ))
     }
+
     /// Re-resolve a context that was already sanitized upstream by
     /// [`Self::resolve_from_peer`]. Internal store methods invoke this without
     /// a peer. The incoming paths are trusted and only missing fields are
@@ -350,7 +353,8 @@ impl PolicyStore {
         merged
     }
 
-    /// Load merged policy from async handlers without blocking the Tokio runtime.
+    /// Load merged policy from async handlers without blocking the Tokio
+    /// runtime.
     pub(crate) fn merged_for_worker(&self, ctx: &ResolvedRequestContext) -> Policy {
         let ctx = ctx.clone();
         if tokio::runtime::Handle::try_current()
@@ -420,10 +424,12 @@ fn policy_file_mtime(path: &Path) -> Option<super::types::MtimeKey> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use agent_sandbox_core::SudoRule;
+
     use super::*;
     use crate::store::types::PolicydArgs;
-    use agent_sandbox_core::SudoRule;
-    use std::time::Duration;
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {

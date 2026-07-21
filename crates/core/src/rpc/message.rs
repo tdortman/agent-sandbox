@@ -4,8 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::push::UiPush;
-use super::reply::RpcReply;
+use super::{push::UiPush, reply::RpcReply};
 
 /// Outgoing RPC / UI push message.
 #[derive(Debug, Clone, Serialize, Deserialize)]

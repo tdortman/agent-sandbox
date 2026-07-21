@@ -1,22 +1,21 @@
 //! Policy store, network.
-use std::path::{Path, PathBuf};
-
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::{
-    CheckReply, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush, VerdictSource,
-    attach_ui_aliases, normalize_host,
+    CheckReply, NetworkRuleKey, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
+    VerdictSource, attach_ui_aliases, normalize_host,
 };
-use tokio::sync::oneshot;
-use tokio::time;
+use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
-use crate::wire::{NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
-
 use super::types::{
-    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkVerdictKey, NetworkWaiter, Pending,
-    PendingKind, PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
+    PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
+use crate::wire::{NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
 
 /// How long a network verdict is cached after the first policy check for the
 /// same hostname plus port. This deduplicates prompts when curl tries multiple
@@ -59,7 +58,8 @@ struct NetworkWaitTarget<'a> {
 }
 
 impl PolicyStore {
-    /// Finish pending network checks that declarative/session policy already allows (e.g. after a UI client registers).
+    /// Finish pending network checks that declarative/session policy already
+    /// allows (e.g. after a UI client registers).
     pub async fn resolve_pending_declarative_allow(&self) {
         let pending: Vec<Pending> = self
             .inner
@@ -104,7 +104,7 @@ impl PolicyStore {
                 p.id(),
                 true,
                 verdict.source,
-                Some(NetworkVerdictKey {
+                Some(NetworkRuleKey {
                     host: host.clone(),
                     port,
                 }),
@@ -119,7 +119,7 @@ impl PolicyStore {
         pending_id: &str,
         allowed: bool,
         source: VerdictSource,
-        verdict_cache_key: Option<NetworkVerdictKey>,
+        verdict_cache_key: Option<NetworkRuleKey>,
     ) {
         let mut inner = self.inner.lock().await;
         if let Some(waiters) = inner.network_futures.remove(pending_id) {
@@ -135,14 +135,11 @@ impl PolicyStore {
         // Cache the verdict for deduplication of multiple IPs from the same
         // DNS response (e.g. curl trying 6 IPv4 + 4 IPv6 for google.com).
         if let Some(key) = verdict_cache_key {
-            inner.network_verdict_cache.insert(
-                key,
-                VerdictEntry {
-                    allowed,
-                    source,
-                    time: Instant::now(),
-                },
-            );
+            inner.network_verdict_cache.insert(key, VerdictEntry {
+                allowed,
+                source,
+                time: Instant::now(),
+            });
             enforce_verdict_cache_limit(&mut inner.network_verdict_cache);
         }
     }
@@ -226,19 +223,16 @@ impl PolicyStore {
             Self::audit("pending", Some(policy_host.as_str()), Some(port), &scheme);
             // Notify immediately. Late UI registration is flushed by
             // `RegisterUi` in `server::client` (see `flush_pending_to_ui`).
-            self.notify_general_ui(
-                &ctx,
-                &UiPush::NetworkRequest {
-                    id: result.id.clone(),
-                    host: Some(policy_host.clone()),
-                    port: Some(port),
-                    scheme: Some(scheme.clone()),
-                    url: attach_ui_aliases(Some(url.clone()), &aliases),
-                    cwd: cwd.clone(),
-                    home: home.clone(),
-                    project_root: project_root.clone(),
-                },
-            )
+            self.notify_general_ui(&ctx, &UiPush::NetworkRequest {
+                id: result.id.clone(),
+                host: Some(policy_host.clone()),
+                port: Some(port),
+                scheme: Some(scheme.clone()),
+                url: attach_ui_aliases(Some(url.clone()), &aliases),
+                cwd: cwd.clone(),
+                home: home.clone(),
+                project_root: project_root.clone(),
+            })
             .await;
             if !self.has_ui_for_context(&ctx).await {
                 let mut spawn_uid = wire_ids.uid();
@@ -279,13 +273,14 @@ impl PolicyStore {
         )
         .await
     }
+
     async fn check_network_verdict_cache(
         &self,
         policy_host: &str,
         port: u16,
     ) -> Option<CheckReply> {
         let inner = self.inner.lock().await;
-        if let Some(entry) = inner.network_verdict_cache.get(&NetworkVerdictKey {
+        if let Some(entry) = inner.network_verdict_cache.get(&NetworkRuleKey {
             host: policy_host.to_string(),
             port,
         }) && entry.time.elapsed() < NETWORK_VERDICT_CACHE_TTL
@@ -440,7 +435,7 @@ impl PolicyStore {
         let last = !inner.network_futures.contains_key(target.pending_id);
         if last {
             inner.network_verdict_cache.insert(
-                NetworkVerdictKey {
+                NetworkRuleKey {
                     host: target.policy_host.clone(),
                     port: target.port,
                 },
@@ -558,8 +553,9 @@ impl PolicyStore {
 mod tests {
     use std::path::Path;
 
-    use super::{NetworkRequestIdentity, PendingNetwork};
     use agent_sandbox_core::VerdictSource;
+
+    use super::{NetworkRequestIdentity, PendingNetwork};
 
     fn pending_network(host: &str, sandbox_session_id: Option<&str>) -> PendingNetwork {
         PendingNetwork {
@@ -597,16 +593,19 @@ mod tests {
         assert!(!identity.matches(&pending_network("other.example", Some("sandbox-a"))));
     }
 
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use tokio::io::AsyncReadExt;
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
-    use crate::store::types::{Pending, PolicyStore, PolicydArgs, UiClient, UiSessionContext};
-    use crate::wire::NetworkCheckRequest;
     use agent_sandbox_core::{
         FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
+    };
+    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
+
+    use crate::{
+        store::types::{Pending, PolicyStore, PolicydArgs, UiClient, UiSessionContext},
+        wire::NetworkCheckRequest,
     };
 
     fn test_store() -> PolicyStore {
@@ -653,23 +652,19 @@ mod tests {
         let (_, ui_write) = a.into_split();
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "ui1".into(),
-                    writer: Arc::new(Mutex::new(ui_write)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui1".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui1".into(),
+                writer: Arc::new(Mutex::new(ui_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui1".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-cap".into()),
                     ..Default::default()
-                },
-            );
+                });
             inner
                 .session_allow
                 .entry("ui1".into())
@@ -842,22 +837,18 @@ mod tests {
         let (mut ui_read, _) = b.into_split();
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "ui1".into(),
-                    writer: Arc::new(Mutex::new(ui_write)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui1".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui1".into(),
+                writer: Arc::new(Mutex::new(ui_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui1".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     ..Default::default()
-                },
-            );
+                });
         }
         let payload = UiPush::NetworkRequest {
             id: "net:ui".into(),
@@ -896,22 +887,18 @@ mod tests {
         // Register standalone UI client
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                2,
-                UiClient {
-                    session_id: "ui1".into(),
-                    writer: Arc::new(Mutex::new(standalone_write)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui1".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(2, UiClient {
+                session_id: "ui1".into(),
+                writer: Arc::new(Mutex::new(standalone_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui1".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     ..Default::default()
-                },
-            );
+                });
         }
 
         let payload = UiPush::NetworkRequest {
@@ -958,23 +945,19 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "ui1".into(),
-                    writer: Arc::new(Mutex::new(standalone_write)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui1".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui1".into(),
+                writer: Arc::new(Mutex::new(standalone_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui1".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-cap".into()),
                     ..Default::default()
-                },
-            );
+                });
         }
 
         let store_for_task = store.clone();
@@ -1077,22 +1060,18 @@ mod tests {
         // Register standalone UI client
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                3,
-                UiClient {
-                    session_id: "ui2".into(),
-                    writer: Arc::new(Mutex::new(fs_write)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui2".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(3, UiClient {
+                session_id: "ui2".into(),
+                writer: Arc::new(Mutex::new(fs_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui2".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     ..Default::default()
-                },
-            );
+                });
         }
 
         // Insert a filesystem pending and flush

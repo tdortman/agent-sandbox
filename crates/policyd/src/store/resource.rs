@@ -1,17 +1,19 @@
 //! Policy store: resource gate (declarative approval flow).
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use agent_sandbox_core::{
-    DbusTarget, ResourceAccess, ResourceCheckReply, ResourceKind, UiPush, VerdictSource,
+    DbusTarget, ResourceAccess, ResourceCheckReply, ResourceKind, ResourceRuleKey, UiPush,
+    VerdictSource,
 };
-use tokio::sync::oneshot;
-use tokio::time;
+use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
 use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
-    ResourceVerdictKey, VerdictEntry, enforce_verdict_cache_limit,
+    VerdictEntry, enforce_verdict_cache_limit,
 };
 use crate::wire::{ResourceCheckRequest, UiSpawnContext, UiSpawnGate};
 
@@ -21,8 +23,9 @@ struct PendingResResult {
     rx: oneshot::Receiver<ResourceCheckReply>,
 }
 
-/// Context fields threaded into [`PolicyStore::dedup_or_create_pending_resource`],
-/// grouped to keep the function signature under clippy's argument-count threshold.
+/// Context fields threaded into
+/// [`PolicyStore::dedup_or_create_pending_resource`], grouped to keep the
+/// function signature under clippy's argument-count threshold.
 struct PendingCtx<'a> {
     cwd: Option<&'a Path>,
     home: Option<&'a Path>,
@@ -158,7 +161,7 @@ impl PolicyStore {
         access: ResourceAccess,
     ) -> Option<ResourceCheckReply> {
         let inner = self.inner.lock().await;
-        if let Some(entry) = inner.resource_verdict_cache.get(&ResourceVerdictKey {
+        if let Some(entry) = inner.resource_verdict_cache.get(&ResourceRuleKey {
             kind,
             path: path.to_path_buf(),
             access,
@@ -300,7 +303,8 @@ impl PolicyStore {
                 inner.resource_futures.remove(pending_id);
                 drop(inner);
                 return ResourceCheckReply::blocked(
-                    "agent-sandbox: no standalone resource policy UI registered (agent-sandbox-ui or auto-spawn)",
+                    "agent-sandbox: no standalone resource policy UI registered (agent-sandbox-ui \
+                     or auto-spawn)",
                     kind,
                     path.clone(),
                     access,
@@ -357,36 +361,36 @@ impl PolicyStore {
             }
         }
         // Cache the verdict for deduplication.
-        inner.resource_verdict_cache.insert(
-            ResourceVerdictKey { kind, path, access },
-            VerdictEntry {
+        inner
+            .resource_verdict_cache
+            .insert(ResourceRuleKey { kind, path, access }, VerdictEntry {
                 allowed,
                 source,
                 time: Instant::now(),
-            },
-        );
+            });
         enforce_verdict_cache_limit(&mut inner.resource_verdict_cache);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use agent_sandbox_core::{
         ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
         VerdictSource,
     };
-    use tokio::io::AsyncReadExt;
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     use super::PolicyStore;
-    use crate::store::types::UiClient;
-    use crate::store::{PolicydArgs, UiSessionContext};
-    use crate::wire::ResourceCheckRequest;
+    use crate::{
+        store::{PolicydArgs, UiSessionContext, types::UiClient},
+        wire::ResourceCheckRequest,
+    };
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(PolicydArgs {
@@ -431,23 +435,19 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "ui1".into(),
-                    writer: Arc::new(Mutex::new(standalone_write)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui1".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui1".into(),
+                writer: Arc::new(Mutex::new(standalone_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui1".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-cap".into()),
                     ..Default::default()
-                },
-            );
+                });
         }
 
         let store_for_task = store.clone();

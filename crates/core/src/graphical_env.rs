@@ -1,8 +1,6 @@
 //! Environment for Qt/KDE dialogs spawned outside the user's shell.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::process::Command;
+use std::{collections::HashMap, path::Path, process::Command};
 
 const PLASMA_COMM_NAMES: &[&str] = &["plasmashell", "kwin_wayland", "kwin_x11"];
 

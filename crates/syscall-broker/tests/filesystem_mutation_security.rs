@@ -4,8 +4,10 @@
 //! `CheckFilesystem`, and dispatch must deny when any endpoint is denied.
 //! Re-validation must reject path swaps before CONTINUE.
 
-use std::ffi::CString;
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::CString,
+    path::{Path, PathBuf},
+};
 
 use agent_sandbox_core::FileAccess;
 use agent_sandbox_syscall::policy::nr;
@@ -66,10 +68,10 @@ where
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn rename_and_link_register_all_mutation_endpoints() {
-    let rename_checks = filesystem_checks(&notif_with_path_args(
-        nr::RENAME,
-        &["/repo/old.txt", "/repo/new.txt"],
-    ));
+    let rename_checks = filesystem_checks(&notif_with_path_args(nr::RENAME, &[
+        "/repo/old.txt",
+        "/repo/new.txt",
+    ]));
     assert_eq!(
         rename_checks,
         vec![
@@ -79,10 +81,10 @@ fn rename_and_link_register_all_mutation_endpoints() {
         "rename must CheckFilesystem both source and destination with read_write"
     );
 
-    let link_checks = filesystem_checks(&notif_with_path_args(
-        nr::LINK,
-        &["/repo/src.txt", "/repo/dst.txt"],
-    ));
+    let link_checks = filesystem_checks(&notif_with_path_args(nr::LINK, &[
+        "/repo/src.txt",
+        "/repo/dst.txt",
+    ]));
     assert_eq!(
         link_checks,
         vec![
@@ -96,10 +98,10 @@ fn rename_and_link_register_all_mutation_endpoints() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn symlink_checks_target_read_and_linkpath_write() {
-    let symlink_checks = filesystem_checks(&notif_with_path_args(
-        nr::SYMLINK,
-        &["/tmp/target", "/tmp/link"],
-    ));
+    let symlink_checks = filesystem_checks(&notif_with_path_args(nr::SYMLINK, &[
+        "/tmp/target",
+        "/tmp/link",
+    ]));
     assert_eq!(
         symlink_checks,
         vec![

@@ -1,6 +1,8 @@
-use std::io;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
@@ -77,6 +79,7 @@ impl PersistentPolicyClient {
             Err(_) => false,
         }
     }
+
     /// Ask policyd whether a resource-gated syscall is allowed.
     ///
     /// Returns an error if the RPC itself fails. A policy denial is returned
@@ -144,14 +147,17 @@ impl PersistentPolicyClient {
 
 #[cfg(test)]
 mod tests {
-    use super::PersistentPolicyClient;
+    use std::{path::Path, time::Duration};
+
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
-    use std::path::Path;
-    use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
+    use super::PersistentPolicyClient;
 
     #[tokio::test]
     async fn mismatched_reply_invalidates_connection_before_next_request() {

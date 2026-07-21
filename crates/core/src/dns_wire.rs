@@ -2,9 +2,10 @@
 
 use std::collections::HashSet;
 
-use hickory_proto::op::{Message, MessageType};
-use hickory_proto::rr::rdata::svcb::SvcParamValue;
-use hickory_proto::rr::{Name, RData};
+use hickory_proto::{
+    op::{Message, MessageType},
+    rr::{Name, RData, rdata::svcb::SvcParamValue},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsMapping {
@@ -86,7 +87,8 @@ fn mappings_from_svcb_rdata(rdata: &RData, ttl: u32, qname: &str) -> Vec<DnsMapp
     mappings
 }
 
-/// DNS response mapping used to correlate transport-layer destinations with hostnames.
+/// DNS response mapping used to correlate transport-layer destinations with
+/// hostnames.
 #[must_use]
 pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     let Ok(message) = Message::from_vec(data) else {
@@ -131,11 +133,18 @@ pub fn question_name(data: &[u8]) -> Option<String> {
 mod tests {
     use std::net::Ipv6Addr;
 
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{
+            Name, RData, Record, RecordType,
+            rdata::{
+                A, AAAA, CNAME, HTTPS,
+                svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue},
+            },
+        },
+    };
+
     use super::{DnsMapping, mappings_from_response, question_name};
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
-    use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");
@@ -153,14 +162,11 @@ mod tests {
     #[test]
     fn mappings_from_a_response() {
         let pkt = build_a_response("api.openai.com", [52, 54, 28, 178], 120);
-        assert_eq!(
-            mappings_from_response(&pkt),
-            vec![DnsMapping {
-                ip: "52.54.28.178".to_string(),
-                hostname: "api.openai.com".to_string(),
-                ttl: 120,
-            }]
-        );
+        assert_eq!(mappings_from_response(&pkt), vec![DnsMapping {
+            ip: "52.54.28.178".to_string(),
+            hostname: "api.openai.com".to_string(),
+            ttl: 120,
+        }]);
     }
 
     #[test]
@@ -181,21 +187,18 @@ mod tests {
             ));
         let pkt = message.to_vec().expect("encode");
 
-        assert_eq!(
-            mappings_from_response(&pkt),
-            vec![
-                DnsMapping {
-                    ip: "172.66.147.243".to_string(),
-                    hostname: "example.com".to_string(),
-                    ttl: 300,
-                },
-                DnsMapping {
-                    ip: "104.20.23.154".to_string(),
-                    hostname: "example.com".to_string(),
-                    ttl: 300,
-                },
-            ]
-        );
+        assert_eq!(mappings_from_response(&pkt), vec![
+            DnsMapping {
+                ip: "172.66.147.243".to_string(),
+                hostname: "example.com".to_string(),
+                ttl: 300,
+            },
+            DnsMapping {
+                ip: "104.20.23.154".to_string(),
+                hostname: "example.com".to_string(),
+                ttl: 300,
+            },
+        ]);
     }
 
     #[test]
@@ -217,14 +220,11 @@ mod tests {
             ));
         let pkt = message.to_vec().expect("encode");
 
-        assert_eq!(
-            mappings_from_response(&pkt),
-            vec![DnsMapping {
-                ip: "1.2.3.4".to_string(),
-                hostname: "api.cursor.example".to_string(),
-                ttl: 300,
-            }]
-        );
+        assert_eq!(mappings_from_response(&pkt), vec![DnsMapping {
+            ip: "1.2.3.4".to_string(),
+            hostname: "api.cursor.example".to_string(),
+            ttl: 300,
+        }]);
     }
 
     #[test]
@@ -247,43 +247,36 @@ mod tests {
     #[test]
     fn mappings_extract_https_ip_hints() {
         let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
-        let svcb = SVCB::new(
-            1,
-            Name::root(),
-            vec![
-                (
-                    SvcParamKey::Ipv4Hint,
-                    SvcParamValue::Ipv4Hint(IpHint(vec![A::new(1, 2, 3, 4)])),
-                ),
-                (
-                    SvcParamKey::Ipv6Hint,
-                    SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(Ipv6Addr::new(
-                        0x2606, 0x4700, 0x7, 0, 0, 0, 0xa29f, 0x874f,
-                    ))])),
-                ),
-            ],
-        );
+        let svcb = SVCB::new(1, Name::root(), vec![
+            (
+                SvcParamKey::Ipv4Hint,
+                SvcParamValue::Ipv4Hint(IpHint(vec![A::new(1, 2, 3, 4)])),
+            ),
+            (
+                SvcParamKey::Ipv6Hint,
+                SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(Ipv6Addr::new(
+                    0x2606, 0x4700, 0x7, 0, 0, 0, 0xA29F, 0x874F,
+                ))])),
+            ),
+        ]);
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message
             .add_query(Query::query(qname.clone(), RecordType::HTTPS))
             .add_answer(Record::from_rdata(qname, 120, RData::HTTPS(HTTPS(svcb))));
         let pkt = message.to_vec().expect("encode");
 
-        assert_eq!(
-            mappings_from_response(&pkt),
-            vec![
-                DnsMapping {
-                    ip: "1.2.3.4".to_string(),
-                    hostname: "api.cursor.example".to_string(),
-                    ttl: 120,
-                },
-                DnsMapping {
-                    ip: "2606:4700:7::a29f:874f".to_string(),
-                    hostname: "api.cursor.example".to_string(),
-                    ttl: 120,
-                },
-            ]
-        );
+        assert_eq!(mappings_from_response(&pkt), vec![
+            DnsMapping {
+                ip: "1.2.3.4".to_string(),
+                hostname: "api.cursor.example".to_string(),
+                ttl: 120,
+            },
+            DnsMapping {
+                ip: "2606:4700:7::a29f:874f".to_string(),
+                hostname: "api.cursor.example".to_string(),
+                ttl: 120,
+            },
+        ]);
     }
 
     #[test]

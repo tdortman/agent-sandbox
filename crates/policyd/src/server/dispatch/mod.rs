@@ -10,9 +10,7 @@ use std::sync::Arc;
 
 use agent_sandbox_core::{RpcReply, RpcRequest};
 
-use crate::error::PolicydError;
-use crate::server::peer::ClientPeer;
-use crate::store::PolicyStore;
+use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
 
 pub async fn dispatch(
     store: &Arc<PolicyStore>,
@@ -31,19 +29,21 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::{SocketRole, dispatch};
-    use crate::error::PolicydError;
-    use crate::server::peer::ClientPeer;
-    use crate::store::{PolicyStore, PolicydArgs};
+    use std::{sync::Arc, time::Duration};
+
     use agent_sandbox_core::{
         FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
         NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
         SocketInode,
     };
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use tokio::{net::UnixStream, sync::Mutex};
+
+    use super::{SocketRole, dispatch};
+    use crate::{
+        error::PolicydError,
+        server::peer::ClientPeer,
+        store::{PolicyStore, PolicydArgs},
+    };
 
     fn test_store(dir: &tempfile::TempDir) -> Arc<PolicyStore> {
         Arc::new(PolicyStore::new(PolicydArgs {
@@ -142,7 +142,8 @@ mod tests {
 
         assert!(
             matches!(result, Err(PolicydError::UnauthorizedUiRegistration)),
-            "dispatch must reject cross-uid UI registration after planning sandbox ownership, got: {result:?}"
+            "dispatch must reject cross-uid UI registration after planning sandbox ownership, \
+             got: {result:?}"
         );
     }
 

@@ -3,9 +3,11 @@
 //! Used only for UI display when the DNS cache has expired. Policy resolution
 //! must not consult this table.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -142,8 +144,9 @@ impl ApprovedBindings {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the parent directory cannot be created, the data cannot be
-    /// serialized to JSON, or the atomic write (temp file + rename) fails.
+    /// Returns `Err` if the parent directory cannot be created, the data cannot
+    /// be serialized to JSON, or the atomic write (temp file + rename)
+    /// fails.
     pub fn save(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -214,10 +217,9 @@ mod tests {
         let path = dir.path().join("approved-bindings.json");
         let mut bindings = ApprovedBindings::load(&path);
         bindings.record("chatgpt.com", "104.18.32.47");
-        assert_eq!(
-            bindings.aliases("104.18.32.47"),
-            vec!["chatgpt.com".to_string()]
-        );
+        assert_eq!(bindings.aliases("104.18.32.47"), vec![
+            "chatgpt.com".to_string()
+        ]);
     }
 
     #[test]
@@ -226,10 +228,9 @@ mod tests {
         let path = dir.path().join("approved-bindings.json");
         let mut bindings = ApprovedBindings::load(&path);
         bindings.record("Example.COM.", "104.18.32.47");
-        assert_eq!(
-            bindings.aliases("104.18.32.47"),
-            vec!["example.com".to_string()]
-        );
+        assert_eq!(bindings.aliases("104.18.32.47"), vec![
+            "example.com".to_string()
+        ]);
     }
 
     #[test]
@@ -250,10 +251,9 @@ mod tests {
         writer.save().expect("save bindings");
 
         let reader = ApprovedBindings::load(&path);
-        assert_eq!(
-            reader.aliases("104.18.32.47"),
-            vec!["chatgpt.com".to_string()]
-        );
+        assert_eq!(reader.aliases("104.18.32.47"), vec![
+            "chatgpt.com".to_string()
+        ]);
     }
 
     #[test]

@@ -1,10 +1,13 @@
-//! Resolved sandbox paths and process identity (fewer `Option`s in daemon hot paths).
+//! Resolved sandbox paths and process identity (fewer `Option`s in daemon hot
+//! paths).
 
 use std::path::{Path, PathBuf};
 
-use crate::merge_policy::ProjectPolicyContext;
-use crate::proc_context::{ProcContext, context_from_pid, home_from_uid};
-use crate::session_context::{SessionContext, read_session_context, write_session_context};
+use crate::{
+    merge_policy::ProjectPolicyContext,
+    proc_context::{ProcContext, context_from_pid, home_from_uid},
+    session_context::{SessionContext, read_session_context, write_session_context},
+};
 
 fn non_empty_path(path: &Path) -> Option<&Path> {
     if path.as_os_str().is_empty() {
@@ -89,22 +92,6 @@ impl SandboxPaths {
     pub fn project_root_path(&self) -> Option<PathBuf> {
         self.project_root().map(Path::to_path_buf)
     }
-
-    #[must_use]
-    pub fn cwd_string(&self) -> Option<String> {
-        self.cwd().map(|p| p.to_string_lossy().into_owned())
-    }
-
-    #[must_use]
-    pub fn home_string(&self) -> Option<String> {
-        self.home().map(|p| p.to_string_lossy().into_owned())
-    }
-
-    #[must_use]
-    pub fn project_root_string(&self) -> Option<String> {
-        self.project_root()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
 }
 
 impl From<&SandboxPaths> for SessionContext {
@@ -178,7 +165,8 @@ impl ResolvedRequestContext {
     }
 }
 
-/// Resolve sandbox paths from peer env, session file, and `/proc` (never the process cwd).
+/// Resolve sandbox paths from peer env, session file, and `/proc` (never the
+/// process cwd).
 #[must_use]
 pub fn resolve_sandbox_paths(
     peer_cwd: Option<PathBuf>,
@@ -259,9 +247,10 @@ pub fn persist_session_paths(paths: &SandboxPaths) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{ProcessIds, SandboxPaths};
     use crate::SessionContext;
-    use std::path::Path;
 
     #[test]
     fn sandbox_paths_merged_with_prefers_explicit_values() {

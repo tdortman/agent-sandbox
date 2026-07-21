@@ -2,11 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::hosts::NetworkSortKey;
-use crate::http::HttpRule;
-use crate::policy::{
-    FilesystemRule, FilesystemSortKey, NetworkRule, Policy, ResourceRule, ResourceSortKey,
-    SudoRule, contract_home_path, expand_policy_path,
+use crate::{
+    hosts::NetworkSortKey,
+    http::HttpRule,
+    policy::{
+        FilesystemRule, FilesystemRuleKey, NetworkRule, Policy, ResourceRule, ResourceRuleKey,
+        SudoRule, contract_home_path, expand_policy_path,
+    },
 };
 
 /// Maximum on-disk policy JSON size policyd/core will load.
@@ -171,11 +173,11 @@ fn sudo_rule_sort_key(rule: &SudoRule) -> Vec<String> {
     rule.argv.clone()
 }
 
-fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemSortKey {
-    FilesystemSortKey::new(contract_home_path(&rule.path, home), rule.access)
+fn filesystem_rule_sort_key(rule: &FilesystemRule, home: Option<&Path>) -> FilesystemRuleKey {
+    FilesystemRuleKey::new(contract_home_path(&rule.path, home), rule.access)
 }
-fn resource_rule_sort_key(rule: &ResourceRule, home: Option<&Path>) -> ResourceSortKey {
-    ResourceSortKey::new(rule.kind, contract_home_path(&rule.path, home), rule.access)
+fn resource_rule_sort_key(rule: &ResourceRule, home: Option<&Path>) -> ResourceRuleKey {
+    ResourceRuleKey::new(rule.kind, contract_home_path(&rule.path, home), rule.access)
 }
 fn sorted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
@@ -565,15 +567,10 @@ mod tests {
         let path =
             Path::new("/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json");
         let paths = policy_chown_paths(path);
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/home/user/.config/agent-sandbox/projects/home-user-repo"),
-                PathBuf::from(
-                    "/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json",
-                ),
-            ]
-        );
+        assert_eq!(paths, vec![
+            PathBuf::from("/home/user/.config/agent-sandbox/projects/home-user-repo"),
+            PathBuf::from("/home/user/.config/agent-sandbox/projects/home-user-repo/policy.json",),
+        ]);
     }
 
     #[test]
@@ -635,17 +632,14 @@ mod tests {
             .iter()
             .map(|rule| rule.host.as_str())
             .collect();
-        assert_eq!(
-            hosts,
-            vec![
-                "developer.apple.com",
-                "docs.developer.apple.com",
-                "example.com",
-                "api.example.com",
-                "r.jina.ai",
-                "api.z.ai",
-            ]
-        );
+        assert_eq!(hosts, vec![
+            "developer.apple.com",
+            "docs.developer.apple.com",
+            "example.com",
+            "api.example.com",
+            "r.jina.ai",
+            "api.z.ai",
+        ]);
         let _ = std::fs::remove_file(&path);
     }
 

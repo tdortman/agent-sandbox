@@ -1,12 +1,18 @@
 //! JSON-line policyd client helpers.
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::time;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    time,
+};
 
 use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
 
@@ -57,9 +63,9 @@ impl RpcConnection {
     /// Read the next message from the connection.
     ///
     /// # Errors
-    /// Returns [`RpcClientError::Closed`] if the connection is closed by the peer,
-    /// [`RpcClientError::InvalidJson`] if the message is not valid JSON, or
-    /// [`RpcClientError::Io`] on I/O errors.
+    /// Returns [`RpcClientError::Closed`] if the connection is closed by the
+    /// peer, [`RpcClientError::InvalidJson`] if the message is not valid
+    /// JSON, or [`RpcClientError::Io`] on I/O errors.
     pub async fn read_message(&mut self) -> Result<RpcMessage, RpcClientError> {
         let mut buf = String::new();
         if self.reader.read_line(&mut buf).await? == 0 {
@@ -156,8 +162,8 @@ impl PersistentRpcClient {
 /// Open a connection, send a request, and wait for a reply with a timeout.
 ///
 /// # Errors
-/// Returns [`RpcClientError::Timeout`] if the operation does not complete within
-/// `timeout`, or any error from [`RpcConnection::connect`] or
+/// Returns [`RpcClientError::Timeout`] if the operation does not complete
+/// within `timeout`, or any error from [`RpcConnection::connect`] or
 /// [`RpcConnection::request`].
 pub async fn policy_rpc(
     socket_path: impl AsRef<Path>,
@@ -174,12 +180,16 @@ pub async fn policy_rpc(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
     use super::{PersistentRpcClient, RpcClientError};
     use crate::{RequestContext, RpcReply, RpcRequest};
-    use std::time::Duration;
-    use tempfile::tempdir;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
 
     fn request() -> RpcRequest {
         RpcRequest::Check {

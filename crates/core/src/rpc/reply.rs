@@ -1,17 +1,19 @@
-use std::borrow::Cow;
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    fmt,
+    path::{Path, PathBuf},
+};
 
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-use crate::http::{HttpRequest, HttpRuleTarget};
-use crate::policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 
 use super::{
     message::RpcMessage,
     proxy::{AttributionToken, ProxyRequestId, ProxySessionToken},
     scope::ApprovalScope,
+};
+use crate::{
+    http::{HttpRequest, HttpRuleTarget},
+    policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind},
 };
 /// Response envelope for pipelined proxy checks and cancellations.
 ///
@@ -982,6 +984,7 @@ impl ScopeActionReply {
             path,
         })
     }
+
     #[must_use]
     pub fn ok_network(
         host: String,
@@ -1051,6 +1054,7 @@ impl ScopeActionReply {
             policy_path,
         })
     }
+
     #[must_use]
     pub fn ok_dbus(target: DbusTarget, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
         Self::Dbus(DbusScopeActionReply {
@@ -1060,6 +1064,7 @@ impl ScopeActionReply {
             path,
         })
     }
+
     #[must_use]
     pub const fn is_ok(&self) -> bool {
         match self {
@@ -1134,6 +1139,7 @@ impl RpcReply {
             _ => None,
         }
     }
+
     #[must_use]
     pub fn scope_path(&self) -> Option<String> {
         match self {

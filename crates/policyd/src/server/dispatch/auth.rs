@@ -56,7 +56,8 @@ pub const fn is_proxy_request(req: &RpcRequest) -> bool {
             | RpcRequest::ReleaseNetworkFlow { .. }
     )
 }
-/// Whether the request is allowed on an inherited UI fd (already-registered UI connection).
+/// Whether the request is allowed on an inherited UI fd (already-registered UI
+/// connection).
 #[must_use]
 pub const fn is_uifd_request(req: &RpcRequest) -> bool {
     matches!(
@@ -85,13 +86,14 @@ pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), Po
 
 #[cfg(test)]
 mod tests {
-    use super::{SocketRole, ensure_allowed};
-    use crate::error::PolicydError;
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
         NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
         SocketInode,
     };
+
+    use super::{SocketRole, ensure_allowed};
+    use crate::error::PolicydError;
 
     #[test]
     fn sandbox_socket_allows_request_ops() {

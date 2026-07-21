@@ -1,11 +1,12 @@
 //! Privileged host-side cgroup freezer for interactive approvals.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use tracing::warn;
 
@@ -298,8 +299,9 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     fn manager_for(path: &Path, registry: &Path, count: usize) -> CgroupFreezeManager {
         CgroupFreezeManager {

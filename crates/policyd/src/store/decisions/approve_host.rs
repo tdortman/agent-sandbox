@@ -2,11 +2,11 @@
 
 use agent_sandbox_core::{RpcReply, normalize_host};
 
-use crate::error::PolicydError;
-use crate::wire::{HostApproveRequest, NetworkScopeOp, ScopeWire};
-
-use super::super::types::PolicyStore;
-use super::DecisionAction;
+use super::{super::types::PolicyStore, DecisionAction};
+use crate::{
+    error::PolicydError,
+    wire::{HostApproveRequest, NetworkScopeOp, ScopeWire},
+};
 
 impl PolicyStore {
     pub async fn approve_host(&self, req: HostApproveRequest) -> RpcReply {

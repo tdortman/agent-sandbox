@@ -3,14 +3,18 @@
 use std::sync::Arc;
 
 use agent_sandbox_core::{ProxyReply, ProxyRequestId, ProxySessionToken, RpcReply, RpcRequest};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixStream, unix::OwnedWriteHalf},
+    sync::Mutex,
+};
 
 use super::dispatch::SocketRole;
-use crate::error::PolicydError;
-use crate::server::peer::ClientPeer;
-use crate::store::{MAX_RPC_LINE_BYTES, PolicyStore, UiClientHandle};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixStream, unix::OwnedWriteHalf};
-use tokio::sync::Mutex;
+use crate::{
+    error::PolicydError,
+    server::peer::ClientPeer,
+    store::{MAX_RPC_LINE_BYTES, PolicyStore, UiClientHandle},
+};
 
 pub async fn handle_client(
     store: Arc<PolicyStore>,

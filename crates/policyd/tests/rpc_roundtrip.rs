@@ -1,12 +1,12 @@
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use agent_sandbox_core::RpcReply;
 use agent_sandbox_policyd::{PolicyServer, PolicyStore, PolicydArgs};
 use tempfile::tempdir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+};
 
 fn test_args(root: &Path) -> PolicydArgs {
     PolicydArgs {

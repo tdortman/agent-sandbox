@@ -4,14 +4,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::http::{HttpRequest, HttpRuleTarget};
-use crate::{ProcessIds, ResolvedRequestContext, SandboxPaths};
-
-use super::proxy::{
-    AttributionToken, FlowRegistration, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
-    ProxySessionToken,
+use super::{
+    proxy::{
+        AttributionToken, FlowRegistration, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
+        ProxySessionToken,
+    },
+    scope::ApprovalScope,
 };
-use super::scope::ApprovalScope;
+use crate::{
+    ProcessIds, ResolvedRequestContext, SandboxPaths,
+    http::{HttpRequest, HttpRuleTarget},
+};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,7 +132,8 @@ pub enum ApprovalTarget {
 
 /// Incoming RPC request (`op` tag).
 ///
-/// `Check` attribution hints are embedded in `url` via [`attach_check_aliases`].
+/// `Check` attribution hints are embedded in `url` via
+/// [`attach_check_aliases`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RpcRequest {
@@ -534,6 +538,7 @@ impl RpcRequest {
             ctx,
         }
     }
+
     const fn start_filesystem_monitor(
         ctx: RequestContext,
         static_allow: Vec<crate::policy::FilesystemRule>,
@@ -725,6 +730,7 @@ impl RpcRequest {
             | Self::ReleaseNetworkFlow { .. } => None,
         }
     }
+
     pub const fn context_mut(&mut self) -> Option<&mut RequestContext> {
         match self {
             Self::RegisterUi { ctx, .. }
@@ -815,9 +821,10 @@ const fn default_once_scope() -> ApprovalScope {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{ApprovalTarget, RequestContext, RpcRequest};
     use crate::{ProcessIds, ResolvedRequestContext, SandboxPaths};
-    use std::path::PathBuf;
 
     #[test]
     fn attach_check_aliases_roundtrip() {
@@ -852,13 +859,10 @@ mod tests {
             r#"{"op":"approve","id":"p1","scope":"project","target":{"kind":"network_host","host":"*.baz.com"},"ctx":{"cwd":"/tmp"}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            req,
-            RpcRequest::Approve {
-                target: Some(ApprovalTarget::NetworkHost { .. }),
-                ..
-            }
-        ));
+        assert!(matches!(req, RpcRequest::Approve {
+            target: Some(ApprovalTarget::NetworkHost { .. }),
+            ..
+        }));
     }
 
     #[test]

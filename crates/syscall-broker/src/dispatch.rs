@@ -1,14 +1,13 @@
-use std::net::SocketAddr;
-use std::path::Path;
-use std::time::Duration;
+use std::{net::SocketAddr, path::Path, time::Duration};
 
-use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SeccompNotif, SyscallTarget, notification_arch_valid,
     revalidate_filesystem_mutation, send_continue, send_errno,
 };
 use tracing::{debug, info, warn};
+
+use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
 
 fn should_bypass_network_policy(
     network_mode: NetworkMode,
@@ -185,8 +184,9 @@ fn execute_response_plan(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
     use agent_sandbox_syscall_broker::NetworkTarget;
+
+    use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
 
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
         NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {

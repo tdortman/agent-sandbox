@@ -1,6 +1,4 @@
-use std::io;
-use std::path::Path;
-use std::time::Duration;
+use std::{io, path::Path, time::Duration};
 
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
 use agent_sandbox_syscall_broker::{
@@ -22,14 +20,17 @@ impl NormalizedNotification {
     pub const fn target(target: SyscallTarget) -> Self {
         Self::Target { target }
     }
+
     #[cfg(test)]
     pub const fn continue_() -> Self {
         Self::Continue
     }
+
     #[cfg(test)]
     pub const fn deny(errno: i32) -> Self {
         Self::Deny { errno }
     }
+
     pub const fn classification_failure(error: io::Error, transient: bool) -> Self {
         Self::ClassificationFailure { error, transient }
     }
@@ -85,9 +86,11 @@ impl ResponsePlan {
     pub const fn deny(errno: i32) -> Self {
         Self::DenyErrno { errno }
     }
+
     pub const fn emulate_resource(target: ResourceTarget) -> Self {
         Self::EmulateResource { target }
     }
+
     pub const fn revalidate_filesystem(target: FilesystemTarget) -> Self {
         Self::RevalidateFilesystemThenContinue { target }
     }
@@ -215,15 +218,15 @@ pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
 
 #[cfg(test)]
 mod tests {
-    use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
+    use std::{io, path::Path, time::Duration};
+
     use agent_sandbox_core::{
         FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply, ResourceKind,
         VerdictSource,
     };
     use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
-    use std::io;
-    use std::path::Path;
-    use std::time::Duration;
+
+    use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
 
     fn resource_target() -> ResourceTarget {
         ResourceTarget {
@@ -290,12 +293,9 @@ mod tests {
     #[test]
     fn network_verdict_maps_to_plan() {
         assert_eq!(ResponsePlan::plan_network(true), ResponsePlan::Continue);
-        assert_eq!(
-            ResponsePlan::plan_network(false),
-            ResponsePlan::DenyErrno {
-                errno: libc::EACCES
-            }
-        );
+        assert_eq!(ResponsePlan::plan_network(false), ResponsePlan::DenyErrno {
+            errno: libc::EACCES
+        });
     }
 
     #[test]

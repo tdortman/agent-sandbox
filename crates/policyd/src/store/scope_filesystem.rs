@@ -6,13 +6,11 @@ use agent_sandbox_core::{
     ResourceRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
 };
 
-use crate::error::PolicydError;
-use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
-
-use super::decisions::DecisionAction;
-
-use super::persist::PersistResourceRuleArgs;
-use super::types::PolicyStore;
+use super::{decisions::DecisionAction, persist::PersistResourceRuleArgs, types::PolicyStore};
+use crate::{
+    error::PolicydError,
+    wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire},
+};
 
 impl PolicyStore {
     fn finalize_filesystem_scope(
@@ -135,6 +133,7 @@ impl PolicyStore {
         }
         self.finalize_filesystem_scope(&paths, path, access, scope, action)
     }
+
     pub(crate) async fn apply_filesystem_scope_session(
         &self,
         action: DecisionAction,
@@ -194,6 +193,7 @@ impl PolicyStore {
             policy_path.map(PathBuf::from),
         ))
     }
+
     pub(crate) async fn apply_dbus_scope(
         &self,
         target: DbusTarget,
@@ -364,6 +364,7 @@ impl PolicyStore {
         }
         self.finalize_resource_scope(&paths, kind, path, access, scope, action)
     }
+
     pub(crate) async fn apply_resource_scope_session(
         &self,
         action: DecisionAction,

@@ -1,5 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
@@ -514,6 +516,7 @@ impl PolicyStore {
             fingerprint,
         }
     }
+
     /// Recursively index files under a denied directory. Decrements `budget`
     /// per cached file; returns `false` when the budget is exhausted and the
     /// walk was abandoned (deny rules on huge trees, e.g. snapshot
@@ -715,6 +718,7 @@ impl PolicyStore {
                 .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
         })
     }
+
     pub(crate) async fn session_dbus_denied(
         &self,
         target: &DbusTarget,
@@ -761,19 +765,17 @@ impl PolicyStore {
 mod tests {
     use std::{collections::HashSet, path::Path, sync::Arc};
 
-    use super::{
-        is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
-        session_sudo_matches,
-    };
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRuleKey, NetworkRuleKey,
         ResourceAccess, ResourceKind, SocketAccess, Verdict, VerdictSource,
     };
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use tokio::{net::UnixStream, sync::Mutex};
 
-    use crate::store::UiSessionContext;
-    use crate::store::types::UiClient;
+    use super::{
+        is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
+        session_sudo_matches,
+    };
+    use crate::store::{UiSessionContext, types::UiClient};
 
     #[test]
     fn session_filesystem_matches_honors_project_relative_paths() {
@@ -1239,7 +1241,8 @@ mod tests {
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
-            "global ./.git should still match via git-discovered project root when ctx project_root is empty"
+            "global ./.git should still match via git-discovered project root when ctx \
+             project_root is empty"
         );
     }
 
@@ -1315,7 +1318,8 @@ mod tests {
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
-            "./.git/ prefix should match via git-discovered project root when ctx project_root is empty"
+            "./.git/ prefix should match via git-discovered project root when ctx project_root is \
+             empty"
         );
     }
 
@@ -1373,7 +1377,8 @@ mod tests {
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
-            "git root inferred from path should match ./.git even when launcher project_root is stale"
+            "git root inferred from path should match ./.git even when launcher project_root is \
+             stale"
         );
     }
 
@@ -1476,13 +1481,10 @@ mod tests {
             let (a, b) = tokio::net::UnixStream::pair().expect("unix stream pair");
             drop(a);
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                super::super::types::UiClient {
-                    session_id: ui_session_id.into(),
-                    writer: std::sync::Arc::new(tokio::sync::Mutex::new(b.into_split().1)),
-                },
-            );
+            inner.ui_clients.insert(1, super::super::types::UiClient {
+                session_id: ui_session_id.into(),
+                writer: std::sync::Arc::new(tokio::sync::Mutex::new(b.into_split().1)),
+            });
             inner.ui_context_by_session.insert(
                 ui_session_id.into(),
                 super::super::types::UiSessionContext {
@@ -1572,14 +1574,15 @@ mod tests {
         };
         {
             let mut inner = store.inner.lock().await;
-            inner.sandbox_filesystem_static_allow.insert(
-                "sandbox:sandbox-test".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
-                    license_path.clone(),
-                    agent_sandbox_core::FileAccess::All,
-                    "static allow license",
-                )],
-            );
+            inner
+                .sandbox_filesystem_static_allow
+                .insert("sandbox:sandbox-test".into(), vec![
+                    agent_sandbox_core::FilesystemRule::new(
+                        license_path.clone(),
+                        agent_sandbox_core::FileAccess::All,
+                        "static allow license",
+                    ),
+                ]);
         }
 
         assert_eq!(
@@ -1641,14 +1644,15 @@ mod tests {
         };
         {
             let mut inner = store.inner.lock().await;
-            inner.sandbox_filesystem_static_allow.insert(
-                "sandbox:sandbox-inode".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
-                    alias_path.clone(),
-                    agent_sandbox_core::FileAccess::All,
-                    "static allow alias",
-                )],
-            );
+            inner
+                .sandbox_filesystem_static_allow
+                .insert("sandbox:sandbox-inode".into(), vec![
+                    agent_sandbox_core::FilesystemRule::new(
+                        alias_path.clone(),
+                        agent_sandbox_core::FileAccess::All,
+                        "static allow alias",
+                    ),
+                ]);
         }
 
         assert_eq!(
@@ -1723,14 +1727,15 @@ mod tests {
         };
         {
             let mut inner = store.inner.lock().await;
-            inner.sandbox_filesystem_static_allow.insert(
-                "sandbox:sandbox-allow".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
-                    license_path.clone(),
-                    agent_sandbox_core::FileAccess::Read,
-                    "static allow license",
-                )],
-            );
+            inner
+                .sandbox_filesystem_static_allow
+                .insert("sandbox:sandbox-allow".into(), vec![
+                    agent_sandbox_core::FilesystemRule::new(
+                        license_path.clone(),
+                        agent_sandbox_core::FileAccess::Read,
+                        "static allow license",
+                    ),
+                ]);
         }
 
         assert_eq!(
@@ -1793,14 +1798,15 @@ mod tests {
         };
         {
             let mut inner = store.inner.lock().await;
-            inner.sandbox_filesystem_static_allow.insert(
-                "sandbox:sandbox-glob".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
-                    project_root.join("writable/**"),
-                    agent_sandbox_core::FileAccess::All,
-                    "static allow writable tree",
-                )],
-            );
+            inner
+                .sandbox_filesystem_static_allow
+                .insert("sandbox:sandbox-glob".into(), vec![
+                    agent_sandbox_core::FilesystemRule::new(
+                        project_root.join("writable/**"),
+                        agent_sandbox_core::FileAccess::All,
+                        "static allow writable tree",
+                    ),
+                ]);
         }
 
         assert_eq!(
@@ -1959,23 +1965,19 @@ mod tests {
         let (_, writer) = stream.into_split();
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "general-ui".into(),
-                    writer: Arc::new(Mutex::new(writer)),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "general-ui".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "general-ui".into(),
+                writer: Arc::new(Mutex::new(writer)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("general-ui".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-dbus".into()),
                     ..Default::default()
-                },
-            );
+                });
         }
         (store, ctx)
     }
@@ -2012,7 +2014,8 @@ mod tests {
         assert!(store.session_dbus_allowed(&concrete, &ctx).await);
         assert!(!store.session_dbus_allowed(&other, &ctx).await);
 
-        // Wildcard match: broad pattern stored, concrete query allowed, other bus rejected.
+        // Wildcard match: broad pattern stored, concrete query allowed, other bus
+        // rejected.
         let wildcard = DbusTarget::session(
             "org.example.Service",
             "**",

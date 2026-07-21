@@ -2,19 +2,17 @@
 
 use std::time::{Duration, Instant};
 
-use agent_sandbox_core::socket_owner::validate_socket_identity;
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, ProcessIds, ProxyConnectionId, ProxyRequestId, ProxySessionReply,
-    ProxySessionToken, ResolvedRequestContext,
+    ProxySessionToken, ResolvedRequestContext, socket_owner::validate_socket_identity,
 };
+use tokio::sync::oneshot;
 
 use super::types::{
     MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState,
 };
-use crate::error::PolicydError;
-use crate::wire::NetworkCheckRequest;
-use tokio::sync::oneshot;
+use crate::{error::PolicydError, wire::NetworkCheckRequest};
 
 const UNCLAIMED_TTL: Duration = Duration::from_secs(30);
 const CLAIMED_IDLE_TTL: Duration = Duration::from_hours(1);
@@ -103,23 +101,21 @@ impl PolicyStore {
         if inner.proxy_flows.len() >= MAX_PROXY_FLOWS {
             return Err(proxy_error("proxy flow registry is full"));
         }
-        inner.proxy_flows.insert(
-            key,
-            ProxyFlowState {
-                owner,
-                registration,
-                context,
-                attribution_token: None,
-                connection_id: None,
-                claimed_at: None,
-                last_check: now,
-            },
-        );
+        inner.proxy_flows.insert(key, ProxyFlowState {
+            owner,
+            registration,
+            context,
+            attribution_token: None,
+            connection_id: None,
+            claimed_at: None,
+            last_check: now,
+        });
         drop(inner);
         Ok(())
     }
 
-    /// Pin a registered flow to one proxy connection and issue an attribution token.
+    /// Pin a registered flow to one proxy connection and issue an attribution
+    /// token.
     ///
     /// # Errors
     ///
@@ -157,7 +153,8 @@ impl PolicyStore {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicydError`] when the session, claim, or request ID is invalid.
+    /// Returns [`PolicydError`] when the session, claim, or request ID is
+    /// invalid.
     pub async fn check_network_flow(
         &self,
         proxy_session: ProxySessionToken,
@@ -221,7 +218,8 @@ impl PolicyStore {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicydError`] when the session, claim, or request ID is invalid.
+    /// Returns [`PolicydError`] when the session, claim, or request ID is
+    /// invalid.
     pub async fn check_http(
         &self,
         proxy_session: ProxySessionToken,
@@ -369,7 +367,7 @@ impl PolicyStore {
                 state.last_check = Instant::now();
             }
 
-            let pending_ids = inner.http_futures.keys().copied().collect::<Vec<_>>();
+            let pending_ids = inner.http_futures.keys().cloned().collect::<Vec<_>>();
             let mut canceled = Vec::new();
             for pending_id in pending_ids {
                 let Some(waiters) = inner.http_futures.remove(&pending_id) else {
@@ -486,17 +484,16 @@ fn prune_flows(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::store::types::{Pending, PolicyStore, PolicydArgs};
-    use agent_sandbox_core::socket_owner::{
-        OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot,
-    };
+    use std::{sync::Arc, time::Duration};
+
     use agent_sandbox_core::{
         FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
         SocketIdentity, SocketInode, VerdictSource,
+        socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
-    use std::sync::Arc;
-    use std::time::Duration;
+
+    use super::*;
+    use crate::store::types::{Pending, PolicyStore, PolicydArgs};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
         PolicyStore::new(PolicydArgs {

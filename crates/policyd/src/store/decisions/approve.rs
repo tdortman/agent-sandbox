@@ -7,13 +7,17 @@ use agent_sandbox_core::{
     SudoRule, VerdictSource, host_pattern_matches,
 };
 
-use super::super::types::{
-    NetworkVerdictKey, Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
-    PendingResource, PolicyStore,
+use super::{
+    super::types::{
+        Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
+        PolicyStore,
+    },
+    DecisionAction,
 };
-use super::DecisionAction;
-use crate::error::PolicydError;
-use crate::wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp};
+use crate::{
+    error::PolicydError,
+    wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp},
+};
 
 impl PolicyStore {
     pub async fn approve(&self, decision: PendingDecision) -> RpcReply {
@@ -133,7 +137,7 @@ impl PolicyStore {
                 &pending_id,
                 true,
                 VerdictSource::Scope(ApprovalScope::Once),
-                Some(NetworkVerdictKey {
+                Some(NetworkRuleKey {
                     host: resolved.host.clone(),
                     port: resolved.port,
                 }),
@@ -167,7 +171,7 @@ impl PolicyStore {
                         &pending_id,
                         true,
                         source,
-                        Some(NetworkVerdictKey {
+                        Some(NetworkRuleKey {
                             host: resolved.host.clone(),
                             port: resolved.port,
                         }),
@@ -179,7 +183,7 @@ impl PolicyStore {
                         &pending_id,
                         false,
                         VerdictSource::User,
-                        Some(NetworkVerdictKey {
+                        Some(NetworkRuleKey {
                             host: resolved.host.clone(),
                             port: resolved.port,
                         }),
@@ -192,7 +196,7 @@ impl PolicyStore {
                 &pending_id,
                 false,
                 VerdictSource::Blocked,
-                Some(NetworkVerdictKey {
+                Some(NetworkRuleKey {
                     host: resolved.host.clone(),
                     port: resolved.port,
                 }),
@@ -770,24 +774,27 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
 
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
-        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
-        load_policy,
+        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, ResourceRuleKey, RpcReply,
+        SandboxPaths, load_policy,
     };
-    use tokio::net::UnixStream;
-    use tokio::sync::Mutex;
+    use tokio::{net::UnixStream, sync::Mutex};
 
-    use crate::store::types::{PendingDbus, UiClient, UiSessionContext};
-    use crate::store::{
-        Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource, PolicyStore,
-        PolicydArgs,
+    use crate::{
+        store::{
+            Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
+            PolicyStore, PolicydArgs,
+            types::{PendingDbus, UiClient, UiSessionContext},
+        },
+        wire::{PendingDecision, ScopeWire},
     };
-    use crate::wire::{PendingDecision, ScopeWire};
 
     #[test]
     fn network_target_accepts_parent_domain_patterns() {
@@ -1366,20 +1373,18 @@ mod tests {
             RpcReply::ScopeAction(agent_sandbox_core::ScopeActionReply::Dbus(_))
         ));
         let inner = store.inner.lock().await;
-        assert!(inner.resource_verdict_cache.contains_key(
-            &crate::store::types::ResourceVerdictKey {
-                kind: ResourceKind::UnixSocket,
-                path: path.clone(),
-                access: ResourceAccess::default(),
-            }
-        ));
-        assert!(!inner.resource_verdict_cache.contains_key(
-            &crate::store::types::ResourceVerdictKey {
+        assert!(inner.resource_verdict_cache.contains_key(&ResourceRuleKey {
+            kind: ResourceKind::UnixSocket,
+            path: path.clone(),
+            access: ResourceAccess::default(),
+        }));
+        assert!(
+            !inner.resource_verdict_cache.contains_key(&ResourceRuleKey {
                 kind: ResourceKind::UnixSocket,
                 path: PathBuf::from("@dbus"),
                 access: ResourceAccess::default(),
-            }
-        ));
+            })
+        );
         drop(inner);
     }
 
@@ -1463,13 +1468,10 @@ mod tests {
 
     async fn add_ui_sessions(store: &PolicyStore) {
         let mut inner = store.inner.lock().await;
-        inner.ui_clients.insert(
-            1,
-            UiClient {
-                session_id: "ui-session".into(),
-                writer: writer(),
-            },
-        );
+        inner.ui_clients.insert(1, UiClient {
+            session_id: "ui-session".into(),
+            writer: writer(),
+        });
         inner
             .ui_context_by_session
             .insert("ui-session".into(), ui_session_context());
@@ -1632,24 +1634,20 @@ mod tests {
         let store = test_store("cross-connection-approve");
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "ui-b".into(),
-                    writer: writer(),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui-b".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui-b".into(),
+                writer: writer(),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui-b".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-b".into()),
                     owner_uid: Some(1000),
                     client_id: 1,
-                },
-            );
+                });
         }
 
         let mut pending = pending_filesystem();
@@ -1689,24 +1687,20 @@ mod tests {
         let store = test_store("sandbox-session-uifd-approval");
         {
             let mut inner = store.inner.lock().await;
-            inner.ui_clients.insert(
-                1,
-                UiClient {
-                    session_id: "ui-a".into(),
-                    writer: writer(),
-                },
-            );
-            inner.ui_context_by_session.insert(
-                "ui-a".into(),
-                UiSessionContext {
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui-a".into(),
+                writer: writer(),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui-a".into(), UiSessionContext {
                     cwd: Some("/repo".into()),
                     home: Some("/home/user".into()),
                     project_root: Some("/repo".into()),
                     sandbox_session_id: Some("sandbox-a".into()),
                     owner_uid: Some(1000),
                     client_id: 1,
-                },
-            );
+                });
         }
 
         let mut pending = pending_filesystem();
@@ -1786,24 +1780,20 @@ mod tests {
             for (client_id, ui_session_id, sandbox_session_id) in
                 [(10_u64, "ui-a", "sandbox-a"), (11_u64, "ui-b", "sandbox-b")]
             {
-                inner.ui_clients.insert(
-                    client_id,
-                    UiClient {
-                        session_id: ui_session_id.into(),
-                        writer: writer(),
-                    },
-                );
-                inner.ui_context_by_session.insert(
-                    ui_session_id.into(),
-                    UiSessionContext {
+                inner.ui_clients.insert(client_id, UiClient {
+                    session_id: ui_session_id.into(),
+                    writer: writer(),
+                });
+                inner
+                    .ui_context_by_session
+                    .insert(ui_session_id.into(), UiSessionContext {
                         cwd: Some("/repo".into()),
                         home: Some("/home/user".into()),
                         project_root: Some("/repo".into()),
                         sandbox_session_id: Some(sandbox_session_id.into()),
                         owner_uid: Some(1000),
                         client_id,
-                    },
-                );
+                    });
             }
             inner
                 .session_allow

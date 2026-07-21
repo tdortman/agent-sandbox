@@ -1,13 +1,16 @@
+use std::path::{Path, PathBuf};
+
 use super::{
     ApprovalScope, CheckReply, ElevateReply, FilesystemCheckReply, FilesystemMonitorReply,
     HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RegisterUiReply,
     ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
     StatusReply, UiPush, Verdict, VerdictSource,
 };
-use crate::ResourceKind;
-use crate::http::HttpRequest;
-use crate::policy::{DeviceAccess, FileAccess, ResourceAccess};
-use std::path::{Path, PathBuf};
+use crate::{
+    ResourceKind,
+    http::HttpRequest,
+    policy::{DeviceAccess, FileAccess, ResourceAccess},
+};
 
 #[test]
 fn check_request_deserializes() {

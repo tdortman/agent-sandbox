@@ -1,13 +1,16 @@
-//! Merge policy layers with deny-wins semantics. A deny rule for a key is final even if a later layer allowed it.
+//! Merge policy layers with deny-wins semantics. A deny rule for a key is final
+//! even if a later layer allowed it.
 
 use std::collections::BTreeMap;
 
-use crate::hosts::{host_pattern_has_glob, host_pattern_matches};
-use crate::http::{HttpMethodMatcher, HttpRule, HttpRuleTarget, HttpUrl};
-use crate::policy::{
-    DbusRule, DbusSection, DirectNetworkSection, FilesystemRule, FilesystemRuleKey,
-    FilesystemSection, HttpSection, NetworkRule, NetworkSection, Policy, ResourceRule,
-    ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
+use crate::{
+    hosts::{host_pattern_has_glob, host_pattern_matches},
+    http::{HttpMethodMatcher, HttpRule, HttpRuleTarget, HttpUrl},
+    policy::{
+        DbusRule, DbusSection, DirectNetworkSection, FilesystemRule, FilesystemRuleKey,
+        FilesystemSection, HttpSection, NetworkRule, NetworkSection, Policy, ResourceRule,
+        ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
+    },
 };
 
 #[must_use]

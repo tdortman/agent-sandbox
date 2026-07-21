@@ -1,15 +1,17 @@
 pub(crate) mod decision;
 pub(crate) mod dispatch;
 
-use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    net::SocketAddr,
+    os::fd::{AsFd, AsRawFd, OwnedFd},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, ResourceTarget, SeccompNotif, parse_network_mode, recv_notification,
+    PersistentPolicyClient, ResourceTarget, SeccompNotif, normalize_path, recv_notification,
     send_addfd, send_continue, send_errno, send_result,
 };
 use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
@@ -22,7 +24,7 @@ use tracing::{debug, info, warn};
     name = "agent-sandbox-syscall-broker",
     version,
     about = "Host-side seccomp user-notification broker for sandboxed agents",
-    long_about = "Runs OUTSIDE the sandbox (typically as the child of `agent-sandbox-syscall-arm`) \
+    long_about = r"Runs OUTSIDE the sandbox (typically as the child of `agent-sandbox-syscall-arm`) \
         and consumes the seccomp user-notification file descriptor the arm inherited from its \
         parent. For each notification the broker asks policyd whether the target syscall is \
         allowed, then writes a `SECCOMP_IOCTL_NOTIF_SEND` continue response with the chosen \
@@ -52,11 +54,14 @@ struct Cli {
     #[arg(long, value_name = "IP:PORT", env = "AGENT_SANDBOX_DNS_ENDPOINT")]
     dns_endpoint: Option<SocketAddr>,
 
-    /// Inherited seccomp user-notification file descriptor. The arm uses `SCM_RIGHTS` to pass this fd across exec. The broker sets it non-blocking and loops on `SECCOMP_IOCTL_NOTIF_RECV`.
+    /// Inherited seccomp user-notification file descriptor. The arm uses
+    /// `SCM_RIGHTS` to pass this fd across exec. The broker sets it
+    /// non-blocking and loops on `SECCOMP_IOCTL_NOTIF_RECV`.
     #[arg(long, value_name = "FD")]
     listener_fd: i32,
 
-    /// Path to the policyd Unix domain socket. Used to ask policyd for the verdict on each notified syscall.
+    /// Path to the policyd Unix domain socket. Used to ask policyd for the
+    /// verdict on each notified syscall.
     #[arg(
         long,
         value_name = "SOCKET",
@@ -64,15 +69,22 @@ struct Cli {
     )]
     policy_socket: PathBuf,
 
-    /// Sandbox session id forwarded to policyd so per-session rules and audit logs are routed correctly. Falls back to the env var `AGENT_SANDBOX_SESSION_ID` if unset.
+    /// Sandbox session id forwarded to policyd so per-session rules and audit
+    /// logs are routed correctly. Falls back to the env var
+    /// `AGENT_SANDBOX_SESSION_ID` if unset.
     #[arg(long, value_name = "ID", env = "AGENT_SANDBOX_SESSION_ID")]
     sandbox_session_id: Option<String>,
 
-    /// Max seconds to wait for a policyd verdict per notified syscall. Fractional values are accepted. The effective wait is clamped to at least 1 second. Larger values tolerate slow policyd startups but delay the sandboxed syscall.
+    /// Max seconds to wait for a policyd verdict per notified syscall.
+    /// Fractional values are accepted. The effective wait is clamped to at
+    /// least 1 second. Larger values tolerate slow policyd startups but delay
+    /// the sandboxed syscall.
     #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
     policy_timeout: f64,
 
-    /// PID of the immediate child the broker is supervising. When the child exits the broker exits too and the seccomp listener is closed. Optional: omit for a broker that runs until its listener fd is revoked.
+    /// PID of the immediate child the broker is supervising. When the child
+    /// exits the broker exits too and the seccomp listener is closed. Optional:
+    /// omit for a broker that runs until its listener fd is revoked.
     #[arg(long, value_name = "PID")]
     child_pid: Option<i32>,
 }
@@ -90,8 +102,12 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let network_mode =
-        parse_network_mode(cli.network_mode.as_deref()).map_err(std::io::Error::other)?;
+    let network_mode = cli
+        .network_mode
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("network mode is required (direct or proxy)"))?
+        .parse()
+        .map_err(std::io::Error::other)?;
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
@@ -185,8 +201,10 @@ fn is_open_family_syscall(nr: i32) -> bool {
 }
 
 fn propagate_child_exit(child_pid: Option<i32>) {
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-    use nix::unistd::Pid;
+    use nix::{
+        sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+        unistd::Pid,
+    };
     let Some(pid) = child_pid else {
         return;
     };
@@ -224,12 +242,6 @@ fn is_policy_socket_bypass(target: &ResourceTarget, policy_socket: &Path) -> boo
         // (e.g. socket deleted between canonicalize and stat).
         _ => normalize_path(&target.path) == normalize_path(policy_socket),
     }
-}
-
-/// Canonicalize a path for comparison, resolving symlinks. Falls back to
-/// the original path if canonicalization fails (socket not yet created).
-fn normalize_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Emulate a policy-allowed resource syscall on behalf of the tracee. Never
@@ -523,10 +535,12 @@ fn emulate_open_with_path(
 
 #[cfg(test)]
 mod tests {
-    use super::is_policy_socket_bypass;
+    use std::path::{Path, PathBuf};
+
     use agent_sandbox_core::{ResourceAccess, ResourceKind};
     use agent_sandbox_syscall_broker::ResourceTarget;
-    use std::path::{Path, PathBuf};
+
+    use super::is_policy_socket_bypass;
 
     fn make_unix_target(path: &str) -> ResourceTarget {
         ResourceTarget {
@@ -669,8 +683,9 @@ mod tests {
 
     #[test]
     fn environment_defaults_are_declared_on_cli_arguments() {
-        use super::Cli;
         use clap::CommandFactory;
+
+        use super::Cli;
 
         let command = Cli::command();
         for (argument, environment) in [

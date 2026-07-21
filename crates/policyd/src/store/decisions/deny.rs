@@ -2,10 +2,8 @@
 
 use agent_sandbox_core::RpcReply;
 
+use super::{super::types::PolicyStore, DecisionAction};
 use crate::wire::PendingDecision;
-
-use super::super::types::PolicyStore;
-use super::DecisionAction;
 
 impl PolicyStore {
     pub async fn deny(&self, decision: PendingDecision) -> RpcReply {

@@ -116,8 +116,7 @@ pub fn trusted_project_policy_path(project_root: &Path) -> Result<PathBuf, Proje
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     use super::{ProjectPolicyContext, trusted_project_policy_path};
 

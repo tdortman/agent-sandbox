@@ -1,8 +1,10 @@
 //! Shared IP→hostname cache populated by the DNS forwarder.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,13 +84,10 @@ impl DnsCache {
         let ttl = ttl.clamp(1, self.max_ttl);
         let now = Instant::now();
         self.prune_expired(now);
-        self.entries.insert(
-            ip.to_string(),
-            LiveCacheEntry {
-                host,
-                expires: now + Duration::from_secs(u64::from(ttl)),
-            },
-        );
+        self.entries.insert(ip.to_string(), LiveCacheEntry {
+            host,
+            expires: now + Duration::from_secs(u64::from(ttl)),
+        });
         self.enforce_max_entries();
     }
 
@@ -135,13 +134,10 @@ impl DnsCache {
                 continue;
             }
             let remaining = entry.expires.duration_since(now).as_secs_f64();
-            entries.insert(
-                ip.clone(),
-                CacheEntry {
-                    host: entry.host.clone(),
-                    expires: unix_now() + remaining,
-                },
-            );
+            entries.insert(ip.clone(), CacheEntry {
+                host: entry.host.clone(),
+                expires: unix_now() + remaining,
+            });
         }
 
         // Merge existing unexpired disk entries so a writer with a partial
@@ -191,13 +187,10 @@ impl DnsCache {
                 continue;
             }
             let remaining = item.expires - now;
-            self.entries.insert(
-                ip,
-                LiveCacheEntry {
-                    host: item.host,
-                    expires: Instant::now() + Duration::from_secs_f64(remaining),
-                },
-            );
+            self.entries.insert(ip, LiveCacheEntry {
+                host: item.host,
+                expires: Instant::now() + Duration::from_secs_f64(remaining),
+            });
         }
     }
 }
@@ -224,8 +217,9 @@ pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheFile, DnsCache, unix_now};
     use std::time::Duration;
+
+    use super::{CacheFile, DnsCache, unix_now};
 
     #[test]
     fn persisted_cache_uses_wall_clock_expiry() {
