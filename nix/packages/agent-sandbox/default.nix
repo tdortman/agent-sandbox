@@ -1,7 +1,6 @@
 {
   lib,
   inputs,
-  pkg-config,
   cmake,
   makeWrapper,
   pkgs,
@@ -49,7 +48,6 @@ rust.rustPlatform.buildRustPackage {
   };
 
   nativeBuildInputs = [
-    pkg-config
     makeWrapper
   ];
 

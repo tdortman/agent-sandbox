@@ -371,7 +371,7 @@ in
       # jail-nix bind-mount combinator is both redundant and broken (bwrap
       # cannot mkdir through symlinks on a root-bound tree).  Generate the
       # wrapper directly to guarantee zero unexpected bind mounts.
-      hasNetwork = network != null && network != { };
+      hasNetwork = network != null;
       sandboxPkgsList = lib.unique (
         [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
@@ -804,7 +804,6 @@ in
         if freezeNeedsScope && !dynamicFs then
           pkgs.writeShellApplication {
             name = sandboxedName;
-            runtimeInputs = [ pkgs.systemd ];
             text = ''
               set -euo pipefail
               exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no \

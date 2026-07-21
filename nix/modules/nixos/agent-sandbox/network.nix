@@ -59,8 +59,6 @@ let
     inherit (flake) jail-nix;
   };
   runtime = agentSandboxLib.mkRuntime { inherit rootCfg; };
-  policyPkg = sandboxPkg;
-  enterBin = sandboxPkg;
   dnsTargetHost =
     let
       parts = lib.splitString ":" runtime.dnsForwardTarget;
@@ -81,15 +79,13 @@ let
 
   # These daemons do not execute approved host commands, so they can be
   # confined without changing the policy daemon's executor namespace.
-  networkDaemonHardening = {
+  networkHardening = {
     PrivateTmp = true;
     ProtectSystem = "strict";
     ProtectHome = true;
-    NoNewPrivileges = true;
     RestrictSUIDSGID = true;
     LockPersonality = true;
     ProtectControlGroups = true;
-    ReadWritePaths = [ "/run/agent-sandbox" ];
     RestrictAddressFamilies = [
       "AF_UNIX"
       "AF_NETLINK"
@@ -98,25 +94,20 @@ let
     ];
   };
 
+  # These daemons do not execute approved host commands, so they can be
+  # confined without changing the policy daemon's executor namespace.
+  networkDaemonHardening = networkHardening // {
+    NoNewPrivileges = true;
+    ReadWritePaths = [ "/run/agent-sandbox" ];
+  };
+
   # Setup units retain their existing root capabilities for netlink/nftables
   # operations, but do not need host home directories or a shared /tmp.
-  networkSetupHardening = {
-    PrivateTmp = true;
-    ProtectSystem = "strict";
-    ProtectHome = true;
-    RestrictSUIDSGID = true;
-    LockPersonality = true;
-    ProtectControlGroups = true;
+  networkSetupHardening = networkHardening // {
     ReadWritePaths = [
       "/run/agent-sandbox"
       "/run/netns"
       "/var/lib/agent-sandbox"
-    ];
-    RestrictAddressFamilies = [
-      "AF_UNIX"
-      "AF_NETLINK"
-      "AF_INET"
-      "AF_INET6"
     ];
   };
 
@@ -125,14 +116,11 @@ let
   # the oneshot exits, so keep only restrictions that do not create a private
   # mount namespace.
   networkNamespaceSetupHardening = {
-    RestrictSUIDSGID = true;
-    LockPersonality = true;
-    RestrictAddressFamilies = [
-      "AF_UNIX"
-      "AF_NETLINK"
-      "AF_INET"
-      "AF_INET6"
-    ];
+    inherit (networkHardening)
+      RestrictSUIDSGID
+      LockPersonality
+      RestrictAddressFamilies
+      ;
   };
 
   # The DNS forwarder runs on the host and listens on the veth gateway. It
@@ -207,15 +195,25 @@ let
     inherit dnsTargetHost;
   };
 
-  hostNatPkg = pkgs.writeShellApplication {
+  mkNetnsLauncher =
+    {
+      name,
+      script,
+      runtimeInputs,
+    }:
+    pkgs.writeShellApplication {
+      inherit name runtimeInputs;
+      text = ''
+        exec ${pkgs.bash}/bin/bash ${script} "$@"
+      '';
+    };
+  hostNatPkg = mkNetnsLauncher {
     name = "agent-sandbox-host-nat";
+    script = hostNatScript;
     runtimeInputs = [
       pkgs.nftables
       pkgs.procps # sysctl
     ];
-    text = ''
-      exec ${pkgs.bash}/bin/bash ${hostNatScript} "$@"
-    '';
   };
 
   netnsUpScript = pkgs.replaceVars ./netns/up.sh {
@@ -231,29 +229,25 @@ let
     hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
   };
 
-  netnsUpPkg = pkgs.writeShellApplication {
+  netnsUpPkg = mkNetnsLauncher {
     name = "agent-sandbox-netns-up";
+    script = netnsUpScript;
     runtimeInputs = [
       pkgs.coreutils
       pkgs.iproute2
       pkgs.nftables
       hostNatPkg
     ];
-    text = ''
-      exec ${pkgs.bash}/bin/bash ${netnsUpScript} "$@"
-    '';
   };
 
   netnsDownScript = pkgs.replaceVars ./netns/down.sh {
     netnsName = runtime.network.netnsName;
     vethHost = runtime.network.vethHost;
   };
-  netnsDownPkg = pkgs.writeShellApplication {
+  netnsDownPkg = mkNetnsLauncher {
     name = "agent-sandbox-netns-down";
+    script = netnsDownScript;
     runtimeInputs = [ pkgs.iproute2 ];
-    text = ''
-      exec ${pkgs.bash}/bin/bash ${netnsDownScript} "$@"
-    '';
   };
   proxyStateDir = "/var/lib/agent-sandbox/proxy";
   proxyBundlePath = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
@@ -289,10 +283,8 @@ let
     name = "agent-sandbox-proxy-firewall";
     runtimeInputs = [
       pkgs.coreutils
-      pkgs.gnugrep
       pkgs.jq
       pkgs.nftables
-      pkgs.shadow
     ];
     text = builtins.readFile ./proxy-firewall.sh;
   };
@@ -310,11 +302,7 @@ let
   };
   readinessMarkerPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-readiness-marker";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.gnugrep
-      pkgs.iproute2
-    ];
+    runtimeInputs = [ pkgs.coreutils ];
     text = builtins.readFile ./readiness-marker.sh;
   };
   proxyPolicyLauncher = pkgs.writeShellApplication {
@@ -330,15 +318,12 @@ let
         echo "agent-sandbox policy: proxy group ID is invalid" >&2
         exit 1
       }
-      exec ${policyPkg}/bin/agent-sandbox-policyd "$@" --proxy-gid "$proxy_gid"
+      exec ${sandboxPkg}/bin/agent-sandbox-policyd "$@" --proxy-gid "$proxy_gid"
     '';
   };
   proxyLaunchPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-proxy-launch";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.shadow
-    ];
+    runtimeInputs = [ pkgs.coreutils ];
     text = ''
       set -euo pipefail
       proxy_gid="$(id -g ${proxyGroup})"
@@ -347,7 +332,7 @@ let
         exit 1
       }
       export AGENT_SANDBOX_PROXY_GID="$proxy_gid"
-      exec ${policyPkg}/bin/agent-sandbox-mitmdump "$@"
+      exec ${sandboxPkg}/bin/agent-sandbox-mitmdump "$@"
     '';
   };
 
@@ -414,7 +399,7 @@ lib.mkIf policyEnabled (
                 if runtime.httpProxy.enable then
                   "${proxyPolicyLauncher}/bin/agent-sandbox-policy-launch"
                 else
-                  "${policyPkg}/bin/agent-sandbox-policyd"
+                  "${sandboxPkg}/bin/agent-sandbox-policyd"
               )
               "--socket"
               runtime.policySocket
@@ -432,7 +417,7 @@ lib.mkIf policyEnabled (
             ]
             ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
               "--ui-spawn-cmd"
-              "${policyPkg}/bin/agent-sandbox-ui"
+              "${sandboxPkg}/bin/agent-sandbox-ui"
             ]
             ++ lib.optionals runtime.httpProxy.enable [
               "--proxy-socket"
@@ -444,7 +429,7 @@ lib.mkIf policyEnabled (
             ]
             ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
               "--fs-monitor-cmd"
-              "${policyPkg}/bin/agent-sandbox-fsmon"
+              "${sandboxPkg}/bin/agent-sandbox-fsmon"
             ]
             ++
               lib.optionals
@@ -455,23 +440,15 @@ lib.mkIf policyEnabled (
                 )
                 [
                   "--syscall-broker-cmd"
-                  "${policyPkg}/bin/agent-sandbox-syscall-broker"
+                  "${sandboxPkg}/bin/agent-sandbox-syscall-broker"
                 ]
           );
           StateDirectory = "agent-sandbox";
           RuntimeDirectory = "agent-sandbox";
           RuntimeDirectoryPreserve = "yes";
           Restart = "on-failure";
-          ExecStopPost = "+${policyPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
+          ExecStopPost = "+${sandboxPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
         };
-        path = [
-          pkgs.util-linux
-          pkgs.systemd
-          pkgs.libnotify
-        ]
-        ++ lib.optionals (runtime.uiBackend == "zenity") [
-          pkgs.zenity
-        ];
         environment = {
           AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
           AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
@@ -513,7 +490,7 @@ lib.mkIf policyEnabled (
       };
 
       security.wrappers.agent-sandbox-enter = {
-        source = "${enterBin}/bin/agent-sandbox-enter";
+        source = "${sandboxPkg}/bin/agent-sandbox-enter";
         # setns(CLONE_NEWNET) needs CAP_SYS_ADMIN; CAP_NET_ADMIN alone is insufficient.
         capabilities = "cap_sys_admin,cap_net_admin+ep";
         owner = "root";
@@ -564,7 +541,7 @@ lib.mkIf policyEnabled (
             Type = "simple";
             ExecStart = lib.escapeShellArgs (
               [
-                "${policyPkg}/bin/agent-sandbox-dns-forwarder"
+                "${sandboxPkg}/bin/agent-sandbox-dns-forwarder"
                 "--listen-host"
                 runtime.hostIp
                 "--listen-port"
@@ -606,7 +583,7 @@ lib.mkIf policyEnabled (
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             ExecStart = lib.escapeShellArgs (
               [
-                "${policyPkg}/bin/agent-sandbox-nfq"
+                "${sandboxPkg}/bin/agent-sandbox-nfq"
                 "--queue"
                 (toString runtime.queueNumber)
                 "--policy-socket"
@@ -629,10 +606,10 @@ lib.mkIf policyEnabled (
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryPreserve = "yes";
             ExecStartPre = lib.optionals cfg.httpProxy.enable [
-              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${nfqReadyPath}"
+              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${nfqReadyPath}"
             ];
             ExecStopPost = lib.optionals cfg.httpProxy.enable [
-              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${nfqReadyPath}"
+              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${nfqReadyPath}"
             ];
           };
           environment = {
@@ -700,17 +677,6 @@ lib.mkIf policyEnabled (
               proxyCidrsPath
               "agent_sandbox_proxy"
             ];
-            ExecStop = lib.escapeShellArgs [
-              "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-              proxyUser
-              proxyGroup
-              cfg.httpProxy.proxyHostIp
-              runtime.hostIp
-              (toString cfg.httpProxy.wireguardPort)
-              proxyCidrsPath
-              "agent_sandbox_proxy"
-              "cleanup"
-            ];
             ExecStopPost = lib.escapeShellArgs [
               "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
               proxyUser
@@ -749,7 +715,7 @@ lib.mkIf policyEnabled (
             User = proxyUser;
             Group = proxyGroup;
             ExecStartPre = [
-              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${proxyReadyPath}"
+              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${proxyReadyPath}"
             ];
             ExecStart = lib.escapeShellArgs [
               "${proxyLaunchPkg}/bin/agent-sandbox-proxy-launch"
@@ -759,7 +725,7 @@ lib.mkIf policyEnabled (
               "confdir=${proxyStateDir}"
             ];
             ExecStopPost = [
-              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker remove ${proxyReadyPath}"
+              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${proxyReadyPath}"
             ];
             Restart = "always";
             RestartSec = 1;
@@ -824,20 +790,6 @@ lib.mkIf policyEnabled (
               proxyReadyPath
               nfqReadyPath
               runtime.hostIp
-            ];
-            ExecStop = lib.escapeShellArgs [
-              "${proxyRoutePkg}/bin/agent-sandbox-proxy-route"
-              proxyInterface
-              "10.0.0.1"
-              cfg.httpProxy.proxyHostIp
-              (toString cfg.httpProxy.wireguardPort)
-              "${proxyStateDir}/wireguard.conf"
-              "agent-sandbox-proxy.service"
-              "agent-sandbox-nfq.service"
-              proxyReadyPath
-              nfqReadyPath
-              runtime.hostIp
-              "cleanup"
             ];
             ExecStopPost = lib.escapeShellArgs [
               "${proxyRoutePkg}/bin/agent-sandbox-proxy-route"
