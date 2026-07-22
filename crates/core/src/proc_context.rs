@@ -1,16 +1,8 @@
 //! Read sandbox context from a client process via /proc (host pid namespace).
 
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    os::fd::AsFd,
-    path::{Path, PathBuf},
-};
-
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials as NixPeerCredentials};
+use std::path::{Path, PathBuf};
 
 use crate::merge_policy::ProjectPolicyContext;
-
-const TCP_ESTABLISHED: &str = "01";
 
 #[must_use]
 pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {
@@ -45,13 +37,6 @@ pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
         .ok()
         .flatten()
         .map(|u| u.dir.to_string_lossy().into_owned())
-}
-
-/// UID and socket inode from a `/proc/net/tcp` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TcpSocketEntry {
-    uid: u32,
-    inode: String,
 }
 
 /// Process credentials for an RPC peer.
@@ -187,117 +172,12 @@ pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
         .cloned()
 }
 
-fn tcp_addr_field(ip: &str, port: u16) -> String {
-    let octets = ip.parse::<Ipv4Addr>().expect("ipv4").octets();
-    let reversed = octets
-        .iter()
-        .rev()
-        .fold(String::with_capacity(8), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02X}");
-            s
-        });
-    format!("{reversed}:{port:04X}")
-}
-
-fn find_tcp_entry(local: SocketAddr, peer: SocketAddr) -> Option<TcpSocketEntry> {
-    let local_field = tcp_addr_field(&local.ip().to_string(), local.port());
-    let peer_field = tcp_addr_field(&peer.ip().to_string(), peer.port());
-    let lines = std::fs::read_to_string("/proc/net/tcp").ok()?;
-    for line in lines.lines().skip(1) {
-        let parts: Vec<_> = line.split_whitespace().collect();
-        if parts.len() < 10 {
-            continue;
-        }
-        if parts[3] != TCP_ESTABLISHED {
-            continue;
-        }
-        if parts[1] == local_field && parts[2] == peer_field {
-            let uid = parts[7].parse().ok()?;
-            return Some(TcpSocketEntry {
-                uid,
-                inode: parts[9].to_string(),
-            });
-        }
-    }
-    None
-}
-
-fn pid_for_socket_inode(inode: &str) -> Option<u32> {
-    let needle = format!("socket:[{inode}]");
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let pid: u32 = name.parse().ok()?;
-        let fd_dir = entry.path().join("fd");
-        let Ok(fds) = std::fs::read_dir(fd_dir) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            if std::fs::read_link(fd.path())
-                .ok()
-                .is_some_and(|l| l.to_string_lossy() == needle)
-            {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
-
 /// Return process credentials for the peer of a connected Unix domain socket.
 pub fn peer_cred_unix(stream: &tokio::net::UnixStream) -> Option<PeerCredentials> {
     let cred = stream.peer_cred().ok()?;
     let pid = u32::try_from(cred.pid()?).ok()?;
     let uid = cred.uid();
     let gid = i32::try_from(cred.gid()).unwrap_or(-1);
-    Some(PeerCredentials { pid, uid, gid })
-}
-
-/// Return process credentials for the peer of a connected socket.
-///
-/// For accepted TCP connections, the local endpoint's `/proc/net/tcp` row
-/// belongs to this process. Look up the inverse quad first so we resolve the
-/// connecting client's pid for policy UI routing.
-pub fn peer_cred(stream: &tokio::net::TcpStream) -> Option<PeerCredentials> {
-    let local = stream.local_addr().ok()?;
-    let peer = stream.peer_addr().ok()?;
-    if local.is_ipv4() && peer.is_ipv4() {
-        // Server-side accept: peer's socket row is (peer, local).
-        if let Some(entry) = find_tcp_entry(peer, local) {
-            let pid = pid_for_socket_inode(&entry.inode).unwrap_or(0);
-            if pid > 0 {
-                return Some(PeerCredentials {
-                    pid,
-                    uid: entry.uid,
-                    gid: -1,
-                });
-            }
-        }
-        // Client-side connect: our socket row is (local, peer).
-        if let Some(entry) = find_tcp_entry(local, peer) {
-            let pid = pid_for_socket_inode(&entry.inode).unwrap_or(0);
-            return Some(PeerCredentials {
-                pid,
-                uid: entry.uid,
-                gid: -1,
-            });
-        }
-    }
-    peer_cred_fd(stream.as_fd())
-}
-
-fn peer_cred_fd(fd: impl AsFd) -> Option<PeerCredentials> {
-    let cred = getsockopt(&fd, NixPeerCredentials).ok()?;
-    let pid = u32::try_from(cred.pid()).ok()?;
-    let uid = cred.uid();
-    let gid = i32::try_from(cred.gid()).ok()?;
-    if pid == 0 && i32::try_from(uid).is_err() {
-        return None;
-    }
     Some(PeerCredentials { pid, uid, gid })
 }
 

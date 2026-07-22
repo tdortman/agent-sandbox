@@ -52,7 +52,7 @@ pub use policy::{
 };
 pub use proc_context::{
     PeerCredentials, ProcContext, context_from_pid, discover_git_project_root, home_from_uid,
-    is_descendant_of, is_path_descendant, peer_cred, peer_cred_unix, read_proc_environ,
+    is_descendant_of, is_path_descendant, peer_cred_unix, read_proc_environ,
     sandbox_session_id_from_pid, trusted_context_from_pid,
 };
 pub use rpc::{
@@ -65,12 +65,11 @@ pub use rpc::{
     ProxySessionReply, ProxySessionToken, RegisterUiReply, RequestContext, ResourceCheckReply,
     ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
     SocketIdentity, SocketInode, StatusReply, UiPush, Verdict, VerdictSource, attach_check_aliases,
-    attach_ui_aliases, split_check_aliases, split_ui_aliases,
+    split_check_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
 pub use session_context::SessionContext;
 pub use socket_owner::{
-    OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner,
-    resolve_owner_snapshot,
+    OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };

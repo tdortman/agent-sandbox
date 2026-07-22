@@ -14,6 +14,7 @@ use super::{
 use crate::{
     ProcessIds, ResolvedRequestContext, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
+    policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestContext {
@@ -104,8 +105,6 @@ impl From<&ResolvedRequestContext> for RequestContext {
     }
 }
 
-use crate::policy::FileAccess;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalTarget {
@@ -122,11 +121,11 @@ pub enum ApprovalTarget {
         path: PathBuf,
     },
     ResourcePath {
-        resource_kind: crate::policy::ResourceKind,
+        resource_kind: ResourceKind,
         path: PathBuf,
     },
     Dbus {
-        target: crate::policy::DbusTarget,
+        target: DbusTarget,
     },
 }
 
@@ -193,15 +192,15 @@ pub enum RpcRequest {
         ctx: RequestContext,
     },
     CheckResource {
-        kind: crate::policy::ResourceKind,
+        kind: ResourceKind,
         path: PathBuf,
         #[serde(default)]
-        access: crate::policy::ResourceAccess,
+        access: ResourceAccess,
         #[serde(default)]
         ctx: RequestContext,
     },
     CheckDbus {
-        target: crate::policy::DbusTarget,
+        target: DbusTarget,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -209,7 +208,7 @@ pub enum RpcRequest {
         #[serde(default)]
         ctx: RequestContext,
         #[serde(default)]
-        static_allow: Vec<crate::policy::FilesystemRule>,
+        static_allow: Vec<FilesystemRule>,
     },
     Elevate {
         argv: Vec<String>,
@@ -327,15 +326,15 @@ enum RpcRequestWire {
         ctx: RequestContext,
     },
     CheckDbus {
-        target: crate::policy::DbusTarget,
+        target: DbusTarget,
         #[serde(default)]
         ctx: RequestContext,
     },
     CheckResource {
-        kind: crate::policy::ResourceKind,
+        kind: ResourceKind,
         path: PathBuf,
         #[serde(default)]
-        access: crate::policy::ResourceAccess,
+        access: ResourceAccess,
         #[serde(default)]
         ctx: RequestContext,
     },
@@ -343,7 +342,7 @@ enum RpcRequestWire {
         #[serde(default)]
         ctx: RequestContext,
         #[serde(default)]
-        static_allow: Vec<crate::policy::FilesystemRule>,
+        static_allow: Vec<FilesystemRule>,
     },
     Elevate {
         argv: Vec<String>,
@@ -526,9 +525,9 @@ impl RpcRequest {
     }
 
     const fn check_resource(
-        kind: crate::policy::ResourceKind,
+        kind: ResourceKind,
         path: PathBuf,
-        access: crate::policy::ResourceAccess,
+        access: ResourceAccess,
         ctx: RequestContext,
     ) -> Self {
         Self::CheckResource {
@@ -541,7 +540,7 @@ impl RpcRequest {
 
     const fn start_filesystem_monitor(
         ctx: RequestContext,
-        static_allow: Vec<crate::policy::FilesystemRule>,
+        static_allow: Vec<FilesystemRule>,
     ) -> Self {
         Self::StartFilesystemMonitor { ctx, static_allow }
     }
@@ -799,18 +798,6 @@ pub fn split_check_aliases(url: Option<String>) -> AliasSplit {
     }
 }
 
-/// Attach attribution hints to a UI prompt URL.
-#[must_use]
-pub fn attach_ui_aliases(url: Option<String>, aliases: &[String]) -> Option<String> {
-    attach_check_aliases(url, aliases)
-}
-
-/// Split attribution hints from a UI prompt URL.
-#[must_use]
-pub fn split_ui_aliases(url: Option<String>) -> AliasSplit {
-    split_check_aliases(url)
-}
-
 fn default_https() -> String {
     "https".into()
 }
@@ -824,7 +811,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{ApprovalTarget, RequestContext, RpcRequest};
-    use crate::{ProcessIds, ResolvedRequestContext, SandboxPaths};
+    use crate::{FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths};
 
     #[test]
     fn attach_check_aliases_roundtrip() {
@@ -913,7 +900,7 @@ mod tests {
             RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
                 assert_eq!(static_allow.len(), 1);
                 assert_eq!(static_allow[0].path, PathBuf::from("/home/user"));
-                assert_eq!(static_allow[0].access, crate::policy::FileAccess::All);
+                assert_eq!(static_allow[0].access, FileAccess::All);
             }
             _ => panic!("expected StartFilesystemMonitor"),
         }

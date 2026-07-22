@@ -62,7 +62,7 @@ pub enum PendingSummary {
 /// UI push after `register_ui` (not a request response).
 ///
 /// `NetworkRequest` attribution hints may be embedded in `url` via
-/// `attach_ui_aliases`.
+/// [`attach_check_aliases`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiPush {

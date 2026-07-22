@@ -176,15 +176,6 @@ impl<T> OwnerResolution<T> {
     }
 }
 
-/// Resolve a tuple to the process/socket identity captured in procfs.
-#[must_use]
-pub fn resolve_owner(
-    protocol: SocketProtocol,
-    tuple: SocketTuple,
-) -> OwnerResolution<SocketIdentity> {
-    resolve_owner_snapshot(protocol, tuple).map(OwnerSnapshot::identity)
-}
-
 /// Revalidate a previously captured socket identity through the owning process.
 ///
 /// This deliberately inspects only `/proc/<pid>` and never resolves the
@@ -528,7 +519,7 @@ mod tests {
     fn missing_local_port_returns_missing() {
         let tuple = SocketTuple::from_local(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         assert_eq!(
-            resolve_owner(SocketProtocol::Tcp, tuple),
+            resolve_owner_snapshot(SocketProtocol::Tcp, tuple),
             OwnerResolution::Missing
         );
     }
