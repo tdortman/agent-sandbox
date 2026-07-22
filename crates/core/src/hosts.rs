@@ -7,6 +7,12 @@ use hickory_proto::rr::Name;
 use idna::domain_to_ascii;
 use thiserror::Error;
 
+pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error> {
+    GlobBuilder::new(pattern)
+        .backslash_escape(true)
+        .literal_separator(true)
+        .build()
+}
 use crate::dns_cache::lookup_dns_cache;
 #[must_use]
 pub fn is_ip_literal(host: &str) -> bool {
@@ -231,10 +237,7 @@ pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
         return host == bare || host.ends_with(suffix);
     }
 
-    if let Ok(glob) = GlobBuilder::new(&pattern)
-        .backslash_escape(true)
-        .literal_separator(true)
-        .build()
+    if let Ok(glob) = build_glob(&pattern)
         && glob.compile_matcher().is_match(&host)
     {
         return true;

@@ -6,10 +6,15 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    dns_cache::{evict_oldest, unix_now, write_json_atomic},
+    hosts::normalize_host,
+};
 
 pub const APPROVED_BINDINGS_PATH: &str = "/run/agent-sandbox/approved-bindings.json";
 pub const APPROVED_BINDINGS_TTL_SECS: u64 = 30 * 24 * 60 * 60;
@@ -98,7 +103,7 @@ impl ApprovedBindings {
 
     /// Remember that `host` was approved for `ip`.
     pub fn record(&mut self, host: &str, ip: &str) {
-        let host = host.trim().to_lowercase().trim_end_matches('.').to_string();
+        let host = normalize_host(host);
         if host.is_empty() || host == ip {
             return;
         }
@@ -127,17 +132,7 @@ impl ApprovedBindings {
         let Some(entry) = self.entries.get_mut(ip) else {
             return;
         };
-        while entry.hosts.len() > MAX_ALIASES_PER_IP {
-            let Some(oldest_host) = entry
-                .hosts
-                .iter()
-                .min_by_key(|(_, expires)| *expires)
-                .map(|(host, _)| host.clone())
-            else {
-                break;
-            };
-            entry.hosts.remove(&oldest_host);
-        }
+        evict_oldest(&mut entry.hosts, MAX_ALIASES_PER_IP, |expires| *expires);
     }
 
     /// Save bindings to the JSON cache file at `self.path`.
@@ -148,9 +143,6 @@ impl ApprovedBindings {
     /// be serialized to JSON, or the atomic write (temp file + rename)
     /// fails.
     pub fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let now = Instant::now();
         let mut entries: HashMap<String, IpBindingEntry> = HashMap::new();
         for (ip, entry) in &self.entries {
@@ -193,18 +185,8 @@ impl ApprovedBindings {
             version: FILE_VERSION,
             entries,
         };
-        let data = serde_json::to_vec(&snapshot)?;
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(tmp, &self.path)?;
-        Ok(())
+        write_json_atomic(&self.path, &snapshot)
     }
-}
-
-fn unix_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@
 
 use std::{fmt, net::IpAddr, num::NonZeroU16};
 
-use globset::GlobBuilder;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as DeError, SeqAccess, Visitor},
@@ -11,7 +10,7 @@ use serde::{
 use thiserror::Error;
 use url::Url;
 
-use crate::hosts::normalize_dns_name;
+use crate::hosts::{build_glob, normalize_dns_name};
 
 const MAX_METHOD_BYTES: usize = 64;
 
@@ -528,11 +527,7 @@ impl HttpUrl {
             }
             pattern = pattern.replacen(&token, &metacharacter.to_string(), 1);
         }
-        GlobBuilder::new(&pattern)
-            .backslash_escape(true)
-            .literal_separator(true)
-            .build()
-            .map_err(|_| HttpParseError::InvalidUrl)?;
+        build_glob(&pattern).map_err(|_| HttpParseError::InvalidUrl)?;
         url.pattern = Some(pattern.into_boxed_str());
         Ok(url)
     }
@@ -625,10 +620,7 @@ impl HttpUrl {
     pub fn matches(&self, request: &Self) -> bool {
         if let Some(pattern) = &self.pattern {
             let pattern = glob_pattern_for_matching(self, pattern);
-            return GlobBuilder::new(&pattern)
-                .backslash_escape(true)
-                .literal_separator(true)
-                .build()
+            return build_glob(&pattern)
                 .is_ok_and(|glob| glob.compile_matcher().is_match(request.to_string()));
         }
         self.covers(request)

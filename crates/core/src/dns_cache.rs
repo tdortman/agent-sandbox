@@ -8,6 +8,41 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::hosts::normalize_host;
+
+pub(crate) fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec(value)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+pub(crate) fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
+    map: &mut HashMap<K, V>,
+    max_entries: usize,
+    timestamp: impl Fn(&V) -> Instant,
+) {
+    while map.len() > max_entries {
+        let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, value)| timestamp(value))
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest_key);
+    }
+}
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
 pub const DEFAULT_MAX_TTL: u32 = 600;
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
@@ -73,11 +108,7 @@ impl DnsCache {
 
     /// Shared validation, normalization, and insertion logic.
     fn insert_entry(&mut self, ip: &str, hostname: &str, ttl: u32) {
-        let host = hostname
-            .trim()
-            .to_lowercase()
-            .trim_end_matches('.')
-            .to_string();
+        let host = normalize_host(hostname);
         if host.is_empty() || host == ip {
             return;
         }
@@ -96,17 +127,7 @@ impl DnsCache {
     }
 
     fn enforce_max_entries(&mut self) {
-        while self.entries.len() > self.max_entries {
-            let Some(oldest_ip) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires)
-                .map(|(ip, _)| ip.clone())
-            else {
-                break;
-            };
-            self.entries.remove(&oldest_ip);
-        }
+        evict_oldest(&mut self.entries, self.max_entries, |entry| entry.expires);
     }
 
     #[must_use]
@@ -122,9 +143,6 @@ impl DnsCache {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let now = Instant::now();
 
         // Build live entries (live → wall-clock expiry).
@@ -159,11 +177,7 @@ impl DnsCache {
             version: 1,
             entries,
         };
-        let data = serde_json::to_vec(&snapshot)?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        write_json_atomic(path, &snapshot)
     }
 
     /// Reload entries from disk, replacing the in-memory cache.
@@ -193,12 +207,6 @@ impl DnsCache {
             });
         }
     }
-}
-
-fn unix_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
 pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {

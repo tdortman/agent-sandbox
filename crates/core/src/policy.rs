@@ -6,10 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-use globset::{GlobBuilder, GlobMatcher};
+use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
 
-use crate::{hosts::NetworkRuleKey, http::HttpRule};
+use crate::{
+    hosts::{NetworkRuleKey, build_glob},
+    http::HttpRule,
+};
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -211,11 +214,7 @@ impl CompiledPath {
         let expanded_str = expanded.to_string_lossy();
 
         if contains_glob_syntax(&expanded_str) {
-            let glob = GlobBuilder::new(&expanded_str)
-                .backslash_escape(true)
-                .literal_separator(true)
-                .build()?
-                .compile_matcher();
+            let glob = build_glob(&expanded_str)?.compile_matcher();
             Ok(Self::Glob(glob))
         } else {
             Ok(Self::Prefix(normalize_rule_path(&expanded)))
@@ -894,11 +893,7 @@ impl DbusRule {
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
-    GlobBuilder::new(pattern)
-        .backslash_escape(true)
-        .literal_separator(true)
-        .build()
-        .is_ok_and(|glob| glob.compile_matcher().is_match(value))
+    build_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
