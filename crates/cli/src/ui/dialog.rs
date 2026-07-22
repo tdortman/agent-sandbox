@@ -9,10 +9,7 @@ use std::{
 use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
 
-use super::options::{
-    ApprovalFormAction, ApprovalFormRequest, ApprovalFormResult, ReviewValidator,
-    scope_from_form_value,
-};
+use super::options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator};
 
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_RESULT_BYTES: usize = 16 * 1024;
@@ -219,14 +216,7 @@ fn qt_dialog_review(
 
         // Cancel exits without validation. Deny with a persistent scope
         // still needs a valid target to create the deny rule.
-        if result.action == ApprovalFormAction::Cancel {
-            if !child.wait().ok()?.success() {
-                return None;
-            }
-            return Some(result);
-        }
-
-        if validate.is_none() {
+        if result.action.is_none() {
             writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
             stdin.flush().ok()?;
             if !child.wait().ok()?.success() {
@@ -234,22 +224,29 @@ fn qt_dialog_review(
             }
             return Some(result);
         }
-        let validator = validate?;
-
-        match validator(&result) {
-            Ok(()) => {
-                writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
-                stdin.flush().ok()?;
-                if !child.wait().ok()?.success() {
-                    return None;
+        if let Some(validator) = validate {
+            match validator(&result) {
+                Ok(()) => {
+                    writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
+                    stdin.flush().ok()?;
+                    if !child.wait().ok()?.success() {
+                        return None;
+                    }
+                    return Some(result);
                 }
-                return Some(result);
+                Err(error) => {
+                    let response = serde_json::json!({"valid": false, "error": error});
+                    writeln!(stdin, "{response}").ok()?;
+                    stdin.flush().ok()?;
+                }
             }
-            Err(error) => {
-                let response = serde_json::json!({"valid": false, "error": error});
-                writeln!(stdin, "{response}").ok()?;
-                stdin.flush().ok()?;
+        } else {
+            writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
+            stdin.flush().ok()?;
+            if !child.wait().ok()?.success() {
+                return None;
             }
+            return Some(result);
         }
     }
 }
@@ -261,12 +258,12 @@ fn parse_review_result(raw: &[u8]) -> Option<ApprovalFormResult> {
     let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
     let object = value.as_object()?;
     let action = match object.get("action")?.as_str()? {
-        "allow" => ApprovalFormAction::Allow,
-        "deny" => ApprovalFormAction::Deny,
-        "cancel" => ApprovalFormAction::Cancel,
+        "allow" => Some(super::options::PromptAction::Allow),
+        "deny" => Some(super::options::PromptAction::Deny),
+        "cancel" => None,
         _ => return None,
     };
-    let scope = scope_from_form_value(object.get("scope")?.as_str()?)?;
+    let scope = object.get("scope")?.as_str()?.parse().ok()?;
     let raw_values = object.get("values")?.as_object()?;
     if raw_values.len() > 16 {
         return None;
@@ -298,6 +295,28 @@ fn resolve_qt_dialog(env: &HashMap<String, String>) -> Option<String> {
     tool_path("AGENT_SANDBOX_QT_DIALOG", "agent-sandbox-qt-dialog")
 }
 
+fn run_graphical_dialog(
+    binary: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Option<String> {
+    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let output = Command::new(binary)
+        .args(args)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .map(|raw| raw.trim().to_owned())
+}
+
 fn qt_dialog_select(
     binary: &str,
     title: &str,
@@ -305,37 +324,17 @@ fn qt_dialog_select(
     env: &HashMap<String, String>,
 ) -> Option<String> {
     let mut args = vec![
-        binary.to_string(),
         "--title".into(),
         "agent-sandbox".into(),
         "--text".into(),
-        title.to_string(),
+        title.into(),
     ];
     for label in options {
         args.push("--option".into());
-        args.push((*label).to_string());
+        args.push((*label).into());
     }
-
-    let _lock = GRAPHICAL_LOCK.lock().ok()?;
-    let output = Command::new(&args[0])
-        .args(&args[1..])
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(output.stdout).ok()?;
-    let trimmed = raw.trim();
-    if options.contains(&trimmed) {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
+    let trimmed = run_graphical_dialog(binary, &args, env)?;
+    options.contains(&trimmed.as_str()).then_some(trimmed)
 }
 
 fn qt_dialog_input(
@@ -344,36 +343,16 @@ fn qt_dialog_input(
     default_text: &str,
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    let args = [
-        binary,
-        "--title",
-        "agent-sandbox",
-        "--text",
-        title,
-        "--input",
-        default_text,
+    let args = vec![
+        "--title".into(),
+        "agent-sandbox".into(),
+        "--text".into(),
+        title.into(),
+        "--input".into(),
+        default_text.into(),
     ];
-
-    let _lock = GRAPHICAL_LOCK.lock().ok()?;
-    let output = Command::new(args[0])
-        .args(&args[1..])
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(output.stdout).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    let trimmed = run_graphical_dialog(binary, &args, env)?;
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn resolve_zenity(env: &HashMap<String, String>) -> Option<String> {
@@ -392,40 +371,18 @@ fn zenity_select(
     options: &[&str],
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    // zenity --list --title "agent-sandbox" --text "..." --column "Options" <opt1>
-    // <opt2> ...
     let mut args = vec![
-        binary.to_string(),
         "--list".into(),
         "--title".into(),
         "agent-sandbox".into(),
         "--text".into(),
-        title.to_string(),
+        title.into(),
         "--column".into(),
         "Options".into(),
     ];
-    args.extend(options.iter().map(|s| (*s).to_string()));
-
-    let _lock = GRAPHICAL_LOCK.lock().ok()?;
-    let output = Command::new(&args[0])
-        .args(&args[1..])
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(output.stdout).ok()?;
-    let trimmed = raw.trim();
-    if options.contains(&trimmed) {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
+    args.extend(options.iter().map(|option| (*option).into()));
+    let trimmed = run_graphical_dialog(binary, &args, env)?;
+    options.contains(&trimmed.as_str()).then_some(trimmed)
 }
 
 fn zenity_input(
@@ -434,37 +391,17 @@ fn zenity_input(
     default_text: &str,
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    let args = [
-        binary,
-        "--entry",
-        "--title",
-        "agent-sandbox",
-        "--text",
-        title,
-        "--entry-text",
-        default_text,
+    let args = vec![
+        "--entry".into(),
+        "--title".into(),
+        "agent-sandbox".into(),
+        "--text".into(),
+        title.into(),
+        "--entry-text".into(),
+        default_text.into(),
     ];
-
-    let _lock = GRAPHICAL_LOCK.lock().ok()?;
-    let output = Command::new(args[0])
-        .args(&args[1..])
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(output.stdout).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    let trimmed = run_graphical_dialog(binary, &args, env)?;
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 #[cfg(test)]
@@ -478,7 +415,7 @@ mod tests {
         ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
         parse_review_result, qt_dialog_review,
     };
-    use crate::ui::options::{ApprovalFormAction, ApprovalFormContext, ReviewValidator};
+    use crate::ui::options::{ApprovalFormContext, ReviewValidator};
 
     struct EofReviewHelper {
         executable: TempPath,
@@ -534,7 +471,7 @@ IFS= read -r response || exit 14
 case "$response" in
     *'"valid":true'*) exit 0 ;;
     *) exit 15 ;;
-esac
+    esac
 "#,
             )
             .expect("write fake review helper");
@@ -578,13 +515,13 @@ printf '%s' "$$" > "$PID_FILE"
     }
 
     fn review_request() -> ApprovalFormRequest {
-        ApprovalFormRequest {
-            summary: "test review".into(),
-            context: Vec::<ApprovalFormContext>::new(),
-            presentation: None,
-            scopes: vec![ApprovalScope::Once, ApprovalScope::Project],
-            fields: Vec::new(),
-        }
+        ApprovalFormRequest::new(
+            "test review",
+            Vec::<ApprovalFormContext>::new(),
+            None,
+            vec![ApprovalScope::Once, ApprovalScope::Project],
+            Vec::new(),
+        )
     }
 
     fn target_validator() -> ReviewValidator {
@@ -715,7 +652,7 @@ printf '%s' "$$" > "$PID_FILE"
         )
         .expect("valid review result");
 
-        assert_eq!(result.action, ApprovalFormAction::Allow);
+        assert_eq!(result.action, Some(crate::ui::options::PromptAction::Allow));
         assert_eq!(result.scope, ApprovalScope::Project);
         assert_eq!(result.values["method"], "get_head");
     }

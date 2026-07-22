@@ -4,10 +4,10 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, FileAccess, FilesystemRule,
-    HttpMethodMatcher, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind, ResourceRule, UiPush,
-    contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name,
-    split_check_aliases,
+    ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
+    HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
+    ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
+    host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
 };
 use tracing::warn;
 
@@ -23,7 +23,7 @@ use super::{
         PromptAction, ReviewValidator, ScopeOption, format_command, scope_only_options,
         sudo_target_options,
     },
-    signature_display,
+    prompt_blocking, signature_display,
 };
 
 /// Default project-relative rule path shown in approval prompts.
@@ -33,10 +33,7 @@ fn suggest_project_rule_path(path: &Path, project_root: Option<&Path>) -> String
         .to_string()
 }
 
-fn approval_context(
-    paths: &agent_sandbox_core::SandboxPaths,
-    session_id: Option<&str>,
-) -> Vec<ApprovalFormContext> {
+fn approval_context(paths: &SandboxPaths, session_id: Option<&str>) -> Vec<ApprovalFormContext> {
     let mut context = Vec::new();
     let project_root = paths.project_root();
     if let Some(project) = project_root {
@@ -71,9 +68,7 @@ async fn rich_review(
     request: ApprovalFormRequest,
     validate: Option<ReviewValidator>,
 ) -> Result<ApprovalReviewOutcome, UiCliError> {
-    tokio::task::spawn_blocking(move || review_approval(&request, validate.as_ref()))
-        .await
-        .map_err(|_| UiCliError::Register("prompt join failed".into()))
+    prompt_blocking(move || review_approval(&request, validate.as_ref())).await
 }
 
 struct ElevationReview {
@@ -83,11 +78,11 @@ struct ElevationReview {
 
 fn build_elevation_review(
     argv: &[String],
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     title: &str,
 ) -> ElevationReview {
-    let prefixes = agent_sandbox_core::SudoRule::approval_prefixes(argv);
+    let prefixes = SudoRule::approval_prefixes(argv);
     let prefix_options = prefixes
         .iter()
         .enumerate()
@@ -97,16 +92,16 @@ fn build_elevation_review(
         })
         .collect();
     ElevationReview {
-        request: ApprovalFormRequest {
-            summary: title.to_owned(),
-            context: approval_context(paths, session_id),
-            presentation: Some(elevation_presentation(argv)),
-            scopes: approval_scopes(session_id.is_some()),
-            fields: vec![
+        request: ApprovalFormRequest::new(
+            title.to_owned(),
+            approval_context(paths, session_id),
+            Some(elevation_presentation(argv)),
+            approval_scopes(session_id.is_some()),
+            vec![
                 choice_field("target", "Command prefix", "0", prefix_options),
                 comment_field(),
             ],
-        },
+        ),
         prefixes,
     }
 }
@@ -125,7 +120,7 @@ fn validated_review_action(
     result: &ApprovalFormResult,
     session_available: bool,
 ) -> Option<ReviewActionScope> {
-    let action = result.action.prompt_action()?;
+    let action = result.action?;
     let scope = result.scope;
     let allowed = scope == ApprovalScope::Once
         || scope == ApprovalScope::Project
@@ -226,22 +221,22 @@ fn resource_presentation(
         ResourceKind::Device => "device",
     };
     let heading = match access {
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect) => {
+        ResourceAccess::Socket(SocketAccess::Connect) => {
             format!("Connect to this {kind_label}?")
         }
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send) => {
+        ResourceAccess::Socket(SocketAccess::Send) => {
             format!("Send data to this {kind_label}?")
         }
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::All) => {
+        ResourceAccess::Socket(SocketAccess::All) => {
             format!("Connect to and send data to this {kind_label}?")
         }
-        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read) => {
+        ResourceAccess::Device(DeviceAccess::Read) => {
             format!("Read from this {kind_label}?")
         }
-        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Write) => {
+        ResourceAccess::Device(DeviceAccess::Write) => {
             format!("Write to this {kind_label}?")
         }
-        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::ReadWrite) => {
+        ResourceAccess::Device(DeviceAccess::ReadWrite) => {
             format!("Read and write this {kind_label}?")
         }
     };
@@ -258,7 +253,7 @@ fn network_presentation(url: &str) -> ApprovalFormPresentation {
     }
 }
 
-fn http_presentation(request: &agent_sandbox_core::HttpRequest) -> ApprovalFormPresentation {
+fn http_presentation(request: &HttpRequest) -> ApprovalFormPresentation {
     ApprovalFormPresentation {
         heading: format!("Allow this {} request?", request.method.as_str()),
         subject: request.url.to_string(),
@@ -368,7 +363,7 @@ fn parse_resource_target(
     if !ResourceRule::new(
         kind,
         path.clone(),
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+        ResourceAccess::Socket(SocketAccess::Connect),
         "",
     )
     .path_matches(requested_path, project_root)
@@ -412,7 +407,7 @@ fn parse_dbus_target(
 }
 async fn handle_dbus_unavailable(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     id: &str,
@@ -456,7 +451,7 @@ async fn handle_dbus_unavailable(
 /// Prompt the user for a D-Bus message approval.
 async fn handle_dbus_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     push: UiPush,
 ) -> Result<(), UiCliError> {
@@ -472,16 +467,16 @@ async fn handle_dbus_push(
         unreachable!("D-Bus variant was validated by the dispatcher")
     };
     let paths = paths.merged_with(cwd, home, project_root);
-    let review = ApprovalFormRequest {
-        summary: format!(
+    let review = ApprovalFormRequest::new(
+        format!(
             "D-Bus {} {}",
             message_kind_name(target.message_kind),
             target.member
         ),
-        context: approval_context(&paths, session_id),
-        presentation: Some(dbus_presentation(&target)),
-        scopes: approval_scopes(session_id.is_some()),
-        fields: vec![
+        approval_context(&paths, session_id),
+        Some(dbus_presentation(&target)),
+        approval_scopes(session_id.is_some()),
+        vec![
             text_field("bus", "Bus", bus_name(target.bus).into()),
             text_field("destination", "Destination", target.destination.clone()),
             text_field("object_path", "Object path", target.object_path.clone()),
@@ -500,7 +495,7 @@ async fn handle_dbus_push(
             text_field("fd_metadata", "FD metadata", dbus_fd_display(&target)),
             comment_field(),
         ],
-    };
+    );
     let requested = target.clone();
     match rich_review(
         review,
@@ -548,7 +543,7 @@ async fn handle_dbus_push(
 /// Prompt the user for a network request approval.
 async fn handle_network_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     push: UiPush,
@@ -588,16 +583,16 @@ async fn handle_network_push(
     );
     let url = url.split(['?', '#']).next().unwrap_or_default().to_owned();
     let paths = paths.merged_with(cwd, home, project_root);
-    let review = ApprovalFormRequest {
-        summary: format!("Network request to {url}"),
-        context: approval_context(&paths, session_id),
-        presentation: Some(network_presentation(&url)),
-        scopes: approval_scopes(session_id.is_some()),
-        fields: vec![
+    let review = ApprovalFormRequest::new(
+        format!("Network request to {url}"),
+        approval_context(&paths, session_id),
+        Some(network_presentation(&url)),
+        approval_scopes(session_id.is_some()),
+        vec![
             text_field("target", "Host rule", host.clone()),
             comment_field(),
         ],
-    };
+    );
     match rich_review(
         review,
         Some(make_validator(session_id.is_some(), {
@@ -645,7 +640,7 @@ async fn handle_network_push(
 
 async fn network_push_cli_fallback(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     id: &str,
@@ -668,9 +663,7 @@ async fn network_push_cli_fallback(
     } else {
         let title = format!("agent-sandbox: {} {url} target?", action.verb());
         let default_host = host.to_owned();
-        let entered = tokio::task::spawn_blocking(move || pick_text(&title, &default_host))
-            .await
-            .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
+        let entered = prompt_blocking(move || pick_text(&title, &default_host)).await?;
         match entered {
             Some(host) => Some(ApprovalTarget::NetworkHost { host }),
             None => return deny_cancellation(socket, paths, sandbox_session_id, id).await,
@@ -696,11 +689,11 @@ async fn network_push_cli_fallback(
 
 async fn handle_http_review(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     id: &str,
-    request: &agent_sandbox_core::HttpRequest,
+    request: &HttpRequest,
 ) -> Result<bool, UiCliError> {
     let method_options = vec![
         ApprovalFormOption {
@@ -712,17 +705,17 @@ async fn handle_http_review(
             label: "All methods".into(),
         },
     ];
-    let review = ApprovalFormRequest {
-        summary: format!("HTTP {} {}", request.method.as_str(), request.url),
-        context: approval_context(paths, session_id),
-        presentation: Some(http_presentation(request)),
-        scopes: approval_scopes(session_id.is_some()),
-        fields: vec![
+    let review = ApprovalFormRequest::new(
+        format!("HTTP {} {}", request.method.as_str(), request.url),
+        approval_context(paths, session_id),
+        Some(http_presentation(request)),
+        approval_scopes(session_id.is_some()),
+        vec![
             choice_field("method", "Methods", "exact", method_options),
             text_field("url", "URL", request.url.to_string()),
             comment_field(),
         ],
-    };
+    );
     let method = request.method.clone();
     let request_url = request.url.clone();
     let session = session_id.is_some();
@@ -788,7 +781,7 @@ async fn handle_http_review(
 /// Prompt the user for a decoded HTTP request approval.
 async fn handle_http_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     push: UiPush,
 ) -> Result<(), UiCliError> {
@@ -895,7 +888,7 @@ async fn handle_http_push(
 /// Prompt the user for an elevation (sudo) request approval.
 async fn handle_elevation_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     push: UiPush,
@@ -997,7 +990,7 @@ async fn handle_elevation_push(
 /// Returns [`UiCliError`] when RPC communication with policyd fails.
 pub async fn handle_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     push: UiPush,
@@ -1028,7 +1021,7 @@ pub async fn handle_push(
 /// Prompt the user for a filesystem access approval.
 async fn handle_filesystem_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     push: UiPush,
@@ -1045,18 +1038,17 @@ async fn handle_filesystem_push(
         unreachable!("filesystem variant was validated by the dispatcher")
     };
     let paths = paths.merged_with(cwd, home, project_root.clone());
-    let title = format!("agent-sandbox: filesystem {access} {}", path.display());
     let default_rule_path = suggest_project_rule_path(&path, paths.project_root());
-    let review = ApprovalFormRequest {
-        summary: format!("Filesystem {access} request for {}", path.display()),
-        context: approval_context(&paths, session_id),
-        presentation: Some(filesystem_presentation(access, &default_rule_path)),
-        scopes: approval_scopes(session_id.is_some()),
-        fields: vec![
+    let review = ApprovalFormRequest::new(
+        format!("Filesystem {access} request for {}", path.display()),
+        approval_context(&paths, session_id),
+        Some(filesystem_presentation(access, &default_rule_path)),
+        approval_scopes(session_id.is_some()),
+        vec![
             text_field("target", "Path or pattern", default_rule_path.clone()),
             comment_field(),
         ],
-    };
+    );
     match rich_review(
         review,
         Some(make_validator(session_id.is_some(), {
@@ -1092,41 +1084,10 @@ async fn handle_filesystem_push(
         ApprovalReviewOutcome::Unavailable => {}
     }
 
-    // Step 1: choose action
-    let Some(action) = choose_action(&title).await? else {
-        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-    };
-
-    // Step 2: choose scope
-    let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} filesystem scope?", action.verb()),
-        session_id.is_some(),
-    )
-    .await?
+    let Some((action, choice)) =
+        choose_filesystem_choice(access, &default_rule_path, session_id.is_some()).await?
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-    };
-
-    // Step 3: for non-Once scopes, edit the rule path in a text field
-    let target = if scope == ApprovalScope::Once {
-        None
-    } else {
-        match choose_path_target(
-            &format!("agent-sandbox: allow filesystem {access} path?"),
-            &default_rule_path,
-            |rule_path| ApprovalTarget::FilesystemPath { path: rule_path },
-        )
-        .await?
-        {
-            Some(t) => Some(t),
-            None => return deny_cancellation(socket, &paths, sandbox_session_id, &id).await,
-        }
-    };
-    let choice = ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
     };
     resolve_choice(
         socket,
@@ -1140,6 +1101,47 @@ async fn handle_filesystem_push(
     .await
 }
 
+async fn choose_filesystem_choice(
+    access: FileAccess,
+    default_rule_path: &str,
+    session_available: bool,
+) -> Result<Option<(PromptAction, ScopeOption)>, UiCliError> {
+    let Some(action) =
+        choose_action(&format!("agent-sandbox: filesystem {access} action?")).await?
+    else {
+        return Ok(None);
+    };
+    let Some(scope) = choose_scope_only(
+        &format!("agent-sandbox: {} filesystem scope?", action.verb()),
+        session_available,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        let Some(target) = choose_path_target(
+            &format!("agent-sandbox: allow filesystem {access} path?"),
+            default_rule_path,
+            |rule_path| ApprovalTarget::FilesystemPath { path: rule_path },
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        Some(target)
+    };
+    let choice = ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+        comment: None,
+    };
+    Ok(Some((action, choice)))
+}
+
 struct ResourcePrompt<'a> {
     kind: ResourceKind,
     access: ResourceAccess,
@@ -1149,7 +1151,7 @@ struct ResourcePrompt<'a> {
 /// Prompt the user for a resource access approval.
 async fn handle_resource_push(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     push: UiPush,
@@ -1168,20 +1170,20 @@ async fn handle_resource_push(
     };
     let paths = paths.merged_with(cwd, home, project_root);
     let display_path = suggest_project_rule_path(&path, paths.project_root());
-    let review = ApprovalFormRequest {
-        summary: format!("{kind} {access} request for {display_path}"),
-        context: approval_context(&paths, session_id),
-        presentation: Some(resource_presentation(
+    let review = ApprovalFormRequest::new(
+        format!("{kind} {access} request for {display_path}"),
+        approval_context(&paths, session_id),
+        Some(resource_presentation(
             access,
             kind,
             Path::new(&display_path),
         )),
-        scopes: approval_scopes(session_id.is_some()),
-        fields: vec![
+        approval_scopes(session_id.is_some()),
+        vec![
             text_field("target", "Path or pattern", display_path),
             comment_field(),
         ],
-    };
+    );
     let validator_kind = kind;
     let validator_path = path.clone();
     let project_root = paths.project_root_path();
@@ -1239,7 +1241,7 @@ async fn handle_resource_push(
 
 async fn resource_push_cli_fallback(
     socket: &Path,
-    paths: &agent_sandbox_core::SandboxPaths,
+    paths: &SandboxPaths,
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     id: &str,
@@ -1296,14 +1298,12 @@ async fn resource_push_cli_fallback(
 
 async fn choose_action(title: &str) -> Result<Option<PromptAction>, UiCliError> {
     let title = title.to_string();
-    let choice = tokio::task::spawn_blocking(move || pick_option(&title, ACTION_OPTIONS))
-        .await
-        .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
+    let choice = prompt_blocking(move || pick_option(&title, ACTION_OPTIONS)).await?;
     Ok(choice.as_deref().and_then(PromptAction::from_label))
 }
 async fn choose_http_target(
     title: &str,
-    request: &agent_sandbox_core::HttpRequest,
+    request: &HttpRequest,
     method: HttpMethodMatcher,
 ) -> Result<Option<ApprovalTarget>, UiCliError> {
     let title = title.to_owned();
@@ -1311,10 +1311,7 @@ async fn choose_http_target(
     loop {
         let prompt_title = title.clone();
         let default_url = default_url.clone();
-        let Some(raw_url) =
-            tokio::task::spawn_blocking(move || pick_text(&prompt_title, &default_url))
-                .await
-                .map_err(|_| UiCliError::Register("prompt join failed".into()))?
+        let Some(raw_url) = prompt_blocking(move || pick_text(&prompt_title, &default_url)).await?
         else {
             return Ok(None);
         };
@@ -1345,16 +1342,15 @@ async fn choose_scope(
     options: Vec<ScopeOption>,
 ) -> Result<Option<ScopeOption>, UiCliError> {
     let title = title.to_string();
-    let choice = tokio::task::spawn_blocking({
+    let choice = prompt_blocking({
         let option_labels: Vec<String> =
             options.iter().map(|option| option.label.clone()).collect();
         move || {
-            let refs: Vec<&str> = option_labels.iter().map(String::as_str).collect();
-            pick_option(&title, &refs)
+            let labels: Vec<&str> = option_labels.iter().map(String::as_str).collect();
+            pick_option(&title, &labels)
         }
     })
-    .await
-    .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
+    .await?;
     Ok(choice.and_then(|label| options.into_iter().find(|option| option.label == label)))
 }
 
@@ -1374,9 +1370,7 @@ async fn choose_path_target(
 ) -> Result<Option<ApprovalTarget>, UiCliError> {
     let title = title.to_string();
     let default_path = default_path.to_string();
-    let choice = tokio::task::spawn_blocking(move || pick_text(&title, &default_path))
-        .await
-        .map_err(|_| UiCliError::Register("prompt join failed".into()))?;
+    let choice = prompt_blocking(move || pick_text(&title, &default_path)).await?;
     Ok(choice.map(|path| build_target(PathBuf::from(path))))
 }
 
@@ -1443,21 +1437,21 @@ mod tests {
 
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
+        SocketAccess,
     };
 
     use super::{
-        ApprovalFormResult, ApprovalScope, ApprovalTarget, approval_context,
+        ApprovalFormResult, ApprovalScope, ApprovalTarget, PromptAction, approval_context,
         elevation_presentation, http_presentation, network_presentation, network_prompt_scheme,
         network_prompt_url, network_prompt_with_aliases, network_prompt_with_transport_hint,
         parse_dbus_target, parse_filesystem_target, parse_network_target, parse_resource_target,
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
-    use crate::ui::options::ApprovalFormAction;
     #[test]
     fn resource_presentation_uses_human_readable_unix_socket_label() {
         let presentation = resource_presentation(
-            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            ResourceAccess::Socket(SocketAccess::Connect),
             ResourceKind::UnixSocket,
             Path::new("/run/example.sock"),
         );
@@ -1616,7 +1610,7 @@ mod tests {
     #[test]
     fn once_review_ignores_untrusted_target_value() {
         let result = ApprovalFormResult {
-            action: ApprovalFormAction::Allow,
+            action: Some(PromptAction::Allow),
             scope: ApprovalScope::Once,
             values: HashMap::new(),
         };
@@ -1632,7 +1626,7 @@ mod tests {
     #[test]
     fn persistent_review_requires_valid_target() {
         let result = ApprovalFormResult {
-            action: ApprovalFormAction::Allow,
+            action: Some(PromptAction::Allow),
             scope: ApprovalScope::Project,
             values: HashMap::from([("target".into(), String::new())]),
         };
@@ -1647,14 +1641,14 @@ mod tests {
     #[test]
     fn review_rejects_unavailable_session_scope_and_cancel_action() {
         let unavailable = ApprovalFormResult {
-            action: ApprovalFormAction::Deny,
+            action: Some(PromptAction::Deny),
             scope: ApprovalScope::Session,
             values: HashMap::new(),
         };
         assert!(reviewed_choice(&unavailable, false, |_| None).is_none());
 
         let cancelled = ApprovalFormResult {
-            action: ApprovalFormAction::Cancel,
+            action: None,
             scope: ApprovalScope::Once,
             values: HashMap::new(),
         };
@@ -1687,7 +1681,7 @@ mod tests {
             Vec::new(),
         );
         let result = ApprovalFormResult {
-            action: ApprovalFormAction::Allow,
+            action: Some(PromptAction::Allow),
             scope: ApprovalScope::Project,
             values: HashMap::from([
                 ("bus".into(), "session".into()),
@@ -1717,7 +1711,7 @@ mod tests {
 
     fn form_result(target: &str) -> ApprovalFormResult {
         ApprovalFormResult {
-            action: ApprovalFormAction::Allow,
+            action: Some(PromptAction::Allow),
             scope: ApprovalScope::Project,
             values: HashMap::from([("target".into(), target.into())]),
         }

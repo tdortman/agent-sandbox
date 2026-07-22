@@ -54,12 +54,6 @@ pub struct ApprovalFormOption {
 }
 
 #[derive(Debug, Clone)]
-pub struct ApprovalScopeFormValue {
-    pub(crate) value: &'static str,
-    pub(crate) label: &'static str,
-}
-
-#[derive(Debug, Clone)]
 pub struct ApprovalFormRequest {
     pub(crate) summary: String,
     pub(crate) context: Vec<ApprovalFormContext>,
@@ -87,13 +81,34 @@ pub enum ApprovalFormControl {
 }
 
 impl ApprovalFormRequest {
+    pub(crate) fn new(
+        summary: impl Into<String>,
+        context: Vec<ApprovalFormContext>,
+        presentation: Option<ApprovalFormPresentation>,
+        scopes: Vec<ApprovalScope>,
+        fields: Vec<ApprovalFormField>,
+    ) -> Self {
+        Self {
+            summary: summary.into(),
+            context,
+            presentation,
+            scopes,
+            fields,
+        }
+    }
+
     pub(crate) fn to_json(&self) -> Value {
         let scopes = self
             .scopes
             .iter()
             .map(|scope| {
-                let form_value = scope_form_value(*scope);
-                json!({ "value": form_value.value, "label": form_value.label })
+                let label = match scope {
+                    ApprovalScope::Once => "Once",
+                    ApprovalScope::Session => "This session",
+                    ApprovalScope::Project => "This project",
+                    ApprovalScope::Global => "Globally",
+                };
+                json!({ "value": scope.as_str(), "label": label })
             })
             .collect::<Vec<_>>();
         let fields = self
@@ -138,7 +153,7 @@ impl ApprovalFormRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalFormResult {
-    pub(crate) action: ApprovalFormAction,
+    pub(crate) action: Option<PromptAction>,
     pub(crate) scope: ApprovalScope,
     pub(crate) values: HashMap<String, String>,
 }
@@ -147,54 +162,6 @@ pub struct ApprovalFormResult {
 /// Returns `Ok(())` to accept, `Err(message)` to send the error back
 /// so the user can fix the input and resubmit.
 pub type ReviewValidator = Box<dyn Fn(&ApprovalFormResult) -> Result<(), String> + Send + 'static>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalFormAction {
-    Allow,
-    Deny,
-    Cancel,
-}
-
-impl ApprovalFormAction {
-    pub(crate) const fn prompt_action(self) -> Option<PromptAction> {
-        match self {
-            Self::Allow => Some(PromptAction::Allow),
-            Self::Deny => Some(PromptAction::Deny),
-            Self::Cancel => None,
-        }
-    }
-}
-
-pub const fn scope_form_value(scope: ApprovalScope) -> ApprovalScopeFormValue {
-    match scope {
-        ApprovalScope::Once => ApprovalScopeFormValue {
-            value: "once",
-            label: "Once",
-        },
-        ApprovalScope::Session => ApprovalScopeFormValue {
-            value: "session",
-            label: "This session",
-        },
-        ApprovalScope::Project => ApprovalScopeFormValue {
-            value: "project",
-            label: "This project",
-        },
-        ApprovalScope::Global => ApprovalScopeFormValue {
-            value: "global",
-            label: "Globally",
-        },
-    }
-}
-
-pub fn scope_from_form_value(value: &str) -> Option<ApprovalScope> {
-    match value {
-        "once" => Some(ApprovalScope::Once),
-        "session" => Some(ApprovalScope::Session),
-        "project" => Some(ApprovalScope::Project),
-        "global" => Some(ApprovalScope::Global),
-        _ => None,
-    }
-}
 
 #[must_use]
 pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
@@ -260,15 +227,15 @@ mod tests {
 
     #[test]
     fn review_request_serializes_generic_scopes_and_fields() {
-        let request = ApprovalFormRequest {
-            summary: "HTTP GET https://example.com/path".into(),
-            context: vec![ApprovalFormContext {
+        let request = ApprovalFormRequest::new(
+            "HTTP GET https://example.com/path",
+            vec![ApprovalFormContext {
                 label: "Project".into(),
                 value: "/work/project".into(),
             }],
-            presentation: None,
-            scopes: vec![ApprovalScope::Once, ApprovalScope::Project],
-            fields: vec![ApprovalFormField {
+            None,
+            vec![ApprovalScope::Once, ApprovalScope::Project],
+            vec![ApprovalFormField {
                 id: "method",
                 label: "Methods".into(),
                 control: ApprovalFormControl::Choice {
@@ -285,7 +252,7 @@ mod tests {
                     ],
                 },
             }],
-        };
+        );
 
         let json = request.to_json();
 

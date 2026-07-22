@@ -20,7 +20,7 @@ use agent_sandbox_core::{
 };
 use clap::Parser;
 pub use error::UiCliError;
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::{Flock, FlockArg, OFlag};
 use tracing::{info, warn};
 
 #[must_use]
@@ -75,14 +75,24 @@ fn prompt_lock_path() -> Result<PathBuf, UiCliError> {
         })
 }
 
+pub(super) async fn prompt_blocking<F, T>(operation: F) -> Result<T, UiCliError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| UiCliError::Register("prompt join failed".into()))
+}
+
 async fn acquire_prompt_lock(path: PathBuf) -> Result<Flock<File>, UiCliError> {
-    tokio::task::spawn_blocking(move || {
+    prompt_blocking(move || {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(OFlag::O_NOFOLLOW.bits())
             .open(&path)
             .map_err(|err| {
                 UiCliError::Register(format!(
@@ -111,8 +121,7 @@ async fn acquire_prompt_lock(path: PathBuf) -> Result<Flock<File>, UiCliError> {
             ))
         })
     })
-    .await
-    .map_err(|err| UiCliError::Register(format!("prompt lock worker failed: {err}")))?
+    .await?
 }
 
 #[derive(Parser, Debug)]
