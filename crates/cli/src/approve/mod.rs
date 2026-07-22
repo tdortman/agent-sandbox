@@ -9,7 +9,7 @@ use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
     RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::ui::{bus_name, message_kind_name, signature_display};
 
@@ -32,7 +32,6 @@ agent-sandbox-approve approve <request-id> session --session-id session-2024-05-
 # Pre-approve 1.1.1.1 on port 53 globally so all sandboxes can use the Cloudflare DNS.
 agent-sandbox-approve approve-host 1.1.1.1 53 global --home /home/user"#
 )]
-
 struct Cli {
     /// Path to the policyd Unix domain socket the CLI talks to.
     #[arg(
@@ -45,25 +44,30 @@ struct Cli {
     cmd: Command,
 }
 
+#[derive(Args, Debug)]
+struct ContextArgs {
+    /// Home directory inside the sandbox. Used to scope "global" rules.
+    /// Defaults to the env var `AGENT_SANDBOX_HOME`.
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
+    home: Option<PathBuf>,
+
+    /// Working directory inside the sandbox. Used to scope per-project rules.
+    /// Defaults to the env var `AGENT_SANDBOX_CWD`.
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
+    cwd: Option<PathBuf>,
+
+    /// Project root inside the sandbox. Required for "project" scope.
+    /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
+    #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
+    project_root: Option<PathBuf>,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// List every pending approval request.
     Pending {
-        /// Home directory inside the sandbox. Used to scope "global" rules to
-        /// the right "policy.json". Defaults to the env var
-        /// `AGENT_SANDBOX_HOME`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
-        home: Option<PathBuf>,
-
-        /// Working directory inside the sandbox. Used to scope per-project
-        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
-        cwd: Option<PathBuf>,
-
-        /// Project root inside the sandbox. Required for "project" scope.
-        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
-        project_root: Option<PathBuf>,
+        #[command(flatten)]
+        context: ContextArgs,
     },
     /// Approve a pending request and persist the rule at the requested scope.
     Approve {
@@ -81,20 +85,8 @@ enum Command {
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
 
-        /// Home directory inside the sandbox. Used to scope "global" rules.
-        /// Defaults to the env var `AGENT_SANDBOX_HOME`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
-        home: Option<PathBuf>,
-
-        /// Working directory inside the sandbox. Used to scope per-project
-        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
-        cwd: Option<PathBuf>,
-
-        /// Project root inside the sandbox. Required for "project" scope.
-        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
-        project_root: Option<PathBuf>,
+        #[command(flatten)]
+        context: ContextArgs,
     },
     /// Pre-approve a single (host, port) pair without an outstanding request.
     /// Writes the rule directly to policyd.
@@ -116,20 +108,8 @@ enum Command {
         /// "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Home directory inside the sandbox. Used to scope "global" rules.
-        /// Defaults to the env var `AGENT_SANDBOX_HOME`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
-        home: Option<PathBuf>,
-
-        /// Working directory inside the sandbox. Used to scope per-project
-        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
-        cwd: Option<PathBuf>,
-
-        /// Project root inside the sandbox. Required for "project" scope.
-        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
-        project_root: Option<PathBuf>,
+        #[command(flatten)]
+        context: ContextArgs,
     },
     /// Pre-approve a decoded HTTP method and URL target.
     ApproveHttp {
@@ -151,14 +131,8 @@ enum Command {
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
 
-        #[arg(long, value_name = "DIR")]
-        home: Option<PathBuf>,
-
-        #[arg(long, value_name = "DIR")]
-        cwd: Option<PathBuf>,
-
-        #[arg(long, value_name = "DIR")]
-        project_root: Option<PathBuf>,
+        #[command(flatten)]
+        context: ContextArgs,
     },
     /// Deny a pending request and persist the deny rule at the requested scope.
     Deny {
@@ -175,20 +149,8 @@ enum Command {
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
 
-        /// Home directory inside the sandbox. Used to scope "global" rules.
-        /// Defaults to the env var `AGENT_SANDBOX_HOME`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
-        home: Option<PathBuf>,
-
-        /// Working directory inside the sandbox. Used to scope per-project
-        /// rules. Defaults to the env var `AGENT_SANDBOX_CWD`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
-        cwd: Option<PathBuf>,
-
-        /// Project root inside the sandbox. Required for "project" scope.
-        /// Defaults to the env var `AGENT_SANDBOX_PROJECT_ROOT`.
-        #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
-        project_root: Option<PathBuf>,
+        #[command(flatten)]
+        context: ContextArgs,
     },
 }
 /// Parse CLI args, dispatch to the matching subcommand handler, and print the
@@ -206,20 +168,21 @@ pub async fn run() -> Result<(), ApproveCliError> {
 
 async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError> {
     match command {
-        Command::Pending {
-            home,
-            cwd,
-            project_root,
-        } => handle_pending(socket, home, cwd, project_root).await,
+        Command::Pending { context } => {
+            let ContextArgs {
+                home,
+                cwd,
+                project_root,
+            } = context;
+            handle_pending(socket, home, cwd, project_root).await
+        }
         Command::Approve {
             id,
             scope,
             session_id,
-            home,
-            cwd,
-            project_root,
+            context,
         } => {
-            let ctx = request_context(cwd, home, project_root);
+            let ctx = request_context(context);
             handle_approve(socket, id, scope, session_id, ctx).await
         }
         Command::ApproveHost {
@@ -227,11 +190,9 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             port,
             scope,
             session_id,
-            home,
-            cwd,
-            project_root,
+            context,
         } => {
-            let ctx = request_context(cwd, home, project_root);
+            let ctx = request_context(context);
             handle_approve_host(socket, host, port, scope, session_id, ctx).await
         }
         Command::ApproveHttp {
@@ -240,33 +201,25 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             method,
             all_methods,
             session_id,
-            home,
-            cwd,
-            project_root,
+            context,
         } => {
-            let ctx = request_context(cwd, home, project_root);
+            let ctx = request_context(context);
             handle_approve_http(socket, url, scope, method, all_methods, session_id, ctx).await
         }
         Command::Deny {
             id,
             scope,
             session_id,
-            home,
-            cwd,
-            project_root,
+            context,
         } => {
-            let ctx = request_context(cwd, home, project_root);
+            let ctx = request_context(context);
             handle_deny(socket, id, scope, session_id, ctx).await
         }
     }
 }
 
-fn request_context(
-    cwd: Option<PathBuf>,
-    home: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-) -> RequestContext {
-    let paths = SandboxPaths::from_wire(cwd, home, project_root);
+fn request_context(context: ContextArgs) -> RequestContext {
+    let paths = SandboxPaths::from_wire(context.cwd, context.home, context.project_root);
     RequestContext::from(&paths)
 }
 
@@ -457,7 +410,6 @@ async fn rpc(socket: &Path, req: RpcRequest) -> Result<RpcReply, ApproveCliError
         .await
         .map_err(ApproveCliError::Rpc)
 }
-
 fn print_json(resp: &RpcReply) -> Result<(), ApproveCliError> {
     println!("{}", serde_json::to_string_pretty(resp)?);
     if resp.is_ok() {
@@ -495,7 +447,7 @@ mod tests {
     #[test]
     fn context_arguments_declare_environment_defaults() {
         let command = Cli::command();
-        for name in ["pending", "approve", "approve-host", "deny"] {
+        for name in ["pending", "approve", "approve-host", "approve-http", "deny"] {
             let subcommand = command
                 .find_subcommand(name)
                 .expect("context subcommand should exist");
