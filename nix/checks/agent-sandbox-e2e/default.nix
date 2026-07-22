@@ -155,11 +155,29 @@ let
     })
   ];
 
-  dynamicPolicy = pkgs.writeText "agent-sandbox-vm-dynamic-policy.json" ''
+  emptyPolicySection = ''{ "allow": [], "deny": [] }'';
+
+  mkPolicy =
+    name:
     {
-      "network": { "direct": { "allow": [], "deny": [] } },
-      "sudo": { "allow": [], "deny": [] },
-      "filesystem": {
+      sudo ? emptyPolicySection,
+      filesystem ? emptyPolicySection,
+      resources ? emptyPolicySection,
+      dbus ? emptyPolicySection,
+    }:
+    pkgs.writeText "agent-sandbox-vm-${name}-policy.json" ''
+      {
+        "network": { "direct": { "allow": [], "deny": [] } },
+        "sudo": ${sudo},
+        "filesystem": ${filesystem},
+        "resources": ${resources},
+        "dbus": ${dbus}
+      }
+    '';
+
+  dynamicPolicy = mkPolicy "dynamic" {
+    filesystem = ''
+      {
         "allow": [
           { "path": "/var/lib/agent-sandbox-test/dynamic-read", "access": "read" },
           { "path": "/var/lib/agent-sandbox-test/dynamic-write", "access": "all" },
@@ -170,42 +188,35 @@ let
           { "path": "/var/lib/agent-sandbox-test/dynamic-denied", "access": "all" },
           { "path": "/var/lib/agent-sandbox-test/dynamic-mutations/denied", "access": "all" }
         ]
-      },
-      "resources": { "allow": [], "deny": [] },
-      "dbus": { "allow": [], "deny": [] }
-    }
-  '';
+      }
+    '';
+  };
 
-  resourcePolicy = pkgs.writeText "agent-sandbox-vm-resource-policy.json" ''
-    {
-      "network": { "direct": { "allow": [], "deny": [] } },
-      "sudo": { "allow": [], "deny": [] },
-      "filesystem": { "allow": [], "deny": [] },
-      "resources": {
+  resourcePolicy = mkPolicy "resource" {
+    resources = ''
+      {
         "allow": [
           { "kind": "unix_socket", "path": "/run/agent-sandbox-test/echo.sock", "access": "connect" },
           { "kind": "unix_socket", "path": "/run/agent-sandbox-test/echo.sock", "access": "send" },
           { "kind": "device", "path": "/dev/agent-sandbox-test-device", "access": "open_read" }
         ],
         "deny": []
-      },
-      "dbus": { "allow": [], "deny": [] }
-    }
-  '';
+      }
+    '';
+  };
 
-  dbusPolicy = pkgs.writeText "agent-sandbox-vm-dbus-policy.json" ''
-    {
-      "network": { "direct": { "allow": [], "deny": [] } },
-      "sudo": { "allow": [], "deny": [] },
-      "filesystem": { "allow": [], "deny": [] },
-      "resources": {
+  dbusPolicy = mkPolicy "dbus" {
+    resources = ''
+      {
         "allow": [
           { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
           { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
         ],
         "deny": []
-      },
-      "dbus": {
+      }
+    '';
+    dbus = ''
+      {
         "allow": [
           {
             "target": {
@@ -236,21 +247,17 @@ let
         ],
         "deny": []
       }
-    }
-  '';
+    '';
+  };
 
-  sudoPolicy = pkgs.writeText "agent-sandbox-vm-sudo-policy.json" ''
-    {
-      "network": { "direct": { "allow": [], "deny": [] } },
-      "sudo": {
+  sudoPolicy = mkPolicy "sudo" {
+    sudo = ''
+      {
         "allow": [ { "argv": [ "id" ], "comment": "VM elevation contract" } ],
         "deny": []
-      },
-      "filesystem": { "allow": [], "deny": [] },
-      "resources": { "allow": [], "deny": [] },
-      "dbus": { "allow": [], "deny": [] }
-    }
-  '';
+      }
+    '';
+  };
 
   testUser = {
     isNormalUser = true;

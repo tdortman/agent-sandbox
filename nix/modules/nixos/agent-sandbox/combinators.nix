@@ -24,58 +24,43 @@ let
     unsafe-add-raw-args
     ;
 
-  # Like jail.nix `base`, but bind host /dev/pts instead of `--dev /dev` (which tries to
-  # recreate the caller's pts node and fails with --disable-userns).
-  agent-sandbox-base = compose [
-    (unsafe-add-raw-args "--proc /proc")
-    (unsafe-add-raw-args "--tmpfs /dev")
-    (unsafe-add-raw-args "--dev-bind /dev/null /dev/null")
-    (unsafe-add-raw-args "--dev-bind /dev/zero /dev/zero")
-    (unsafe-add-raw-args "--dev-bind /dev/random /dev/random")
-    (unsafe-add-raw-args "--dev-bind /dev/urandom /dev/urandom")
-    (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
-    (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
-    (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
-    (unsafe-add-raw-args "--tmpfs /tmp")
-    (unsafe-add-raw-args "--tmpfs ~")
-    (ro-bind "${pkgs.bash}/bin/sh" "/bin/sh")
-    (add-path "/bin")
-    (add-pkg-deps [
-      pkgs.coreutils
-      pkgs.bash
-    ])
-    (unsafe-add-raw-args "--clearenv")
-    (fwd-env "LANG")
-    (fwd-env "HOME")
-    (fwd-env "TERM")
-  ];
+  # Shared static/dynamic base: bind host /dev/pts instead of `--dev /dev` (which tries to
+  # recreate the caller's pts node and fails with --disable-userns). Dynamic mode exposes
+  # the full host filesystem via --bind / / for fanotify approval.
+  mk-agent-sandbox-base =
+    dynamic:
+    compose (
+      lib.optional dynamic (unsafe-add-raw-args "--bind / /")
+      ++ [
+        (unsafe-add-raw-args "--proc /proc")
+        (unsafe-add-raw-args "--tmpfs /dev")
+        (unsafe-add-raw-args "--dev-bind /dev/null /dev/null")
+        (unsafe-add-raw-args "--dev-bind /dev/zero /dev/zero")
+        (unsafe-add-raw-args "--dev-bind /dev/random /dev/random")
+        (unsafe-add-raw-args "--dev-bind /dev/urandom /dev/urandom")
+        (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
+        (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
+        (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
+        (unsafe-add-raw-args "--tmpfs /tmp")
+      ]
+      ++ lib.optionals (!dynamic) [
+        (ro-bind "${pkgs.bash}/bin/sh" "/bin/sh")
+        (add-path "/bin")
+      ]
+      ++ [
+        (add-pkg-deps [
+          pkgs.coreutils
+          pkgs.bash
+        ])
+        (unsafe-add-raw-args "--clearenv")
+        (fwd-env "LANG")
+        (fwd-env "HOME")
+        (fwd-env "TERM")
+      ]
+    );
 
-  # Base combinator for dynamic filesystem-approval mode.
-  # Exposes the full host filesystem via --bind / / so that fanotify (fsmon)
-  # can gate individual opens instead of relying on static bwrap mounts.
-  # Sandbox-private /proc, /dev, and /tmp still overlay the host root. Host
-  # /bin remains visible; rebinding /bin/sh breaks bwrap root-bind setup.
-  agent-sandbox-dynamic-base = compose [
-    (unsafe-add-raw-args "--bind / /")
-    (unsafe-add-raw-args "--proc /proc")
-    (unsafe-add-raw-args "--tmpfs /dev")
-    (unsafe-add-raw-args "--dev-bind /dev/null /dev/null")
-    (unsafe-add-raw-args "--dev-bind /dev/zero /dev/zero")
-    (unsafe-add-raw-args "--dev-bind /dev/random /dev/random")
-    (unsafe-add-raw-args "--dev-bind /dev/urandom /dev/urandom")
-    (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
-    (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
-    (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
-    (unsafe-add-raw-args "--tmpfs /tmp")
-    (add-pkg-deps [
-      pkgs.coreutils
-      pkgs.bash
-    ])
-    (unsafe-add-raw-args "--clearenv")
-    (fwd-env "LANG")
-    (fwd-env "HOME")
-    (fwd-env "TERM")
-  ];
+  agent-sandbox-base = mk-agent-sandbox-base false;
+  agent-sandbox-dynamic-base = mk-agent-sandbox-base true;
 
   inheritShellEnvRuntime = ''
     declare -A _asbx_bound=()
@@ -237,6 +222,20 @@ let
       fi
     }
   '';
+  home-mounts =
+    bindFlag:
+    rels:
+    if rels == [ ] then
+      (s: s)
+    else
+      add-runtime ''
+        realHome=$(readlink -f "$HOME")
+        declare -A _agent_sandbox_canon=()
+        ${mountHomePathFn}
+        ${lib.concatMapStringsSep "\n" (rel: ''
+          mount_home_path "$realHome/${rel}" ${bindFlag}
+        '') rels}
+      '';
   restrictedNet =
     dynamic:
     include-once "agent-sandbox-restricted-net" (
@@ -285,34 +284,8 @@ in
 {
   inherit agent-sandbox-base agent-sandbox-dynamic-base;
   inherit rebind-cwd;
-
-  home-readonly-mounts =
-    rels:
-    if rels == [ ] then
-      (s: s)
-    else
-      add-runtime ''
-        realHome=$(readlink -f "$HOME")
-        declare -A _agent_sandbox_canon=()
-        ${mountHomePathFn}
-        ${lib.concatMapStringsSep "\n" (rel: ''
-          mount_home_path "$realHome/${rel}" --ro-bind
-        '') rels}
-      '';
-
-  home-readwrite-mounts =
-    rels:
-    if rels == [ ] then
-      (s: s)
-    else
-      add-runtime ''
-        realHome=$(readlink -f "$HOME")
-        declare -A _agent_sandbox_canon=()
-        ${mountHomePathFn}
-        ${lib.concatMapStringsSep "\n" (rel: ''
-          mount_home_path "$realHome/${rel}" --bind
-        '') rels}
-      '';
+  home-readonly-mounts = home-mounts "--ro-bind";
+  home-readwrite-mounts = home-mounts "--bind";
 
   block-env-vars =
     vars:
@@ -329,6 +302,7 @@ in
     (fwd-env "PATH")
     (add-runtime inheritShellEnvRuntime)
   ]);
+
 
   inherit-shell-env-dynamic = include-once "agent-sandbox-inherit-shell-env-dynamic" (compose [
     (fwd-env "PATH")
