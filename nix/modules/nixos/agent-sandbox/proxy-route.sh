@@ -8,28 +8,18 @@ PROXY_RULE_PRIORITY=100
 proxy_ports() {
   local action="$1"
   local family="$2"
-  for protocol_port in "tcp 80" "tcp 443" "tcp 8008" "tcp 8080" "tcp 8443" "udp 443"; do
-    read -r protocol port <<< "$protocol_port"
-    if [[ "$family" == 6 ]]; then
-      while ip -6 rule del priority "$PROXY_RULE_PRIORITY" \
-        ipproto "$protocol" dport "$port" table "$ROUTE_TABLE" 2>/dev/null; do
-        :
-      done
-      if [[ "$action" == add ]]; then
-        ip -6 rule add priority "$PROXY_RULE_PRIORITY" \
-          ipproto "$protocol" dport "$port" table "$ROUTE_TABLE"
-      fi
-    else
-      while ip rule del priority "$PROXY_RULE_PRIORITY" \
-        ipproto "$protocol" dport "$port" table "$ROUTE_TABLE" 2>/dev/null; do
-        :
-      done
-      if [[ "$action" == add ]]; then
-        ip rule add priority "$PROXY_RULE_PRIORITY" \
-          ipproto "$protocol" dport "$port" table "$ROUTE_TABLE"
-      fi
+  local -a ip_args=()
+  [[ "$family" == 6 ]] && ip_args=(-6)
+  while read -r protocol port; do
+    while ip "${ip_args[@]}" rule del priority "$PROXY_RULE_PRIORITY" \
+      ipproto "$protocol" dport "$port" table "$ROUTE_TABLE" 2>/dev/null; do
+      :
+    done
+    if [[ "$action" == add ]]; then
+      ip "${ip_args[@]}" rule add priority "$PROXY_RULE_PRIORITY" \
+        ipproto "$protocol" dport "$port" table "$ROUTE_TABLE"
     fi
-  done
+  done < <(printf '%s\n' "tcp 80" "tcp 443" "tcp 8008" "tcp 8080" "tcp 8443" "udp 443")
 }
 
 

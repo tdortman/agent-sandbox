@@ -710,7 +710,7 @@ lib.mkIf policyEnabled (
           ];
           before = [ "agent-sandbox-proxy-route.service" ];
           wants = [ "agent-sandbox-proxy-route.service" ];
-          serviceConfig = {
+          serviceConfig = networkDaemonHardening // {
             Type = "simple";
             User = proxyUser;
             Group = proxyGroup;
@@ -738,19 +738,6 @@ lib.mkIf policyEnabled (
               "/run/agent-sandbox"
             ];
             BindReadOnlyPaths = [ "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf" ];
-            ProtectSystem = "strict";
-            ProtectHome = true;
-            PrivateTmp = true;
-            NoNewPrivileges = true;
-            RestrictSUIDSGID = true;
-            LockPersonality = true;
-            ProtectKernelTunables = true;
-            ProtectControlGroups = true;
-            RestrictAddressFamilies = [
-              "AF_UNIX"
-              "AF_INET"
-              "AF_INET6"
-            ];
           };
           environment = {
             SSL_CERT_FILE = proxyBundlePath;

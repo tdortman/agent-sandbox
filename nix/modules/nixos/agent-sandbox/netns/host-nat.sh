@@ -20,10 +20,12 @@ if [[ "$DNS_TARGET_HOST" == 127.* ]]; then
   echo "agent-sandbox-host-nat: route_localnet enabled for ${HOST_IF}" >&2
 fi
 
-# Recreate host table so INPUT uses priority filter - 200 (before NixOS firewall drops).
-nft delete table ip agent_sandbox_host 2>/dev/null || true
-nft -f - <<EOF
-table ip agent_sandbox_host {
+# Recreate host tables so INPUT uses priority filter - 200 (before NixOS firewall drops).
+create_family_table() {
+  local family="$1"
+  nft delete table "$family" agent_sandbox_host 2>/dev/null || true
+  nft -f - <<EOF
+table $family agent_sandbox_host {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
   }
@@ -34,19 +36,10 @@ table ip agent_sandbox_host {
   }
 }
 EOF
+}
+
+create_family_table ip
+create_family_table ip6
 
 echo "agent-sandbox-host-nat: INPUT on ${HOST_IF} accepts DNS (53)" >&2
-nft delete table ip6 agent_sandbox_host 2>/dev/null || true
-nft -f - <<EOF
-table ip6 agent_sandbox_host {
-  chain postrouting {
-    type nat hook postrouting priority srcnat; policy accept;
-  }
-  chain input {
-    type filter hook input priority filter - 200; policy accept;
-    iifname "${HOST_IF}" tcp dport 53 accept
-    iifname "${HOST_IF}" udp dport 53 accept
-  }
-}
-EOF
 echo "agent-sandbox-host-nat: IPv6 host table created (NAT66 + IPv6 DNS input on ${HOST_IF})" >&2
