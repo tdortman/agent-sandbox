@@ -8,7 +8,6 @@ let
   system = pkgs.stdenv.hostPlatform.system;
 in
 {
-  packages = selfFlake.packages.${system};
   package = name: selfFlake.packages.${system}.${name};
 
   jail-nix = inputs.jail-nix or selfFlake.inputs.jail-nix;
