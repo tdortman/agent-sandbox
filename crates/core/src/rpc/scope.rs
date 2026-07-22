@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::InvalidScopeError;
 /// Approval scope for network and sudo rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,7 +16,7 @@ pub enum ApprovalScope {
 }
 
 impl std::str::FromStr for ApprovalScope {
-    type Err = crate::error::InvalidScopeError;
+    type Err = InvalidScopeError;
 
     fn from_str(scope: &str) -> Result<Self, Self::Err> {
         match scope {
@@ -23,7 +24,7 @@ impl std::str::FromStr for ApprovalScope {
             "session" => Ok(Self::Session),
             "project" => Ok(Self::Project),
             "global" => Ok(Self::Global),
-            other => Err(crate::error::InvalidScopeError::new(other)),
+            other => Err(InvalidScopeError::new(other)),
         }
     }
 }

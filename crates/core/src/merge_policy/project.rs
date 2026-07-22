@@ -22,10 +22,11 @@ impl ProjectPolicyContext {
         }
     }
 
+    #[must_use]
     pub fn home_hint(&self) -> Option<String> {
         self.home
             .as_deref()
-            .map(path_to_string)
+            .map(|path| path.to_string_lossy().into_owned())
             .or_else(|| infer_home([self.project_root.as_deref(), self.cwd.as_deref()]))
     }
 
@@ -73,10 +74,6 @@ fn is_valid_project_root(path: &Path) -> bool {
     path != Path::new("/") && path.file_name().is_some()
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 /// Build the path to the trusted per-project policy file inside the project:
 /// `<canonical project_root>/.agent-sandbox/policy.json`.
 ///
@@ -118,7 +115,7 @@ pub fn trusted_project_policy_path(project_root: &Path) -> Result<PathBuf, Proje
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{ProjectPolicyContext, trusted_project_policy_path};
+    use super::{ProjectPolicyContext, ProjectPolicyError, trusted_project_policy_path};
 
     #[test]
     fn project_root_returns_explicit_value() {
@@ -226,10 +223,7 @@ mod tests {
             .expect("create symlink");
         let err = trusted_project_policy_path(&repo).unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::ProjectPolicyError::InvalidProjectRoot { .. }
-            ),
+            matches!(err, ProjectPolicyError::InvalidProjectRoot { .. }),
             "expected InvalidProjectRoot, got {err:?}"
         );
     }
@@ -238,10 +232,7 @@ mod tests {
     fn trusted_project_policy_path_rejects_nonexistent_project_root() {
         let err = trusted_project_policy_path(Path::new("/nonexistent/path/here")).unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::ProjectPolicyError::InvalidProjectRoot { .. }
-            ),
+            matches!(err, ProjectPolicyError::InvalidProjectRoot { .. }),
             "expected InvalidProjectRoot, got {err:?}"
         );
     }

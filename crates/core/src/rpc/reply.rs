@@ -12,6 +12,7 @@ use super::{
     scope::ApprovalScope,
 };
 use crate::{
+    error::{InvalidScopeError, ScopeResolveError},
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind},
 };
@@ -135,14 +136,14 @@ impl ErrorReply {
     }
 }
 
-impl From<crate::error::InvalidScopeError> for RpcReply {
-    fn from(err: crate::error::InvalidScopeError) -> Self {
+impl From<InvalidScopeError> for RpcReply {
+    fn from(err: InvalidScopeError) -> Self {
         Self::Error(ErrorReply::new(err.to_string()))
     }
 }
 
-impl From<crate::error::ScopeResolveError> for RpcReply {
-    fn from(err: crate::error::ScopeResolveError) -> Self {
+impl From<ScopeResolveError> for RpcReply {
+    fn from(err: ScopeResolveError) -> Self {
         Self::Error(ErrorReply::new(err.to_string()))
     }
 }

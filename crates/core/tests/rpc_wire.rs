@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use agent_sandbox_core::{
-    ApprovalScope, HttpCheckReply, HttpRequest, ProxyReply, ProxyRequestId, RequestContext,
-    RpcMessage, RpcReply, RpcRequest, Verdict, VerdictSource,
+    ApprovalScope, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody, ProxyRequestId,
+    RequestContext, RpcMessage, RpcReply, RpcRequest, Verdict, VerdictSource,
 };
 
 #[test]
@@ -69,7 +69,7 @@ fn proxy_http_reply_round_trips_as_a_single_json_line() {
         RpcMessage::Reply(RpcReply::Proxy(proxy)) => {
             assert_eq!(proxy.request_id, request_id);
             match proxy.reply {
-                agent_sandbox_core::ProxyReplyBody::HttpCheck(reply) => {
+                ProxyReplyBody::HttpCheck(reply) => {
                     assert!(reply.ok);
                     assert!(reply.allowed);
                     assert_eq!(reply.source, VerdictSource::Scope(ApprovalScope::Session));

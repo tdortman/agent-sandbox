@@ -533,12 +533,12 @@ fn push_spaced_json(out: &mut String, compact: &str) {
 mod tests {
     use super::*;
     use crate::policy::{
-        DbusMessageKind, DbusRule, DbusTarget, FileAccess, FilesystemRule, NetworkRule,
+        DbusMessageKind, DbusRule, DbusTarget, FileAccess, FilesystemRule, NetworkRule, Policy,
     };
 
     #[test]
     fn policy_json_formats_dbus_rules_multiline() {
-        let mut policy = crate::policy::Policy::default();
+        let mut policy = Policy::default();
         policy.dbus.allow = vec![DbusRule::new(
             DbusTarget::session(
                 "org.freedesktop.DBus",
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn policy_json_writes_home_paths_as_tilde() {
-        let mut policy = crate::policy::Policy::default();
+        let mut policy = Policy::default();
         policy.filesystem.allow = vec![FilesystemRule::new(
             "/home/user/.local/share/foo",
             FileAccess::All,
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn policy_json_leaves_non_home_paths_absolute() {
-        let mut policy = crate::policy::Policy::default();
+        let mut policy = Policy::default();
         policy.filesystem.allow = vec![FilesystemRule::new("/nix/store", FileAccess::All, "")];
         let path = std::env::temp_dir().join("agent-sandbox-write-nonhome.json");
         let _ = std::fs::remove_file(&path);
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn policy_json_sorts_network_by_domain_hierarchy() {
-        let mut policy = crate::policy::Policy::default();
+        let mut policy = Policy::default();
         policy.network.direct.allow = vec![
             NetworkRule::new("docs.developer.apple.com", 443, "global"),
             NetworkRule::new("api.z.ai", 443, "global"),
@@ -693,7 +693,7 @@ mod tests {
     fn load_policy_round_trip_through_disk() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("policy.json");
-        let mut policy = crate::policy::Policy::default();
+        let mut policy = Policy::default();
         policy.filesystem.allow = vec![
             FilesystemRule::new("/home/user/.local/share/foo", FileAccess::All, ""),
             FilesystemRule::new("/nix/store", FileAccess::Read, ""),

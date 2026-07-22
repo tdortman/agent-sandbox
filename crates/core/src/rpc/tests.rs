@@ -9,7 +9,7 @@ use super::{
 use crate::{
     ResourceKind,
     http::HttpRequest,
-    policy::{DeviceAccess, FileAccess, ResourceAccess},
+    policy::{DeviceAccess, FileAccess, Policy, ResourceAccess},
 };
 
 #[test]
@@ -145,7 +145,7 @@ fn filesystem_monitor_error_reply_deserializes_as_monitor() {
 fn status_reply_includes_merged_policy() {
     let reply = StatusReply {
         ok: true,
-        merged: crate::policy::Policy::default(),
+        merged: Policy::default(),
         pending: vec![],
     };
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");

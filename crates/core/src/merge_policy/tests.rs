@@ -3,7 +3,10 @@ use std::{fs, os::unix::fs::MetadataExt, path::Path};
 use super::{io::policy_json, *};
 use crate::{
     HttpRule,
-    policy::{FileAccess, FilesystemRule, HttpSection, NetworkRule, Policy, SudoRule},
+    policy::{
+        DirectNetworkSection, FileAccess, FilesystemRule, FilesystemSection, HttpSection,
+        NetworkRule, NetworkSection, Policy, SudoRule, SudoSection,
+    },
 };
 
 fn empty_policy() -> Policy {
@@ -13,8 +16,8 @@ fn empty_policy() -> Policy {
 #[test]
 fn deny_removes_allow_from_earlier_layer() {
     let low = Policy {
-        network: crate::policy::NetworkSection {
-            direct: crate::policy::DirectNetworkSection {
+        network: NetworkSection {
+            direct: DirectNetworkSection {
                 allow: vec![NetworkRule::new("example.com", 443, "")],
                 deny: vec![],
             },
@@ -23,8 +26,8 @@ fn deny_removes_allow_from_earlier_layer() {
         ..empty_policy()
     };
     let high = Policy {
-        network: crate::policy::NetworkSection {
-            direct: crate::policy::DirectNetworkSection {
+        network: NetworkSection {
+            direct: DirectNetworkSection {
                 allow: vec![],
                 deny: vec![NetworkRule::new("example.com", 443, "")],
             },
@@ -322,14 +325,14 @@ fn policy_json_one_rule_per_line_invariant() {
 #[test]
 fn filesystem_later_deny_overrides_earlier_allow() {
     let low = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
             deny: vec![],
         },
         ..empty_policy()
     };
     let high = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![],
             deny: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
         },
@@ -343,14 +346,14 @@ fn filesystem_later_deny_overrides_earlier_allow() {
 #[test]
 fn filesystem_trailing_slash_path_merge_deduplicates() {
     let low = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![FilesystemRule::new("/home/", FileAccess::Read, "")],
             deny: vec![],
         },
         ..empty_policy()
     };
     let high = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![FilesystemRule::new("/home", FileAccess::Read, "")],
             deny: vec![],
         },
@@ -364,7 +367,7 @@ fn filesystem_trailing_slash_path_merge_deduplicates() {
 #[test]
 fn filesystem_deny_wins_over_allow_at_eval_time() {
     let merged = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![FilesystemRule::new("/tmp", FileAccess::Read, "")],
             deny: vec![FilesystemRule::new("/tmp", FileAccess::All, "")],
         },
@@ -396,8 +399,8 @@ fn old_policy_without_filesystem_still_loads() {
 #[test]
 fn global_deny_beats_project_allow() {
     let low = Policy {
-        network: crate::policy::NetworkSection {
-            direct: crate::policy::DirectNetworkSection {
+        network: NetworkSection {
+            direct: DirectNetworkSection {
                 allow: vec![NetworkRule::new("example.com", 443, "")],
                 deny: vec![],
             },
@@ -406,8 +409,8 @@ fn global_deny_beats_project_allow() {
         ..empty_policy()
     };
     let high = Policy {
-        network: crate::policy::NetworkSection {
-            direct: crate::policy::DirectNetworkSection {
+        network: NetworkSection {
+            direct: DirectNetworkSection {
                 allow: vec![],
                 deny: vec![NetworkRule::new("example.com", 443, "")],
             },
@@ -423,14 +426,14 @@ fn global_deny_beats_project_allow() {
 #[test]
 fn sudo_deny_beats_later_allow() {
     let low = Policy {
-        sudo: crate::policy::SudoSection {
+        sudo: SudoSection {
             allow: vec![SudoRule::new(vec!["rm".into(), "-rf".into()], "")],
             deny: vec![],
         },
         ..empty_policy()
     };
     let high = Policy {
-        sudo: crate::policy::SudoSection {
+        sudo: SudoSection {
             allow: vec![],
             deny: vec![SudoRule::new(vec!["rm".into(), "-rf".into()], "")],
         },
@@ -444,8 +447,8 @@ fn sudo_deny_beats_later_allow() {
 #[test]
 fn deny_wins_over_wildcard_allow_on_merge() {
     let low = Policy {
-        network: crate::policy::NetworkSection {
-            direct: crate::policy::DirectNetworkSection {
+        network: NetworkSection {
+            direct: DirectNetworkSection {
                 allow: vec![NetworkRule::new("*.evil.com", 443, "")],
                 deny: vec![],
             },
@@ -454,8 +457,8 @@ fn deny_wins_over_wildcard_allow_on_merge() {
         ..empty_policy()
     };
     let high = Policy {
-        network: crate::policy::NetworkSection {
-            direct: crate::policy::DirectNetworkSection {
+        network: NetworkSection {
+            direct: DirectNetworkSection {
                 allow: vec![],
                 deny: vec![NetworkRule::new("evil.com", 443, "")],
             },
@@ -473,14 +476,14 @@ fn deny_wins_over_wildcard_allow_on_merge() {
 #[test]
 fn filesystem_deny_beats_later_allow() {
     let low = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
             deny: vec![],
         },
         ..empty_policy()
     };
     let high = Policy {
-        filesystem: crate::policy::FilesystemSection {
+        filesystem: FilesystemSection {
             allow: vec![],
             deny: vec![FilesystemRule::new("/home", FileAccess::ReadWrite, "")],
         },
