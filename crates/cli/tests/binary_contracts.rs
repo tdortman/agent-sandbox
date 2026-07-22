@@ -39,14 +39,3 @@ fn ui_help_describes_context_options() {
     assert!(stdout.contains("--sandbox-session-id <ID>"));
     assert!(stdout.contains("--project-root <DIR>"));
 }
-
-#[test]
-fn open_ui_fd_rejects_missing_required_launcher_context() {
-    let output = run(env!("CARGO_BIN_EXE_agent-sandbox-open-ui-fd"), &[]);
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("the following required arguments were not provided"));
-    assert!(stderr.contains("--socket <SOCKET>"));
-    assert!(stderr.contains("--sandbox-session-id <SANDBOX_SESSION_ID>"));
-}

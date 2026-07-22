@@ -4,7 +4,7 @@
 }:
 let
   policyContextScript = ''
-    # Reuse outer context if already set (e.g. by agent-sandbox-open-ui-fd).
+    # Reuse outer context if already set.
     if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
       _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
     else

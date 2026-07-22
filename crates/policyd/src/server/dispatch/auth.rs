@@ -23,10 +23,7 @@ pub enum SocketRole {
 /// executing arbitrary commands as root on the host.
 ///
 /// UI registration (and therefore the `UiFd` approval role that only a
-/// registered connection can attain) is host-socket-only. The intended
-/// approval channel from inside the sandbox is the inherited fd pre-opened by
-/// `agent-sandbox-open-ui-fd` against the host socket before bwrap exec; see
-/// `open_ui_fd.rs`.
+/// registered connection can attain) is host-socket-only.
 ///
 /// The privileged NFQ daemon also uses the sandbox socket for flow
 /// registration; dispatch separately restricts that request to root peers.

@@ -20,10 +20,6 @@ path = "src/bin/elevate.rs"
 name = "agent-sandbox-ui"
 path = "src/bin/ui.rs"
 
-[[bin]]
-name = "agent-sandbox-open-ui-fd"
-path = "src/bin/open_ui_fd.rs"
-
 [dependencies]
 agent-sandbox-core.workspace = true
 agent-sandbox-sysutil.workspace = true

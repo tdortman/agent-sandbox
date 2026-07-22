@@ -130,7 +130,7 @@ async fn acquire_prompt_lock(path: PathBuf) -> Result<Flock<File>, UiCliError> {
     version,
     about = "Long-lived policyd UI client that surfaces interactive approval prompts",
     long_about = r#"Long-lived UI client for policyd. 
-Connects to the policyd host socket, registers as a UI client for the current context, then loops on the connection to display incoming approval requests (network/elevation/filesystem) and forward the user's decisions back to policyd. Typically spawned by "agent-sandbox-open-ui-fd" or by policyd itself when no other UI is registered for a given request.
+Connects to the policyd host socket, registers as a UI client for the current context, then loops on the connection to display incoming approval requests (network/elevation/filesystem) and forward the user's decisions back to policyd.
 
 EXAMPLES:
 # Start a UI client from launcher-provided env vars, including AGENT_SANDBOX_SESSION_ID.
