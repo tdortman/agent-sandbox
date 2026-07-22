@@ -11,8 +11,8 @@ use std::{
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
-    normalize_path, recv_notification, send_addfd, send_response,
+    NetworkMode, PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    SeccompNotif, normalize_path, recv_notification, send_addfd, send_response,
 };
 use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
 use clap::Parser;
@@ -43,10 +43,15 @@ agent-sandbox-syscall-broker \
 struct Cli {
     /// Trusted network mediation mode. `direct` keeps transport policy RPC
     /// checks; `proxy` delegates Internet transport to the transparent proxy.
-    /// If omitted, `AGENT_SANDBOX_NETWORK_MODE` is consulted and missing or
-    /// unknown values fail closed at startup.
-    #[arg(long, value_name = "MODE", env = "AGENT_SANDBOX_NETWORK_MODE")]
-    network_mode: Option<String>,
+    /// The value is required; `AGENT_SANDBOX_NETWORK_MODE` is consulted as a
+    /// fallback, and missing or unknown values fail closed at startup.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        env = "AGENT_SANDBOX_NETWORK_MODE"
+    )]
+    network_mode: NetworkMode,
 
     /// Trusted DNS forwarder endpoint inside the sandbox network namespace.
     /// Only this exact TCP/UDP endpoint bypasses transport policy. If omitted,
@@ -102,12 +107,8 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let network_mode = cli
-        .network_mode
-        .as_deref()
-        .ok_or_else(|| std::io::Error::other("network mode is required (direct or proxy)"))?
-        .parse()
-        .map_err(std::io::Error::other)?;
+
+    let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));

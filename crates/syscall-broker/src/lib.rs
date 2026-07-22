@@ -85,24 +85,10 @@ pub struct SeccompNotifResp {
 /// `AF_INET`/`AF_INET6` connect/send decisions; other network destinations
 /// remain gated by seccomp user notification. Unix resources and filesystem
 /// mediation remain unchanged in both modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum NetworkMode {
     Direct,
     Proxy,
-}
-
-impl std::str::FromStr for NetworkMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "direct" => Ok(Self::Direct),
-            "proxy" => Ok(Self::Proxy),
-            _ => Err(format!(
-                "invalid network mode {value:?}; expected exactly \"direct\" or \"proxy\""
-            )),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
