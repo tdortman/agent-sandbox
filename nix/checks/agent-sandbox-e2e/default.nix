@@ -84,6 +84,7 @@ let
     })
     (mkBash "sandbox-static-no-cwd-bash" {
       extraPkgs = commonExtraPkgs;
+      runtimeReadonlyDirs = [ ];
       exposeWorkingDirectory = false;
     })
     (mkCurl "sandbox-static-curl" {
@@ -363,15 +364,39 @@ let
     server.serve_forever()
   '';
 
-  httpServer = port: {
-    systemd.services."agent-sandbox-vm-http-${toString port}" = {
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} ${toString port}";
-        User = "sandbox";
-        Restart = "on-failure";
+  httpServer =
+    {
+      port,
+      address ? null,
+      certificate ? null,
+      privateKey ? null,
+      serviceName ? "http",
+    }:
+    {
+      name = "agent-sandbox-vm-${serviceName}-${toString port}";
+      value = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          ExecStart = lib.escapeShellArgs (
+            [
+              "${pkgs.python3}/bin/python"
+              httpServerScript
+              (toString port)
+            ]
+            ++ lib.optional (address != null) address
+            ++ lib.optionals (certificate != null) [
+              certificate
+              privateKey
+            ]
+          );
+          User = "sandbox";
+          Restart = "on-failure";
+        };
       };
     };
+
+  httpServers = specs: {
+    systemd.services = lib.listToAttrs (map httpServer specs);
   };
 
   vmTest = pkgs.testers.runNixOSTest (_: {
@@ -525,9 +550,28 @@ let
       direct =
         _:
         lib.recursiveUpdate baseNode (
-          lib.recursiveUpdate (httpServer 18080) (
-            lib.recursiveUpdate (httpServer 18081) {
-              imports = [ module ];
+          lib.recursiveUpdate
+            (httpServers (
+              (map (port: { inherit port; }) [
+                18080
+                18081
+                18086
+                18087
+                18088
+              ])
+              ++ (map
+                (port: {
+                  inherit port;
+                  address = "::";
+                  serviceName = "http6";
+                })
+                [
+                  18084
+                  18085
+                ]
+              )
+            ))
+            {
               systemd.services = {
                 agent-sandbox-vm-udp-18082 = {
                   wantedBy = [ "multi-user.target" ];
@@ -541,46 +585,6 @@ let
                   wantedBy = [ "multi-user.target" ];
                   serviceConfig = {
                     ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18083,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-http6-18084 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} 18084 ::";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-http6-18085 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} 18085 ::";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-http-18086 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} 18086";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-http-18087 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} 18087";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-http-18088 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} 18088";
                     User = "sandbox";
                     Restart = "on-failure";
                   };
@@ -606,6 +610,7 @@ let
                   };
                 };
               };
+              imports = [ module ];
               agent-sandbox = {
                 enable = true;
                 packages = directNetworkPackages;
@@ -656,22 +661,20 @@ let
                 };
               };
             }
-          )
         );
 
       proxy =
         _:
         baseNode
-        // (lib.recursiveUpdate (httpServer 8008) {
-          systemd.services.agent-sandbox-vm-https-8443 = {
-            wantedBy = [ "multi-user.target" ];
-            serviceConfig = {
-              ExecStart = "${pkgs.python3}/bin/python ${httpServerScript} 8443 ${tlsFixture}/server-cert.pem ${tlsFixture}/server-key.pem";
-              User = "sandbox";
-              Restart = "on-failure";
-            };
-          };
-        })
+        // (httpServers [
+          { port = 8008; }
+          {
+            port = 8443;
+            serviceName = "https";
+            certificate = "${tlsFixture}/server-cert.pem";
+            privateKey = "${tlsFixture}/server-key.pem";
+          }
+        ])
         // {
           imports = [ module ];
           agent-sandbox = {
@@ -785,6 +788,7 @@ let
       # unlisted paths, working-directory opt-out, blocked credentials, and
       # wrapper naming.
       static.succeed("stat -c '%a %U' /var/lib/agent-sandbox-test/readwrite-file | grep -q '644 sandbox'")
+      sandbox_shell(static, "sandbox-static-no-cwd-bash", "test ! -e /run/wrappers/bin/sudo")
       static.succeed("runuser -u sandbox -- test -w /var/lib/agent-sandbox-test/readwrite-file")
       sandbox_shell(static, "sandbox-static-bash", "cat /var/lib/agent-sandbox-test/readonly-file | grep -q marker")
       sandbox_shell(static, "sandbox-static-bash", "echo changed > /var/lib/agent-sandbox-test/readonly-file", expect_success=False)
