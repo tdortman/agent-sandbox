@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use agent_sandbox_core::{FileAccess, ResourceAccess, ResourceKind};
+use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess};
 use agent_sandbox_syscall::policy::nr;
 pub use policy_client::PersistentPolicyClient;
 
@@ -15,7 +15,6 @@ pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
 /// `SECCOMP_IOW(2, __u64)` — not `IOWR` like SEND; argument is a single u64 id.
 pub const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
 pub const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
-pub const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1;
 pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 
 /// `struct seccomp_notif_addfd` passed to `SECCOMP_IOCTL_NOTIF_ADDFD`.
@@ -158,7 +157,6 @@ pub enum SyscallTarget {
     Resource(ResourceTarget),
     Filesystem(FilesystemTarget),
     Errno(i32),
-    None,
 }
 /// Parsed `AF_UNIX` address: a filesystem path or a kernel abstract name.
 ///
@@ -238,53 +236,28 @@ pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
     Ok(notif)
 }
 
-/// Send a `SECCOMP_USER_NOTIF_FLAG_CONTINUE` response, allowing the syscall.
+/// Send a response to a seccomp notification.
+///
+/// `val` is the syscall return value and `error` is the negative errno to
+/// inject. `flags` may request `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
 ///
 /// # Errors
 ///
-/// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
-pub fn send_continue(listener_fd: i32, id: u64) -> io::Result<()> {
-    notif_id_valid(listener_fd, id)?;
-    let mut resp = SeccompNotifResp {
-        id,
-        val: 0,
-        error: 0,
-        flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-    };
-    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
-}
-
-/// Inject an error return value into the tracee's syscall result.
-///
-/// # Errors
-///
-/// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
-pub fn send_errno(listener_fd: i32, id: u64, errno: i32) -> io::Result<()> {
-    notif_id_valid(listener_fd, id)?;
-    let mut resp = SeccompNotifResp {
-        id,
-        val: 0,
-        error: -errno,
-        flags: 0,
-    };
-    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
-}
-
-/// Inject a success return value into the tracee's syscall result.
-///
-/// Used to complete emulated syscalls (e.g. `connect`/`sendto` performed
-/// by the broker on the tracee's behalf): `val` is the syscall return value.
-///
-/// # Errors
-///
-/// Returns an error if the `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
-pub fn send_result(listener_fd: i32, id: u64, val: i64) -> io::Result<()> {
+/// Returns an error if the notification id is stale or the
+/// `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
+pub fn send_response(
+    listener_fd: i32,
+    id: u64,
+    val: i64,
+    error: i32,
+    flags: u32,
+) -> io::Result<()> {
     notif_id_valid(listener_fd, id)?;
     let mut resp = SeccompNotifResp {
         id,
         val,
-        error: 0,
-        flags: 0,
+        error,
+        flags,
     };
     agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
 }
@@ -373,7 +346,7 @@ fn scheme_for_fd(notif: &SeccompNotif, sockfd: u64, default: &str) -> String {
 /// truncation. Returns `None` for any other family or a buffer too short
 /// to hold the family prefix.
 #[must_use]
-pub fn parse_sockaddr(bytes: &[u8], addrlen: usize) -> Option<SockaddrTarget> {
+fn parse_sockaddr(bytes: &[u8], addrlen: usize) -> Option<SockaddrTarget> {
     let addrlen = addrlen.min(bytes.len());
     if addrlen < 2 {
         return None;
@@ -447,14 +420,14 @@ pub fn parse_sockaddr(bytes: &[u8], addrlen: usize) -> Option<SockaddrTarget> {
 /// # Errors
 ///
 /// Returns an error if reading tracee memory via `process_vm_readv` fails.
-pub fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let scheme = scheme_for_fd(notif, notif.data.args[0], "tcp");
     sockaddr_target(
         notif,
         notif.data.args[1],
         notif.data.args[2],
         &scheme,
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+        ResourceAccess::Socket(SocketAccess::Connect),
     )
 }
 /// Extract a target from a `sendto` syscall notification.
@@ -469,14 +442,14 @@ pub fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<SyscallTar
 /// # Errors
 ///
 /// Returns an error if reading tracee memory via `process_vm_readv` fails.
-pub fn target_from_sendto(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+fn target_from_sendto(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let scheme = scheme_for_fd(notif, notif.data.args[0], "udp");
     sockaddr_target(
         notif,
         notif.data.args[4],
         notif.data.args[5],
         &scheme,
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send),
+        ResourceAccess::Socket(SocketAccess::Send),
     )
 }
 
@@ -522,7 +495,7 @@ fn parse_msghdr_target(bytes: &[u8]) -> Option<MsghdrParts> {
 ///
 /// Returns an error if reading the tracee's `msghdr` or sockaddr via
 /// `process_vm_readv` fails.
-pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let msg = notif.data.args[1];
     if msg == 0 {
         return Ok(None);
@@ -537,7 +510,7 @@ pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTar
         mhdr.name,
         u64::from(mhdr.name_len),
         &scheme,
-        ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send),
+        ResourceAccess::Socket(SocketAccess::Send),
     )
 }
 
@@ -551,7 +524,7 @@ pub fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTar
 /// # Errors
 ///
 /// Returns an error if reading tracee memory via `process_vm_readv` fails.
-pub fn target_from_sendmmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
+fn target_from_sendmmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let msgvec = notif.data.args[1];
     let vlen = usize::try_from(notif.data.args[2]).unwrap_or(0);
     if msgvec == 0 || vlen == 0 {
@@ -947,11 +920,13 @@ pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<Sysca
     }
 }
 
-/// Canonicalize a filesystem path by resolving symlinks. Used for `AF_UNIX`
-/// socket paths and device paths so policy rules match consistently
-/// regardless of which symlink alias the tracee used (e.g. `/var/run`
-/// resolves to `/run`). Falls back to the original path if canonicalization
-/// fails (e.g. the socket file does not exist yet).
+/// Canonicalize a filesystem path by resolving symlinks.
+///
+/// Used for `AF_UNIX` socket paths and device paths so policy rules match
+/// consistently regardless of which symlink alias the tracee used (e.g.
+/// `/var/run` resolves to `/run`). Falls back to the original path if
+/// canonicalization fails (e.g. the socket file does not exist yet).
+#[must_use]
 pub fn normalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1045,11 +1020,11 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
 
     let acc = open_flags & libc::O_ACCMODE;
     let access = if acc == libc::O_WRONLY {
-        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Write)
+        ResourceAccess::Device(DeviceAccess::Write)
     } else if acc == libc::O_RDWR {
-        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::ReadWrite)
+        ResourceAccess::Device(DeviceAccess::ReadWrite)
     } else {
-        ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read)
+        ResourceAccess::Device(DeviceAccess::Read)
     };
     Some(SyscallTarget::Resource(ResourceTarget {
         kind: ResourceKind::Device,
@@ -1245,8 +1220,8 @@ mod tests {
         const IOW: u32 = 1;
         assert_eq!(SECCOMP_IOCTL_NOTIF_RECV, ioc(IOREWR, 0, 80));
         assert_eq!(SECCOMP_IOCTL_NOTIF_SEND, ioc(IOREWR, 1, 24));
-        // ID_VALID is IOW(2, __u64), not IOREWR like SEND — mixing them up
-        // makes every send_continue fail with EINVAL.
+        // ID_VALID is IOW(2, __u64), not IOREWR like SEND. Mixing them up
+        // makes every response fail with EINVAL.
         assert_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, ioc(IOW, 2, 8));
         assert_eq!(SECCOMP_IOCTL_NOTIF_ADDFD, ioc(IOW, 3, 24));
     }

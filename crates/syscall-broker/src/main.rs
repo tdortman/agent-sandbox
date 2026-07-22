@@ -11,8 +11,8 @@ use std::{
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, ResourceTarget, SeccompNotif, normalize_path, recv_notification,
-    send_addfd, send_continue, send_errno, send_result,
+    PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
+    normalize_path, recv_notification, send_addfd, send_response,
 };
 use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
 use clap::Parser;
@@ -112,7 +112,7 @@ async fn main() -> std::io::Result<()> {
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
-    let policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());
+    let mut policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());
 
     // Don't SIGCONT the child until the broker is inside its notification
     // loop and ready to receive. The child traps from the first openat onward
@@ -169,7 +169,7 @@ async fn main() -> std::io::Result<()> {
         };
         dispatch::dispatch_notification_with_mode(
             &cli.policy_socket,
-            &policy_client,
+            &mut policy_client,
             cli.sandbox_session_id.as_deref(),
             cli.listener_fd,
             &notif,
@@ -245,12 +245,12 @@ fn is_policy_socket_bypass(target: &ResourceTarget, policy_socket: &Path) -> boo
 }
 
 /// Emulate a policy-allowed resource syscall on behalf of the tracee. Never
-/// calls `send_continue`: the broker completes the syscall itself and injects
-/// the result, so the tracee never touches the gated resource directly.
+/// calls a continue response: the broker completes the syscall itself and
+/// injects the result, so the tracee never touches the gated resource directly.
 ///
 /// For Unix-socket `connect`/`sendto`/`sendmsg`/`sendmmsg`: duplicate the
 /// tracee's socket fd via `pidfd_getfd`, perform the syscall in the broker's
-/// own fd table, and inject the return value with `send_result`. For device
+/// own fd table, and inject the return value with a response. For device
 /// `open*`: open the device in the broker and install the fd into the tracee
 /// with `send_addfd`.
 ///
@@ -297,13 +297,19 @@ fn emulate_unix_socket(
             // re-read the tracee pointer. This prevents a TOCTOU where the
             // tracee swaps the sockaddr between approval and emulation.
             if target.raw.is_empty() {
-                return send_continue(listener_fd, notif.id);
+                return send_response(
+                    listener_fd,
+                    notif.id,
+                    0,
+                    0,
+                    SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+                );
             }
             match connect_raw(&dup, &target.raw) {
-                Ok(()) => send_result(listener_fd, notif.id, 0),
+                Ok(()) => send_response(listener_fd, notif.id, 0, 0, 0),
                 Err(err) => {
                     let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-                    send_errno(listener_fd, notif.id, errno)
+                    send_response(listener_fd, notif.id, 0, -errno, 0)
                 }
             }
         }
@@ -320,14 +326,20 @@ fn emulate_unix_socket(
                 Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)
             ) && agent_sandbox_sysutil::is_socket_connected(dup.as_fd())
             {
-                return send_continue(listener_fd, notif.id);
+                return send_response(
+                    listener_fd,
+                    notif.id,
+                    0,
+                    0,
+                    SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+                );
             }
             info!("sendmmsg on AF_UNIX denied: multi-message emulation not supported");
-            send_errno(listener_fd, notif.id, libc::EACCES)
+            send_response(listener_fd, notif.id, 0, -libc::EACCES, 0)
         }
         _ => {
             // Unknown socket syscall, deny to be safe.
-            send_errno(listener_fd, notif.id, libc::EACCES)
+            send_response(listener_fd, notif.id, 0, -libc::EACCES, 0)
         }
     }
 }
@@ -350,13 +362,13 @@ fn enhance_sendto_emulation(
     // Use target.raw unconditionally: if it is empty, something is wrong
     // and we deny rather than CONTINUE (which would bypass the resource gate).
     if target.raw.is_empty() {
-        return send_errno(listener_fd, notif.id, libc::EACCES);
+        return send_response(listener_fd, notif.id, 0, -libc::EACCES, 0);
     }
     // Copy the payload from the tracee's address space into a broker-owned
     // buffer. The user namespace does NOT share the address space, so tracee
     // pointers are invalid in the broker.
     if len > MAX_PAYLOAD {
-        return send_errno(listener_fd, notif.id, libc::E2BIG);
+        return send_response(listener_fd, notif.id, 0, -libc::E2BIG, 0);
     }
     let payload =
         agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, buf_ptr, len.min(MAX_PAYLOAD))?;
@@ -364,10 +376,16 @@ fn enhance_sendto_emulation(
         Ok(n) => n,
         Err(err) => {
             let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-            return send_errno(listener_fd, notif.id, errno);
+            return send_response(listener_fd, notif.id, 0, -errno, 0);
         }
     };
-    send_result(listener_fd, notif.id, i64::try_from(sent).unwrap_or(0))
+    send_response(
+        listener_fd,
+        notif.id,
+        i64::try_from(sent).unwrap_or(0),
+        0,
+        0,
+    )
 }
 /// Emulate `sendmsg(sockfd, msg, flags)` on a duplicated tracee socket.
 /// If `msg` is null or `msg_name` is null the socket is already connected
@@ -385,7 +403,13 @@ fn enhance_sendmsg_emulation(
     let msg_ptr = notif.data.args[1];
     let flags = i32::try_from(notif.data.args[2]).unwrap_or(0);
     if msg_ptr == 0 {
-        return send_continue(listener_fd, notif.id);
+        return send_response(
+            listener_fd,
+            notif.id,
+            0,
+            0,
+            SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+        );
     }
     // Connected SOCK_STREAM / SOCK_SEQPACKET sockets: the kernel ignores
     // msg_name, so the destination is fixed by the prior approved connect.
@@ -397,19 +421,25 @@ fn enhance_sendmsg_emulation(
         Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)
     ) && agent_sandbox_sysutil::is_socket_connected(dup.as_fd())
     {
-        return send_continue(listener_fd, notif.id);
+        return send_response(
+            listener_fd,
+            notif.id,
+            0,
+            0,
+            SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+        );
     }
     // Read the msghdr to check for control data and find iovec locations.
     // The destination sockaddr is NOT re-read: use target.raw (captured
     // during policy parsing) to prevent a TOCTOU swap.
     let bytes = agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, msg_ptr, 56)?;
     if bytes.len() < 56 {
-        return send_errno(listener_fd, notif.id, libc::EINVAL);
+        return send_response(listener_fd, notif.id, 0, -libc::EINVAL, 0);
     }
     // For a resource target, the destination was non-null when approved.
     // Use target.raw unconditionally: if empty, deny rather than CONTINUE.
     if target.raw.is_empty() {
-        return send_errno(listener_fd, notif.id, libc::EACCES);
+        return send_response(listener_fd, notif.id, 0, -libc::EACCES, 0);
     }
     let msg_control = u64::from_ne_bytes(bytes[32..40].try_into().expect("8 bytes"));
     let msg_controllen = u64::from_ne_bytes(bytes[40..48].try_into().expect("8 bytes"));
@@ -417,7 +447,7 @@ fn enhance_sendmsg_emulation(
         // Control data present (SCM_RIGHTS, SCM_CREDENTIALS, etc.). The
         // broker cannot safely relay ancillary data, so deny.
         info!("sendmsg with control data denied");
-        return send_errno(listener_fd, notif.id, libc::EACCES);
+        return send_response(listener_fd, notif.id, 0, -libc::EACCES, 0);
     }
     let msg_iov = u64::from_ne_bytes(bytes[16..24].try_into().expect("8 bytes"));
     let msg_iovlen = u64::from_ne_bytes(bytes[24..32].try_into().expect("8 bytes"));
@@ -433,7 +463,7 @@ fn enhance_sendmsg_emulation(
             16,
         )?;
         if iov_buf.len() < 16 {
-            return send_errno(listener_fd, notif.id, libc::EINVAL);
+            return send_response(listener_fd, notif.id, 0, -libc::EINVAL, 0);
         }
         let iov_base = u64::from_ne_bytes(iov_buf[0..8].try_into().expect("8 bytes"));
         let iov_len = u64::from_ne_bytes(iov_buf[8..16].try_into().expect("8 bytes"));
@@ -444,7 +474,7 @@ fn enhance_sendmsg_emulation(
         let iov_len_usize = usize::try_from(iov_len).unwrap_or(0);
         total = total.saturating_add(iov_len_usize);
         if total > MAX_PAYLOAD {
-            return send_errno(listener_fd, notif.id, libc::E2BIG);
+            return send_response(listener_fd, notif.id, 0, -libc::E2BIG, 0);
         }
         let payload =
             agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, iov_base, iov_len_usize)?;
@@ -480,10 +510,10 @@ fn enhance_sendmsg_emulation(
         Ok(n) => n,
         Err(err) => {
             let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-            return send_errno(listener_fd, notif.id, errno);
+            return send_response(listener_fd, notif.id, 0, -errno, 0);
         }
     };
-    send_result(listener_fd, notif.id, i64::try_from(rc).unwrap_or(0))
+    send_response(listener_fd, notif.id, i64::try_from(rc).unwrap_or(0), 0, 0)
 }
 
 /// Emulate `open`/`openat`/`openat2`/`creat` using captured path and flags.
@@ -524,7 +554,7 @@ fn emulate_open_with_path(
         Ok(fd) => fd,
         Err(err) => {
             let errno = err as i32;
-            return send_errno(listener_fd, notif_id, errno);
+            return send_response(listener_fd, notif_id, 0, -errno, 0);
         }
     };
     let cloexec = oflag.contains(nix::fcntl::OFlag::O_CLOEXEC);
@@ -537,7 +567,7 @@ fn emulate_open_with_path(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use agent_sandbox_core::{ResourceAccess, ResourceKind};
+    use agent_sandbox_core::{DeviceAccess, ResourceAccess, ResourceKind, SocketAccess};
     use agent_sandbox_syscall_broker::ResourceTarget;
 
     use super::is_policy_socket_bypass;
@@ -546,7 +576,7 @@ mod tests {
         ResourceTarget {
             kind: ResourceKind::UnixSocket,
             path: PathBuf::from(path),
-            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            access: ResourceAccess::Socket(SocketAccess::Connect),
             raw: path.as_bytes().to_vec(),
             open_flags: 0,
             open_mode: 0,
@@ -644,7 +674,7 @@ mod tests {
         let target = ResourceTarget {
             kind: ResourceKind::Device,
             path: PathBuf::from("/run/agent-sandbox/policy.sock"),
-            access: ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
+            access: ResourceAccess::Device(DeviceAccess::Read),
             raw: b"/run/agent-sandbox/policy.sock".to_vec(),
             open_flags: 0,
             open_mode: 0,

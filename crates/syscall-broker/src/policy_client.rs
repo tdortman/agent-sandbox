@@ -8,7 +8,6 @@ use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
     ResourceCheckReply, RpcReply, RpcRequest, SandboxPaths,
 };
-use tokio::sync::Mutex;
 
 use crate::{NetworkTarget, ResourceTarget};
 
@@ -22,38 +21,31 @@ fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestConte
 }
 
 /// Persistent sequential policyd client owned by one syscall broker.
-///
-/// The mutex is a defensive guard around the current-thread broker's
-/// connection. Each policy check holds it for exactly one request/reply
-/// exchange, preventing concurrent borrows if the dispatch loop is ever
-/// changed to overlap work.
 pub struct PersistentPolicyClient {
-    client: Mutex<PersistentRpcClient>,
+    client: PersistentRpcClient,
 }
 
 impl PersistentPolicyClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
-            client: Mutex::new(PersistentRpcClient::new(socket_path)),
+            client: PersistentRpcClient::new(socket_path),
         }
     }
 
-    async fn request(&self, req: RpcRequest, timeout: Duration) -> io::Result<RpcReply> {
+    async fn request(&mut self, req: RpcRequest, timeout: Duration) -> io::Result<RpcReply> {
         self.client
-            .lock()
-            .await
             .request(req, timeout)
             .await
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    async fn invalidate(&self) {
-        self.client.lock().await.invalidate();
+    fn invalidate(&mut self) {
+        self.client.invalidate();
     }
 
     pub async fn check_target(
-        &self,
+        &mut self,
         target: &NetworkTarget,
         sandbox_session_id: Option<String>,
         pid: u32,
@@ -73,7 +65,7 @@ impl PersistentPolicyClient {
         match self.request(req, timeout).await {
             Ok(RpcReply::Check(reply)) => reply.allowed,
             Ok(_) => {
-                self.invalidate().await;
+                self.invalidate();
                 false
             }
             Err(_) => false,
@@ -90,7 +82,7 @@ impl PersistentPolicyClient {
     /// Returns an error if policyd is unreachable, times out, or sends a
     /// malformed response.
     pub async fn check_resource(
-        &self,
+        &mut self,
         target: &ResourceTarget,
         sandbox_session_id: Option<String>,
         pid: u32,
@@ -105,7 +97,7 @@ impl PersistentPolicyClient {
         if let RpcReply::ResourceCheck(reply) = self.request(req, timeout).await? {
             Ok(reply)
         } else {
-            self.invalidate().await;
+            self.invalidate();
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "policyd returned a non-ResourceCheck reply for CheckResource",
@@ -121,7 +113,7 @@ impl PersistentPolicyClient {
     /// Returns an error if policyd is unreachable, times out, or sends a
     /// malformed response.
     pub async fn check_filesystem(
-        &self,
+        &mut self,
         path: &Path,
         access: FileAccess,
         sandbox_session_id: Option<String>,
@@ -136,7 +128,7 @@ impl PersistentPolicyClient {
         if let RpcReply::FilesystemCheck(reply) = self.request(req, timeout).await? {
             Ok(reply)
         } else {
-            self.invalidate().await;
+            self.invalidate();
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "policyd returned a non-FilesystemCheck reply for CheckFilesystem",
@@ -192,7 +184,7 @@ mod tests {
             }
         });
 
-        let client = PersistentPolicyClient::new(&socket_path);
+        let mut client = PersistentPolicyClient::new(&socket_path);
         let first = client
             .check_filesystem(
                 Path::new("/tmp/first"),

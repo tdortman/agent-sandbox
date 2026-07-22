@@ -39,7 +39,7 @@ impl NormalizedNotification {
 /// Convert a kernel notification into policy-independent facts.
 pub fn normalize(notif: &SeccompNotif) -> Result<NormalizedNotification, io::Error> {
     target_from_notification(notif).map(|target| match target {
-        Some(SyscallTarget::None) | None => NormalizedNotification::Continue,
+        None => NormalizedNotification::Continue,
         Some(SyscallTarget::Errno(errno)) => NormalizedNotification::Deny { errno },
         Some(target) => NormalizedNotification::Target { target },
     })
@@ -97,7 +97,7 @@ impl ResponsePlan {
 }
 
 pub async fn decide(
-    client: &PersistentPolicyClient,
+    client: &mut PersistentPolicyClient,
     sandbox_session_id: Option<&str>,
     pid: u32,
     timeout: Duration,
@@ -105,9 +105,6 @@ pub async fn decide(
 ) -> ResponsePlan {
     match facts {
         NormalizedNotification::Continue
-        | NormalizedNotification::Target {
-            target: SyscallTarget::None,
-        }
         | NormalizedNotification::ClassificationFailure {
             transient: true, ..
         } => ResponsePlan::Continue,
@@ -221,8 +218,8 @@ mod tests {
     use std::{io, path::Path, time::Duration};
 
     use agent_sandbox_core::{
-        FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply, ResourceKind,
-        VerdictSource,
+        DeviceAccess, FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply,
+        ResourceKind, VerdictSource,
     };
     use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
 
@@ -232,7 +229,7 @@ mod tests {
         ResourceTarget {
             kind: ResourceKind::Device,
             path: "/dev/example".into(),
-            access: ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
+            access: ResourceAccess::Device(DeviceAccess::Read),
             raw: Vec::new(),
             open_flags: 0,
             open_mode: 0,
@@ -247,10 +244,10 @@ mod tests {
 
     #[tokio::test]
     async fn decision_routes_policy_independent_facts() {
-        let client = PersistentPolicyClient::new("/tmp/agent-sandbox-test-policy.sock");
+        let mut client = PersistentPolicyClient::new("/tmp/agent-sandbox-test-policy.sock");
         assert_eq!(
             decide(
-                &client,
+                &mut client,
                 None,
                 0,
                 Duration::from_secs(1),
@@ -261,7 +258,7 @@ mod tests {
         );
         assert_eq!(
             decide(
-                &client,
+                &mut client,
                 None,
                 0,
                 Duration::from_secs(1),
@@ -274,7 +271,7 @@ mod tests {
         );
         assert_eq!(
             decide(
-                &client,
+                &mut client,
                 None,
                 0,
                 Duration::from_secs(1),

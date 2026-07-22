@@ -2,8 +2,8 @@ use std::{net::SocketAddr, path::Path, time::Duration};
 
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall_broker::{
-    NetworkMode, PersistentPolicyClient, SeccompNotif, SyscallTarget, notification_arch_valid,
-    revalidate_filesystem_mutation, send_continue, send_errno,
+    NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
+    SyscallTarget, notification_arch_valid, revalidate_filesystem_mutation, send_response,
 };
 use tracing::{debug, info, warn};
 
@@ -43,10 +43,9 @@ pub struct NetworkPolicyBypass {
     pub mode: NetworkMode,
     pub dns_endpoint: Option<SocketAddr>,
 }
-
 pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
-    client: &PersistentPolicyClient,
+    client: &mut PersistentPolicyClient,
     sandbox_session_id: Option<&str>,
     listener_fd: i32,
     notif: &SeccompNotif,
@@ -59,7 +58,7 @@ pub async fn dispatch_notification_with_mode(
             native = agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE,
             "seccomp notification arch mismatch; denying"
         );
-        super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
+        super::log_notification_response(send_response(listener_fd, notif.id, 0, -libc::EACCES, 0));
         return;
     }
 
@@ -122,10 +121,16 @@ fn execute_response_plan(
             } else {
                 debug!(syscall = notif.data.nr, "continuing non-gated syscall");
             }
-            super::log_notification_response(send_continue(listener_fd, notif.id));
+            super::log_notification_response(send_response(
+                listener_fd,
+                notif.id,
+                0,
+                0,
+                SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+            ));
         }
         ResponsePlan::DenyErrno { errno } => {
-            super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+            super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
         }
         ResponsePlan::ResourcePolicyDenied {
             target,
@@ -133,11 +138,23 @@ fn execute_response_plan(
             error,
         } => {
             info!(target = ?target, source = ?source, error = ?error, "resource syscall denied by policy");
-            super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
+            super::log_notification_response(send_response(
+                listener_fd,
+                notif.id,
+                0,
+                -libc::EACCES,
+                0,
+            ));
         }
         ResponsePlan::ResourceRpcFailure { target, error } => {
             warn!(target = ?target, error = %error, "resource policy RPC failed");
-            super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
+            super::log_notification_response(send_response(
+                listener_fd,
+                notif.id,
+                0,
+                -libc::EACCES,
+                0,
+            ));
         }
         ResponsePlan::FilesystemPolicyDenied {
             errno,
@@ -147,7 +164,7 @@ fn execute_response_plan(
             error,
         } => {
             info!(path = %path.display(), access = ?access, source = ?source, error = ?error, "filesystem syscall denied by policy");
-            super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+            super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
         }
         ResponsePlan::FilesystemRpcFailure {
             errno,
@@ -156,7 +173,7 @@ fn execute_response_plan(
             error,
         } => {
             warn!(path = %path.display(), access = ?access, error = %error, "filesystem policy RPC failed");
-            super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+            super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
         }
         ResponsePlan::EmulateResource { target } => {
             if let Err(err) = super::emulate_resource(listener_fd, notif, &target) {
@@ -166,15 +183,33 @@ fn execute_response_plan(
                 } else {
                     debug!(error = %err, errno, target = ?target, "resource emulation failed");
                 }
-                super::log_notification_response(send_errno(listener_fd, notif.id, errno));
+                super::log_notification_response(send_response(
+                    listener_fd,
+                    notif.id,
+                    0,
+                    -errno,
+                    0,
+                ));
             }
         }
         ResponsePlan::RevalidateFilesystemThenContinue { target } => {
             if let Err(err) = revalidate_filesystem_mutation(notif, &target) {
                 warn!(error = %err, target = ?target, "filesystem dispatch failed");
-                super::log_notification_response(send_errno(listener_fd, notif.id, libc::EACCES));
+                super::log_notification_response(send_response(
+                    listener_fd,
+                    notif.id,
+                    0,
+                    -libc::EACCES,
+                    0,
+                ));
             } else {
-                super::log_notification_response(send_continue(listener_fd, notif.id));
+                super::log_notification_response(send_response(
+                    listener_fd,
+                    notif.id,
+                    0,
+                    0,
+                    SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+                ));
             }
         }
     }
