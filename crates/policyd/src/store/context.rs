@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
     SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
-    migrate_policy, read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
+    read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
     trusted_context_from_pid, trusted_project_policy_path,
 };
 
@@ -298,24 +298,10 @@ impl PolicyStore {
                 .join(".config")
                 .join("agent-sandbox")
                 .join("policy.json");
-            if let Err(error) = migrate_policy(&home_policy, home_path, None) {
-                tracing::warn!(
-                    path = %home_policy.display(),
-                    error = %error,
-                    "failed to migrate legacy home policy"
-                );
-            }
             layers.push(load_policy(&home_policy, home_path, None));
             if let Some(root) = project_root_path
                 && let Ok(trusted) = trusted_project_policy_path(root)
             {
-                if let Err(error) = migrate_policy(&trusted, home_path, Some(root)) {
-                    tracing::warn!(
-                        path = %trusted.display(),
-                        error = %error,
-                        "failed to migrate legacy project policy"
-                    );
-                }
                 layers.push(load_policy(&trusted, home_path, project_root_path));
             }
         }
@@ -435,23 +421,16 @@ mod tests {
     use agent_sandbox_core::SudoRule;
 
     use super::*;
-    use crate::store::types::PolicydArgs;
 
     fn test_store() -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            "/tmp/test.sock".into(),
+            "/tmp/test-sandbox.sock".into(),
+            "/tmp/declarative.json".into(),
+            "/tmp/export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ))
     }
 
     #[test]
@@ -584,42 +563,6 @@ mod tests {
                 )
                 .await,
             "sandbox reads of declarative policy must be denied"
-        );
-    }
-    #[test]
-    fn merged_for_migrates_legacy_home_policy() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
-        let project_root = tmp.path().join("project");
-        let policy_dir = home.join(".config/agent-sandbox");
-        std::fs::create_dir_all(&policy_dir).expect("create policy directory");
-        std::fs::create_dir_all(&project_root).expect("create project root");
-        let policy_path = policy_dir.join("policy.json");
-        std::fs::write(
-            &policy_path,
-            r#"{"network":{"allow":[{"host":"example.com","port":443}],"deny":[]}}"#,
-        )
-        .expect("write legacy home policy");
-
-        let store = test_store();
-        let home_s = home.to_string_lossy().into_owned();
-        let project_s = project_root.to_string_lossy().into_owned();
-        let ctx = ResolvedRequestContext::new(
-            SandboxPaths::new(&project_s, &home_s, &project_s),
-            ProcessIds::default(),
-            None,
-        );
-        let merged = store.merged_for(&ctx);
-        assert_eq!(merged.network.direct.allow.len(), 1);
-        let rewritten: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(policy_path).expect("read policy"))
-                .expect("parse rewritten policy");
-        assert!(rewritten["network"]["allow"].is_null());
-        assert_eq!(
-            rewritten["network"]["direct"]["allow"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
         );
     }
 

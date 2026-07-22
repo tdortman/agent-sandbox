@@ -152,7 +152,7 @@ mod tests {
         fs::create_dir_all(repo.join(".agent-sandbox")).expect("create dirs");
         fs::write(
             repo.join(".agent-sandbox/policy.json"),
-            r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
+            r#"{"network":{"direct":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]}}"#,
         )
         .expect("write file");
 

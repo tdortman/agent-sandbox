@@ -122,13 +122,6 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     mappings
 }
 
-/// First question name in a packet (lowercase, no trailing dot).
-#[must_use]
-pub fn question_name(data: &[u8]) -> Option<String> {
-    let message = Message::from_vec(data).ok()?;
-    query_name(&message)
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::Ipv6Addr;
@@ -144,7 +137,7 @@ mod tests {
         },
     };
 
-    use super::{DnsMapping, mappings_from_response, question_name};
+    use super::{DnsMapping, mappings_from_response};
 
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");
@@ -277,12 +270,6 @@ mod tests {
                 ttl: 120,
             },
         ]);
-    }
-
-    #[test]
-    fn question_name_normalizes_case() {
-        let pkt = build_a_response("Example.COM", [1, 2, 3, 4], 300);
-        assert_eq!(question_name(&pkt), Some("example.com".to_string()));
     }
 
     #[test]

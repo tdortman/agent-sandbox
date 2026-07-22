@@ -30,8 +30,6 @@ const ENV_INHERIT: &[&str] = &[
     "LD_LIBRARY_PATH",
 ];
 
-pub type ToolPathFn = fn(&str, &str) -> Option<String>;
-
 #[must_use]
 pub fn tool_path(env_key: &str, binary: &str) -> Option<String> {
     if let Ok(explicit) = std::env::var(env_key) {

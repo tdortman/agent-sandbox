@@ -48,7 +48,7 @@ fn atomic_write_preserves_symlink() {
     let real_policy = real.join("policy.json");
     fs::write(
         &real_policy,
-        r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#,
+        r#"{"network":{"direct":{"allow":[],"deny":[]},"http":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]}}"#,
     )
     .expect("write file");
     let link = tmp.path().join("policy.json");
@@ -170,10 +170,12 @@ fn load_policy_ignores_top_level_http_rules() {
     fs::write(
         &path,
         r#"{
-    "network": { "allow": [], "deny": [] },
+    "network": {
+        "direct": { "allow": [], "deny": [] }
+    },
     "http": {
-        "allow": [{ "method": "GET", "url": "https://api.example.com/v1" }],
-        "deny": [{ "url": "https://api.example.com/v1/telemetry" }]
+        "allow": [{ "methods": ["GET"], "url": "https://api.example.com/v1" }],
+        "deny": [{ "methods": [], "url": "https://api.example.com/v1/telemetry" }]
     },
     "sudo": { "allow": [], "deny": [] },
     "filesystem": { "allow": [], "deny": [] },
@@ -185,85 +187,6 @@ fn load_policy_ignores_top_level_http_rules() {
     let policy = load_policy(&path, None, None);
     assert!(policy.network.http.allow.is_empty());
     assert!(policy.network.http.deny.is_empty());
-}
-
-#[test]
-fn legacy_direct_network_fields_deserialize_to_canonical_direct() {
-    let policy: Policy = serde_json::from_str(
-        r#"{
-    "network": {
-        "allow": [{ "host": "example.com", "port": 443 }],
-        "deny": []
-    }
-}"#,
-    )
-    .expect("legacy direct policy");
-    assert_eq!(policy.network.direct.allow.len(), 1);
-    assert!(policy.network.direct.deny.is_empty());
-    let json = serde_json::to_value(policy).expect("serialize canonical policy");
-    let network = json
-        .get("network")
-        .and_then(serde_json::Value::as_object)
-        .expect("network object");
-    assert!(network.contains_key("direct"));
-    assert!(!network.contains_key("allow"));
-    assert!(!network.contains_key("deny"));
-}
-
-#[test]
-fn migrate_policy_rewrites_legacy_network_fields_on_disk() {
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let path = tmp.path().join("policy.json");
-    fs::write(
-        &path,
-        r#"{
-    "network": {
-        "allow": [{ "host": "example.com", "port": 443 }],
-        "deny": []
-    }
-}"#,
-    )
-    .expect("write legacy policy");
-
-    assert!(migrate_policy(&path, None, None).expect("migrate policy"));
-    let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&path).expect("read migrated policy"))
-            .expect("parse migrated policy");
-    let network = value
-        .get("network")
-        .and_then(serde_json::Value::as_object)
-        .expect("network object");
-    assert!(network.contains_key("direct"));
-    assert!(!network.contains_key("allow"));
-    assert!(!network.contains_key("deny"));
-    assert_eq!(
-        network["direct"]["allow"][0]["host"],
-        serde_json::Value::String("example.com".into())
-    );
-}
-
-#[test]
-fn migrate_policy_reports_invalid_http_without_rewriting() {
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let path = tmp.path().join("policy.json");
-    let legacy = r#"{
-    "network": {
-        "allow": [{ "host": "example.com", "port": 443 }],
-        "http": {
-            "allow": [{ "method": "GET", "url": "not a URL" }]
-        }
-    }
-}"#;
-    fs::write(&path, legacy).expect("write legacy policy");
-    let before = fs::read(&path).expect("read original policy");
-
-    let loaded = load_policy(&path, None, None);
-    assert_eq!(loaded.network.direct.allow.len(), 1);
-    assert!(loaded.network.http.allow.is_empty());
-
-    let error = migrate_policy(&path, None, None).expect_err("invalid HTTP rule must fail");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert_eq!(fs::read(&path).expect("read unchanged policy"), before);
 }
 
 #[test]
@@ -389,8 +312,8 @@ fn filesystem_deny_wins_over_allow_at_eval_time() {
 }
 
 #[test]
-fn old_policy_without_filesystem_still_loads() {
-    let json = r#"{"network":{"allow":[],"deny":[]},"sudo":{"allow":[],"deny":[]}}"#;
+fn policy_without_filesystem_still_loads() {
+    let json = r#"{"network":{"direct":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]}}"#;
     let policy: Policy = serde_json::from_str(json).expect("deserialize policy");
     assert!(policy.filesystem.allow.is_empty());
     assert!(policy.filesystem.deny.is_empty());

@@ -956,42 +956,12 @@ pub struct DirectNetworkSection {
     pub deny: Vec<NetworkRule>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkSection {
     #[serde(default)]
     pub direct: DirectNetworkSection,
     #[serde(default)]
     pub http: HttpSection,
-}
-
-#[derive(Deserialize)]
-struct NetworkSectionWire {
-    #[serde(default)]
-    direct: Option<DirectNetworkSection>,
-    #[serde(default)]
-    allow: Vec<NetworkRule>,
-    #[serde(default)]
-    deny: Vec<NetworkRule>,
-    #[serde(default)]
-    http: HttpSection,
-}
-
-impl<'de> Deserialize<'de> for NetworkSection {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = NetworkSectionWire::deserialize(deserializer)?;
-        let mut direct = wire.direct.unwrap_or_default();
-        // Accept legacy `network.allow` and `network.deny` fields and
-        // normalize them into the canonical `network.direct` section.
-        direct.allow.extend(wire.allow);
-        direct.deny.extend(wire.deny);
-        Ok(Self {
-            direct,
-            http: wire.http,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

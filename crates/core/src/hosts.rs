@@ -219,11 +219,6 @@ pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) ->
     HostResolution::new(policy_host, connect_host)
 }
 
-#[must_use]
-pub fn allow_keys(host: &str, port: u16) -> Vec<NetworkRuleKey> {
-    vec![NetworkRuleKey::new(host, port)]
-}
-
 /// Whether `host` matches a policy `pattern` using globset syntax and
 /// normalized IP-prefix aliases.
 #[must_use]
@@ -450,15 +445,6 @@ mod tests {
         let path = dir.path().join("dns-cache.json");
         let result = policy_host_for_connect("10.0.0.9", Some(&path));
         assert_eq!(result.policy_host, "10.0.0.9");
-    }
-
-    #[test]
-    fn allow_keys_does_not_add_ptr_host_for_ip_literal() {
-        // allow_keys must not insert a reverse-DNS/PTR-derived hostname.
-        let keys = allow_keys("104.18.32.47", 443);
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].host, "104.18.32.47");
-        assert_eq!(keys[0].port, 443);
     }
 
     #[test]

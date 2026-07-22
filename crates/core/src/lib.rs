@@ -28,9 +28,9 @@ pub use dns_wire::{DnsMapping, mappings_from_response};
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 pub use hosts::{
-    DnsNameError, HostResolution, NetworkRuleKey, NetworkSortKey, allow_keys,
-    approval_host_patterns, host_pattern_matches, is_ip_literal, normalize_dns_name,
-    normalize_host, policy_host_for_connect, reverse_hostname,
+    DnsNameError, HostResolution, NetworkRuleKey, NetworkSortKey, approval_host_patterns,
+    host_pattern_matches, is_ip_literal, normalize_dns_name, normalize_host,
+    policy_host_for_connect, reverse_hostname,
 };
 pub use http::{
     HttpAuthority, HttpContextKey, HttpHost, HttpMethod, HttpMethodMatcher, HttpParseError,
@@ -39,7 +39,7 @@ pub use http::{
 };
 pub use merge_policy::{
     ProjectPolicyContext, atomic_write_policy, chown_policy_path, load_policy, merge_layers,
-    migrate_policy, resolve_policy_write_path, trusted_project_policy_path,
+    resolve_policy_write_path, trusted_project_policy_path,
 };
 pub use policy::{
     DbusBus, DbusFdMetadata, DbusMessageKind, DbusRule, DbusSection, DbusTarget, DeviceAccess,

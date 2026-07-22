@@ -8,7 +8,7 @@ mod project;
 mod tests;
 
 pub use io::{
-    atomic_write_policy, chown_policy_path, load_policy, migrate_policy, resolve_owner_uid,
+    atomic_write_policy, chown_policy_path, load_policy, resolve_owner_uid,
     resolve_policy_write_path,
 };
 pub use merge::merge_layers;

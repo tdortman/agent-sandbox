@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
     ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,
-    ScopeTarget, allow_keys,
+    ScopeTarget,
 };
 
 use super::{decisions::DecisionAction, types::PolicyStore};
@@ -54,9 +54,7 @@ impl PolicyStore {
             ScopeTarget::Ephemeral => {
                 if action == DecisionAction::Approve {
                     let mut inner = self.inner.lock().await;
-                    for key in allow_keys(&host, port) {
-                        inner.once_allow.insert(key);
-                    }
+                    inner.once_allow.insert(NetworkRuleKey::new(&host, port));
                 }
             }
             ScopeTarget::Session { session_id } => {

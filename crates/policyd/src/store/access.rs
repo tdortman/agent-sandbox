@@ -6,9 +6,8 @@ use std::{
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, SocketAccess, Verdict, allow_keys, contains_glob_syntax,
-    discover_git_project_root, expand_policy_path, normalize_directory_traverse_access,
-    normalize_host,
+    ResourceRuleKey, SocketAccess, Verdict, contains_glob_syntax, discover_git_project_root,
+    expand_policy_path, normalize_directory_traverse_access, normalize_host,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -19,7 +18,7 @@ use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore}
 const MAX_DENY_INODE_ENTRIES: usize = 100_000;
 
 fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u16) -> bool {
-    let keys = allow_keys(host, port);
+    let keys = [NetworkRuleKey::new(host, port)];
     bucket.iter().any(|rule| {
         rule.port == port
             && keys
@@ -65,7 +64,7 @@ pub(super) fn is_sandbox_infrastructure_path(path: &Path) -> bool {
 
 impl PolicyStore {
     pub(crate) async fn once_allowed(&self, host: &str, port: u16, consume: bool) -> bool {
-        let keys = allow_keys(host, port);
+        let keys = [NetworkRuleKey::new(host, port)];
         let mut inner = self.inner.lock().await;
         let matched = keys.iter().any(|k| inner.once_allow.contains(k));
         if matched && consume {

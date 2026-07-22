@@ -819,8 +819,10 @@ impl<'de> Deserialize<'de> for HttpRuleTarget {
 }
 
 /// Raw JSON/Nix policy rule. Validate before matching or persistence.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpRule {
+    #[serde(default)]
     pub methods: Vec<String>,
     pub url: String,
     pub comment: Option<String>,
@@ -844,32 +846,6 @@ impl Serialize for HttpRule {
             comment: &self.comment,
         }
         .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for HttpRule {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Wire {
-            #[serde(default)]
-            methods: Option<Vec<String>>,
-            #[serde(default)]
-            method: Option<String>,
-            url: String,
-            #[serde(default)]
-            comment: Option<String>,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            methods: wire
-                .methods
-                .unwrap_or_else(|| wire.method.into_iter().collect()),
-            url: wire.url,
-            comment: wire.comment,
-        })
     }
 }
 
@@ -1301,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_methods_and_legacy_method_deserialize() {
+    fn canonical_methods_deserialize_and_singular_method_is_rejected() {
         let canonical: HttpRule =
             serde_json::from_str(r#"{"methods":["POST","GET"],"url":"https://example.com"}"#)
                 .expect("canonical methods");
@@ -1310,22 +1286,9 @@ mod tests {
             serde_json::to_string(&canonical).expect("serialize canonical"),
             r#"{"methods":["POST","GET"],"url":"https://example.com"}"#
         );
-
-        let legacy: HttpRule =
-            serde_json::from_str(r#"{"method":"GET","url":"https://example.com"}"#)
-                .expect("legacy method");
-        assert_eq!(legacy.methods, vec!["GET"]);
-        assert_eq!(
-            serde_json::to_string(&legacy).expect("serialize legacy as canonical"),
-            r#"{"methods":["GET"],"url":"https://example.com"}"#
-        );
-
-        let all: HttpRule =
-            serde_json::from_str(r#"{"url":"https://example.com"}"#).expect("all methods");
-        assert!(all.methods.is_empty());
-        assert_eq!(
-            serde_json::to_string(&all).expect("serialize all methods"),
-            r#"{"methods":[],"url":"https://example.com"}"#
+        assert!(
+            serde_json::from_str::<HttpRule>(r#"{"method":"GET","url":"https://example.com"}"#)
+                .is_err()
         );
     }
 
