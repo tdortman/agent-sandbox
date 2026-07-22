@@ -342,8 +342,8 @@ in
         that plain ``sudo`` inside the agent routes through policyd, and the
         approved command runs as root on the host (not inside bubblewrap).
         Host-side ``agent-sandbox-ui`` may approve. v1: ``sudo <cmd> [args…]``
-        only; ``-u`` / ``-E`` and similar flags are not supported. The host\'s
-        ``/run/wrappers/bin/sudo`` is left untouched.
+        only. ``-u`` / ``-E`` and similar flags are not supported. The
+        host's ``/run/wrappers`` tree is hidden inside the sandbox.
       '';
     };
 

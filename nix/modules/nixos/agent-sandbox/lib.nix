@@ -3,6 +3,63 @@
   jail-nix,
 }:
 let
+  policyContextScript = ''
+    # Reuse outer context if already set (e.g. by agent-sandbox-open-ui-fd).
+    if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
+      _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
+    else
+      IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
+    fi
+    if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
+      _agent_sandbox_home="$AGENT_SANDBOX_HOME"
+    else
+      _agent_sandbox_home=$(readlink -f "$HOME")
+    fi
+    if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
+      _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
+    else
+      _agent_sandbox_cwd="$PWD"
+    fi
+    if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
+      _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
+    else
+      _agent_sandbox_project_root="$PWD"
+      if command -v git >/dev/null 2>&1; then
+        _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
+        [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
+      fi
+    fi
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
+  '';
+
+  nvidiaSetupScript = bindDevices: ''
+    ${lib.optionalString bindDevices ''
+      for _gpu in /dev/nvidia*; do
+        [[ -e "$_gpu" ]] || continue
+        RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
+      done
+      if [[ -d /dev/nvidia-caps ]]; then
+        for _cap in /dev/nvidia-caps/*; do
+          [[ -e "$_cap" ]] || continue
+          RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
+        done
+      fi
+    ''}
+    if [[ -d /run/opengl-driver/lib ]]; then
+      _asbx_ld="/run/opengl-driver/lib"
+      if [[ -n "''${LD_LIBRARY_PATH:-}" ]]; then
+        case ":$LD_LIBRARY_PATH:" in
+          *":$_asbx_ld:"*) ;;
+          *) _asbx_ld="$_asbx_ld:$LD_LIBRARY_PATH" ;;
+        esac
+      fi
+      RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
+    fi
+  '';
+
   defaultCommonPkgs =
     pkgs: with pkgs; [
       bashInteractive
@@ -37,7 +94,6 @@ let
 
   defaultRuntimeReadonlyDirs = [
     "/run/current-system"
-    "/run/wrappers"
     "/run/opengl-driver"
     "/run/opengl-driver-32"
   ];
@@ -182,7 +238,11 @@ let
     ++ [
       agent-sandbox-nvidia-gpu
     ]
-    ++ map try-dev-bind devicePaths;
+    ++ map try-dev-bind devicePaths
+    ++ [
+      (unsafe-add-raw-args "--dir /run")
+      (unsafe-add-raw-args "--tmpfs /run/wrappers")
+    ];
 
 in
 {
@@ -232,7 +292,10 @@ in
 
       builtinCombinators = (jail-nix.lib.init pkgs).combinators;
 
-      agentCombinators = import ./combinators.nix { inherit pkgs lib; } builtinCombinators;
+      agentCombinators = import ./combinators.nix {
+        inherit pkgs lib policyContextScript;
+        nvidiaSetupScript = nvidiaSetupScript true;
+      } builtinCombinators;
 
       # Syscall gate: when wired, prepend `agent-sandbox-syscall-arm --` to
       # the entry chain. The arm helper installs a seccomp filter inside the
@@ -410,29 +473,21 @@ in
       # Rebind explicit narrow /run/* mounts configured by the package
       # definition. Skip the broad /run path so the host's runtime sockets
       # stay hidden by the surrounding tmpfs.
-      runReadonlyBindScript = lib.concatMapStringsSep "\n" (
-        path:
-        if path == "/run" then
-          ""
-        else
-          ''
-            if [[ -e "${path}" ]]; then
-              RUNTIME_ARGS+=(--ro-bind "${path}" "${path}")
-            fi
-          ''
-      ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique (readonlyDirs ++ readonlyFiles)));
-
-      runReadwriteBindScript = lib.concatMapStringsSep "\n" (
-        path:
-        if path == "/run" then
-          ""
-        else
-          ''
-            if [[ -e "${path}" ]]; then
-              RUNTIME_ARGS+=(--bind "${path}" "${path}")
-            fi
-          ''
-      ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique (readwriteDirs ++ readwriteFiles)));
+      runBindScript =
+        bindFlag: paths:
+        lib.concatMapStringsSep "\n" (
+          path:
+          if path == "/run" then
+            ""
+          else
+            ''
+              if [[ -e "${path}" ]]; then
+                RUNTIME_ARGS+=(${bindFlag} "${path}" "${path}")
+              fi
+            ''
+        ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique paths));
+      runReadonlyBindScript = runBindScript "--ro-bind" (readonlyDirs ++ readonlyFiles);
+      runReadwriteBindScript = runBindScript "--bind" (readwriteDirs ++ readwriteFiles);
 
       runMaskScript =
         if resourceGate then
@@ -442,7 +497,7 @@ in
         else
           ''
             RUNTIME_ARGS+=(--tmpfs /run)
-            for _asbx_safe_runtime in /run/current-system /run/wrappers /run/opengl-driver /run/opengl-driver-32 /run/netns; do
+            for _asbx_safe_runtime in /run/current-system /run/opengl-driver /run/opengl-driver-32 /run/netns; do
               if [[ -e "$_asbx_safe_runtime" ]]; then
                 RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
               fi
@@ -453,37 +508,8 @@ in
       policyScript =
         lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
           ''
-            # Reuse outer context if already set (e.g. by agent-sandbox-open-ui-fd).
-            if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
-              _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
-            else
-              IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
-            fi
-            if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
-              _agent_sandbox_home="$AGENT_SANDBOX_HOME"
-            else
-              _agent_sandbox_home=$(readlink -f "$HOME")
-            fi
-            if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
-              _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
-            else
-              _agent_sandbox_cwd="$PWD"
-            fi
-            if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
-              _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
-            else
-              _agent_sandbox_project_root="$PWD"
-              if command -v git >/dev/null 2>&1; then
-                _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
-                [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
-              fi
-            fi
+            ${policyContextScript}
             RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
-            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
-            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
-            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
-            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
-
             # Mask /run so unrelated host IPC sockets are invisible. With
             # resource gate, only /run/agent-sandbox is tmpfs'd; AF_UNIX
             # sockets remain visible from the host /run tree and are gated
@@ -665,8 +691,11 @@ in
           ''_asbx_hide="$HOME/${lib.removePrefix "~/" path}"''
         else
           "_asbx_hide=${lib.escapeShellArg path}";
-      hidePathsScript = lib.concatMapStringsSep "\n" (path: ''
-        ${hidePathAssignment path}
+      hidePathsScript = ''
+        RUNTIME_ARGS+=(--tmpfs /run/wrappers)
+      ''
+      + lib.concatMapStringsSep "\n" (path: ''
+          ${hidePathAssignment path}
         _asbx_hide_target=""
         if [[ -e "$_asbx_hide" ]]; then
           _asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)" || _asbx_hide_target=""
@@ -723,25 +752,7 @@ in
           ${dbusScript}
           ${dnsScript}
 
-          ${lib.optionalString (!resourceGate) ''
-            for _gpu in /dev/nvidia*; do
-              [[ -e "$_gpu" ]] || continue
-              RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
-            done
-            if [[ -d /dev/nvidia-caps ]]; then
-              for _cap in /dev/nvidia-caps/*; do
-                [[ -e "$_cap" ]] || continue
-                RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
-              done
-            fi
-          ''}
-          if [[ -d /run/opengl-driver/lib ]]; then
-            _asbx_ld="/run/opengl-driver/lib"
-            if [[ -n "''${LD_LIBRARY_PATH:-}" ]]; then
-              case ":$LD_LIBRARY_PATH:" in *":$_asbx_ld:"*) ;; *) _asbx_ld="$_asbx_ld:$LD_LIBRARY_PATH" ;; esac
-            fi
-            RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
-          fi
+          ${nvidiaSetupScript (!resourceGate)}
           ${lib.optionalString (!resourceGate) deviceBindScript}
 
           ${networkModeScript}

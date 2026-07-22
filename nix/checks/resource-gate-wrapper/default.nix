@@ -63,6 +63,10 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
   grep -F -q -- '--tmpfs /run/agent-sandbox' rg-wrapper.sh \
     || fail "resource-gate: missing --tmpfs /run/agent-sandbox"
 
+  # /run/wrappers is always hidden, including resource-gate mode.
+  grep -F -q -- 'RUNTIME_ARGS+=(--tmpfs /run/wrappers)' rg-wrapper.sh \
+    || fail "resource-gate: /run/wrappers must be hidden"
+
   # 3. Broad --tmpfs /run is NOT present in resource-gate mode.
   if grep -F -q -- 'RUNTIME_ARGS+=(--tmpfs /run)' rg-wrapper.sh; then
     fail "resource-gate: broad --tmpfs /run should not be present"
@@ -100,6 +104,9 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
   # 9. Broad --tmpfs /run IS present in non-resource-gate mode.
   grep -F -q -- 'RUNTIME_ARGS+=(--tmpfs /run)' nrg-wrapper.sh \
     || fail "non-resource-gate: missing broad --tmpfs /run"
+
+  grep -F -q -- 'RUNTIME_ARGS+=(--tmpfs /run/wrappers)' nrg-wrapper.sh \
+    || fail "non-resource-gate: /run/wrappers must be hidden"
 
   # 10. GPU auto-bind loop IS present in non-resource-gate mode.
   grep -F -q 'for _gpu in /dev/nvidia' nrg-wrapper.sh \

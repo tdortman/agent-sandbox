@@ -1,5 +1,11 @@
 # Additional jail.nix combinators for agent-sandbox (home mounts, restricted net).
-{ pkgs, lib, ... }:
+{
+  pkgs,
+  lib,
+  policyContextScript,
+  nvidiaSetupScript,
+  ...
+}:
 builtin:
 let
   inherit (builtin)
@@ -231,6 +237,50 @@ let
       fi
     }
   '';
+  restrictedNet =
+    dynamic:
+    include-once "agent-sandbox-restricted-net" (
+      compose (
+        lib.optionals dynamic [
+          time-zone
+          (share-ns "pid")
+        ]
+        ++ [
+          (share-ns "net")
+          (add-runtime ''
+            if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
+              RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf /etc/nsswitch.conf)
+            ${lib.optionalString (!dynamic) ''
+              else
+                RUNTIME_ARGS+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
+            ''}
+            fi
+          '')
+          (add-runtime ''
+            if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
+              RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf /etc/resolv.conf)
+            fi
+          '')
+          (add-runtime ''
+            if [[ -d /run/nscd ]]; then
+              RUNTIME_ARGS+=(--tmpfs /run/nscd)
+            fi
+          '')
+        ]
+        ++ lib.optionals (!dynamic) [
+          (runtime-deep-ro-bind "/etc/ssl")
+          (try-readonly "/etc/static/ssl")
+          (try-readonly "/run/opengl-driver")
+          (try-readonly "/run/opengl-driver-32")
+          (try-readonly "/run/current-system")
+          (try-readonly "/run/agent-sandbox")
+          (try-readonly "/run/netns")
+        ]
+        ++ [
+          (unsafe-add-raw-args "--disable-userns")
+        ]
+      )
+    );
 in
 {
   inherit agent-sandbox-base agent-sandbox-dynamic-base;
@@ -295,36 +345,8 @@ in
       (add-runtime ''
         # jail.nix base uses --clearenv; only --setenv survives into the jail.
         # policyd and enforcement daemons read these from /proc/<pid>/environ.
-        # Reuse outer context if already set (e.g. by agent-sandbox-open-ui-fd).
-        if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
-          _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
-        else
-          IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
-        fi
-        if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
-          _agent_sandbox_home="$AGENT_SANDBOX_HOME"
-        else
-          _agent_sandbox_home=$(readlink -f "$HOME")
-        fi
-        if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
-          _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
-        else
-          _agent_sandbox_cwd="$PWD"
-        fi
-        if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
-          _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
-        else
-          _agent_sandbox_project_root="$PWD"
-          if command -v git >/dev/null 2>&1; then
-            _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
-            [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
-          fi
-        fi
+        ${policyContextScript}
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
         RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
       '')
     ];
@@ -340,32 +362,11 @@ in
 
   # Bind all host NVIDIA nodes (including nvidia-fs* when nvidia-fs is enabled).
   # Must run after inherit-shell-env so LD_LIBRARY_PATH can prefer /run/opengl-driver.
-  agent-sandbox-nvidia-gpu = add-runtime ''
-    for _gpu in /dev/nvidia*; do
-      [[ -e "$_gpu" ]] || continue
-      RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
-    done
-    if [[ -d /dev/nvidia-caps ]]; then
-      for _cap in /dev/nvidia-caps/*; do
-        [[ -e "$_cap" ]] || continue
-        RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
-      done
-    fi
-    if [[ -d /run/opengl-driver/lib ]]; then
-      _asbx_ld="/run/opengl-driver/lib"
-      if [[ -n "''${LD_LIBRARY_PATH:-}" ]]; then
-        case ":$LD_LIBRARY_PATH:" in
-          *":$_asbx_ld:"*) ;;
-          *) _asbx_ld="$_asbx_ld:$LD_LIBRARY_PATH" ;;
-        esac
-      fi
-      RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
-    fi
-  '';
+  agent-sandbox-nvidia-gpu = add-runtime nvidiaSetupScript;
 
   # Sudo guard combinator. The guard binary is exposed on PATH so that
-  # plain `sudo` inside the sandbox routes through it. No bind-mount at
-  # /run/wrappers/bin/sudo — the host's sudo wrapper is left untouched.
+  # plain `sudo` inside the sandbox routes through it. No bind mount at
+  # `/run/wrappers/bin/sudo` is needed.
   agent-sandbox-sudo-guard =
     sudoPkg:
     compose [
@@ -374,60 +375,7 @@ in
       '')
     ];
 
-  agent-sandbox-restricted-net = include-once "agent-sandbox-restricted-net" (compose [
-    (share-ns "net")
-    (add-runtime ''
-      RUNTIME_ARGS+=(--dir /etc)
-      if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
-        RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf /etc/nsswitch.conf)
-      else
-        RUNTIME_ARGS+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
-      fi
-    '')
-    (runtime-deep-ro-bind "/etc/ssl")
-    (add-runtime ''
-      # Points at the veth gateway. agent-sandbox-dns-forwarder sends to host systemd-resolved.
-      if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
-        RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf /etc/resolv.conf)
-      fi
-    '')
-    (add-runtime ''
-      if [[ -d /run/nscd ]]; then
-        RUNTIME_ARGS+=(--tmpfs /run/nscd)
-      fi
-    '')
-    (try-readonly "/etc/static/ssl")
-    (try-readonly "/run/opengl-driver")
-    (try-readonly "/run/opengl-driver-32")
-    (try-readonly "/run/current-system")
-    (try-readonly "/run/wrappers")
-    (try-readonly "/run/agent-sandbox")
-    (try-readonly "/run/netns")
-    (unsafe-add-raw-args "--disable-userns")
-  ]);
+  agent-sandbox-restricted-net = restrictedNet false;
+  agent-sandbox-restricted-net-dynamic = restrictedNet true;
 
-  # Dynamic-FS variant: skip all redundant bind mounts since --bind / / exposes
-  # everything.  Keep only namespace sharing, DNS file replacements, and userns
-  # disable.  The try-readonly calls fail on symlinks under a root-bound tree.
-  agent-sandbox-restricted-net-dynamic = include-once "agent-sandbox-restricted-net" (compose [
-    time-zone
-    (share-ns "pid")
-    (share-ns "net")
-    (add-runtime ''
-      if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
-        RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf /etc/nsswitch.conf)
-      fi
-    '')
-    (add-runtime ''
-      if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
-        RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/resolv.conf /etc/resolv.conf)
-      fi
-    '')
-    (add-runtime ''
-      if [[ -d /run/nscd ]]; then
-        RUNTIME_ARGS+=(--tmpfs /run/nscd)
-      fi
-    '')
-    (unsafe-add-raw-args "--disable-userns")
-  ]);
 }
