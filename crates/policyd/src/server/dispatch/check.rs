@@ -128,7 +128,8 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
-        ApprovalScope, ProcessIds, ResolvedRequestContext, RpcReply, SandboxPaths, VerdictSource,
+        ApprovalScope, NetworkRuleKey, ProcessIds, ResolvedRequestContext, RpcReply, SandboxPaths,
+        VerdictSource,
     };
     use uuid::Uuid;
 
@@ -272,7 +273,7 @@ mod tests {
             let mut inner = store.inner.lock().await;
             inner
                 .once_allow
-                .insert(agent_sandbox_core::NetworkRuleKey::new("chatgpt.com", 443));
+                .insert(NetworkRuleKey::new("chatgpt.com", 443));
         }
 
         let first = handle_check(&store, isolated_check_args(&base, "chatgpt.com", Some(443)))

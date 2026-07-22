@@ -19,7 +19,8 @@ use std::{
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost,
-    SandboxPaths, lookup_dns_cache, mappings_from_response, sandbox_session_id_from_pid,
+    OwnerSnapshot, SandboxPaths, lookup_dns_cache, mappings_from_response,
+    sandbox_session_id_from_pid,
 };
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
@@ -633,7 +634,7 @@ where
         Option<u32>,
         &[String],
         Duration,
-    ) -> std::io::Result<policy::PolicyResult>,
+    ) -> std::io::Result<bool>,
 {
     // Try IPv4 first, then IPv6.
     let meta = packet::parse_ipv4(payload).or_else(|| packet::parse_ipv6(payload));
@@ -678,7 +679,7 @@ where
     // them; all other destinations stay on the ordinary kernel route and are
     // checked synchronously below.
     let src_pid = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port)
-        .map(agent_sandbox_core::OwnerSnapshot::pid_value);
+        .map(OwnerSnapshot::pid_value);
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
     if state.proxy_mode
         && !meta.dst_ip.is_loopback()
@@ -710,7 +711,7 @@ where
     );
 
     let allowed = match result {
-        Ok(result) => result.0,
+        Ok(result) => result,
         Err(err) => {
             warn!(
                 protocol = meta.protocol.as_str(),
@@ -914,7 +915,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -973,7 +974,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
         let registration = std::cell::RefCell::new(None);
         let mut register = |flow: FlowRegistration| {
@@ -1035,7 +1036,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            Ok(policy::PolicyResult(false))
+            Ok(false)
         };
         let registration_count = std::cell::Cell::new(0_u32);
         let mut register = |_: FlowRegistration| {
@@ -1085,7 +1086,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -1124,7 +1125,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            Ok(policy::PolicyResult(false))
+            Ok(false)
         };
         let registration_count = std::cell::Cell::new(0_u32);
         let mut register = |_: FlowRegistration| {
@@ -1215,7 +1216,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         // First check: policy consulted.
@@ -1640,7 +1641,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -1683,7 +1684,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -1726,7 +1727,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -1760,7 +1761,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -1797,7 +1798,7 @@ mod tests {
                          aliases: &[String],
                          _: Duration| {
             *aliases_seen.borrow_mut() = aliases.to_vec();
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(
@@ -1910,7 +1911,7 @@ mod tests {
                          _: packet::TransportProtocol,
                          _: Option<u32>,
                          _: &[String],
-                         _: Duration| Ok(policy::PolicyResult(true));
+                         _: Duration| Ok(true);
 
         let v = handle_packet_payload_with_registration(
             &state,
@@ -1943,7 +1944,7 @@ mod tests {
                          _: &[String],
                          _: Duration| {
             call_count.set(call_count.get() + 1);
-            Ok(policy::PolicyResult(true))
+            Ok(true)
         };
 
         let v = handle_packet_payload_with_registration(

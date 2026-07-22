@@ -65,7 +65,7 @@ impl PolicyStore {
             .await
         {
             Ok(target) => target,
-            Err(reply) => return reply,
+            Err(reply) => return *reply,
         };
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {
@@ -218,7 +218,7 @@ impl PolicyStore {
             .await
         {
             Ok(target) => target,
-            Err(reply) => return reply,
+            Err(reply) => return *reply,
         };
         let policy_path = match scope_target {
             ScopeTarget::Ephemeral => None,
@@ -321,7 +321,7 @@ impl PolicyStore {
             .await
         {
             Ok(target) => target,
-            Err(reply) => return reply,
+            Err(reply) => return *reply,
         };
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {

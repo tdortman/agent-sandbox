@@ -29,11 +29,12 @@ use std::{
 };
 
 pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
+pub(crate) use types::evict_oldest;
 pub use types::{
-    DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, HttpVerdictKey,
-    MAX_CONNECTIONS_PER_UID, MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation,
-    PendingFilesystem, PendingHttp, PendingKind, PendingNetwork, PendingResource, PolicyStore,
-    PolicydArgs, ProxyFlowState, ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
+    DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
+    MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation, PendingFilesystem, PendingHttp,
+    PendingKind, PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ProxyFlowState,
+    ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
 use types::{MergedPolicyCache, PolicyDecisionState};
 

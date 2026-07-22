@@ -12,26 +12,11 @@ use agent_sandbox_core::graphical_env::{graphical_session_env, tool_path};
 use nix::unistd::User;
 
 use crate::{
-    store::{PolicyStore, PolicydArgs},
-    wire::{UiSpawnContext, UiSpawnGate},
+    store::{PolicyStore, PolicydArgs, evict_oldest},
+    wire::UiSpawnContext,
 };
 
 const MAX_UI_SPAWN_THROTTLES: usize = 1024;
-
-/// Evict the oldest entries (by `Instant`) from a UI spawn throttle map
-/// until the map is within the global cap.
-fn enforce_ui_spawn_last_limit<S: BuildHasher>(map: &mut HashMap<String, Instant, S>) {
-    while map.len() > MAX_UI_SPAWN_THROTTLES {
-        let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, instant)| *instant)
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        map.remove(&oldest_key);
-    }
-}
 
 #[must_use]
 pub fn ui_spawn_env(
@@ -113,7 +98,7 @@ fn opt_path_str(path: Option<&Path>) -> String {
 impl PolicyStore {
     /// Spawn the policy UI without holding the store mutex across blocking I/O.
     pub(crate) async fn spawn_policy_ui(&self, spawn: UiSpawnContext<'_>) {
-        if spawn.gate.has_matching_ui {
+        if spawn.has_matching_ui {
             return;
         }
         let _ui_spawn_guard = self.ui_spawn_lock.lock().await;
@@ -129,9 +114,7 @@ impl PolicyStore {
         };
         let throttle = match tokio::task::spawn_blocking(move || {
             let spawn = UiSpawnContext {
-                gate: UiSpawnGate {
-                    has_matching_ui: false,
-                },
+                has_matching_ui: false,
                 sandbox_session_id: sandbox_session_id.as_deref(),
                 uid,
                 home: home.as_deref(),
@@ -166,7 +149,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     else {
         return;
     };
-    if spawn.gate.has_matching_ui {
+    if spawn.has_matching_ui {
         return;
     }
     let Some(uid) = spawn.uid.filter(|u| *u > 0) else {
@@ -192,12 +175,12 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     }
     ui_spawn_last.insert(spawn_key.clone(), now);
-    enforce_ui_spawn_last_limit(ui_spawn_last);
+
+    evict_oldest(ui_spawn_last, MAX_UI_SPAWN_THROTTLES, |instant| *instant);
 
     let Ok(Some(user)) = User::from_uid(nix::unistd::Uid::from_raw(uid)) else {
         return;
     };
-
     let Some(runuser) = tool_path("AGENT_SANDBOX_RUNUSER", "runuser") else {
         tracing::warn!("cannot spawn policy UI (runuser not found)");
         return;

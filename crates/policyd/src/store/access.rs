@@ -6,8 +6,9 @@ use std::{
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, Verdict, allow_keys, contains_glob_syntax, discover_git_project_root,
-    expand_policy_path, normalize_host,
+    ResourceRuleKey, SocketAccess, Verdict, allow_keys, contains_glob_syntax,
+    discover_git_project_root, expand_policy_path, normalize_directory_traverse_access,
+    normalize_host,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -269,7 +270,7 @@ impl PolicyStore {
         access: FileAccess,
         ctx: &ResolvedRequestContext,
     ) -> bool {
-        let access = agent_sandbox_core::normalize_directory_traverse_access(path, access);
+        let access = normalize_directory_traverse_access(path, access);
         let project_root = ctx.paths.project_root();
         let ctx = ctx.clone();
         let merged = self.merged_for_worker(&ctx);
@@ -598,11 +599,7 @@ fn is_protected_host_ipc_socket(kind: ResourceKind, path: &Path, access: Resourc
     if kind != ResourceKind::UnixSocket
         || !matches!(
             access,
-            ResourceAccess::Socket(
-                agent_sandbox_core::SocketAccess::Connect
-                    | agent_sandbox_core::SocketAccess::Send
-                    | agent_sandbox_core::SocketAccess::All
-            )
+            ResourceAccess::Socket(SocketAccess::Connect | SocketAccess::Send | SocketAccess::All)
         )
     {
         return false;
@@ -766,8 +763,10 @@ mod tests {
     use std::{collections::HashSet, path::Path, sync::Arc};
 
     use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRuleKey, NetworkRuleKey,
-        ResourceAccess, ResourceKind, SocketAccess, Verdict, VerdictSource,
+        DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRule, FilesystemRuleKey,
+        NetworkRule, NetworkRuleKey, Policy, ProcessIds, ResolvedRequestContext, ResourceAccess,
+        ResourceKind, SandboxPaths, SocketAccess, Verdict, VerdictSource, atomic_write_policy,
+        trusted_project_policy_path,
     };
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -876,21 +875,16 @@ mod tests {
             .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
-        let mut policy = agent_sandbox_core::Policy::default();
+        let mut policy = Policy::default();
         policy
             .network
             .direct
             .deny
-            .push(agent_sandbox_core::NetworkRule::new(
-                "34.230.40.*",
-                443,
-                "test",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+            .push(NetworkRule::new("34.230.40.*", 443, "test"));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -909,9 +903,9 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root, &home, &project_root),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
@@ -945,21 +939,16 @@ mod tests {
             .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
-        let mut policy = agent_sandbox_core::Policy::default();
+        let mut policy = Policy::default();
         policy
             .network
             .direct
             .deny
-            .push(agent_sandbox_core::NetworkRule::new(
-                "2001:db8:*",
-                443,
-                "test",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+            .push(NetworkRule::new("2001:db8:*", 443, "test"));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -978,9 +967,9 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root, &home, &project_root),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
@@ -1010,21 +999,16 @@ mod tests {
             .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
-        let mut policy = agent_sandbox_core::Policy::default();
+        let mut policy = Policy::default();
         policy
             .network
             .direct
             .deny
-            .push(agent_sandbox_core::NetworkRule::new(
-                "example.com",
-                443,
-                "test",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+            .push(NetworkRule::new("example.com", 443, "test"));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1043,18 +1027,17 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root, &home, &project_root),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
         assert!(store.policy_denied("example.com", 443, &ctx));
         assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
 
-        let empty = agent_sandbox_core::Policy::default();
-        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None, None)
-            .expect("clear policy");
+        let empty = Policy::default();
+        atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
 
         // The merged policy is computed on every call, so removing the deny rule
         // from disk takes effect immediately.
@@ -1071,21 +1054,16 @@ mod tests {
         std::fs::create_dir_all(project_root.join(".agent-sandbox"))
             .expect("create .agent-sandbox dir");
         std::fs::create_dir_all(&home).expect("create home dir");
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
-        let mut policy = agent_sandbox_core::Policy::default();
+        let mut policy = Policy::default();
         policy
             .network
             .direct
             .deny
-            .push(agent_sandbox_core::NetworkRule::new(
-                "34.230.40.*",
-                443,
-                "test",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+            .push(NetworkRule::new("34.230.40.*", 443, "test"));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1104,9 +1082,9 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root, &home, &project_root),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
@@ -1125,18 +1103,13 @@ mod tests {
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         let policy_path = policy_dir.join("policy.json");
 
-        let mut policy = agent_sandbox_core::Policy::default();
+        let mut policy = Policy::default();
         policy
             .network
             .direct
             .allow
-            .push(agent_sandbox_core::NetworkRule::new(
-                "example.com",
-                443,
-                "test",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+            .push(NetworkRule::new("example.com", 443, "test"));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1155,17 +1128,16 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root, &home, &project_root),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root, &home, &project_root),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
         assert!(store.is_allowed("example.com", 443, &ctx, false).await);
 
-        let empty = agent_sandbox_core::Policy::default();
-        agent_sandbox_core::atomic_write_policy(&policy_path, &empty, None, None, None)
-            .expect("clear policy");
+        let empty = Policy::default();
+        atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
 
         assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
     }
@@ -1181,17 +1153,13 @@ mod tests {
         let policy_path = policy_dir.join("policy.json");
         let config_path = project_root.join(".git/config");
 
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git",
-                agent_sandbox_core::FileAccess::ReadWrite,
-                "global",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            "./.git",
+            FileAccess::ReadWrite,
+            "global",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1210,35 +1178,27 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
-        let with_root = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let with_root = ResolvedRequestContext {
+            paths: SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
-        let without_root = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, ""),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let without_root = ResolvedRequestContext {
+            paths: SandboxPaths::new(&root_s, &home_s, ""),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &config_path,
-                    agent_sandbox_core::FileAccess::ReadWrite,
-                    &with_root,
-                )
+                .filesystem_allow_source(&config_path, FileAccess::ReadWrite, &with_root,)
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
             "global ./.git should match .git/config when project_root is set"
         );
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &config_path,
-                    agent_sandbox_core::FileAccess::ReadWrite,
-                    &without_root,
-                )
+                .filesystem_allow_source(&config_path, FileAccess::ReadWrite, &without_root,)
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
             "global ./.git should still match via git-discovered project root when ctx \
@@ -1258,17 +1218,13 @@ mod tests {
         let head_path = project_root.join(".git/HEAD");
         std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
 
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git/",
-                agent_sandbox_core::FileAccess::ReadWrite,
-                "global",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            "./.git/",
+            FileAccess::ReadWrite,
+            "global",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1287,35 +1243,27 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
-        let with_root = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let with_root = ResolvedRequestContext {
+            paths: SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
-        let without_root = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, ""),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let without_root = ResolvedRequestContext {
+            paths: SandboxPaths::new(&root_s, &home_s, ""),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &head_path,
-                    agent_sandbox_core::FileAccess::Read,
-                    &with_root,
-                )
+                .filesystem_allow_source(&head_path, FileAccess::Read, &with_root,)
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
             "./.git/ prefix should match .git/HEAD when project_root is set"
         );
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &head_path,
-                    agent_sandbox_core::FileAccess::Read,
-                    &without_root,
-                )
+                .filesystem_allow_source(&head_path, FileAccess::Read, &without_root,)
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
             "./.git/ prefix should match via git-discovered project root when ctx project_root is \
@@ -1334,17 +1282,13 @@ mod tests {
         let policy_path = policy_dir.join("policy.json");
         let objects_path = project_root.join(".git/objects/pack");
 
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git",
-                agent_sandbox_core::FileAccess::ReadWrite,
-                "global",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            "./.git",
+            FileAccess::ReadWrite,
+            "global",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1362,19 +1306,15 @@ mod tests {
         });
 
         let home_s = home.to_string_lossy().into_owned();
-        let stale_root = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new("/tmp", &home_s, "/tmp"),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let stale_root = ResolvedRequestContext {
+            paths: SandboxPaths::new("/tmp", &home_s, "/tmp"),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
         assert_eq!(
             store
-                .filesystem_allow_source(
-                    &objects_path,
-                    agent_sandbox_core::FileAccess::ReadWrite,
-                    &stale_root,
-                )
+                .filesystem_allow_source(&objects_path, FileAccess::ReadWrite, &stale_root,)
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
             "git root inferred from path should match ./.git even when launcher project_root is \
@@ -1393,17 +1333,13 @@ mod tests {
         let policy_path = policy_dir.join("policy.json");
         let pack_dir = project_root.join(".git/objects/pack");
 
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git",
-                agent_sandbox_core::FileAccess::ReadWrite,
-                "global",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            "./.git",
+            FileAccess::ReadWrite,
+            "global",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1422,15 +1358,15 @@ mod tests {
 
         let root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
 
         assert_eq!(
             store
-                .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Execute, &ctx,)
+                .filesystem_allow_source(&pack_dir, FileAccess::Execute, &ctx,)
                 .await,
             Some(Verdict::allowed(VerdictSource::policy())),
             "opendir on .git/objects/pack is directory traverse (Execute), not binary exec"
@@ -1448,17 +1384,13 @@ mod tests {
         let policy_path = policy_dir.join("policy.json");
         let pack_dir = project_root.join(".git/objects/pack");
 
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                "./.git",
-                agent_sandbox_core::FileAccess::ReadWrite,
-                "global",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            "./.git",
+            FileAccess::ReadWrite,
+            "global",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1501,24 +1433,21 @@ mod tests {
             .apply_filesystem_scope_session(
                 crate::store::decisions::DecisionAction::Deny,
                 ui_session_id.into(),
-                agent_sandbox_core::FilesystemRuleKey::new(
-                    "./.git",
-                    agent_sandbox_core::FileAccess::ReadWrite,
-                ),
+                FilesystemRuleKey::new("./.git", FileAccess::ReadWrite),
             )
             .await;
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&root_s, &home_s, &root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&root_s, &home_s, &root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some(session_id.into()),
         };
 
         assert_eq!(
             store
-                .filesystem_allow_source(&pack_dir, agent_sandbox_core::FileAccess::Read, &ctx,)
+                .filesystem_allow_source(&pack_dir, FileAccess::Read, &ctx,)
                 .await,
             Some(Verdict::denied(VerdictSource::policy())),
             "session deny on ./.git blocks the tree even when global ./.git allows"
@@ -1536,19 +1465,15 @@ mod tests {
         let license_path = project_root.join("LICENSE");
         std::fs::write(&license_path, "license").expect("write license");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                license_path.clone(),
-                agent_sandbox_core::FileAccess::All,
-                "deny license",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            license_path.clone(),
+            FileAccess::All,
+            "deny license",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1567,27 +1492,25 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-test".into()),
         };
         {
             let mut inner = store.inner.lock().await;
             inner
                 .sandbox_filesystem_static_allow
-                .insert("sandbox:sandbox-test".into(), vec![
-                    agent_sandbox_core::FilesystemRule::new(
-                        license_path.clone(),
-                        agent_sandbox_core::FileAccess::All,
-                        "static allow license",
-                    ),
-                ]);
+                .insert("sandbox:sandbox-test".into(), vec![FilesystemRule::new(
+                    license_path.clone(),
+                    FileAccess::All,
+                    "static allow license",
+                )]);
         }
 
         assert_eq!(
             store
-                .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .filesystem_allow_source(&license_path, FileAccess::Read, &ctx)
                 .await,
             Some(Verdict::denied(VerdictSource::policy()))
         );
@@ -1606,19 +1529,15 @@ mod tests {
         let alias_path = project_root.join("alias.txt");
         std::fs::hard_link(&secret_path, &alias_path).expect("hardlink alias");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                secret_path.clone(),
-                agent_sandbox_core::FileAccess::All,
-                "deny secret",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            secret_path.clone(),
+            FileAccess::All,
+            "deny secret",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1637,27 +1556,25 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-inode".into()),
         };
         {
             let mut inner = store.inner.lock().await;
             inner
                 .sandbox_filesystem_static_allow
-                .insert("sandbox:sandbox-inode".into(), vec![
-                    agent_sandbox_core::FilesystemRule::new(
-                        alias_path.clone(),
-                        agent_sandbox_core::FileAccess::All,
-                        "static allow alias",
-                    ),
-                ]);
+                .insert("sandbox:sandbox-inode".into(), vec![FilesystemRule::new(
+                    alias_path.clone(),
+                    FileAccess::All,
+                    "static allow alias",
+                )]);
         }
 
         assert_eq!(
             store
-                .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .filesystem_allow_source(&alias_path, FileAccess::Read, &ctx)
                 .await,
             Some(Verdict::denied(VerdictSource::policy()))
         );
@@ -1680,12 +1597,12 @@ mod tests {
             proxy_socket: None,
             proxy_gid: None,
         });
-        let ctx = agent_sandbox_core::ResolvedRequestContext::default();
+        let ctx = ResolvedRequestContext::default();
         assert_eq!(
             store
                 .filesystem_allow_source(
                     Path::new("/run/agent-sandbox/sandbox-policy.sock"),
-                    agent_sandbox_core::FileAccess::ReadWrite,
+                    FileAccess::ReadWrite,
                     &ctx,
                 )
                 .await,
@@ -1720,27 +1637,25 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-allow".into()),
         };
         {
             let mut inner = store.inner.lock().await;
             inner
                 .sandbox_filesystem_static_allow
-                .insert("sandbox:sandbox-allow".into(), vec![
-                    agent_sandbox_core::FilesystemRule::new(
-                        license_path.clone(),
-                        agent_sandbox_core::FileAccess::Read,
-                        "static allow license",
-                    ),
-                ]);
+                .insert("sandbox:sandbox-allow".into(), vec![FilesystemRule::new(
+                    license_path.clone(),
+                    FileAccess::Read,
+                    "static allow license",
+                )]);
         }
 
         assert_eq!(
             store
-                .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .filesystem_allow_source(&license_path, FileAccess::Read, &ctx)
                 .await,
             Some(Verdict::allowed(VerdictSource::Static))
         );
@@ -1760,19 +1675,15 @@ mod tests {
         std::fs::create_dir_all(alias_path.parent().unwrap()).expect("writable dir");
         std::fs::hard_link(&secret_path, &alias_path).expect("hardlink alias");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                secret_path.clone(),
-                agent_sandbox_core::FileAccess::All,
-                "deny secret",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            secret_path.clone(),
+            FileAccess::All,
+            "deny secret",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1791,27 +1702,25 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob".into()),
         };
         {
             let mut inner = store.inner.lock().await;
             inner
                 .sandbox_filesystem_static_allow
-                .insert("sandbox:sandbox-glob".into(), vec![
-                    agent_sandbox_core::FilesystemRule::new(
-                        project_root.join("writable/**"),
-                        agent_sandbox_core::FileAccess::All,
-                        "static allow writable tree",
-                    ),
-                ]);
+                .insert("sandbox:sandbox-glob".into(), vec![FilesystemRule::new(
+                    project_root.join("writable/**"),
+                    FileAccess::All,
+                    "static allow writable tree",
+                )]);
         }
 
         assert_eq!(
             store
-                .filesystem_allow_source(&alias_path, agent_sandbox_core::FileAccess::Write, &ctx)
+                .filesystem_allow_source(&alias_path, FileAccess::Write, &ctx)
                 .await,
             Some(Verdict::denied(VerdictSource::policy())),
             "static allow globs must not bypass inode deny checks"
@@ -1845,18 +1754,18 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob-allow".into()),
         };
         {
             let mut inner = store.inner.lock().await;
             inner.sandbox_filesystem_static_allow.insert(
                 "sandbox:sandbox-glob-allow".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
+                vec![FilesystemRule::new(
                     project_root.join("vendor/**"),
-                    agent_sandbox_core::FileAccess::Read,
+                    FileAccess::Read,
                     "static allow vendor tree",
                 )],
             );
@@ -1864,7 +1773,7 @@ mod tests {
 
         assert_eq!(
             store
-                .filesystem_allow_source(&nested_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .filesystem_allow_source(&nested_path, FileAccess::Read, &ctx)
                 .await,
             Some(Verdict::allowed(VerdictSource::Static))
         );
@@ -1881,19 +1790,15 @@ mod tests {
         let license_path = project_root.join("LICENSE");
         std::fs::write(&license_path, "license").expect("write license");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                license_path.clone(),
-                agent_sandbox_core::FileAccess::All,
-                "deny license",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            license_path.clone(),
+            FileAccess::All,
+            "deny license",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1912,18 +1817,18 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-broad-glob-deny".into()),
         };
         {
             let mut inner = store.inner.lock().await;
             inner.sandbox_filesystem_static_allow.insert(
                 "sandbox:sandbox-broad-glob-deny".into(),
-                vec![agent_sandbox_core::FilesystemRule::new(
+                vec![FilesystemRule::new(
                     project_root.join("**"),
-                    agent_sandbox_core::FileAccess::All,
+                    FileAccess::All,
                     "broad static allow repo tree",
                 )],
             );
@@ -1931,16 +1836,13 @@ mod tests {
 
         assert_eq!(
             store
-                .filesystem_allow_source(&license_path, agent_sandbox_core::FileAccess::Read, &ctx)
+                .filesystem_allow_source(&license_path, FileAccess::Read, &ctx)
                 .await,
             Some(Verdict::denied(VerdictSource::policy())),
             "broad user-defined globs must not bypass concrete policy deny"
         );
     }
-    async fn dbus_session_store() -> (
-        super::super::types::PolicyStore,
-        agent_sandbox_core::ResolvedRequestContext,
-    ) {
+    async fn dbus_session_store() -> (super::super::types::PolicyStore, ResolvedRequestContext) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -1956,9 +1858,9 @@ mod tests {
             proxy_socket: None,
             proxy_gid: None,
         });
-        let ctx = agent_sandbox_core::ResolvedRequestContext {
-            paths: agent_sandbox_core::SandboxPaths::new("/repo", "/home/user", "/repo"),
-            ids: agent_sandbox_core::ProcessIds::default(),
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+            ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-dbus".into()),
         };
         let (stream, _) = UnixStream::pair().expect("unix stream pair");

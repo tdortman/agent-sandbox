@@ -2,6 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use agent_sandbox_core::SandboxPaths;
 use agent_sandbox_policyd::{PolicyServer, PolicyStore, PolicydArgs, PolicydError};
 use clap::Parser;
 
@@ -161,7 +162,7 @@ async fn main() -> Result<(), PolicydError> {
     let mut store = PolicyStore::new(args);
     store.enable_cgroup_freezer();
     let store = Arc::new(store);
-    store.export_policy_files(agent_sandbox_core::SandboxPaths::default())?;
+    store.export_policy_files(SandboxPaths::default())?;
 
     let host_socket = store.args().host_socket.clone();
     let sandbox_socket = store.args().sandbox_socket.clone();

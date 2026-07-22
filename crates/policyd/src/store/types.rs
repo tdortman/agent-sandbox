@@ -63,13 +63,6 @@ pub struct HttpPendingKey {
     pub context: HttpContextKey,
 }
 
-/// Exact HTTP request and context used for a short-lived verdict cache.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct HttpVerdictKey {
-    pub request: HttpRequest,
-    pub context: HttpContextKey,
-}
-
 /// HTTP scope rule and context used for session/project/global state.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HttpScopeKey {
@@ -85,21 +78,30 @@ pub struct VerdictEntry {
     pub time: Instant,
 }
 
-/// Evict the oldest entries (by `VerdictEntry.time`) from a verdict cache
-/// until the map is within the global cap.
-pub fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
-    map: &mut HashMap<K, VerdictEntry>,
-) {
-    while map.len() > MAX_VERDICT_CACHE_ENTRIES {
+pub fn evict_oldest<K, V, S>(
+    map: &mut HashMap<K, V, S>,
+    max_entries: usize,
+    timestamp: impl Fn(&V) -> Instant,
+) where
+    K: Clone + Eq + std::hash::Hash,
+    S: std::hash::BuildHasher,
+{
+    while map.len() > max_entries {
         let Some(oldest_key) = map
             .iter()
-            .min_by_key(|(_, entry)| entry.time)
-            .map(|(k, _)| k.clone())
+            .min_by_key(|(_, value)| timestamp(value))
+            .map(|(key, _)| key.clone())
         else {
             break;
         };
         map.remove(&oldest_key);
     }
+}
+
+pub fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
+    map: &mut HashMap<K, VerdictEntry>,
+) {
+    evict_oldest(map, MAX_VERDICT_CACHE_ENTRIES, |entry| entry.time);
 }
 
 pub static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -439,7 +441,7 @@ pub struct PolicyDecisionState {
     pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
     pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
     pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,
-    pub(crate) http_verdict_cache: HashMap<HttpVerdictKey, VerdictEntry>,
+    pub(crate) http_verdict_cache: HashMap<HttpPendingKey, VerdictEntry>,
     pub(crate) ui_spawn_last: HashMap<String, Instant>,
     pub(crate) session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
     pub(crate) session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,

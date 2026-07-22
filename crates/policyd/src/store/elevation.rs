@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
 use crate::{
     error::PolicydError,
-    wire::{ElevationRequest, UiSpawnContext, UiSpawnGate},
+    wire::{ElevationRequest, UiSpawnContext},
 };
 
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
@@ -290,9 +290,7 @@ impl PolicyStore {
                 .map(|u| u.uid.as_raw());
         }
         let spawn = UiSpawnContext {
-            gate: UiSpawnGate {
-                has_matching_ui: false,
-            },
+            has_matching_ui: false,
             uid: spawn_uid,
             home,
             cwd,

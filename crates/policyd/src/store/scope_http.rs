@@ -1,8 +1,8 @@
 //! Typed HTTP session/project/global scope mutations.
 
 use agent_sandbox_core::{
-    ApprovalScope, HttpMethodMatcher, HttpRequest, HttpRuleTarget, ProcessIds,
-    ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
+    ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
+    ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
 };
 
 use super::{
@@ -23,9 +23,7 @@ fn context_for_pending(pending: &PendingHttp, ids: ProcessIds) -> ResolvedReques
     )
 }
 
-fn target_methods(
-    target: &HttpRuleTarget,
-) -> Result<Vec<agent_sandbox_core::HttpMethod>, PolicydError> {
+fn target_methods(target: &HttpRuleTarget) -> Result<Vec<HttpMethod>, PolicydError> {
     match &target.method {
         HttpMethodMatcher::Exact(method) => Ok(vec![method.clone()]),
         HttpMethodMatcher::AnyOf(methods) if !methods.is_empty() => Ok(methods.clone()),
@@ -37,7 +35,7 @@ fn target_methods(
 
 fn build_once_keys(
     target: &HttpRuleTarget,
-    context: &agent_sandbox_core::HttpContextKey,
+    context: &HttpContextKey,
 ) -> Result<Vec<HttpPendingKey>, PolicydError> {
     Ok(target_methods(target)?
         .into_iter()
@@ -55,7 +53,7 @@ fn apply_http_memory_locked(
     inner: &mut super::types::PolicyDecisionState,
     target: &HttpRuleTarget,
     scope_target: &ScopeTarget,
-    context: &agent_sandbox_core::HttpContextKey,
+    context: &HttpContextKey,
     allowed: bool,
 ) -> Result<(), PolicydError> {
     match scope_target {
@@ -112,7 +110,7 @@ impl PolicyStore {
         target: HttpRuleTarget,
         scope: ApprovalScope,
         session_id: Option<String>,
-        ctx: agent_sandbox_core::ResolvedRequestContext,
+        ctx: ResolvedRequestContext,
     ) -> Result<ScopeActionReply, PolicydError> {
         self.apply_http_scope(target, scope, session_id, ctx, true)
             .await
@@ -123,7 +121,7 @@ impl PolicyStore {
         target: HttpRuleTarget,
         scope: ApprovalScope,
         session_id: Option<String>,
-        ctx: agent_sandbox_core::ResolvedRequestContext,
+        ctx: ResolvedRequestContext,
         allowed: bool,
     ) -> Result<ScopeActionReply, PolicydError> {
         self.apply_http_scope_with_comment(target, scope, session_id, ctx, allowed, None)
@@ -135,7 +133,7 @@ impl PolicyStore {
         target: HttpRuleTarget,
         scope: ApprovalScope,
         session_id: Option<String>,
-        ctx: agent_sandbox_core::ResolvedRequestContext,
+        ctx: ResolvedRequestContext,
         allowed: bool,
         comment: Option<&str>,
     ) -> Result<ScopeActionReply, PolicydError> {
@@ -288,7 +286,7 @@ mod tests {
 
     use agent_sandbox_core::{
         HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingHttpId,
-        ProcessIds, ResolvedRequestContext, SandboxPaths, load_policy,
+        ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, load_policy,
     };
 
     use super::*;
@@ -503,7 +501,7 @@ mod tests {
             .await
             .expect("global approval");
         match &reply {
-            agent_sandbox_core::ScopeActionReply::Http(value) => {
+            ScopeActionReply::Http(value) => {
                 assert_eq!(value.path.as_deref(), Some(policy_path.as_path()));
             }
             _ => panic!("expected HTTP scope reply"),

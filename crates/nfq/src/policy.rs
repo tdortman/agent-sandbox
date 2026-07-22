@@ -9,9 +9,6 @@ use agent_sandbox_core::{
 
 use crate::packet::TransportProtocol;
 
-/// Result of a policy check for a queued packet.
-pub struct PolicyResult(pub bool);
-
 struct PolicyContext {
     paths: SandboxPaths,
     ids: ProcessIds,
@@ -35,7 +32,7 @@ pub async fn check_destination(
     socket: &str,
     args: CheckDestinationArgs<'_>,
     timeout: Duration,
-) -> std::io::Result<PolicyResult> {
+) -> std::io::Result<bool> {
     let ctx = resolve_context(args.src_pid);
     let scheme = args.protocol.as_str();
     let url = format!("{scheme}://{}:{}", args.hostname, args.dst_port);
@@ -57,7 +54,7 @@ pub async fn check_destination(
         .await
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     let allowed = matches!(resp, RpcReply::Check(check) if check.allowed);
-    Ok(PolicyResult(allowed))
+    Ok(allowed)
 }
 
 /// Register one owner-identified flow with policyd before proxy forwarding.

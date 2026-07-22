@@ -1,7 +1,9 @@
 //! Policy store: ui.
 use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
 
-use agent_sandbox_core::{ResolvedRequestContext, SessionContext, UiPush, attach_ui_aliases};
+use agent_sandbox_core::{
+    ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
+};
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
 use uuid::Uuid;
 
@@ -12,27 +14,10 @@ use super::{
     },
     ui_route::{UiRoute, paths_match},
 };
-use crate::wire::{UiSpawnContext, UiSpawnGate};
-
-#[derive(Clone, Copy)]
-enum UiRoutingKind {
-    General,
-    Standalone,
-}
+use crate::wire::UiSpawnContext;
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
 const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
 type UiNotificationTarget = (u64, std::sync::Arc<Mutex<OwnedWriteHalf>>);
-
-impl UiRoutingKind {
-    const fn for_pending(pending: &Pending) -> Self {
-        match pending {
-            Pending::Filesystem(_) | Pending::Resource(_) => Self::Standalone,
-            Pending::Elevation(_) | Pending::Network(_) | Pending::Http(_) | Pending::Dbus(_) => {
-                Self::General
-            }
-        }
-    }
-}
 
 impl PolicyStore {
     fn route_for_context(ctx: &ResolvedRequestContext) -> UiRoute {
@@ -64,7 +49,6 @@ impl PolicyStore {
     fn matching_ui_session_ids(
         inner: &super::types::PolicyDecisionState,
         route: &UiRoute,
-        _kind: UiRoutingKind,
     ) -> HashSet<String> {
         inner
             .ui_clients
@@ -79,9 +63,9 @@ impl PolicyStore {
             .collect()
     }
 
-    async fn session_ids_for_route(&self, route: &UiRoute, kind: UiRoutingKind) -> HashSet<String> {
+    async fn session_ids_for_route(&self, route: &UiRoute) -> HashSet<String> {
         let inner = self.inner.lock().await;
-        Self::matching_ui_session_ids(&inner, route, kind)
+        Self::matching_ui_session_ids(&inner, route)
     }
 
     pub(crate) async fn session_ids_for_context(
@@ -89,8 +73,7 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> HashSet<String> {
         let route = Self::route_for_context(ctx);
-        self.session_ids_for_route(&route, UiRoutingKind::General)
-            .await
+        self.session_ids_for_route(&route).await
     }
 
     pub(crate) async fn standalone_session_ids_for_context(
@@ -98,8 +81,7 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> HashSet<String> {
         let route = Self::route_for_context(ctx);
-        self.session_ids_for_route(&route, UiRoutingKind::Standalone)
-            .await
+        self.session_ids_for_route(&route).await
     }
 
     pub(crate) async fn standalone_session_ids_for_filesystem_pending(
@@ -111,8 +93,7 @@ impl PolicyStore {
             pending.project_root.as_deref(),
             pending.sandbox_session_id.as_deref(),
         );
-        self.session_ids_for_route(&route, UiRoutingKind::Standalone)
-            .await
+        self.session_ids_for_route(&route).await
     }
 
     pub(crate) async fn standalone_session_ids_for_resource_pending(
@@ -124,38 +105,31 @@ impl PolicyStore {
             pending.project_root.as_deref(),
             pending.sandbox_session_id.as_deref(),
         );
-        self.session_ids_for_route(&route, UiRoutingKind::Standalone)
-            .await
+        self.session_ids_for_route(&route).await
     }
 
-    async fn has_ui_for_route(&self, route: &UiRoute, kind: UiRoutingKind) -> bool {
-        !self.session_ids_for_route(route, kind).await.is_empty()
+    async fn has_ui_for_route(&self, route: &UiRoute) -> bool {
+        !self.session_ids_for_route(route).await.is_empty()
     }
 
     pub(crate) async fn has_ui_for_context(&self, ctx: &ResolvedRequestContext) -> bool {
         let route = Self::route_for_context(ctx);
-        self.has_ui_for_route(&route, UiRoutingKind::General).await
+        self.has_ui_for_route(&route).await
     }
 
     pub(crate) async fn has_standalone_ui_for_context(&self, ctx: &ResolvedRequestContext) -> bool {
         let route = Self::route_for_context(ctx);
-        self.has_ui_for_route(&route, UiRoutingKind::Standalone)
-            .await
+        self.has_ui_for_route(&route).await
     }
 
     pub(crate) async fn has_ui_for_pending(&self, pending: &Pending) -> bool {
         let route = Self::route_for_pending(pending);
-        self.has_ui_for_route(&route, UiRoutingKind::for_pending(pending))
-            .await
+        self.has_ui_for_route(&route).await
     }
 
-    async fn ui_notification_targets_for(
-        &self,
-        route: &UiRoute,
-        kind: UiRoutingKind,
-    ) -> Vec<UiNotificationTarget> {
+    async fn ui_notification_targets_for(&self, route: &UiRoute) -> Vec<UiNotificationTarget> {
         let inner = self.inner.lock().await;
-        let session_ids = Self::matching_ui_session_ids(&inner, route, kind);
+        let session_ids = Self::matching_ui_session_ids(&inner, route);
         let mut targets: Vec<_> = inner
             .ui_clients
             .iter()
@@ -170,7 +144,7 @@ impl PolicyStore {
     pub(crate) async fn start_ui_session(
         &self,
         handle: &UiClientHandle,
-        peer: crate::server::ClientPeer,
+        peer: crate::server::peer::ClientPeer,
         context: UiSessionContext,
     ) -> String {
         let session_id = Uuid::now_v7().simple().to_string();
@@ -192,7 +166,7 @@ impl PolicyStore {
         self.end_ui_session_by_id(client_id).await;
     }
 
-    pub async fn try_acquire_connection(&self, peer: crate::server::ClientPeer) -> bool {
+    pub async fn try_acquire_connection(&self, peer: crate::server::peer::ClientPeer) -> bool {
         if peer.uid == 0 {
             return true;
         }
@@ -206,7 +180,7 @@ impl PolicyStore {
         true
     }
 
-    pub async fn release_connection(&self, peer: crate::server::ClientPeer) {
+    pub async fn release_connection(&self, peer: crate::server::peer::ClientPeer) {
         if peer.uid == 0 {
             return;
         }
@@ -267,9 +241,7 @@ impl PolicyStore {
                     .flatten()
                     .map(|u| u.uid.as_raw());
                 let spawn = UiSpawnContext {
-                    gate: UiSpawnGate {
-                        has_matching_ui: false,
-                    },
+                    has_matching_ui: false,
                     uid: spawn_uid,
                     home: p.home(),
                     cwd: p.cwd(),
@@ -319,7 +291,7 @@ impl PolicyStore {
                 host: Some(net.host.clone()),
                 port: Some(net.port),
                 scheme: Some(net.scheme.clone()),
-                url: attach_ui_aliases(Some(net.url.clone()), &net.aliases),
+                url: attach_check_aliases(Some(net.url.clone()), &net.aliases),
                 cwd: net.cwd.clone(),
                 home: net.home.clone(),
                 project_root: net.project_root.clone(),
@@ -366,8 +338,7 @@ impl PolicyStore {
             },
         };
         let route = Self::route_for_pending(pending);
-        self.notify_ui(&route, &push, UiRoutingKind::for_pending(pending))
-            .await
+        self.notify_ui(&route, &push).await
     }
 
     pub fn new_client_handle(writer: std::sync::Arc<Mutex<OwnedWriteHalf>>) -> UiClientHandle {
@@ -390,8 +361,8 @@ impl PolicyStore {
             })
     }
 
-    async fn notify_ui(&self, route: &UiRoute, payload: &UiPush, kind: UiRoutingKind) -> bool {
-        let targets = self.ui_notification_targets_for(route, kind).await;
+    async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) -> bool {
+        let targets = self.ui_notification_targets_for(route).await;
         if targets.is_empty() {
             tracing::warn!(
                 kind = ?payload,
@@ -404,10 +375,7 @@ impl PolicyStore {
 
     pub(crate) async fn notify_general_ui(&self, ctx: &ResolvedRequestContext, payload: &UiPush) {
         let route = Self::route_for_context(ctx);
-        if !self
-            .notify_ui(&route, payload, UiRoutingKind::General)
-            .await
-        {
+        if !self.notify_ui(&route, payload).await {
             self.reroute_orphaned_pending().await;
         }
     }
@@ -420,16 +388,13 @@ impl PolicyStore {
         payload: &UiPush,
     ) {
         let route = Self::route_for_context(ctx);
-        if !self
-            .notify_ui(&route, payload, UiRoutingKind::Standalone)
-            .await
-        {
+        if !self.notify_ui(&route, payload).await {
             self.reroute_orphaned_pending().await;
         }
     }
 
     async fn send_to_targets(&self, payload: &UiPush, targets: &[UiNotificationTarget]) -> bool {
-        let line = agent_sandbox_core::RpcMessage::UiPush(payload.clone()).to_string();
+        let line = RpcMessage::UiPush(payload.clone()).to_string();
         for (id, writer) in targets {
             let mut w = writer.lock().await;
             if w.write_all(line.as_bytes()).await.is_ok() {

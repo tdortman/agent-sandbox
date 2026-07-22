@@ -18,7 +18,7 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
     PendingFilesystem, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext, UiSpawnGate};
+use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext};
 
 /// Timeout for waiting for the fsmon `ready` line.
 const FSMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -268,9 +268,7 @@ impl PolicyStore {
                         .filter(|uid| *uid > 0);
                 }
                 let spawn = UiSpawnContext {
-                    gate: UiSpawnGate {
-                        has_matching_ui: false,
-                    },
+                    has_matching_ui: false,
                     uid: spawn_uid,
                     home: home.as_deref(),
                     cwd: cwd.as_deref(),
@@ -521,8 +519,8 @@ mod tests {
     };
 
     use agent_sandbox_core::{
-        ApprovalScope, FileAccess, FilesystemRule, ProcessIds, ResolvedRequestContext,
-        SandboxPaths, VerdictSource,
+        ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
+        SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
 
     use crate::{
@@ -668,27 +666,20 @@ mod tests {
         std::fs::write(&allowed_path, "ok").expect("write allowed");
         std::fs::write(&denied_path, "no").expect("write denied");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                allowed_path.clone(),
-                agent_sandbox_core::FileAccess::ReadWrite,
-                "allow rename/link source",
-            ));
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                denied_path.clone(),
-                agent_sandbox_core::FileAccess::All,
-                "deny destination",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            allowed_path.clone(),
+            FileAccess::ReadWrite,
+            "allow rename/link source",
+        ));
+        policy.filesystem.deny.push(FilesystemRule::new(
+            denied_path.clone(),
+            FileAccess::All,
+            "deny destination",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = PolicyStore::new(PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -750,27 +741,20 @@ mod tests {
         let link_path = project_root.join("link.txt");
         std::fs::write(&target_path, "target").expect("write target");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .allow
-            .push(agent_sandbox_core::FilesystemRule::new(
-                target_path.clone(),
-                FileAccess::Read,
-                "allow symlink target read",
-            ));
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                link_path.clone(),
-                FileAccess::All,
-                "deny symlink linkpath",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.allow.push(FilesystemRule::new(
+            target_path.clone(),
+            FileAccess::Read,
+            "allow symlink target read",
+        ));
+        policy.filesystem.deny.push(FilesystemRule::new(
+            link_path.clone(),
+            FileAccess::All,
+            "deny symlink linkpath",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = PolicyStore::new(PolicydArgs {
             host_socket: dir.path().join("sock"),
@@ -894,19 +878,15 @@ mod tests {
         let license_path = project_root.join("LICENSE");
         std::fs::write(&license_path, "license").expect("write license");
 
-        let policy_path = agent_sandbox_core::trusted_project_policy_path(&project_root)
-            .expect("trusted project policy path");
-        let mut policy = agent_sandbox_core::Policy::default();
-        policy
-            .filesystem
-            .deny
-            .push(agent_sandbox_core::FilesystemRule::new(
-                license_path.clone(),
-                FileAccess::All,
-                "deny license",
-            ));
-        agent_sandbox_core::atomic_write_policy(&policy_path, &policy, None, None, None)
-            .expect("write policy");
+        let policy_path =
+            trusted_project_policy_path(&project_root).expect("trusted project policy path");
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            license_path.clone(),
+            FileAccess::All,
+            "deny license",
+        ));
+        atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = PolicyStore::new(PolicydArgs {
             host_socket: dir.path().join("sock"),

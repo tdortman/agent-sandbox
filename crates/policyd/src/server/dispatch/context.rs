@@ -374,7 +374,7 @@ mod tests {
 
     use super::{ResolvedRpcRequest, plan};
     use crate::{
-        server::{ClientPeer, dispatch::SocketRole},
+        server::{dispatch::SocketRole, peer::ClientPeer},
         store::{PolicyStore, PolicydArgs},
     };
 

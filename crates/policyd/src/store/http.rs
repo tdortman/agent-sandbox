@@ -8,13 +8,10 @@ use agent_sandbox_core::{
 };
 
 use super::types::{
-    HttpPendingKey, HttpVerdictKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING,
-    Pending, PendingHttp, PolicyStore, enforce_verdict_cache_limit,
+    HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
+    PendingHttp, PolicyStore, enforce_verdict_cache_limit,
 };
-use crate::{
-    error::PolicydError,
-    wire::{UiSpawnContext, UiSpawnGate},
-};
+use crate::{error::PolicydError, wire::UiSpawnContext};
 
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -119,7 +116,7 @@ impl PolicyStore {
                     ApprovalScope::Session,
                 )));
             }
-            if let Some(entry) = inner.http_verdict_cache.get(&HttpVerdictKey {
+            if let Some(entry) = inner.http_verdict_cache.get(&HttpPendingKey {
                 request: request.clone(),
                 context: key.context.clone(),
             }) && entry.time.elapsed() < HTTP_VERDICT_CACHE_TTL
@@ -202,9 +199,7 @@ impl PolicyStore {
             .await;
             if !self.has_ui_for_context(&ctx).await {
                 let spawn = UiSpawnContext {
-                    gate: UiSpawnGate {
-                        has_matching_ui: false,
-                    },
+                    has_matching_ui: false,
                     uid: ctx.ids.uid(),
                     home: pending.context.home.as_deref(),
                     cwd: pending.context.cwd.as_deref(),
@@ -457,7 +452,7 @@ impl PolicyStore {
         }
         if !once {
             inner.http_verdict_cache.insert(
-                HttpVerdictKey {
+                HttpPendingKey {
                     request: pending.request,
                     context: pending.context,
                 },

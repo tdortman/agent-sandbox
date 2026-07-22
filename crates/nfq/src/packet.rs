@@ -239,7 +239,7 @@ fn parse_tcp(
     })
 }
 
-fn parse_udp(
+const fn parse_udp(
     payload: &[u8],
     ip_hdr_len: usize,
     src_ip: IpAddr,

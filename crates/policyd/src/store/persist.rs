@@ -6,10 +6,10 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, HttpRule, HttpRuleTarget,
-    NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey,
-    SudoRule, atomic_write_policy, contract_home_path, load_policy, normalize_host,
-    trusted_project_policy_path,
+    DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, HttpMethodMatcher,
+    HttpRule, HttpRuleTarget, NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind,
+    ResourceRule, ResourceRuleKey, SudoRule, atomic_write_policy, contract_home_path, load_policy,
+    normalize_host, trusted_project_policy_path,
 };
 
 use super::types::PolicyStore;
@@ -155,11 +155,11 @@ enum HttpMethods {
 impl HttpMethods {
     fn from_target(target: &HttpRuleTarget) -> Self {
         match &target.method {
-            agent_sandbox_core::HttpMethodMatcher::All => Self::All,
-            agent_sandbox_core::HttpMethodMatcher::Exact(method) => {
+            HttpMethodMatcher::All => Self::All,
+            HttpMethodMatcher::Exact(method) => {
                 Self::Some(BTreeSet::from([method.as_str().to_owned()]))
             }
-            agent_sandbox_core::HttpMethodMatcher::AnyOf(methods) => Self::Some(
+            HttpMethodMatcher::AnyOf(methods) => Self::Some(
                 methods
                     .iter()
                     .map(|method| method.as_str().to_owned())
@@ -570,14 +570,14 @@ mod tests {
             &mut rules,
             ResourceKind::UnixSocket,
             path,
-            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            ResourceAccess::Socket(SocketAccess::Connect),
             "connect",
         );
         upsert_resource_rule(
             &mut rules,
             ResourceKind::UnixSocket,
             path,
-            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Send),
+            ResourceAccess::Socket(SocketAccess::Send),
             "send",
         );
 

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use agent_sandbox_core::{DbusCheckReply, ResourceAccess, ResourceKind, Verdict, VerdictSource};
+use agent_sandbox_core::{
+    ApprovalScope, DbusCheckReply, ResourceAccess, ResourceKind, Verdict, VerdictSource,
+};
 
 use super::PolicyStore;
 use crate::wire::DbusCheckRequest;
@@ -22,9 +24,7 @@ impl PolicyStore {
         }
         if self.session_dbus_allowed(&target, &ctx).await {
             return DbusCheckReply::from_verdict(
-                Verdict::allowed(VerdictSource::Scope(
-                    agent_sandbox_core::ApprovalScope::Session,
-                )),
+                Verdict::allowed(VerdictSource::Scope(ApprovalScope::Session)),
                 target,
             );
         }

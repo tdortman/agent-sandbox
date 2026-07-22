@@ -5,8 +5,9 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    CheckReply, NetworkRuleKey, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
-    VerdictSource, attach_ui_aliases, normalize_host,
+    CheckReply, NetworkRuleKey, ProcessIds, ProxyRequestId, ProxySessionToken,
+    ResolvedRequestContext, SandboxPaths, UiPush, VerdictSource, attach_check_aliases,
+    normalize_host,
 };
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
@@ -15,7 +16,7 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
     PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::wire::{NetworkCheckRequest, UiSpawnContext, UiSpawnGate};
+use crate::wire::{NetworkCheckRequest, UiSpawnContext};
 
 /// How long a network verdict is cached after the first policy check for the
 /// same hostname plus port. This deduplicates prompts when curl tries multiple
@@ -162,10 +163,7 @@ impl PolicyStore {
         &self,
         req: NetworkCheckRequest,
         aliases: Vec<String>,
-        waiter: Option<(
-            agent_sandbox_core::ProxySessionToken,
-            agent_sandbox_core::ProxyRequestId,
-        )>,
+        waiter: Option<(ProxySessionToken, ProxyRequestId)>,
         cancel: Option<oneshot::Receiver<()>>,
     ) -> CheckReply {
         let NetworkCheckRequest {
@@ -228,7 +226,7 @@ impl PolicyStore {
                 host: Some(policy_host.clone()),
                 port: Some(port),
                 scheme: Some(scheme.clone()),
-                url: attach_ui_aliases(Some(url.clone()), &aliases),
+                url: attach_check_aliases(Some(url.clone()), &aliases),
                 cwd: cwd.clone(),
                 home: home.clone(),
                 project_root: project_root.clone(),
@@ -246,9 +244,7 @@ impl PolicyStore {
                             .map(|u| u.uid.as_raw());
                 }
                 let spawn = UiSpawnContext {
-                    gate: UiSpawnGate {
-                        has_matching_ui: false,
-                    },
+                    has_matching_ui: false,
                     uid: spawn_uid,
                     home: home.as_deref(),
                     cwd: cwd.as_deref(),
@@ -301,10 +297,7 @@ impl PolicyStore {
         scheme: &str,
         url: &str,
         aliases: &[String],
-        waiter: Option<&(
-            agent_sandbox_core::ProxySessionToken,
-            agent_sandbox_core::ProxyRequestId,
-        )>,
+        waiter: Option<&(ProxySessionToken, ProxyRequestId)>,
     ) -> Result<PendingNetResult, CheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
@@ -380,10 +373,7 @@ impl PolicyStore {
     fn remove_network_waiter_locked(
         inner: &mut super::types::PolicyDecisionState,
         pending_id: &str,
-        proxy: Option<&(
-            agent_sandbox_core::ProxySessionToken,
-            agent_sandbox_core::ProxyRequestId,
-        )>,
+        proxy: Option<&(ProxySessionToken, ProxyRequestId)>,
     ) -> Vec<oneshot::Sender<CheckReply>> {
         let Some(mut waiters) = inner.network_futures.remove(pending_id) else {
             return Vec::new();
@@ -411,10 +401,7 @@ impl PolicyStore {
     async fn cancel_network_wait(
         &self,
         pending_id: &str,
-        proxy: Option<&(
-            agent_sandbox_core::ProxySessionToken,
-            agent_sandbox_core::ProxyRequestId,
-        )>,
+        proxy: Option<&(ProxySessionToken, ProxyRequestId)>,
     ) -> Vec<oneshot::Sender<CheckReply>> {
         let mut inner = self.inner.lock().await;
         let canceled = Self::remove_network_waiter_locked(&mut inner, pending_id, proxy);
@@ -425,10 +412,7 @@ impl PolicyStore {
     async fn expire_network_wait(
         &self,
         target: &NetworkWaitTarget<'_>,
-        proxy: Option<&(
-            agent_sandbox_core::ProxySessionToken,
-            agent_sandbox_core::ProxyRequestId,
-        )>,
+        proxy: Option<&(ProxySessionToken, ProxyRequestId)>,
     ) -> (Vec<oneshot::Sender<CheckReply>>, bool) {
         let mut inner = self.inner.lock().await;
         let canceled = Self::remove_network_waiter_locked(&mut inner, target.pending_id, proxy);
@@ -456,10 +440,7 @@ impl PolicyStore {
         target: NetworkWaitTarget<'_>,
         rx: oneshot::Receiver<CheckReply>,
         cancel: Option<oneshot::Receiver<()>>,
-        proxy: Option<(
-            agent_sandbox_core::ProxySessionToken,
-            agent_sandbox_core::ProxyRequestId,
-        )>,
+        proxy: Option<(ProxySessionToken, ProxyRequestId)>,
     ) -> CheckReply {
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
         let ui_deadline = Instant::now() + ui_wait;
@@ -553,7 +534,7 @@ impl PolicyStore {
 mod tests {
     use std::path::Path;
 
-    use agent_sandbox_core::VerdictSource;
+    use agent_sandbox_core::{ApprovalScope, NetworkRuleKey, VerdictSource};
 
     use super::{NetworkRequestIdentity, PendingNetwork};
 
@@ -669,17 +650,14 @@ mod tests {
                 .session_allow
                 .entry("ui1".into())
                 .or_default()
-                .insert(agent_sandbox_core::NetworkRuleKey::new("example.com", 443));
+                .insert(NetworkRuleKey::new("example.com", 443));
         }
 
         let first = store
             .request_network_approval(unique_request("example.com", 443))
             .await;
         assert!(first.allowed, "session approval should allow first request");
-        assert_eq!(
-            first.source,
-            VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
-        );
+        assert_eq!(first.source, VerdictSource::Scope(ApprovalScope::Session));
         assert!(
             store.pending_summaries().await.is_empty(),
             "session approval must not create a pending prompt"
@@ -692,10 +670,7 @@ mod tests {
             second.allowed,
             "session approval should allow second request"
         );
-        assert_eq!(
-            second.source,
-            VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Session)
-        );
+        assert_eq!(second.source, VerdictSource::Scope(ApprovalScope::Session));
         assert!(
             store.pending_summaries().await.is_empty(),
             "second session-approved request must not create a pending prompt"
@@ -709,17 +684,14 @@ mod tests {
             let mut inner = store.inner.lock().await;
             inner
                 .once_allow
-                .insert(agent_sandbox_core::NetworkRuleKey::new("example.com", 443));
+                .insert(NetworkRuleKey::new("example.com", 443));
         }
 
         let first = store
             .request_network_approval(unique_request("example.com", 443))
             .await;
         assert!(first.allowed, "Once grant should allow the first request");
-        assert_eq!(
-            first.source,
-            VerdictSource::Scope(agent_sandbox_core::ApprovalScope::Once)
-        );
+        assert_eq!(first.source, VerdictSource::Scope(ApprovalScope::Once));
         assert!(
             store.inner.lock().await.once_allow.is_empty(),
             "Once grant must be consumed by the pre-prompt check"

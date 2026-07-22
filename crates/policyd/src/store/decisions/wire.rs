@@ -157,7 +157,7 @@ impl PolicyStore {
     pub(crate) async fn take_pending_decision(
         &self,
         decision: PendingDecision,
-    ) -> Result<TakenPendingDecision, RpcReply> {
+    ) -> Result<TakenPendingDecision, Box<RpcReply>> {
         let PendingDecision {
             pending_id,
             scope,
@@ -172,7 +172,7 @@ impl PolicyStore {
         };
         let pending = pending.ok_or_else(|| {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
-            err
+            Box::new(err)
         })?;
         if !self
             .approval_client_authorized(client_id, pending.sandbox_session_id(), approver_uid)
@@ -181,7 +181,9 @@ impl PolicyStore {
             let mut inner = self.inner.lock().await;
             inner.restore_pending(pending);
             drop(inner);
-            return Err(crate::error::PolicydError::UnauthorizedApprovalClient.into());
+            return Err(Box::new(
+                crate::error::PolicydError::UnauthorizedApprovalClient.into(),
+            ));
         }
         Ok(TakenPendingDecision {
             pending,

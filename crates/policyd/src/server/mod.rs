@@ -2,13 +2,12 @@
 
 mod client;
 mod dispatch;
-mod peer;
+pub(crate) mod peer;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{path::Path, sync::Arc};
 
-pub use peer::ClientPeer;
 use tokio::net::UnixListener;
 
 use crate::store::PolicyStore;

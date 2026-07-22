@@ -96,13 +96,8 @@ pub struct ResourceScopeOp {
     pub wire: ScopeWire,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct UiSpawnGate {
-    pub has_matching_ui: bool,
-}
-
 pub struct UiSpawnContext<'a> {
-    pub gate: UiSpawnGate,
+    pub has_matching_ui: bool,
     pub sandbox_session_id: Option<&'a str>,
     pub uid: Option<u32>,
     pub home: Option<&'a Path>,

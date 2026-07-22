@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agent_sandbox_core::{PendingSummary, ResolvedRequestContext, StatusReply};
+use agent_sandbox_core::{PendingSummary, Policy, ResolvedRequestContext, StatusReply};
 
 use super::types::{Pending, PolicyStore};
 
@@ -17,17 +17,14 @@ impl PolicyStore {
         }
     }
 
-    pub(crate) async fn merged_for_async(
-        self: &Arc<Self>,
-        ctx: &ResolvedRequestContext,
-    ) -> agent_sandbox_core::Policy {
+    pub(crate) async fn merged_for_async(self: &Arc<Self>, ctx: &ResolvedRequestContext) -> Policy {
         let store = Arc::clone(self);
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || store.merged_for(&ctx))
             .await
             .unwrap_or_else(|err| {
                 tracing::error!(error = %err, "merged_for worker panicked");
-                agent_sandbox_core::Policy::default()
+                Policy::default()
             })
     }
 

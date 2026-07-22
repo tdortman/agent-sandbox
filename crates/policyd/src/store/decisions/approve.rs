@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
     NetworkRuleKey, ResourceAccess, ResourceKind, ResourceRule, RpcReply, ScopeActionReply,
-    SudoRule, VerdictSource, host_pattern_matches,
+    SocketAccess, SudoRule, VerdictSource, host_pattern_matches,
 };
 
 use super::{
@@ -32,7 +32,7 @@ impl PolicyStore {
     ) -> RpcReply {
         let decision = match self.take_pending_decision(decision).await {
             Ok(value) => value,
-            Err(err) => return err,
+            Err(err) => return *err,
         };
         match decision.pending {
             Pending::Network(net) => {
@@ -711,7 +711,7 @@ impl PolicyStore {
         if ResourceRule::new(
             pending.kind,
             path.clone(),
-            ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            ResourceAccess::Socket(SocketAccess::Connect),
             "",
         )
         .path_matches(pending_path.as_path(), project_root)
@@ -783,7 +783,7 @@ mod tests {
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
         PendingSummary, ProcessIds, ResourceAccess, ResourceKind, ResourceRuleKey, RpcReply,
-        SandboxPaths, load_policy,
+        SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
     };
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -1026,7 +1026,7 @@ mod tests {
             created_at: 0.0,
             kind: ResourceKind::UnixSocket,
             path: "/home/user/repo/.sock".into(),
-            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            access: ResourceAccess::Socket(SocketAccess::Connect),
             cwd: None,
             home: Some("/home/user".into()),
             project_root: Some("/home/user/repo".into()),
@@ -1223,7 +1223,7 @@ mod tests {
             created_at: 0.0,
             kind: ResourceKind::UnixSocket,
             path: "/dev/fd/3".into(),
-            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            access: ResourceAccess::Socket(SocketAccess::Connect),
             cwd: None,
             home: Some(home.clone()),
             project_root: None,
@@ -1265,9 +1265,9 @@ mod tests {
         let found = policy.resources.allow.iter().any(|rule| {
             rule.kind == ResourceKind::UnixSocket
                 && rule.path == Path::new("/dev/fd/*")
-                && rule.access.covers(ResourceAccess::Socket(
-                    agent_sandbox_core::SocketAccess::Connect,
-                ))
+                && rule
+                    .access
+                    .covers(ResourceAccess::Socket(SocketAccess::Connect))
         });
         assert!(
             found,
@@ -1370,7 +1370,7 @@ mod tests {
 
         assert!(matches!(
             reply,
-            RpcReply::ScopeAction(agent_sandbox_core::ScopeActionReply::Dbus(_))
+            RpcReply::ScopeAction(ScopeActionReply::Dbus(_))
         ));
         let inner = store.inner.lock().await;
         assert!(inner.resource_verdict_cache.contains_key(&ResourceRuleKey {

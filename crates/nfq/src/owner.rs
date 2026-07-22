@@ -2,7 +2,9 @@
 
 use std::net::IpAddr;
 
-use agent_sandbox_core::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot};
+use agent_sandbox_core::{
+    OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
+};
 
 use crate::packet::TransportProtocol;
 
@@ -17,7 +19,7 @@ pub fn owner_snapshot(
     protocol: TransportProtocol,
     src_ip: IpAddr,
     src_port: u16,
-) -> Option<agent_sandbox_core::OwnerSnapshot> {
+) -> Option<OwnerSnapshot> {
     let protocol = match protocol {
         TransportProtocol::Tcp => SocketProtocol::Tcp,
         TransportProtocol::Udp => SocketProtocol::Udp,
@@ -46,7 +48,7 @@ mod tests {
 
         let resolved_pid =
             owner_snapshot(TransportProtocol::Tcp, client_addr.ip(), client_addr.port())
-                .map(agent_sandbox_core::OwnerSnapshot::pid_value);
+                .map(OwnerSnapshot::pid_value);
 
         assert_eq!(resolved_pid, Some(std::process::id()));
     }

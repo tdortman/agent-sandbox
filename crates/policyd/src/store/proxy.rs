@@ -367,7 +367,7 @@ impl PolicyStore {
                 state.last_check = Instant::now();
             }
 
-            let pending_ids = inner.http_futures.keys().cloned().collect::<Vec<_>>();
+            let pending_ids = inner.http_futures.keys().copied().collect::<Vec<_>>();
             let mut canceled = Vec::new();
             for pending_id in pending_ids {
                 let Some(waiters) = inner.http_futures.remove(&pending_id) else {

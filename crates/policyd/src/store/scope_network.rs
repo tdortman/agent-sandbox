@@ -47,7 +47,7 @@ impl PolicyStore {
             .await
         {
             Ok(target) => target,
-            Err(reply) => return reply,
+            Err(reply) => return *reply,
         };
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         match target {
@@ -182,7 +182,7 @@ impl PolicyStore {
         session_id: Option<&str>,
         home: Option<&Path>,
         project_root: Option<&Path>,
-    ) -> Result<ScopeTarget, RpcReply> {
+    ) -> Result<ScopeTarget, Box<RpcReply>> {
         let active = self.active_session_ids().await;
         let home_str = home.and_then(Path::to_str);
         let project_root_str = project_root.and_then(Path::to_str);
@@ -193,7 +193,7 @@ impl PolicyStore {
             project_root: project_root_str,
             active_session_ids: &active,
         };
-        ScopeTarget::resolve(&ctx).map_err(RpcReply::from)
+        ScopeTarget::resolve(&ctx).map_err(|err| Box::new(RpcReply::from(err)))
     }
 }
 

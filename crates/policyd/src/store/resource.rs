@@ -5,8 +5,8 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    DbusTarget, ResourceAccess, ResourceCheckReply, ResourceKind, ResourceRuleKey, UiPush,
-    VerdictSource,
+    DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
+    ResourceRuleKey, UiPush, VerdictSource,
 };
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
     VerdictEntry, enforce_verdict_cache_limit,
 };
-use crate::wire::{ResourceCheckRequest, UiSpawnContext, UiSpawnGate};
+use crate::wire::{ResourceCheckRequest, UiSpawnContext};
 
 struct PendingResResult {
     id: String,
@@ -137,9 +137,7 @@ impl PolicyStore {
                             .map(|u| u.uid.as_raw());
                 }
                 let spawn = UiSpawnContext {
-                    gate: UiSpawnGate {
-                        has_matching_ui: false,
-                    },
+                    has_matching_ui: false,
                     uid: spawn_uid,
                     home: home.as_deref(),
                     cwd: cwd.as_deref(),
@@ -280,7 +278,7 @@ impl PolicyStore {
 
     async fn await_resource_verdict(
         &self,
-        ctx: &agent_sandbox_core::ResolvedRequestContext,
+        ctx: &ResolvedRequestContext,
         pending_id: &str,
         kind: ResourceKind,
         path: PathBuf,
@@ -382,7 +380,7 @@ mod tests {
 
     use agent_sandbox_core::{
         ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
-        VerdictSource,
+        SocketAccess, VerdictSource,
     };
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
@@ -413,7 +411,7 @@ mod tests {
         ResourceCheckRequest {
             kind: ResourceKind::UnixSocket,
             path: PathBuf::from(path),
-            access: ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+            access: ResourceAccess::Socket(SocketAccess::Connect),
             ctx: ResolvedRequestContext {
                 paths: SandboxPaths::from_wire(
                     Some("/repo".into()),
@@ -481,7 +479,7 @@ mod tests {
                 &pending_id,
                 ResourceKind::UnixSocket,
                 PathBuf::from("/repo/fast.sock"),
-                ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+                ResourceAccess::Socket(SocketAccess::Connect),
                 true,
                 VerdictSource::policy_with_comment("test"),
             )
@@ -527,7 +525,7 @@ mod tests {
                 &pending_id,
                 ResourceKind::UnixSocket,
                 PathBuf::from("/repo/slow.sock"),
-                ResourceAccess::Socket(agent_sandbox_core::SocketAccess::Connect),
+                ResourceAccess::Socket(SocketAccess::Connect),
                 true,
                 VerdictSource::policy_with_comment("cli"),
             )

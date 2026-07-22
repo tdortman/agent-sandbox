@@ -195,8 +195,8 @@ mod tests {
     use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
-        DeviceAccess, NetworkRuleKey, Policy, ProcessIds, ResourceRule, ResourceRuleKey,
-        SandboxPaths, atomic_write_policy,
+        DbusMessageKind, DbusRule, DbusTarget, DeviceAccess, NetworkRule, NetworkRuleKey, Policy,
+        ProcessIds, ResourceRule, ResourceRuleKey, SandboxPaths, atomic_write_policy,
     };
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -310,15 +310,11 @@ mod tests {
         std::fs::create_dir_all(&project_root).expect("create project root");
 
         let mut policy = Policy::default();
-        policy
-            .network
-            .direct
-            .allow
-            .push(agent_sandbox_core::NetworkRule::new(
-                "example.com",
-                443,
-                "trusted policy file",
-            ));
+        policy.network.direct.allow.push(NetworkRule::new(
+            "example.com",
+            443,
+            "trusted policy file",
+        ));
         atomic_write_policy(&policy_dir.join("policy.json"), &policy, None, None, None)
             .expect("write policy");
 
@@ -358,7 +354,7 @@ mod tests {
         policy.resources.allow.push(ResourceRule::new(
             ResourceKind::Device,
             device_path.clone(),
-            ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
+            ResourceAccess::Device(DeviceAccess::Read),
             "policy allow",
         ));
         atomic_write_policy(&policy_dir.join("policy.json"), &policy, None, None, None)
@@ -380,7 +376,7 @@ mod tests {
                 HashSet::from([ResourceRuleKey::new(
                     ResourceKind::Device,
                     device_path.clone(),
-                    ResourceAccess::Device(agent_sandbox_core::DeviceAccess::Read),
+                    ResourceAccess::Device(DeviceAccess::Read),
                 )]),
             );
         }
@@ -416,13 +412,13 @@ mod tests {
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         std::fs::create_dir_all(&project_root).expect("create project root");
         let mut policy = Policy::default();
-        policy.dbus.allow.push(agent_sandbox_core::DbusRule::new(
-            agent_sandbox_core::DbusTarget::session(
+        policy.dbus.allow.push(DbusRule::new(
+            DbusTarget::session(
                 "org.example.Service",
                 "/org/example/Object",
                 "org.example.Interface",
                 "Read",
-                agent_sandbox_core::DbusMessageKind::MethodCall,
+                DbusMessageKind::MethodCall,
                 "s",
                 Vec::new(),
             ),
@@ -438,12 +434,12 @@ mod tests {
             ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
-        let target = agent_sandbox_core::DbusTarget::session(
+        let target = DbusTarget::session(
             "org.example.Service",
             "/org/example/Object",
             "org.example.Interface",
             "Read",
-            agent_sandbox_core::DbusMessageKind::MethodCall,
+            DbusMessageKind::MethodCall,
             "s",
             Vec::new(),
         );
