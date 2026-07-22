@@ -9,45 +9,33 @@ use super::{
     PolicyStore,
     access::{filesystem_rules_match_allow, is_sandbox_infrastructure_path},
 };
-pub struct PolicyEvaluation<'a> {
-    store: &'a PolicyStore,
-    ctx: ResolvedRequestContext,
-}
 
 impl PolicyStore {
-    pub(crate) fn policy_evaluation(&self, ctx: &ResolvedRequestContext) -> PolicyEvaluation<'_> {
-        PolicyEvaluation {
-            store: self,
-            ctx: ctx.clone(),
-        }
-    }
-}
-
-impl PolicyEvaluation<'_> {
     pub(crate) async fn network_verdict(
         &self,
         host: &str,
         port: u16,
+        ctx: &ResolvedRequestContext,
         consume_once: bool,
     ) -> Option<Verdict> {
         let host = normalize_host(host);
-        if self.store.policy_denied(&host, port, &self.ctx) {
+        if self.policy_denied(&host, port, ctx) {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
-        if self.store.session_denied(&host, port, &self.ctx).await {
+        if self.session_denied(&host, port, ctx).await {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
-        if self.store.once_allowed(&host, port, consume_once).await {
+        if self.once_allowed(&host, port, consume_once).await {
             return Some(Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)));
         }
-        if self.store.session_allowed(&host, port, &self.ctx).await {
+        if self.session_allowed(&host, port, ctx).await {
             return Some(Verdict::allowed(VerdictSource::Scope(
                 ApprovalScope::Session,
             )));
         }
-        let merged = self.store.merged_for(&self.ctx);
+        let merged = self.merged_for(ctx);
         for rule in &merged.network.direct.allow {
-            if PolicyStore::host_matches(&rule.host, &host) && rule.port == port {
+            if Self::host_matches(&rule.host, &host) && rule.port == port {
                 if let Some(comment) = &rule.comment
                     && !comment.is_empty()
                 {
@@ -61,8 +49,14 @@ impl PolicyEvaluation<'_> {
         None
     }
 
-    pub(crate) async fn network_allowed(&self, host: &str, port: u16, consume_once: bool) -> bool {
-        self.network_verdict(host, port, consume_once)
+    pub(crate) async fn network_allowed(
+        &self,
+        host: &str,
+        port: u16,
+        ctx: &ResolvedRequestContext,
+        consume_once: bool,
+    ) -> bool {
+        self.network_verdict(host, port, ctx, consume_once)
             .await
             .is_some_and(|verdict| verdict.allowed)
     }
@@ -71,14 +65,15 @@ impl PolicyEvaluation<'_> {
         &self,
         path: &Path,
         access: FileAccess,
+        ctx: &ResolvedRequestContext,
     ) -> Option<Verdict> {
         let access = normalize_directory_traverse_access(path, access);
         if is_sandbox_infrastructure_path(path) {
             return Some(Verdict::allowed(VerdictSource::Infrastructure));
         }
-        let merged = self.store.merged_for_worker(&self.ctx);
-        let project_root = self.ctx.paths.project_root();
-        let home = self.ctx.paths.home();
+        let merged = self.merged_for_worker(ctx);
+        let project_root = ctx.paths.project_root();
+        let home = ctx.paths.home();
         let path_denied = merged
             .filesystem
             .deny
@@ -87,44 +82,27 @@ impl PolicyEvaluation<'_> {
         if path_denied {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
-        let fingerprint = PolicyStore::deny_fingerprint(&merged, home, project_root);
-        if self
-            .store
-            .deny_inode_denied(path, access, &fingerprint)
-            .await
-        {
+        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+        if self.deny_inode_denied(path, access, &fingerprint).await {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
-        if self
-            .store
-            .session_filesystem_denied(path, access, &self.ctx)
-            .await
-        {
+        if self.session_filesystem_denied(path, access, ctx).await {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
+        if self.session_filesystem_allowed(path, access, ctx).await {
+            return Some(Verdict::allowed(VerdictSource::Scope(
+                ApprovalScope::Session,
+            )));
+        }
         if self
-            .store
-            .session_filesystem_allowed(path, access, &self.ctx)
+            .session_filesystem_allowed_by_inode(path, access, ctx)
             .await
         {
             return Some(Verdict::allowed(VerdictSource::Scope(
                 ApprovalScope::Session,
             )));
         }
-        if self
-            .store
-            .session_filesystem_allowed_by_inode(path, access, &self.ctx)
-            .await
-        {
-            return Some(Verdict::allowed(VerdictSource::Scope(
-                ApprovalScope::Session,
-            )));
-        }
-        if self
-            .store
-            .static_filesystem_allowed(path, access, &self.ctx)
-            .await
-        {
+        if self.static_filesystem_allowed(path, access, ctx).await {
             return Some(Verdict::allowed(VerdictSource::Static));
         }
         if filesystem_rules_match_allow(&merged.filesystem.allow, path, access, project_root) {
@@ -138,41 +116,31 @@ impl PolicyEvaluation<'_> {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
+        ctx: &ResolvedRequestContext,
     ) -> Option<Verdict> {
-        if self
-            .store
-            .resource_policy_denied(kind, path, access, &self.ctx)
-            .await
-        {
+        if self.resource_policy_denied(kind, path, access, ctx).await {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
-        if self
-            .store
-            .session_resource_denied(kind, path, access, &self.ctx)
-            .await
-        {
+        if self.session_resource_denied(kind, path, access, ctx).await {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
-        if self
-            .store
-            .session_resource_allowed(kind, path, access, &self.ctx)
-            .await
-        {
+        if self.session_resource_allowed(kind, path, access, ctx).await {
             return Some(Verdict::allowed(VerdictSource::Scope(
                 ApprovalScope::Session,
             )));
         }
-        if self
-            .store
-            .resource_policy_allowed(kind, path, access, &self.ctx)
-        {
+        if self.resource_policy_allowed(kind, path, access, ctx) {
             return Some(Verdict::allowed(VerdictSource::policy()));
         }
         None
     }
 
-    pub(crate) fn dbus_verdict(&self, target: &DbusTarget) -> Option<Verdict> {
-        let merged = self.store.merged_for(&self.ctx);
+    pub(crate) fn dbus_verdict(
+        &self,
+        target: &DbusTarget,
+        ctx: &ResolvedRequestContext,
+    ) -> Option<Verdict> {
+        let merged = self.merged_for(ctx);
         if merged.dbus.deny.iter().any(|rule| rule.matches(target)) {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
@@ -201,25 +169,19 @@ mod tests {
     use tokio::{net::UnixStream, sync::Mutex};
 
     use super::{
-        super::types::{PolicydArgs, UiClient, UiSessionContext},
+        super::types::{UiClient, UiSessionContext},
         *,
     };
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            false,
+        ))
     }
 
     async fn register_ui_session(
@@ -286,18 +248,10 @@ mod tests {
         };
 
         assert_eq!(
-            store
-                .policy_evaluation(&ctx)
-                .network_verdict("example.com", 443, false)
-                .await,
+            store.network_verdict("example.com", 443, &ctx, false).await,
             Some(Verdict::denied(VerdictSource::policy()))
         );
-        assert!(
-            !store
-                .policy_evaluation(&ctx)
-                .network_allowed("example.com", 443, true)
-                .await
-        );
+        assert!(!store.network_allowed("example.com", 443, &ctx, true).await);
     }
 
     #[tokio::test]
@@ -328,10 +282,7 @@ mod tests {
         };
 
         assert_eq!(
-            store
-                .policy_evaluation(&ctx)
-                .network_verdict("example.com", 443, false)
-                .await,
+            store.network_verdict("example.com", 443, &ctx, false).await,
             Some(Verdict::allowed(VerdictSource::policy_with_comment(
                 "trusted policy file"
             )))
@@ -391,11 +342,11 @@ mod tests {
 
         assert_eq!(
             store
-                .policy_evaluation(&ctx)
                 .resource_allow_source(
                     ResourceKind::Device,
                     &device_path,
                     ResourceAccess::Device(DeviceAccess::Read),
+                    &ctx,
                 )
                 .await,
             Some(Verdict::allowed(VerdictSource::Scope(
@@ -444,7 +395,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            store.policy_evaluation(&ctx).dbus_verdict(&target),
+            store.dbus_verdict(&target, &ctx),
             Some(Verdict::allowed(VerdictSource::policy_with_comment(
                 "trusted D-Bus method"
             )))

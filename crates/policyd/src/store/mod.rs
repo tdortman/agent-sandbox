@@ -27,6 +27,8 @@ use std::{
     sync::{Arc, RwLock},
     time::Instant,
 };
+#[cfg(test)]
+use std::{path::PathBuf, time::Duration};
 
 pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
 pub(crate) use types::evict_oldest;
@@ -37,6 +39,61 @@ pub use types::{
     ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
 use types::{MergedPolicyCache, PolicyDecisionState};
+
+fn apply_session_rule<T>(
+    action: decisions::DecisionAction,
+    session_id: &str,
+    key: &T,
+    allow: &mut HashMap<String, HashSet<T>>,
+    deny: &mut HashMap<String, HashSet<T>>,
+) where
+    T: Clone + Eq + std::hash::Hash,
+{
+    match action {
+        decisions::DecisionAction::Approve => {
+            allow
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(key.clone());
+            if let Some(deny_bucket) = deny.get_mut(session_id) {
+                deny_bucket.remove(key);
+            }
+        }
+        decisions::DecisionAction::Deny => {
+            deny.entry(session_id.to_owned())
+                .or_default()
+                .insert(key.clone());
+            if let Some(allow_bucket) = allow.get_mut(session_id) {
+                allow_bucket.remove(key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn test_args(
+    host_socket: PathBuf,
+    sandbox_socket: PathBuf,
+    declarative: PathBuf,
+    export_json: PathBuf,
+    approval_timeout: Duration,
+    interactive_approval: bool,
+) -> PolicydArgs {
+    PolicydArgs {
+        host_socket,
+        sandbox_socket,
+        proxy_socket: None,
+        proxy_gid: None,
+        declarative,
+        export_json,
+        export_nix: None,
+        approval_timeout,
+        interactive_approval,
+        ui_spawn_cmd: None,
+        fs_monitor_cmd: None,
+        syscall_broker_cmd: None,
+    }
+}
 
 impl PolicyStore {
     #[must_use]

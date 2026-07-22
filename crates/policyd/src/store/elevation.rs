@@ -10,18 +10,13 @@ use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
-use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PolicyStore};
+use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore};
 use crate::{
     error::PolicydError,
     wire::{ElevationRequest, UiSpawnContext},
 };
 
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
-
-struct PendingElevationEntry {
-    id: String,
-    rx: oneshot::Receiver<ElevateReply>,
-}
 
 impl PolicyStore {
     pub(crate) fn user_for_home(home: Option<&Path>) -> String {
@@ -238,7 +233,7 @@ impl PolicyStore {
         home: Option<&Path>,
         project_root: Option<&Path>,
         sandbox_session_id: Option<&str>,
-    ) -> Option<PendingElevationEntry> {
+    ) -> Option<PendingResult<String, ElevateReply>> {
         let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
         {
@@ -265,7 +260,11 @@ impl PolicyStore {
         }
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
-        Some(PendingElevationEntry { id: pending_id, rx })
+        Some(PendingResult {
+            id: pending_id,
+            is_new: true,
+            rx,
+        })
     }
 
     async fn maybe_spawn_elevation_ui(
@@ -376,30 +375,21 @@ mod tests {
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
 
     use super::ELEVATION_PATH;
-    use crate::{
-        store::types::{PolicyStore, PolicydArgs},
-        wire::ElevationRequest,
-    };
+    use crate::{store::types::PolicyStore, wire::ElevationRequest};
 
     fn system_profile_true() -> Option<PathBuf> {
         let path = Path::new(ELEVATION_PATH).join("true");
         path.is_file().then_some(path)
     }
     fn test_store() -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            "/tmp/test.sock".into(),
+            "/tmp/test-sandbox.sock".into(),
+            "/tmp/declarative.json".into(),
+            "/tmp/export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ))
     }
 
     fn elevation_request(argv: Vec<String>) -> ElevationRequest {

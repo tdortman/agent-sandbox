@@ -3,7 +3,11 @@ use std::path::PathBuf;
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 
-use super::{decisions::DecisionAction, types::PolicyStore};
+use super::{
+    apply_session_rule,
+    decisions::DecisionAction,
+    types::{PolicyDecisionState, PolicyStore},
+};
 use crate::{
     error::PolicydError,
     wire::{ScopeWire, SudoScopeOp},
@@ -60,26 +64,24 @@ impl PolicyStore {
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
-                self.apply_sudo_scope_session(action, session_id.clone(), key)
-                    .await;
+                let mut inner = self.inner.lock().await;
+                let PolicyDecisionState {
+                    session_sudo_allow: allow,
+                    session_sudo_deny: deny,
+                    ..
+                } = &mut *inner;
+                apply_session_rule(action, &session_id, &key, allow, deny);
+                drop(inner);
             }
             ScopeTarget::Global { policy_path, home } => {
-                let persist = match action {
-                    DecisionAction::Approve => Self::persist_sudo_allow(
-                        &policy_path,
-                        &argv,
-                        scope_label,
-                        Some(home.as_path()),
-                        owner_uid,
-                    ),
-                    DecisionAction::Deny => Self::persist_sudo_deny(
-                        &policy_path,
-                        &argv,
-                        scope_label,
-                        Some(home.as_path()),
-                        owner_uid,
-                    ),
-                };
+                let persist = Self::persist_sudo_rule(
+                    &policy_path,
+                    &argv,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    Some(home.as_path()),
+                    owner_uid,
+                );
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
@@ -88,14 +90,14 @@ impl PolicyStore {
                 policy_path,
                 project_root: _,
             } => {
-                let persist = match action {
-                    DecisionAction::Approve => {
-                        Self::persist_sudo_allow(&policy_path, &argv, scope_label, home, owner_uid)
-                    }
-                    DecisionAction::Deny => {
-                        Self::persist_sudo_deny(&policy_path, &argv, scope_label, home, owner_uid)
-                    }
-                };
+                let persist = Self::persist_sudo_rule(
+                    &policy_path,
+                    &argv,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    home,
+                    owner_uid,
+                );
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
@@ -112,36 +114,5 @@ impl PolicyStore {
             scope,
             action,
         )
-    }
-
-    pub(crate) async fn apply_sudo_scope_session(
-        &self,
-        action: DecisionAction,
-        session_id: String,
-        key: Vec<String>,
-    ) {
-        let mut inner = self.inner.lock().await;
-        match action {
-            DecisionAction::Approve => {
-                let bucket = inner
-                    .session_sudo_allow
-                    .entry(session_id.clone())
-                    .or_default();
-                bucket.insert(key.clone());
-                if let Some(deny_bucket) = inner.session_sudo_deny.get_mut(&session_id) {
-                    deny_bucket.remove(&key);
-                }
-            }
-            DecisionAction::Deny => {
-                let bucket = inner
-                    .session_sudo_deny
-                    .entry(session_id.clone())
-                    .or_default();
-                bucket.insert(key.clone());
-                if let Some(allow_bucket) = inner.session_sudo_allow.get_mut(&session_id) {
-                    allow_bucket.remove(&key);
-                }
-            }
-        }
     }
 }

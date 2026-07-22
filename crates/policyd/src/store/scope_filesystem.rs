@@ -6,7 +6,12 @@ use agent_sandbox_core::{
     ResourceRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
 };
 
-use super::{decisions::DecisionAction, persist::PersistResourceRuleArgs, types::PolicyStore};
+use super::{
+    apply_session_rule,
+    decisions::DecisionAction,
+    persist::PersistResourceRuleArgs,
+    types::{PolicyDecisionState, PolicyStore},
+};
 use crate::{
     error::PolicydError,
     wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire},
@@ -73,8 +78,14 @@ impl PolicyStore {
             ScopeTarget::Session { session_id } => {
                 let resolved_path = expand_policy_path(&path, home, project_root);
                 let key = FilesystemRuleKey::new(resolved_path, access);
-                self.apply_filesystem_scope_session(action, session_id.clone(), key)
-                    .await;
+                let mut inner = self.inner.lock().await;
+                let PolicyDecisionState {
+                    session_filesystem_allow: allow,
+                    session_filesystem_deny: deny,
+                    ..
+                } = &mut *inner;
+                apply_session_rule(action, &session_id, &key, allow, deny);
+                drop(inner);
             }
             ScopeTarget::Global { policy_path, home } => {
                 let persist = match action {
@@ -136,37 +147,6 @@ impl PolicyStore {
         self.finalize_filesystem_scope(&paths, path, access, scope, action)
     }
 
-    pub(crate) async fn apply_filesystem_scope_session(
-        &self,
-        action: DecisionAction,
-        session_id: String,
-        key: FilesystemRuleKey,
-    ) {
-        let mut inner = self.inner.lock().await;
-        match action {
-            DecisionAction::Approve => {
-                let bucket = inner
-                    .session_filesystem_allow
-                    .entry(session_id.clone())
-                    .or_default();
-                bucket.insert(key.clone());
-                if let Some(deny_bucket) = inner.session_filesystem_deny.get_mut(&session_id) {
-                    deny_bucket.remove(&key);
-                }
-            }
-            DecisionAction::Deny => {
-                let bucket = inner
-                    .session_filesystem_deny
-                    .entry(session_id.clone())
-                    .or_default();
-                bucket.insert(key.clone());
-                if let Some(allow_bucket) = inner.session_filesystem_allow.get_mut(&session_id) {
-                    allow_bucket.remove(&key);
-                }
-            }
-        }
-    }
-
     fn finalize_resource_scope(
         &self,
         paths: &SandboxPaths,
@@ -223,8 +203,14 @@ impl PolicyStore {
         let policy_path = match scope_target {
             ScopeTarget::Ephemeral => None,
             ScopeTarget::Session { session_id } => {
-                self.apply_dbus_scope_session(action, session_id, target.clone())
-                    .await;
+                let mut inner = self.inner.lock().await;
+                let PolicyDecisionState {
+                    session_dbus_allow: allow,
+                    session_dbus_deny: deny,
+                    ..
+                } = &mut *inner;
+                apply_session_rule(action, &session_id, &target, allow, deny);
+                drop(inner);
                 None
             }
             ScopeTarget::Global { policy_path, home } => {
@@ -264,37 +250,6 @@ impl PolicyStore {
         RpcReply::ScopeAction(ScopeActionReply::ok_dbus(target, scope, policy_path))
     }
 
-    pub(crate) async fn apply_dbus_scope_session(
-        &self,
-        action: DecisionAction,
-        session_id: String,
-        target: DbusTarget,
-    ) {
-        let mut inner = self.inner.lock().await;
-        match action {
-            DecisionAction::Approve => {
-                inner
-                    .session_dbus_allow
-                    .entry(session_id.clone())
-                    .or_default()
-                    .insert(target.clone());
-                if let Some(deny) = inner.session_dbus_deny.get_mut(&session_id) {
-                    deny.remove(&target);
-                }
-            }
-            DecisionAction::Deny => {
-                inner
-                    .session_dbus_deny
-                    .entry(session_id.clone())
-                    .or_default()
-                    .insert(target.clone());
-                if let Some(allow) = inner.session_dbus_allow.get_mut(&session_id) {
-                    allow.remove(&target);
-                }
-            }
-        }
-    }
-
     pub(crate) async fn apply_resource_scope(
         &self,
         op: ResourceScopeOp,
@@ -324,12 +279,18 @@ impl PolicyStore {
             Err(reply) => return *reply,
         };
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+        let key = ResourceRuleKey::new(kind, &path, access);
         match target {
             ScopeTarget::Ephemeral => {}
             ScopeTarget::Session { session_id } => {
-                let key = ResourceRuleKey::new(kind, &path, access);
-                self.apply_resource_scope_session(action, session_id.clone(), key)
-                    .await;
+                let mut inner = self.inner.lock().await;
+                let PolicyDecisionState {
+                    session_resource_allow: allow,
+                    session_resource_deny: deny,
+                    ..
+                } = &mut *inner;
+                apply_session_rule(action, &session_id, &key, allow, deny);
+                drop(inner);
             }
             ScopeTarget::Global { policy_path, home } => {
                 if let Err(err) = Self::persist_resource_rule(&PersistResourceRuleArgs {
@@ -366,37 +327,6 @@ impl PolicyStore {
         }
         self.finalize_resource_scope(&paths, kind, path, access, scope, action)
     }
-
-    pub(crate) async fn apply_resource_scope_session(
-        &self,
-        action: DecisionAction,
-        session_id: String,
-        key: ResourceRuleKey,
-    ) {
-        let mut inner = self.inner.lock().await;
-        match action {
-            DecisionAction::Approve => {
-                let bucket = inner
-                    .session_resource_allow
-                    .entry(session_id.clone())
-                    .or_default();
-                bucket.insert(key.clone());
-                if let Some(deny_bucket) = inner.session_resource_deny.get_mut(&session_id) {
-                    deny_bucket.remove(&key);
-                }
-            }
-            DecisionAction::Deny => {
-                let bucket = inner
-                    .session_resource_deny
-                    .entry(session_id.clone())
-                    .or_default();
-                bucket.insert(key.clone());
-                if let Some(allow_bucket) = inner.session_resource_allow.get_mut(&session_id) {
-                    allow_bucket.remove(&key);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -410,7 +340,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::{decisions::DecisionAction, types::PolicydArgs},
+        store::decisions::DecisionAction,
         wire::{FilesystemScopeOp, ScopeWire},
     };
 
@@ -423,20 +353,14 @@ mod tests {
         std::fs::create_dir_all(&scripts).expect("create project scripts");
         let declarative = dir.path().join("declarative.json");
         let export_json = dir.path().join("export.json");
-        let store = PolicyStore::new(PolicydArgs {
-            host_socket: dir.path().join("host.sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
             declarative,
             export_json,
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+            Duration::from_secs(30),
+            true,
+        ));
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project, &home, &project),
             ids: ProcessIds::default(),

@@ -385,24 +385,18 @@ mod tests {
     use super::*;
     use crate::{
         error::PolicydError,
-        store::{PolicyStore, PolicydArgs, TrustedPeer},
+        store::{PolicyStore, TrustedPeer},
     };
 
     fn test_store() -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            "/tmp/test.sock".into(),
+            "/tmp/test-sandbox.sock".into(),
+            "/tmp/declarative.json".into(),
+            "/tmp/export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ))
     }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {

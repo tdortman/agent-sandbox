@@ -278,7 +278,7 @@ impl PolicyStore {
         atomic_write_policy(path, &current, home, owner_uid, None)
     }
 
-    fn persist_network_rule(
+    pub(crate) fn persist_network_rule(
         path: &Path,
         host: &str,
         port: u16,
@@ -318,29 +318,7 @@ impl PolicyStore {
         atomic_write_policy(path, &current, home, owner_uid, None)
     }
 
-    pub(crate) fn persist_network_allow(
-        path: &Path,
-        host: &str,
-        port: u16,
-        label: &str,
-        home: Option<&Path>,
-        owner_uid: Option<u32>,
-    ) -> std::io::Result<()> {
-        Self::persist_network_rule(path, host, port, label, true, home, owner_uid)
-    }
-
-    pub(crate) fn persist_network_deny(
-        path: &Path,
-        host: &str,
-        port: u16,
-        label: &str,
-        home: Option<&Path>,
-        owner_uid: Option<u32>,
-    ) -> std::io::Result<()> {
-        Self::persist_network_rule(path, host, port, label, false, home, owner_uid)
-    }
-
-    fn persist_sudo_rule(
+    pub(crate) fn persist_sudo_rule(
         path: &Path,
         argv: &[String],
         label: &str,
@@ -374,26 +352,6 @@ impl PolicyStore {
         current.sudo.allow = allow.into_values().collect();
         current.sudo.deny = deny.into_values().collect();
         atomic_write_policy(path, &current, home, owner_uid, None)
-    }
-
-    pub(crate) fn persist_sudo_allow(
-        path: &Path,
-        argv: &[String],
-        label: &str,
-        home: Option<&Path>,
-        owner_uid: Option<u32>,
-    ) -> std::io::Result<()> {
-        Self::persist_sudo_rule(path, argv, label, true, home, owner_uid)
-    }
-
-    pub(crate) fn persist_sudo_deny(
-        path: &Path,
-        argv: &[String],
-        label: &str,
-        home: Option<&Path>,
-        owner_uid: Option<u32>,
-    ) -> std::io::Result<()> {
-        Self::persist_sudo_rule(path, argv, label, false, home, owner_uid)
     }
 
     pub(crate) fn persist_filesystem_rule(

@@ -493,23 +493,17 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::types::{Pending, PolicyStore, PolicydArgs};
+    use crate::store::types::{Pending, PolicyStore};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: dir.path().join("host.sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ))
     }
 
     fn test_owner() -> SocketIdentity {

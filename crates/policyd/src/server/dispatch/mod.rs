@@ -39,27 +39,17 @@ mod tests {
     use tokio::{net::UnixStream, sync::Mutex};
 
     use super::{SocketRole, dispatch};
-    use crate::{
-        error::PolicydError,
-        server::peer::ClientPeer,
-        store::{PolicyStore, PolicydArgs},
-    };
+    use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
 
     fn test_store(dir: &tempfile::TempDir) -> Arc<PolicyStore> {
-        Arc::new(PolicyStore::new(PolicydArgs {
-            host_socket: dir.path().join("host.sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("policy.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        }))
+        Arc::new(PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("policy.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            false,
+        )))
     }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {

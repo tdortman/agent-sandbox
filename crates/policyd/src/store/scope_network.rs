@@ -6,18 +6,18 @@ use agent_sandbox_core::{
     ScopeTarget,
 };
 
-use super::{decisions::DecisionAction, types::PolicyStore};
+use super::{
+    apply_session_rule,
+    decisions::DecisionAction,
+    types::{PolicyDecisionState, PolicyStore},
+};
 use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, ScopeWire},
 };
 
 fn session_network_entries(host: &str, port: u16) -> Vec<NetworkRuleKey> {
-    if host.starts_with("*.") {
-        vec![NetworkRuleKey::new(host, port)]
-    } else {
-        allow_keys(host, port)
-    }
+    vec![NetworkRuleKey::new(host, port)]
 }
 
 impl PolicyStore {
@@ -58,28 +58,27 @@ impl PolicyStore {
                 }
             }
             ScopeTarget::Session { session_id } => {
-                self.apply_network_scope_session(action, session_id, session_entries)
-                    .await;
+                let mut inner = self.inner.lock().await;
+                let PolicyDecisionState {
+                    session_allow: allow,
+                    session_deny: deny,
+                    ..
+                } = &mut *inner;
+                for key in session_entries {
+                    apply_session_rule(action, &session_id, &key, allow, deny);
+                }
+                drop(inner);
             }
             ScopeTarget::Global { policy_path, home } => {
-                let persist = match action {
-                    DecisionAction::Approve => Self::persist_network_allow(
-                        &policy_path,
-                        &host,
-                        port,
-                        scope_label,
-                        Some(home.as_path()),
-                        owner_uid,
-                    ),
-                    DecisionAction::Deny => Self::persist_network_deny(
-                        &policy_path,
-                        &host,
-                        port,
-                        scope_label,
-                        Some(home.as_path()),
-                        owner_uid,
-                    ),
-                };
+                let persist = Self::persist_network_rule(
+                    &policy_path,
+                    &host,
+                    port,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    Some(home.as_path()),
+                    owner_uid,
+                );
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
@@ -88,24 +87,15 @@ impl PolicyStore {
                 policy_path,
                 project_root: _,
             } => {
-                let persist = match action {
-                    DecisionAction::Approve => Self::persist_network_allow(
-                        &policy_path,
-                        &host,
-                        port,
-                        scope_label,
-                        home,
-                        owner_uid,
-                    ),
-                    DecisionAction::Deny => Self::persist_network_deny(
-                        &policy_path,
-                        &host,
-                        port,
-                        scope_label,
-                        home,
-                        owner_uid,
-                    ),
-                };
+                let persist = Self::persist_network_rule(
+                    &policy_path,
+                    &host,
+                    port,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    home,
+                    owner_uid,
+                );
                 if let Err(err) = persist {
                     return PolicydError::from(err).into();
                 }
@@ -113,39 +103,6 @@ impl PolicyStore {
             }
         }
         self.finalize_network_scope(&paths, host, port, scope, action)
-    }
-
-    async fn apply_network_scope_session(
-        &self,
-        action: DecisionAction,
-        session_id: String,
-        entries: Vec<NetworkRuleKey>,
-    ) {
-        let mut inner = self.inner.lock().await;
-        match action {
-            DecisionAction::Approve => {
-                let bucket = inner.session_allow.entry(session_id.clone()).or_default();
-                for entry in &entries {
-                    bucket.insert(entry.clone());
-                }
-                if let Some(deny_bucket) = inner.session_deny.get_mut(&session_id) {
-                    for entry in entries {
-                        deny_bucket.remove(&entry);
-                    }
-                }
-            }
-            DecisionAction::Deny => {
-                let bucket = inner.session_deny.entry(session_id.clone()).or_default();
-                for entry in &entries {
-                    bucket.insert(entry.clone());
-                }
-                if let Some(allow_bucket) = inner.session_allow.get_mut(&session_id) {
-                    for entry in entries {
-                        allow_bucket.remove(&entry);
-                    }
-                }
-            }
-        }
     }
 
     fn finalize_network_scope(

@@ -334,22 +334,14 @@ mod tests {
     async fn pending_http_scope_uses_pending_context_for_memory_rule() {
         use std::time::Duration;
 
-        use crate::store::types::PolicydArgs;
-
-        let store = PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = PolicyStore::new(crate::store::test_args(
+            "/tmp/test.sock".into(),
+            "/tmp/test-sandbox.sock".into(),
+            "/tmp/declarative.json".into(),
+            "/tmp/export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ));
         let pending_id = PendingHttpId::new();
         let pending = PendingHttp {
             id: pending_id.to_string(),
@@ -402,20 +394,14 @@ mod tests {
     }
     #[tokio::test]
     async fn any_of_once_target_tracks_each_method() {
-        let store = PolicyStore::new(crate::store::types::PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = PolicyStore::new(crate::store::test_args(
+            "/tmp/test.sock".into(),
+            "/tmp/test-sandbox.sock".into(),
+            "/tmp/declarative.json".into(),
+            "/tmp/export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ));
         let url = HttpUrl::parse("https://example.com/").expect("valid URL");
         let target = HttpRuleTarget::new(
             HttpMethodMatcher::AnyOf(vec![
@@ -444,20 +430,14 @@ mod tests {
         std::fs::create_dir_all(&pending_project).expect("create pending project");
         let policy_path = pending_home.join(".config/agent-sandbox/policy.json");
 
-        let store = PolicyStore::new(crate::store::types::PolicydArgs {
-            host_socket: dir.path().join("host.sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ));
         let pending_id = PendingHttpId::new();
         let request = HttpRequest {
             method: HttpMethod::parse("GET").expect("valid method"),

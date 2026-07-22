@@ -124,6 +124,12 @@ pub struct PolicydArgs {
     pub syscall_broker_cmd: Option<PathBuf>,
 }
 
+pub(super) struct PendingResult<I, T> {
+    pub(super) id: I,
+    pub(super) is_new: bool,
+    pub(super) rx: oneshot::Receiver<T>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingElevation {
     pub id: String,

@@ -13,7 +13,7 @@ impl PolicyStore {
     /// retained only as an internal deduplication key.
     pub async fn check_dbus(&self, req: DbusCheckRequest) -> DbusCheckReply {
         let DbusCheckRequest { target, ctx } = req;
-        let policy_verdict = self.policy_evaluation(&ctx).dbus_verdict(&target);
+        let policy_verdict = self.dbus_verdict(&target, &ctx);
         if let Some(verdict) = policy_verdict.as_ref()
             && !verdict.allowed
         {

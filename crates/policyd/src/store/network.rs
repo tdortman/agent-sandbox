@@ -183,11 +183,7 @@ impl PolicyStore {
             tracing::info!(%policy_host, port, "check deny (project policy)");
             return CheckReply::denied(VerdictSource::policy());
         }
-        if let Some(verdict) = self
-            .policy_evaluation(&ctx)
-            .network_verdict(&policy_host, port, true)
-            .await
-        {
+        if let Some(verdict) = self.network_verdict(&policy_host, port, &ctx, true).await {
             return CheckReply::from_verdict(verdict);
         }
         if !self.args.interactive_approval {
@@ -585,25 +581,19 @@ mod tests {
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     use crate::{
-        store::types::{Pending, PolicyStore, PolicydArgs, UiClient, UiSessionContext},
+        store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
         wire::NetworkCheckRequest,
     };
 
     fn test_store() -> PolicyStore {
-        PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/test.sock".into(),
-            sandbox_socket: "/tmp/test-sandbox.sock".into(),
-            declarative: "/tmp/declarative.json".into(),
-            export_json: "/tmp/export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            "/tmp/test.sock".into(),
+            "/tmp/test-sandbox.sock".into(),
+            "/tmp/declarative.json".into(),
+            "/tmp/export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ))
     }
 
     fn unique_request(host: &str, port: u16) -> NetworkCheckRequest {

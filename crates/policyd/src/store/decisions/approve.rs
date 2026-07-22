@@ -790,7 +790,7 @@ mod tests {
     use crate::{
         store::{
             Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
-            PolicyStore, PolicydArgs,
+            PolicyStore,
             types::{PendingDbus, UiClient, UiSessionContext},
         },
         wire::{PendingDecision, ScopeWire},
@@ -1283,20 +1283,14 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test store dir");
-        PolicyStore::new(PolicydArgs {
-            host_socket: dir.join("policy.sock"),
-            sandbox_socket: dir.join("sandbox-policy.sock"),
-            declarative: dir.join("declarative.json"),
-            export_json: dir.join("exported-policy.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_mins(1),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            dir.join("policy.sock"),
+            dir.join("sandbox-policy.sock"),
+            dir.join("declarative.json"),
+            dir.join("exported-policy.json"),
+            Duration::from_mins(1),
+            true,
+        ))
     }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {

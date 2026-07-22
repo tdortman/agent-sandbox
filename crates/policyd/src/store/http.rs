@@ -9,7 +9,7 @@ use agent_sandbox_core::{
 
 use super::types::{
     HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
-    PendingHttp, PolicyStore, enforce_verdict_cache_limit,
+    PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
 };
 use crate::{error::PolicydError, wire::UiSpawnContext};
 
@@ -167,7 +167,7 @@ impl PolicyStore {
             }
         };
 
-        let (pending_id, is_new, rx) = self
+        let pending = self
             .dedup_or_create_http(
                 proxy_session.clone(),
                 request_id,
@@ -176,6 +176,9 @@ impl PolicyStore {
                 &ctx,
             )
             .await?;
+        let pending_id = pending.id;
+        let is_new = pending.is_new;
+        let rx = pending.rx;
         if is_new {
             let pending = {
                 let inner = self.inner.lock().await;
@@ -221,14 +224,7 @@ impl PolicyStore {
         attribution_token: agent_sandbox_core::AttributionToken,
         request: &HttpRequest,
         ctx: &ResolvedRequestContext,
-    ) -> Result<
-        (
-            PendingHttpId,
-            bool,
-            tokio::sync::oneshot::Receiver<HttpCheckReply>,
-        ),
-        PolicydError,
-    > {
+    ) -> Result<PendingResult<PendingHttpId, HttpCheckReply>, PolicydError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let key = http_key(request, ctx);
         let mut inner = self.inner.lock().await;
@@ -287,7 +283,11 @@ impl PolicyStore {
             .http_waiters
             .insert((proxy_session, request_id), pending_id);
         drop(inner);
-        Ok((pending_id, existing.is_none(), rx))
+        Ok(PendingResult {
+            id: pending_id,
+            is_new: existing.is_none(),
+            rx,
+        })
     }
 
     async fn await_http_verdict(
@@ -488,8 +488,7 @@ mod tests {
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
 
-    use super::super::types::{PolicyStore, PolicydArgs};
-
+    use super::super::types::{PendingResult, PolicyStore};
     #[tokio::test]
     async fn documented_network_http_rule_allows_without_prompt() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -517,20 +516,14 @@ mod tests {
         )
         .expect("write global policy");
 
-        let store = PolicyStore::new(PolicydArgs {
-            host_socket: dir.path().join("host.sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_mins(1),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_mins(1),
+            true,
+        ));
         let request = HttpRequest::parse_absolute("GET", "https://api.example.com/v1")
             .expect("valid request");
         let home_s = home.to_string_lossy().into_owned();
@@ -581,20 +574,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = PolicyStore::new(PolicydArgs {
-            host_socket: dir.path().join("host.sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_mins(1),
+            false,
+        ));
         let home_s = home.to_string_lossy().into_owned();
         let project_s = project_root.to_string_lossy().into_owned();
         let ctx = ResolvedRequestContext::new(
@@ -630,20 +617,14 @@ mod tests {
         );
     }
     async fn test_http_store() -> (PolicyStore, ProxySessionToken, AttributionToken) {
-        let store = PolicyStore::new(PolicydArgs {
-            host_socket: "/tmp/http-once-test.sock".into(),
-            sandbox_socket: "/tmp/http-once-test-sandbox.sock".into(),
-            declarative: "/tmp/http-once-test-declarative.json".into(),
-            export_json: "/tmp/http-once-test-export.json".into(),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(30),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = PolicyStore::new(crate::store::test_args(
+            "/tmp/http-once-test.sock".into(),
+            "/tmp/http-once-test-sandbox.sock".into(),
+            "/tmp/http-once-test-declarative.json".into(),
+            "/tmp/http-once-test-export.json".into(),
+            Duration::from_secs(30),
+            true,
+        ));
         let proxy_session = store
             .open_proxy_session(1)
             .await
@@ -736,8 +717,16 @@ mod tests {
                 &context,
             ),
         );
-        let (pending_1, first, rx_1) = first_result.expect("first waiter");
-        let (pending_2, second, rx_2) = second_result.expect("second waiter");
+        let PendingResult {
+            id: pending_1,
+            is_new: first,
+            rx: rx_1,
+        } = first_result.expect("first waiter");
+        let PendingResult {
+            id: pending_2,
+            is_new: second,
+            rx: rx_2,
+        } = second_result.expect("second waiter");
         assert_eq!(pending_1, pending_2);
         assert_ne!(
             first, second,

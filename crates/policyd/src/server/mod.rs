@@ -14,21 +14,11 @@ use crate::store::PolicyStore;
 
 pub struct PolicyServer {
     store: Arc<PolicyStore>,
-    host_socket_path: std::path::PathBuf,
-    sandbox_socket_path: std::path::PathBuf,
 }
 
 impl PolicyServer {
-    pub fn new(
-        store: Arc<PolicyStore>,
-        host_socket_path: impl Into<std::path::PathBuf>,
-        sandbox_socket_path: impl Into<std::path::PathBuf>,
-    ) -> Self {
-        Self {
-            store,
-            host_socket_path: host_socket_path.into(),
-            sandbox_socket_path: sandbox_socket_path.into(),
-        }
+    pub const fn new(store: Arc<PolicyStore>) -> Self {
+        Self { store }
     }
 
     fn bind_socket(path: &Path, mode: u32, group: Option<u32>) -> std::io::Result<UnixListener> {
@@ -90,7 +80,9 @@ impl PolicyServer {
     /// socket binding fails (permissions, path length, or filesystem
     /// issues), or if Unix-domain socket setup fails.
     pub async fn run(self) -> std::io::Result<()> {
-        if self.host_socket_path == self.sandbox_socket_path {
+        let host_socket_path = self.store.args().host_socket.clone();
+        let sandbox_socket_path = self.store.args().sandbox_socket.clone();
+        if host_socket_path == sandbox_socket_path {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "host and sandbox policy sockets must differ",
@@ -100,7 +92,7 @@ impl PolicyServer {
         let proxy_path = self.store.args().proxy_socket.clone();
         let proxy_gid = self.store.args().proxy_gid;
         if let Some(proxy_path) = proxy_path.as_ref()
-            && (proxy_path == &self.host_socket_path || proxy_path == &self.sandbox_socket_path)
+            && (proxy_path == &host_socket_path || proxy_path == &sandbox_socket_path)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -118,8 +110,8 @@ impl PolicyServer {
         // as root, so 0600 would mean only root can connect and the desktop user's
         // UI/approve CLI could never register. Sensitive ops still bind to
         // SO_PEERCRED. Sandbox socket: same mode; RPC auth limits it to request ops.
-        let host_listener = Self::bind_socket(&self.host_socket_path, 0o666, None)?;
-        let sandbox_listener = Self::bind_socket(&self.sandbox_socket_path, 0o666, None)?;
+        let host_listener = Self::bind_socket(&host_socket_path, 0o666, None)?;
+        let sandbox_listener = Self::bind_socket(&sandbox_socket_path, 0o666, None)?;
 
         if let Some(proxy_path) = proxy_path {
             let proxy_listener = Self::bind_socket(&proxy_path, 0o660, proxy_gid)?;
@@ -128,13 +120,13 @@ impl PolicyServer {
                     host_listener,
                     self.store.clone(),
                     dispatch::SocketRole::Host,
-                    self.host_socket_path,
+                    host_socket_path,
                 ),
                 Self::accept_loop(
                     sandbox_listener,
                     self.store.clone(),
                     dispatch::SocketRole::Sandbox,
-                    self.sandbox_socket_path,
+                    sandbox_socket_path,
                 ),
                 Self::accept_loop(
                     proxy_listener,
@@ -149,13 +141,13 @@ impl PolicyServer {
                     host_listener,
                     self.store.clone(),
                     dispatch::SocketRole::Host,
-                    self.host_socket_path,
+                    host_socket_path,
                 ),
                 Self::accept_loop(
                     sandbox_listener,
                     self.store,
                     dispatch::SocketRole::Sandbox,
-                    self.sandbox_socket_path,
+                    sandbox_socket_path,
                 ),
             );
         }
@@ -176,20 +168,14 @@ mod tests {
     use crate::store::PolicydArgs;
 
     fn test_args(dir: &tempfile::TempDir) -> PolicydArgs {
-        PolicydArgs {
-            host_socket: dir.path().join("host-policy.sock"),
-            sandbox_socket: dir.path().join("sandbox-policy.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("exported-policy.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_mins(5),
-            interactive_approval: true,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        }
+        crate::store::test_args(
+            dir.path().join("host-policy.sock"),
+            dir.path().join("sandbox-policy.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("exported-policy.json"),
+            Duration::from_mins(5),
+            true,
+        )
     }
 
     async fn send_and_recv(
@@ -205,11 +191,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
-        let server = PolicyServer::new(
-            store.clone(),
-            args.host_socket.clone(),
-            args.sandbox_socket.clone(),
-        );
+        let server = PolicyServer::new(store.clone());
 
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
@@ -267,11 +249,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
-        let server = PolicyServer::new(
-            store.clone(),
-            args.host_socket.clone(),
-            args.sandbox_socket.clone(),
-        );
+        let server = PolicyServer::new(store.clone());
 
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
@@ -336,11 +314,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
-        let server = PolicyServer::new(
-            store.clone(),
-            args.host_socket.clone(),
-            args.sandbox_socket.clone(),
-        );
+        let server = PolicyServer::new(store.clone());
 
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
@@ -411,11 +385,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
-        let server = PolicyServer::new(
-            store.clone(),
-            args.host_socket.clone(),
-            args.sandbox_socket.clone(),
-        );
+        let server = PolicyServer::new(store.clone());
 
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
@@ -499,11 +469,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
-        let server = PolicyServer::new(
-            store.clone(),
-            args.host_socket.clone(),
-            args.sandbox_socket.clone(),
-        );
+        let server = PolicyServer::new(store.clone());
 
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;

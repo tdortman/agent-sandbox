@@ -89,8 +89,7 @@ pub async fn handle_check(
     if let Some(verdict) = store.allow_verdict(&policy_host, port, &ctx).await {
         if verdict.is_once() {
             let verdict = store
-                .policy_evaluation(&ctx)
-                .network_verdict(&policy_host, port, true)
+                .network_verdict(&policy_host, port, &ctx, true)
                 .await
                 .unwrap_or_else(Verdict::blocked);
             if verdict.allowed {
@@ -134,26 +133,20 @@ mod tests {
     use uuid::Uuid;
 
     use super::{CheckArgs, PromptHost, handle_check, prompt_url};
-    use crate::store::{PolicyStore, PolicydArgs};
+    use crate::store::PolicyStore;
 
     fn test_store() -> PolicyStore {
         let base =
             std::env::temp_dir().join(format!("agent-sandbox-check-{}", Uuid::now_v7().simple()));
         std::fs::create_dir_all(&base).expect("create temp test dir");
-        PolicyStore::new(PolicydArgs {
-            host_socket: base.join("host.sock"),
-            sandbox_socket: base.join("sandbox.sock"),
-            declarative: base.join("policy.json"),
-            export_json: base.join("export.json"),
-            export_nix: None,
-            approval_timeout: Duration::from_secs(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        })
+        PolicyStore::new(crate::store::test_args(
+            base.join("host.sock"),
+            base.join("sandbox.sock"),
+            base.join("policy.json"),
+            base.join("export.json"),
+            Duration::from_secs(1),
+            false,
+        ))
     }
 
     fn empty_context() -> ResolvedRequestContext {

@@ -179,9 +179,7 @@ impl PolicyStore {
         port: u16,
         ctx: &ResolvedRequestContext,
     ) -> Option<Verdict> {
-        self.policy_evaluation(ctx)
-            .network_verdict(host, port, false)
-            .await
+        self.network_verdict(host, port, ctx, false).await
     }
 
     pub async fn is_allowed(
@@ -191,9 +189,7 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
         consume_once: bool,
     ) -> bool {
-        self.policy_evaluation(ctx)
-            .network_allowed(host, port, consume_once)
-            .await
+        self.network_allowed(host, port, ctx, consume_once).await
     }
 }
 
@@ -385,17 +381,6 @@ impl PolicyStore {
             .await
             .sandbox_filesystem_static_allow
             .insert(key, rules);
-    }
-
-    pub(crate) async fn filesystem_allow_source(
-        &self,
-        path: &Path,
-        access: FileAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> Option<Verdict> {
-        self.policy_evaluation(ctx)
-            .filesystem_allow_source(path, access)
-            .await
     }
 
     pub(super) async fn deny_inode_denied(
@@ -744,18 +729,6 @@ impl PolicyStore {
                 .is_some_and(|bucket| session_dbus_matches(bucket, target))
         })
     }
-
-    pub(crate) async fn resource_allow_source(
-        &self,
-        kind: ResourceKind,
-        path: &Path,
-        access: ResourceAccess,
-        ctx: &ResolvedRequestContext,
-    ) -> Option<Verdict> {
-        self.policy_evaluation(ctx)
-            .resource_allow_source(kind, path, access)
-            .await
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -885,20 +858,14 @@ mod tests {
             .push(NetworkRule::new("34.230.40.*", 443, "test"));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
@@ -949,20 +916,14 @@ mod tests {
             .push(NetworkRule::new("2001:db8:*", 443, "test"));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
@@ -1009,20 +970,14 @@ mod tests {
             .push(NetworkRule::new("example.com", 443, "test"));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
@@ -1064,20 +1019,14 @@ mod tests {
             .push(NetworkRule::new("34.230.40.*", 443, "test"));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
@@ -1110,20 +1059,14 @@ mod tests {
             .push(NetworkRule::new("example.com", 443, "test"));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
@@ -1160,20 +1103,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
@@ -1225,20 +1162,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_gid: None,
-            proxy_socket: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
@@ -1289,20 +1220,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let home_s = home.to_string_lossy().into_owned();
         let stale_root = ResolvedRequestContext {
@@ -1340,20 +1265,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1391,20 +1310,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let session_id = "sandbox-git-session";
         let ui_session_id = "ui-git-session";
@@ -1428,13 +1341,23 @@ mod tests {
                 },
             );
         }
-        store
-            .apply_filesystem_scope_session(
+        {
+            let mut inner = store.inner.lock().await;
+            let super::super::types::PolicyDecisionState {
+                session_filesystem_allow: allow,
+                session_filesystem_deny: deny,
+                ..
+            } = &mut *inner;
+            let key = FilesystemRuleKey::new("./.git", FileAccess::ReadWrite);
+            super::super::apply_session_rule(
                 crate::store::decisions::DecisionAction::Deny,
-                ui_session_id.into(),
-                FilesystemRuleKey::new("./.git", FileAccess::ReadWrite),
-            )
-            .await;
+                ui_session_id,
+                &key,
+                allow,
+                deny,
+            );
+            drop(inner);
+        }
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
@@ -1474,20 +1397,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1538,20 +1455,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1582,20 +1493,14 @@ mod tests {
     #[tokio::test]
     async fn infrastructure_paths_are_allowed_without_merged_policy() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
         let ctx = ResolvedRequestContext::default();
         assert_eq!(
             store
@@ -1619,20 +1524,14 @@ mod tests {
         let license_path = project_root.join("LICENSE");
         std::fs::write(&license_path, "license").expect("write license");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1684,20 +1583,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1736,20 +1629,14 @@ mod tests {
         let nested_path = project_root.join("vendor/pkg/LICENSE");
         std::fs::write(&nested_path, "license").expect("write license");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1799,20 +1686,14 @@ mod tests {
         ));
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
@@ -1843,20 +1724,14 @@ mod tests {
     }
     async fn dbus_session_store() -> (super::super::types::PolicyStore, ResolvedRequestContext) {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let store = super::super::types::PolicyStore::new(super::super::types::PolicydArgs {
-            host_socket: dir.path().join("sock"),
-            sandbox_socket: dir.path().join("sandbox.sock"),
-            declarative: dir.path().join("declarative.json"),
-            export_json: dir.path().join("export.json"),
-            export_nix: None,
-            approval_timeout: std::time::Duration::from_mins(1),
-            interactive_approval: false,
-            ui_spawn_cmd: None,
-            fs_monitor_cmd: None,
-            syscall_broker_cmd: None,
-            proxy_socket: None,
-            proxy_gid: None,
-        });
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::default(),

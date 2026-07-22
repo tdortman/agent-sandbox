@@ -65,14 +65,7 @@ async fn sandbox_filesystem_rpc_applies_allow_and_deny_policy() {
     )
     .expect("declarative policy");
     let sandbox_socket = args.sandbox_socket.clone();
-    let server = tokio::spawn(
-        PolicyServer::new(
-            Arc::new(PolicyStore::new(args)),
-            root.path().join("host.sock"),
-            sandbox_socket.clone(),
-        )
-        .run(),
-    );
+    let server = tokio::spawn(PolicyServer::new(Arc::new(PolicyStore::new(args))).run());
 
     let allowed = rpc(
         connect_when_ready(&sandbox_socket).await,
