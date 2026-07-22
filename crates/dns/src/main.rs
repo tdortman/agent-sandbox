@@ -206,7 +206,7 @@ impl DnsForwarder {
                 Ok(0) => continue,
                 Ok(n) => n,
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(err),
             };
             let mut data = vec![0_u8; usize::from(len)];
             if stream.read_exact(&mut data).await.is_err() {

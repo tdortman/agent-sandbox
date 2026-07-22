@@ -81,7 +81,7 @@ pub mod rpc_client {
                 access,
                 ctx,
             };
-            let reply = self.send_request(&req)?;
+            let reply = self.request(&req)?;
             match reply {
                 RpcReply::FilesystemCheck(r) => Ok(r),
                 RpcReply::Error(_) => {
@@ -103,7 +103,7 @@ pub mod rpc_client {
             Ok(())
         }
 
-        fn send_request(&mut self, req: &RpcRequest) -> Result<RpcReply, Error> {
+        fn request(&mut self, req: &RpcRequest) -> Result<RpcReply, Error> {
             let line = serde_json::to_vec(req).map_err(Error::Json)?;
             self.ensure_connected()?;
 
@@ -167,24 +167,12 @@ pub mod rpc_client {
         static_allow: Vec<FilesystemRule>,
     ) -> Result<FilesystemMonitorReply, Error> {
         let req = RpcRequest::StartFilesystemMonitor { ctx, static_allow };
-        let reply = send_request(socket_path, &req)?;
+        let reply = PersistentClient::new(socket_path).request(&req)?;
         match reply {
             RpcReply::FilesystemMonitor(r) => Ok(r),
             RpcReply::Error(_) => Err(Error::Reply("policyd returned an error")),
             _ => Err(Error::Reply("unexpected reply type from policyd")),
         }
-    }
-
-    fn send_request(socket_path: &Path, req: &RpcRequest) -> Result<RpcReply, Error> {
-        let mut stream = UnixStream::connect(socket_path).map_err(Error::Io)?;
-        let line = serde_json::to_string(req).map_err(Error::Json)?;
-        writeln!(stream, "{line}").map_err(Error::Io)?;
-        stream.flush().map_err(Error::Io)?;
-
-        let mut reader = std::io::BufReader::new(&stream);
-        let mut resp = String::new();
-        reader.read_line(&mut resp).map_err(Error::Io)?;
-        serde_json::from_str(resp.trim()).map_err(Error::Json)
     }
 }
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_sandbox_core::rpc::RequestContext;
+use agent_sandbox_core::{DbusBus, rpc::RequestContext};
 use agent_sandbox_dbus_proxy::{RelayConfig, run};
 use clap::Parser;
 
@@ -62,9 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = RelayConfig::new(args.listen, args.upstream_address, args.policy_socket);
     config.context = context;
     config.bus = if args.bus == "system" {
-        agent_sandbox_core::DbusBus::System
+        DbusBus::System
     } else {
-        agent_sandbox_core::DbusBus::Session
+        DbusBus::Session
     };
     run(config).await?;
     Ok(())

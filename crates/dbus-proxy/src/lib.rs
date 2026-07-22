@@ -174,9 +174,6 @@ pub enum RelayError {
     #[error("D-Bus error: {0}")]
     Dbus(#[from] zbus::Error),
 
-    #[error("policy RPC error: {0}")]
-    Policy(#[from] agent_sandbox_core::rpc_client::RpcClientError),
-
     #[error("invalid D-Bus message: {0}")]
     Message(String),
 }
@@ -353,24 +350,16 @@ async fn send_access_denied(connection: &Connection, message: &Message) -> Resul
 }
 
 fn is_forbidden_bus_control(message: &Message) -> bool {
-    let header = message.header();
-    message.message_type() == Type::MethodCall
-        && header
-            .destination()
-            .is_some_and(|destination| destination.as_str() == DBUS_IFACE)
-        && header.path().is_some_and(|path| path.as_str() == DBUS_PATH)
-        && header
-            .interface()
-            .is_some_and(|interface| interface.as_str() == DBUS_IFACE)
-        && header.member().is_some_and(|member| {
-            matches!(
-                member.as_str(),
-                "RequestName" | "BecomeMonitor" | "AddMatch"
-            )
-        })
+    is_bus_method(message, |member| {
+        matches!(member, "RequestName" | "BecomeMonitor" | "AddMatch")
+    })
 }
 
 fn is_hello(message: &Message) -> bool {
+    is_bus_method(message, |member| member == HELLO)
+}
+
+fn is_bus_method(message: &Message, member_matches: impl FnOnce(&str) -> bool) -> bool {
     let header = message.header();
     message.message_type() == Type::MethodCall
         && header
@@ -382,7 +371,7 @@ fn is_hello(message: &Message) -> bool {
             .is_some_and(|interface| interface.as_str() == DBUS_IFACE)
         && header
             .member()
-            .is_some_and(|member| member.as_str() == HELLO)
+            .is_some_and(|member| member_matches(member.as_str()))
 }
 
 fn rewrite_message(
@@ -431,7 +420,7 @@ mod tests {
 
     use zbus::{message::Message, zvariant::Endian};
 
-    use super::{SerialMap, is_forbidden_bus_control, target_from_message};
+    use super::{DbusBus, SerialMap, is_forbidden_bus_control, target_from_message};
 
     #[test]
     fn serial_map_correlates_and_removes_replies() {
@@ -456,13 +445,13 @@ mod tests {
             .build(&("hello",))
             .expect("message");
 
-        let target = target_from_message(&message, agent_sandbox_core::DbusBus::System);
+        let target = target_from_message(&message, DbusBus::System);
         assert_eq!(target.destination, "org.example.Service");
         assert_eq!(target.object_path, "/org/example/Object");
         assert_eq!(target.interface, "org.example.Interface");
         assert_eq!(target.member, "Ping");
         assert_eq!(target.signature, "s");
-        assert_eq!(target.bus, agent_sandbox_core::DbusBus::System);
+        assert_eq!(target.bus, DbusBus::System);
     }
 
     #[test]
