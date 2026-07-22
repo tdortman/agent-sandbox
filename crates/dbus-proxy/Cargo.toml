@@ -12,7 +12,7 @@ nix = { workspace = true, features = ["socket"] }
 thiserror = { workspace = true }
 tokio = {
   workspace = true,
-  features = ["macros", "net", "rt-multi-thread", "sync", "time"]
+  features = ["macros", "net", "rt-multi-thread"]
 }
 tracing = { workspace = true }
 zbus = { workspace = true }

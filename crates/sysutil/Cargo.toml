@@ -8,7 +8,7 @@ license.workspace = true
 libc.workspace = true
 nix = {
   workspace = true,
-  features = ["fs", "process", "sched", "socket", "uio", "user"]
+  features = ["fs", "process", "sched", "socket", "uio"]
 }
 
 [lints]

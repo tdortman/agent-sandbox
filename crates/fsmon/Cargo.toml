@@ -17,7 +17,7 @@ agent-sandbox-core.workspace = true
 agent-sandbox-sysutil.workspace = true
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true
-nix = { workspace = true, features = ["dir", "fs", "sched"] }
+nix = { workspace = true, features = ["dir", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
