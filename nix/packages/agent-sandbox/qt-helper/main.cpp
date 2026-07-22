@@ -275,7 +275,7 @@ static int runReview() {
     layout->addWidget(errorLabel);
 
     auto* buttons = new QHBoxLayout();
-    auto* deny = new QPushButton("Deny", &dialog);
+    auto* deny = new QPushButton("Deny once", &dialog);
     auto* allow = new QPushButton("Allow once", &dialog);
     deny->setDefault(true);
     deny->setAutoDefault(true);
@@ -357,10 +357,13 @@ static int runReview() {
         const bool once = scopeValue == "once";
         targets->setEnabled(!once);
         if (once) {
+            deny->setText("Deny once");
             allow->setText("Allow once");
         } else if (scopeValue == "global") {
+            deny->setText("Deny globally");
             allow->setText("Allow globally");
         } else {
+            deny->setText("Deny for " + scope->currentText().toLower());
             allow->setText("Allow for " + scope->currentText().toLower());
         }
     };
