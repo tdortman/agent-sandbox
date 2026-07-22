@@ -85,19 +85,6 @@ fn exec_cstrings(args: &[CString]) -> ! {
     }
 }
 
-fn exec_child(args: &[String], sandbox_session_id: &str) -> ! {
-    build_child_args(args, sandbox_session_id).map_or_else(
-        || {
-            agent_sandbox_sysutil::pre_exec_set_var("AGENT_SANDBOX_SESSION_ID", sandbox_session_id);
-            let child_args: Vec<CString> = args.iter().map(|s| cstring(s.as_bytes())).collect();
-            exec_cstrings(&child_args);
-        },
-        |child_args| {
-            exec_cstrings(&child_args);
-        },
-    )
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -163,7 +150,15 @@ fn main() {
     drop(stream);
 
     // 6. Build child argv and exec without approval-capable env vars.
-    exec_child(launcher_args, &cli.sandbox_session_id);
+    if let Some(child_args) = build_child_args(launcher_args, &cli.sandbox_session_id) {
+        exec_cstrings(&child_args);
+    }
+    agent_sandbox_sysutil::pre_exec_set_var("AGENT_SANDBOX_SESSION_ID", &cli.sandbox_session_id);
+    let child_args: Vec<CString> = launcher_args
+        .iter()
+        .map(|arg| cstring(arg.as_bytes()))
+        .collect();
+    exec_cstrings(&child_args);
 }
 
 #[cfg(test)]
