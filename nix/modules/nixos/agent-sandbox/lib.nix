@@ -423,6 +423,7 @@ in
             (builtinCombinators.set-env "SSL_CERT_FILE" proxyTrustBundle)
             (builtinCombinators.set-env "REQUESTS_CA_BUNDLE" proxyTrustBundle)
             (builtinCombinators.set-env "CURL_CA_BUNDLE" proxyTrustBundle)
+            (builtinCombinators.set-env "NODE_EXTRA_CA_CERTS" proxyTrustBundle)
           ])
         ];
 
@@ -626,6 +627,7 @@ in
         RUNTIME_ARGS+=(--setenv SSL_CERT_FILE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
+        RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS ${proxyTrustBundle})
       '';
       dbusScript = lib.optionalString dbusMode ''
         _asbx_dbus_root="${dbusSocketDirectory}/''${UID}"

@@ -382,6 +382,8 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "static proxy wrapper does not set REQUESTS_CA_BUNDLE to the mounted CA bundle"
   grep -F -q -- '--setenv CURL_CA_BUNDLE /run/agent-sandbox/mitmproxy-ca-bundle.pem' "$static_proxy" \
     || fail "static proxy wrapper does not set CURL_CA_BUNDLE to the mounted CA bundle"
+  grep -F -q -- '--setenv NODE_EXTRA_CA_CERTS /run/agent-sandbox/mitmproxy-ca-bundle.pem' "$static_proxy" \
+    || fail "static proxy wrapper does not set NODE_EXTRA_CA_CERTS to the mounted CA bundle"
   grep -F -q -- 'RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/mitmproxy-ca-bundle.pem /run/agent-sandbox/mitmproxy-ca-bundle.pem)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not mount the CA bundle at its non-symlink path"
   grep -F -q -- 'RUNTIME_ARGS+=(--setenv SSL_CERT_FILE /run/agent-sandbox/mitmproxy-ca-bundle.pem)' "$dynamic_proxy" \
@@ -390,6 +392,8 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "dynamic proxy wrapper does not set REQUESTS_CA_BUNDLE to the mounted CA bundle"
   grep -F -q -- 'RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE /run/agent-sandbox/mitmproxy-ca-bundle.pem)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not set CURL_CA_BUNDLE to the mounted CA bundle"
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS /run/agent-sandbox/mitmproxy-ca-bundle.pem)' "$dynamic_proxy" \
+    || fail "dynamic proxy wrapper does not set NODE_EXTRA_CA_CERTS to the mounted CA bundle"
   ${proxyGroupLookupCheck}/bin/proxy-group-lookup-regression nixbld \
     || fail "single proxy-group lookup was rejected"
 
