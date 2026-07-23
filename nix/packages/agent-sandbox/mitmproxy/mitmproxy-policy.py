@@ -5,7 +5,6 @@ policyd over the dedicated proxy Unix socket. The socket is opened afresh for
 each request so an interrupted RPC cannot poison a later request.
 """
 
-
 import asyncio
 import ipaddress
 import json
@@ -19,13 +18,12 @@ from mitmproxy import ctx, http, tcp, udp
 from mitmproxy.connection import Connection
 from mitmproxy.flow import Flow
 
-
 SOCKET_ENV = "AGENT_SANDBOX_PROXY_SOCKET"
 SESSION_READY_ENV = "AGENT_SANDBOX_PROXY_SESSION_READY"
 INVOCATION_ID_ENV = "INVOCATION_ID"
 DEFAULT_SOCKET = "/run/agent-sandbox/proxy-policy.sock"
 MAX_ACTIVE_CHECKS = 256
-MAX_PENDING_BYTES = 256 * 1024
+MAX_PENDING_BYTES = 256 * 1024 * 1024
 DEFAULT_RPC_TIMEOUT = 305.0
 
 
@@ -313,6 +311,7 @@ class NetworkCheckReply:
 
 def _opaque_tls_transport(protocol: str, port: int) -> bool:
     return protocol == "tcp" and port in (443, 8443)
+
 
 class PolicyAddon:
     """A fail-closed, typed adapter between live flows and policyd."""

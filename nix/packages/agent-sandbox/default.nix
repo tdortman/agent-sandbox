@@ -67,6 +67,7 @@ rust.rustPlatform.buildRustPackage {
       --add-flags "--set upstream_cert=false" \
       --add-flags "--set http2=true" \
       --add-flags "--set http3=true" \
+      --add-flags "--set udp_timeout=600" \
       --add-flags "--set validate_inbound_headers=true" \
       --add-flags "--set ssl_insecure=false" \
       --add-flags "--set ssl_verify_upstream_trusted_ca=/run/agent-sandbox/mitmproxy-ca-bundle.pem" \
