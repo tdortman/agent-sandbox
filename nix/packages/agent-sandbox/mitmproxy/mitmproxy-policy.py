@@ -220,10 +220,9 @@ class HttpRequest:
         )
         if path == "":
             path = "/"
-        if path == "*":
-            path_for_wire = "*"
-        else:
-            path_for_wire = path
+        elif path != "*":
+            path = path.split("?", 1)[0].split("#", 1)[0] or "/"
+        path_for_wire = path
         return cls(method, scheme, authority, path_for_wire)
 
     def encode(self) -> dict[str, str]:
@@ -408,6 +407,9 @@ class PolicyAddon:
         except BaseException:
             self._kill(flow)
             await self._release_flow(flow)
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        flow.response.stream = True
 
     def request(self, flow: http.HTTPFlow) -> None:
         content = flow.request.content

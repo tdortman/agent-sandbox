@@ -24,11 +24,13 @@ def _load_addon():
     connection.Connection = object
     flow = types.ModuleType("mitmproxy.flow")
     flow.Flow = object
-    sys.modules.update({
-        "mitmproxy": mitmproxy,
-        "mitmproxy.connection": connection,
-        "mitmproxy.flow": flow,
-    })
+    sys.modules.update(
+        {
+            "mitmproxy": mitmproxy,
+            "mitmproxy.connection": connection,
+            "mitmproxy.flow": flow,
+        }
+    )
     spec = importlib.util.spec_from_file_location(
         "agent_sandbox_mitmproxy_policy",
         Path(__file__).with_name("mitmproxy-policy.py"),
@@ -59,12 +61,19 @@ async def main() -> None:
     )
     assert http_body.ok and http_body.allowed
     network_body = addon_module._decode_reply(
-        {"kind": "network_flow", "reply": {"ok": True, "allowed": True, "source": "allow"}}
+        {
+            "kind": "network_flow",
+            "reply": {"ok": True, "allowed": True, "source": "allow"},
+        }
     )
     assert network_body.ok and network_body.allowed
-    assert addon_module._decode_reply({"kind": "canceled", "reply": {"ok": True}}) is True
+    assert (
+        addon_module._decode_reply({"kind": "canceled", "reply": {"ok": True}}) is True
+    )
     try:
-        addon_module._decode_reply({"kind": "error", "reply": {"ok": False, "error": "denied"}})
+        addon_module._decode_reply(
+            {"kind": "error", "reply": {"ok": False, "error": "denied"}}
+        )
     except addon_module.WireError:
         pass
     else:
@@ -79,6 +88,37 @@ async def main() -> None:
     assert not addon_module._opaque_tls_transport("udp", 443)
     assert addon_module._opaque_tls_transport("tcp", 443)
     assert addon_module._opaque_tls_transport("tcp", 8443)
+    request_flow = types.SimpleNamespace(
+        request=types.SimpleNamespace(
+            data=types.SimpleNamespace(method=b"POST", path=b"/generate?alt=sse"),
+            host_header="example.com",
+        ),
+        client_conn=types.SimpleNamespace(
+            transport_protocol="tcp", tls=True, tls_established=True
+        ),
+    )
+    observed_request = addon_module.HttpRequest.from_flow(request_flow)
+    assert observed_request.encode() == {
+        "method": "POST",
+        "url": "https://example.com/generate",
+    }
+    assert request_flow.request.data.path == b"/generate?alt=sse"
+    sse_response = types.SimpleNamespace(
+        headers={"content-type": "text/event-stream; charset=utf-8"},
+        stream=None,
+    )
+    addon_module.PolicyAddon().responseheaders(
+        types.SimpleNamespace(response=sse_response)
+    )
+    assert sse_response.stream is True
+    json_response = types.SimpleNamespace(
+        headers={"content-type": "application/json"},
+        stream=None,
+    )
+    addon_module.PolicyAddon().responseheaders(
+        types.SimpleNamespace(response=json_response)
+    )
+    assert json_response.stream is True
 
     retry_addon = addon_module.PolicyAddon()
     ready_directory = tempfile.TemporaryDirectory()
@@ -115,9 +155,9 @@ async def main() -> None:
     ready_directory.cleanup()
 
     fast_seen = asyncio.Event()
+
     async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         active: set[asyncio.Task[None]] = set()
-        
 
         async def respond(request: dict[str, object]) -> None:
             seen.append(request)
@@ -178,20 +218,24 @@ async def main() -> None:
             addon_module.ProxyConnectionId(connection_id),
             addon_module.AttributionToken(attribution),
         )
-        claim = await addon._rpc({
-            "op": "claim_network_flow",
-            "proxy_session": session.value,
-            "flow": state.key.encode(),
-            "connection_id": state.connection_id.encode(),
-        })
+        claim = await addon._rpc(
+            {
+                "op": "claim_network_flow",
+                "proxy_session": session.value,
+                "flow": state.key.encode(),
+                "connection_id": state.connection_id.encode(),
+            }
+        )
         assert claim.value == attribution
-        check = await addon._rpc({
-            "op": "check_http",
-            "proxy_session": session.value,
-            "request_id": request_id,
-            "attribution_token": attribution,
-            "request": {"method": "GET", "url": "https://example.com/"},
-        })
+        check = await addon._rpc(
+            {
+                "op": "check_http",
+                "proxy_session": session.value,
+                "request_id": request_id,
+                "attribution_token": attribution,
+                "request": {"method": "GET", "url": "https://example.com/"},
+            }
+        )
         assert check.ok and check.allowed
 
         async def check_url(url: str, check_id: str) -> object:
@@ -204,30 +248,41 @@ async def main() -> None:
                     "request": {"method": "GET", "url": url},
                 }
             )
+
         slow, fast = await asyncio.gather(
-            check_url("https://example.com/slow", "01900000-0000-7000-8000-000000000003"),
-            check_url("https://example.com/fast", "01900000-0000-7000-8000-000000000004"),
+            check_url(
+                "https://example.com/slow", "01900000-0000-7000-8000-000000000003"
+            ),
+            check_url(
+                "https://example.com/fast", "01900000-0000-7000-8000-000000000004"
+            ),
         )
         assert slow.request.path == "/slow"
         assert fast.request.path == "/fast"
-        await addon._rpc({
-            "op": "release_network_flow",
-            "proxy_session": session.value,
-            "attribution_token": attribution,
-        })
+        await addon._rpc(
+            {
+                "op": "release_network_flow",
+                "proxy_session": session.value,
+                "attribution_token": attribution,
+            }
+        )
         await addon.done()
         server.close()
         await server.wait_closed()
 
     check_seen = asyncio.Event()
     cancel_seen = asyncio.Event()
-    async def cancel_serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+
+    async def cancel_serve(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             while line := await reader.readline():
                 request = json.loads(line)
                 if request["op"] == "open_proxy_session":
                     writer.write(
-                        json.dumps({"ok": True, "proxy_session": token}).encode() + b"\n"
+                        json.dumps({"ok": True, "proxy_session": token}).encode()
+                        + b"\n"
                     )
                     await writer.drain()
                 elif request["op"] == "check_http":

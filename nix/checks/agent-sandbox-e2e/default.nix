@@ -332,9 +332,12 @@ let
   httpServerScript = pkgs.writeText "agent-sandbox-vm-http.py" ''
     import sys
     import socket
+    import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def respond(self, body):
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -342,16 +345,30 @@ let
             self.wfile.write(body)
 
         def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/stream":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                first = b"data: first\n\n"
+                self.wfile.write(f"{len(first):X}\r\n".encode() + first + b"\r\n")
+                self.wfile.flush()
+                time.sleep(5)
+                second = b"data: second\n\n"
+                self.wfile.write(f"{len(second):X}\r\n".encode() + second + b"\r\n0\r\n\r\n")
+                self.wfile.flush()
+                return
             bodies = {
                 "/readonly-file": b"readonly-file-marker\n",
                 "/allowed": b"allowed-get\n",
                 "/denied": b"denied-get\n",
                 "/unlisted": b"unlisted-get\n",
             }
-            if self.path not in bodies:
+            if path not in bodies:
                 self.send_error(404)
                 return
-            self.respond(bodies[self.path])
+            self.respond(bodies[path])
 
         def do_POST(self):
             self.respond(b"post-ok\n")
@@ -707,6 +724,10 @@ let
                     methods = [ "GET" ];
                   }
                   {
+                    url = "http://169.254.100.1:8008/stream";
+                    methods = [ "GET" ];
+                  }
+                  {
                     url = "https://169.254.100.1:8443/allowed";
                     methods = [ "GET" ];
                   }
@@ -986,6 +1007,7 @@ let
       sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/mitmproxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
       sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed | grep -q allowed-get", wrapper=session_wrapper)
       sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get", wrapper=session_wrapper)
+      sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 3 curl --no-buffer --fail --silent --show-error 'http://169.254.100.1:8008/stream?alt=sse' | grep -q 'data: first'", wrapper=session_wrapper)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/denied", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/denied", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/allowed", wrapper=session_wrapper, expect_success=False)
