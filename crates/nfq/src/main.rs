@@ -39,7 +39,7 @@ const COPY_RANGE: u16 = u16::MAX;
     about = "NFQUEUE-based packet policy enforcer for the sandbox network namespace",
     long_about = r"NFQUEUE packet interceptor that runs inside the agent-sandbox network namespace.
 nftables queues outbound TCP SYN packets and all UDP packets here.
-For each queued packet the daemon resolves the destination hostname from the DNS forwarder in-memory cache (or the on-disk fallback), asks policyd for a verdict, and either accepts the packet or actively rejects it via a transient nftables set. 
+For each queued packet the daemon resolves the destination hostname from the DNS forwarder in-memory cache (or the on-disk fallback), asks policyd for a verdict, and either accepts the packet or actively rejects it via a transient nftables set.
 Traffic to the local DNS forwarder on port 53 always bypasses policyd so name resolution can never be blocked.
 
 EXAMPLES:
@@ -105,7 +105,8 @@ struct Cli {
     push_socket: PathBuf,
 
     /// Check transport policy before registering owner-identified flows for
-    /// mitmproxy. Direct mode leaves proxy flow registration disabled.
+    /// the transparent proxy. Direct mode leaves proxy flow registration
+    /// disabled.
     #[arg(long)]
     proxy_mode: bool,
 
@@ -595,8 +596,9 @@ fn register_proxy_flow(
             info!(
                 protocol = meta.protocol.as_str(),
                 src = %meta.src_ip,
+                src_port = meta.src_port,
                 dst = %meta.dst_ip,
-                port = meta.dst_port,
+                dst_port = meta.dst_port,
                 "registered proxy flow"
             );
             Verdict::Accept
@@ -670,17 +672,29 @@ where
         return Verdict::Accept;
     }
 
+    info!(
+        protocol = meta.protocol.as_str(),
+        src = %meta.src_ip,
+        src_port = meta.src_port,
+        dst = %meta.dst_ip,
+        dst_port = meta.dst_port,
+        policy_boundary = meta.is_policy_boundary(),
+        "inspected policy packet"
+    );
+
     if !meta.is_policy_boundary() {
         return Verdict::Accept;
     }
 
-    // Loopback traffic never traverses the proxy WireGuard route. Proxy-mode
-    // HTTP(S) flows are registered and accepted here so mitmproxy can decode
+    // Loopback traffic never traverses the transparent proxy route. Proxy-mode
+    // HTTP(S) flows are registered and accepted here so the proxy can decode
     // them; all other destinations stay on the ordinary kernel route and are
     // checked synchronously below.
     let src_pid = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port)
         .map(OwnerSnapshot::pid_value);
+
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
+
     if state.proxy_mode
         && !meta.dst_ip.is_loopback()
         && proxy_flow_port(meta.protocol, meta.dst_port)
@@ -694,11 +708,13 @@ where
 
     let dst_ip = meta.dst_ip.to_string();
     let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
+
     let aliases = state
         .approved_bindings
         .lock()
         .map(|bindings| bindings.aliases(&dst_ip))
         .unwrap_or_default();
+
     let result = check(
         policy_socket,
         &hostname,
@@ -710,20 +726,17 @@ where
         timeout,
     );
 
-    let allowed = match result {
-        Ok(result) => result,
-        Err(err) => {
-            warn!(
-                protocol = meta.protocol.as_str(),
-                host = %hostname,
-                dst = %dst_ip,
-                port = meta.dst_port,
-                error = %err,
-                "policy check failed"
-            );
-            false
-        }
-    };
+    let allowed = result.unwrap_or_else(|err| {
+        warn!(
+            protocol = meta.protocol.as_str(),
+            host = %hostname,
+            dst = %dst_ip,
+            port = meta.dst_port,
+            error = %err,
+            "policy check failed"
+        );
+        false
+    });
 
     if !allowed {
         info!(
@@ -742,6 +755,7 @@ where
         bindings.record(&hostname, &dst_ip);
         let _ = bindings.save();
     }
+
     info!(
         protocol = meta.protocol.as_str(),
         host = %hostname,
@@ -749,6 +763,7 @@ where
         port = meta.dst_port,
         "accept"
     );
+
     Verdict::Accept
 }
 
@@ -782,6 +797,7 @@ fn handle_packet(
             to,
         ))
     };
+
     let mut register = |registration: FlowRegistration| {
         runtime.block_on(policy::register_network_flow(
             policy_socket,
@@ -789,6 +805,7 @@ fn handle_packet(
             timeout,
         ))
     };
+
     handle_packet_payload_with_registration(
         state,
         policy_socket,

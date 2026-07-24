@@ -25,10 +25,13 @@ impl PolicyServer {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
         let listener = UnixListener::bind(path)?;
+
         #[cfg(unix)]
         {
             if let Some(group) = group {
@@ -43,6 +46,7 @@ impl PolicyServer {
             perms.set_mode(mode);
             std::fs::set_permissions(path, perms)?;
         }
+
         Ok(listener)
     }
 
@@ -57,6 +61,7 @@ impl PolicyServer {
             socket = %socket_path.display(),
             "policyd listening"
         );
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -82,6 +87,7 @@ impl PolicyServer {
     pub async fn run(self) -> std::io::Result<()> {
         let host_socket_path = self.store.args().host_socket.clone();
         let sandbox_socket_path = self.store.args().sandbox_socket.clone();
+
         if host_socket_path == sandbox_socket_path {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -99,6 +105,7 @@ impl PolicyServer {
                 "proxy socket must differ from policy sockets",
             ));
         }
+
         if proxy_path.is_some() && proxy_gid.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -208,6 +215,7 @@ mod tests {
         })
         .await
         .expect("host RegisterUi");
+
         assert!(
             matches!(&reply, RpcReply::Error(e) if e.error == "approval session does not match pending sandbox session"),
             "host RegisterUi without sandbox_session_id must be rejected, got: {reply:?}"
@@ -224,6 +232,7 @@ mod tests {
         })
         .await
         .expect("sandbox RegisterUi");
+
         assert!(
             matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
             "sandbox RegisterUi must be rejected, got: {reply:?}"
@@ -236,6 +245,7 @@ mod tests {
         })
         .await
         .expect("sandbox StartFilesystemMonitor");
+
         assert!(
             matches!(&reply, RpcReply::FilesystemMonitor(r) if !r.active && r.error.as_deref() == Some("fs_monitor_cmd not configured")),
             "sandbox StartFilesystemMonitor should reach handler, got: {reply:?}"
@@ -261,6 +271,7 @@ mod tests {
         let mut conn = RpcConnection::connect(&args.host_socket)
             .await
             .expect("connect host socket");
+
         let reply = conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
@@ -271,6 +282,7 @@ mod tests {
             })
             .await
             .expect("RegisterUi");
+
         assert!(
             matches!(&reply, RpcReply::RegisterUi(r) if r.ok),
             "RegisterUi should succeed, got: {reply:?}"
@@ -289,6 +301,7 @@ mod tests {
             })
             .await
             .expect("Check after RegisterUi");
+
         assert!(
             matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on inherited UI policy fd"),
             "Check should be rejected on UiFd connection, got: {reply:?}"
@@ -301,6 +314,7 @@ mod tests {
             })
             .await
             .expect("Status after RegisterUi");
+
         assert!(
             matches!(&reply, RpcReply::Status(_)),
             "Status should succeed on UiFd connection, got: {reply:?}"
@@ -319,11 +333,13 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
         });
+
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let mut ui_conn = RpcConnection::connect(&args.host_socket)
             .await
             .expect("connect host socket");
+
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
@@ -337,11 +353,13 @@ mod tests {
             })
             .await
             .expect("RegisterUi");
+
         assert!(matches!(&reply, RpcReply::RegisterUi(r) if r.ok));
 
         let mut sandbox_conn = RpcConnection::connect(&args.sandbox_socket)
             .await
             .expect("connect sandbox socket");
+
         sandbox_conn
             .write_request(&RpcRequest::Check {
                 host: Some("example.com".into()),
@@ -365,6 +383,7 @@ mod tests {
                 .await
                 .expect("network push timeout")
                 .expect("read network push");
+
         assert!(
             matches!(
                 pushed,
@@ -390,11 +409,13 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
         });
+
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let mut ui_conn = RpcConnection::connect(&args.host_socket)
             .await
             .expect("connect host socket");
+
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
@@ -408,11 +429,13 @@ mod tests {
             })
             .await
             .expect("RegisterUi");
+
         assert!(matches!(&reply, RpcReply::RegisterUi(r) if r.ok));
 
         let mut sandbox_conn = RpcConnection::connect(&args.sandbox_socket)
             .await
             .expect("connect sandbox socket");
+
         sandbox_conn
             .write_request(&RpcRequest::Elevate {
                 argv: vec!["whoami".into()],
@@ -432,6 +455,7 @@ mod tests {
                 .await
                 .expect("elevation push timeout")
                 .expect("read elevation push");
+
         assert!(
             matches!(
                 &pushed,
@@ -474,6 +498,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let _ = server.run().await;
         });
+
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Attacker (inside the sandbox) connects to the sandbox socket and
@@ -482,6 +507,7 @@ mod tests {
         let mut attacker = RpcConnection::connect(&args.sandbox_socket)
             .await
             .expect("connect sandbox socket");
+
         let reply = attacker
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
@@ -495,6 +521,7 @@ mod tests {
             })
             .await
             .expect("sandbox RegisterUi");
+
         assert!(
             matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
             "sandbox RegisterUi must be rejected to block the self-approval escape, got: {reply:?}"
@@ -515,6 +542,7 @@ mod tests {
             })
             .await
             .expect("sandbox Approve");
+
         assert!(
             matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
             "Approve must remain blocked on a sandbox connection that failed to register, got: \

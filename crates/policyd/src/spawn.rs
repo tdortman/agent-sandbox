@@ -244,6 +244,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
             .spawn();
     }
 }
+
 struct UiSpawnCmd {
     command: std::process::Command,
     log_path: PathBuf,

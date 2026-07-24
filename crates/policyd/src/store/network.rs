@@ -1,4 +1,5 @@
 //! Policy store, network.
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -526,6 +527,7 @@ impl PolicyStore {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

@@ -155,6 +155,7 @@ pub struct PendingNetwork {
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
+
 #[derive(Debug, Clone)]
 pub struct PendingHttp {
     /// Wire/display identifier. The typed ID is retained in `pending_id`.
@@ -176,6 +177,7 @@ pub struct PendingFilesystem {
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
+
 #[derive(Debug, Clone)]
 pub struct PendingResource {
     pub id: String,
@@ -415,6 +417,7 @@ pub struct ProxyFlowState {
     pub claimed_at: Option<Instant>,
     pub last_check: Instant,
 }
+
 /// One decoded HTTP check waiting for the policy UI.
 pub struct HttpWaiter {
     pub request_id: ProxyRequestId,
@@ -422,15 +425,18 @@ pub struct HttpWaiter {
     pub attribution_token: AttributionToken,
     pub tx: oneshot::Sender<HttpCheckReply>,
 }
+
 /// One transport fallback check waiting for a policy verdict.
 pub struct NetworkWaiter {
     pub proxy: Option<(ProxySessionToken, ProxyRequestId)>,
     pub tx: oneshot::Sender<CheckReply>,
 }
+
 pub enum ProxyCancellation {
     Active(oneshot::Sender<()>),
     Canceled,
 }
+
 pub struct PolicyDecisionState {
     pub(crate) session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
     pub(crate) once_allow: HashSet<NetworkRuleKey>,

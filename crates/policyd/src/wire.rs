@@ -131,6 +131,7 @@ pub struct ResourceCheckRequest {
     pub access: ResourceAccess,
     pub ctx: ResolvedRequestContext,
 }
+
 #[derive(Debug, Clone)]
 pub struct DbusCheckRequest {
     pub target: DbusTarget,

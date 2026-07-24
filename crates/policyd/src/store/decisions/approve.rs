@@ -1,4 +1,5 @@
 //! Apply pending network or elevation decisions.
+
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{

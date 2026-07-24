@@ -95,6 +95,7 @@ pub fn default_syscalls() -> BTreeSet<i64> {
         nr::IO_URING_ENTER,
         nr::IO_URING_REGISTER,
     ]);
+
     push_filesystem_mutation_syscalls(&mut syscalls);
     syscalls
 }

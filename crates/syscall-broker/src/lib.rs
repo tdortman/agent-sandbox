@@ -408,6 +408,7 @@ fn parse_sockaddr(bytes: &[u8], addrlen: usize) -> Option<SockaddrTarget> {
 /// Returns an error if reading tracee memory via `process_vm_readv` fails.
 fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let scheme = scheme_for_fd(notif, notif.data.args[0], "tcp");
+
     sockaddr_target(
         notif,
         notif.data.args[1],
@@ -430,6 +431,7 @@ fn target_from_connect(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>
 /// Returns an error if reading tracee memory via `process_vm_readv` fails.
 fn target_from_sendto(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let scheme = scheme_for_fd(notif, notif.data.args[0], "udp");
+
     sockaddr_target(
         notif,
         notif.data.args[4],
@@ -491,6 +493,7 @@ fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>
         return Ok(None);
     };
     let scheme = scheme_for_fd(notif, notif.data.args[0], "udp");
+
     sockaddr_target(
         notif,
         mhdr.name,

@@ -49,6 +49,7 @@ pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
             SeccompAction::Trap
         }
     };
+
     SeccompFilter::new(rules, SeccompAction::Allow, action, target_arch())
         .expect("seccomp filter construction is total for non-empty rule maps")
         .try_into()

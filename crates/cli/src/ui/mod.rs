@@ -100,12 +100,14 @@ async fn acquire_prompt_lock(path: PathBuf) -> Result<Flock<File>, UiCliError> {
                     path.display()
                 ))
             })?;
+
         let metadata = file.metadata().map_err(|err| {
             UiCliError::Register(format!(
                 "failed to inspect prompt lock {}: {err}",
                 path.display()
             ))
         })?;
+
         if metadata.uid() != nix::unistd::Uid::current().as_raw()
             || (metadata.mode() & 0o7777) != 0o600
         {
@@ -114,6 +116,7 @@ async fn acquire_prompt_lock(path: PathBuf) -> Result<Flock<File>, UiCliError> {
                 path.display()
             )));
         }
+
         Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, err)| {
             UiCliError::Register(format!(
                 "failed to lock prompt lock {}: {err}",
@@ -186,6 +189,7 @@ pub async fn run() -> Result<(), UiCliError> {
         cli.home,
         cli.project_root,
     ));
+
     ctx.sandbox_session_id = cli.sandbox_session_id;
     let paths = ctx.sandbox_paths();
     UiClient::new(cli.socket, paths, ctx.sandbox_session_id)

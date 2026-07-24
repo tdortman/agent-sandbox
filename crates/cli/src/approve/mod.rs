@@ -40,6 +40,7 @@ struct Cli {
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     socket: PathBuf,
+
     #[command(subcommand)]
     cmd: Command,
 }
@@ -69,6 +70,7 @@ enum Command {
         #[command(flatten)]
         context: ContextArgs,
     },
+
     /// Approve a pending request and persist the rule at the requested scope.
     Approve {
         /// Request id printed by "pending". Identifies the queued elevation,
@@ -88,6 +90,7 @@ enum Command {
         #[command(flatten)]
         context: ContextArgs,
     },
+
     /// Pre-approve a single (host, port) pair without an outstanding request.
     /// Writes the rule directly to policyd.
     ApproveHost {
@@ -111,6 +114,7 @@ enum Command {
         #[command(flatten)]
         context: ContextArgs,
     },
+
     /// Pre-approve a decoded HTTP method and URL target.
     ApproveHttp {
         /// URL or URL pattern without a query string or fragment.
@@ -134,6 +138,7 @@ enum Command {
         #[command(flatten)]
         context: ContextArgs,
     },
+
     /// Deny a pending request and persist the deny rule at the requested scope.
     Deny {
         /// Request id printed by "pending".
@@ -153,6 +158,7 @@ enum Command {
         context: ContextArgs,
     },
 }
+
 /// Parse CLI args, dispatch to the matching subcommand handler, and print the
 /// result.
 ///

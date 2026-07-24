@@ -1,4 +1,5 @@
 //! Policy store: network scope application.
+
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{

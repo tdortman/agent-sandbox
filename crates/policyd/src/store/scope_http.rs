@@ -194,6 +194,11 @@ impl PolicyStore {
                 .collect::<Vec<_>>()
         };
         let once = scope == ApprovalScope::Once;
+        let source = if allowed {
+            VerdictSource::Scope(scope)
+        } else {
+            VerdictSource::User
+        };
         let once_keys = once
             .then(|| build_once_keys(&target, &context))
             .transpose()?
@@ -202,7 +207,7 @@ impl PolicyStore {
             let mut delivered = false;
             for pending_id in pending_ids {
                 if self
-                    .finish_http(pending_id, allowed, VerdictSource::Scope(scope), true)
+                    .finish_http(pending_id, allowed, source.clone(), true)
                     .await
                 {
                     delivered = true;
@@ -218,7 +223,7 @@ impl PolicyStore {
             }
         } else {
             for pending_id in pending_ids {
-                self.finish_http(pending_id, allowed, VerdictSource::Scope(scope), false)
+                self.finish_http(pending_id, allowed, source.clone(), false)
                     .await;
             }
         }
@@ -268,13 +273,13 @@ impl PolicyStore {
         // pending request is resolved even when a broad target did not match
         // the caller's path context exactly.
         if scope == ApprovalScope::Once {
-            self.finish_http(
-                pending.pending_id,
-                allowed,
-                VerdictSource::Scope(scope),
-                true,
-            )
-            .await;
+            let source = if allowed {
+                VerdictSource::Scope(scope)
+            } else {
+                VerdictSource::User
+            };
+            self.finish_http(pending.pending_id, allowed, source, true)
+                .await;
         }
         Ok(reply)
     }

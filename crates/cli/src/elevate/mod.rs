@@ -67,6 +67,7 @@ pub async fn run() -> Result<(), ElevateCliError> {
             .unwrap_or_default(),
         std::env::var("AGENT_SANDBOX_PROJECT_ROOT").unwrap_or_default(),
     );
+
     let pid = std::process::id();
     let uid = nix::unistd::getuid().as_raw();
 

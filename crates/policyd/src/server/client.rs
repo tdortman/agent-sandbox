@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use agent_sandbox_core::{ProxyReply, ProxyRequestId, ProxySessionToken, RpcReply, RpcRequest};
+use agent_sandbox_core::{
+    ProxyReply, ProxyRequestId, ProxySessionToken, RpcMessage, RpcReply, RpcRequest,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -34,8 +36,10 @@ pub async fn handle_client(
     let client = PolicyStore::new_client_handle(writer.clone());
     let mut reader = BufReader::new(reader);
     let mut read_error = None;
+
     let active_checks: Arc<Mutex<Vec<(ProxySessionToken, ProxyRequestId)>>> =
         Arc::new(Mutex::new(Vec::new()));
+
     let mut proxy_session_owner = false;
     let mut proxy_single_request = false;
 
@@ -52,12 +56,15 @@ pub async fn handle_client(
                 break;
             }
         };
+
         if role == SocketRole::Proxy && (proxy_session_owner || proxy_single_request) {
             break;
         }
+
         if line.is_empty() {
             continue;
         }
+
         let req: RpcRequest = if let Ok(req) = serde_json::from_str(&line) {
             req
         } else {
@@ -69,6 +76,7 @@ pub async fn handle_client(
             &req,
             RpcRequest::CheckHttp { .. } | RpcRequest::CheckNetworkFlow { .. }
         );
+
         if role == SocketRole::Proxy && is_long_check {
             if !spawn_proxy_check(
                 store.clone(),
@@ -82,6 +90,7 @@ pub async fn handle_client(
             {
                 continue;
             }
+
             proxy_single_request = true;
             continue;
         }
@@ -89,6 +98,7 @@ pub async fn handle_client(
 
         let is_open_proxy_session = matches!(&req, RpcRequest::OpenProxySession);
         let is_register = matches!(req, RpcRequest::RegisterUi { .. });
+
         let resp = match super::dispatch::dispatch(&store, &client, peer, role, req).await {
             Ok(value) => value,
             Err(err) => {
@@ -96,9 +106,11 @@ pub async fn handle_client(
                 err.into()
             }
         };
+
         let resp = envelope_proxy_reply(role, request_id, resp);
         let register_succeeded = is_register && resp.is_ok();
         reply(writer.clone(), &resp).await;
+
         if role == SocketRole::Proxy {
             if is_open_proxy_session && resp.is_ok() {
                 proxy_session_owner = true;
@@ -156,11 +168,14 @@ async fn spawn_proxy_check(
     let Some((proxy_session, request_id)) = proxy_check_identity(&req) else {
         return false;
     };
+
     active_checks
         .lock()
         .await
         .push((proxy_session.clone(), request_id));
+
     let active_checks_for_task = active_checks;
+
     tokio::spawn(async move {
         let resp =
             match super::dispatch::dispatch(&store, &client, peer, SocketRole::Proxy, req).await {
@@ -170,9 +185,11 @@ async fn spawn_proxy_check(
                     err.into()
                 }
             };
+
         let resp = envelope_proxy_reply(SocketRole::Proxy, Some(request_id), resp);
         reply(writer, &resp).await;
         let mut active = active_checks_for_task.lock().await;
+
         if let Some(index) = active
             .iter()
             .position(|(session, id)| *id == request_id && session == &proxy_session)
@@ -207,6 +224,7 @@ fn proxy_check_identity(req: &RpcRequest) -> Option<(ProxySessionToken, ProxyReq
         _ => None,
     }
 }
+
 fn envelope_proxy_reply(
     role: SocketRole,
     request_id: Option<ProxyRequestId>,
@@ -217,6 +235,7 @@ fn envelope_proxy_reply(
     {
         return RpcReply::Proxy(ProxyReply::from_reply(request_id, reply));
     }
+
     reply
 }
 
@@ -226,8 +245,10 @@ async fn read_line_limited(
 ) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     let mut chunk = [0_u8; 1];
+
     loop {
         let n = reader.read(&mut chunk).await?;
+
         if n == 0 {
             return if buf.is_empty() {
                 Ok(None)
@@ -237,27 +258,38 @@ async fn read_line_limited(
                 })?))
             };
         }
+
         if chunk[0] == b'\n' {
             return Ok(Some(String::from_utf8(buf).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
             })?));
         }
+
         if buf.len() >= max_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "RPC line too large",
             ));
         }
+
         buf.push(chunk[0]);
     }
 }
 
 async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
-    let line = payload.to_string();
+    let line = match RpcMessage::Reply(payload.clone()).encode_line() {
+        Ok(line) => line,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize policyd RPC reply");
+            return;
+        }
+    };
     let mut w = writer.lock().await;
+
     if w.write_all(line.as_bytes()).await.is_err() {
         return;
     }
+
     drop(line);
     let _ = w.flush().await;
     drop(w);

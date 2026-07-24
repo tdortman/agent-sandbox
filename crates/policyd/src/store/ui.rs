@@ -1,4 +1,5 @@
 //! Policy store: ui.
+
 use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
 
 use agent_sandbox_core::{
@@ -394,7 +395,14 @@ impl PolicyStore {
     }
 
     async fn send_to_targets(&self, payload: &UiPush, targets: &[UiNotificationTarget]) -> bool {
-        let line = RpcMessage::UiPush(payload.clone()).to_string();
+        let line = match RpcMessage::UiPush(payload.clone()).encode_line() {
+            Ok(line) => line,
+            Err(error) => {
+                tracing::error!(%error, "failed to serialize policyd UI push");
+                return false;
+            }
+        };
+
         for (id, writer) in targets {
             let mut w = writer.lock().await;
             if w.write_all(line.as_bytes()).await.is_ok() {

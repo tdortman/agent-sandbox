@@ -40,6 +40,7 @@ pub enum CgroupFreezeError {
     #[error("cannot persist cgroup freeze state: {0}")]
     Registry(#[source] io::Error),
 }
+
 #[derive(Clone)]
 pub struct CgroupFreezeManager {
     state: Arc<Mutex<FreezeState>>,
@@ -160,6 +161,7 @@ impl CgroupFreezeManager {
         }
     }
 }
+
 /// Thaw every cgroup recorded by the previous policy daemon instance.
 ///
 /// # Errors
@@ -249,6 +251,7 @@ fn set_frozen(path: &Path, frozen: bool) -> Result<(), CgroupFreezeError> {
         }
     })
 }
+
 fn persist_registry<'a>(
     registry: &Path,
     paths: impl Iterator<Item = &'a PathBuf>,

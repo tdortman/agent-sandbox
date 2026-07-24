@@ -1,4 +1,5 @@
 //! Policy store: sudo scope application.
+
 use std::path::PathBuf;
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};

@@ -1,4 +1,5 @@
 //! Policy store: resource gate (declarative approval flow).
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},

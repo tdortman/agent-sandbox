@@ -8,6 +8,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
+    os::unix::net::UnixDatagram,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -15,7 +16,10 @@ use std::{
 
 use agent_sandbox_core::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, mappings_from_response};
 use clap::Parser;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::{
+    op::{Message, MessageType, ResponseCode},
+    rr::RecordType,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -81,6 +85,10 @@ struct Args {
 
     #[arg(long)]
     verbose: bool,
+
+    /// Remove HTTPS/SVCB answers so clients cannot learn QUIC alternatives.
+    #[arg(long)]
+    suppress_https_svcb: bool,
 }
 
 #[derive(Clone)]
@@ -88,7 +96,8 @@ struct DnsForwarder {
     cache: Arc<std::sync::Mutex<DnsCache>>,
     max_ttl: u32,
     verbose: bool,
-    push_socket: Arc<std::os::unix::net::UnixDatagram>,
+    suppress_https_svcb: bool,
+    push_socket: Arc<UnixDatagram>,
     push_socket_path: PathBuf,
     cache_client_ip: Option<IpAddr>,
     forward_target: SocketAddr,
@@ -111,16 +120,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dns_cache = DnsCache::new(Some(&args.cache_path), args.max_ttl);
     dns_cache.reload();
     let cache = Arc::new(std::sync::Mutex::new(dns_cache));
+
     if let Some(parent) = args.push_socket.parent()
         && !parent.as_os_str().is_empty()
     {
         let _ = std::fs::create_dir_all(parent);
     }
-    let push_socket = Arc::new(std::os::unix::net::UnixDatagram::unbound()?);
+
+    let push_socket = Arc::new(UnixDatagram::unbound()?);
+
     let forwarder = DnsForwarder {
         cache,
         max_ttl: args.max_ttl,
         verbose: args.verbose,
+        suppress_https_svcb: args.suppress_https_svcb,
         push_socket: push_socket.clone(),
         push_socket_path: args.push_socket.clone(),
         cache_client_ip: args.cache_client_ip,
@@ -131,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = format!("{}:{}", args.listen_host, args.listen_port);
     let udp = UdpSocket::bind(&bind).await?;
     let tcp = TcpListener::bind(&bind).await?;
+
     info!(
         %bind,
         cache = %args.cache_path.display(),
@@ -140,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let udp = Arc::new(udp);
     let udp_forwarder = forwarder.clone();
+
     let udp_task = tokio::spawn(async move {
         let mut buf = vec![0_u8; 65_535];
         loop {
@@ -158,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let tcp_forwarder = forwarder.clone();
+
     let tcp_task = tokio::spawn(async move {
         loop {
             let Ok((stream, peer)) = tcp.accept().await else {
@@ -195,6 +211,8 @@ impl DnsForwarder {
                 }
             }
         };
+
+        let resp = self.sanitize_response(resp)?;
         self.record_mappings_from_response(&resp, peer);
         sock.send_to(&resp, peer).await?;
         Ok(())
@@ -208,10 +226,12 @@ impl DnsForwarder {
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(err) => return Err(err),
             };
+
             let mut data = vec![0_u8; usize::from(len)];
             if stream.read_exact(&mut data).await.is_err() {
                 break;
             }
+
             let resp = match self.forward_tcp(&data).await {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -224,6 +244,8 @@ impl DnsForwarder {
                     }
                 }
             };
+
+            let resp = self.sanitize_response(resp)?;
             self.record_mappings_from_response(&resp, peer);
             let resp_len = u16::try_from(resp.len()).unwrap_or(0);
             stream.write_u16(resp_len).await?;
@@ -237,6 +259,7 @@ impl DnsForwarder {
             IpAddr::V4(_) => "0.0.0.0:0",
             IpAddr::V6(_) => "[::]:0",
         };
+
         let sock = UdpSocket::bind(bind_addr).await?;
         let forward_fut = async {
             sock.send_to(data, self.forward_target).await?;
@@ -244,6 +267,7 @@ impl DnsForwarder {
             let (len, _) = sock.recv_from(&mut buf).await?;
             Ok(buf[..len].to_vec())
         };
+
         tokio::time::timeout(self.forward_timeout, forward_fut)
             .await
             .map_err(|_| {
@@ -266,6 +290,7 @@ impl DnsForwarder {
                 "dns upstream forward timed out",
             )
         })??;
+
         let forward_fut = async {
             let len = u16::try_from(data.len()).map_err(|_| {
                 std::io::Error::new(
@@ -280,6 +305,7 @@ impl DnsForwarder {
             stream.read_exact(&mut resp).await?;
             Ok(resp)
         };
+
         tokio::time::timeout(self.forward_timeout, forward_fut)
             .await
             .map_err(|_| {
@@ -288,6 +314,30 @@ impl DnsForwarder {
                     "dns upstream forward timed out",
                 )
             })?
+    }
+
+    fn sanitize_response(&self, response: Vec<u8>) -> std::io::Result<Vec<u8>> {
+        if !self.suppress_https_svcb {
+            return Ok(response);
+        }
+
+        let mut message = Message::from_vec(&response).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+
+        let remove_metadata = |records: &mut Vec<hickory_proto::rr::Record>| {
+            records.retain(|record| {
+                !matches!(record.record_type(), RecordType::HTTPS | RecordType::SVCB)
+            });
+        };
+
+        remove_metadata(&mut message.answers);
+        remove_metadata(&mut message.authorities);
+        remove_metadata(&mut message.additionals);
+
+        message.to_vec().map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })
     }
 
     fn record_mappings_from_response(&self, response: &[u8], peer: SocketAddr) {
@@ -301,6 +351,7 @@ impl DnsForwarder {
             );
             return;
         }
+
         let mappings = mappings_from_response(response);
         if mappings.is_empty() {
             return;
@@ -315,14 +366,17 @@ impl DnsForwarder {
                 );
             }
         }
+
         if let Some(push_path) = self.push_socket_path.to_str() {
             for mapping in &mappings {
                 let ttl = mapping.ttl.min(self.max_ttl);
+
                 let payload = serde_json::json!({
                     "ip": &mapping.ip,
                     "host": &mapping.hostname,
                     "ttl": ttl,
                 });
+
                 if let Ok(mut line) = serde_json::to_string(&payload) {
                     line.push('\n');
                     let send_result = self.push_socket.send_to(line.as_bytes(), push_path);
@@ -355,7 +409,10 @@ impl DnsForwarder {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        os::unix::net::UnixDatagram,
+    };
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query, ResponseCode},
@@ -380,9 +437,8 @@ mod tests {
             ))),
             max_ttl: DEFAULT_MAX_TTL,
             verbose: false,
-            push_socket: Arc::new(
-                std::os::unix::net::UnixDatagram::unbound().expect("unbound push socket"),
-            ),
+            suppress_https_svcb: false,
+            push_socket: Arc::new(UnixDatagram::unbound().expect("unbound push socket")),
             push_socket_path: PathBuf::from("/nonexistent/dns-push.sock"),
             cache_client_ip: None,
             forward_target,
@@ -402,6 +458,24 @@ mod tests {
                 RData::TXT(TXT::new(vec!["sandbox-test".to_string()])),
             ));
         message.to_vec().expect("encode response")
+    }
+
+    #[test]
+    fn suppresses_https_and_svcb_answers() -> Result<(), Box<dyn std::error::Error>> {
+        use hickory_proto::rr::rdata::svcb::SVCB;
+
+        let name = Name::from_ascii("example.com.")?;
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        message.add_answer(Record::from_rdata(
+            name,
+            300,
+            RData::SVCB(SVCB::new(1, Name::root(), Vec::new())),
+        ));
+        let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
+        forwarder.suppress_https_svcb = true;
+        let filtered = Message::from_vec(&forwarder.sanitize_response(message.to_vec()?)?)?;
+        assert!(filtered.answers.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

@@ -135,11 +135,13 @@ async fn main() -> Result<(), PolicydError> {
         .init();
 
     let cli = Cli::parse();
+
     if cli.cleanup_cgroup_freeze {
         agent_sandbox_policyd::cleanup_cgroup_freeze()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         return Ok(());
     }
+
     let args = PolicydArgs {
         host_socket: cli.socket,
         sandbox_socket: cli.sandbox_socket,
@@ -179,19 +181,24 @@ mod tests {
     fn cli_defaults_preserve_standalone_fallbacks() {
         let cli = Cli::try_parse_from(["agent-sandbox-policyd"])
             .expect("standalone invocation has valid defaults");
+
         assert_eq!(cli.socket, PathBuf::from("/run/agent-sandbox/policy.sock"));
+
         assert_eq!(
             cli.sandbox_socket,
             PathBuf::from("/run/agent-sandbox/sandbox-policy.sock")
         );
+
         assert_eq!(
             cli.declarative,
             PathBuf::from("/etc/agent-sandbox/declarative.json")
         );
+
         assert_eq!(
             cli.export_json,
             PathBuf::from("/var/lib/agent-sandbox/exported-policy.json")
         );
+
         assert_eq!(cli.export_nix, "");
         assert!((cli.approval_timeout - 300.0).abs() < f64::EPSILON);
         assert!(cli.interactive_approval);
@@ -225,21 +232,27 @@ mod tests {
             "/bin/test-broker",
         ])
         .expect("explicit launch facts parse");
+
         assert_eq!(cli.socket, PathBuf::from("/run/test/policy.sock"));
+
         assert_eq!(
             cli.sandbox_socket,
             PathBuf::from("/run/test/sandbox-policy.sock")
         );
+
         assert_eq!(cli.declarative, PathBuf::from("/etc/test/declarative.json"));
+
         assert_eq!(
             cli.export_json,
             PathBuf::from("/var/lib/test/exported-policy.json")
         );
+
         assert_eq!(cli.export_nix, "/var/lib/test/policy.nix");
         assert!((cli.approval_timeout - 42.5).abs() < f64::EPSILON);
         assert!(!cli.interactive_approval);
         assert_eq!(cli.ui_spawn_cmd, Some(PathBuf::from("/bin/test-ui")));
         assert_eq!(cli.fs_monitor_cmd, Some(PathBuf::from("/bin/test-fsmon")));
+
         assert_eq!(
             cli.syscall_broker_cmd,
             Some(PathBuf::from("/bin/test-broker"))

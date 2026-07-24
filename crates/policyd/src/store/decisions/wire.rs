@@ -7,6 +7,7 @@ use super::super::types::{
     PendingResource, PolicyStore,
 };
 use crate::wire::{PendingDecision, ScopeWire};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionAction {
     Approve,

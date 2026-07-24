@@ -1,4 +1,5 @@
 //! Policy store: filesystem (fanotify monitor spawn and declarative checks).
+
 use std::{
     io::BufRead,
     path::{Path, PathBuf},

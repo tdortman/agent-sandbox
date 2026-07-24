@@ -21,23 +21,28 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept client");
         let mut request = String::new();
+
         BufReader::new(stream.try_clone().expect("clone stream"))
             .read_line(&mut request)
             .expect("read request");
+
         let request: serde_json::Value =
             serde_json::from_str(request.trim()).expect("valid request JSON");
+
         assert_eq!(request["op"], "start_filesystem_monitor");
         assert_eq!(request["ctx"]["pid"], std::process::id());
         assert_eq!(request["static_allow"][0]["path"], "/workspace");
         assert_eq!(request["static_allow"][0]["access"], "write");
 
         let reply = RpcReply::FilesystemMonitor(FilesystemMonitorReply::active());
+
         writeln!(
             stream,
             "{}",
             serde_json::to_string(&reply).expect("serialize reply")
         )
         .expect("write reply");
+
         stream.flush().expect("flush reply");
     });
 
@@ -45,11 +50,13 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
         pid: Some(std::process::id()),
         ..RequestContext::default()
     };
+
     let rules = vec![FilesystemRule {
         path: PathBuf::from("/workspace"),
         access: FileAccess::Write,
         comment: None,
     }];
+
     let reply = start_monitor(&socket_path, ctx, rules).expect("start monitor RPC");
     assert!(reply.ok);
     assert!(reply.active);

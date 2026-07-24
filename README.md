@@ -31,7 +31,7 @@ Use `sudoPolicy = "approve"` to gate sudo. Set `uiBackend = "none"` for headless
 | Gate       | Behavior                                                                                                                                        |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Network    | Per-sandbox network namespace and outbound TCP/UDP checks.                                                                                      |
-| HTTP proxy | Optional HTTP/1.1, HTTP/2, and HTTP/3 inspection through mitmproxy.                                                                             |
+| HTTP proxy | Optional HTTP/1.1 and HTTP/2 inspection through the transparent proxy.                                                                |
 | Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
 | Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
 | Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |

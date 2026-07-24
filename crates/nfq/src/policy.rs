@@ -36,6 +36,7 @@ pub async fn check_destination(
     let ctx = resolve_context(args.src_pid);
     let scheme = args.protocol.as_str();
     let url = format!("{scheme}://{}:{}", args.hostname, args.dst_port);
+
     let req = RpcRequest::Check {
         host: Some(args.hostname.to_string()),
         connect_host: Some(args.dst_ip.to_string()),
@@ -53,16 +54,16 @@ pub async fn check_destination(
     let resp = policy_rpc(socket, req, timeout)
         .await
         .map_err(|err| std::io::Error::other(err.to_string()))?;
+
     let allowed = matches!(resp, RpcReply::Check(check) if check.allowed);
     Ok(allowed)
 }
 
 /// Register one owner-identified flow with policyd before proxy forwarding.
 ///
-/// Registration is deliberately separate from transport `Check`: proxy mode
-/// asks policyd to validate the typed owner snapshot and stores the flow for
-/// mitmproxy to claim later. Any malformed reply is an RPC failure and must be
-/// treated as a failed registration by callers.
+/// Asks policyd to validate the typed owner snapshot and stores the flow for
+/// the transparent proxy to claim later. Any malformed reply is an RPC failure
+/// and must be treated as a failed registration by callers.
 pub async fn register_network_flow(
     socket: &str,
     registration: FlowRegistration,
@@ -75,6 +76,7 @@ pub async fn register_network_flow(
     )
     .await
     .map_err(|error| std::io::Error::other(error.to_string()))?;
+
     match response {
         RpcReply::Simple(reply) => Ok(reply.ok),
         RpcReply::Error(error) => Err(std::io::Error::other(error.error)),

@@ -49,6 +49,7 @@ pub(super) fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
     }
     project_or_cwd_matches(ui, route)
 }
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

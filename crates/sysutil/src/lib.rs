@@ -197,6 +197,7 @@ pub fn join_mount_namespace(target_pid: u32) -> io::Result<()> {
         nix::fcntl::OFlag::O_RDONLY,
         nix::sys::stat::Mode::empty(),
     )?;
+
     nix::sched::setns(&ns_fd, nix::sched::CloneFlags::CLONE_NEWNS).map_err(io::Error::from)
 }
 

@@ -91,9 +91,7 @@ impl PolicyStore {
                     })
             });
             if denied {
-                return Some(Verdict::denied(VerdictSource::Scope(
-                    ApprovalScope::Session,
-                )));
+                return Some(Verdict::denied(VerdictSource::User));
             }
             if inner.http_once_deny.remove(&key) {
                 return Some(Verdict::denied(VerdictSource::User));
@@ -482,8 +480,9 @@ mod tests {
     use std::time::Duration;
 
     use agent_sandbox_core::{
-        ApprovalScope, AttributionToken, FlowContext, FlowProtocol, FlowRegistration, HttpRequest,
-        HttpRule, NetworkFlowKey, NormalizedPolicyHost, Policy, ProcessIdentity, ProcessIds,
+        ApprovalScope, AttributionToken, FlowContext, FlowProtocol, FlowRegistration,
+        HttpCheckReply, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRule, HttpRuleTarget,
+        NetworkFlowKey, NormalizedPolicyHost, Policy, ProcessIdentity, ProcessIds,
         ProxyConnectionId, ProxyRequestId, ProxySessionToken, ResolvedRequestContext, SandboxPaths,
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
@@ -552,6 +551,38 @@ mod tests {
             "policy allow must not prompt"
         );
     }
+    #[tokio::test]
+    async fn one_shot_http_denial_returns_serializable_user_source() {
+        let (store, ..) = test_http_store().await;
+        let request =
+            HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
+        let context = ResolvedRequestContext::new(
+            SandboxPaths::default(),
+            ProcessIds::default(),
+            Some("test-session".into()),
+        );
+        let target = HttpRuleTarget::new(
+            HttpMethodMatcher::Exact(HttpMethod::parse("GET").expect("HTTP method")),
+            request.url.clone(),
+        )
+        .expect("HTTP target");
+
+        store
+            .apply_http_scope(target, ApprovalScope::Once, None, context.clone(), false)
+            .await
+            .expect("apply one-shot denial");
+
+        let verdict = store
+            .evaluate_http(&request, &context)
+            .await
+            .expect("HTTP policy verdict");
+        let reply = HttpCheckReply::from_verdict(request, verdict);
+
+        assert!(reply.ok);
+        assert!(!reply.allowed);
+        assert_eq!(reply.source, VerdictSource::User);
+    }
+
     #[test]
     fn partial_http_method_deny_preserves_allow_and_narrow_path() {
         let dir = tempfile::tempdir().expect("create tempdir");

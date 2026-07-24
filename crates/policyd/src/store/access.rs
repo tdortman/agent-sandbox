@@ -555,6 +555,7 @@ impl PolicyStore {
         })
     }
 }
+
 fn session_resource_matches(
     bucket: &HashSet<ResourceRuleKey>,
     kind: ResourceKind,
@@ -730,6 +731,7 @@ impl PolicyStore {
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, path::Path, sync::Arc};

@@ -1,4 +1,5 @@
 //! Policy store: filesystem scope application.
+
 use std::path::PathBuf;
 
 use agent_sandbox_core::{

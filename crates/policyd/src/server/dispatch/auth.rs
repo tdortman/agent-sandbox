@@ -53,6 +53,7 @@ pub const fn is_proxy_request(req: &RpcRequest) -> bool {
             | RpcRequest::ReleaseNetworkFlow { .. }
     )
 }
+
 /// Whether the request is allowed on an inherited UI fd (already-registered UI
 /// connection).
 #[must_use]

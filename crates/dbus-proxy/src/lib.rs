@@ -192,24 +192,30 @@ async fn handle_client(
     let credentials = getsockopt(&client_socket, PeerCredentials).map_err(|error| {
         RelayError::Message(format!("cannot read D-Bus peer credentials: {error}"))
     })?;
+
     config.context.pid = u32::try_from(credentials.pid()).ok();
     config.context.uid = Some(credentials.uid());
+
     let client_stream = Builder::unix_stream(client_socket)
         .p2p()
         .server(Guid::generate())?
         .build_message_stream()
         .await?;
+
     let upstream_stream = Builder::address(config.upstream_address.as_str())?
         .build_message_stream()
         .await?;
+
     let client_connection = Connection::from(&client_stream);
     let upstream_connection = Connection::from(&upstream_stream);
     let upstream_name = upstream_connection
         .unique_name()
         .map(ToString::to_string)
         .ok_or_else(|| RelayError::Message("upstream has no unique name".into()))?;
+
     let mut policy = PersistentRpcClient::new(config.policy_socket.clone());
     let mut serials = SerialMap::new();
+
     relay_loop(
         RelayChannels {
             client_stream,
