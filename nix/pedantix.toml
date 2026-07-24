@@ -1,0 +1,196 @@
+[args]
+first = ["config", "lib", "pkgs", "options", "modulesPath", "utils"]
+last = ["<defaulted>", "..."]
+
+[attrs]
+first = [
+  "pname",
+  "version",
+  "src",
+  "type",
+  "device",
+  "imports",
+  "options",
+  "config",
+  "enable",
+  "package",
+  "example",
+  "default",
+  "defaultText",
+  "size",
+  "content",
+  "input",
+  "inputChannels",
+  "output",
+  "mutedInputs",
+  "appCategories",
+  "fallbackCategory",
+]
+last = ["meta"]
+
+[[overrides]]
+path = "**.disko.**"
+attrs.first = ["device", "size"]
+
+[[overrides]]
+path = "**.fileSystems.**"
+attrs.first = ["fsType", "device", "options"]
+
+[[overrides]]
+path = "**.options.**"
+attrs.last = ["description", "meta"]
+
+[[overrides]]
+path = "**.services.**"
+attrs.first = [
+  "description",
+  "before",
+  "after",
+  "wants",
+  "requires",
+  "wantedBy",
+  "serviceConfig",
+  "unitConfig",
+  "script",
+]
+
+[[overrides]]
+path = "**.pipewire.**"
+attrs.first = ["name"]
+
+[[overrides]]
+path = "environment.systemPackages"
+lists.sort = true
+
+[[overrides]]
+path = "**.runtimeInputs"
+lists.sort = true
+
+[[overrides]]
+path = "**.buildInputs"
+lists.sort = true
+
+[[overrides]]
+path = "**.nativeBuildInputs"
+lists.sort = true
+
+[[overrides]]
+path = "**.kernelModules"
+lists.sort = true
+
+[[overrides]]
+path = "**.networking.firewall.allowedTCPPorts"
+lists.sort = true
+
+[[overrides]]
+path = "**.networking.firewall.allowedUDPPorts"
+lists.sort = true
+
+[[overrides]]
+path = "**.allowedIPs"
+lists.sort = true
+
+[[overrides]]
+path = "**.services.*.after"
+lists.sort = true
+
+[[overrides]]
+path = "**.services.*.wants"
+lists.sort = true
+
+[[overrides]]
+path = "**.services.*.requires"
+lists.sort = true
+
+[[overrides]]
+path = "**.services.*.before"
+lists.sort = true
+
+[[overrides]]
+path = "**.services.*.wantedBy"
+lists.sort = true
+
+[[overrides]]
+path = "imports"
+lists.sort = true
+
+[[overrides]]
+path = "**.availableKernelModules"
+lists.sort = true
+
+[[overrides]]
+path = "**.blacklistedKernelModules"
+lists.sort = true
+
+[[overrides]]
+path = "**.audio.appCategories.**"
+lists.sort = true
+
+[[overrides]]
+path = "**.packages"
+lists.sort = true
+
+[[overrides]]
+path = "**.users.**.extraGroups"
+lists.sort = true
+
+[[overrides]]
+path = "**.programs.steam.extraCompatPackages"
+lists.sort = true
+
+[[overrides]]
+path = "**.extraPackages"
+lists.sort = true
+
+[[overrides]]
+path = "**.spicetify.*"
+lists.sort = true
+
+[[overrides]]
+path = "**.drivers"
+lists.sort = true
+
+[[overrides]]
+path = "**.hardware.firmware"
+lists.sort = true
+
+[[overrides]]
+path = "**.paths"
+lists.sort = true
+
+[[overrides]]
+path = "**.extensions"
+lists.sort = true
+
+[[overrides]]
+path = "**.overlays"
+lists.sort = true
+
+[[overrides]]
+path = "**.src"
+attrs.first = [
+  "domain",
+  "url",
+  "owner",
+  "repo",
+  "rev",
+  "tag",
+  "hash",
+  "sha256",
+  "fetchSubmodules",
+]
+
+[[overrides]]
+path = "**.meta"
+attrs.first = [
+  "description",
+  "longDescription",
+  "homepage",
+  "changelog",
+  "license",
+  "sourceProvenance",
+  "maintainers",
+  "platforms",
+  "badPlatforms",
+  "mainProgram",
+]

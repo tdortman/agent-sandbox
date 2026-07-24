@@ -2,40 +2,86 @@
 
   description = "Policy stack and NixOS module for sandboxed AI agent CLIs";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-
-    snowfall-lib = {
-      url = "github:anntnzrb/snowfall-lib";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    jail-nix.url = "sourcehut:~alexdavid/jail.nix";
-  };
-
   outputs =
     inputs:
     inputs.snowfall-lib.mkFlake {
       inherit inputs;
-      src = ./.;
 
-      snowfall.root = ./nix;
-      snowfall.namespace = "agent-sandbox";
+      snowfall = {
+        namespace = "agent-sandbox";
+        root = ./nix;
+      };
+
+      src = ./.;
+      alias.packages.default = "agent-sandbox";
+
+      overlays = [
+        inputs.rust-overlay.overlays.default
+      ];
 
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
 
-      overlays = [
-        inputs.rust-overlay.overlays.default
-      ];
+      outputs-builder =
+        channels:
+        let
+          treefmt = inputs.treefmt-nix.lib.evalModule channels.nixpkgs {
+            imports = [ inputs.pedantix.treefmtModules.default ];
 
-      alias.packages.default = "agent-sandbox";
+            programs.pedantix = {
+              enable = true;
+
+              settings = {
+                attrs = {
+                  blank-lines = 1;
+                  blank-lines-mode = "multiline";
+                  flatten = true;
+                  merge = true;
+                };
+
+                formatter = "nixfmt";
+                inherit-placement = "front";
+                lists.sort = false;
+              };
+            };
+
+            projectRootFile = "flake.nix";
+          };
+        in
+        {
+          checks.formatting = treefmt.config.build.check inputs.self;
+          formatter = treefmt.config.build.wrapper;
+        };
     };
+
+  inputs = {
+    jail-nix.url = "sourcehut:~alexdavid/jail.nix";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    pedantix = {
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        treefmt-nix.follows = "treefmt-nix";
+      };
+
+      url = "github:swarsel/pedantix";
+    };
+
+    rust-overlay = {
+      inputs.nixpkgs.follows = "nixpkgs";
+      url = "github:oxalica/rust-overlay";
+    };
+
+    snowfall-lib = {
+      inputs.nixpkgs.follows = "nixpkgs";
+      url = "github:anntnzrb/snowfall-lib";
+    };
+
+    treefmt-nix = {
+      inputs.nixpkgs.follows = "nixpkgs";
+      url = "github:numtide/treefmt-nix";
+    };
+  };
 }

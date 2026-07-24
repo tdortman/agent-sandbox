@@ -1,0 +1,12 @@
+[attrs]
+first = ["description", "outputs", "inputs", "snowfall", "src"]
+last = ["outputs-builder"]
+
+[[overrides]]
+path = "**.permittedInsecurePackages"
+lists.sort = true
+
+[[overrides]]
+path = "**.modules.**"
+lists.sort = true
+
