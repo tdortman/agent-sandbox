@@ -43,6 +43,7 @@ pub(crate) fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
         map.remove(&oldest_key);
     }
 }
+
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
 pub const DEFAULT_MAX_TTL: u32 = 600;
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
@@ -70,6 +71,7 @@ pub struct DnsCache {
     max_entries: usize,
     entries: HashMap<String, LiveCacheEntry>,
 }
+
 impl DnsCache {
     pub fn new(path: Option<impl AsRef<Path>>, max_ttl: u32) -> Self {
         Self {
@@ -115,10 +117,12 @@ impl DnsCache {
         let ttl = ttl.clamp(1, self.max_ttl);
         let now = Instant::now();
         self.prune_expired(now);
+
         self.entries.insert(ip.to_string(), LiveCacheEntry {
             host,
             expires: now + Duration::from_secs(u64::from(ttl)),
         });
+
         self.enforce_max_entries();
     }
 
@@ -143,14 +147,17 @@ impl DnsCache {
         let Some(path) = &self.path else {
             return Ok(());
         };
+
         let now = Instant::now();
 
         // Build live entries (live → wall-clock expiry).
         let mut entries: HashMap<String, CacheEntry> = HashMap::new();
+
         for (ip, entry) in &self.entries {
             if entry.expires <= now {
                 continue;
             }
+
             let remaining = entry.expires.duration_since(now).as_secs_f64();
             entries.insert(ip.clone(), CacheEntry {
                 host: entry.host.clone(),
@@ -168,6 +175,7 @@ impl DnsCache {
                 if item.expires <= wall_now {
                     continue;
                 }
+
                 // Live entries take precedence for the same IP.
                 entries.entry(ip).or_insert(item);
             }
@@ -185,22 +193,28 @@ impl DnsCache {
         let Some(path) = &self.path else {
             return;
         };
+
         let Ok(raw) = std::fs::read_to_string(path) else {
             return;
         };
+
         let Ok(file) = serde_json::from_str::<CacheFile>(&raw) else {
             return;
         };
         if file.version != 1 {
             return;
         }
+
         let now = unix_now();
         self.entries.clear();
+
         for (ip, item) in file.entries {
             if item.expires <= now {
                 continue;
             }
+
             let remaining = item.expires - now;
+
             self.entries.insert(ip, LiveCacheEntry {
                 host: item.host,
                 expires: Instant::now() + Duration::from_secs_f64(remaining),
@@ -218,6 +232,7 @@ pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
                 .map(PathBuf::from)
         })
         .or_else(|| Some(PathBuf::from(DEFAULT_CACHE_PATH)));
+
     let mut cache = DnsCache::new(path, DEFAULT_MAX_TTL);
     cache.reload();
     cache.lookup(ip)
@@ -240,6 +255,7 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("read persisted dns cache file");
         let file: CacheFile = serde_json::from_str(&raw).expect("parse persisted dns cache json");
+
         let entry = file
             .entries
             .get("104.18.32.47")
@@ -258,6 +274,7 @@ mod tests {
 
         let mut reader = DnsCache::new(Some(&path), 300);
         reader.reload();
+
         assert_eq!(
             reader.lookup("104.18.32.47"),
             Some("example.com".to_string())
@@ -281,6 +298,7 @@ mod tests {
 
         reader.reload();
         assert_eq!(reader.lookup("10.0.0.1"), Some("first.example".to_string()));
+
         assert_eq!(
             reader.lookup("10.0.0.2"),
             Some("second.example".to_string())
@@ -344,6 +362,7 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("read persisted dns cache file");
         let file: CacheFile = serde_json::from_str(&raw).expect("parse persisted dns cache json");
         assert_eq!(file.entries.len(), 2, "expected both IPs in cache file");
+
         assert_eq!(
             file.entries.get("192.168.1.1").map(|e| &*e.host),
             Some("host-a.example")

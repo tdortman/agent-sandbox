@@ -33,6 +33,7 @@ fn ip_from_rdata(rdata: &RData) -> Option<String> {
 
 fn allowed_owner_names(message: &Message, qname: &str) -> HashSet<String> {
     let mut allowed = HashSet::from([qname.to_string()]);
+
     loop {
         let mut added = false;
         for record in &message.answers {
@@ -51,6 +52,7 @@ fn allowed_owner_names(message: &Message, qname: &str) -> HashSet<String> {
             break;
         }
     }
+
     allowed
 }
 
@@ -60,7 +62,9 @@ fn mappings_from_svcb_rdata(rdata: &RData, ttl: u32, qname: &str) -> Vec<DnsMapp
         RData::SVCB(svcb) => svcb,
         _ => return Vec::new(),
     };
+
     let mut mappings = Vec::new();
+
     for (_key, value) in &svcb.svc_params {
         match value {
             SvcParamValue::Ipv4Hint(hint) => {
@@ -94,14 +98,18 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
     let Ok(message) = Message::from_vec(data) else {
         return Vec::new();
     };
+
     if message.metadata.message_type != MessageType::Response {
         return Vec::new();
     }
+
     let Some(qname) = query_name(&message) else {
         return Vec::new();
     };
+
     let allowed = allowed_owner_names(&message, &qname);
     let mut mappings = Vec::new();
+
     for record in &message.answers {
         let owner = normalize_owner(&record.name);
         if !allowed.contains(&owner) {
@@ -119,6 +127,7 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
             mappings.extend(mappings_from_svcb_rdata(rdata, ttl, &qname));
         }
     }
+
     mappings
 }
 
@@ -142,6 +151,7 @@ mod tests {
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");
         let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
@@ -149,6 +159,7 @@ mod tests {
                 ttl,
                 RData::A(A::new(ip[0], ip[1], ip[2], ip[3])),
             ));
+
         message.to_vec().expect("encode")
     }
 

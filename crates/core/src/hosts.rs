@@ -52,17 +52,22 @@ pub enum DnsNameError {
 /// wire-format limits.
 pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
     let trimmed = host.trim();
+
     if trimmed.is_empty() {
         return Err(DnsNameError::Empty);
     }
+
     let ascii = domain_to_ascii(trimmed).map_err(|_| DnsNameError::Invalid)?;
     let canonical = ascii.trim_end_matches('.');
+
     if canonical.is_empty() {
         return Err(DnsNameError::Empty);
     }
+
     if canonical.len() > 253 {
         return Err(DnsNameError::TooLong);
     }
+
     for label in canonical.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(if label.is_empty() {
@@ -75,6 +80,7 @@ pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
             return Err(DnsNameError::Invalid);
         }
     }
+
     let name = Name::from_ascii(format!("{canonical}.")).map_err(|_| DnsNameError::Invalid)?;
     Ok(name.to_ascii().trim_end_matches('.').to_ascii_lowercase())
 }
@@ -106,6 +112,7 @@ impl NetworkSortKey {
     #[must_use]
     pub fn new(host: &str, port: u16) -> Self {
         let host = normalize_host(host);
+
         if host.is_empty() || is_ip_literal(&host) {
             return Self {
                 domain: host,
@@ -137,6 +144,7 @@ impl NetworkSortKey {
 #[must_use]
 pub fn approval_host_patterns(host: &str) -> Vec<String> {
     let host = normalize_host(host);
+
     if host.is_empty() {
         return Vec::new();
     }
@@ -174,6 +182,7 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
 #[must_use]
 pub fn reverse_hostname(ip: &str) -> Option<String> {
     let ip: IpAddr = ip.parse().ok()?;
+
     dns_lookup::lookup_addr(&ip)
         .ok()
         .map(|h| normalize_host(&h))
@@ -212,6 +221,7 @@ pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) ->
     }
 
     let policy_host = normalize_host(connect_host);
+
     if let Some(cached) = lookup_dns_cache(&policy_host, cache_path) {
         return HostResolution::new(cached, connect_host);
     }
@@ -225,6 +235,7 @@ pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) ->
 pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_lowercase();
     let host = host.to_lowercase();
+
     if let Some(bare) = pattern.strip_prefix("*.")
         && !host_pattern_has_glob(bare)
     {
@@ -270,6 +281,7 @@ struct Ipv4Prefix {
 fn parse_ipv4_prefix(prefix: &str) -> Option<Ipv4Prefix> {
     let mut octets = [0_u8; 3];
     let mut count = 0_usize;
+
     for part in prefix.split('.') {
         if count == octets.len() {
             return None;
@@ -277,6 +289,7 @@ fn parse_ipv4_prefix(prefix: &str) -> Option<Ipv4Prefix> {
         octets[count] = part.parse().ok()?;
         count += 1;
     }
+
     if (1..=3).contains(&count) {
         Some(Ipv4Prefix { octets, count })
     } else {
@@ -286,26 +299,32 @@ fn parse_ipv4_prefix(prefix: &str) -> Option<Ipv4Prefix> {
 
 fn ipv4_prefix_matches(pattern: &str, host: &str) -> Option<bool> {
     let prefix = pattern.strip_suffix(".*")?;
+
     let Ipv4Prefix {
         octets: prefix_octets,
         count: prefix_len,
     } = parse_ipv4_prefix(prefix)?;
+
     let host_octets = host.parse::<std::net::Ipv4Addr>().ok()?.octets();
     Some(host_octets[..prefix_len] == prefix_octets[..prefix_len])
 }
 
 fn parse_ipv6_hextets(prefix: &str) -> Option<Vec<u16>> {
     let hextets: Vec<&str> = prefix.split(':').collect();
+
     if hextets.is_empty() || hextets.len() > 7 {
         return None;
     }
+
     let mut result = Vec::with_capacity(hextets.len());
+
     for h in &hextets {
         if h.is_empty() || h.len() > 4 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         result.push(u16::from_str_radix(h, 16).ok()?);
     }
+
     Some(result)
 }
 

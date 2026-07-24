@@ -175,9 +175,11 @@ pub fn resolve_sandbox_paths(
     ids: ProcessIds,
 ) -> SandboxPaths {
     let file = read_session_context();
+
     let cwd: Option<PathBuf> = peer_cwd
         .or(file.cwd)
         .or_else(|| std::env::var("AGENT_SANDBOX_CWD").ok().map(PathBuf::from));
+
     let mut home: Option<PathBuf> = peer_home
         .or(file.home)
         .or_else(|| {
@@ -187,6 +189,7 @@ pub fn resolve_sandbox_paths(
         })
         .or_else(|| std::env::var("AGENT_SANDBOX_HOME").ok().map(PathBuf::from))
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from));
+
     let mut project_root: Option<PathBuf> = peer_project.or(file.project_root).or_else(|| {
         std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
             .ok()
@@ -217,11 +220,13 @@ pub fn peer_sandbox_paths(ids: ProcessIds) -> SandboxPaths {
     let ctx = ids
         .pid()
         .map_or_else(ProcContext::default, context_from_pid);
+
     let home = ctx.home.clone().or_else(|| {
         ids.uid()
             .and_then(|u| home_from_uid(Some(u)))
             .map(PathBuf::from)
     });
+
     SandboxPaths::from_wire(ctx.cwd, home, ctx.project_root)
 }
 
@@ -229,6 +234,7 @@ pub fn peer_sandbox_paths(ids: ProcessIds) -> SandboxPaths {
 #[must_use]
 pub fn resolve_daemon_paths(ids: ProcessIds) -> SandboxPaths {
     let peer = peer_sandbox_paths(ids);
+
     resolve_sandbox_paths(
         peer.cwd_path(),
         peer.home_path(),

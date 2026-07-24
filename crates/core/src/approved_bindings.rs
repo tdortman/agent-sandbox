@@ -46,11 +46,13 @@ pub struct ApprovedBindings {
 impl ApprovedBindings {
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
+
         let mut bindings = Self {
             path,
             ttl_secs: APPROVED_BINDINGS_TTL_SECS,
             entries: HashMap::new(),
         };
+
         bindings.reload_from_disk();
         bindings
     }
@@ -68,15 +70,19 @@ impl ApprovedBindings {
         let wall_now = unix_now();
         let live_now = Instant::now();
         self.entries.clear();
+
         for (ip, item) in file.entries {
             let mut hosts = HashMap::new();
+
             for (host, expires) in item.hosts {
                 if expires <= wall_now {
                     continue;
                 }
+
                 let remaining = expires - wall_now;
                 hosts.insert(host, live_now + Duration::from_secs_f64(remaining));
             }
+
             if !hosts.is_empty() {
                 self.entries.insert(ip, LiveIpBindings { hosts });
             }
@@ -87,15 +93,18 @@ impl ApprovedBindings {
     #[must_use]
     pub fn aliases(&self, ip: &str) -> Vec<String> {
         let now = Instant::now();
+
         let Some(entry) = self.entries.get(ip) else {
             return Vec::new();
         };
+
         let mut aliases: Vec<String> = entry
             .hosts
             .iter()
             .filter(|(host, expires)| **expires > now && !host.is_empty() && host.as_str() != ip)
             .map(|(host, _)| host.clone())
             .collect();
+
         aliases.sort();
         aliases.dedup();
         aliases
@@ -104,20 +113,25 @@ impl ApprovedBindings {
     /// Remember that `host` was approved for `ip`.
     pub fn record(&mut self, host: &str, ip: &str) {
         let host = normalize_host(host);
+
         if host.is_empty() || host == ip {
             return;
         }
+
         let now = Instant::now();
         self.prune_expired(now);
+
         let entry = self
             .entries
             .entry(ip.to_string())
             .or_insert_with(|| LiveIpBindings {
                 hosts: HashMap::new(),
             });
+
         entry
             .hosts
             .insert(host, now + Duration::from_secs(self.ttl_secs));
+
         self.enforce_limits(ip);
     }
 
@@ -145,15 +159,19 @@ impl ApprovedBindings {
     pub fn save(&self) -> std::io::Result<()> {
         let now = Instant::now();
         let mut entries: HashMap<String, IpBindingEntry> = HashMap::new();
+
         for (ip, entry) in &self.entries {
             let mut hosts = HashMap::new();
+
             for (host, expires) in &entry.hosts {
                 if *expires <= now {
                     continue;
                 }
+
                 let remaining = expires.duration_since(now).as_secs_f64();
                 hosts.insert(host.clone(), unix_now() + remaining);
             }
+
             if !hosts.is_empty() {
                 entries.insert(ip.clone(), IpBindingEntry { hosts });
             }
@@ -169,12 +187,15 @@ impl ApprovedBindings {
                     .into_iter()
                     .filter(|(_, expires)| *expires > wall_now)
                     .collect();
+
                 if merged.is_empty() {
                     continue;
                 }
+
                 let slot = entries.entry(ip).or_insert_with(|| IpBindingEntry {
                     hosts: HashMap::new(),
                 });
+
                 for (host, expires) in merged.drain() {
                     slot.hosts.entry(host).or_insert(expires);
                 }
@@ -199,6 +220,7 @@ mod tests {
         let path = dir.path().join("approved-bindings.json");
         let mut bindings = ApprovedBindings::load(&path);
         bindings.record("chatgpt.com", "104.18.32.47");
+
         assert_eq!(bindings.aliases("104.18.32.47"), vec![
             "chatgpt.com".to_string()
         ]);
@@ -210,6 +232,7 @@ mod tests {
         let path = dir.path().join("approved-bindings.json");
         let mut bindings = ApprovedBindings::load(&path);
         bindings.record("Example.COM.", "104.18.32.47");
+
         assert_eq!(bindings.aliases("104.18.32.47"), vec![
             "example.com".to_string()
         ]);
@@ -233,6 +256,7 @@ mod tests {
         writer.save().expect("save bindings");
 
         let reader = ApprovedBindings::load(&path);
+
         assert_eq!(reader.aliases("104.18.32.47"), vec![
             "chatgpt.com".to_string()
         ]);
@@ -249,14 +273,17 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("read bindings file");
         let file: BindingsFile = serde_json::from_str(&raw).expect("parse bindings json");
+
         let entry = file
             .entries
             .get("104.18.32.47")
             .expect("bindings file should contain IP entry");
+
         let expires = entry
             .hosts
             .get("chatgpt.com")
             .expect("bindings file should contain host entry");
+
         assert!(*expires > 30.0f64.mul_add(86_400.0, before) - 5.0);
     }
 

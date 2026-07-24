@@ -15,16 +15,20 @@ pub enum RpcMessage {
 }
 
 impl RpcMessage {
-    fn encode_line(&self) -> String {
-        let mut line = serde_json::to_string(self).unwrap_or_default();
+    /// # Errors
+    ///
+    /// Returns the JSON serialization error when the message cannot be encoded.
+    pub fn encode_line(&self) -> Result<String, serde_json::Error> {
+        let mut line = serde_json::to_string(self)?;
         line.push('\n');
-        line
+        Ok(line)
     }
 }
 
 impl fmt::Display for RpcMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.encode_line())
+        let line = self.encode_line().map_err(|_| fmt::Error)?;
+        f.write_str(&line)
     }
 }
 

@@ -38,6 +38,7 @@ pub fn tool_path(env_key: &str, binary: &str) -> Option<String> {
             return Some(explicit);
         }
     }
+
     which::which(binary)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
@@ -45,16 +46,20 @@ pub fn tool_path(env_key: &str, binary: &str) -> Option<String> {
 
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
+
     path.metadata()
         .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
 fn environ_for_pid(pid: u32) -> HashMap<String, String> {
     let path = format!("/proc/{pid}/environ");
+
     let Ok(raw) = std::fs::read(&path) else {
         return HashMap::new();
     };
+
     let mut env = HashMap::new();
+
     for item in raw.split(|&b| b == 0) {
         if let Some(eq) = item.iter().position(|&b| b == b'=') {
             let (key, value) = item.split_at(eq);
@@ -64,6 +69,7 @@ fn environ_for_pid(pid: u32) -> HashMap<String, String> {
             }
         }
     }
+
     env
 }
 
@@ -71,16 +77,19 @@ pub fn inherit_plasma_env(uid: u32) -> HashMap<String, String> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return HashMap::new();
     };
+
     let mut pids: Vec<u32> = entries
         .filter_map(std::result::Result::ok)
         .filter_map(|e| e.file_name().to_string_lossy().parse().ok())
         .collect();
+
     pids.sort_unstable();
 
     for pid in pids {
         let Ok(meta) = std::fs::metadata(format!("/proc/{pid}")) else {
             continue;
         };
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -88,14 +97,19 @@ pub fn inherit_plasma_env(uid: u32) -> HashMap<String, String> {
                 continue;
             }
         }
+
         let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
             continue;
         };
+
         let comm = comm.trim();
+
         if !PLASMA_COMM_NAMES.contains(&comm) {
             continue;
         }
+
         let proc_env = environ_for_pid(pid);
+
         return ENV_INHERIT
             .iter()
             .filter_map(|key| proc_env.get(*key).map(|v| ((*key).to_string(), v.clone())))
@@ -116,14 +130,18 @@ fn kde_session_defaults() -> HashMap<String, String> {
 #[must_use]
 pub fn x11_display_for_uid(uid: u32) -> Option<String> {
     let loginctl = tool_path("AGENT_SANDBOX_LOGINCTL", "loginctl")?;
+
     let output = Command::new(&loginctl)
         .args(["list-sessions", "--uid", &uid.to_string(), "--no-legend"])
         .output()
         .ok()?;
+
     if !output.status.success() {
         return None;
     }
+
     let sessions = String::from_utf8_lossy(&output.stdout);
+
     for line in sessions.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
         if parts.len() < 2 || !parts.contains(&"active") {
@@ -151,12 +169,14 @@ pub fn x11_display_for_uid(uid: u32) -> Option<String> {
         }
         return Some(format!(":{display}"));
     }
+
     None
 }
 
 #[must_use]
 pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
     let home = home?;
+
     let paths = [
         home.join(".config").join("kdeglobals"),
         home.join(".config").join("kdedefaults").join("kdeglobals"),
@@ -184,6 +204,7 @@ pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
             }
         }
     }
+
     None
 }
 
@@ -191,6 +212,7 @@ pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
 pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, String> {
     let mut env = kde_session_defaults();
     env.extend(inherit_plasma_env(uid));
+
     if !env.contains_key("COLORSCHEME")
         && let Some(scheme) = kde_color_scheme_from_config(home)
     {
@@ -215,6 +237,7 @@ pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, S
             }
         }
     }
+
     if !env.contains_key("WAYLAND_DISPLAY")
         && !env.contains_key("DISPLAY")
         && let Some(display) = x11_display_for_uid(uid)
@@ -223,13 +246,17 @@ pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, S
         env.entry("QT_QPA_PLATFORM".into())
             .or_insert_with(|| "xcb".into());
     }
+
     env.entry("QT_QPA_PLATFORMTHEME".into())
         .or_insert_with(|| "kde".into());
+
     let bus = format!("{runtime}/bus");
+
     if Path::new(&bus).exists() {
         env.entry("DBUS_SESSION_BUS_ADDRESS".into())
             .or_insert_with(|| format!("unix:path={bus}"));
     }
+
     env.entry("PATH".into())
         .or_insert_with(|| "/run/current-system/sw/bin".into());
     env
