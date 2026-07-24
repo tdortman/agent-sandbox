@@ -119,8 +119,8 @@ let
       ''
     else
       {
-        home = map homeMountRel (lib.filter isHomeMountPath paths);
         abs = lib.filter isHostMountPath paths;
+        home = map homeMountRel (lib.filter isHomeMountPath paths);
       };
 
   mkRuntime =
@@ -138,8 +138,7 @@ let
     in
     {
       inherit policyContext;
-      policySocket = policy.socketPath;
-      sandboxPolicySocket = policy.sandboxSocketPath;
+
       inherit (policy)
         exportedJson
         exportedNix
@@ -148,6 +147,12 @@ let
         autoSpawnPolicyUi
         uiBackend
         ;
+
+      inherit (network) queueNumber hostIp hostIp6;
+      inherit (network) dnsForwardTarget;
+      inherit (policy) dbus;
+      httpProxy = network.httpProxy or { enable = false; };
+
       network =
         if network.enable then
           {
@@ -159,33 +164,33 @@ let
               netnsIp6
               netnsIp6Prefix
               ;
+
             inherit netnsEnter;
           }
         else
           null;
-      inherit (network) queueNumber hostIp hostIp6;
+
+      policySocket = policy.socketPath;
       policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
-      inherit (network) dnsForwardTarget;
-      httpProxy = network.httpProxy or { enable = false; };
-      inherit (policy) dbus;
+      sandboxPolicySocket = policy.sandboxSocketPath;
     };
 
   buildPermissions =
     c:
     {
-      dynamicFs ? false,
-      readonlyDirs ? [ ],
-      readwriteDirs ? [ ],
-      readonlyFiles ? [ ],
-      readwriteFiles ? [ ],
-      extraPkgs ? [ ],
-      runtimeReadonlyDirs ? defaultRuntimeReadonlyDirs,
-      devicePaths ? defaultDevicePaths,
-      commonPkgs ? defaultCommonPkgs,
       blockEnvVars ? defaultBlockEnvVars,
+      commonPkgs ? defaultCommonPkgs,
+      devicePaths ? defaultDevicePaths,
+      dynamicFs ? false,
       exposeWorkingDirectory ? true,
       extraBwrapArgs ? [ ],
+      extraPkgs ? [ ],
+      readonlyDirs ? [ ],
+      readonlyFiles ? [ ],
+      readwriteDirs ? [ ],
+      readwriteFiles ? [ ],
       runtime ? null,
+      runtimeReadonlyDirs ? defaultRuntimeReadonlyDirs,
       sudoGuard ? null,
       ...
     }@cfg:
@@ -259,31 +264,31 @@ in
     {
       package,
       binary ? null,
-      readonlyDirs ? [ ],
-      readwriteDirs ? [ ],
-      readonlyFiles ? [ ],
-      readwriteFiles ? [ ],
-      extraPkgs ? [ ],
-      runtimeReadonlyDirs ? defaultRuntimeReadonlyDirs,
-      devicePaths ? defaultDevicePaths,
-      commonPkgs ? defaultCommonPkgs pkgs,
       blockEnvVars ? defaultBlockEnvVars,
-      exposeWorkingDirectory ? true,
-      extraBwrapArgs ? [ ],
-      replaceOriginalBinary ? true,
-      unsafeAliasPrefix ? "unsafe-",
-      policySocket ? null,
-      sandboxPolicySocket ? null,
-      policyContext ? false,
-      network ? null,
-      runtime ? null,
+      commonPkgs ? defaultCommonPkgs pkgs,
       dbus ? null,
       dbusProxyPkg ? null,
-      sudoGuard ? null,
+      devicePaths ? defaultDevicePaths,
+      exposeWorkingDirectory ? true,
+      extraBwrapArgs ? [ ],
+      extraPkgs ? [ ],
       fsArmPkg ? null,
-      syscallArmPkg ? null,
-      resourceGate ? false,
       hiddenPaths ? [ ],
+      network ? null,
+      policyContext ? false,
+      policySocket ? null,
+      readonlyDirs ? [ ],
+      readonlyFiles ? [ ],
+      readwriteDirs ? [ ],
+      readwriteFiles ? [ ],
+      replaceOriginalBinary ? true,
+      resourceGate ? false,
+      runtime ? null,
+      runtimeReadonlyDirs ? defaultRuntimeReadonlyDirs,
+      sandboxPolicySocket ? null,
+      sudoGuard ? null,
+      syscallArmPkg ? null,
+      unsafeAliasPrefix ? "unsafe-",
     }:
     let
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
@@ -309,7 +314,7 @@ in
       dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;
       networkMode = if proxyMode then "proxy" else "direct";
       dnsEndpoint = if runtime != null && runtime.network != null then "${runtime.hostIp}:53" else null;
-      proxyTrustBundle = "/run/agent-sandbox/mitmproxy-ca-bundle.pem";
+      proxyTrustBundle = "/run/agent-sandbox/proxy-ca-bundle.pem";
       runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
 
       dynamicFs = fsArmPkg != null;
@@ -319,6 +324,7 @@ in
           "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package}"
         else
           lib.getExe package;
+
       syscallArmPrefix = if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
 
       entryPackage =
@@ -336,12 +342,12 @@ in
 
       staticAllowRules = [
         {
-          path = "/nix/store";
           access = "all";
+          path = "/nix/store";
         }
         {
-          path = "/tmp";
           access = "all";
+          path = "/tmp";
         }
       ]
       ++ (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
@@ -352,12 +358,14 @@ in
         inherit path;
         access = "read_write";
       }));
+
       staticAllowJson = builtins.toJSON staticAllowRules;
       staticAllowJsonArg = lib.escapeShellArg staticAllowJson;
 
       jailFn = jail-nix.lib.extend {
         inherit pkgs;
         additionalCombinators = _: agentCombinators;
+
         basePermissions =
           c:
           with c;
@@ -392,6 +400,7 @@ in
             commonPkgs
             devicePaths
             ;
+
           runtimeReadonlyDirs = runtimeReadonlyDirs';
         }
         ++ lib.optionals (fsArmPkg != null) [
@@ -436,17 +445,21 @@ in
       # cannot mkdir through symlinks on a root-bound tree).  Generate the
       # wrapper directly to guarantee zero unexpected bind mounts.
       hasNetwork = network != null;
+
       sandboxPkgsList = lib.unique (
         [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
+
       sandboxPathStr = lib.makeBinPath sandboxPkgsList;
       entryCmd = "${syscallArmPrefix} ${entryBase}";
       blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
+
       namespaceFlags =
         if hasNetwork then
           "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
         else
           "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
+
       dnsScript = lib.optionalString hasNetwork ''
         if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
           _real_ns=$(readlink -f /etc/nsswitch.conf 2>/dev/null) || _real_ns=""
@@ -487,6 +500,7 @@ in
               fi
             ''
         ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique paths));
+
       runReadonlyBindScript = runBindScript "--ro-bind" (readonlyDirs ++ readonlyFiles);
       runReadwriteBindScript = runBindScript "--bind" (readwriteDirs ++ readwriteFiles);
 
@@ -608,15 +622,18 @@ in
             # control socket stays hidden by tmpfs.
             RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
           '';
+
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
+
       networkModeScript = lib.optionalString syscallGate ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
         ${lib.optionalString (dnsEndpoint != null) ''
           RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT ${lib.escapeShellArg dnsEndpoint})
         ''}
       '';
+
       proxyTrustScript = lib.optionalString proxyMode ''
         [[ -f ${proxyTrustBundle} ]] || {
           echo "agent-sandbox proxy trust bundle is unavailable" >&2
@@ -629,6 +646,7 @@ in
         RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS ${proxyTrustBundle})
       '';
+
       dbusScript = lib.optionalString dbusMode ''
         _asbx_dbus_root="${dbusSocketDirectory}/''${UID}"
         mkdir -p "$_asbx_dbus_root"
@@ -670,6 +688,7 @@ in
         RUNTIME_ARGS+=(--ro-bind "$_asbx_dbus_dir" "$_asbx_dbus_dir")
         RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_socket")
       '';
+
       dbusCleanupScript = lib.optionalString dbusMode ''
         kill "$_asbx_dbus_pid" 2>/dev/null || true
         wait "$_asbx_dbus_pid" 2>/dev/null || true
@@ -693,6 +712,7 @@ in
           ''_asbx_hide="$HOME/${lib.removePrefix "~/" path}"''
         else
           "_asbx_hide=${lib.escapeShellArg path}";
+
       hidePathsScript = ''
         RUNTIME_ARGS+=(--tmpfs /run/wrappers)
       ''
@@ -708,20 +728,24 @@ in
           RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
         fi
       '') hiddenPaths;
+
       deviceBindScript = lib.concatMapStringsSep "\n" (path: ''
         if [[ -e "${path}" ]]; then
           RUNTIME_ARGS+=(--dev-bind "${path}" "${path}")
         fi
       '') devicePaths;
+
       extraBwrapStr = lib.concatStringsSep " " extraBwrapArgs;
       freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no --unit=\"agent-sandbox-$$_$RANDOM.scope\" -- ";
 
       dynamicInner = pkgs.writeShellApplication {
         name = sandboxedName;
+
         runtimeInputs = [
           pkgs.bubblewrap
           pkgs.coreutils
         ];
+
         text = ''
           RUNTIME_ARGS=()
 
@@ -790,6 +814,7 @@ in
         if hasNetwork then
           pkgs.writeShellApplication {
             name = sandboxedName;
+
             text = ''
               set -euo pipefail
               exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
@@ -805,6 +830,7 @@ in
         else if network != null then
           pkgs.writeShellApplication {
             name = sandboxedName;
+
             text = ''
               set -euo pipefail
               exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
@@ -813,10 +839,12 @@ in
           }
         else
           jailedDrv;
+
       scopedLauncher =
         if freezeNeedsScope && !dynamicFs then
           pkgs.writeShellApplication {
             name = sandboxedName;
+
             text = ''
               set -euo pipefail
               exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no \
@@ -825,12 +853,14 @@ in
           }
         else
           launcher;
+
       finalLauncher = scopedLauncher;
 
     in
     pkgs.symlinkJoin {
       name = "${lib.getName package}-agent-sandbox";
       paths = [ package ];
+
       postBuild = ''
         if [ "${if replaceOriginalBinary then "1" else "0"}" = "1" ]; then
           mv $out/bin/${binName} $out/bin/${unsafeAliasPrefix}${binName}

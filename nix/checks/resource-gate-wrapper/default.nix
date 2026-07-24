@@ -9,8 +9,8 @@
 # Also asserts that a non-resource-gate wrapper preserves the current
 # behavior: broad --tmpfs /run, GPU auto-binds, and devicePaths.
 {
-  pkgs,
   lib,
+  pkgs,
   inputs,
   ...
 }:
@@ -23,21 +23,21 @@ let
   resourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
     package = pkgs.hello;
     binary = "hello";
-    fsArmPkg = pkgs.hello;
-    syscallArmPkg = pkgs.hello;
-    policyContext = true;
-    resourceGate = true;
     devicePaths = [ "/dev/agent-sandbox-regression-device" ];
+    fsArmPkg = pkgs.hello;
+    policyContext = true;
     policySocket = "/tmp/resource-gate-regression.sock";
+    resourceGate = true;
     sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
+    syscallArmPkg = pkgs.hello;
   };
 
   nonResourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
     package = pkgs.hello;
     binary = "hello";
+    devicePaths = [ "/dev/agent-sandbox-regression-device" ];
     fsArmPkg = pkgs.hello;
     policyContext = true;
-    devicePaths = [ "/dev/agent-sandbox-regression-device" ];
     policySocket = "/tmp/resource-gate-regression.sock";
     sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
   };

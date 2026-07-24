@@ -1,6 +1,6 @@
 {
-  pkgs,
   lib,
+  pkgs,
   inputs,
   ...
 }:
@@ -11,31 +11,34 @@ let
   };
 
   rootCfg = {
-    policy = {
-      socketPath = "/run/test/policyd.sock";
-      sandboxSocketPath = "/run/test/sandbox-policyd.sock";
-      exportedJson = "/var/lib/test/policy.json";
-      exportedNix = "/var/lib/test/policy.nix";
-      interactiveApproval = false;
-      approvalTimeout = 47.5;
-      autoSpawnPolicyUi = true;
-      uiBackend = "test-ui";
-    };
+    gates.filesystem.enable = false;
+
     network = {
       enable = true;
-      netnsName = "test-netns";
-      vethHost = "test-veth-host";
-      vethNetns = "test-veth-netns";
+      dnsForwardTarget = "192.0.2.53:53";
+      hostIp = "192.0.2.1";
+      hostIp6 = "2001:db8::1";
       netnsIp = "192.0.2.2";
       netnsIp6 = "2001:db8::2";
       netnsIp6Prefix = 64;
-      queueNumber = 9;
-      hostIp = "192.0.2.1";
-      hostIp6 = "2001:db8::1";
+      netnsName = "test-netns";
       policyTimeout = 19.0;
-      dnsForwardTarget = "192.0.2.53:53";
+      queueNumber = 9;
+      vethHost = "test-veth-host";
+      vethNetns = "test-veth-netns";
     };
-    gates.filesystem.enable = false;
+
+    policy = {
+      approvalTimeout = 47.5;
+      autoSpawnPolicyUi = true;
+      exportedJson = "/var/lib/test/policy.json";
+      exportedNix = "/var/lib/test/policy.nix";
+      interactiveApproval = false;
+      sandboxSocketPath = "/run/test/sandbox-policyd.sock";
+      socketPath = "/run/test/policyd.sock";
+      uiBackend = "test-ui";
+    };
+
     sudoPolicy = "deny";
   };
 

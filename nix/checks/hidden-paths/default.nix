@@ -4,8 +4,8 @@
 # selected paths afterward so the sandbox cannot see them (tmpfs for dirs,
 # /dev/null for files). Default includes ~/.snapshots.
 {
-  pkgs,
   lib,
+  pkgs,
   inputs,
   ...
 }:
@@ -19,6 +19,7 @@ let
     package = pkgs.hello;
     binary = "hello";
     fsArmPkg = pkgs.hello;
+
     hiddenPaths = [
       "~/.snapshots"
       "/secret/file"

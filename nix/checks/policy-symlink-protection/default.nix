@@ -13,8 +13,8 @@
 # expected symlink-handling anchors. It is a build-time Nix check, not a
 # NixOS VM test; no bwrap is run.
 {
-  pkgs,
   lib,
+  pkgs,
   inputs,
   ...
 }:

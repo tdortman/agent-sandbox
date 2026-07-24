@@ -9,10 +9,10 @@ let
     toolchain:
     toolchain.default.override {
       extensions = [
-        "rust-src"
-        "rustfmt"
         "clippy"
         "rust-analyzer"
+        "rust-src"
+        "rustfmt"
       ];
     }
   );
@@ -20,6 +20,7 @@ let
 in
 {
   inherit toolchain;
+
   rustPlatform = pkgs.makeRustPlatform {
     cargo = toolchain;
     rustc = toolchain;

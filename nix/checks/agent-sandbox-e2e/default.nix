@@ -1,7 +1,7 @@
 {
+  lib,
   pkgs,
   inputs,
-  lib,
   ...
 }:
 let
@@ -14,6 +14,7 @@ let
       package = pkgs.writeShellScriptBin name ''
         exec ${lib.getExe pkgs.bashInteractive} "$@"
       '';
+
       binary = name;
     };
 
@@ -24,6 +25,7 @@ let
       package = pkgs.writeShellScriptBin name ''
         exec ${lib.getExe pkgs.curl} "$@"
       '';
+
       binary = name;
     };
 
@@ -34,24 +36,29 @@ let
     sudo
     util-linux
   ];
+
   tlsFixture =
     pkgs.runCommand "agent-sandbox-vm-tls-fixture" { nativeBuildInputs = [ pkgs.openssl ]; }
       ''
         mkdir -p "$out"
+
         openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
           -subj '/CN=agent-sandbox VM test CA' \
           -addext 'basicConstraints=critical,CA:true,pathlen:1' \
           -addext 'keyUsage=critical,keyCertSign,cRLSign' \
           -keyout "$out/ca-key.pem" -out "$out/ca-cert.pem" >/dev/null 2>&1
+
         openssl req -new -newkey rsa:2048 -sha256 -nodes \
           -subj '/CN=169.254.100.1' \
           -keyout "$out/server-key.pem" -out "$out/server.csr" >/dev/null 2>&1
+
         cat > server.ext <<'EOF'
         basicConstraints=critical,CA:false
         keyUsage=critical,digitalSignature,keyEncipherment
         extendedKeyUsage=serverAuth
         subjectAltName=IP:169.254.100.1
         EOF
+
         openssl x509 -req -sha256 -days 3650 \
           -in "$out/server.csr" \
           -CA "$out/ca-cert.pem" -CAkey "$out/ca-key.pem" -CAcreateserial \
@@ -61,42 +68,52 @@ let
 
   staticPackages = [
     (mkBash "sandbox-static-bash" {
+      devicePaths = [ "/dev/agent-sandbox-test-device" ];
+      exposeWorkingDirectory = true;
       extraPkgs = commonExtraPkgs;
       readonlyDirs = [ "/var/lib/agent-sandbox-test/readonly-dir" ];
-      readwriteDirs = [ "~/sandbox-readwrite" ];
+
       readonlyFiles = [
         "/var/lib/agent-sandbox-test/readonly-file"
         "~/sandbox-home-readonly"
       ];
+
+      readwriteDirs = [ "~/sandbox-readwrite" ];
       readwriteFiles = [ "/var/lib/agent-sandbox-test/readwrite-file" ];
-      devicePaths = [ "/dev/agent-sandbox-test-device" ];
-      exposeWorkingDirectory = true;
     })
+
     (mkBash "sandbox-static-options-bash" {
-      extraPkgs = commonExtraPkgs;
-      runtimeReadonlyDirs = [ "/run/agent-sandbox-test-runtime" ];
       blockEnvVars = [ "CUSTOM_SECRET" ];
+
       extraBwrapArgs = [
         "--setenv"
         "AGENT_SANDBOX_EXTRA_BWRAP"
         "covered"
       ];
+
+      extraPkgs = commonExtraPkgs;
+      runtimeReadonlyDirs = [ "/run/agent-sandbox-test-runtime" ];
     })
+
     (mkBash "sandbox-static-no-cwd-bash" {
+      exposeWorkingDirectory = false;
       extraPkgs = commonExtraPkgs;
       runtimeReadonlyDirs = [ ];
-      exposeWorkingDirectory = false;
     })
+
     (mkCurl "sandbox-static-curl" {
       extraPkgs = commonExtraPkgs;
     })
+
     {
       package = pkgs.writeShellScriptBin "sandbox-inferred-binary" ''
         printf 'inferred-binary\n'
       '';
+
       extraPkgs = commonExtraPkgs;
     }
   ];
+
   wrappingPackages = [
     (mkBash "sandbox-wrapping-bash" {
       extraPkgs = commonExtraPkgs;
@@ -106,12 +123,14 @@ let
   dynamicPackages = [
     (mkBash "sandbox-dynamic-bash" {
       extraPkgs = commonExtraPkgs ++ [ pkgs.python3 ];
+
       hiddenPaths = [
         "/etc/agent-sandbox-test/hidden-file"
         "/var/lib/agent-sandbox-test/hidden-file"
         "~/sandbox-hidden-dir"
       ];
     })
+
     (mkCurl "sandbox-dynamic-curl" {
       extraPkgs = commonExtraPkgs;
       hiddenPaths = [ "/var/lib/agent-sandbox-test/hidden-file" ];
@@ -128,6 +147,7 @@ let
     (mkCurl "sandbox-direct-curl" {
       extraPkgs = commonExtraPkgs;
     })
+
     (mkBash "sandbox-direct-bash" {
       extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
     })
@@ -137,6 +157,7 @@ let
     (mkCurl "sandbox-proxy-curl" {
       extraPkgs = commonExtraPkgs;
     })
+
     (mkBash "sandbox-proxy-bash" {
       extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
     })
@@ -160,10 +181,10 @@ let
   mkPolicy =
     name:
     {
-      sudo ? emptyPolicySection,
+      dbus ? emptyPolicySection,
       filesystem ? emptyPolicySection,
       resources ? emptyPolicySection,
-      dbus ? emptyPolicySection,
+      sudo ? emptyPolicySection,
     }:
     pkgs.writeText "agent-sandbox-vm-${name}-policy.json" ''
       {
@@ -206,15 +227,6 @@ let
   };
 
   dbusPolicy = mkPolicy "dbus" {
-    resources = ''
-      {
-        "allow": [
-          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
-          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
-        ],
-        "deny": []
-      }
-    '';
     dbus = ''
       {
         "allow": [
@@ -248,6 +260,16 @@ let
         "deny": []
       }
     '';
+
+    resources = ''
+      {
+        "allow": [
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
+        ],
+        "deny": []
+      }
+    '';
   };
 
   sudoPolicy = mkPolicy "sudo" {
@@ -260,21 +282,20 @@ let
   };
 
   testUser = {
-    isNormalUser = true;
-    uid = 1000;
-    home = "/home/user";
-    group = "users";
     extraGroups = [ "dialout" ];
+    group = "users";
+    home = "/home/user";
+    isNormalUser = true;
     linger = true;
+    uid = 1000;
   };
 
   baseNode = {
     boot.kernelParams = [ "audit=0" ];
-    virtualisation.memorySize = 2048;
-    virtualisation.cores = 2;
+    environment.etc."agent-sandbox-test/hidden-file".text = "hidden file marker\n";
     networking.firewall.enable = false;
     nixpkgs.overlays = lib.mkForce [ ];
-    users.users.sandbox = testUser;
+
     systemd.tmpfiles.rules = [
       "d /home/user/sandbox-readwrite 0755 sandbox users -"
       "d /home/user/sandbox-hidden-dir 0755 sandbox users -"
@@ -310,18 +331,27 @@ let
       "d /home/.snapshots 0755 root root -"
       "f /home/.snapshots/marker 0644 root root - snapshot-marker"
     ];
-    environment.etc."agent-sandbox-test/hidden-file".text = "hidden file marker\n";
+
+    users.users.sandbox = testUser;
+
+    virtualisation = {
+      cores = 2;
+      memorySize = 2048;
+    };
   };
 
   installPolicy = policy: {
     environment.etc."agent-sandbox-vm-policy.json".source = policy;
+
     systemd.services.agent-sandbox-vm-policy = {
-      wantedBy = [ "multi-user.target" ];
       before = [ "agent-sandbox-policy.service" ];
+      wantedBy = [ "multi-user.target" ];
+
       serviceConfig = {
-        Type = "oneshot";
         RemainAfterExit = true;
+        Type = "oneshot";
       };
+
       script = ''
         install -d -o sandbox -g users /home/user/.config/agent-sandbox
         install -o sandbox -g users ${policy} /home/user/.config/agent-sandbox/policy.json
@@ -398,8 +428,8 @@ let
     }:
     {
       name = "agent-sandbox-vm-${serviceName}-${toString port}";
+
       value = {
-        wantedBy = [ "multi-user.target" ];
         serviceConfig = {
           ExecStart = lib.escapeShellArgs (
             [
@@ -413,161 +443,162 @@ let
               privateKey
             ]
           );
-          User = "sandbox";
+
           Restart = "on-failure";
+          User = "sandbox";
         };
+
+        wantedBy = [ "multi-user.target" ];
       };
     };
 
   httpServers = specs: {
     systemd.services = lib.listToAttrs (map httpServer specs);
   };
+  proxyNode =
+    baseNode
+    // (httpServers [
+      { port = 8008; }
+      {
+        certificate = "${tlsFixture}/server-cert.pem";
+        port = 8443;
+        privateKey = "${tlsFixture}/server-key.pem";
+        serviceName = "https";
+      }
+    ])
+    // {
+      imports = [ module ];
+
+      agent-sandbox = {
+        enable = true;
+        gates.syscalls.enable = true;
+
+        network = {
+          enable = true;
+
+          httpProxy = {
+            enable = true;
+            caCertificateFile = "${tlsFixture}/ca-cert.pem";
+            caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
+
+            declarativeAllow = [
+              {
+                methods = [ "GET" ];
+                url = "http://169.254.100.1:8008/allowed";
+              }
+              {
+                methods = [ "GET" ];
+                url = "http://169.254.100.1:8008/stream";
+              }
+              {
+                methods = [ "GET" ];
+                url = "https://169.254.100.1:8443/allowed";
+              }
+            ];
+
+            declarativeDeny = [
+              {
+                allMethods = true;
+                url = "http://169.254.100.1:8008/denied";
+              }
+              {
+                allMethods = true;
+                url = "https://169.254.100.1:8443/denied";
+              }
+            ];
+
+            upstreamAllowCidrs = [ "169.254.100.1/32" ];
+          };
+
+          vethHost = "asbx-test-host";
+          vethNetns = "asbx-test-ns";
+        };
+
+        packages = proxyNetworkPackages;
+
+        policy = {
+          interactiveApproval = false;
+          uiBackend = "none";
+        };
+      };
+
+      networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [
+        8008
+        8443
+      ];
+    };
 
   vmTest = pkgs.testers.runNixOSTest (_: {
     name = "agent-sandbox-e2e";
     node.specialArgs = { inherit inputs; };
 
     nodes = {
-      static =
-        _:
-        baseNode
-        // {
-          imports = [ module ];
-          agent-sandbox = {
-            enable = true;
-            packages = staticPackages;
-            sudoPolicy = "deny";
-            wrapping.unsafeAliasPrefix = "unwrapped-";
-            readonlyDirs = [ "/var/lib/agent-sandbox-test/global-readonly-dir" ];
-            readwriteDirs = [ "/var/lib/agent-sandbox-test/global-readwrite-dir" ];
-            readonlyFiles = [ "/var/lib/agent-sandbox-test/global-readonly-file" ];
-            readwriteFiles = [ "/var/lib/agent-sandbox-test/global-readwrite-file" ];
-          };
-        };
-
-      wrapping =
-        _:
-        baseNode
-        // {
-          imports = [ module ];
-          agent-sandbox = {
-            enable = true;
-            packages = wrappingPackages;
-            wrapping.replaceOriginalBinary = false;
-          };
-        };
-
-      dynamic =
-        _:
-        lib.recursiveUpdate baseNode (
-          lib.recursiveUpdate (installPolicy dynamicPolicy) {
-            imports = [ module ];
-            agent-sandbox = {
-              enable = true;
-              packages = dynamicPackages;
-              policy = {
-                interactiveApproval = false;
-                uiBackend = "none";
-                exportedNix = "/var/lib/agent-sandbox/exported-policy.nix";
-              };
-              gates.filesystem.enable = true;
-            };
-          }
-        );
-
-      resource =
-        _:
-        lib.recursiveUpdate baseNode (
-          lib.recursiveUpdate (installPolicy resourcePolicy) {
-            imports = [ module ];
-            services.dbus.enable = true;
-            agent-sandbox = {
-              enable = true;
-              packages = resourcePackages;
-              policy = {
-                interactiveApproval = false;
-                uiBackend = "none";
-                dbus.enable = false;
-              };
-              gates.filesystem.enable = true;
-              gates.resources.enable = true;
-            };
-            systemd.services.agent-sandbox-vm-resource-server = {
-              wantedBy = [ "multi-user.target" ];
-              after = [ "agent-sandbox-vm-policy.service" ];
-              serviceConfig = {
-                ExecStart = "${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/echo.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                User = "sandbox";
-                RuntimeDirectory = "agent-sandbox-test";
-                Restart = "on-failure";
-              };
-            };
-            systemd.services.agent-sandbox-vm-resource-denied-server = {
-              wantedBy = [ "multi-user.target" ];
-              requires = [ "agent-sandbox-vm-resource-server.service" ];
-              after = [ "agent-sandbox-vm-resource-server.service" ];
-              serviceConfig = {
-                ExecStart = "${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/denied.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                User = "sandbox";
-                Restart = "on-failure";
-              };
-            };
-          }
-        );
-
       dbus =
         _:
         lib.recursiveUpdate baseNode (
           lib.recursiveUpdate (installPolicy dbusPolicy) {
             imports = [ module ];
-            services.dbus.enable = true;
+
             agent-sandbox = {
               enable = true;
+
+              gates = {
+                filesystem.enable = true;
+                resources.enable = true;
+              };
+
               packages = [
                 (mkBash "sandbox-dbus-bash" {
                   extraPkgs = commonExtraPkgs;
                 })
               ];
+
               policy = {
-                interactiveApproval = false;
-                uiBackend = "none";
                 dbus = {
                   enable = true;
-                  socketDirectory = "/var/lib/agent-sandbox-test/dbus-runtime";
-                  upstreamAddress = "unix:path=/run/user/1000/bus";
+
                   declarativeAllow = [
                     {
+                      comment = "VM module serialization allow";
+
                       target = {
                         bus = "session";
                         destination = "org.freedesktop.DBus";
-                        objectPath = "/org/freedesktop/DBus";
                         interface = "org.freedesktop.DBus";
                         member = "ListNames";
                         messageKind = "method_call";
+                        objectPath = "/org/freedesktop/DBus";
                         signature = "";
                       };
-                      comment = "VM module serialization allow";
                     }
                   ];
+
                   declarativeDeny = [
                     {
+                      comment = "VM module serialization deny";
+
                       target = {
                         bus = "session";
                         destination = "org.freedesktop.DBus";
-                        objectPath = "/org/freedesktop/DBus";
                         interface = "org.freedesktop.DBus";
                         member = "GetId";
                         messageKind = "method_call";
+                        objectPath = "/org/freedesktop/DBus";
                         signature = "";
                       };
-                      comment = "VM module serialization deny";
                     }
                   ];
+
+                  socketDirectory = "/var/lib/agent-sandbox-test/dbus-runtime";
+                  upstreamAddress = "unix:path=/run/user/1000/bus";
                 };
+
+                interactiveApproval = false;
+                uiBackend = "none";
               };
-              gates.filesystem.enable = true;
-              gates.resources.enable = true;
             };
+
+            services.dbus.enable = true;
           }
         );
 
@@ -596,56 +627,15 @@ let
               )
             ))
             {
-              systemd.services = {
-                agent-sandbox-vm-udp-18082 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18082,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-udp-18083 = {
-                  wantedBy = [ "multi-user.target" ];
-                  serviceConfig = {
-                    ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18083,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    User = "sandbox";
-                    Restart = "on-failure";
-                  };
-                };
-                agent-sandbox-vm-dns = {
-                  wantedBy = [ "multi-user.target" ];
-                  requires = [ "agent-sandbox-netns.service" ];
-                  after = [ "agent-sandbox-netns.service" ];
-                  serviceConfig = {
-                    ExecStart = lib.escapeShellArgs [
-                      "${pkgs.dnsmasq}/bin/dnsmasq"
-                      "--keep-in-foreground"
-                      "--no-resolv"
-                      "--no-hosts"
-                      "--bind-interfaces"
-                      "--listen-address=169.254.100.1"
-                      "--port=5353"
-                      "--user=sandbox"
-                      "--address=/allowed.test/169.254.100.1"
-                      "--address=/denied.test/169.254.100.1"
-                    ];
-                    Restart = "on-failure";
-                  };
-                };
-              };
               imports = [ module ];
+
               agent-sandbox = {
                 enable = true;
-                packages = directNetworkPackages;
-                policy = {
-                  interactiveApproval = false;
-                  uiBackend = "none";
-                };
                 gates.syscalls.enable = true;
+
                 network = {
                   enable = true;
-                  dnsForwardTarget = "169.254.100.1:5353";
+
                   declarativeAllow = [
                     {
                       host = "169.254.100.1";
@@ -664,6 +654,7 @@ let
                       port = 18086;
                     }
                   ];
+
                   declarativeDeny = [
                     {
                       host = "169.254.100.1";
@@ -682,80 +673,155 @@ let
                       port = 18087;
                     }
                   ];
+
+                  dnsForwardTarget = "169.254.100.1:5353";
+                };
+
+                packages = directNetworkPackages;
+
+                policy = {
+                  interactiveApproval = false;
+                  uiBackend = "none";
+                };
+              };
+
+              systemd.services = {
+                agent-sandbox-vm-dns = {
+                  after = [ "agent-sandbox-netns.service" ];
+                  requires = [ "agent-sandbox-netns.service" ];
+                  wantedBy = [ "multi-user.target" ];
+
+                  serviceConfig = {
+                    ExecStart = lib.escapeShellArgs [
+                      "${pkgs.dnsmasq}/bin/dnsmasq"
+                      "--keep-in-foreground"
+                      "--no-resolv"
+                      "--no-hosts"
+                      "--bind-interfaces"
+                      "--listen-address=169.254.100.1"
+                      "--port=5353"
+                      "--user=sandbox"
+                      "--address=/allowed.test/169.254.100.1"
+                      "--address=/denied.test/169.254.100.1"
+                    ];
+
+                    Restart = "on-failure";
+                  };
+                };
+
+                agent-sandbox-vm-udp-18082 = {
+                  wantedBy = [ "multi-user.target" ];
+
+                  serviceConfig = {
+                    ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18082,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                    Restart = "on-failure";
+                    User = "sandbox";
+                  };
+                };
+
+                agent-sandbox-vm-udp-18083 = {
+                  wantedBy = [ "multi-user.target" ];
+
+                  serviceConfig = {
+                    ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18083,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                    Restart = "on-failure";
+                    User = "sandbox";
+                  };
                 };
               };
             }
         );
 
-      proxy =
+      dynamic =
         _:
-        baseNode
-        // (httpServers [
-          { port = 8008; }
-          {
-            port = 8443;
-            serviceName = "https";
-            certificate = "${tlsFixture}/server-cert.pem";
-            privateKey = "${tlsFixture}/server-key.pem";
-          }
-        ])
-        // {
-          imports = [ module ];
-          agent-sandbox = {
-            enable = true;
-            packages = proxyNetworkPackages;
-            policy = {
-              interactiveApproval = false;
-              uiBackend = "none";
-            };
-            gates.syscalls.enable = true;
-            network = {
+        lib.recursiveUpdate baseNode (
+          lib.recursiveUpdate (installPolicy dynamicPolicy) {
+            imports = [ module ];
+
+            agent-sandbox = {
               enable = true;
-              vethHost = "asbx-test-host";
-              vethNetns = "asbx-test-ns";
-              httpProxy = {
-                enable = true;
-                caCertificateFile = "${tlsFixture}/ca-cert.pem";
-                caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
-                upstreamAllowCidrs = [ "169.254.100.1/32" ];
-                declarativeAllow = [
-                  {
-                    url = "http://169.254.100.1:8008/allowed";
-                    methods = [ "GET" ];
-                  }
-                  {
-                    url = "http://169.254.100.1:8008/stream";
-                    methods = [ "GET" ];
-                  }
-                  {
-                    url = "https://169.254.100.1:8443/allowed";
-                    methods = [ "GET" ];
-                  }
-                ];
-                declarativeDeny = [
-                  {
-                    url = "http://169.254.100.1:8008/denied";
-                    allMethods = true;
-                  }
-                  {
-                    url = "https://169.254.100.1:8443/denied";
-                    allMethods = true;
-                  }
-                ];
+              gates.filesystem.enable = true;
+              packages = dynamicPackages;
+
+              policy = {
+                exportedNix = "/var/lib/agent-sandbox/exported-policy.nix";
+                interactiveApproval = false;
+                uiBackend = "none";
               };
             };
-          };
-        };
+          }
+        );
 
-      "sudo-deny" =
+      proxy = proxyNode;
+
+      resource =
+        _:
+        lib.recursiveUpdate baseNode (
+          lib.recursiveUpdate (installPolicy resourcePolicy) {
+            imports = [ module ];
+
+            agent-sandbox = {
+              enable = true;
+
+              gates = {
+                filesystem.enable = true;
+                resources.enable = true;
+              };
+
+              packages = resourcePackages;
+
+              policy = {
+                dbus.enable = false;
+                interactiveApproval = false;
+                uiBackend = "none";
+              };
+            };
+
+            services.dbus.enable = true;
+
+            systemd.services = {
+              agent-sandbox-vm-resource-denied-server = {
+                after = [ "agent-sandbox-vm-resource-server.service" ];
+                requires = [ "agent-sandbox-vm-resource-server.service" ];
+                wantedBy = [ "multi-user.target" ];
+
+                serviceConfig = {
+                  ExecStart = "${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/denied.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                  Restart = "on-failure";
+                  User = "sandbox";
+                };
+              };
+
+              agent-sandbox-vm-resource-server = {
+                after = [ "agent-sandbox-vm-policy.service" ];
+                wantedBy = [ "multi-user.target" ];
+
+                serviceConfig = {
+                  ExecStart = "${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/echo.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                  Restart = "on-failure";
+                  RuntimeDirectory = "agent-sandbox-test";
+                  User = "sandbox";
+                };
+              };
+            };
+          }
+        );
+
+      static =
         _:
         baseNode
         // {
           imports = [ module ];
+
           agent-sandbox = {
             enable = true;
-            packages = sudoDenyPackages;
+            packages = staticPackages;
+            readonlyDirs = [ "/var/lib/agent-sandbox-test/global-readonly-dir" ];
+            readonlyFiles = [ "/var/lib/agent-sandbox-test/global-readonly-file" ];
+            readwriteDirs = [ "/var/lib/agent-sandbox-test/global-readwrite-dir" ];
+            readwriteFiles = [ "/var/lib/agent-sandbox-test/global-readwrite-file" ];
             sudoPolicy = "deny";
+            wrapping.unsafeAliasPrefix = "unwrapped-";
           };
         };
 
@@ -764,17 +830,46 @@ let
         lib.recursiveUpdate baseNode (
           lib.recursiveUpdate (installPolicy sudoPolicy) {
             imports = [ module ];
+
             agent-sandbox = {
               enable = true;
               packages = sudoApprovePackages;
-              sudoPolicy = "approve";
+
               policy = {
                 interactiveApproval = false;
                 uiBackend = "none";
               };
+
+              sudoPolicy = "approve";
             };
           }
         );
+
+      "sudo-deny" =
+        _:
+        baseNode
+        // {
+          imports = [ module ];
+
+          agent-sandbox = {
+            enable = true;
+            packages = sudoDenyPackages;
+            sudoPolicy = "deny";
+          };
+        };
+
+      wrapping =
+        _:
+        baseNode
+        // {
+          imports = [ module ];
+
+          agent-sandbox = {
+            enable = true;
+            packages = wrappingPackages;
+            wrapping.replaceOriginalBinary = false;
+          };
+        };
     };
 
     testScript = ''
@@ -993,28 +1088,53 @@ let
       sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --silent --show-error --max-time 5 http://denied.test:18087/denied", expect_success=False)
       sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --silent --show-error --max-time 5 http://169.254.100.1:18088/unlisted", expect_success=False)
 
-      # Transparent HTTP(S) policy: allowed URLs and methods reach local
-      # plaintext and TLS servers, while denied URLs are killed by the proxy.
+      # Transparent HTTP(S) policy: exercise the allow, deny, TLS, and
+      # streaming contracts through the transparent proxy.
+      print(proxy.succeed("systemctl --no-pager --full status agent-sandbox-proxy.service agent-sandbox-proxy-route.service agent-sandbox-nfq.service agent-sandbox-dns.service agent-sandbox-netns.service agent-sandbox-policy.service agent-sandbox-proxy-firewall.service agent-sandbox-proxy-init.service || true"))
+      print(proxy.succeed("systemctl --failed --no-legend || true; journalctl --no-pager -b -u agent-sandbox-proxy-route.service -u agent-sandbox-nfq.service -u agent-sandbox-dns.service -u agent-sandbox-netns.service -u agent-sandbox-policy.service || true"))
       proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
       proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
       proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+      print(proxy.succeed("ip netns exec agent-sandbox sh -c 'ip rule show; ip route show table 51820' || true"))
+      print(proxy.succeed("systemctl show --property=MainPID,ActiveState,SubState,ExecMainCode,ExecMainStatus agent-sandbox-proxy.service; systemctl --no-pager --full status agent-sandbox-proxy.service || true"))
+      print(proxy.succeed("ip netns exec agent-sandbox sh -c 'cat /proc/net/tcp; cat /proc/net/tcp6'"))
+      print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy"))
       proxy.wait_for_unit("user@1000.service")
       proxy.wait_for_open_port(8008)
       proxy.wait_for_open_port(8443)
       proxy.succeed("curl --fail --silent -X POST http://127.0.0.1:8008/allowed | grep -q post-ok")
       proxy.succeed("curl --fail --silent http://127.0.0.1:8008/unlisted | grep -q unlisted-get")
       proxy.succeed("curl --fail --silent --cacert ${tlsFixture}/ca-cert.pem https://169.254.100.1:8443/allowed | grep -q allowed-get")
-      sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/mitmproxy-ca-bundle.pem && test \"$NODE_EXTRA_CA_CERTS\" = /run/agent-sandbox/mitmproxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
+      sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/proxy-ca-bundle.pem && test \"$NODE_EXTRA_CA_CERTS\" = /run/agent-sandbox/proxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
+      print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox"))
+      print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list ruleset"))
       sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed | grep -q allowed-get", wrapper=session_wrapper)
       sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get", wrapper=session_wrapper)
       sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 3 curl --no-buffer --fail --silent --show-error 'http://169.254.100.1:8008/stream?alt=sse' | grep -q 'data: first'", wrapper=session_wrapper)
-      sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/denied", wrapper=session_wrapper, expect_success=False)
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "status=$(curl --silent --show-error --max-time 15 --dump-header /tmp/proxy-denied-http.headers --output /tmp/proxy-denied-http.body --write-out '%{http_code}' http://169.254.100.1:8008/denied); test \"$status\" = 403 && grep -F -q 'x-agent-sandbox-policy: blocked' /tmp/proxy-denied-http.headers && grep -F -x -q 'blocked by agent-sandbox policy' /tmp/proxy-denied-http.body",
+          wrapper=session_wrapper,
+      )
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/denied", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "http://169.254.100.1:8008/allowed", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/unlisted", wrapper=session_wrapper, expect_success=False)
-      sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/denied", wrapper=session_wrapper, expect_success=False)
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "status=$(curl --silent --show-error --max-time 15 --dump-header /tmp/proxy-denied-https.headers --output /tmp/proxy-denied-https.body --write-out '%{http_code}' https://169.254.100.1:8443/denied); test \"$status\" = 403 && grep -F -q 'x-agent-sandbox-policy: blocked' /tmp/proxy-denied-https.headers && grep -F -x -q 'blocked by agent-sandbox policy' /tmp/proxy-denied-https.body",
+          wrapper=session_wrapper,
+      )
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "https://169.254.100.1:8443/allowed", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/unlisted", wrapper=session_wrapper, expect_success=False)
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "printf blocked | timeout 3 socat - UDP4:169.254.100.1:443 | grep -q blocked",
+          wrapper=session_wrapper,
+          expect_success=False,
+      )
 
       # Sudo deny is an immediate guard failure; approve mode executes the
       # declaratively allowed command with arguments but rejects sudo options.

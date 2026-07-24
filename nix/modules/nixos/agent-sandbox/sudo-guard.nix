@@ -1,9 +1,10 @@
 # sudo shim for jailed agents: deny, or delegate to policyd.
 {
   pkgs,
-  policyPkg,
   policy,
+  policyPkg,
 }:
+
 let
   body =
     if policy == "deny" then
@@ -21,6 +22,7 @@ in
 pkgs.writeShellApplication {
   name = "sudo";
   runtimeInputs = if policy == "approve" then [ policyPkg ] else [ ];
+
   text = ''
     set -euo pipefail
     if [ "$#" -eq 0 ]; then

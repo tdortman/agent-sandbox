@@ -1,9 +1,9 @@
 # Additional jail.nix combinators for agent-sandbox (home mounts, restricted net).
 {
-  pkgs,
   lib,
-  policyContextScript,
+  pkgs,
   nvidiaSetupScript,
+  policyContextScript,
   ...
 }:
 builtin:
@@ -222,9 +222,9 @@ let
       fi
     }
   '';
+
   home-mounts =
-    bindFlag:
-    rels:
+    bindFlag: rels:
     if rels == [ ] then
       (s: s)
     else
@@ -236,6 +236,7 @@ let
           mount_home_path "$realHome/${rel}" ${bindFlag}
         '') rels}
       '';
+
   restrictedNet =
     dynamic:
     include-once "agent-sandbox-restricted-net" (
@@ -284,30 +285,6 @@ in
 {
   inherit agent-sandbox-base agent-sandbox-dynamic-base;
   inherit rebind-cwd;
-  home-readonly-mounts = home-mounts "--ro-bind";
-  home-readwrite-mounts = home-mounts "--bind";
-
-  block-env-vars =
-    vars:
-    if vars == [ ] then
-      (s: s)
-    else
-      add-runtime ''
-        ${lib.concatMapStringsSep "\n" (var: "unset ${var} || true") vars}
-      '';
-
-  # Inherit the invoking shell env (opt-out: block-env-vars unsets secrets before this runs).
-  # fwd-env PATH must precede add-pkg-deps so sandbox bins are prepended, not replaced.
-  inherit-shell-env = include-once "agent-sandbox-inherit-shell-env" (compose [
-    (fwd-env "PATH")
-    (add-runtime inheritShellEnvRuntime)
-  ]);
-
-
-  inherit-shell-env-dynamic = include-once "agent-sandbox-inherit-shell-env-dynamic" (compose [
-    (fwd-env "PATH")
-    (add-runtime inheritShellEnvRuntimeDynamic)
-  ]);
 
   agent-sandbox-context-env =
     { runtime, ... }:
@@ -325,18 +302,11 @@ in
       '')
     ];
 
-  # GPU device nodes need --dev-bind (rw). try-readonly breaks NVML/CUDA ioctls.
-  try-dev-bind =
-    path:
-    add-runtime ''
-      if [[ -e "${path}" ]]; then
-        RUNTIME_ARGS+=(--dev-bind "${path}" "${path}")
-      fi
-    '';
-
   # Bind all host NVIDIA nodes (including nvidia-fs* when nvidia-fs is enabled).
   # Must run after inherit-shell-env so LD_LIBRARY_PATH can prefer /run/opengl-driver.
   agent-sandbox-nvidia-gpu = add-runtime nvidiaSetupScript;
+  agent-sandbox-restricted-net = restrictedNet false;
+  agent-sandbox-restricted-net-dynamic = restrictedNet true;
 
   # Sudo guard combinator. The guard binary is exposed on PATH so that
   # plain `sudo` inside the sandbox routes through it. No bind mount at
@@ -349,7 +319,37 @@ in
       '')
     ];
 
-  agent-sandbox-restricted-net = restrictedNet false;
-  agent-sandbox-restricted-net-dynamic = restrictedNet true;
+  block-env-vars =
+    vars:
+    if vars == [ ] then
+      (s: s)
+    else
+      add-runtime ''
+        ${lib.concatMapStringsSep "\n" (var: "unset ${var} || true") vars}
+      '';
+
+  home-readonly-mounts = home-mounts "--ro-bind";
+  home-readwrite-mounts = home-mounts "--bind";
+
+  # Inherit the invoking shell env (opt-out: block-env-vars unsets secrets before this runs).
+  # fwd-env PATH must precede add-pkg-deps so sandbox bins are prepended, not replaced.
+  inherit-shell-env = include-once "agent-sandbox-inherit-shell-env" (compose [
+    (fwd-env "PATH")
+    (add-runtime inheritShellEnvRuntime)
+  ]);
+
+  inherit-shell-env-dynamic = include-once "agent-sandbox-inherit-shell-env-dynamic" (compose [
+    (fwd-env "PATH")
+    (add-runtime inheritShellEnvRuntimeDynamic)
+  ]);
+
+  # GPU device nodes need --dev-bind (rw). try-readonly breaks NVML/CUDA ioctls.
+  try-dev-bind =
+    path:
+    add-runtime ''
+      if [[ -e "${path}" ]]; then
+        RUNTIME_ARGS+=(--dev-bind "${path}" "${path}")
+      fi
+    '';
 
 }

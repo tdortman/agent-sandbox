@@ -45,16 +45,19 @@ let
       default = [ ];
       description = "Directories mounted read-only. ${mountPathDescription}";
     };
-    readwriteDirs = lib.mkOption {
-      type = lib.types.listOf mountPathType;
-      default = [ ];
-      description = "Directories mounted read-write. ${mountPathDescription}";
-    };
+
     readonlyFiles = lib.mkOption {
       type = lib.types.listOf mountPathType;
       default = [ ];
       description = "Files mounted read-only. ${mountPathDescription}";
     };
+
+    readwriteDirs = lib.mkOption {
+      type = lib.types.listOf mountPathType;
+      default = [ ];
+      description = "Directories mounted read-write. ${mountPathDescription}";
+    };
+
     readwriteFiles = lib.mkOption {
       type = lib.types.listOf mountPathType;
       default = [ ];
@@ -107,37 +110,43 @@ let
 
   httpRuleType = lib.types.submodule {
     options = {
-      url = lib.mkOption {
-        type = httpUrlType;
-        description = "Absolute HTTP(S) URL to match.";
-      };
-      methods = lib.mkOption {
-        type = lib.types.nullOr (lib.types.listOf httpMethodType);
-        default = null;
-        description = "HTTP method token list to match; empty means all methods only with allMethods = true.";
-      };
       allMethods = lib.mkOption {
         type = lib.types.bool;
         default = false;
         description = "Match every HTTP method at this URL.";
       };
+
       comment = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
         description = "Optional operator comment for this rule.";
       };
+
+      methods = lib.mkOption {
+        type = lib.types.nullOr (lib.types.listOf httpMethodType);
+        default = null;
+        description = "HTTP method token list to match; empty means all methods only with allMethods = true.";
+      };
+
+      url = lib.mkOption {
+        type = httpUrlType;
+        description = "Absolute HTTP(S) URL to match.";
+      };
     };
   };
+
   httpRules = {
     type = lib.types.listOf httpRuleType;
     default = [ ];
   };
+
   dbusFdMetadataType = lib.types.submodule {
     options = {
       kind = lib.mkOption {
         type = lib.types.str;
         default = "unknown";
       };
+
       readOnly = lib.mkOption {
         type = lib.types.bool;
         default = false;
@@ -152,12 +161,20 @@ let
           "session"
           "system"
         ];
+
         default = "session";
       };
+
       destination = lib.mkOption { type = lib.types.str; };
-      objectPath = lib.mkOption { type = lib.types.str; };
+
+      fdMetadata = lib.mkOption {
+        type = lib.types.listOf dbusFdMetadataType;
+        default = [ ];
+      };
+
       interface = lib.mkOption { type = lib.types.str; };
       member = lib.mkOption { type = lib.types.str; };
+
       messageKind = lib.mkOption {
         type = lib.types.enum [
           "method_call"
@@ -165,23 +182,23 @@ let
           "error"
           "signal"
         ];
+
         default = "method_call";
       };
+
+      objectPath = lib.mkOption { type = lib.types.str; };
       signature = lib.mkOption { type = lib.types.str; };
-      fdMetadata = lib.mkOption {
-        type = lib.types.listOf dbusFdMetadataType;
-        default = [ ];
-      };
     };
   };
 
   dbusRuleType = lib.types.submodule {
     options = {
-      target = lib.mkOption { type = dbusTargetType; };
       comment = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
       };
+
+      target = lib.mkOption { type = dbusTargetType; };
     };
   };
 
@@ -197,46 +214,56 @@ let
       type = lib.types.package;
       description = "The package to wrap.";
     };
+
     binary = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = "Override the main executable name; when null, uses lib.baseNameOf (lib.getExe package).";
     };
-    extraPkgs = lib.mkOption {
-      type = lib.types.listOf lib.types.package;
-      default = [ ];
-    };
-    runtimeReadonlyDirs = lib.mkOption {
+
+    blockEnvVars = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = agentSandboxLib.defaultRuntimeReadonlyDirs;
+      default = agentSandboxLib.defaultBlockEnvVars;
     };
+
     devicePaths = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = agentSandboxLib.defaultDevicePaths;
+
       description = ''
         Extra device nodes to bind into the jail (rw). Standard NVIDIA devices
         (including nvidia-fs when enabled) are bound automatically.
       '';
     };
-    blockEnvVars = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = agentSandboxLib.defaultBlockEnvVars;
-    };
+
     exposeWorkingDirectory = lib.mkOption {
       type = lib.types.bool;
       default = true;
     };
+
     extraBwrapArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
     };
+
+    extraPkgs = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+    };
+
     hiddenPaths = lib.mkOption {
       type = lib.types.listOf hiddenPathType;
       default = [ ];
+
       description = ''
         ${hiddenPathDescription}
         Merged with ``agent-sandbox.hiddenPaths`` for this package only.
       '';
+    };
+
+    runtimeReadonlyDirs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = agentSandboxLib.defaultRuntimeReadonlyDirs;
     };
   };
 
@@ -246,20 +273,21 @@ let
     cfg.network.enable || cfg.gates.filesystem.enable || cfg.sudoPolicy == "approve";
 
   sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
+
   runtime = agentSandboxLib.mkRuntime {
-    rootCfg = cfg;
     netnsEnter = "${config.security.wrapperDir}/agent-sandbox-enter";
+    rootCfg = cfg;
   };
 
   mergePackageMounts =
     pkgCfg:
     pkgCfg
     // {
-      readonlyDirs = lib.unique (cfg.readonlyDirs ++ sharedRuntimeReadonly ++ pkgCfg.readonlyDirs);
-      readwriteDirs = lib.unique (cfg.readwriteDirs ++ pkgCfg.readwriteDirs);
-      readonlyFiles = lib.unique (cfg.readonlyFiles ++ pkgCfg.readonlyFiles);
-      readwriteFiles = lib.unique (cfg.readwriteFiles ++ pkgCfg.readwriteFiles);
       hiddenPaths = lib.unique (cfg.hiddenPaths ++ pkgCfg.hiddenPaths);
+      readonlyDirs = lib.unique (cfg.readonlyDirs ++ sharedRuntimeReadonly ++ pkgCfg.readonlyDirs);
+      readonlyFiles = lib.unique (cfg.readonlyFiles ++ pkgCfg.readonlyFiles);
+      readwriteDirs = lib.unique (cfg.readwriteDirs ++ pkgCfg.readwriteDirs);
+      readwriteFiles = lib.unique (cfg.readwriteFiles ++ pkgCfg.readwriteFiles);
     };
 
   sudoGuardPkg = import ./sudo-guard.nix {
@@ -274,6 +302,7 @@ let
       // {
         inherit (cfg.wrapping) replaceOriginalBinary unsafeAliasPrefix;
         inherit runtime;
+
         inherit (runtime)
           policySocket
           sandboxPolicySocket
@@ -281,6 +310,7 @@ let
           network
           dbus
           ;
+
         dbusProxyPkg = policyPkg;
         sudoGuard = sudoGuardPkg;
       }
@@ -301,9 +331,11 @@ let
         resourceGate = true;
       }
     );
+
   credentialPathValid =
     path:
     path == null || (lib.hasPrefix "/" path && !(lib.hasInfix "\n" path) && !(lib.hasInfix "\r" path));
+
   cidrValid = value: builtins.match "^.+/.+$" value != null;
 
 in
@@ -311,172 +343,59 @@ in
   options.agent-sandbox = {
     enable = lib.mkEnableOption "jail.nix bubblewrap sandbox + optional network policy for AI agent CLIs";
 
-    packages = lib.mkOption {
-      type = lib.types.listOf (lib.types.submodule { options = packageOptions; });
-      default = [ ];
-      description = "Agent packages wrapped for sandboxed execution.";
-    };
+    gates = {
+      filesystem.enable = lib.mkEnableOption ''
+        kernel-mediated dynamic filesystem access approval via fanotify.
+        Controls filesystem access at runtime using path-based allow/deny rules.
+        The first process inside each sandbox becomes agent-sandbox-fs-arm,
+        Dynamic filesystem mode traps unsupported directory/device/metadata,
+        timestamp, and fallocate mutations before tracee-pointer classification.
+        Legacy rename/link/symlink/unlink/truncate operations remain policy-gated
+        with revalidation and ``CONTINUE`` for compatibility, with a residual
+        directory-entry TOCTOU risk. Use static bubblewrap mounts and predeclared
+        writable directories for workloads such as package installs. Static
+        bubblewrap mounts remain the structural read-only/read-write boundary.
+        Disabled by default. When disabled, no fs-arm helper or fsmon process
+        is used and there is no kernel-level filesystem mediation.
+      '';
 
-    wrapping = {
-      replaceOriginalBinary = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Install the sandbox launcher as the original program name (jail.nix-style).";
-      };
-      unsafeAliasPrefix = lib.mkOption {
-        type = lib.types.str;
-        default = "unsafe-";
-        description = "Prefix for the unwrapped executable when replaceOriginalBinary is true.";
-      };
-    };
+      resources.enable = lib.mkEnableOption ''
+        seccomp-backed resource gates for all AF_UNIX sockets and
+        broker-opened host device nodes under /dev in dynamic filesystem mode.
+        Requires gates.filesystem.enable.
+      '';
 
-    sudoPolicy = lib.mkOption {
-      type = lib.types.enum [
-        "deny"
-        "approve"
-      ];
-      default = "deny";
-      description = ''
-        How sandboxed agents may invoke sudo. ``deny`` blocks elevation.
-        ``approve`` prepends an agent-sandbox guard to the sandbox PATH so
-        that plain ``sudo`` inside the agent routes through policyd, and the
-        approved command runs as root on the host (not inside bubblewrap).
-        Host-side ``agent-sandbox-ui`` may approve. v1: ``sudo <cmd> [args…]``
-        only. ``-u`` / ``-E`` and similar flags are not supported. The
-        host's ``/run/wrappers`` tree is hidden inside the sandbox.
+      syscalls.enable = lib.mkEnableOption ''
+        kernel-mediated seccomp user-notification gate for packet-emitting syscalls.
+        The arm helper installs a seccomp filter inside the sandbox, then execs its
+        argv tail. The host-side broker (``agent-sandbox-syscall-broker``) consults policyd
+        before allowing or denying the syscall. The user-visible benefit is that a
+        short-timeout UDP client such as ``dig @1.1.1.1 +time=2`` blocks inside the
+        kernel until the approval prompt is answered, instead of returning before
+        the prompt renders. NFQUEUE remains in place as a backstop. Disabled by
+        default. When disabled, no syscall-arm helper or broker is wired.
       '';
     };
 
-    policy = {
-      socketPath = lib.mkOption {
-        type = lib.types.str;
-        default = "/run/agent-sandbox/policy.sock";
-      };
-      sandboxSocketPath = lib.mkOption {
-        type = lib.types.str;
-        default = "/run/agent-sandbox/sandbox-policy.sock";
-        description = "Sandbox-facing policyd socket. Bound over policy.socketPath inside sandboxes.";
-      };
-      exportedJson = lib.mkOption {
-        type = lib.types.str;
-        default = "/var/lib/agent-sandbox/exported-policy.json";
-      };
-      exportedNix = lib.mkOption {
-        type = lib.types.str;
-        default = "";
-        description = "Optional path to export merged policy as a .nix file beside your config repo.";
-      };
-      interactiveApproval = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          When true, unknown hosts block in policyd until the UI allows or denies
-          (same flow as elevation). Host-side OMP extension, ``agent-sandbox-ui``,
-          or ``agent-sandbox-approve`` may approve from the host policy socket.
-        '';
-      };
-      approvalTimeout = lib.mkOption {
-        type = lib.types.float;
-        default = 300.0;
-        description = ''
-          Max seconds to wait for OMP network or elevation approval after UI is connected.
-        '';
-      };
-      autoSpawnPolicyUi = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          When no policy UI is connected, policyd spawns ``agent-sandbox-ui`` as the
-          requesting user (via runuser) so non-OMP agents still get prompts.
-          Set ``uiBackend = "none"`` instead for a cleaner headless setup.
-        '';
-      };
-      uiBackend = lib.mkOption {
-        type = lib.types.enum [
-          "qt-dialog"
-          "zenity"
-          "none"
-        ];
-        default = "qt-dialog";
-        description = ''
-          Which dialog backend to use for approval prompts.
-          ``qt-dialog`` uses the packaged Qt6 helper (default).
-          ``zenity`` uses the GTK dialog tool.
-          ``none`` disables auto-spawned prompts entirely; approve and deny
-          manually with ``agent-sandbox-approve`` from a terminal.
-        '';
-      };
-      dbus = {
-        enable = lib.mkEnableOption "filtered session D-Bus access for sandboxes (requires gates.resources.enable)";
+    hiddenPaths = lib.mkOption {
+      type = lib.types.listOf hiddenPathType;
 
-        declarativeAllow = lib.mkOption {
-          type = lib.types.listOf dbusRuleType;
-          default = [ ];
-          description = "D-Bus capabilities allowed without interactive approval.";
-        };
-        declarativeDeny = lib.mkOption {
-          type = lib.types.listOf dbusRuleType;
-          default = [ ];
-          description = "D-Bus capabilities denied even when another policy allows them.";
-        };
-        socketDirectory = lib.mkOption {
-          type = lib.types.str;
-          default = "/run/user";
-          description = "Host directory used for per-sandbox D-Bus relay sockets.";
-        };
-        upstreamAddress = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = "Optional D-Bus upstream address; defaults to DBUS_SESSION_BUS_ADDRESS.";
-        };
-      };
+      default = [
+        "~/.snapshots"
+        "/home/.snapshots"
+      ];
+
+      description = ''
+        ${hiddenPathDescription}
+
+        Defaults to ``~/.snapshots`` and ``/home/.snapshots`` so btrfs snapshot trees are invisible inside
+        sandboxes and never hit filesystem policy checks. Set to ``[]`` to
+        disable masking entirely, or extend the list with additional paths.
+      '';
     };
 
     network = {
       enable = lib.mkEnableOption "deny-by-default network via netns + NFQUEUE policy enforcement";
-
-      netnsName = lib.mkOption {
-        type = lib.types.str;
-        default = "agent-sandbox";
-      };
-
-      queueNumber = lib.mkOption {
-        type = lib.types.int;
-        default = 0;
-        description = "NFQUEUE number used by nftables and agent-sandbox-nfq.";
-      };
-
-      hostIp = lib.mkOption {
-        type = lib.types.str;
-        default = "169.254.100.1";
-      };
-      netnsIp = lib.mkOption {
-        type = lib.types.str;
-        default = "169.254.100.2";
-      };
-      vethHost = lib.mkOption {
-        type = lib.types.str;
-        default = "asbx-host";
-      };
-      vethNetns = lib.mkOption {
-        type = lib.types.str;
-        default = "asbx-ns";
-      };
-      hostIp6 = lib.mkOption {
-        type = lib.types.str;
-        default = "fd00:dead:beef::1";
-        description = "IPv6 host-side veth address (stable ULA).";
-      };
-      netnsIp6 = lib.mkOption {
-        type = lib.types.str;
-        default = "fd00:dead:beef::2";
-        description = "IPv6 netns-side veth address (stable ULA).";
-      };
-      netnsIp6Prefix = lib.mkOption {
-        type = lib.types.int;
-        default = 64;
-        description = "IPv6 prefix length for the veth link (ULA /64 for SLAAC compatibility).";
-      };
 
       declarativeAllow = lib.mkOption {
         type = lib.types.listOf ruleType;
@@ -489,59 +408,29 @@ in
         default = [ ];
       };
 
-      policyTimeout = lib.mkOption {
-        type = lib.types.float;
-        default = 305.0;
-        description = ''
-          Max seconds the NFQUEUE daemon waits for policyd per transport-layer
-          connection check. Should exceed ``agent-sandbox.policy.approvalTimeout``
-          so that policyd's own timeout fires first. When interactive approval
-          is enabled, the NFQUEUE daemon uses at least ``approvalTimeout``.
-        '';
-      };
-
       dnsForwardTarget = lib.mkOption {
         type = lib.types.str;
         default = "127.0.0.53:53";
+
         description = ''
           Upstream DNS server used by agent-sandbox-dns-forwarder for raw DNS
           forwarding. Defaults to the systemd-resolved stub on the host.
         '';
       };
+
+      hostIp = lib.mkOption {
+        type = lib.types.str;
+        default = "169.254.100.1";
+      };
+
+      hostIp6 = lib.mkOption {
+        type = lib.types.str;
+        default = "fd00:dead:beef::1";
+        description = "IPv6 host-side veth address (stable ULA).";
+      };
+
       httpProxy = {
         enable = lib.mkEnableOption "transparent HTTP interception through the trusted proxy RPC";
-        declarativeAllow = lib.mkOption {
-          inherit (httpRules) type;
-          default = [ ];
-          description = ''
-            HTTP(S) URL rules allowed without interactive approval. Each rule
-            must set either a non-empty ``methods`` list or ``allMethods = true``.
-          '';
-        };
-
-        declarativeDeny = lib.mkOption {
-          inherit (httpRules) type;
-          default = [ ];
-          description = "HTTP(S) URL rules denied even when another policy allows them.";
-        };
-
-        wireguardPort = lib.mkOption {
-          type = lib.types.ints.between 1 65535;
-          default = 51820;
-          description = "UDP port used by mitmproxy's WireGuard listener.";
-        };
-
-        proxyHostIp = lib.mkOption {
-          type = lib.types.str;
-          default = "169.254.100.1";
-          description = "Host IPv4 address at which the proxy WireGuard peer is reachable.";
-        };
-
-        upstreamAllowCidrs = lib.mkOption {
-          type = lib.types.listOf lib.types.str;
-          default = [ ];
-          description = "Additional CIDRs the dedicated proxy UID may reach directly.";
-        };
 
         caCertificateFile = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
@@ -555,11 +444,20 @@ in
           description = "Absolute path to a supplied unencrypted interception CA private key.";
         };
 
-        socketPath = lib.mkOption {
-          type = lib.types.str;
-          default = "/run/agent-sandbox/proxy-policy.sock";
-          description = "Unix socket exposed to the trusted transparent HTTP proxy.";
+        declarativeAllow = lib.mkOption {
+          inherit (httpRules) type;
+          default = [ ];
 
+          description = ''
+            HTTP(S) URL rules allowed without interactive approval. Each rule
+            must set either a non-empty ``methods`` list or ``allMethods = true``.
+          '';
+        };
+
+        declarativeDeny = lib.mkOption {
+          inherit (httpRules) type;
+          default = [ ];
+          description = "HTTP(S) URL rules denied even when another policy allows them.";
         };
 
         gid = lib.mkOption {
@@ -568,58 +466,210 @@ in
           description = "Optional explicit group ID allowed to connect to the trusted proxy socket; null uses the dedicated proxy group.";
         };
 
-      };
-    };
-    gates = {
-      filesystem = {
-        enable = lib.mkEnableOption ''
-          kernel-mediated dynamic filesystem access approval via fanotify.
-          Controls filesystem access at runtime using path-based allow/deny rules.
-          The first process inside each sandbox becomes agent-sandbox-fs-arm,
-          Dynamic filesystem mode traps unsupported directory/device/metadata,
-          timestamp, and fallocate mutations before tracee-pointer classification.
-          Legacy rename/link/symlink/unlink/truncate operations remain policy-gated
-          with revalidation and ``CONTINUE`` for compatibility, with a residual
-          directory-entry TOCTOU risk. Use static bubblewrap mounts and predeclared
-          writable directories for workloads such as package installs. Static
-          bubblewrap mounts remain the structural read-only/read-write boundary.
-          Disabled by default. When disabled, no fs-arm helper or fsmon process
-          is used and there is no kernel-level filesystem mediation.
-        '';
-      };
-      resources = {
-        enable = lib.mkEnableOption ''
-          seccomp-backed resource gates for all AF_UNIX sockets and
-          broker-opened host device nodes under /dev in dynamic filesystem mode.
-          Requires gates.filesystem.enable.
-        '';
-      };
-      syscalls = {
-        enable = lib.mkEnableOption ''
-          kernel-mediated seccomp user-notification gate for packet-emitting syscalls.
-          The arm helper installs a seccomp filter inside the sandbox, then execs its
-          argv tail. The host-side broker (``agent-sandbox-syscall-broker``) consults policyd
-          before allowing or denying the syscall. The user-visible benefit is that a
-          short-timeout UDP client such as ``dig @1.1.1.1 +time=2`` blocks inside the
-          kernel until the approval prompt is answered, instead of returning before
-          the prompt renders. NFQUEUE remains in place as a backstop. Disabled by
-          default. When disabled, no syscall-arm helper or broker is wired.
-        '';
-      };
-    };
-    hiddenPaths = lib.mkOption {
-      type = lib.types.listOf hiddenPathType;
-      default = [
-        "~/.snapshots"
-        "/home/.snapshots"
-      ];
-      description = ''
-        ${hiddenPathDescription}
+        socketPath = lib.mkOption {
+          type = lib.types.str;
+          default = "/run/agent-sandbox/proxy-policy.sock";
+          description = "Unix socket exposed to the trusted transparent HTTP proxy.";
 
-        Defaults to ``~/.snapshots`` and ``/home/.snapshots`` so btrfs snapshot trees are invisible inside
-        sandboxes and never hit filesystem policy checks. Set to ``[]`` to
-        disable masking entirely, or extend the list with additional paths.
+        };
+
+        upstreamAllowCidrs = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          description = "Additional CIDRs the dedicated proxy UID may reach directly.";
+        };
+
+      };
+
+      netnsIp = lib.mkOption {
+        type = lib.types.str;
+        default = "169.254.100.2";
+      };
+
+      netnsIp6 = lib.mkOption {
+        type = lib.types.str;
+        default = "fd00:dead:beef::2";
+        description = "IPv6 netns-side veth address (stable ULA).";
+      };
+
+      netnsIp6Prefix = lib.mkOption {
+        type = lib.types.int;
+        default = 64;
+        description = "IPv6 prefix length for the veth link (ULA /64 for SLAAC compatibility).";
+      };
+
+      netnsName = lib.mkOption {
+        type = lib.types.str;
+        default = "agent-sandbox";
+      };
+
+      policyTimeout = lib.mkOption {
+        type = lib.types.float;
+        default = 305.0;
+
+        description = ''
+          Max seconds the NFQUEUE daemon waits for policyd per transport-layer
+          connection check. Should exceed ``agent-sandbox.policy.approvalTimeout``
+          so that policyd's own timeout fires first. When interactive approval
+          is enabled, the NFQUEUE daemon uses at least ``approvalTimeout``.
+        '';
+      };
+
+      queueNumber = lib.mkOption {
+        type = lib.types.int;
+        default = 0;
+        description = "NFQUEUE number used by nftables and agent-sandbox-nfq.";
+      };
+
+      vethHost = lib.mkOption {
+        type = lib.types.str;
+        default = "asbx-host";
+      };
+
+      vethNetns = lib.mkOption {
+        type = lib.types.str;
+        default = "asbx-ns";
+      };
+    };
+
+    packages = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule { options = packageOptions; });
+      default = [ ];
+      description = "Agent packages wrapped for sandboxed execution.";
+    };
+
+    policy = {
+      approvalTimeout = lib.mkOption {
+        type = lib.types.float;
+        default = 300.0;
+
+        description = ''
+          Max seconds to wait for OMP network or elevation approval after UI is connected.
+        '';
+      };
+
+      autoSpawnPolicyUi = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+
+        description = ''
+          When no policy UI is connected, policyd spawns ``agent-sandbox-ui`` as the
+          requesting user (via runuser) so non-OMP agents still get prompts.
+          Set ``uiBackend = "none"`` instead for a cleaner headless setup.
+        '';
+      };
+
+      dbus = {
+        enable = lib.mkEnableOption "filtered session D-Bus access for sandboxes (requires gates.resources.enable)";
+
+        declarativeAllow = lib.mkOption {
+          type = lib.types.listOf dbusRuleType;
+          default = [ ];
+          description = "D-Bus capabilities allowed without interactive approval.";
+        };
+
+        declarativeDeny = lib.mkOption {
+          type = lib.types.listOf dbusRuleType;
+          default = [ ];
+          description = "D-Bus capabilities denied even when another policy allows them.";
+        };
+
+        socketDirectory = lib.mkOption {
+          type = lib.types.str;
+          default = "/run/user";
+          description = "Host directory used for per-sandbox D-Bus relay sockets.";
+        };
+
+        upstreamAddress = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Optional D-Bus upstream address; defaults to DBUS_SESSION_BUS_ADDRESS.";
+        };
+      };
+
+      exportedJson = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/lib/agent-sandbox/exported-policy.json";
+      };
+
+      exportedNix = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Optional path to export merged policy as a .nix file beside your config repo.";
+      };
+
+      interactiveApproval = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+
+        description = ''
+          When true, unknown hosts block in policyd until the UI allows or denies
+          (same flow as elevation). Host-side OMP extension, ``agent-sandbox-ui``,
+          or ``agent-sandbox-approve`` may approve from the host policy socket.
+        '';
+      };
+
+      sandboxSocketPath = lib.mkOption {
+        type = lib.types.str;
+        default = "/run/agent-sandbox/sandbox-policy.sock";
+        description = "Sandbox-facing policyd socket. Bound over policy.socketPath inside sandboxes.";
+      };
+
+      socketPath = lib.mkOption {
+        type = lib.types.str;
+        default = "/run/agent-sandbox/policy.sock";
+      };
+
+      uiBackend = lib.mkOption {
+        type = lib.types.enum [
+          "qt-dialog"
+          "zenity"
+          "none"
+        ];
+
+        default = "qt-dialog";
+
+        description = ''
+          Which dialog backend to use for approval prompts.
+          ``qt-dialog`` uses the packaged Qt6 helper (default).
+          ``zenity`` uses the GTK dialog tool.
+          ``none`` disables auto-spawned prompts entirely; approve and deny
+          manually with ``agent-sandbox-approve`` from a terminal.
+        '';
+      };
+    };
+
+    sudoPolicy = lib.mkOption {
+      type = lib.types.enum [
+        "deny"
+        "approve"
+      ];
+
+      default = "deny";
+
+      description = ''
+        How sandboxed agents may invoke sudo. ``deny`` blocks elevation.
+        ``approve`` prepends an agent-sandbox guard to the sandbox PATH so
+        that plain ``sudo`` inside the agent routes through policyd, and the
+        approved command runs as root on the host (not inside bubblewrap).
+        Host-side ``agent-sandbox-ui`` may approve. v1: ``sudo <cmd> [args…]``
+        only. ``-u`` / ``-E`` and similar flags are not supported. The
+        host's ``/run/wrappers`` tree is hidden inside the sandbox.
       '';
+    };
+
+    wrapping = {
+      replaceOriginalBinary = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Install the sandbox launcher as the original program name (jail.nix-style).";
+      };
+
+      unsafeAliasPrefix = lib.mkOption {
+        type = lib.types.str;
+        default = "unsafe-";
+        description = "Prefix for the unwrapped executable when replaceOriginalBinary is true.";
+      };
     };
   }
   // mountOptions;
@@ -649,6 +699,7 @@ in
             rules = proxy.declarativeAllow ++ proxy.declarativeDeny;
           in
           proxy.enable || rules == [ ];
+
         message =
           let
             proxy = cfg.network.httpProxy;
@@ -666,6 +717,7 @@ in
           (proxy.caCertificateFile == null) == (proxy.caPrivateKeyFile == null)
           && credentialPathValid proxy.caCertificateFile
           && credentialPathValid proxy.caPrivateKeyFile;
+
         message = "agent-sandbox HTTP proxy CA certificate and key must be supplied together and use absolute paths";
       }
       {
@@ -674,6 +726,7 @@ in
             proxy = cfg.network.httpProxy;
           in
           lib.all cidrValid proxy.upstreamAllowCidrs;
+
         message = "agent-sandbox.network.httpProxy.upstreamAllowCidrs entries must be non-empty CIDR strings";
       }
       {
@@ -681,14 +734,15 @@ in
         message = "agent-sandbox.network.httpProxy.gid must be nonzero when explicitly configured";
       }
     ];
-    environment.systemPackages = (map wrapOne cfg.packages) ++ [
-      policyPkg
-    ];
 
-    # Propagate UI backend choice to session so manually run agent-sandbox-ui
-    # picks up the configured backend without needing the service environment.
-    environment.sessionVariables = {
-      AGENT_SANDBOX_UI_BACKEND = cfg.policy.uiBackend;
+    environment = {
+      # Propagate UI backend choice to session so manually run agent-sandbox-ui
+      # picks up the configured backend without needing the service environment.
+      sessionVariables.AGENT_SANDBOX_UI_BACKEND = cfg.policy.uiBackend;
+
+      systemPackages = (map wrapOne cfg.packages) ++ [
+        policyPkg
+      ];
     };
 
     nixpkgs.overlays = lib.mkAfter [
@@ -701,8 +755,9 @@ in
             defaultRuntimeReadonlyDirs
             defaultDevicePaths
             ;
-          wrapPackage = agentSandboxLib.mkWrapPackage final;
+
           inherit policyPkg;
+          wrapPackage = agentSandboxLib.mkWrapPackage final;
         };
       })
     ];

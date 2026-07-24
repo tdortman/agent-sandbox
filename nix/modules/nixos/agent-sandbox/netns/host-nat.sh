@@ -24,6 +24,7 @@ fi
 create_family_table() {
   local family="$1"
   nft delete table "$family" agent_sandbox_host 2>/dev/null || true
+  
   nft -f - <<EOF
 table $family agent_sandbox_host {
   chain postrouting {
