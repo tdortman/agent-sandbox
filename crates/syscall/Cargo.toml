@@ -1,11 +1,11 @@
 [package]
+name = "agent-sandbox-syscall"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-name              = "agent-sandbox-syscall"
-version.workspace = true
 
 [dependencies]
-libc.workspace        = true
+libc.workspace = true
 seccompiler.workspace = true
 
 [lints]

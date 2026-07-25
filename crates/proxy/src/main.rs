@@ -1,31 +1,34 @@
+mod ech_state;
+
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
-    future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use agent_sandbox_core::{HttpRequest, ProxyRequestId};
+use agent_sandbox_core::{EchRewrite, HttpRequest, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
     policy::{PolicySession, authority_for_policy, flow_key, normalize_authority},
     strip_alt_svc,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
     Layer, Service,
-    conversion::RamaTryFrom,
     error::{BoxError, BoxErrorExt},
+    extensions::ExtensionsRef,
+    io::Io,
     rt::Executor,
     service::service_fn,
 };
 use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
-    Body, HeaderValue, Request, Response, StatusCode, Version,
+    Body, HeaderValue, Request, Response, StatusCode, Version, body::util::BodyExt,
     layer::version_adapter::RequestVersionAdapter,
 };
 use rama_http_backend::{client::HttpConnector, server::HttpServer};
@@ -35,15 +38,16 @@ use rama_net::{
     stream::Socket,
 };
 use rama_tcp::{TcpStream, client::service::TcpConnector, server::TcpListener};
-use rama_tls::{
-    client::TlsClientConfig,
-    server::{ServerAuthData, TlsPeekRouter, TlsServerConfig},
+use rama_tls::{client::TlsClientConfig, server::TlsPeekRouter};
+use rama_tls_boring::{
+    TlsStream,
+    core::{
+        hpke::HpkeKey,
+        ssl::{AlpnError, NameType, SelectCertError, SslAcceptor, SslEchKeys, SslMethod, SslRef},
+        x509::X509,
+    },
 };
-use rama_tls_rustls::{
-    client::TlsConnector,
-    dep::rustls::{ServerConfig, server::ClientHello},
-    server::{DynamicConfigProvider, RustlsServerConfigExt, TlsAcceptorLayer},
-};
+use rama_tls_rustls::client::TlsConnector;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 
@@ -53,6 +57,27 @@ const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 #[derive(Debug)]
 struct PolicyDenied;
 
+fn select_alpn<'a>(_: &mut SslRef, offered: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+    let mut offset = 0;
+    let mut http11 = None;
+    while offset < offered.len() {
+        let length = offered[offset] as usize;
+        let end = offset.saturating_add(1 + length);
+        if end > offered.len() {
+            return Err(AlpnError::ALERT_FATAL);
+        }
+        let protocol = &offered[offset + 1..end];
+        if protocol == b"h2" {
+            return Ok(protocol);
+        }
+        if protocol == b"http/1.1" {
+            http11 = Some(protocol);
+        }
+        offset = end;
+    }
+    http11.ok_or(AlpnError::NOACK)
+}
+
 impl Display for PolicyDenied {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(POLICY_DENIED_BODY)
@@ -60,6 +85,31 @@ impl Display for PolicyDenied {
 }
 
 impl Error for PolicyDenied {}
+
+/// Select the client-facing ECH configuration and verify explicit overrides.
+///
+/// An override is accepted only when it is byte-for-byte identical to the
+/// persisted configuration whose private key the proxy will use.
+fn select_ech_config_list(
+    encoded: Option<&str>,
+    state: Option<&ech_state::EchState>,
+) -> Result<Option<Arc<Vec<u8>>>, BoxError> {
+    let Some(encoded) = encoded else {
+        return Ok(state.map(|state| Arc::new(state.config_list.clone())));
+    };
+    let config_list = STANDARD.decode(encoded)?;
+    let Some(state) = state else {
+        return Err(BoxError::from_static_str(
+            "ECH config override requires ECH state",
+        ));
+    };
+    if config_list != state.config_list {
+        return Err(BoxError::from_static_str(
+            "ECH config override does not match ECH private key",
+        ));
+    }
+    Ok(Some(Arc::new(config_list)))
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-sandbox-proxy")]
@@ -72,15 +122,29 @@ struct Args {
     policy_socket: PathBuf,
 
     #[arg(long, env = "AGENT_SANDBOX_PROXY_CA_CERT")]
-    ca_certificate: PathBuf,
+    ca_certificate: Option<PathBuf>,
 
     #[arg(long, env = "AGENT_SANDBOX_PROXY_CA_KEY")]
-    ca_private_key: PathBuf,
+    ca_private_key: Option<PathBuf>,
+
+    #[arg(long)]
+    init_ech_state_only: bool,
 
     #[arg(long, default_value_t = 18080)]
     listen_port: u16,
+
     #[arg(long, default_value_t = 305_000)]
     policy_timeout_ms: u64,
+
+    #[arg(long, env = "AGENT_SANDBOX_ECH_CONFIG_LIST")]
+    ech_config_list: Option<String>,
+
+    #[arg(
+        long,
+        env = "AGENT_SANDBOX_ECH_STATE_DIR",
+        default_value = ech_state::DEFAULT_ECH_STATE_DIR
+    )]
+    ech_state_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -90,36 +154,84 @@ struct FlowState {
     active_checks: Arc<Semaphore>,
     policy: Arc<PolicySession>,
     attribution_token: agent_sandbox_core::AttributionToken,
+    ech_config_list: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone)]
-struct DynamicTls {
+struct BoringTlsService<S> {
     issuer: CertificateIssuer,
-    server_name: String,
+    ech_config_list: Option<Arc<Vec<u8>>>,
+    ech_private_key: Option<[u8; 32]>,
+    fallback_name: String,
+    inner: S,
 }
 
-impl DynamicConfigProvider for DynamicTls {
-    fn get_config(
-        &self,
-        client_hello: ClientHello<'_>,
-    ) -> impl Future<Output = Result<Arc<ServerConfig>, BoxError>> {
-        let result = (|| {
-            let server_name = client_hello.server_name().unwrap_or(&self.server_name);
+impl<S, IO> Service<IO> for BoringTlsService<S>
+where
+    IO: Io + Unpin + ExtensionsRef + std::fmt::Debug + Sync + 'static,
+    S: Service<TlsStream<IO>, Error: Into<BoxError>>,
+{
+    type Error = BoxError;
+    type Output = S::Output;
 
-            let issued = self.issuer.issue(server_name)?;
+    async fn serve(&self, stream: IO) -> Result<Self::Output, Self::Error> {
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
+        acceptor.set_grease_enabled(true);
+        acceptor.set_alpn_select_callback(select_alpn);
 
-            let tls_config = TlsServerConfig::new()
-                .with_alpn_http_auto()
-                .with_single_cert(ServerAuthData {
-                    private_key: issued.private_key.as_ref().clone_key(),
-                    cert_chain: issued.certificate_chain.clone(),
-                    ocsp: None,
-                });
+        if let (Some(config_list), Some(private_key)) =
+            (&self.ech_config_list, self.ech_private_key)
+        {
+            let mut keys = SslEchKeys::builder()?;
+            let config = config_list
+                .get(2..)
+                .ok_or_else(|| BoxError::from_static_str("invalid ECH config list"))?;
+            keys.add_key(true, config, HpkeKey::dhkem_p256_sha256(&private_key)?)?;
+            acceptor.set_ech_keys(&keys.build())?;
+        }
 
-            Ok(Arc::new(ServerConfig::rama_try_from(tls_config)?))
-        })();
+        let issuer = self.issuer.clone();
+        let fallback_name = self.fallback_name.clone();
+        acceptor.set_select_certificate_callback(move |mut client_hello| {
+            let server_name = client_hello
+                .servername(NameType::HOST_NAME)
+                .unwrap_or(&fallback_name);
 
-        std::future::ready(result)
+            let issued_certificate = issuer
+                .issue(server_name)
+                .map_err(|_| SelectCertError::ERROR)?;
+
+            let ssl = client_hello.ssl_mut();
+
+            let leaf = X509::from_der(issued_certificate.certificate_chain[0].as_ref())
+                .map_err(|_| SelectCertError::ERROR)?;
+
+            ssl.set_certificate(leaf.as_ref())
+                .map_err(|_| SelectCertError::ERROR)?;
+
+            for certificate in issued_certificate.certificate_chain.iter().skip(1) {
+                let certificate =
+                    X509::from_der(certificate.as_ref()).map_err(|_| SelectCertError::ERROR)?;
+
+                ssl.add_chain_cert(certificate.as_ref())
+                    .map_err(|_| SelectCertError::ERROR)?;
+            }
+
+            let private_key = rama_tls_boring::core::pkey::PKey::private_key_from_der(
+                issued_certificate.private_key.secret_der(),
+            )
+            .map_err(|_| SelectCertError::ERROR)?;
+
+            ssl.set_private_key(private_key.as_ref())
+                .map_err(|_| SelectCertError::ERROR)?;
+            Ok(())
+        });
+
+        let stream = rama_tls_boring::core::tokio::accept(&acceptor.build(), stream).await?;
+        self.inner
+            .serve(TlsStream::new(stream))
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -131,8 +243,35 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     let args = Args::parse();
-    let ca_certificate = std::fs::read_to_string(&args.ca_certificate)?;
-    let ca_private_key = std::fs::read_to_string(&args.ca_private_key)?;
+
+    if args.init_ech_state_only {
+        let state_dir = args
+            .ech_state_dir
+            .as_deref()
+            .ok_or_else(|| BoxError::from_static_str("ECH state directory is required"))?;
+        ech_state::load_or_generate(state_dir)?;
+        return Ok(());
+    }
+
+    let ech_state = args
+        .ech_state_dir
+        .as_deref()
+        .map(ech_state::load_or_generate)
+        .transpose()?;
+
+    let ech_config_list =
+        select_ech_config_list(args.ech_config_list.as_deref(), ech_state.as_ref())?;
+    let ech_private_key = ech_state.map(|state| state.private_key);
+    let ca_certificate = args
+        .ca_certificate
+        .as_deref()
+        .ok_or_else(|| BoxError::from_static_str("CA certificate is required"))?;
+    let ca_certificate = std::fs::read_to_string(ca_certificate)?;
+    let ca_private_key = args
+        .ca_private_key
+        .as_deref()
+        .ok_or_else(|| BoxError::from_static_str("CA private key is required"))?;
+    let ca_private_key = std::fs::read_to_string(ca_private_key)?;
     let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
 
     let policy = Arc::new(
@@ -143,14 +282,19 @@ async fn main() -> Result<(), BoxError> {
         .await?,
     );
 
+    let shutdown = Arc::new(Notify::new());
     let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
     let executor = Executor::default();
-    let shutdown = Arc::new(Notify::new());
 
+    let listener_config = ListenerConfig {
+        issuer,
+        ech_config_list,
+        ech_private_key,
+    };
     let service = build_listener_service(
         executor.clone(),
         policy.clone(),
-        issuer,
+        listener_config,
         shutdown.clone(),
         active_checks,
         args.listen_port,
@@ -218,10 +362,17 @@ fn policy_denied_response() -> Response {
     response
 }
 
+#[derive(Clone)]
+struct ListenerConfig {
+    issuer: CertificateIssuer,
+    ech_config_list: Option<Arc<Vec<u8>>>,
+    ech_private_key: Option<[u8; 32]>,
+}
+
 fn build_listener_service(
     executor: Executor,
     policy: Arc<PolicySession>,
-    issuer: CertificateIssuer,
+    listener_config: ListenerConfig,
     shutdown: Arc<Notify>,
     active_checks: Arc<Semaphore>,
     listen_port: u16,
@@ -229,10 +380,11 @@ fn build_listener_service(
     service_fn(move |stream: TcpStream| {
         let executor = executor.clone();
         let policy = policy.clone();
-        let issuer = issuer.clone();
+        let issuer = listener_config.issuer.clone();
+        let ech_config_list = listener_config.ech_config_list.clone();
+        let ech_private_key = listener_config.ech_private_key;
         let shutdown = shutdown.clone();
         let active_checks = active_checks.clone();
-
         async move {
             let peer: SocketAddr = stream.peer_addr()?.into();
             let destination = destination_for_stream(&stream, listen_port)?;
@@ -247,8 +399,8 @@ fn build_listener_service(
                 active_checks: active_checks.clone(),
                 policy: policy.clone(),
                 attribution_token: attribution_token.clone(),
+                ech_config_list: ech_config_list.clone(),
             };
-
             let http = HttpServer::auto(executor.clone()).service(service_fn(move |request| {
                 let state = state.clone();
                 let shutdown = shutdown.clone();
@@ -268,16 +420,16 @@ fn build_listener_service(
                     }
                 }
             }));
+            let fallback_http = http.clone();
+            let tls = BoringTlsService {
+                issuer,
+                ech_config_list: ech_config_list.clone(),
+                ech_private_key,
+                fallback_name: destination.ip().to_string(),
+                inner: http.clone(),
+            };
 
-            let tls = TlsAcceptorLayer::new(TlsServerConfig::new().with_dynamic_config(Arc::new(
-                DynamicTls {
-                    issuer,
-                    server_name: destination.ip().to_string(),
-                },
-            )))
-            .into_layer(http.clone());
-
-            let service = TlsPeekRouter::new(tls).with_fallback(http);
+            let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
             let result = service.serve(stream).await;
             let release_result = policy.release(attribution_token).await;
             release_result?;
@@ -358,6 +510,88 @@ impl Drop for PendingPolicyCheck {
     }
 }
 
+fn is_doh_request(request: &Request) -> bool {
+    let content_type = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
+        });
+
+    let dns_query = request.uri().query().is_some_and(|query| {
+        query
+            .to_string()
+            .split('&')
+            .any(|part| part.starts_with("dns="))
+    });
+
+    (request.method().as_str().eq_ignore_ascii_case("POST") && content_type)
+        || (request.method().as_str().eq_ignore_ascii_case("GET") && dns_query)
+}
+
+fn is_doh_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
+        })
+}
+
+/// Rewrite a successful `DoH` DNS response before returning it to the client.
+///
+/// Only `application/dns-message` responses are inspected. Unsupported content
+/// encodings and DNSSEC-protected ECH answers fail closed.
+async fn rewrite_doh_response(
+    mut response: Response,
+    ech_config_list: Option<&[u8]>,
+) -> Result<Response, BoxError> {
+    let Some(replacement) = ech_config_list else {
+        return Ok(response);
+    };
+
+    if !is_doh_response(&response) {
+        return Err(Box::new(PolicyDenied));
+    }
+
+    if response
+        .headers()
+        .get("content-encoding")
+        .is_some_and(|value| value != "identity")
+    {
+        return Err(BoxError::from_static_str(
+            "cannot inspect encoded DoH response",
+        ));
+    }
+
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    let body = body.limited(65_535).collect().await?.to_bytes();
+    let body = match rewrite_ech_config(&body, replacement)? {
+        EchRewrite::Rewritten(body) => body,
+        EchRewrite::Unchanged => body.to_vec(),
+        EchRewrite::DnssecProtected => {
+            return Err(Box::new(PolicyDenied));
+        }
+    };
+
+    response.headers_mut().remove("transfer-encoding");
+    response.headers_mut().insert(
+        "content-length",
+        HeaderValue::from_str(&body.len().to_string())?,
+    );
+
+    *response.body_mut() = Body::from(body);
+    Ok(response)
+}
+
 async fn proxy_request(
     mut request: Request,
     state: FlowState,
@@ -366,6 +600,8 @@ async fn proxy_request(
     if blocked_http_request(&request) {
         return Err(Box::new(PolicyDenied));
     }
+
+    let doh = is_doh_request(&request);
 
     let host = request
         .headers()
@@ -394,7 +630,9 @@ async fn proxy_request(
             .clone()
             .try_acquire_owned()
             .map_err(|_| BoxError::from_static_str("too many active policy checks"))?;
+
         let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
+
         let check = tokio::select! {
             result = state.policy.check_http(request_id, state.attribution_token, policy_request) => result?,
             () = shutdown.notified() => {
@@ -403,6 +641,7 @@ async fn proxy_request(
                 return Err(BoxError::from_static_str("proxy shutting down"));
             }
         };
+
         pending.disarm();
         check
     };
@@ -444,12 +683,22 @@ async fn proxy_request(
     let connection = client.serve(request).await?;
     let mut response = connection.conn.serve(connection.input).await?;
     strip_alt_svc(&mut response);
+
+    if doh {
+        response = rewrite_doh_response(
+            response,
+            state.ech_config_list.as_ref().map(|value| value.as_slice()),
+        )
+        .await?;
+    }
+
     info!(
         %original_uri,
         host = %upstream_authority,
         destination = %state.destination,
         "proxied HTTP request"
     );
+
     Ok(response)
 }
 
@@ -483,8 +732,10 @@ fn blocked_http_request(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Body, POLICY_DENIED_BODY, Request, StatusCode, blocked_http_request, policy_denied_response,
+        Body, POLICY_DENIED_BODY, Request, StatusCode, blocked_http_request, is_doh_request,
+        policy_denied_response, select_ech_config_list,
     };
+    use crate::ech_state::EchState;
 
     #[test]
     fn blocks_tunnel_methods_case_insensitively() {
@@ -506,6 +757,39 @@ mod tests {
             .expect("test request");
 
         assert!(blocked_http_request(&request));
+    }
+    #[test]
+    fn detects_doh_post_and_get_requests() {
+        let post = Request::builder()
+            .method("POST")
+            .header("content-type", "application/dns-message")
+            .body(Body::empty())
+            .expect("test request");
+        assert!(is_doh_request(&post));
+
+        let get = Request::builder()
+            .method("GET")
+            .uri("/dns-query?dns=abc")
+            .body(Body::empty())
+            .expect("test request");
+        assert!(is_doh_request(&get));
+    }
+
+    #[test]
+    fn ech_config_override_must_match_private_key() {
+        let state = EchState {
+            config_list: vec![1],
+            private_key: [0; 32],
+        };
+
+        assert!(select_ech_config_list(Some("Ag=="), Some(&state)).is_err());
+        assert_eq!(
+            select_ech_config_list(Some("AQ=="), Some(&state))
+                .expect("matching ECH config")
+                .expect("ECH config")
+                .as_slice(),
+            &[1]
+        );
     }
 
     #[test]

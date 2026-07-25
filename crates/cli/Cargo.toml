@@ -21,8 +21,9 @@ name = "agent-sandbox-ui"
 path = "src/bin/ui.rs"
 
 [dependencies]
-agent-sandbox-core.workspace = true
-agent-sandbox-sysutil.workspace = true
+agent-sandbox-core = { path = "../core" }
+agent-sandbox-sysutil = { path = "../sysutil" }
+
 clap = { workspace = true, features = ["env"] }
 nix = { workspace = true, features = ["fs", "process", "user"] }
 serde_json.workspace = true

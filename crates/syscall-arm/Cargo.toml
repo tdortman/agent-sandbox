@@ -1,19 +1,20 @@
 [package]
+name = "agent-sandbox-syscall-arm"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-name              = "agent-sandbox-syscall-arm"
-version.workspace = true
-
-[lints]
-workspace = true
 
 [[bin]]
 name = "agent-sandbox-syscall-arm"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-syscall.workspace = true
-agent-sandbox-sysutil.workspace = true
-clap.workspace                  = true
-libc.workspace                  = true
-nix = { workspace = true, features = ["process", "signal", "fs"] }
+agent-sandbox-syscall = { path = "../syscall" }
+agent-sandbox-sysutil = { path = "../sysutil" }
+
+clap.workspace = true
+libc.workspace = true
+nix = { workspace = true, features = ["fs", "process", "signal"] }
+
+[lints]
+workspace = true

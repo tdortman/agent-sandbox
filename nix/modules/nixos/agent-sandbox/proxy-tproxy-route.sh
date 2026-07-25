@@ -42,12 +42,14 @@ fail_closed() {
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
      tcp dport { $ports } reject with tcp reset
-     udp dport 443 reject
+     tcp dport 853 reject with tcp reset
+     udp dport { 443, 853 } reject
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
      tcp dport { $ports } reject with tcp reset
-     udp dport 443 reject
+     tcp dport 853 reject with tcp reset
+     udp dport { 443, 853 } reject
    }
  }
 EOF
@@ -87,13 +89,15 @@ nft -f - <<EOF
      meta skuid $proxy_uid return
      # Queue before local TPROXY routing so the policy daemon sees the
      # original sandbox socket tuple.
+     tcp dport 853 reject with tcp reset
+     udp dport { 443, 853 } reject
      tcp dport { $ports } counter meta mark set $mark queue num $queue_number
-     udp dport 443 reject
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
+     tcp dport 853 reject with tcp reset
+     udp dport { 443, 853 } reject
      tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark
-     udp dport 443 reject
    }
    chain output_redirect {
      type nat hook output priority 5; policy accept;

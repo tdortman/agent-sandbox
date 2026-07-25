@@ -56,6 +56,8 @@ trap 'rm -f "$rules_file" "$apply_file"' EXIT
   printf '  ct state established,related accept\n'
   printf '  ip daddr %s udp dport 53 accept\n' "$dns_server_ip"
   printf '  ip daddr %s tcp dport 53 accept\n' "$dns_server_ip"
+  printf '  tcp dport 853 reject with tcp reset\n'
+  printf '  udp dport { 443, 853 } reject\n'
 
   while IFS= read -r cidr; do
     [[ -n "$cidr" ]] || continue
@@ -64,9 +66,7 @@ trap 'rm -f "$rules_file" "$apply_file"' EXIT
       *) printf '  ip daddr %s accept\n' "$cidr" ;;
     esac
   done < <(jq -r '.[]' "$cidrs_file")
-
   printf '  fib daddr type local reject\n'
-  printf '  udp dport 443 reject\n'
 
   # Permit public upstream destinations, while keeping private and reserved
   # address ranges fail-closed unless explicitly listed above.

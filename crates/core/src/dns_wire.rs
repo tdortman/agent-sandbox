@@ -1,10 +1,12 @@
 //! Extract policy-relevant IP→hostname mappings from DNS response packets.
-
 use std::collections::HashSet;
 
 use hickory_proto::{
     op::{Message, MessageType},
-    rr::{Name, RData, rdata::svcb::SvcParamValue},
+    rr::{
+        Name, RData,
+        rdata::svcb::{SvcParamKey, SvcParamValue},
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +14,102 @@ pub struct DnsMapping {
     pub ip: String,
     pub hostname: String,
     pub ttl: u32,
+}
+
+/// Result of attempting to replace an ECH configuration in a DNS response.
+///
+/// The caller must treat `DnssecProtected` as a fail-closed result rather than
+/// forwarding a response whose authenticated contents were modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EchRewrite {
+    /// At least one ECH configuration was replaced and the message re-encoded.
+    ///
+    /// Contains the complete DNS response bytes.
+    Rewritten(Vec<u8>),
+    /// No ECH configuration was present, or the message was not changed.
+    Unchanged,
+    /// The response contains DNSSEC evidence and must not be rewritten.
+    DnssecProtected,
+}
+
+/// Replace only advertised ECH configurations in an unsigned DNS response.
+///
+/// DNSSEC-bearing responses are returned unchanged so the caller can fail
+/// closed instead of forwarding an internally inconsistent response.
+///
+/// # Errors
+///
+/// Returns an error when the DNS response cannot be decoded or re-encoded.
+pub fn rewrite_ech_config(data: &[u8], replacement: &[u8]) -> Result<EchRewrite, String> {
+    let mut message = Message::from_vec(data).map_err(|error| error.to_string())?;
+
+    if message.metadata.message_type != MessageType::Response {
+        return Ok(EchRewrite::Unchanged);
+    }
+
+    let has_ech = message
+        .answers
+        .iter()
+        .chain(&message.authorities)
+        .chain(&message.additionals)
+        .any(|record| match &record.data {
+            RData::HTTPS(https) => https
+                .0
+                .svc_params
+                .iter()
+                .any(|(key, _)| *key == SvcParamKey::EchConfigList),
+            RData::SVCB(svcb) => svcb
+                .svc_params
+                .iter()
+                .any(|(key, _)| *key == SvcParamKey::EchConfigList),
+            _ => false,
+        });
+
+    let dnssec_evidence = has_ech
+        && (message.metadata.authentic_data
+            || message
+                .answers
+                .iter()
+                .chain(&message.authorities)
+                .chain(&message.additionals)
+                .any(|record| record.record_type().is_dnssec()));
+
+    if dnssec_evidence {
+        return Ok(EchRewrite::DnssecProtected);
+    }
+
+    let mut rewritten = false;
+    for record in message
+        .answers
+        .iter_mut()
+        .chain(&mut message.authorities)
+        .chain(&mut message.additionals)
+    {
+        let params = match &mut record.data {
+            RData::HTTPS(https) => &mut https.0.svc_params,
+            RData::SVCB(svcb) => &mut svcb.svc_params,
+            _ => continue,
+        };
+
+        for (key, value) in params {
+            if *key == SvcParamKey::EchConfigList {
+                let SvcParamValue::EchConfigList(config) = value else {
+                    continue;
+                };
+                config.0 = replacement.to_vec();
+                rewritten = true;
+            }
+        }
+    }
+
+    if !rewritten {
+        return Ok(EchRewrite::Unchanged);
+    }
+
+    message
+        .to_vec()
+        .map(EchRewrite::Rewritten)
+        .map_err(|error| error.to_string())
 }
 
 fn query_name(message: &Message) -> Option<String> {
@@ -141,12 +239,12 @@ mod tests {
             Name, RData, Record, RecordType,
             rdata::{
                 A, AAAA, CNAME, HTTPS,
-                svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue},
+                svcb::{EchConfigList, IpHint, SVCB, SvcParamKey, SvcParamValue},
             },
         },
     };
 
-    use super::{DnsMapping, mappings_from_response};
+    use super::{DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config};
 
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");
@@ -281,6 +379,52 @@ mod tests {
                 ttl: 120,
             },
         ]);
+    }
+
+    #[test]
+    fn rewrites_advertised_ech_config() {
+        let qname = Name::from_ascii("example.com.").expect("valid name");
+        let svcb = SVCB::new(1, Name::root(), vec![(
+            SvcParamKey::EchConfigList,
+            SvcParamValue::EchConfigList(EchConfigList(vec![1, 2, 3])),
+        )]);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message
+            .add_query(Query::query(qname.clone(), RecordType::HTTPS))
+            .add_answer(Record::from_rdata(qname, 60, RData::HTTPS(HTTPS(svcb))));
+
+        let result =
+            rewrite_ech_config(&message.to_vec().expect("encode"), &[4, 5, 6]).expect("rewrite");
+        let EchRewrite::Rewritten(bytes) = result else {
+            panic!("expected rewritten response");
+        };
+        let rewritten = Message::from_vec(&bytes).expect("decode rewritten response");
+        let RData::HTTPS(https) = &rewritten.answers[0].data else {
+            panic!("expected HTTPS answer");
+        };
+        assert_eq!(
+            https.0.svc_params[0].1,
+            SvcParamValue::EchConfigList(EchConfigList(vec![4, 5, 6]))
+        );
+    }
+
+    #[test]
+    fn refuses_to_rewrite_authenticated_ech_config() {
+        let qname = Name::from_ascii("example.com.").expect("valid name");
+        let svcb = SVCB::new(1, Name::root(), vec![(
+            SvcParamKey::EchConfigList,
+            SvcParamValue::EchConfigList(EchConfigList(vec![1, 2, 3])),
+        )]);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.metadata.authentic_data = true;
+        message
+            .add_query(Query::query(qname.clone(), RecordType::HTTPS))
+            .add_answer(Record::from_rdata(qname, 60, RData::HTTPS(HTTPS(svcb))));
+
+        assert_eq!(
+            rewrite_ech_config(&message.to_vec().expect("encode"), &[4, 5, 6]).expect("rewrite"),
+            EchRewrite::DnssecProtected
+        );
     }
 
     #[test]

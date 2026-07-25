@@ -25,6 +25,7 @@ let
   proxyTproxyRouteSource = builtins.toFile "agent-sandbox-proxy-tproxy-route.sh" (
     builtins.readFile ../../modules/nixos/agent-sandbox/proxy-tproxy-route.sh
   );
+  proxyInitSource = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-init.sh;
   runtime = proxy: {
     hostIp = "169.254.100.1";
     httpProxy.enable = proxy;
@@ -131,6 +132,17 @@ let
   validPortJson =
     builtins.fromJSON
       validPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+
+  echStateOrdering =
+    let
+      dnsService = validPortSystem.config.systemd.services."agent-sandbox-dns";
+      initService = validPortSystem.config.systemd.services."agent-sandbox-proxy-init";
+    in
+    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.after;
+    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.requires;
+    assert lib.hasInfix "--init-ech-state-only" proxyInitSource;
+    assert lib.hasInfix "agent-sandbox-proxy" (toString initService.serviceConfig.ExecStart);
+    true;
 
   invalidProxySystem = mkNixosSystem {
     agent-sandbox.network.httpProxy.declarativeAllow = [
@@ -315,6 +327,7 @@ in
 pkgs.runCommand "network-mode-wrapper-regression" { } ''
   fail() { echo "FAIL: $*" >&2; exit 1; }
   test "${if declarativeHttpContract then "ok" else "failed"}" = ok
+  test "${if echStateOrdering then "ok" else "failed"}" = ok
 
 
   static_direct=${script staticDirect}

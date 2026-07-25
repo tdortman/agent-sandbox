@@ -31,7 +31,9 @@ rust.rustPlatform.buildRustPackage {
   pname = "agent-sandbox";
 
   nativeBuildInputs = [
+    cmake
     makeWrapper
+    pkgs.gitMinimal
     rust.rustPlatform.bindgenHook
   ];
 
@@ -46,7 +48,20 @@ rust.rustPlatform.buildRustPackage {
     outputHashes."seccompiler-0.5.0" = "sha256-k1TNr0GA8GeJYo1RvB/cfuvVg+tN4G7yypkVkhSq+h8=";
   };
 
+  preBuild = ''
+    # rama-boring-sys 0.6.4 treats GCC 15's upstream false positives as errors.
+    export CXXFLAGS="''${CXXFLAGS:-} -Wno-error=array-bounds -Wno-error=stringop-overflow"
+  '';
+
   doCheck = true;
+
+  # The target-qualified nextest hook cannot link rama-boring's generated
+  # native symbols for proxy tests; run the workspace tests for the host.
+  checkPhase = ''
+    runHook preCheck
+    cargo test --release --workspace --offline
+    runHook postCheck
+  '';
 
   postInstall = ''
     # Copy the Qt dialog helper into the package.
@@ -61,8 +76,6 @@ rust.rustPlatform.buildRustPackage {
     # Install zsh completion.
     install -Dm644 ${./_agent-sandbox-approve} $out/share/zsh/site-functions/_agent-sandbox-approve
   '';
-
-  useNextest = true;
 
   meta = with lib; {
     description = "Policy daemon, NFQUEUE enforcer, DNS cache, CLIs, netns enter helper, and Qt-wrapped UI";

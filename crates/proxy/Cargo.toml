@@ -9,7 +9,9 @@ name = "agent-sandbox-proxy"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-core.workspace = true
+agent-sandbox-core = { path = "../core" }
+
+base64.workspace = true
 clap = { workspace = true, features = ["env"] }
 nix = { workspace = true, features = ["net", "socket"] }
 rama-core.workspace = true
@@ -19,6 +21,7 @@ rama-http-backend.workspace = true
 rama-net.workspace = true
 rama-tcp.workspace = true
 rama-tls.workspace = true
+rama-tls-boring.workspace = true
 rama-tls-rustls.workspace = true
 rcgen.workspace = true
 thiserror.workspace = true

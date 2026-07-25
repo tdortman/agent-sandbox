@@ -185,6 +185,9 @@ let
         ip daddr . udp dport @reject_v4 reject
         ip6 daddr . tcp dport @reject_v6 reject with tcp reset
         ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
+        # Encrypted DNS transports have no policy-controlled resolver path.
+        tcp dport 853 reject with tcp reset
+        udp dport { 443, 853 } reject
         ${lib.optionalString (!cfg.httpProxy.enable)
           "    ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    ip protocol udp queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto udp queue num ${toString runtime.queueNumber}\n"
         }
@@ -353,6 +356,7 @@ let
         --policy-socket ${lib.escapeShellArg runtime.httpProxy.socketPath} \
         --ca-certificate ${lib.escapeShellArg "${proxyStateDir}/proxy-ca-cert.pem"} \
         --ca-private-key ${lib.escapeShellArg "${proxyStateDir}/proxy-ca.key"} \
+        --ech-state-dir ${lib.escapeShellArg proxyStateDir} \
         --listen-port 18080
     '';
   };
@@ -552,7 +556,13 @@ lib.mkIf policyEnabled (
             "agent-sandbox-netns.service"
             "network.target"
             "systemd-resolved.service"
-          ];
+          ]
+          ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
+
+          requires = [
+            "agent-sandbox-netns.service"
+          ]
+          ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
 
           wantedBy = [ "multi-user.target" ];
 
@@ -574,6 +584,8 @@ lib.mkIf policyEnabled (
               ++ lib.optionals cfg.httpProxy.enable [
                 "--cache-client-ip"
                 runtime.network.netnsIp
+                "--ech-config-path"
+                "${proxyStateDir}/ech-config-list"
               ]
               ++ lib.optional cfg.httpProxy.enable "--suppress-https-svcb"
             );
@@ -798,6 +810,7 @@ lib.mkIf policyEnabled (
               proxyStateDir
               proxyBundlePath
               "/etc/ssl/certs/ca-bundle.crt"
+              "${sandboxPkg}/bin/agent-sandbox-proxy"
             ];
 
             ExecStartPost = "${pkgs.coreutils}/bin/chown -R ${proxyUser}:${proxyGroup} ${proxyStateDir}";

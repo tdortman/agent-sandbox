@@ -24,7 +24,7 @@ pub use agent_context::{
 };
 pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
 pub use dns_cache::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_cache};
-pub use dns_wire::{DnsMapping, mappings_from_response};
+pub use dns_wire::{DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config};
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 pub use hosts::{

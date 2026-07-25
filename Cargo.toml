@@ -22,12 +22,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-# internal crates
-agent-sandbox-core = { path = "crates/core" }
-agent-sandbox-syscall = { path = "crates/syscall" }
-agent-sandbox-sysutil = { path = "crates/sysutil" }
-
-# external
+base64 = "0.23.0"
 caps = "0.5.6"
 clap = { version = "4.6.4", features = ["derive"] }
 dns-lookup = "3.0.1"
@@ -71,6 +66,10 @@ features = ["tls"]
 version = "0.3.0"
 default-features = false
 features = ["http", "ring"]
+
+[workspace.dependencies.rama-tls-boring]
+version = "0.3.0"
+default-features = false
 
 [workspace.dependencies.seccompiler]
 git = "https://github.com/rust-vmm/seccompiler.git"

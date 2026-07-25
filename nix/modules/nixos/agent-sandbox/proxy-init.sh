@@ -4,6 +4,7 @@ set -euo pipefail
 STATE_DIR="$1"
 BUNDLE_PATH="$2"
 HOST_BUNDLE="$3"
+ECH_INIT_BIN="$4"
 
 mkdir -p "$STATE_DIR" "$(dirname "$BUNDLE_PATH")"
 chmod 0700 "$STATE_DIR"
@@ -88,5 +89,8 @@ fi
 
 cat -- "$cert_state" >> "$temporary_bundle"
 chmod 0644 "$temporary_bundle"
+
 mv -f -- "$temporary_bundle" "$BUNDLE_PATH"
+
+"$ECH_INIT_BIN" --init-ech-state-only --ech-state-dir "$STATE_DIR"
 

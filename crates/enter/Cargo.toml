@@ -9,7 +9,8 @@ name = "agent-sandbox-enter"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-sysutil = { workspace = true }
+agent-sandbox-sysutil = { path = "../sysutil/" }
+
 caps.workspace = true
 clap.workspace = true
 nix = { workspace = true, features = ["sched"] }

@@ -14,6 +14,22 @@ let
 
     text = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-init.sh;
   };
+
+  echInit = pkgs.writeShellApplication {
+    name = "proxy-ech-init-regression";
+    runtimeInputs = [ pkgs.coreutils ];
+
+    text = ''
+      set -euo pipefail
+      [[ "$#" == 3 ]] || exit 1
+      [[ "$1" == "--init-ech-state-only" ]] || exit 1
+      [[ "$2" == "--ech-state-dir" ]] || exit 1
+      state="$3"
+      mkdir -p "$state"
+      printf '%s\n' "$*" >> "$state/ech-init-args"
+      : > "$state/ech-config-list"
+    '';
+  };
 in
 pkgs.runCommand "proxy-init-regression"
   {
@@ -33,7 +49,9 @@ pkgs.runCommand "proxy-init-regression"
     host_bundle="$TMPDIR/host-bundle.pem"
     printf '%s\n' 'host trust placeholder' > "$host_bundle"
 
-    ${proxyInit}/bin/proxy-init-regression "$state" "$bundle" "$host_bundle"
+    ${proxyInit}/bin/proxy-init-regression "$state" "$bundle" "$host_bundle" ${echInit}/bin/proxy-ech-init-regression
+    grep -F -q -- '--init-ech-state-only --ech-state-dir' "$state/ech-init-args" \
+      || fail "ECH state initialization was not ordered through proxy init"
 
     [[ ! -e "$state/proxy-ca.pem" ]] || fail "obsolete combined CA file was generated"
     [[ -s "$state/proxy-ca-cert.pem" ]] || fail "certificate-only CA file is missing"
@@ -51,7 +69,7 @@ pkgs.runCommand "proxy-init-regression"
     grep -F -q -- 'BEGIN CERTIFICATE' "$bundle" || fail "proxy CA was not added to the bundle"
 
     rm -- "$bundle"
-    ${proxyInit}/bin/proxy-init-regression "$state" "$bundle" "$host_bundle"
+    ${proxyInit}/bin/proxy-init-regression "$state" "$bundle" "$host_bundle" ${echInit}/bin/proxy-ech-init-regression
     openssl pkey -in "$state/proxy-ca.key" -noout
     openssl x509 -in "$state/proxy-ca-cert.pem" -noout
 
