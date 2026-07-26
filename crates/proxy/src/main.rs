@@ -617,6 +617,7 @@ async fn proxy_request(
     state: FlowState,
     shutdown: Arc<Notify>,
 ) -> Result<Response, BoxError> {
+    let websocket = is_websocket_upgrade_request(&request);
     if blocked_http_request(&request) {
         return Err(Box::new(PolicyDenied));
     }
@@ -668,6 +669,11 @@ async fn proxy_request(
     };
 
     if !check.ok || !check.allowed {
+        info!(
+            %authority, %path, method = %request.method().as_str(),
+            ?websocket, version = ?request.version(),
+            "HTTP request denied by policy"
+        );
         return Err(Box::new(PolicyDenied));
     }
 
@@ -703,6 +709,12 @@ async fn proxy_request(
 
     let connection = client.serve(request).await?;
     let mut response = connection.conn.serve(connection.input).await?;
+    let response_status = response.status();
+    let response_version = response.version();
+    if websocket {
+        info!(host = %upstream_authority, ?response_status, ?response_version, "received WebSocket upgrade response");
+    }
+
     adapt_response_version(&mut response, &response_context)?;
     strip_alt_svc(&mut response);
 
@@ -718,6 +730,9 @@ async fn proxy_request(
         %original_uri,
         host = %upstream_authority,
         destination = %state.destination,
+        ?websocket,
+        ?response_status,
+        ?response_version,
         "proxied HTTP request"
     );
 
