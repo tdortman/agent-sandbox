@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.199.0"
 edition = "2024"
 license = "MIT"
 
@@ -62,14 +62,14 @@ version = "0.3.0"
 default-features = false
 features = ["tls"]
 
+[workspace.dependencies.rama-tls-boring]
+version = "0.3.0"
+default-features = false
+
 [workspace.dependencies.rama-tls-rustls]
 version = "0.3.0"
 default-features = false
 features = ["http", "ring"]
-
-[workspace.dependencies.rama-tls-boring]
-version = "0.3.0"
-default-features = false
 
 [workspace.dependencies.seccompiler]
 git = "https://github.com/rust-vmm/seccompiler.git"
