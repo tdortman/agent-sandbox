@@ -357,6 +357,9 @@ let
         --ca-certificate ${lib.escapeShellArg "${proxyStateDir}/proxy-ca-cert.pem"} \
         --ca-private-key ${lib.escapeShellArg "${proxyStateDir}/proxy-ca.key"} \
         --ech-state-dir ${lib.escapeShellArg proxyStateDir} \
+        ${lib.concatMapStringsSep "\n" (
+          url: "        --websocket-http11-url ${lib.escapeShellArg url} \\"
+        ) runtime.httpProxy.websocketHttp11Urls}
         --listen-port 18080
     '';
   };

@@ -26,6 +26,15 @@ Run agent CLIs inside a bubblewrap jail on NixOS. `policyd` checks network, HTTP
 
 Use `sudoPolicy = "approve"` to gate sudo. Set `uiBackend = "none"` for headless systems. The full option reference is `nix/modules/nixos/agent-sandbox/agent-sandbox.nix`.
 
+For an upstream WebSocket endpoint that does not accept HTTP/2 Extended
+CONNECT, pin only that URL pattern to HTTP/1.1:
+
+```nix
+agent-sandbox.network.httpProxy.websocketHttp11Urls = [
+  "https://api.openai.com/v1/live/rtc_*"
+];
+```
+
 ## What it gates
 
 | Gate       | Behavior                                                                                                                                        |

@@ -9,8 +9,7 @@ use std::{
     time::Duration,
 };
 
-use agent_sandbox_core::{EchRewrite, HttpRequest, ProxyRequestId, rewrite_ech_config};
-
+use agent_sandbox_core::{EchRewrite, HttpRequest, HttpUrl, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
     policy::{PolicySession, authority_for_policy, flow_key, normalize_authority},
@@ -164,6 +163,9 @@ struct Args {
     #[arg(long, default_value_t = 305_000)]
     policy_timeout_ms: u64,
 
+    #[arg(long = "websocket-http11-url", value_name = "URL")]
+    websocket_http11_urls: Vec<String>,
+
     #[arg(long, env = "AGENT_SANDBOX_ECH_CONFIG_LIST")]
     ech_config_list: Option<String>,
 
@@ -183,6 +185,7 @@ struct FlowState {
     policy: Arc<PolicySession>,
     attribution_token: agent_sandbox_core::AttributionToken,
     ech_config_list: Option<Arc<Vec<u8>>>,
+    websocket_http11_urls: Arc<Vec<HttpUrl>>,
 }
 
 #[derive(Clone)]
@@ -276,6 +279,18 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     let args = Args::parse();
+    let websocket_http11_urls = args
+        .websocket_http11_urls
+        .iter()
+        .map(|pattern| {
+            HttpUrl::parse_pattern(pattern).map_err(|error| {
+                BoxError::from(format!(
+                    "invalid WebSocket HTTP/1.1 URL pattern {pattern:?}: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let websocket_http11_urls = Arc::new(websocket_http11_urls);
 
     if args.init_ech_state_only {
         let state_dir = args
@@ -329,6 +344,7 @@ async fn main() -> Result<(), BoxError> {
         issuer,
         ech_config_list,
         ech_private_key,
+        websocket_http11_urls,
     };
 
     let service = build_listener_service(
@@ -408,6 +424,7 @@ struct ListenerConfig {
     issuer: CertificateIssuer,
     ech_config_list: Option<Arc<Vec<u8>>>,
     ech_private_key: Option<[u8; 32]>,
+    websocket_http11_urls: Arc<Vec<HttpUrl>>,
 }
 
 fn build_listener_service(
@@ -424,6 +441,7 @@ fn build_listener_service(
         let issuer = listener_config.issuer.clone();
         let ech_config_list = listener_config.ech_config_list.clone();
         let ech_private_key = listener_config.ech_private_key;
+        let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let shutdown = shutdown.clone();
         let active_checks = active_checks.clone();
 
@@ -442,6 +460,7 @@ fn build_listener_service(
                 policy: policy.clone(),
                 attribution_token: attribution_token.clone(),
                 ech_config_list: ech_config_list.clone(),
+                websocket_http11_urls: websocket_http11_urls.clone(),
             };
 
             let request_service = service_fn(move |request| {
@@ -748,7 +767,7 @@ async fn proxy_request(
         .headers_mut()
         .insert("host", upstream_authority.parse()?);
 
-    force_websocket_http11(&request);
+    force_websocket_http11(&request, &normalized.url, &state.websocket_http11_urls);
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
     let connector = RequestVersionAdapter::new(connector).with_default_version(Version::HTTP_11);
@@ -812,9 +831,11 @@ fn is_websocket_upgrade_request(request: &Request) -> bool {
         && request.headers().get("sec-websocket-key").is_some()
 }
 
-fn force_websocket_http11(request: &Request) {
+fn force_websocket_http11(request: &Request, target: &HttpUrl, patterns: &[HttpUrl]) {
     // RequestVersionAdapter translates H2 WebSocket CONNECT into H1 GET/Upgrade.
-    if is_websocket_upgrade_request(request) {
+    if is_websocket_upgrade_request(request)
+        && patterns.iter().any(|pattern| pattern.matches(target))
+    {
         request
             .extensions()
             .insert(TargetHttpVersion(Version::HTTP_11));
@@ -891,10 +912,10 @@ mod tests {
     };
 
     use super::{
-        Body, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion,
-        Version, adapt_response_version, blocked_http_request, force_websocket_http11,
-        is_doh_request, is_websocket_upgrade_request, is_websocket_upgrade_response,
-        policy_denied_response, select_ech_config_list,
+        Body, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode,
+        TargetHttpVersion, Version, adapt_response_version, blocked_http_request,
+        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
+        is_websocket_upgrade_response, policy_denied_response, select_ech_config_list,
     };
 
     use crate::ech_state::EchState;
@@ -988,13 +1009,35 @@ mod tests {
         assert!(is_websocket_upgrade_request(&request));
         assert!(!blocked_http_request(&request));
 
+        let live_pattern =
+            HttpUrl::parse_pattern("https://api.openai.com/v1/live").expect("live URL pattern");
+        let live_target = HttpUrl::parse("https://api.openai.com/v1/live/rtc").expect("live URL");
+        let ordinary_target =
+            HttpUrl::parse("https://api.openai.com/v1/responses").expect("ordinary URL");
+        let patterns = [live_pattern];
+
+        force_websocket_http11(&request, &live_target, &[]);
+        assert!(
+            request
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .is_none()
+        );
+
+        force_websocket_http11(&request, &ordinary_target, &patterns);
+        assert!(
+            request
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .is_none()
+        );
+
         let ordinary = Request::builder()
             .method("GET")
             .body(Body::empty())
             .expect("test request");
 
-        force_websocket_http11(&ordinary);
-
+        force_websocket_http11(&ordinary, &live_target, &patterns);
         assert!(
             ordinary
                 .extensions()
@@ -1017,7 +1060,7 @@ mod tests {
         *extended_connect.version_mut() = Version::HTTP_2;
         assert!(is_websocket_upgrade_request(&extended_connect));
         assert!(!blocked_http_request(&extended_connect));
-        force_websocket_http11(&extended_connect);
+        force_websocket_http11(&extended_connect, &live_target, &patterns);
 
         assert_eq!(
             extended_connect

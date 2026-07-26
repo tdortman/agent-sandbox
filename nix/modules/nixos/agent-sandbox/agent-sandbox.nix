@@ -479,6 +479,12 @@ in
           description = "Additional CIDRs the dedicated proxy UID may reach directly.";
         };
 
+        websocketHttp11Urls = lib.mkOption {
+          type = lib.types.listOf httpUrlType;
+          default = [ ];
+          description = "Absolute HTTP(S) URL glob patterns whose WebSocket upstreams must use HTTP/1.1.";
+        };
+
       };
 
       netnsIp = lib.mkOption {
