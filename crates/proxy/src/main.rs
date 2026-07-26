@@ -23,17 +23,24 @@ use rama_core::{
     error::{BoxError, BoxErrorExt},
     extensions::ExtensionsRef,
     io::Io,
+    matcher::{match_fn, service::MatcherServicePair},
     rt::Executor,
     service::service_fn,
 };
 use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
-    Body, HeaderValue, Request, Response, StatusCode, Version, body::util::BodyExt,
-    layer::version_adapter::RequestVersionAdapter,
+    Body, HeaderValue, Request, Response, StatusCode, Version,
+    body::util::BodyExt,
+    io::upgrade::OnUpgrade,
+    layer::{
+        upgrade::mitm::HttpUpgradeMitmRelay,
+        version_adapter::{RequestVersionAdapter, ResponseVersionAdaptCtx, adapt_response_version},
+    },
 };
 use rama_http_backend::{client::HttpConnector, server::HttpServer};
 use rama_net::{
     address::SocketAddress,
+    proxy::IoForwardService,
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
@@ -401,9 +408,10 @@ fn build_listener_service(
                 attribution_token: attribution_token.clone(),
                 ech_config_list: ech_config_list.clone(),
             };
-            let http = HttpServer::auto(executor.clone()).service(service_fn(move |request| {
+            let request_service = service_fn(move |request| {
                 let state = state.clone();
                 let shutdown = shutdown.clone();
+
                 async move {
                     match proxy_request(request, state, shutdown).await {
                         Ok(response) => Ok(response),
@@ -419,7 +427,19 @@ fn build_listener_service(
                         }
                     }
                 }
-            }));
+            });
+            let upgrade_matcher = MatcherServicePair::new(
+                match_fn(is_websocket_upgrade_request),
+                MatcherServicePair::new(
+                    match_fn(is_websocket_upgrade_response),
+                    IoForwardService::new(executor.clone()),
+                ),
+            );
+            let request_service =
+                HttpUpgradeMitmRelay::new(executor.clone(), upgrade_matcher, request_service);
+            let mut http_server = HttpServer::auto(executor.clone());
+            http_server.h2_mut().set_enable_connect_protocol();
+            let http = http_server.service(request_service);
             let fallback_http = http.clone();
             let tls = BoringTlsService {
                 issuer,
@@ -600,6 +620,7 @@ async fn proxy_request(
     if blocked_http_request(&request) {
         return Err(Box::new(PolicyDenied));
     }
+    let response_context = ResponseVersionAdaptCtx::from_request(&request);
 
     let doh = is_doh_request(&request);
 
@@ -682,6 +703,7 @@ async fn proxy_request(
 
     let connection = client.serve(request).await?;
     let mut response = connection.conn.serve(connection.input).await?;
+    adapt_response_version(&mut response, &response_context)?;
     strip_alt_svc(&mut response);
 
     if doh {
@@ -702,6 +724,39 @@ async fn proxy_request(
     Ok(response)
 }
 
+fn is_websocket_upgrade_request(request: &Request) -> bool {
+    if request.method().as_str().eq_ignore_ascii_case("CONNECT") {
+        return request
+            .extensions()
+            .get_ref::<rama_http::proto::h2::ext::Protocol>()
+            .is_some_and(|protocol| protocol.as_str().eq_ignore_ascii_case("websocket"));
+    }
+
+    request.method().as_str().eq_ignore_ascii_case("GET")
+        && request
+            .headers()
+            .get("upgrade")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && request
+            .headers()
+            .get("connection")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        && request.headers().get("sec-websocket-key").is_some()
+}
+
+fn is_websocket_upgrade_response(response: &Response) -> bool {
+    matches!(
+        response.status(),
+        StatusCode::SWITCHING_PROTOCOLS | StatusCode::OK
+    ) && response.extensions().get_ref::<OnUpgrade>().is_some()
+}
+
 fn request_target(request: &Request) -> String {
     let path = request.uri().path_or_root().to_string();
     let query = request.uri().query_or_empty();
@@ -713,6 +768,10 @@ fn request_target(request: &Request) -> String {
 }
 
 fn blocked_http_request(request: &Request) -> bool {
+    if is_websocket_upgrade_request(request) {
+        return false;
+    }
+
     if ["CONNECT", "MASQUE", "WEBTRANSPORT"]
         .iter()
         .any(|method| request.method().as_str().eq_ignore_ascii_case(method))
@@ -731,11 +790,91 @@ fn blocked_http_request(request: &Request) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use rama_core::{
+        Service,
+        bytes::Bytes,
+        extensions::{Extensions, ExtensionsRef},
+        matcher::{match_fn, service::MatcherServicePair},
+        rt::Executor,
+        service::service_fn,
+    };
+    use rama_http::{
+        Response,
+        io::upgrade::{Upgraded, pending},
+        layer::upgrade::mitm::HttpUpgradeMitmRelay,
+    };
+    use rama_net::proxy::IoForwardService;
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
+        time::{Duration, timeout},
+    };
+
     use super::{
-        Body, POLICY_DENIED_BODY, Request, StatusCode, blocked_http_request, is_doh_request,
-        policy_denied_response, select_ech_config_list,
+        Body, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode, Version,
+        adapt_response_version, blocked_http_request, is_doh_request, is_websocket_upgrade_request,
+        is_websocket_upgrade_response, policy_denied_response, select_ech_config_list,
     };
     use crate::ech_state::EchState;
+
+    struct TestIo {
+        stream: DuplexStream,
+        extensions: Extensions,
+    }
+
+    impl TestIo {
+        fn new(stream: DuplexStream) -> Self {
+            Self {
+                stream,
+                extensions: Extensions::new(),
+            }
+        }
+    }
+
+    impl ExtensionsRef for TestIo {
+        fn extensions(&self) -> &Extensions {
+            &self.extensions
+        }
+    }
+
+    impl AsyncRead for TestIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for TestIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(context)
+        }
+    }
 
     #[test]
     fn blocks_tunnel_methods_case_insensitively() {
@@ -757,6 +896,123 @@ mod tests {
             .expect("test request");
 
         assert!(blocked_http_request(&request));
+    }
+
+    #[test]
+    fn allows_websocket_upgrade_requests() {
+        let request = Request::builder()
+            .method("GET")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .expect("test request");
+
+        assert!(is_websocket_upgrade_request(&request));
+        assert!(!blocked_http_request(&request));
+
+        let extended_connect = Request::builder()
+            .method("CONNECT")
+            .body(Body::empty())
+            .expect("test request");
+        extended_connect
+            .extensions()
+            .insert(rama_http::proto::h2::ext::Protocol::from_static(
+                "websocket",
+            ));
+
+        assert!(is_websocket_upgrade_request(&extended_connect));
+        assert!(!blocked_http_request(&extended_connect));
+    }
+
+    #[test]
+    fn adapts_websocket_response_for_http2() {
+        let mut request = Request::builder()
+            .method("CONNECT")
+            .body(Body::empty())
+            .expect("test request");
+        *request.version_mut() = Version::HTTP_2;
+        request
+            .extensions()
+            .insert(rama_http::proto::h2::ext::Protocol::from_static(
+                "websocket",
+            ));
+        let context = ResponseVersionAdaptCtx::from_request(&request);
+        let (_, on_upgrade) = pending();
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+        *response.version_mut() = Version::HTTP_11;
+        response.extensions().insert(on_upgrade);
+
+        adapt_response_version(&mut response, &context).expect("adapt websocket response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), Version::HTTP_2);
+    }
+
+    #[tokio::test]
+    async fn relays_websocket_upgrade_bytes() {
+        let (ingress_pending, ingress_on_upgrade) = pending();
+        let (egress_pending, egress_on_upgrade) = pending();
+        let inner = service_fn(move |_request: Request| {
+            let on_upgrade = egress_on_upgrade.clone();
+
+            async move {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                response.extensions().insert(on_upgrade);
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let matcher = MatcherServicePair::new(
+            match_fn(|request: &Request| is_websocket_upgrade_request(request)),
+            MatcherServicePair::new(
+                match_fn(is_websocket_upgrade_response),
+                IoForwardService::new(Executor::default()),
+            ),
+        );
+        let relay = HttpUpgradeMitmRelay::new(Executor::default(), matcher, inner);
+        let request = Request::builder()
+            .method("GET")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .expect("test request");
+        request.extensions().insert(ingress_on_upgrade);
+
+        let response = relay.serve(request).await.expect("upgrade response");
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        let (mut ingress_peer, ingress_io) = duplex(1024);
+        let (mut egress_peer, egress_io) = duplex(1024);
+        ingress_pending.fulfill(Upgraded::new(TestIo::new(ingress_io), Bytes::new()));
+        egress_pending.fulfill(Upgraded::new(TestIo::new(egress_io), Bytes::new()));
+
+        ingress_peer
+            .write_all(b"ping")
+            .await
+            .expect("write ingress");
+        let mut received = [0; 4];
+        timeout(
+            Duration::from_secs(1),
+            egress_peer.read_exact(&mut received),
+        )
+        .await
+        .expect("ingress relay timeout")
+        .expect("read relayed ingress bytes");
+        assert_eq!(&received, b"ping");
+
+        egress_peer.write_all(b"pong").await.expect("write egress");
+        let mut received = [0; 4];
+        timeout(
+            Duration::from_secs(1),
+            ingress_peer.read_exact(&mut received),
+        )
+        .await
+        .expect("egress relay timeout")
+        .expect("read relayed egress bytes");
+        assert_eq!(&received, b"pong");
     }
     #[test]
     fn detects_doh_post_and_get_requests() {
