@@ -768,6 +768,7 @@ fn is_websocket_upgrade_request(request: &Request) -> bool {
 }
 
 fn force_websocket_http11(request: &Request) {
+    // RequestVersionAdapter translates H2 WebSocket CONNECT into H1 GET/Upgrade.
     if is_websocket_upgrade_request(request) {
         request
             .extensions()
@@ -832,7 +833,7 @@ mod tests {
     use rama_http::{
         Response,
         io::upgrade::{Upgraded, pending},
-        layer::upgrade::mitm::HttpUpgradeMitmRelay,
+        layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
     use rama_net::proxy::IoForwardService;
     use tokio::{
@@ -949,8 +950,9 @@ mod tests {
                 .is_none()
         );
 
-        let extended_connect = Request::builder()
+        let mut extended_connect = Request::builder()
             .method("CONNECT")
+            .uri("https://api.openai.com/v1/live/rtc")
             .body(Body::empty())
             .expect("test request");
         extended_connect
@@ -958,6 +960,7 @@ mod tests {
             .insert(rama_http::proto::h2::ext::Protocol::from_static(
                 "websocket",
             ));
+        *extended_connect.version_mut() = Version::HTTP_2;
 
         assert!(is_websocket_upgrade_request(&extended_connect));
         assert!(!blocked_http_request(&extended_connect));
@@ -968,6 +971,22 @@ mod tests {
                 .get_ref::<TargetHttpVersion>()
                 .map(|target| target.0),
             Some(Version::HTTP_11)
+        );
+        adapt_request_version(&mut extended_connect, Version::HTTP_11).expect("H1 adaptation");
+        assert_eq!(extended_connect.method().as_str(), "GET");
+        assert_eq!(
+            extended_connect
+                .headers()
+                .get("upgrade")
+                .and_then(|value| value.to_str().ok()),
+            Some("websocket")
+        );
+        assert_eq!(
+            extended_connect
+                .headers()
+                .get("connection")
+                .and_then(|value| value.to_str().ok()),
+            Some("upgrade")
         );
     }
 
