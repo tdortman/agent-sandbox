@@ -31,6 +31,7 @@ use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
     Body, HeaderValue, Request, Response, StatusCode, Version,
     body::util::BodyExt,
+    conn::TargetHttpVersion,
     io::upgrade::OnUpgrade,
     layer::{
         upgrade::mitm::HttpUpgradeMitmRelay,
@@ -701,6 +702,7 @@ async fn proxy_request(
     request
         .headers_mut()
         .insert("host", upstream_authority.parse()?);
+    force_websocket_http11(&request);
 
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
@@ -763,6 +765,14 @@ fn is_websocket_upgrade_request(request: &Request) -> bool {
                     .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
             })
         && request.headers().get("sec-websocket-key").is_some()
+}
+
+fn force_websocket_http11(request: &Request) {
+    if is_websocket_upgrade_request(request) {
+        request
+            .extensions()
+            .insert(TargetHttpVersion(Version::HTTP_11));
+    }
 }
 
 fn is_websocket_upgrade_response(response: &Response) -> bool {
@@ -831,9 +841,10 @@ mod tests {
     };
 
     use super::{
-        Body, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode, Version,
-        adapt_response_version, blocked_http_request, is_doh_request, is_websocket_upgrade_request,
-        is_websocket_upgrade_response, policy_denied_response, select_ech_config_list,
+        Body, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion,
+        Version, adapt_response_version, blocked_http_request, force_websocket_http11,
+        is_doh_request, is_websocket_upgrade_request, is_websocket_upgrade_response,
+        policy_denied_response, select_ech_config_list,
     };
     use crate::ech_state::EchState;
 
@@ -926,6 +937,18 @@ mod tests {
         assert!(is_websocket_upgrade_request(&request));
         assert!(!blocked_http_request(&request));
 
+        let ordinary = Request::builder()
+            .method("GET")
+            .body(Body::empty())
+            .expect("test request");
+        force_websocket_http11(&ordinary);
+        assert!(
+            ordinary
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .is_none()
+        );
+
         let extended_connect = Request::builder()
             .method("CONNECT")
             .body(Body::empty())
@@ -938,6 +961,14 @@ mod tests {
 
         assert!(is_websocket_upgrade_request(&extended_connect));
         assert!(!blocked_http_request(&extended_connect));
+        force_websocket_http11(&extended_connect);
+        assert_eq!(
+            extended_connect
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .map(|target| target.0),
+            Some(Version::HTTP_11)
+        );
     }
 
     #[test]
