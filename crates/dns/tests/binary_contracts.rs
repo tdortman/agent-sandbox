@@ -10,7 +10,6 @@ fn run(args: &[&str]) -> std::process::Output {
 #[test]
 fn help_exposes_forwarder_configuration() {
     let output = run(&["--help"]);
-
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: agent-sandbox-dns-forwarder [OPTIONS]"));
@@ -22,7 +21,6 @@ fn help_exposes_forwarder_configuration() {
 #[test]
 fn invalid_port_is_rejected_before_starting_listeners() {
     let output = run(&["--listen-port", "not-a-port"]);
-
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid value 'not-a-port'"));

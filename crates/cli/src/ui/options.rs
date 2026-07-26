@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-
 use agent_sandbox_core::{ApprovalScope, ApprovalTarget, SudoRule};
 use serde_json::{Value, json};
-
 pub const ACTION_OPTIONS: &[&str] = &["Allow", "Deny"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +39,7 @@ pub struct ApprovalFormContext {
     pub(crate) label: String,
     pub(crate) value: String,
 }
+
 #[derive(Debug, Clone)]
 pub struct ApprovalFormPresentation {
     pub(crate) heading: String,
@@ -74,6 +73,7 @@ pub enum ApprovalFormControl {
     Text {
         value: String,
     },
+
     Choice {
         value: String,
         options: Vec<ApprovalFormOption>,
@@ -108,9 +108,11 @@ impl ApprovalFormRequest {
                     ApprovalScope::Project => "This project",
                     ApprovalScope::Global => "Globally",
                 };
+
                 json!({ "value": scope.as_str(), "label": label })
             })
             .collect::<Vec<_>>();
+
         let fields = self
             .fields
             .iter()
@@ -132,6 +134,7 @@ impl ApprovalFormRequest {
                 }),
             })
             .collect::<Vec<_>>();
+
         let mut request = json!({
             "version": 1,
             "summary": self.summary,
@@ -141,12 +144,14 @@ impl ApprovalFormRequest {
             "scopes": scopes,
             "fields": fields,
         });
+
         if let Some(presentation) = &self.presentation {
             request["presentation"] = json!({
                 "heading": presentation.heading,
                 "subject": presentation.subject,
             });
         }
+
         request
     }
 }
@@ -171,6 +176,7 @@ pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
         target: None,
         comment: None,
     }];
+
     if session_available {
         options.push(ScopeOption {
             label: "This session".into(),
@@ -179,18 +185,21 @@ pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
             comment: None,
         });
     }
+
     options.push(ScopeOption {
         label: "This project".into(),
         scope: ApprovalScope::Project,
         target: None,
         comment: None,
     });
+
     options.push(ScopeOption {
         label: "Globally".into(),
         scope: ApprovalScope::Global,
         target: None,
         comment: None,
     });
+
     options
 }
 
@@ -199,6 +208,7 @@ pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
 pub fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOption> {
     let prefixes = SudoRule::approval_prefixes(argv);
     let mut options = Vec::with_capacity(prefixes.len());
+
     for argv in &prefixes {
         options.push(ScopeOption {
             label: format_command(argv),
@@ -207,6 +217,7 @@ pub fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOp
             comment: None,
         });
     }
+
     options
 }
 
@@ -255,7 +266,6 @@ mod tests {
         );
 
         let json = request.to_json();
-
         assert_eq!(json["version"], 1);
         assert_eq!(json["scopes"][0]["value"], "once");
         assert_eq!(json["fields"][0]["kind"], "choice");

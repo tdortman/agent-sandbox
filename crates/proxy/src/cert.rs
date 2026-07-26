@@ -47,6 +47,7 @@ impl CertificateIssuer {
         private_key_pem: &str,
     ) -> Result<Self, CertificateError> {
         let mut certificates = CertificateDer::pem_slice_iter(certificate_pem.as_bytes());
+
         let ca_certificate_der = certificates
             .next()
             .ok_or(CertificateError::MissingCertificate)?
@@ -86,6 +87,7 @@ impl CertificateIssuer {
         let params = CertificateParams::new(vec![server_name.clone()])?;
         let key_pair = KeyPair::generate()?;
         let certificate = params.signed_by(&key_pair, &self.ca_issuer)?;
+
         let private_key = PrivateKeyDer::try_from(key_pair.serialize_der())
             .map_err(|_| CertificateError::IssuedKey)?;
 

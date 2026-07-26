@@ -14,10 +14,12 @@ use agent_sandbox_core::{
     ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
 };
+
 use tokio::{
     net::unix::OwnedWriteHalf,
     sync::{Mutex, oneshot},
 };
+
 /// Hard cap on the number of pending approval requests held in memory.
 /// Beyond this cap new prompts are blocked instead of being added.
 pub const MAX_PENDING_APPROVALS: usize = 512;
@@ -40,6 +42,7 @@ pub const MAX_CONNECTIONS_PER_UID: usize = 64;
 
 /// Maximum JSON-line RPC payload size.
 pub const MAX_RPC_LINE_BYTES: usize = 1 << 20;
+
 /// Hard cap on registered proxy flow identities.
 pub const MAX_PROXY_FLOWS: usize = 65_536;
 
@@ -94,6 +97,7 @@ pub fn evict_oldest<K, V, S>(
         else {
             break;
         };
+
         map.remove(&oldest_key);
     }
 }
@@ -118,8 +122,10 @@ pub struct PolicydArgs {
     pub approval_timeout: Duration,
     pub interactive_approval: bool,
     pub ui_spawn_cmd: Option<PathBuf>,
+
     /// Path to the agent-sandbox-fsmon binary.
     pub fs_monitor_cmd: Option<PathBuf>,
+
     /// Path to the agent-sandbox-syscall-broker binary.
     pub syscall_broker_cmd: Option<PathBuf>,
 }
@@ -160,6 +166,7 @@ pub struct PendingNetwork {
 pub struct PendingHttp {
     /// Wire/display identifier. The typed ID is retained in `pending_id`.
     pub id: String,
+
     pub pending_id: PendingHttpId,
     pub created_at: f64,
     pub request: HttpRequest,
@@ -344,13 +351,16 @@ pub struct UiClient {
 pub struct PolicyStore {
     pub(crate) args: PolicydArgs,
     pub(crate) inner: Mutex<PolicyDecisionState>,
+
     /// Single-flight guard for deny inode cache rebuilds: concurrent
     /// filesystem checks must wait for one rebuild instead of each starting
     /// their own recursive directory walk.
     pub(crate) deny_inode_rebuild: Mutex<()>,
+
     /// Serializes UI spawn decisions so concurrent requests cannot launch
     /// duplicate clients from the same throttle snapshot.
     pub(crate) ui_spawn_lock: Mutex<()>,
+
     pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
     pub(crate) merged_cache: std::sync::Mutex<MergedPolicyCache>,
     pub(crate) cgroup_freeze: super::freeze::CgroupFreezeManager,
@@ -390,11 +400,13 @@ impl MergedPolicyCache {
             *existing = policy;
             return;
         }
+
         while self.order.len() >= Self::MAX_ENTRIES {
             if let Some(old) = self.order.pop_front() {
                 self.entries.remove(&old);
             }
         }
+
         self.order.push_back(key.clone());
         self.entries.insert(key, policy);
     }
@@ -468,18 +480,23 @@ pub struct PolicyDecisionState {
     pub(crate) http_once_deny: HashSet<HttpPendingKey>,
     pub(crate) http_session_allow: HashMap<String, HashSet<HttpScopeKey>>,
     pub(crate) http_session_deny: HashMap<String, HashSet<HttpScopeKey>>,
+
     /// Static filesystem allow rules registered by `StartFilesystemMonitor`,
     /// keyed by sandbox session id (or cwd/project-root context fallback).
     pub(crate) sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
+
     /// Inode cache for hardlink defense. Maps `(inode, device)` to canonical
     /// paths for files under deny rules. Built by walking deny directories and
     /// stat'ing concrete deny files. Fingerprinted by deny rule path mtimes.
     /// When the fingerprint changes the cache is rebuilt on next access.
     pub(crate) deny_inode_cache: DenyInodeCache,
+
     /// Active RPC connections per peer uid.
     pub(crate) connections_by_uid: HashMap<u32, usize>,
+
     /// Registered flow identities and active claims.
     pub(crate) proxy_flows: HashMap<NetworkFlowKey, ProxyFlowState>,
+
     /// The one active trusted proxy session, if any.
     pub(crate) proxy_session: Option<ProxySessionState>,
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use agent_sandbox_core::{
     ProxyReply, ProxyRequestId, ProxySessionToken, RpcMessage, RpcReply, RpcRequest,
 };
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -12,6 +13,7 @@ use tokio::{
 };
 
 use super::dispatch::SocketRole;
+
 use crate::{
     error::PolicydError,
     server::peer::ClientPeer,
@@ -24,6 +26,7 @@ pub async fn handle_client(
     mut role: SocketRole,
 ) -> std::io::Result<()> {
     let peer = ClientPeer::from_stream(&stream);
+
     if !store.try_acquire_connection(peer).await {
         let (_reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
@@ -94,8 +97,8 @@ pub async fn handle_client(
             proxy_single_request = true;
             continue;
         }
-        let request_id = proxy_request_id(&req);
 
+        let request_id = proxy_request_id(&req);
         let is_open_proxy_session = matches!(&req, RpcRequest::OpenProxySession);
         let is_register = matches!(req, RpcRequest::RegisterUi { .. });
 
@@ -131,6 +134,7 @@ pub async fn handle_client(
 
     finish_client(store, client, peer, role, active_checks, read_error).await
 }
+
 async fn finish_client(
     store: Arc<PolicyStore>,
     client: UiClientHandle,
@@ -143,17 +147,22 @@ async fn finish_client(
         let mut active = active_checks.lock().await;
         std::mem::take(&mut *active)
     };
+
     for (proxy_session, request_id) in active_checks {
         let _ = store.cancel_check(proxy_session, request_id).await;
     }
+
     if role == SocketRole::Proxy {
         store.close_proxy_session(client.id).await;
     }
+
     store.end_ui_session(client.id).await;
     store.release_connection(peer).await;
+
     if let Some(err) = read_error {
         return Err(err);
     }
+
     Ok(())
 }
 
@@ -197,6 +206,7 @@ async fn spawn_proxy_check(
             active.remove(index);
         }
     });
+
     true
 }
 
@@ -205,6 +215,7 @@ const fn proxy_request_id(req: &RpcRequest) -> Option<ProxyRequestId> {
         RpcRequest::CheckHttp { request_id, .. }
         | RpcRequest::CheckNetworkFlow { request_id, .. }
         | RpcRequest::CancelCheck { request_id, .. } => Some(*request_id),
+
         _ => None,
     }
 }
@@ -221,6 +232,7 @@ fn proxy_check_identity(req: &RpcRequest) -> Option<(ProxySessionToken, ProxyReq
             request_id,
             ..
         } => Some((proxy_session.clone(), *request_id)),
+
         _ => None,
     }
 }
@@ -284,6 +296,7 @@ async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
             return;
         }
     };
+
     let mut w = writer.lock().await;
 
     if w.write_all(line.as_bytes()).await.is_err() {

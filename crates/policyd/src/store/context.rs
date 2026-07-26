@@ -10,6 +10,7 @@ use agent_sandbox_core::{
 };
 
 use super::types::PolicyStore;
+
 use crate::{
     store::types::{SandboxSessionRegistration, TrustedPeer},
     wire::MergeContext,
@@ -17,9 +18,11 @@ use crate::{
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     let target = resolve_policy_write_path(path, None)?;
+
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
     let tmp = target.with_file_name(format!(
         "{}.tmp",
         target
@@ -27,6 +30,7 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
             .and_then(|name| name.to_str())
             .unwrap_or("agent-sandbox-export")
     ));
+
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, &target)?;
     Ok(())
@@ -37,16 +41,20 @@ impl PolicyStore {
         if peer.pid == 0 || peer.uid == 0 {
             return;
         }
+
         let trusted = trusted_context_from_pid(peer.pid, Some(peer.uid));
+
         let project_root = trusted
             .project_root
             .clone()
             .or_else(|| trusted.cwd.clone())
             .unwrap_or_default();
+
         let mut sessions = self
             .sandbox_sessions
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         sessions
             .entry(sandbox_session_id.to_string())
             .and_modify(|reg| {
@@ -77,6 +85,7 @@ impl PolicyStore {
                 ctx.sandbox_session_id.clone(),
             ));
         };
+
         self.resolve_from_peer(ctx, peer)
     }
 
@@ -88,7 +97,9 @@ impl PolicyStore {
             .ids
             .pid()
             .filter(|_| ctx.ids.uid().is_none_or(|uid| uid == peer.uid));
+
         let ids = ProcessIds::from_options(pid, Some(peer.uid));
+
         Self::resolve_trusted_context(&ResolvedRequestContext::new(
             SandboxPaths::default(),
             ids,
@@ -105,8 +116,8 @@ impl PolicyStore {
     pub(crate) fn resolve_trusted_context(ctx: &ResolvedRequestContext) -> ResolvedRequestContext {
         let uid = ctx.ids.uid();
         let pid = ctx.ids.pid();
-
         let mut sandbox_session_id = ctx.sandbox_session_id.clone();
+
         if sandbox_session_id.is_none()
             && let Some(pid) = pid
         {
@@ -120,17 +131,21 @@ impl PolicyStore {
         if home.is_none() {
             home = uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from);
         }
+
         if (cwd.is_none() || project_root.is_none())
             && let Some(pid) = pid
         {
             let proc = trusted_context_from_pid(pid, uid);
+
             if cwd.is_none() {
                 cwd = proc.cwd;
             }
+
             if project_root.is_none() {
                 project_root = proc.project_root;
             }
         }
+
         if project_root.is_none()
             && let (Some(home), Some(cwd_path)) = (home.as_deref(), cwd.as_deref())
         {
@@ -159,6 +174,7 @@ impl PolicyStore {
 
         let peer = Some(peer);
         let trusted_uid = peer.and_then(|p| (p.uid > 0).then_some(p.uid));
+
         let verified_pid = match (ctx.ids.pid().filter(|&p| p > 0), peer) {
             // syscall-arm: the broker parent connects on behalf of the tracee
             // during emulated connects; prefer the wire tracee pid when it is
@@ -168,9 +184,10 @@ impl PolicyStore {
             (_, Some(p)) if p.pid > 0 => Some(p.pid),
             _ => None,
         };
-        let trusted_uid = trusted_uid.or_else(|| ctx.ids.uid());
 
+        let trusted_uid = trusted_uid.or_else(|| ctx.ids.uid());
         let mut sandbox_session_id = ctx.sandbox_session_id.clone();
+
         if sandbox_session_id.is_none()
             && let Some(pid) = verified_pid
         {
@@ -183,6 +200,7 @@ impl PolicyStore {
         let home = trusted_uid
             .and_then(|u| home_from_uid(Some(u)))
             .map(PathBuf::from);
+
         let mut cwd = None;
         let mut project_root = None;
 
@@ -193,17 +211,21 @@ impl PolicyStore {
                     .ok()
                     .and_then(|sessions| sessions.get(id).cloned())
             });
+
             let pid_allowed = registration
                 .as_ref()
                 .is_none_or(|reg| reg.root_pid == pid || is_descendant_of(reg.root_pid, pid));
+
             if pid_allowed {
                 let env = read_proc_environ(pid);
+
                 if cwd.is_none() {
                     cwd = env
                         .get("AGENT_SANDBOX_CWD")
                         .filter(|value| !value.is_empty())
                         .map(PathBuf::from);
                 }
+
                 if project_root.is_none() {
                     project_root = env
                         .get("AGENT_SANDBOX_PROJECT_ROOT")
@@ -212,12 +234,15 @@ impl PolicyStore {
                 }
 
                 let proc = trusted_context_from_pid(pid, trusted_uid);
+
                 if cwd.is_none() {
                     cwd = proc.cwd;
                 }
+
                 if project_root.is_none() {
                     project_root = proc.project_root;
                 }
+
                 if let (Some(pr), Some(reg)) = (&project_root, &registration)
                     && !reg.project_root.as_os_str().is_empty()
                     && !is_path_descendant(pr, &reg.project_root)
@@ -255,15 +280,19 @@ impl PolicyStore {
     /// rule shadows the corresponding `allow` rule across the merged set.
     pub fn merged_for(&self, ctx: &ResolvedRequestContext) -> Policy {
         let key = self.merged_cache_key(ctx);
+
         if let Ok(cache) = self.merged_cache.lock()
             && let Some(policy) = cache.get(&key)
         {
             return policy;
         }
+
         let policy = self.build_merged_for(ctx);
+
         if let Ok(mut cache) = self.merged_cache.lock() {
             cache.insert(key, policy.clone());
         }
+
         policy
     }
 
@@ -271,13 +300,16 @@ impl PolicyStore {
         let ctx = ctx.clone();
         let home_path = ctx.paths.home().map(Path::new);
         let project_root_path = ctx.paths.project_root().map(Path::new);
+
         let home_policy = home_path.map(|home| {
             home.join(".config")
                 .join("agent-sandbox")
                 .join("policy.json")
         });
+
         let project_policy =
             project_root_path.and_then(|root| trusted_project_policy_path(root).ok());
+
         super::types::MergedCacheKey {
             home: home_path.map(Path::to_path_buf),
             project_root: project_root_path.map(Path::to_path_buf),
@@ -293,19 +325,24 @@ impl PolicyStore {
         let project_root_path = ctx.paths.project_root().map(Path::new);
         let mut layers: Vec<Policy> = Vec::new();
         layers.push(load_policy(&self.args.declarative, home_path, None));
+
         if let Some(home) = home_path {
             let home_policy = home
                 .join(".config")
                 .join("agent-sandbox")
                 .join("policy.json");
+
             layers.push(load_policy(&home_policy, home_path, None));
+
             if let Some(root) = project_root_path
                 && let Ok(trusted) = trusted_project_policy_path(root)
             {
                 layers.push(load_policy(&trusted, home_path, project_root_path));
             }
         }
+
         let mut merged = merge_layers(&layers);
+
         // Implicit deny-all for trusted policy files. Hides the policy from
         // the sandboxed agent so it cannot learn pre-approved paths and
         // craft bypasses. The DenyInodeCache fingerprints these by inode,
@@ -327,6 +364,7 @@ impl PolicyStore {
                 comment: Some("trusted policy file".into()),
             });
         }
+
         if let Some(root) = project_root_path
             && let Ok(trusted) = trusted_project_policy_path(root)
         {
@@ -336,6 +374,7 @@ impl PolicyStore {
                 comment: Some("trusted policy file".into()),
             });
         }
+
         merged
     }
 
@@ -343,6 +382,7 @@ impl PolicyStore {
     /// runtime.
     pub(crate) fn merged_for_worker(&self, ctx: &ResolvedRequestContext) -> Policy {
         let ctx = ctx.clone();
+
         if tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         {
@@ -370,7 +410,9 @@ impl PolicyStore {
             ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
+
         let merged = self.merged_for(&ctx);
+
         atomic_write_text(
             &self.args.export_json,
             &(serde_json::to_string_pretty(&merged)? + "\n"),
@@ -382,25 +424,32 @@ impl PolicyStore {
                 "{".to_string(),
                 "  network.direct.allow = [".to_string(),
             ];
+
             for rule in &merged.network.direct.allow {
                 let host = rule.host.replace('"', "\\\"");
+
                 lines.push(format!(
                     "    {{ host = \"{host}\"; port = {}; }}",
                     rule.port
                 ));
             }
+
             lines.push("  ];".to_string());
             lines.push("  network.direct.deny = [".to_string());
+
             for rule in &merged.network.direct.deny {
                 let host = rule.host.replace('"', "\\\"");
+
                 lines.push(format!(
                     "    {{ host = \"{host}\"; port = {}; }}",
                     rule.port
                 ));
             }
+
             lines.extend(["  ];".to_string(), "}".to_string(), String::new()]);
             atomic_write_text(nix_path, &lines.join("\n"))?;
         }
+
         Ok(())
     }
 }
@@ -408,6 +457,7 @@ impl PolicyStore {
 fn policy_file_mtime(path: &Path) -> Option<super::types::MtimeKey> {
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+
     Some(super::types::MtimeKey {
         secs: duration.as_secs(),
         nanos: duration.subsec_nanos(),
@@ -417,9 +467,7 @@ fn policy_file_mtime(path: &Path) -> Option<super::types::MtimeKey> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-
     use agent_sandbox_core::SudoRule;
-
     use super::*;
 
     fn test_store() -> PolicyStore {
@@ -451,6 +499,7 @@ mod tests {
         .expect("write policy via symlink");
 
         assert!(link.is_symlink());
+
         assert_eq!(
             std::fs::read_to_string(real).expect("read policy file"),
             "{}\n"
@@ -462,6 +511,7 @@ mod tests {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
         let real_home = home_from_uid(Some(uid)).map(PathBuf::from);
+
         let wire = MergeContext {
             paths: SandboxPaths::from_wire(
                 Some(PathBuf::from("/attacker/cwd")),
@@ -471,12 +521,15 @@ mod tests {
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,
         };
+
         let resolved = store.resolve_context_with_peer(&wire, Some(TrustedPeer { pid: 0, uid }));
         assert_eq!(resolved.paths.home_path(), real_home);
+
         assert_ne!(
             resolved.paths.home_path(),
             Some(PathBuf::from("/attacker/home"))
         );
+
         assert_ne!(
             resolved.paths.project_root_path(),
             Some(PathBuf::from("/attacker/project"))
@@ -486,6 +539,7 @@ mod tests {
     #[test]
     fn root_helper_preserves_wire_paths_from_fsmon() {
         let store = test_store();
+
         let wire = MergeContext {
             paths: SandboxPaths::from_wire(
                 Some(PathBuf::from("/home/user")),
@@ -495,6 +549,7 @@ mod tests {
             ids: ProcessIds::from_options(None, None),
             sandbox_session_id: Some("sandbox-session".into()),
         };
+
         let resolved = store.resolve_context_with_peer(
             &wire,
             Some(TrustedPeer {
@@ -502,15 +557,19 @@ mod tests {
                 uid: 0,
             }),
         );
+
         assert_eq!(
             resolved.paths.home_path(),
             Some(PathBuf::from("/home/user"))
         );
+
         assert_eq!(resolved.paths.cwd_path(), Some(PathBuf::from("/home/user")));
+
         assert_eq!(
             resolved.paths.project_root_path(),
             Some(PathBuf::from("/home/user/project"))
         );
+
         assert_eq!(
             resolved.sandbox_session_id.as_deref(),
             Some("sandbox-session")
@@ -521,6 +580,7 @@ mod tests {
     fn wire_tracee_pid_preferred_over_broker_peer() {
         let store = test_store();
         let pid = std::process::id();
+
         let parent = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| {
@@ -530,11 +590,13 @@ mod tests {
                 fields.next()?.parse().ok()
             })
             .expect("parent pid");
+
         let wire = MergeContext {
             paths: SandboxPaths::default(),
             ids: ProcessIds::from_options(Some(pid), Some(1000)),
             sandbox_session_id: None,
         };
+
         let resolved = store.resolve_context_with_peer(
             &wire,
             Some(TrustedPeer {
@@ -542,12 +604,14 @@ mod tests {
                 uid: 1000,
             }),
         );
+
         assert_eq!(resolved.ids.pid(), Some(pid));
     }
 
     #[tokio::test]
     async fn declarative_policy_is_denied_to_sandbox_requests() {
         let store = test_store();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new("/home/user/project", "/home/user", "/home/user/project"),
             ids: ProcessIds::default(),
@@ -573,11 +637,13 @@ mod tests {
         let evil = tmp.path().join("evil");
         std::fs::create_dir_all(real_home.join(".config/agent-sandbox")).expect("real config");
         std::fs::create_dir_all(evil.join(".config/agent-sandbox")).expect("evil config");
+
         std::fs::write(
             real_home.join(".config/agent-sandbox/policy.json"),
             r#"{"network":{"direct":{"allow":[],"deny":[]},"http":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]},"filesystem":{"allow":[],"deny":[]},"resources":{"allow":[],"deny":[]}}"#,
         )
         .expect("real policy");
+
         std::fs::write(
             evil.join(".config/agent-sandbox/policy.json"),
             serde_json::to_string(&Policy {
@@ -593,13 +659,16 @@ mod tests {
 
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
+
         let forged = MergeContext {
             paths: SandboxPaths::from_wire(Some(evil.clone()), Some(evil.clone()), Some(evil)),
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,
         };
+
         let resolved = store.resolve_context_with_peer(&forged, Some(TrustedPeer { pid: 0, uid }));
         let merged = store.merged_for(&resolved);
+
         assert!(
             merged.sudo.allow.is_empty(),
             "forged home must not load attacker sudo allow rules"

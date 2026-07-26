@@ -9,6 +9,7 @@ use super::{
     http::http_context,
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
+
 use crate::{error::PolicydError, wire::ScopeWire};
 
 fn context_for_pending(pending: &PendingHttp, ids: ProcessIds) -> ResolvedRequestContext {
@@ -27,6 +28,7 @@ fn target_methods(target: &HttpRuleTarget) -> Result<Vec<HttpMethod>, PolicydErr
     match &target.method {
         HttpMethodMatcher::Exact(method) => Ok(vec![method.clone()]),
         HttpMethodMatcher::AnyOf(methods) if !methods.is_empty() => Ok(methods.clone()),
+
         HttpMethodMatcher::AnyOf(_) | HttpMethodMatcher::All => {
             Err(PolicydError::InvalidDecisionTarget)
         }
@@ -68,6 +70,7 @@ fn apply_http_memory_locked(
                 }
             }
         }
+
         ScopeTarget::Session { session_id } => {
             let key = super::types::HttpScopeKey {
                 target: target.clone(),
@@ -93,8 +96,10 @@ fn apply_http_memory_locked(
                 }
             }
         }
+
         ScopeTarget::Project { .. } | ScopeTarget::Global { .. } => {}
     }
+
     Ok(())
 }
 
@@ -140,6 +145,7 @@ impl PolicyStore {
         if scope == ApprovalScope::Once && matches!(target.method, HttpMethodMatcher::All) {
             return Err(PolicydError::InvalidDecisionTarget);
         }
+
         let scope_target = self
             .resolve_scope_target(
                 scope,
@@ -149,13 +155,16 @@ impl PolicyStore {
             )
             .await
             .map_err(|reply| PolicydError::Proxy(format!("invalid HTTP scope: {reply:?}")))?;
+
         let context = http_context(&ctx);
+
         let scope_path = match &scope_target {
             ScopeTarget::Global { policy_path, .. } | ScopeTarget::Project { policy_path, .. } => {
                 Some(policy_path.clone())
             }
             ScopeTarget::Session { .. } | ScopeTarget::Ephemeral => None,
         };
+
         {
             let mut inner = self.inner.lock().await;
             Self::clear_http_verdict_cache_locked(&mut inner);
@@ -163,6 +172,7 @@ impl PolicyStore {
         }
 
         let home = ctx.paths.home_path();
+
         if let Some(policy_path) = &scope_path {
             Self::persist_http_rule(
                 policy_path,
@@ -172,10 +182,12 @@ impl PolicyStore {
                 home.as_deref(),
                 ctx.ids.uid(),
             )?;
+
             self.merged_cache
                 .lock()
                 .map(|mut cache| cache.entries.clear())
                 .ok();
+
             let mut inner = self.inner.lock().await;
             Self::clear_http_verdict_cache_locked(&mut inner);
         }
@@ -188,23 +200,29 @@ impl PolicyStore {
                     let Pending::Http(value) = pending else {
                         return None;
                     };
+
                     (value.context == context && target.matches(&value.request))
                         .then_some(value.pending_id)
                 })
                 .collect::<Vec<_>>()
         };
+
         let once = scope == ApprovalScope::Once;
+
         let source = if allowed {
             VerdictSource::Scope(scope)
         } else {
             VerdictSource::User
         };
+
         let once_keys = once
             .then(|| build_once_keys(&target, &context))
             .transpose()?
             .unwrap_or_default();
+
         if once {
             let mut delivered = false;
+
             for pending_id in pending_ids {
                 if self
                     .finish_http(pending_id, allowed, source.clone(), true)
@@ -214,8 +232,10 @@ impl PolicyStore {
                     break;
                 }
             }
+
             if delivered {
                 let mut inner = self.inner.lock().await;
+
                 for key in once_keys {
                     inner.http_once_allow.remove(&key);
                     inner.http_once_deny.remove(&key);
@@ -227,6 +247,7 @@ impl PolicyStore {
                     .await;
             }
         }
+
         Ok(ScopeActionReply::ok_http(target, scope, scope_path))
     }
 
@@ -242,6 +263,7 @@ impl PolicyStore {
         let pending_context = context_for_pending(&pending, ids);
         let session_id = wire.session_id;
         let comment = wire.comment.as_deref();
+
         let target = if scope == ApprovalScope::Once {
             if target.is_some() {
                 return Err(PolicydError::InvalidDecisionTarget);
@@ -254,10 +276,12 @@ impl PolicyStore {
             }
             target
         };
+
         {
             let mut inner = self.inner.lock().await;
             inner.insert_pending(Pending::Http(pending.clone()));
         }
+
         let reply = self
             .apply_http_scope_with_comment(
                 target,
@@ -268,6 +292,7 @@ impl PolicyStore {
                 comment,
             )
             .await?;
+
         // A pending decision can carry a context that has no sandbox session.
         // Direct application above handles the scope state; ensure this exact
         // pending request is resolved even when a broad target did not match
@@ -278,9 +303,11 @@ impl PolicyStore {
             } else {
                 VerdictSource::User
             };
+
             self.finish_http(pending.pending_id, allowed, source, true)
                 .await;
         }
+
         Ok(reply)
     }
 }
@@ -299,6 +326,7 @@ mod tests {
     #[test]
     fn pending_http_scope_rebuilds_request_context() {
         let pending_id = PendingHttpId::new();
+
         let pending = PendingHttp {
             id: pending_id.to_string(),
             pending_id,
@@ -321,20 +349,25 @@ mod tests {
             context.paths.cwd_path(),
             Some(PathBuf::from("/pending/cwd"))
         );
+
         assert_eq!(
             context.paths.home_path(),
             Some(PathBuf::from("/pending/home"))
         );
+
         assert_eq!(
             context.paths.project_root_path(),
             Some(PathBuf::from("/pending/project"))
         );
+
         assert_eq!(context.ids, ProcessIds::new(42, 1000));
+
         assert_eq!(
             context.sandbox_session_id.as_deref(),
             Some("pending-session")
         );
     }
+
     #[tokio::test]
     async fn pending_http_scope_uses_pending_context_for_memory_rule() {
         use std::time::Duration;
@@ -347,7 +380,9 @@ mod tests {
             Duration::from_secs(30),
             true,
         ));
+
         let pending_id = PendingHttpId::new();
+
         let pending = PendingHttp {
             id: pending_id.to_string(),
             pending_id,
@@ -363,6 +398,7 @@ mod tests {
                 sandbox_session_id: Some("pending-session".into()),
             },
         };
+
         let ui_context = ResolvedRequestContext::new(
             SandboxPaths::new("/ui/cwd", "/ui/home", "/ui/project"),
             ProcessIds::new(7, 1000),
@@ -392,11 +428,13 @@ mod tests {
             drop(inner);
             context
         };
+
         assert_eq!(cwd, pending.context.cwd);
         assert_eq!(home, pending.context.home);
         assert_eq!(project_root, pending.context.project_root);
         assert_eq!(sandbox_session_id, pending.context.sandbox_session_id);
     }
+
     #[tokio::test]
     async fn any_of_once_target_tracks_each_method() {
         let store = PolicyStore::new(crate::store::test_args(
@@ -407,7 +445,9 @@ mod tests {
             Duration::from_secs(30),
             true,
         ));
+
         let url = HttpUrl::parse("https://example.com/").expect("valid URL");
+
         let target = HttpRuleTarget::new(
             HttpMethodMatcher::AnyOf(vec![
                 HttpMethod::parse("GET").expect("valid method"),
@@ -416,10 +456,13 @@ mod tests {
             url,
         )
         .expect("valid target");
+
         let context = HttpContextKey::default();
         let mut inner = store.inner.lock().await;
+
         apply_http_memory_locked(&mut inner, &target, &ScopeTarget::Ephemeral, &context, true)
             .expect("store any-of once target");
+
         assert_eq!(inner.http_once_allow.len(), 2);
         drop(inner);
     }
@@ -443,11 +486,14 @@ mod tests {
             Duration::from_secs(30),
             true,
         ));
+
         let pending_id = PendingHttpId::new();
+
         let request = HttpRequest {
             method: HttpMethod::parse("GET").expect("valid method"),
             url: HttpUrl::parse("https://api.example.com/v1").expect("valid URL"),
         };
+
         let pending = PendingHttp {
             id: pending_id.to_string(),
             pending_id,
@@ -460,6 +506,7 @@ mod tests {
                 sandbox_session_id: Some("pending-session".into()),
             },
         };
+
         let ui_context = ResolvedRequestContext::new(
             SandboxPaths::new(
                 dir.path().join("ui-cwd"),
@@ -469,6 +516,7 @@ mod tests {
             ProcessIds::new(7, 0),
             Some("ui-session".into()),
         );
+
         let target = HttpRuleTarget::new(
             HttpMethodMatcher::Exact(request.method.clone()),
             request.url.clone(),
@@ -485,14 +533,17 @@ mod tests {
             )
             .await
             .expect("global approval");
+
         match &reply {
             ScopeActionReply::Http(value) => {
                 assert_eq!(value.path.as_deref(), Some(policy_path.as_path()));
             }
+
             _ => panic!("expected HTTP scope reply"),
         }
 
         let policy = load_policy(&policy_path, Some(&pending_home), None);
+
         let found = policy
             .network
             .http
@@ -500,6 +551,7 @@ mod tests {
             .iter()
             .filter_map(|rule| rule.target().ok())
             .any(|value| value == target && value.matches(&request));
+
         assert!(found, "global HTTP approval missing from {policy_path:?}");
     }
 }

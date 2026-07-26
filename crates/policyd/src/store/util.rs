@@ -20,8 +20,10 @@ mod tests {
     fn host_matches_dns_suffix_wildcard() {
         assert!(PolicyStore::host_matches("*.baz.com", "foo.bar.baz.com"));
         assert!(PolicyStore::host_matches("*.baz.com", "bar.baz.com"));
+
         // "*.baz.com" matches bare "baz.com" (existing behavior via `bare`).
         assert!(PolicyStore::host_matches("*.baz.com", "baz.com"));
+
         assert!(!PolicyStore::host_matches("*.baz.com", "other.com"));
     }
 
@@ -43,6 +45,7 @@ mod tests {
     fn host_matches_ipv4_prefix_wildcard_partial_octet_rejected() {
         // "34.230.4.*" must NOT match "34.230.40.69" (partial octet).
         assert!(!PolicyStore::host_matches("34.230.4.*", "34.230.40.69"));
+
         assert!(!PolicyStore::host_matches("34.2.*", "34.230.40.69"));
     }
 
@@ -65,10 +68,12 @@ mod tests {
     #[test]
     fn host_matches_ipv6_prefix_wildcard() {
         assert!(PolicyStore::host_matches("2001:db8:*", "2001:db8::1"));
+
         assert!(PolicyStore::host_matches(
             "2001:db8:0:0:0:0:0:*",
             "2001:db8::1"
         ));
+
         assert!(PolicyStore::host_matches("2001:*", "2001:db8::1"));
     }
 
@@ -94,6 +99,7 @@ mod tests {
     #[test]
     fn host_matches_ipv6_exact_literal() {
         assert!(PolicyStore::host_matches("2001:db8::1", "2001:db8::1"));
+
         // Different representations of the same address.
         assert!(PolicyStore::host_matches(
             "2001:0db8:0000:0000:0000:0000:0000:0001",

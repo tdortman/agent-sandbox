@@ -13,6 +13,7 @@ use super::{
     persist::PersistResourceRuleArgs,
     types::{PolicyDecisionState, PolicyStore},
 };
+
 use crate::{
     error::PolicydError,
     wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire},
@@ -29,15 +30,19 @@ impl PolicyStore {
     ) -> RpcReply {
         let _ = self.export_policy_files(paths.clone());
         let scope_label = scope.as_str();
+
         let detail = format!(
             "path={} access={access:?} scope={scope_label}",
             path.display()
         );
+
         Self::audit(action.audit_verb(), None, None, &detail);
+
         let policy_path = match (paths.home(), paths.project_root()) {
             (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
             _ => None,
         };
+
         RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
             path,
             access,
@@ -57,6 +62,7 @@ impl PolicyStore {
             scope,
             wire,
         } = op;
+
         let ScopeWire {
             paths,
             session_id,
@@ -64,8 +70,10 @@ impl PolicyStore {
             sandbox_session_id: _,
             comment,
         } = wire;
+
         let home = paths.home();
         let project_root = paths.project_root();
+
         let target = match self
             .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
@@ -73,9 +81,12 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return *reply,
         };
+
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+
         match target {
             ScopeTarget::Ephemeral => {}
+
             ScopeTarget::Session { session_id } => {
                 let resolved_path = expand_policy_path(&path, home, project_root);
                 let key = FilesystemRuleKey::new(resolved_path, access);
@@ -88,6 +99,7 @@ impl PolicyStore {
                 apply_session_rule(action, &session_id, &key, allow, deny);
                 drop(inner);
             }
+
             ScopeTarget::Global { policy_path, home } => {
                 let persist = match action {
                     DecisionAction::Approve => Self::persist_filesystem_rule(
@@ -114,6 +126,7 @@ impl PolicyStore {
                 }
                 self.invalidate_merged_policy_cache();
             }
+
             ScopeTarget::Project {
                 policy_path,
                 project_root: _,
@@ -145,6 +158,7 @@ impl PolicyStore {
                 tracing::info!(path = ?policy_path, "project filesystem policy saved");
             }
         }
+
         self.finalize_filesystem_scope(&paths, path, access, scope, action)
     }
 
@@ -159,15 +173,19 @@ impl PolicyStore {
     ) -> RpcReply {
         let _ = self.export_policy_files(paths.clone());
         let scope_label = scope.as_str();
+
         let detail = format!(
             "kind={kind:?} path={} access={access:?} scope={scope_label}",
             path.display()
         );
+
         Self::audit(action.audit_verb(), None, None, &detail);
+
         let policy_path = match (paths.home(), paths.project_root()) {
             (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
             _ => None,
         };
+
         RpcReply::ScopeAction(ScopeActionReply::ok_resource(
             kind,
             path,
@@ -191,9 +209,11 @@ impl PolicyStore {
             sandbox_session_id: _,
             comment,
         } = wire;
+
         let home = paths.home();
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         let project_root = paths.project_root();
+
         let scope_target = match self
             .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
@@ -201,6 +221,7 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return *reply,
         };
+
         let policy_path = match scope_target {
             ScopeTarget::Ephemeral => None,
             ScopeTarget::Session { session_id } => {
@@ -241,13 +262,16 @@ impl PolicyStore {
                 Some(policy_path)
             }
         };
+
         let _ = self.export_policy_files(paths);
+
         Self::audit(
             action.audit_verb(),
             None,
             None,
             &format!("D-Bus target={target:?} scope={scope_label}"),
         );
+
         RpcReply::ScopeAction(ScopeActionReply::ok_dbus(target, scope, policy_path))
     }
 
@@ -263,6 +287,7 @@ impl PolicyStore {
             scope,
             wire,
         } = op;
+
         let ScopeWire {
             paths,
             session_id,
@@ -270,8 +295,10 @@ impl PolicyStore {
             sandbox_session_id: _,
             comment,
         } = wire;
+
         let home = paths.home();
         let project_root = paths.project_root();
+
         let target = match self
             .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
@@ -279,10 +306,13 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return *reply,
         };
+
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
         let key = ResourceRuleKey::new(kind, &path, access);
+
         match target {
             ScopeTarget::Ephemeral => {}
+
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
                 let PolicyDecisionState {
@@ -293,6 +323,7 @@ impl PolicyStore {
                 apply_session_rule(action, &session_id, &key, allow, deny);
                 drop(inner);
             }
+
             ScopeTarget::Global { policy_path, home } => {
                 if let Err(err) = Self::persist_resource_rule(&PersistResourceRuleArgs {
                     path: &policy_path,
@@ -307,6 +338,7 @@ impl PolicyStore {
                     return PolicydError::from(err).into();
                 }
             }
+
             ScopeTarget::Project {
                 policy_path,
                 project_root: _,
@@ -326,6 +358,7 @@ impl PolicyStore {
                 tracing::info!(path = ?policy_path, "project resource policy saved");
             }
         }
+
         self.finalize_resource_scope(&paths, kind, path, access, scope, action)
     }
 }
@@ -340,6 +373,7 @@ mod tests {
     };
 
     use super::*;
+
     use crate::{
         store::decisions::DecisionAction,
         wire::{FilesystemScopeOp, ScopeWire},
@@ -354,6 +388,7 @@ mod tests {
         std::fs::create_dir_all(&scripts).expect("create project scripts");
         let declarative = dir.path().join("declarative.json");
         let export_json = dir.path().join("export.json");
+
         let store = PolicyStore::new(crate::store::test_args(
             dir.path().join("host.sock"),
             dir.path().join("sandbox.sock"),
@@ -362,11 +397,13 @@ mod tests {
             Duration::from_secs(30),
             true,
         ));
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project, &home, &project),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
+
         let requested = scripts.join("plot_utils.py");
 
         assert_eq!(
@@ -387,6 +424,7 @@ mod tests {
                 DecisionAction::Approve,
             )
             .await;
+
         assert!(matches!(reply, RpcReply::ScopeAction(_)));
 
         assert_eq!(
@@ -395,11 +433,13 @@ mod tests {
                 .await,
             Some(Verdict::allowed(VerdictSource::policy()))
         );
+
         let policy: Policy = agent_sandbox_core::load_policy(
             &project.join(".agent-sandbox/policy.json"),
             Some(&home),
             None,
         );
+
         assert_eq!(policy.filesystem.allow[0].path, PathBuf::from("./scripts"));
     }
 }

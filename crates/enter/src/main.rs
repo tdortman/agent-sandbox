@@ -16,6 +16,7 @@ use std::{
 
 use caps::CapSet;
 use clap::Parser as _;
+
 use nix::{
     sched::{CloneFlags, setns},
     unistd::execvp,
@@ -47,9 +48,11 @@ fn netns_name_allowed(name: &str) -> bool {
     if name.is_empty() || name.len() > 200 {
         return false;
     }
+
     if name.contains("..") {
         return false;
     }
+
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
@@ -62,22 +65,27 @@ fn resolve_netns_path(name: &str) -> io::Result<PathBuf> {
             "invalid netns name",
         ));
     }
+
     let requested = PathBuf::from(NETNS_DIR).join(name);
+
     let canonical = requested.canonicalize().map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("canonicalize netns path {}: {err}", requested.display()),
         )
     })?;
+
     let netns_root = Path::new(NETNS_DIR)
         .canonicalize()
         .map_err(|err| io::Error::new(err.kind(), format!("canonicalize {NETNS_DIR}: {err}")))?;
+
     if !canonical.starts_with(&netns_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "netns path escapes /run/netns",
         ));
     }
+
     for component in canonical.components() {
         if matches!(component, Component::ParentDir) {
             return Err(io::Error::new(
@@ -86,12 +94,14 @@ fn resolve_netns_path(name: &str) -> io::Result<PathBuf> {
             ));
         }
     }
+
     if canonical.file_name().and_then(|n| n.to_str()) != Some(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "netns symlink target name mismatch",
         ));
     }
+
     Ok(canonical)
 }
 
@@ -129,8 +139,8 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-
     let path = resolve_netns_path(&cli.netns).unwrap_or_else(|e| die("resolve netns", &e));
+
     let file = OpenOptions::new()
         .read(true)
         .open(&path)
@@ -140,6 +150,7 @@ fn main() {
         if err == nix::errno::Errno::EPERM {
             eprintln!("setns: need CAP_SYS_ADMIN on agent-sandbox-enter (rebuild NixOS)");
         }
+
         die("setns", &io::Error::other(err));
     }
 
@@ -152,6 +163,7 @@ fn main() {
         .iter()
         .map(|s| CString::new(s.as_os_str().as_bytes()).expect("interior NUL"))
         .collect();
+
     let cmd = cargs
         .first()
         .expect("clap requires at least one command")
@@ -161,6 +173,7 @@ fn main() {
     // because the process image is replaced. unwrap_err is safe because
     // the compiler can prove the Ok variant is uninhabited.
     let err = execvp(&cmd, &cargs).unwrap_err();
+
     die("execvp", &io::Error::other(err));
 }
 

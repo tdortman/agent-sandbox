@@ -28,6 +28,7 @@ pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     // SAFETY: `pidfd_open(pid_t pid, unsigned int flags)` with flags=0. The
     // returned fd is owned exclusively by this call.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), 0u32) };
+
     fd_from_syscall(raw)
 }
 
@@ -42,11 +43,13 @@ pub fn pidfd_getfd(pidfd: impl AsFd, fd: i32) -> io::Result<OwnedFd> {
     // SAFETY: `pidfd_getfd(int pidfd, int targetfd, unsigned int flags)` with
     // flags=0. The returned fd is owned exclusively by this call.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_fd().as_raw_fd(), fd, 0u32) };
+
     fd_from_syscall(raw)
 }
 
 fn tracee_process_id(thread_id: u32) -> io::Result<u32> {
     let status = std::fs::read_to_string(format!("/proc/{thread_id}/status"))?;
+
     status
         .lines()
         .find_map(|line| {
@@ -80,8 +83,10 @@ fn fd_from_syscall(raw: libc::c_long) -> io::Result<OwnedFd> {
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
+
     let fd = i32::try_from(raw)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fd out of range"))?;
+
     // SAFETY: `fd` is a freshly-returned kernel fd not owned by anyone else.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -98,6 +103,7 @@ pub fn ioctl<T>(fd: std::os::fd::RawFd, request: libc::c_ulong, arg: &mut T) -> 
     // SAFETY: the caller guarantees the (fd, request, arg) triple is a valid
     // ioctl and owns `fd`. `arg` is derived from a live mutable reference.
     let rc = unsafe { libc::ioctl(fd, request, std::ptr::from_mut::<T>(arg)) };
+
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -114,10 +120,12 @@ pub fn ioctl<T>(fd: std::os::fd::RawFd, request: libc::c_ulong, arg: &mut T) -> 
 /// `/proc/<pid>/mem` unreadable).
 pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
+
     if let Some(n) = process_vm_readv_into(pid, addr, &mut buf) {
         buf.truncate(n);
         return Ok(buf);
     }
+
     let mem_path = format!("/proc/{pid}/mem");
     read_proc_mem(Path::new(&mem_path), addr, &mut buf)?;
     Ok(buf)
@@ -132,12 +140,15 @@ pub fn process_vm_readv_into(pid: u32, addr: u64, buf: &mut [u8]) -> Option<usiz
     if buf.is_empty() {
         return Some(0);
     }
+
     let len = buf.len();
     let mut local = [std::io::IoSliceMut::new(buf)];
+
     let remote = [nix::sys::uio::RemoteIoVec {
         base: usize::try_from(addr).unwrap_or(0),
         len,
     }];
+
     nix::sys::uio::process_vm_readv(Pid::from_raw(pid.cast_signed()), &mut local, &remote).ok()
 }
 
@@ -160,8 +171,10 @@ pub fn read_proc_mem(mem_path: &Path, addr: u64, buf: &mut [u8]) -> io::Result<(
 #[must_use]
 pub fn socket_type(fd: impl AsFd) -> Option<i32> {
     let mut sock_type: libc::c_int = 0;
+
     let mut optlen: libc::socklen_t =
         u32::try_from(std::mem::size_of::<libc::c_int>()).expect("c_int size fits in socklen_t");
+
     // SAFETY: getsockopt writes into the live `sock_type` and `optlen`. The fd
     // is borrowed for the call. Arguments match the SO_TYPE signature.
     let rc = unsafe {
@@ -173,6 +186,7 @@ pub fn socket_type(fd: impl AsFd) -> Option<i32> {
             &raw mut optlen,
         )
     };
+
     (rc == 0).then_some(sock_type)
 }
 
@@ -192,6 +206,7 @@ pub fn is_socket_connected(fd: impl AsFd) -> bool {
 /// Returns an error if the namespace fd cannot be opened or `setns` fails.
 pub fn join_mount_namespace(target_pid: u32) -> io::Result<()> {
     let ns_path = format!("/proc/{target_pid}/ns/mnt");
+
     let ns_fd = nix::fcntl::open(
         ns_path.as_str(),
         nix::fcntl::OFlag::O_RDONLY,
@@ -217,13 +232,16 @@ pub fn clear_ambient_capabilities() -> io::Result<()> {
         for cap in 0_i32.. {
             if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_LOWER, cap, 0, 0) < 0 {
                 let err = io::Error::last_os_error();
+
                 if err.raw_os_error() == Some(libc::EINVAL) {
                     break;
                 }
+
                 return Err(err);
             }
         }
     }
+
     Ok(())
 }
 
@@ -234,16 +252,20 @@ pub fn clear_ambient_capabilities() -> io::Result<()> {
 
 /// `fanotify_init` flags.
 const FAN_CLASS_PRE_CONTENT: u32 = libc::FAN_CLASS_PRE_CONTENT;
+
 const FAN_CLOEXEC: u32 = libc::FAN_CLOEXEC;
 
 /// `fanotify_mark` flags.
 const FAN_MARK_ADD: u32 = libc::FAN_MARK_ADD;
+
 const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
 
 /// Permission event masks.
 pub const FAN_OPEN_PERM: u64 = libc::FAN_OPEN_PERM;
+
 pub const FAN_OPEN_EXEC_PERM: u64 = libc::FAN_OPEN_EXEC_PERM;
 pub const FAN_ACCESS_PERM: u64 = libc::FAN_ACCESS_PERM;
+
 /// Pre-content access mask. Not exported by libc, matches the kernel UAPI.
 pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
@@ -268,18 +290,24 @@ pub fn fanotify_init_pre_content() -> io::Result<(OwnedFd, bool)> {
         // SAFETY: `fanotify_init(unsigned int flags, unsigned int event_f_flags)`
         // with event_f_flags=0. The returned fd is owned exclusively by us.
         let raw_fd = unsafe { libc::syscall(libc::SYS_fanotify_init, flags, 0u32) };
+
         let fd = i32::try_from(raw_fd)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fanotify fd overflow"))?;
+
         if fd >= 0 {
             // SAFETY: freshly-returned kernel fd.
             return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, reports_tid));
         }
+
         let err = io::Error::last_os_error();
+
         if reports_tid && matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
             continue;
         }
+
         return Err(err);
     }
+
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "fanotify_init failed",
@@ -297,6 +325,7 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr, try_pre_access: bool) -> io
     } else {
         FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM
     };
+
     // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
     // int dirfd, const char *pathname)`. The fd and path are live for the call.
     let ret = unsafe {
@@ -309,13 +338,17 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr, try_pre_access: bool) -> io
             path.as_ptr(),
         )
     };
+
     if ret == 0 {
         return Ok(mask);
     }
+
     let err = io::Error::last_os_error();
+
     if try_pre_access && matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
         return fanotify_mark(fan_fd, path, false);
     }
+
     Err(err)
 }
 
@@ -325,15 +358,21 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr, try_pre_access: bool) -> io
 pub struct FanotifyEventMetadata {
     /// Length of the event including any information records.
     pub event_len: u32,
+
     /// Version of this struct.
     pub vers: u8,
+
     pub reserved: u8,
+
     /// Length of the event metadata (not including information records).
     pub metadata_len: u16,
+
     /// Mask describing the event.
     pub mask: u64,
+
     /// Fd describing the object being accessed, or negative.
     pub fd: i32,
+
     /// Pid of the process that triggered the event.
     pub pid: i32,
 }
@@ -344,15 +383,19 @@ pub struct FanotifyEventMetadata {
 #[must_use]
 pub const fn fanotify_event(bytes: &[u8]) -> Option<FanotifyEventMetadata> {
     let n = std::mem::size_of::<FanotifyEventMetadata>();
+
     if bytes.len() < n {
         return None;
     }
+
     let mut meta = std::mem::MaybeUninit::<FanotifyEventMetadata>::uninit();
+
     // SAFETY: `bytes` holds at least `n` bytes. `copy_nonoverlapping` copies
     // them into the `MaybeUninit` without forming a stricter-aligned pointer.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), std::ptr::addr_of_mut!(meta).cast::<u8>(), n);
     }
+
     Some(unsafe { meta.assume_init() })
 }
 
@@ -433,6 +476,7 @@ pub fn connect_raw(fd: impl AsFd, addr: &[u8]) -> io::Result<()> {
             u32::try_from(addr.len()).unwrap_or(u32::MAX),
         )
     };
+
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -459,6 +503,7 @@ pub fn sendto_raw(fd: impl AsFd, buf: &[u8], flags: i32, addr: &[u8]) -> io::Res
             u32::try_from(addr.len()).unwrap_or(u32::MAX),
         )
     };
+
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -479,6 +524,7 @@ pub fn sendto_raw(fd: impl AsFd, buf: &[u8], flags: i32, addr: &[u8]) -> io::Res
 pub unsafe fn sendmsg_raw(fd: impl AsFd, msg: &libc::msghdr, flags: i32) -> io::Result<isize> {
     // SAFETY: deferred to caller per the function's safety contract.
     let rc = unsafe { libc::sendmsg(fd.as_fd().as_raw_fd(), msg, flags) };
+
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -495,6 +541,7 @@ pub unsafe fn sendmsg_raw(fd: impl AsFd, msg: &libc::msghdr, flags: i32) -> io::
 pub fn install_seccomp_notify(prog: &mut libc::sock_fprog) -> io::Result<OwnedFd> {
     // Stable kernel UAPI constants from <linux/seccomp.h>.
     const SECCOMP_SET_MODE_FILTER: u32 = 1;
+
     const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
 
     // SAFETY: `prog` is a valid BPF program. The syscall is the standard
@@ -507,6 +554,7 @@ pub fn install_seccomp_notify(prog: &mut libc::sock_fprog) -> io::Result<OwnedFd
             std::ptr::from_mut::<libc::sock_fprog>(prog),
         )
     };
+
     fd_from_syscall(raw)
 }
 
@@ -531,12 +579,15 @@ pub fn pre_exec_fork() -> io::Result<nix::unistd::ForkResult> {
 /// Returns the kernel error if `fcntl` fails.
 pub fn set_raw_fd_nonblocking(fd: i32) -> io::Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
     // SAFETY: caller guarantees `fd` is live.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+
     let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
     fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +601,7 @@ mod tests {
             nix::sys::socket::SockFlag::empty(),
         )
         .expect("socketpair");
+
         assert_eq!(socket_type(&fds.0), Some(libc::SOCK_STREAM));
     }
 
@@ -562,6 +614,7 @@ mod tests {
             nix::sys::socket::SockFlag::empty(),
         )
         .expect("socketpair");
+
         assert!(is_socket_connected(&fds.0));
     }
 
@@ -577,14 +630,18 @@ mod tests {
     #[test]
     fn dup_tracee_fd_round_trips_dev_null() {
         use std::io::Read;
+
         let devnull = std::fs::OpenOptions::new()
             .read(true)
             .open("/dev/null")
             .expect("open /dev/null");
+
         let self_pid = std::process::id();
         let dup = dup_tracee_fd(self_pid, devnull.as_fd().as_raw_fd()).expect("dup own fd");
+
         // The duplicated fd must be readable (devnull reads as EOF).
         let mut buf = [0u8; 1];
+
         let mut f = std::fs::File::from(dup);
         assert_eq!(f.read(&mut buf).unwrap_or(0), 0);
     }
@@ -597,19 +654,21 @@ mod tests {
             .read(true)
             .open("/dev/null")
             .expect("open /dev/null");
+
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+
         let handle = thread::spawn(move || {
             let thread_id = u32::try_from(nix::unistd::gettid().as_raw()).expect("valid thread ID");
             ready_tx.send(thread_id).expect("send thread ID");
             release_rx.recv().expect("wait for duplication");
         });
+
         let thread_id = ready_rx.recv().expect("receive thread ID");
         let result = dup_tracee_fd(thread_id, devnull.as_fd().as_raw_fd());
         release_tx.send(()).expect("release thread");
         handle.join().expect("join tracee thread");
         let dup = result.expect("duplicate fd from notification thread");
-
         let mut buf = [0_u8; 1];
         let mut file = std::fs::File::from(dup);
         assert_eq!(std::io::Read::read(&mut file, &mut buf).unwrap_or(0), 0);

@@ -12,6 +12,7 @@ use super::{
     decisions::DecisionAction,
     types::{PolicyDecisionState, PolicyStore},
 };
+
 use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, ScopeWire},
@@ -33,6 +34,7 @@ impl PolicyStore {
             scope,
             wire,
         } = op;
+
         let ScopeWire {
             paths,
             session_id,
@@ -40,9 +42,11 @@ impl PolicyStore {
             sandbox_session_id: _,
             comment,
         } = wire;
+
         let home = paths.home();
         let project_root = paths.project_root();
         let session_entries = session_network_entries(&host, port);
+
         let target = match self
             .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
             .await
@@ -50,7 +54,9 @@ impl PolicyStore {
             Ok(target) => target,
             Err(reply) => return *reply,
         };
+
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+
         match target {
             ScopeTarget::Ephemeral => {
                 if action == DecisionAction::Approve {
@@ -58,6 +64,7 @@ impl PolicyStore {
                     inner.once_allow.insert(NetworkRuleKey::new(&host, port));
                 }
             }
+
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
                 let PolicyDecisionState {
@@ -70,6 +77,7 @@ impl PolicyStore {
                 }
                 drop(inner);
             }
+
             ScopeTarget::Global { policy_path, home } => {
                 let persist = Self::persist_network_rule(
                     &policy_path,
@@ -84,6 +92,7 @@ impl PolicyStore {
                     return PolicydError::from(err).into();
                 }
             }
+
             ScopeTarget::Project {
                 policy_path,
                 project_root: _,
@@ -103,6 +112,7 @@ impl PolicyStore {
                 tracing::info!(path = ?policy_path, "project policy saved");
             }
         }
+
         self.finalize_network_scope(&paths, host, port, scope, action)
     }
 
@@ -119,11 +129,14 @@ impl PolicyStore {
             paths.home_path(),
             paths.project_root_path(),
         ));
+
         Self::audit(action.audit_verb(), Some(&host), Some(port), scope.as_str());
+
         let path = match (paths.home(), paths.project_root()) {
             (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
             _ => None,
         };
+
         RpcReply::ScopeAction(ScopeActionReply::ok_network(
             host,
             port,
@@ -142,6 +155,7 @@ impl PolicyStore {
         let active = self.active_session_ids().await;
         let home_str = home.and_then(Path::to_str);
         let project_root_str = project_root.and_then(Path::to_str);
+
         let ctx = ScopeContext {
             scope,
             session_id,
@@ -149,6 +163,7 @@ impl PolicyStore {
             project_root: project_root_str,
             active_session_ids: &active,
         };
+
         ScopeTarget::resolve(&ctx).map_err(|err| Box::new(RpcReply::from(err)))
     }
 }
@@ -156,7 +171,6 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use agent_sandbox_core::NetworkRuleKey;
-
     use super::session_network_entries;
 
     #[test]

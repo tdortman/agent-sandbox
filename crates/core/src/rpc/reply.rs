@@ -11,11 +11,13 @@ use super::{
     proxy::{AttributionToken, ProxyRequestId, ProxySessionToken},
     scope::ApprovalScope,
 };
+
 use crate::{
     error::{InvalidScopeError, ScopeResolveError},
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind},
 };
+
 /// Response envelope for pipelined proxy checks and cancellations.
 ///
 /// The request identifier is part of the response rather than relying on
@@ -48,6 +50,7 @@ impl ProxyReply {
                 "invalid reply for a pipelined proxy request",
             )),
         };
+
         Self { request_id, reply }
     }
 }
@@ -98,10 +101,10 @@ impl<'de> Deserialize<'de> for RpcReply {
                 }
             };
         }
+
         try_variant!(Proxy, ProxyReply);
         try_variant!(ProxySession, ProxySessionReply);
         try_variant!(FlowClaim, FlowClaimReply);
-
         try_variant!(RegisterUi, RegisterUiReply);
         try_variant!(FilesystemCheck, FilesystemCheckReply);
         try_variant!(ResourceCheck, ResourceCheckReply);
@@ -207,6 +210,7 @@ impl VerdictSource {
                     comment: Some(comment),
                 },
             ) => Ok(Cow::Owned(format!("allow:{comment}"))),
+
             (true, Self::Policy { comment: None }) => Ok(Cow::Borrowed("allow")),
             (false, Self::Policy { .. }) => Ok(Cow::Borrowed("deny")),
             (true, Self::Scope(scope)) => Ok(Cow::Borrowed(scope.as_str())),
@@ -224,10 +228,12 @@ impl VerdictSource {
             if value == "allow" {
                 return Ok(Self::policy());
             }
+
             if let Some(comment) = value.strip_prefix("allow:") {
                 return Ok(Self::policy_with_comment(comment));
             }
         }
+
         match (allowed, value) {
             (false, "deny") => Ok(Self::policy()),
             (false, "denied") => Ok(Self::User),
@@ -250,6 +256,7 @@ impl fmt::Display for VerdictSource {
             Self::Policy {
                 comment: Some(comment),
             } => write!(f, "policy:{comment}"),
+
             Self::Policy { comment: None } => f.write_str("policy"),
             Self::Scope(scope) => f.write_str(scope.as_str()),
             Self::User => f.write_str("user"),
@@ -320,6 +327,7 @@ struct WireCheckReply {
     ok: bool,
     allowed: bool,
     source: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -364,14 +372,17 @@ impl Serialize for CheckReply {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
+
         let field_count = if self.error.is_some() { 4 } else { 3 };
         let mut state = serializer.serialize_struct("CheckReply", field_count)?;
         state.serialize_field("ok", &self.ok)?;
         state.serialize_field("allowed", &self.allowed)?;
         state.serialize_field("source", source.as_ref())?;
+
         if let Some(error) = &self.error {
             state.serialize_field("error", error)?;
         }
+
         state.end()
     }
 }
@@ -382,6 +393,7 @@ impl<'de> Deserialize<'de> for CheckReply {
         D: Deserializer<'de>,
     {
         let wire = WireCheckReply::deserialize(deserializer)?;
+
         Ok(Self {
             ok: wire.ok,
             allowed: wire.allowed,
@@ -401,14 +413,17 @@ pub struct HttpCheckReply {
     pub error: Option<String>,
     pub request: Option<HttpRequest>,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireHttpCheckReply {
     ok: bool,
     allowed: bool,
     source: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+
     #[serde(default)]
     request: Option<HttpRequest>,
 }
@@ -446,23 +461,30 @@ impl Serialize for HttpCheckReply {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
+
         let mut field_count = 3;
+
         if self.error.is_some() {
             field_count += 1;
         }
+
         if self.request.is_some() {
             field_count += 1;
         }
+
         let mut state = serializer.serialize_struct("HttpCheckReply", field_count)?;
         state.serialize_field("ok", &self.ok)?;
         state.serialize_field("allowed", &self.allowed)?;
         state.serialize_field("source", source.as_ref())?;
+
         if let Some(error) = &self.error {
             state.serialize_field("error", error)?;
         }
+
         if let Some(request) = &self.request {
             state.serialize_field("request", request)?;
         }
+
         state.end()
     }
 }
@@ -473,6 +495,7 @@ impl<'de> Deserialize<'de> for HttpCheckReply {
         D: Deserializer<'de>,
     {
         let wire = WireHttpCheckReply::deserialize(deserializer)?;
+
         Ok(Self {
             ok: wire.ok,
             allowed: wire.allowed,
@@ -504,6 +527,7 @@ pub struct NetworkFlowCheckReply {
     pub ok: bool,
     pub allowed: bool,
     pub source: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -568,6 +592,7 @@ struct WireFilesystemCheckReply {
     source: String,
     path: PathBuf,
     access: FileAccess,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -616,6 +641,7 @@ impl Serialize for FilesystemCheckReply {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
+
         let field_count = if self.error.is_some() { 6 } else { 5 };
         let mut state = serializer.serialize_struct("FilesystemCheckReply", field_count)?;
         state.serialize_field("ok", &self.ok)?;
@@ -623,9 +649,11 @@ impl Serialize for FilesystemCheckReply {
         state.serialize_field("source", source.as_ref())?;
         state.serialize_field("path", &self.path)?;
         state.serialize_field("access", &self.access)?;
+
         if let Some(error) = &self.error {
             state.serialize_field("error", error)?;
         }
+
         state.end()
     }
 }
@@ -636,6 +664,7 @@ impl<'de> Deserialize<'de> for FilesystemCheckReply {
         D: Deserializer<'de>,
     {
         let wire = WireFilesystemCheckReply::deserialize(deserializer)?;
+
         Ok(Self {
             ok: wire.ok,
             allowed: wire.allowed,
@@ -667,6 +696,7 @@ struct WireResourceCheckReply {
     kind: ResourceKind,
     path: PathBuf,
     access: ResourceAccess,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -737,6 +767,7 @@ impl Serialize for ResourceCheckReply {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
+
         let field_count = if self.error.is_some() { 7 } else { 6 };
         let mut state = serializer.serialize_struct("ResourceCheckReply", field_count)?;
         state.serialize_field("ok", &self.ok)?;
@@ -745,9 +776,11 @@ impl Serialize for ResourceCheckReply {
         state.serialize_field("kind", &self.kind)?;
         state.serialize_field("path", &self.path)?;
         state.serialize_field("access", &self.access)?;
+
         if let Some(error) = &self.error {
             state.serialize_field("error", error)?;
         }
+
         state.end()
     }
 }
@@ -758,6 +791,7 @@ impl<'de> Deserialize<'de> for ResourceCheckReply {
         D: Deserializer<'de>,
     {
         let wire = WireResourceCheckReply::deserialize(deserializer)?;
+
         Ok(Self {
             ok: wire.ok,
             allowed: wire.allowed,
@@ -787,6 +821,7 @@ struct WireDbusCheckReply {
     allowed: bool,
     source: String,
     target: DbusTarget,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -833,15 +868,18 @@ impl Serialize for DbusCheckReply {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
+
         let field_count = if self.error.is_some() { 5 } else { 4 };
         let mut state = serializer.serialize_struct("DbusCheckReply", field_count)?;
         state.serialize_field("ok", &self.ok)?;
         state.serialize_field("allowed", &self.allowed)?;
         state.serialize_field("source", source.as_ref())?;
         state.serialize_field("target", &self.target)?;
+
         if let Some(error) = &self.error {
             state.serialize_field("error", error)?;
         }
+
         state.end()
     }
 }
@@ -852,6 +890,7 @@ impl<'de> Deserialize<'de> for DbusCheckReply {
         D: Deserializer<'de>,
     {
         let wire = WireDbusCheckReply::deserialize(deserializer)?;
+
         Ok(Self {
             ok: wire.ok,
             allowed: wire.allowed,
@@ -867,6 +906,7 @@ impl<'de> Deserialize<'de> for DbusCheckReply {
 pub struct FilesystemMonitorReply {
     pub ok: bool,
     pub active: bool,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -902,12 +942,14 @@ pub enum ScopeActionReply {
     Resource(ResourceScopeActionReply),
     Dbus(DbusScopeActionReply),
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpScopeActionReply {
     pub ok: bool,
     pub target: HttpRuleTarget,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
@@ -919,6 +961,7 @@ pub struct NetworkScopeActionReply {
     pub host: String,
     pub port: u16,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
@@ -929,6 +972,7 @@ pub struct SudoScopeActionReply {
     pub ok: bool,
     pub argv: Vec<String>,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
@@ -938,8 +982,10 @@ pub struct SudoScopeActionReply {
 pub struct ElevationScopeActionReply {
     pub ok: bool,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+
     pub allowed: bool,
 }
 
@@ -950,6 +996,7 @@ pub struct FilesystemScopeActionReply {
     pub path: PathBuf,
     pub access: FileAccess,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_path: Option<PathBuf>,
 }
@@ -962,15 +1009,18 @@ pub struct ResourceScopeActionReply {
     pub path: PathBuf,
     pub access: ResourceAccess,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_path: Option<PathBuf>,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DbusScopeActionReply {
     pub ok: bool,
     pub target: DbusTarget,
     pub scope: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
@@ -1123,6 +1173,7 @@ impl RpcReply {
                 ProxyReplyBody::Canceled(reply) => reply.ok,
                 ProxyReplyBody::Error(_) => false,
             },
+
             Self::Error(_) => false,
             _ => true,
         }
@@ -1161,6 +1212,7 @@ mod tests {
     use super::{
         ApprovalScope, DbusCheckReply, DbusTarget, RpcReply, ScopeActionReply, VerdictSource,
     };
+
     use crate::policy::DbusMessageKind;
 
     #[test]
@@ -1172,7 +1224,9 @@ mod tests {
             None,
         ))
         .unwrap();
+
         let reply: RpcReply = serde_json::from_str(&line).unwrap();
+
         assert!(matches!(
             reply,
             RpcReply::ScopeAction(ScopeActionReply::Network(_))
@@ -1188,10 +1242,12 @@ mod tests {
             None,
         ))
         .unwrap();
+
         assert!(json.get("argv").is_none());
         assert!(json.get("allowed").is_none());
         assert_eq!(json["host"], "ex.com");
     }
+
     #[test]
     fn dbus_reply_round_trips_typed_target() {
         let target = DbusTarget::session(
@@ -1203,10 +1259,13 @@ mod tests {
             "s",
             Vec::new(),
         );
+
         let reply = DbusCheckReply::allowed(VerdictSource::Static, target.clone());
         let value = serde_json::to_value(&reply).expect("D-Bus reply serializes");
+
         let decoded: DbusCheckReply =
             serde_json::from_value(value).expect("D-Bus reply deserializes");
+
         assert_eq!(decoded.target, target);
         assert!(decoded.allowed);
     }

@@ -10,14 +10,17 @@ use std::{
 };
 
 use agent_sandbox_core::{EchRewrite, HttpRequest, ProxyRequestId, rewrite_ech_config};
+
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
     policy::{PolicySession, authority_for_policy, flow_key, normalize_authority},
     strip_alt_svc,
 };
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use nix::sys::socket::{getsockopt, sockopt};
+
 use rama_core::{
     Layer, Service,
     error::{BoxError, BoxErrorExt},
@@ -27,7 +30,9 @@ use rama_core::{
     rt::Executor,
     service::service_fn,
 };
+
 use rama_dns::client::DnsConnectorLayer;
+
 use rama_http::{
     Body, HeaderValue, Request, Response, StatusCode, Version,
     body::util::BodyExt,
@@ -38,15 +43,19 @@ use rama_http::{
         version_adapter::{RequestVersionAdapter, ResponseVersionAdaptCtx, adapt_response_version},
     },
 };
+
 use rama_http_backend::{client::HttpConnector, server::HttpServer};
+
 use rama_net::{
     address::SocketAddress,
     proxy::IoForwardService,
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
+
 use rama_tcp::{TcpStream, client::service::TcpConnector, server::TcpListener};
 use rama_tls::{client::TlsClientConfig, server::TlsPeekRouter};
+
 use rama_tls_boring::{
     TlsStream,
     core::{
@@ -55,10 +64,10 @@ use rama_tls_boring::{
         x509::X509,
     },
 };
+
 use rama_tls_rustls::client::TlsConnector;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
-
 const MAX_ACTIVE_CHECKS: usize = 256;
 const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
@@ -68,21 +77,28 @@ struct PolicyDenied;
 fn select_alpn<'a>(_: &mut SslRef, offered: &'a [u8]) -> Result<&'a [u8], AlpnError> {
     let mut offset = 0;
     let mut http11 = None;
+
     while offset < offered.len() {
         let length = offered[offset] as usize;
         let end = offset.saturating_add(1 + length);
+
         if end > offered.len() {
             return Err(AlpnError::ALERT_FATAL);
         }
+
         let protocol = &offered[offset + 1..end];
+
         if protocol == b"h2" {
             return Ok(protocol);
         }
+
         if protocol == b"http/1.1" {
             http11 = Some(protocol);
         }
+
         offset = end;
     }
+
     http11.ok_or(AlpnError::NOACK)
 }
 
@@ -105,17 +121,21 @@ fn select_ech_config_list(
     let Some(encoded) = encoded else {
         return Ok(state.map(|state| Arc::new(state.config_list.clone())));
     };
+
     let config_list = STANDARD.decode(encoded)?;
+
     let Some(state) = state else {
         return Err(BoxError::from_static_str(
             "ECH config override requires ECH state",
         ));
     };
+
     if config_list != state.config_list {
         return Err(BoxError::from_static_str(
             "ECH config override does not match ECH private key",
         ));
     }
+
     Ok(Some(Arc::new(config_list)))
 }
 
@@ -191,15 +211,18 @@ where
             (&self.ech_config_list, self.ech_private_key)
         {
             let mut keys = SslEchKeys::builder()?;
+
             let config = config_list
                 .get(2..)
                 .ok_or_else(|| BoxError::from_static_str("invalid ECH config list"))?;
+
             keys.add_key(true, config, HpkeKey::dhkem_p256_sha256(&private_key)?)?;
             acceptor.set_ech_keys(&keys.build())?;
         }
 
         let issuer = self.issuer.clone();
         let fallback_name = self.fallback_name.clone();
+
         acceptor.set_select_certificate_callback(move |mut client_hello| {
             let server_name = client_hello
                 .servername(NameType::HOST_NAME)
@@ -232,10 +255,12 @@ where
 
             ssl.set_private_key(private_key.as_ref())
                 .map_err(|_| SelectCertError::ERROR)?;
+
             Ok(())
         });
 
         let stream = rama_tls_boring::core::tokio::accept(&acceptor.build(), stream).await?;
+
         self.inner
             .serve(TlsStream::new(stream))
             .await
@@ -257,6 +282,7 @@ async fn main() -> Result<(), BoxError> {
             .ech_state_dir
             .as_deref()
             .ok_or_else(|| BoxError::from_static_str("ECH state directory is required"))?;
+
         ech_state::load_or_generate(state_dir)?;
         return Ok(());
     }
@@ -269,16 +295,21 @@ async fn main() -> Result<(), BoxError> {
 
     let ech_config_list =
         select_ech_config_list(args.ech_config_list.as_deref(), ech_state.as_ref())?;
+
     let ech_private_key = ech_state.map(|state| state.private_key);
+
     let ca_certificate = args
         .ca_certificate
         .as_deref()
         .ok_or_else(|| BoxError::from_static_str("CA certificate is required"))?;
+
     let ca_certificate = std::fs::read_to_string(ca_certificate)?;
+
     let ca_private_key = args
         .ca_private_key
         .as_deref()
         .ok_or_else(|| BoxError::from_static_str("CA private key is required"))?;
+
     let ca_private_key = std::fs::read_to_string(ca_private_key)?;
     let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
 
@@ -299,6 +330,7 @@ async fn main() -> Result<(), BoxError> {
         ech_config_list,
         ech_private_key,
     };
+
     let service = build_listener_service(
         executor.clone(),
         policy.clone(),
@@ -311,7 +343,6 @@ async fn main() -> Result<(), BoxError> {
     let v4 = bind_listener(Domain::IPv4, args.listen_port, executor.clone()).await?;
     let v6 = bind_listener(Domain::IPv6, args.listen_port, executor.clone()).await?;
     policy.mark_ready()?;
-
     info!(port = args.listen_port, "transparent HTTP proxy listening");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -363,10 +394,12 @@ async fn bind_listener(
 fn policy_denied_response() -> Response {
     let mut response = Response::new(Body::from(POLICY_DENIED_BODY));
     *response.status_mut() = StatusCode::FORBIDDEN;
+
     response.headers_mut().insert(
         "x-agent-sandbox-policy",
         HeaderValue::from_static("blocked"),
     );
+
     response
 }
 
@@ -393,6 +426,7 @@ fn build_listener_service(
         let ech_private_key = listener_config.ech_private_key;
         let shutdown = shutdown.clone();
         let active_checks = active_checks.clone();
+
         async move {
             let peer: SocketAddr = stream.peer_addr()?.into();
             let destination = destination_for_stream(&stream, listen_port)?;
@@ -409,6 +443,7 @@ fn build_listener_service(
                 attribution_token: attribution_token.clone(),
                 ech_config_list: ech_config_list.clone(),
             };
+
             let request_service = service_fn(move |request| {
                 let state = state.clone();
                 let shutdown = shutdown.clone();
@@ -416,10 +451,12 @@ fn build_listener_service(
                 async move {
                     match proxy_request(request, state, shutdown).await {
                         Ok(response) => Ok(response),
+
                         Err(error) if error.downcast_ref::<PolicyDenied>().is_some() => {
                             info!(%error, "proxy request denied by policy");
                             Ok(policy_denied_response())
                         }
+
                         Err(error) => {
                             error!(%error, "proxy request failed");
                             let mut response = Response::new(Body::empty());
@@ -429,6 +466,7 @@ fn build_listener_service(
                     }
                 }
             });
+
             let upgrade_matcher = MatcherServicePair::new(
                 match_fn(is_websocket_upgrade_request),
                 MatcherServicePair::new(
@@ -436,12 +474,15 @@ fn build_listener_service(
                     IoForwardService::new(executor.clone()),
                 ),
             );
+
             let request_service =
                 HttpUpgradeMitmRelay::new(executor.clone(), upgrade_matcher, request_service);
+
             let mut http_server = HttpServer::auto(executor.clone());
             http_server.h2_mut().set_enable_connect_protocol();
             let http = http_server.service(request_service);
             let fallback_http = http.clone();
+
             let tls = BoringTlsService {
                 issuer,
                 ech_config_list: ech_config_list.clone(),
@@ -461,6 +502,7 @@ fn build_listener_service(
 
 fn destination_for_stream(stream: &TcpStream, listen_port: u16) -> Result<SocketAddr, BoxError> {
     let local: SocketAddr = stream.local_addr()?.into();
+
     if local.port() != listen_port {
         return Ok(local);
     }
@@ -595,6 +637,7 @@ async fn rewrite_doh_response(
 
     let body = std::mem::replace(response.body_mut(), Body::empty());
     let body = body.limited(65_535).collect().await?.to_bytes();
+
     let body = match rewrite_ech_config(&body, replacement)? {
         EchRewrite::Rewritten(body) => body,
         EchRewrite::Unchanged => body.to_vec(),
@@ -604,6 +647,7 @@ async fn rewrite_doh_response(
     };
 
     response.headers_mut().remove("transfer-encoding");
+
     response.headers_mut().insert(
         "content-length",
         HeaderValue::from_str(&body.len().to_string())?,
@@ -619,11 +663,12 @@ async fn proxy_request(
     shutdown: Arc<Notify>,
 ) -> Result<Response, BoxError> {
     let websocket = is_websocket_upgrade_request(&request);
+
     if blocked_http_request(&request) {
         return Err(Box::new(PolicyDenied));
     }
-    let response_context = ResponseVersionAdaptCtx::from_request(&request);
 
+    let response_context = ResponseVersionAdaptCtx::from_request(&request);
     let doh = is_doh_request(&request);
 
     let host = request
@@ -675,6 +720,7 @@ async fn proxy_request(
             ?websocket, version = ?request.version(),
             "HTTP request denied by policy"
         );
+
         return Err(Box::new(PolicyDenied));
     }
 
@@ -696,23 +742,22 @@ async fn proxy_request(
     let original_uri = request.uri().to_string();
     let target = request_target(&request);
     let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
-
     *request.uri_mut() = uri.parse()?;
 
     request
         .headers_mut()
         .insert("host", upstream_authority.parse()?);
-    force_websocket_http11(&request);
 
+    force_websocket_http11(&request);
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
     let connector = RequestVersionAdapter::new(connector).with_default_version(Version::HTTP_11);
     let client = HttpConnector::new(connector, Executor::default());
-
     let connection = client.serve(request).await?;
     let mut response = connection.conn.serve(connection.input).await?;
     let response_status = response.status();
     let response_version = response.version();
+
     if websocket {
         info!(host = %upstream_authority, ?response_status, ?response_version, "received WebSocket upgrade response");
     }
@@ -786,6 +831,7 @@ fn is_websocket_upgrade_response(response: &Response) -> bool {
 fn request_target(request: &Request) -> String {
     let path = request.uri().path_or_root().to_string();
     let query = request.uri().query_or_empty();
+
     if query.is_empty() {
         path
     } else {
@@ -830,12 +876,15 @@ mod tests {
         rt::Executor,
         service::service_fn,
     };
+
     use rama_http::{
         Response,
         io::upgrade::{Upgraded, pending},
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
+
     use rama_net::proxy::IoForwardService;
+
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         time::{Duration, timeout},
@@ -847,6 +896,7 @@ mod tests {
         is_doh_request, is_websocket_upgrade_request, is_websocket_upgrade_response,
         policy_denied_response, select_ech_config_list,
     };
+
     use crate::ech_state::EchState;
 
     struct TestIo {
@@ -942,7 +992,9 @@ mod tests {
             .method("GET")
             .body(Body::empty())
             .expect("test request");
+
         force_websocket_http11(&ordinary);
+
         assert!(
             ordinary
                 .extensions()
@@ -955,16 +1007,18 @@ mod tests {
             .uri("https://api.openai.com/v1/live/rtc")
             .body(Body::empty())
             .expect("test request");
+
         extended_connect
             .extensions()
             .insert(rama_http::proto::h2::ext::Protocol::from_static(
                 "websocket",
             ));
-        *extended_connect.version_mut() = Version::HTTP_2;
 
+        *extended_connect.version_mut() = Version::HTTP_2;
         assert!(is_websocket_upgrade_request(&extended_connect));
         assert!(!blocked_http_request(&extended_connect));
         force_websocket_http11(&extended_connect);
+
         assert_eq!(
             extended_connect
                 .extensions()
@@ -972,8 +1026,10 @@ mod tests {
                 .map(|target| target.0),
             Some(Version::HTTP_11)
         );
+
         adapt_request_version(&mut extended_connect, Version::HTTP_11).expect("H1 adaptation");
         assert_eq!(extended_connect.method().as_str(), "GET");
+
         assert_eq!(
             extended_connect
                 .headers()
@@ -981,6 +1037,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("websocket")
         );
+
         assert_eq!(
             extended_connect
                 .headers()
@@ -996,21 +1053,22 @@ mod tests {
             .method("CONNECT")
             .body(Body::empty())
             .expect("test request");
+
         *request.version_mut() = Version::HTTP_2;
+
         request
             .extensions()
             .insert(rama_http::proto::h2::ext::Protocol::from_static(
                 "websocket",
             ));
+
         let context = ResponseVersionAdaptCtx::from_request(&request);
         let (_, on_upgrade) = pending();
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
         *response.version_mut() = Version::HTTP_11;
         response.extensions().insert(on_upgrade);
-
         adapt_response_version(&mut response, &context).expect("adapt websocket response");
-
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.version(), Version::HTTP_2);
     }
@@ -1019,6 +1077,7 @@ mod tests {
     async fn relays_websocket_upgrade_bytes() {
         let (ingress_pending, ingress_on_upgrade) = pending();
         let (egress_pending, egress_on_upgrade) = pending();
+
         let inner = service_fn(move |_request: Request| {
             let on_upgrade = egress_on_upgrade.clone();
 
@@ -1029,6 +1088,7 @@ mod tests {
                 Ok::<_, Infallible>(response)
             }
         });
+
         let matcher = MatcherServicePair::new(
             match_fn(|request: &Request| is_websocket_upgrade_request(request)),
             MatcherServicePair::new(
@@ -1036,7 +1096,9 @@ mod tests {
                 IoForwardService::new(Executor::default()),
             ),
         );
+
         let relay = HttpUpgradeMitmRelay::new(Executor::default(), matcher, inner);
+
         let request = Request::builder()
             .method("GET")
             .header("upgrade", "websocket")
@@ -1044,11 +1106,10 @@ mod tests {
             .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .body(Body::empty())
             .expect("test request");
-        request.extensions().insert(ingress_on_upgrade);
 
+        request.extensions().insert(ingress_on_upgrade);
         let response = relay.serve(request).await.expect("upgrade response");
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
-
         let (mut ingress_peer, ingress_io) = duplex(1024);
         let (mut egress_peer, egress_io) = duplex(1024);
         ingress_pending.fulfill(Upgraded::new(TestIo::new(ingress_io), Bytes::new()));
@@ -1058,7 +1119,9 @@ mod tests {
             .write_all(b"ping")
             .await
             .expect("write ingress");
+
         let mut received = [0; 4];
+
         timeout(
             Duration::from_secs(1),
             egress_peer.read_exact(&mut received),
@@ -1066,10 +1129,11 @@ mod tests {
         .await
         .expect("ingress relay timeout")
         .expect("read relayed ingress bytes");
-        assert_eq!(&received, b"ping");
 
+        assert_eq!(&received, b"ping");
         egress_peer.write_all(b"pong").await.expect("write egress");
         let mut received = [0; 4];
+
         timeout(
             Duration::from_secs(1),
             ingress_peer.read_exact(&mut received),
@@ -1077,8 +1141,10 @@ mod tests {
         .await
         .expect("egress relay timeout")
         .expect("read relayed egress bytes");
+
         assert_eq!(&received, b"pong");
     }
+
     #[test]
     fn detects_doh_post_and_get_requests() {
         let post = Request::builder()
@@ -1086,6 +1152,7 @@ mod tests {
             .header("content-type", "application/dns-message")
             .body(Body::empty())
             .expect("test request");
+
         assert!(is_doh_request(&post));
 
         let get = Request::builder()
@@ -1093,6 +1160,7 @@ mod tests {
             .uri("/dns-query?dns=abc")
             .body(Body::empty())
             .expect("test request");
+
         assert!(is_doh_request(&get));
     }
 
@@ -1104,6 +1172,7 @@ mod tests {
         };
 
         assert!(select_ech_config_list(Some("Ag=="), Some(&state)).is_err());
+
         assert_eq!(
             select_ech_config_list(Some("AQ=="), Some(&state))
                 .expect("matching ECH config")
@@ -1116,8 +1185,8 @@ mod tests {
     #[test]
     fn policy_denial_response_is_explicit() {
         let response = policy_denied_response();
-
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
         assert_eq!(
             response
                 .headers()
@@ -1125,6 +1194,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("blocked")
         );
+
         assert_eq!(POLICY_DENIED_BODY, "blocked by agent-sandbox policy\n");
     }
 }

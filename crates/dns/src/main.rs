@@ -18,16 +18,20 @@ use agent_sandbox_core::{
     DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, EchRewrite, mappings_from_response,
     rewrite_ech_config,
 };
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
+
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
     rr::{RData, rdata::svcb::SvcParamKey},
 };
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
 };
+
 use tracing::{debug, info, warn};
 
 /// Build a DNS `SERVFAIL` response for a parseable query packet.
@@ -37,20 +41,25 @@ use tracing::{debug, info, warn};
 /// usual two-byte length prefix.
 fn servfail_response(query: &[u8]) -> Option<Vec<u8>> {
     let message = Message::from_vec(query).ok()?;
+
     if message.metadata.message_type != MessageType::Query {
         return None;
     }
+
     let mut response = Message::new(
         message.metadata.id,
         MessageType::Response,
         message.metadata.op_code,
     );
+
     response.metadata.recursion_desired = message.metadata.recursion_desired;
     response.metadata.recursion_available = false;
     response.metadata.response_code = ResponseCode::ServFail;
+
     for question in &message.queries {
         response.add_query(question.clone());
     }
+
     response.to_vec().ok()
 }
 
@@ -132,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
     let ech_config_list = args
         .ech_config_list
         .as_deref()
@@ -251,6 +261,7 @@ impl DnsForwarder {
                 }
             }
         };
+
         self.record_mappings_from_response(&resp, peer);
         sock.send_to(&resp, peer).await?;
         Ok(())
@@ -266,6 +277,7 @@ impl DnsForwarder {
             };
 
             let mut data = vec![0_u8; usize::from(len)];
+
             if stream.read_exact(&mut data).await.is_err() {
                 break;
             }
@@ -295,11 +307,13 @@ impl DnsForwarder {
                     }
                 }
             };
+
             self.record_mappings_from_response(&resp, peer);
             let resp_len = u16::try_from(resp.len()).unwrap_or(0);
             stream.write_u16(resp_len).await?;
             stream.write_all(&resp).await?;
         }
+
         Ok(())
     }
 
@@ -310,6 +324,7 @@ impl DnsForwarder {
         };
 
         let sock = UdpSocket::bind(bind_addr).await?;
+
         let forward_fut = async {
             sock.send_to(data, self.forward_target).await?;
             let mut buf = vec![0_u8; 65_535];
@@ -370,7 +385,9 @@ impl DnsForwarder {
             Some(path) => Some(std::fs::read(path)?),
             None => None,
         };
+
         let replacement = self.ech_config_list.as_deref().or(file_config.as_deref());
+
         let response = if let Some(replacement) = replacement {
             match rewrite_ech_config(&response, replacement) {
                 Ok(EchRewrite::Rewritten(response)) => response,
@@ -404,6 +421,7 @@ impl DnsForwarder {
                 .chain(&message.authorities)
                 .chain(&message.additionals)
                 .any(|record| record.record_type().is_dnssec());
+
         if dnssec_evidence {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -442,13 +460,16 @@ impl DnsForwarder {
                 %expected,
                 "ignoring DNS response from an untrusted client peer"
             );
+
             return;
         }
 
         let mappings = mappings_from_response(response);
+
         if mappings.is_empty() {
             return;
         }
+
         {
             let mut cache = self.cache.lock().expect("dns cache lock");
             for mapping in &mappings {
@@ -473,12 +494,14 @@ impl DnsForwarder {
                 if let Ok(mut line) = serde_json::to_string(&payload) {
                     line.push('\n');
                     let send_result = self.push_socket.send_to(line.as_bytes(), push_path);
+
                     if let Err(err) = send_result {
                         match err.kind() {
                             std::io::ErrorKind::NotFound
                             | std::io::ErrorKind::ConnectionRefused => {
                                 debug!(error = %err, "no nfq listener for push socket");
                             }
+
                             _ => {
                                 warn!(error = %err, "push socket send failed");
                             }
@@ -487,12 +510,14 @@ impl DnsForwarder {
                 }
             }
         }
+
         if self.verbose {
             let addrs = mappings
                 .iter()
                 .map(|m| m.ip.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+
             if let Some(hostname) = mappings.first().map(|m| m.hostname.as_str()) {
                 info!(%hostname, addrs = %addrs, "resolved");
             }
@@ -545,6 +570,7 @@ mod tests {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.metadata.response_code = ResponseCode::NoError;
+
         message
             .add_query(Query::query(name.clone(), RecordType::TXT))
             .add_answer(Record::from_rdata(
@@ -552,20 +578,22 @@ mod tests {
                 300,
                 RData::TXT(TXT::new(vec!["sandbox-test".to_string()])),
             ));
+
         message.to_vec().expect("encode response")
     }
 
     #[test]
     fn suppresses_https_and_svcb_answers() -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::SVCB;
-
         let name = Name::from_ascii("example.com.")?;
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+
         message.add_answer(Record::from_rdata(
             name,
             300,
             RData::SVCB(SVCB::new(1, Name::root(), Vec::new())),
         ));
+
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
         forwarder.suppress_https_svcb = true;
         let filtered = Message::from_vec(&forwarder.sanitize_response(message.to_vec()?)?)?;
@@ -576,21 +604,23 @@ mod tests {
     #[test]
     fn refuses_to_strip_dnssec_authenticated_metadata() -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::SVCB;
-
         let name = Name::from_ascii("example.com.")?;
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.metadata.authentic_data = true;
+
         message.add_answer(Record::from_rdata(
             name,
             300,
             RData::SVCB(SVCB::new(1, Name::root(), Vec::new())),
         ));
+
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
         forwarder.suppress_https_svcb = true;
 
         let error = forwarder
             .sanitize_response(message.to_vec()?)
             .expect_err("DNSSEC-authenticated metadata must not be stripped");
+
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         Ok(())
     }
@@ -598,9 +628,9 @@ mod tests {
     #[test]
     fn suppresses_metadata_but_keeps_rewritten_ech() -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue};
-
         let name = Name::from_ascii("example.com.")?;
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+
         message.add_answer(Record::from_rdata(
             name,
             300,
@@ -612,20 +642,24 @@ mod tests {
                 ),
             ])),
         ));
+
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
         forwarder.ech_config_list = Some(vec![4, 5, 6]);
         forwarder.suppress_https_svcb = true;
-
         let filtered = Message::from_vec(&forwarder.sanitize_response(message.to_vec()?)?)?;
+
         let RData::SVCB(svcb) = &filtered.answers[0].data else {
             panic!("expected SVCB answer");
         };
+
         assert_eq!(svcb.svc_params.len(), 1);
         assert_eq!(svcb.svc_params[0].0, SvcParamKey::EchConfigList);
+
         assert_eq!(
             svcb.svc_params[0].1,
             SvcParamValue::EchConfigList(EchConfigList(vec![4, 5, 6]))
         );
+
         Ok(())
     }
 
@@ -658,6 +692,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream");
+
         let upstream_addr = listener.local_addr().expect("upstream addr");
         let expected = upstream_txt_response();
         let expected_for_responder = expected.clone();
@@ -721,6 +756,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind forwarder listener");
+
         let listener_addr = listener.local_addr().expect("listener addr");
         let forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
         let query = example_query(RecordType::A);
@@ -736,6 +772,7 @@ mod tests {
         let mut client = TcpStream::connect(listener_addr)
             .await
             .expect("connect to forwarder");
+
         let query_len = u16::try_from(query.len()).expect("query len");
         client.write_u16(query_len).await.expect("write query len");
         client.write_all(&query).await.expect("write query");
@@ -744,9 +781,11 @@ mod tests {
         client.read_exact(&mut resp).await.expect("read resp");
         let message = Message::from_vec(&resp).expect("parse servfail");
         assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+
         // Close the client side so handle_tcp's read loop sees EOF and
         // returns, instead of blocking waiting for a second query frame.
         drop(client);
+
         server.await.expect("server task");
     }
 
@@ -754,6 +793,7 @@ mod tests {
     fn mappings_from_response_returns_all_addresses_for_example_com() {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
@@ -766,20 +806,24 @@ mod tests {
                 300,
                 RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(93, 184, 216, 35))),
             ));
-        let resp = message.to_vec().expect("encode response");
 
+        let resp = message.to_vec().expect("encode response");
         let mappings = mappings_from_response(&resp);
         assert_eq!(mappings.len(), 2);
+
         for m in &mappings {
             assert_eq!(m.hostname, "example.com");
         }
+
         assert_eq!(mappings[0].ip, "93.184.216.34");
         assert_eq!(mappings[1].ip, "93.184.216.35");
     }
+
     #[test]
     fn cache_client_ip_filters_attribution_to_exact_udp_and_tcp_peer() {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new(0x4321, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
@@ -787,14 +831,14 @@ mod tests {
                 300,
                 RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 20))),
             ));
-        let response = message.to_vec().expect("encode response");
 
+        let response = message.to_vec().expect("encode response");
         let mut forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
         let trusted = SocketAddr::from(([192, 0, 2, 10], 5353));
         let untrusted = SocketAddr::from(([192, 0, 2, 11], 5353));
         forwarder.cache_client_ip = Some(trusted.ip());
-
         forwarder.record_mappings_from_response(&response, untrusted);
+
         assert!(
             forwarder
                 .cache
@@ -806,6 +850,7 @@ mod tests {
         );
 
         forwarder.record_mappings_from_response(&response, trusted);
+
         assert_eq!(
             forwarder
                 .cache
@@ -820,12 +865,15 @@ mod tests {
     fn cli_defaults_preserve_standalone_fallbacks() {
         let args = Args::try_parse_from(["agent-sandbox-dns-forwarder"])
             .expect("standalone invocation has valid defaults");
+
         assert_eq!(args.listen_host, "169.254.100.1");
         assert_eq!(args.cache_path, PathBuf::from(DEFAULT_CACHE_PATH));
+
         assert_eq!(
             args.push_socket,
             PathBuf::from("/run/agent-sandbox/dns-push.sock")
         );
+
         assert_eq!(
             args.forward_target,
             "127.0.0.53:53"
@@ -848,12 +896,16 @@ mod tests {
             "192.0.2.53:53",
         ])
         .expect("explicit launch facts parse");
+
         assert_eq!(args.listen_host, "192.0.2.10");
+
         assert_eq!(
             args.cache_path,
             PathBuf::from("/var/lib/test/dns-cache.json")
         );
+
         assert_eq!(args.push_socket, PathBuf::from("/run/test/dns-push.sock"));
+
         assert_eq!(
             args.forward_target,
             "192.0.2.53:53"

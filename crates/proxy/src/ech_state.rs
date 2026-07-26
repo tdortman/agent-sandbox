@@ -12,10 +12,10 @@ use rama_tls_boring::core::x25519::X25519PrivateKey;
 
 /// Directory containing the proxy's persistent ECH key and configuration.
 pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";
+
 const CONFIG_FILE: &str = "ech-config-list";
 const PRIVATE_KEY_FILE: &str = "ech-private-key";
 const PUBLIC_NAME: &[u8] = b"proxy.agent-sandbox.invalid";
-
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// ECH state loaded by the proxy for client-facing TLS and DNS rewriting.
@@ -38,7 +38,6 @@ pub struct EchState {
 /// created, read, or updated, or when persisted key material is invalid.
 pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
     fs::create_dir_all(state_dir)?;
-
     let config_path = state_dir.join(CONFIG_FILE);
     let private_key_path = state_dir.join(PRIVATE_KEY_FILE);
 
@@ -88,7 +87,7 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
 
     let config_list = encode_config_list(&public_key);
     atomic_write(&config_path, &config_list)?;
-    
+
     Ok(EchState {
         config_list,
         private_key,
@@ -112,7 +111,6 @@ fn create_if_missing(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> 
         .and_then(|()| fs::hard_link(&temporary_path, path));
 
     let _ = fs::remove_file(temporary_path);
-
     result
 }
 
@@ -149,17 +147,22 @@ fn encode_config_list(public_key: &[u8; 32]) -> Vec<u8> {
         &mut config,
         u16::try_from(config_len).expect("ECH config length fits in u16"),
     );
+
     push_u16(&mut config, 0xFE0D);
+
     push_u16(
         &mut config,
         u16::try_from(config_data_len).expect("ECH config data length fits in u16"),
     );
+
     config.push(1);
     push_u16(&mut config, 0x0020);
+
     push_u16(
         &mut config,
         u16::try_from(public_key.len()).expect("ECH public key length fits in u16"),
     );
+
     config.extend_from_slice(public_key);
     push_u16(&mut config, 4);
     push_u16(&mut config, 1);
@@ -206,6 +209,7 @@ mod tests {
             ])),
             first.config_list.len() - 2
         );
+
         assert_eq!(first.config_list.len(), 80);
         fs::remove_dir_all(directory).expect("remove temporary directory");
     }
@@ -224,6 +228,7 @@ mod tests {
             std::array::from_fn(|_| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 let directory = directory.clone();
+
                 std::thread::spawn(move || {
                     barrier.wait();
                     load_or_generate(&directory)

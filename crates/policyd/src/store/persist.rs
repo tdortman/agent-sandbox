@@ -38,6 +38,7 @@ fn network_sort_key(host: &str, port: u16) -> NetworkSortKey {
 fn path_key(path: &Path) -> String {
     let s = path.to_string_lossy();
     let trimmed = s.trim_end_matches('/');
+
     if trimmed.is_empty() && s.starts_with('/') {
         "/".to_owned()
     } else {
@@ -66,11 +67,13 @@ fn upsert_filesystem_rule(
     }
 
     let rule = FilesystemRule::new(rule_path, merged_access, label);
+
     if let Some(index) = insert_index {
         retained.insert(index, rule);
     } else {
         retained.push(rule);
     }
+
     *rules = retained;
 }
 
@@ -116,11 +119,13 @@ fn upsert_resource_rule(
     }
 
     let rule = ResourceRule::new(kind, rule_path, merged_access, label);
+
     if let Some(index) = insert_index {
         retained.insert(index, rule);
     } else {
         retained.push(rule);
     }
+
     *rules = retained;
 }
 
@@ -156,9 +161,11 @@ impl HttpMethods {
     fn from_target(target: &HttpRuleTarget) -> Self {
         match &target.method {
             HttpMethodMatcher::All => Self::All,
+
             HttpMethodMatcher::Exact(method) => {
                 Self::Some(BTreeSet::from([method.as_str().to_owned()]))
             }
+
             HttpMethodMatcher::AnyOf(methods) => Self::Some(
                 methods
                     .iter()
@@ -188,6 +195,7 @@ impl HttpMethods {
         match (self, selected) {
             (Self::All, Self::Some(_)) => Some(Self::All),
             (Self::All | Self::Some(_), Self::All) => None,
+
             (Self::Some(current), Self::Some(selected)) => {
                 let remaining = current
                     .iter()
@@ -217,17 +225,21 @@ fn subtract_http_methods(
     selected: &HttpMethods,
 ) {
     let mut retained = Vec::with_capacity(rules.len());
+
     for mut rule in rules.drain(..) {
         if !same_http_url(&rule, target) {
             retained.push(rule);
             continue;
         }
+
         let Some(methods) = HttpMethods::from_rule(&rule).subtract(selected) else {
             continue;
         };
+
         rule.methods = methods.into_methods();
         retained.push(rule);
     }
+
     *rules = retained;
 }
 
@@ -240,6 +252,7 @@ fn union_http_methods(
     let mut merged = selected.clone();
     let mut insert_index = None;
     let mut retained = Vec::with_capacity(rules.len() + 1);
+
     for rule in rules.drain(..) {
         if same_http_url(&rule, target) {
             merged.union_with(&HttpMethods::from_rule(&rule));
@@ -248,12 +261,15 @@ fn union_http_methods(
             retained.push(rule);
         }
     }
+
     let rule = HttpRule::new(merged.into_methods(), target.url.to_string(), label);
+
     if let Some(index) = insert_index {
         retained.insert(index, rule);
     } else {
         retained.push(rule);
     }
+
     *rules = retained;
 }
 
@@ -268,6 +284,7 @@ impl PolicyStore {
     ) -> std::io::Result<()> {
         let mut current = load_policy(path, home, None);
         let selected = HttpMethods::from_target(target);
+
         if allow_rule {
             subtract_http_methods(&mut current.network.http.deny, target, &selected);
             union_http_methods(&mut current.network.http.allow, target, &selected, label);
@@ -275,6 +292,7 @@ impl PolicyStore {
             subtract_http_methods(&mut current.network.http.allow, target, &selected);
             union_http_methods(&mut current.network.http.deny, target, &selected, label);
         }
+
         atomic_write_policy(path, &current, home, owner_uid, None)
     }
 
@@ -290,6 +308,7 @@ impl PolicyStore {
         let mut current = load_policy(path, home, None);
         let host_norm = normalize_host(host);
         let key = network_sort_key(&host_norm, port);
+
         let mut allow: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network
             .direct
@@ -297,6 +316,7 @@ impl PolicyStore {
             .iter()
             .map(|r| (network_rule_sort_key(r), r.clone()))
             .collect();
+
         let mut deny: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network
             .direct
@@ -328,12 +348,14 @@ impl PolicyStore {
     ) -> std::io::Result<()> {
         let mut current = load_policy(path, home, None);
         let key: Vec<String> = argv.to_vec();
+
         let mut allow: BTreeMap<Vec<String>, SudoRule> = current
             .sudo
             .allow
             .iter()
             .filter_map(|r| r.key().map(|k| (k, r.clone())))
             .collect();
+
         let mut deny: BTreeMap<Vec<String>, SudoRule> = current
             .sudo
             .deny
@@ -364,6 +386,7 @@ impl PolicyStore {
         owner_uid: Option<u32>,
     ) -> std::io::Result<()> {
         let mut policy = load_policy(path, home, None);
+
         if allow_rule {
             upsert_filesystem_rule(&mut policy.filesystem.allow, rule_path, access, label);
             remove_filesystem_rule(&mut policy.filesystem.deny, rule_path, access);
@@ -371,6 +394,7 @@ impl PolicyStore {
             upsert_filesystem_rule(&mut policy.filesystem.deny, rule_path, access, label);
             remove_filesystem_rule(&mut policy.filesystem.allow, rule_path, access);
         }
+
         sort_filesystem_rules(&mut policy.filesystem.allow, home);
         sort_filesystem_rules(&mut policy.filesystem.deny, home);
         atomic_write_policy(path, &policy, home, owner_uid, None)
@@ -387,7 +411,9 @@ impl PolicyStore {
             home,
             owner_uid,
         } = args;
+
         let mut policy = load_policy(path, home, None);
+
         if allow_rule {
             upsert_resource_rule(&mut policy.resources.allow, kind, rule_path, access, label);
             remove_resource_rule(&mut policy.resources.deny, kind, rule_path, access);
@@ -395,6 +421,7 @@ impl PolicyStore {
             upsert_resource_rule(&mut policy.resources.deny, kind, rule_path, access, label);
             remove_resource_rule(&mut policy.resources.allow, kind, rule_path, access);
         }
+
         sort_resource_rules(&mut policy.resources.allow, home);
         sort_resource_rules(&mut policy.resources.deny, home);
         atomic_write_policy(path, &policy, home, owner_uid, None)
@@ -410,12 +437,15 @@ impl PolicyStore {
     ) -> std::io::Result<()> {
         let mut policy = load_policy(path, home, None);
         let rule = DbusRule::new(target.clone(), label);
+
         let (selected, other) = if allow_rule {
             (&mut policy.dbus.allow, &mut policy.dbus.deny)
         } else {
             (&mut policy.dbus.deny, &mut policy.dbus.allow)
         };
+
         other.retain(|existing| existing.target != *target);
+
         if let Some(existing) = selected
             .iter_mut()
             .find(|existing| existing.target == *target)
@@ -424,6 +454,7 @@ impl PolicyStore {
         } else {
             selected.push(rule);
         }
+
         selected.sort_by_key(|entry| entry.target.clone());
         other.sort_by_key(|entry| entry.target.clone());
         atomic_write_policy(path, &policy, home, owner_uid, None)
@@ -474,11 +505,13 @@ mod tests {
 
         PolicyStore::persist_http_rule(&path, &target("GET"), "get", true, None, None)
             .expect("persist GET allow");
+
         PolicyStore::persist_http_rule(&path, &target("POST"), "post", true, None, None)
             .expect("persist POST allow");
 
         let policy = load_policy(&path, None, None);
         assert_eq!(policy.network.http.allow.len(), 1);
+
         assert_eq!(policy.network.http.allow[0].methods, vec![
             "GET".to_owned(),
             "POST".to_owned()
@@ -486,17 +519,20 @@ mod tests {
 
         PolicyStore::persist_http_rule(&path, &target("POST"), "deny post", false, None, None)
             .expect("persist POST deny");
+
         let policy = load_policy(&path, None, None);
         assert_eq!(policy.network.http.allow.len(), 1);
         assert_eq!(policy.network.http.allow[0].methods, vec!["GET".to_owned()]);
         assert_eq!(policy.network.http.deny.len(), 1);
         assert_eq!(policy.network.http.deny[0].methods, vec!["POST".to_owned()]);
     }
+
     #[test]
     fn persist_dbus_rules_replaces_matching_target_and_removes_opposite_rule() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("policy.json");
         atomic_write_policy(&path, &Policy::default(), None, None, None).expect("write policy");
+
         let target = DbusTarget::session(
             "org.example.Service",
             "/org/example/Object",
@@ -509,6 +545,7 @@ mod tests {
 
         PolicyStore::persist_dbus_rule(&path, &target, "allow", true, None, None)
             .expect("persist allow");
+
         PolicyStore::persist_dbus_rule(&path, &target, "deny", false, None, None)
             .expect("persist deny");
 
@@ -531,6 +568,7 @@ mod tests {
             ResourceAccess::Socket(SocketAccess::Connect),
             "connect",
         );
+
         upsert_resource_rule(
             &mut rules,
             ResourceKind::UnixSocket,

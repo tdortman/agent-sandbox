@@ -1,12 +1,12 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
-
 use agent_sandbox_core::ResourceKind;
+
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
     SyscallTarget, notification_arch_valid, revalidate_filesystem_mutation, send_response,
 };
-use tracing::{debug, info, warn};
 
+use tracing::{debug, info, warn};
 use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
 
 fn should_bypass_network_policy(
@@ -38,11 +38,13 @@ fn should_bypass_network_policy(
         ("tcp", 80 | 443 | 8008 | 8080 | 8443) | ("udp", 443)
     )
 }
+
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkPolicyBypass {
     pub mode: NetworkMode,
     pub dns_endpoint: Option<SocketAddr>,
 }
+
 pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
     client: &mut PersistentPolicyClient,
@@ -58,11 +60,13 @@ pub async fn dispatch_notification_with_mode(
             native = agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE,
             "seccomp notification arch mismatch; denying"
         );
+
         super::log_notification_response(send_response(listener_fd, notif.id, 0, -libc::EACCES, 0));
         return;
     }
 
     let facts = normalize_or_failure(notif);
+
     if let NormalizedNotification::ClassificationFailure { error, transient } = &facts {
         if *transient {
             debug!(error = %error, syscall = notif.data.nr, pid = notif.pid, "could not read tracee syscall args; continuing");
@@ -72,6 +76,7 @@ pub async fn dispatch_notification_with_mode(
             warn!(error = %error, syscall = notif.data.nr, pid = notif.pid, "failed to parse syscall target");
         }
     }
+
     if let NormalizedNotification::Deny { errno } = &facts {
         if super::is_open_family_syscall(notif.data.nr) {
             info!(
@@ -105,6 +110,7 @@ pub async fn dispatch_notification_with_mode(
     } else {
         decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
+
     execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
 }
 
@@ -129,9 +135,11 @@ fn execute_response_plan(
                 SECCOMP_USER_NOTIF_FLAG_CONTINUE,
             ));
         }
+
         ResponsePlan::DenyErrno { errno } => {
             super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
         }
+
         ResponsePlan::ResourcePolicyDenied {
             target,
             source,
@@ -146,6 +154,7 @@ fn execute_response_plan(
                 0,
             ));
         }
+
         ResponsePlan::ResourceRpcFailure { target, error } => {
             warn!(target = ?target, error = %error, "resource policy RPC failed");
             super::log_notification_response(send_response(
@@ -156,6 +165,7 @@ fn execute_response_plan(
                 0,
             ));
         }
+
         ResponsePlan::FilesystemPolicyDenied {
             errno,
             path,
@@ -166,6 +176,7 @@ fn execute_response_plan(
             info!(path = %path.display(), access = ?access, source = ?source, error = ?error, "filesystem syscall denied by policy");
             super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
         }
+
         ResponsePlan::FilesystemRpcFailure {
             errno,
             path,
@@ -175,6 +186,7 @@ fn execute_response_plan(
             warn!(path = %path.display(), access = ?access, error = %error, "filesystem policy RPC failed");
             super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
         }
+
         ResponsePlan::EmulateResource { target } => {
             if let Err(err) = super::emulate_resource(listener_fd, notif, &target) {
                 let errno = err.raw_os_error().unwrap_or(libc::EACCES);
@@ -192,6 +204,7 @@ fn execute_response_plan(
                 ));
             }
         }
+
         ResponsePlan::RevalidateFilesystemThenContinue { target } => {
             if let Err(err) = revalidate_filesystem_mutation(notif, &target) {
                 warn!(error = %err, target = ?target, "filesystem dispatch failed");
@@ -218,9 +231,7 @@ fn execute_response_plan(
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
     use agent_sandbox_syscall_broker::NetworkTarget;
-
     use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
 
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
@@ -241,6 +252,7 @@ mod tests {
             Some(dns_endpoint),
             &target("udp", "169.254.100.1", 53)
         ));
+
         assert!(should_bypass_network_policy(
             NetworkMode::Proxy,
             Some(dns_endpoint),
@@ -257,11 +269,13 @@ mod tests {
             Some(dns_endpoint),
             &target("udp", "169.254.100.2", 53)
         ));
+
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             Some(dns_endpoint),
             &target("udp", "169.254.100.1", 5353)
         ));
+
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             None,
@@ -276,26 +290,31 @@ mod tests {
             None,
             &target("tcp", "192.0.2.10", 443)
         ));
+
         assert!(should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
             &target("udp", "192.0.2.10", 443)
         ));
+
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
             &target("tcp", "192.0.2.10", 853)
         ));
+
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
             &target("udp", "192.0.2.10", 853)
         ));
+
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             None,
             &target("tcp", "192.0.2.10", 443)
         ));
+
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
             None,

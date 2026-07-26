@@ -11,8 +11,8 @@ use super::types::{
     HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
     PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
 };
-use crate::{error::PolicydError, wire::UiSpawnContext};
 
+use crate::{error::PolicydError, wire::UiSpawnContext};
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub(super) fn http_context(ctx: &ResolvedRequestContext) -> HttpContextKey {
@@ -48,22 +48,27 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> (Option<Verdict>, Option<Verdict>) {
         let merged = self.merged_for_worker(ctx);
+
         let denied = merged.network.http.deny.iter().find_map(|rule| {
             let target = rule.target().ok()?;
+
             target.matches(request).then(|| {
                 rule.comment
                     .as_deref()
                     .map_or_else(VerdictSource::policy, VerdictSource::policy_with_comment)
             })
         });
+
         let allowed = merged.network.http.allow.iter().find_map(|rule| {
             let target = rule.target().ok()?;
+
             target.matches(request).then(|| {
                 rule.comment
                     .as_deref()
                     .map_or_else(VerdictSource::policy, VerdictSource::policy_with_comment)
             })
         });
+
         (denied.map(Verdict::denied), allowed.map(Verdict::allowed))
     }
 
@@ -73,11 +78,14 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> Option<Verdict> {
         let (policy_deny, policy_allow) = self.http_policy_verdicts(request, ctx);
+
         if let Some(verdict) = policy_deny {
             return Some(verdict);
         }
+
         let key = http_key(request, ctx);
         let session_ids = self.session_ids_for_context(ctx).await;
+
         {
             let mut inner = self.inner.lock().await;
             let denied = session_ids.iter().any(|session_id| {
@@ -126,6 +134,7 @@ impl PolicyStore {
                 });
             }
         }
+
         policy_allow
     }
 
@@ -146,16 +155,19 @@ impl PolicyStore {
         if let Some(verdict) = self.evaluate_http(&request, &ctx).await {
             return Ok(HttpCheckReply::from_verdict(request, verdict));
         }
+
         if !self.args.interactive_approval {
             return Ok(HttpCheckReply::blocked(
                 "agent-sandbox: HTTP approval is disabled",
             ));
         }
+
         let Some(pid) = ctx.ids.pid() else {
             return Ok(HttpCheckReply::blocked(
                 "agent-sandbox: cannot identify sandbox process for HTTP approval",
             ));
         };
+
         let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
             Ok(hold) => hold,
             Err(error) => {
@@ -174,9 +186,11 @@ impl PolicyStore {
                 &ctx,
             )
             .await?;
+
         let pending_id = pending.id;
         let is_new = pending.is_new;
         let rx = pending.rx;
+
         if is_new {
             let pending = {
                 let inner = self.inner.lock().await;
@@ -189,6 +203,7 @@ impl PolicyStore {
                     }
                 }
             };
+
             self.notify_general_ui(&ctx, &UiPush::HttpRequest {
                 id: pending.pending_id,
                 request: pending.request.clone(),
@@ -198,6 +213,7 @@ impl PolicyStore {
                 sandbox_session_id: pending.context.sandbox_session_id.clone(),
             })
             .await;
+
             if !self.has_ui_for_context(&ctx).await {
                 let spawn = UiSpawnContext {
                     has_matching_ui: false,
@@ -207,9 +223,11 @@ impl PolicyStore {
                     project_root: pending.context.project_root.as_deref(),
                     sandbox_session_id: pending.context.sandbox_session_id.as_deref(),
                 };
+
                 self.spawn_policy_ui(spawn).await;
             }
         }
+
         Ok(self
             .await_http_verdict(proxy_session, request_id, &request, &ctx, pending_id, rx)
             .await)
@@ -226,6 +244,7 @@ impl PolicyStore {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let key = http_key(request, ctx);
         let mut inner = self.inner.lock().await;
+
         if inner
             .http_waiters
             .contains_key(&(proxy_session.clone(), request_id))
@@ -234,13 +253,16 @@ impl PolicyStore {
                 "duplicate in-flight HTTP request ID".into(),
             ));
         }
+
         let existing = inner.pending_values().find_map(|pending| {
             let Pending::Http(value) = pending else {
                 return None;
             };
+
             (value.request == key.request && value.context == key.context)
                 .then_some(value.pending_id)
         });
+
         let pending_id = if let Some(id) = existing {
             let waiters = inner.http_futures.get(&id).map_or(0, Vec::len);
             if waiters >= MAX_WAITERS_PER_PENDING {
@@ -267,6 +289,7 @@ impl PolicyStore {
             inner.http_futures.insert(id, Vec::new());
             id
         };
+
         inner
             .http_futures
             .entry(pending_id)
@@ -277,10 +300,13 @@ impl PolicyStore {
                 attribution_token,
                 tx,
             });
+
         inner
             .http_waiters
             .insert((proxy_session, request_id), pending_id);
+
         drop(inner);
+
         Ok(PendingResult {
             id: pending_id,
             is_new: existing.is_none(),
@@ -300,15 +326,19 @@ impl PolicyStore {
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
         let deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
+
         loop {
             if self.has_ui_for_context(ctx).await {
                 break;
             }
+
             let now = Instant::now();
+
             if now >= deadline {
                 self.remove_http_waiter(proxy_session, request_id).await;
                 return HttpCheckReply::blocked("agent-sandbox: no policy UI registered");
             }
+
             tokio::select! {
                 biased;
                 () = tokio::time::sleep((deadline - now).min(Duration::from_millis(50))) => {}
@@ -317,9 +347,11 @@ impl PolicyStore {
                 }
             }
         }
+
         match tokio::time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(_)) => HttpCheckReply::blocked("agent-sandbox: HTTP approval waiter closed"),
+
             Err(_) => {
                 self.remove_http_waiter(proxy_session, request_id).await;
                 let _ = (request, pending_id);
@@ -352,11 +384,13 @@ impl PolicyStore {
             drop(inner);
             tx
         };
+
         if let Some(tx) = tx {
             let _ = tx.send(HttpCheckReply::blocked(
                 "agent-sandbox: HTTP check cancelled",
             ));
         }
+
         Ok(())
     }
 
@@ -369,6 +403,7 @@ impl PolicyStore {
             let mut inner = self.inner.lock().await;
             Self::remove_http_waiter_locked(&mut inner, &proxy_session, request_id)
         };
+
         if let Some(tx) = tx {
             let _ = tx.send(HttpCheckReply::blocked(
                 "agent-sandbox: HTTP check cancelled",
@@ -384,15 +419,20 @@ impl PolicyStore {
         let pending_id = inner
             .http_waiters
             .remove(&(proxy_session.clone(), request_id))?;
+
         let waiters = inner.http_futures.get_mut(&pending_id)?;
+
         let index = waiters.iter().position(|waiter| {
             waiter.proxy_session == *proxy_session && waiter.request_id == request_id
         })?;
+
         let waiter = waiters.remove(index);
+
         if waiters.is_empty() {
             inner.http_futures.remove(&pending_id);
             inner.take_pending(&pending_id.to_string());
         }
+
         Some(waiter.tx)
     }
 
@@ -418,11 +458,14 @@ impl PolicyStore {
         once: bool,
     ) -> bool {
         let mut inner = self.inner.lock().await;
+
         let Some(Pending::Http(pending)) = inner.take_pending(&pending_id.to_string()) else {
             return false;
         };
+
         let waiters = inner.http_futures.remove(&pending_id).unwrap_or_default();
         let mut live_waiters = Vec::with_capacity(waiters.len());
+
         for waiter in waiters {
             if Self::http_waiter_is_live(&inner, &waiter) {
                 live_waiters.push(waiter);
@@ -430,24 +473,30 @@ impl PolicyStore {
                 inner
                     .http_waiters
                     .remove(&(waiter.proxy_session.clone(), waiter.request_id));
+
                 let _ = waiter
                     .tx
                     .send(HttpCheckReply::blocked("agent-sandbox: HTTP flow expired"));
             }
         }
+
         if live_waiters.is_empty() {
             return false;
         }
+
         let reply = HttpCheckReply::from_verdict(pending.request.clone(), Verdict {
             allowed,
             source: source.clone(),
         });
+
         for waiter in live_waiters {
             inner
                 .http_waiters
                 .remove(&(waiter.proxy_session, waiter.request_id));
+
             let _ = waiter.tx.send(reply.clone());
         }
+
         if !once {
             inner.http_verdict_cache.insert(
                 HttpPendingKey {
@@ -460,8 +509,10 @@ impl PolicyStore {
                     time: Instant::now(),
                 },
             );
+
             enforce_verdict_cache_limit(&mut inner.http_verdict_cache);
         }
+
         drop(inner);
         true
     }
@@ -488,6 +539,7 @@ mod tests {
     };
 
     use super::super::types::{PendingResult, PolicyStore};
+
     #[tokio::test]
     async fn documented_network_http_rule_allows_without_prompt() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -496,8 +548,10 @@ mod tests {
         let policy_path = home.join(".config/agent-sandbox/policy.json");
         std::fs::create_dir_all(&home).expect("create home");
         std::fs::create_dir_all(&project_root).expect("create project root");
+
         std::fs::create_dir_all(policy_path.parent().expect("policy parent"))
             .expect("create policy directory");
+
         std::fs::write(
             &policy_path,
             r#"{
@@ -523,10 +577,13 @@ mod tests {
             Duration::from_mins(1),
             true,
         ));
+
         let request = HttpRequest::parse_absolute("GET", "https://api.example.com/v1")
             .expect("valid request");
+
         let home_s = home.to_string_lossy().into_owned();
         let project_s = project_root.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext::new(
             SandboxPaths::new(&project_s, &home_s, &project_s),
             ProcessIds::default(),
@@ -546,21 +603,26 @@ mod tests {
 
         assert!(reply.allowed);
         assert_eq!(reply.source, VerdictSource::policy());
+
         assert!(
             store.pending_summaries().await.is_empty(),
             "policy allow must not prompt"
         );
     }
+
     #[tokio::test]
     async fn one_shot_http_denial_returns_serializable_user_source() {
         let (store, ..) = test_http_store().await;
+
         let request =
             HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
+
         let context = ResolvedRequestContext::new(
             SandboxPaths::default(),
             ProcessIds::default(),
             Some("test-session".into()),
         );
+
         let target = HttpRuleTarget::new(
             HttpMethodMatcher::Exact(HttpMethod::parse("GET").expect("HTTP method")),
             request.url.clone(),
@@ -576,8 +638,8 @@ mod tests {
             .evaluate_http(&request, &context)
             .await
             .expect("HTTP policy verdict");
-        let reply = HttpCheckReply::from_verdict(request, verdict);
 
+        let reply = HttpCheckReply::from_verdict(request, verdict);
         assert!(reply.ok);
         assert!(!reply.allowed);
         assert_eq!(reply.source, VerdictSource::User);
@@ -589,20 +651,24 @@ mod tests {
         let home = dir.path().join("home");
         let project_root = dir.path().join("project");
         let policy_path = home.join(".config/agent-sandbox/policy.json");
+
         std::fs::create_dir_all(policy_path.parent().expect("policy parent"))
             .expect("create policy directory");
 
         let mut policy = Policy::default();
+
         policy.network.http.allow.push(HttpRule::new(
             vec!["GET".to_owned()],
             "https://api.example.com/v1",
             "allow GET",
         ));
+
         policy.network.http.deny.push(HttpRule::new(
             vec!["POST".to_owned()],
             "https://api.example.com/v1/private",
             "deny POST",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = PolicyStore::new(crate::store::test_args(
@@ -613,33 +679,41 @@ mod tests {
             Duration::from_mins(1),
             false,
         ));
+
         let home_s = home.to_string_lossy().into_owned();
         let project_s = project_root.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext::new(
             SandboxPaths::new(&project_s, &home_s, &project_s),
             ProcessIds::default(),
             None,
         );
+
         let get_public = HttpRequest::parse_absolute("GET", "https://api.example.com/v1/public")
             .expect("valid GET request");
+
         let post_public = HttpRequest::parse_absolute("POST", "https://api.example.com/v1/public")
             .expect("valid POST request");
+
         let post_private =
             HttpRequest::parse_absolute("POST", "https://api.example.com/v1/private/item")
                 .expect("valid POST request");
 
         let (get_deny, get_allow) = store.http_policy_verdicts(&get_public, &ctx);
         assert!(get_deny.is_none());
+
         assert_eq!(
             get_allow,
             Some(Verdict::allowed(VerdictSource::policy_with_comment(
                 "allow GET"
             )))
         );
+
         let (post_deny, post_allow) = store.http_policy_verdicts(&post_public, &ctx);
         assert!(post_deny.is_none());
         assert!(post_allow.is_none());
         let (private_deny, _) = store.http_policy_verdicts(&post_private, &ctx);
+
         assert_eq!(
             private_deny,
             Some(Verdict::denied(VerdictSource::policy_with_comment(
@@ -647,6 +721,7 @@ mod tests {
             )))
         );
     }
+
     async fn test_http_store() -> (PolicyStore, ProxySessionToken, AttributionToken) {
         let store = PolicyStore::new(crate::store::test_args(
             "/tmp/http-once-test.sock".into(),
@@ -656,16 +731,19 @@ mod tests {
             Duration::from_secs(30),
             true,
         ));
+
         let proxy_session = store
             .open_proxy_session(1)
             .await
             .expect("open proxy session")
             .proxy_session;
+
         let owner = SocketIdentity::new(
             ProcessIdentity::new(1, nix::unistd::getuid().as_raw(), 1)
                 .expect("valid process identity"),
             SocketInode::new(1).expect("valid socket inode"),
         );
+
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Tcp,
             "127.0.0.1".parse().expect("valid source address"),
@@ -674,6 +752,7 @@ mod tests {
             443.try_into().expect("valid destination port"),
         )
         .expect("valid flow");
+
         store
             .register_network_flow(FlowRegistration::new(
                 flow.clone(),
@@ -683,19 +762,23 @@ mod tests {
             ))
             .await
             .expect("register flow");
+
         let attribution_token = store
             .claim_network_flow(proxy_session.clone(), flow, ProxyConnectionId::new())
             .await
             .expect("claim flow")
             .attribution_token;
+
         (store, proxy_session, attribution_token)
     }
 
     #[tokio::test]
     async fn http_approval_requires_process_identity_for_freezing() {
         let (store, proxy_session, attribution_token) = test_http_store().await;
+
         let request =
             HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
+
         let context = ResolvedRequestContext::new(
             SandboxPaths::default(),
             ProcessIds::default(),
@@ -714,6 +797,7 @@ mod tests {
             .expect("HTTP approval response");
 
         assert!(!reply.ok);
+
         assert_eq!(
             reply.error.as_deref(),
             Some("agent-sandbox: cannot identify sandbox process for HTTP approval")
@@ -723,15 +807,19 @@ mod tests {
     #[tokio::test]
     async fn once_http_decision_resolves_all_coalesced_waiters_without_cache() {
         let (store, proxy_session, attribution_token) = test_http_store().await;
+
         let request =
             HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
+
         let context = ResolvedRequestContext::new(
             SandboxPaths::default(),
             ProcessIds::default(),
             Some("test-session".into()),
         );
+
         let request_id_1 = ProxyRequestId::new();
         let request_id_2 = ProxyRequestId::new();
+
         let (first_result, second_result) = tokio::join!(
             store.dedup_or_create_http(
                 proxy_session.clone(),
@@ -748,21 +836,26 @@ mod tests {
                 &context,
             ),
         );
+
         let PendingResult {
             id: pending_1,
             is_new: first,
             rx: rx_1,
         } = first_result.expect("first waiter");
+
         let PendingResult {
             id: pending_2,
             is_new: second,
             rx: rx_2,
         } = second_result.expect("second waiter");
+
         assert_eq!(pending_1, pending_2);
+
         assert_ne!(
             first, second,
             "exactly one waiter creates the pending request"
         );
+
         assert!(first || second);
 
         assert!(
@@ -775,35 +868,45 @@ mod tests {
                 )
                 .await
         );
+
         let reply_1 = tokio::time::timeout(Duration::from_secs(1), rx_1)
             .await
             .expect("first waiter reply timed out")
             .expect("first waiter reply");
+
         let reply_2 = tokio::time::timeout(Duration::from_secs(1), rx_2)
             .await
             .expect("second waiter reply timed out")
             .expect("second waiter reply");
+
         assert_eq!(reply_1.allowed, reply_2.allowed);
         assert_eq!(reply_1.source, reply_2.source);
         assert_eq!(reply_1.request, reply_2.request);
+
         assert!(
             store.pending_summaries().await.is_empty(),
             "once must not leave replacement pending"
         );
+
         let inner = store.inner.lock().await;
+
         assert!(
             inner.http_futures.is_empty(),
             "once must remove all pending waiter futures"
         );
+
         assert!(
             inner.http_waiters.is_empty(),
             "once must remove all waiter identities"
         );
+
         assert!(
             inner.http_verdict_cache.is_empty(),
             "once must not populate the verdict cache"
         );
+
         drop(inner);
+
         assert!(
             store.evaluate_http(&request, &context).await.is_none(),
             "once must not grant a later request"

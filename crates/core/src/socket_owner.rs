@@ -60,6 +60,7 @@ impl SocketTuple {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
+
         Self::new(local_ip, local_port, remote_ip, 0)
     }
 
@@ -164,6 +165,7 @@ pub enum OwnerResolution<T = OwnerSnapshot> {
     Missing,
     Ambiguous,
 }
+
 impl<T> OwnerResolution<T> {
     /// Transform a unique owner while preserving fail-closed outcomes.
     #[must_use]
@@ -192,9 +194,11 @@ pub fn validate_socket_identity(identity: SocketIdentity) -> bool {
     let Some(uids) = process_uids(pid) else {
         return false;
     };
+
     if !uids.contains(&expected_uid) {
         return false;
     }
+
     if process_start_time_ticks(pid) != Some(expected_start_time) {
         return false;
     }
@@ -202,18 +206,24 @@ pub fn validate_socket_identity(identity: SocketIdentity) -> bool {
     let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
         return false;
     };
+
     let needle = format!("socket:[{expected_inode}]");
+
     for fd in fds.flatten() {
         let fd_path = fd.path();
+
         let Ok(link) = fs::read_link(&fd_path) else {
             continue;
         };
+
         if link.as_os_str() != std::ffi::OsStr::new(&needle) {
             continue;
         }
+
         let Ok(metadata) = fs::metadata(&fd_path) else {
             continue;
         };
+
         if metadata.ino() != expected_inode {
             continue;
         }
@@ -223,9 +233,11 @@ pub fn validate_socket_identity(identity: SocketIdentity) -> bool {
         let Some(uids) = process_uids(pid) else {
             return false;
         };
+
         return uids.contains(&expected_uid)
             && process_start_time_ticks(pid) == Some(expected_start_time);
     }
+
     false
 }
 
@@ -241,11 +253,13 @@ pub fn resolve_owner_snapshot(
     tuple: SocketTuple,
 ) -> OwnerResolution<OwnerSnapshot> {
     let entries = socket_table_entries(protocol, tuple);
+
     if entries.is_empty() {
         return OwnerResolution::Missing;
     }
 
     let mut owners = HashMap::new();
+
     for entry in entries {
         for candidate in process_candidates(entry.inode, entry.uid, tuple) {
             owners
@@ -274,15 +288,18 @@ fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<Soc
         (SocketProtocol::Tcp, true) => "/proc/net/tcp6",
         (SocketProtocol::Udp, true) => "/proc/net/udp6",
     };
+
     let Ok(table) = fs::read_to_string(table_path) else {
         return Vec::new();
     };
 
     let exact = proc_addr_field(tuple.local_ip, tuple.local_port);
+
     let wildcard_ip = match tuple.local_ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
+
     let wildcard = proc_addr_field(wildcard_ip, tuple.local_port);
     let remote = tuple.remote_port != 0;
     let remote_field = remote.then(|| proc_addr_field(tuple.remote_ip, tuple.remote_port));
@@ -290,21 +307,26 @@ fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<Soc
 
     for line in table.lines().skip(1) {
         let parts: Vec<_> = line.split_whitespace().collect();
+
         if parts.len() < 10
             || (parts[1] != exact && parts[1] != wildcard)
             || (remote && remote_field.as_deref() != Some(parts[2]))
         {
             continue;
         }
+
         let Some(uid) = parts[7].parse().ok() else {
             continue;
         };
+
         let Ok(inode_value) = parts[9].parse() else {
             continue;
         };
+
         let Ok(inode) = SocketInode::new(inode_value) else {
             continue;
         };
+
         if !entries
             .iter()
             .any(|entry: &SocketTableEntry| entry.inode == inode)
@@ -312,6 +334,7 @@ fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<Soc
             entries.push(SocketTableEntry { uid, inode });
         }
     }
+
     entries
 }
 
@@ -321,28 +344,38 @@ fn process_candidates(
     tuple: SocketTuple,
 ) -> Vec<OwnerSnapshot> {
     let needle = format!("socket:[{}]", inode.get());
+
     let Ok(processes) = fs::read_dir("/proc") else {
         return Vec::new();
     };
+
     let mut candidates = Vec::new();
+
     for process in processes.flatten() {
         let name = process.file_name();
+
         let Some(pid) = name.to_str().and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
+
         let Some(start_time) = process_start_time_ticks(pid) else {
             continue;
         };
+
         let Some(uids) = process_uids(pid) else {
             continue;
         };
+
         if !uids.contains(&expected_uid) {
             continue;
         }
+
         let fd_dir = process.path().join("fd");
+
         let Ok(fds) = fs::read_dir(fd_dir) else {
             continue;
         };
+
         for fd in fds.flatten() {
             let Some(fd_number) = fd
                 .file_name()
@@ -351,25 +384,33 @@ fn process_candidates(
             else {
                 continue;
             };
+
             let fd_path = fd.path();
+
             let Ok(link) = fs::read_link(&fd_path) else {
                 continue;
             };
+
             if link.to_string_lossy() != needle {
                 continue;
             }
+
             let Ok(metadata) = fs::metadata(&fd_path) else {
                 continue;
             };
+
             if metadata.ino() != inode.get() {
                 continue;
             }
+
             let Ok(process_identity) = ProcessIdentity::new(pid, expected_uid, start_time) else {
                 continue;
             };
+
             if process_start_time_ticks(pid) != Some(start_time) {
                 continue;
             }
+
             candidates.push(OwnerSnapshot::new(
                 SocketIdentity::new(process_identity, inode),
                 tuple,
@@ -377,17 +418,21 @@ fn process_candidates(
             ));
         }
     }
+
     candidates
 }
 
 fn process_uids(pid: u32) -> Option<Vec<u32>> {
     let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+
     status.lines().find_map(|line| {
         let values = line.strip_prefix("Uid:")?.split_whitespace();
         let values = values.collect::<Vec<_>>();
+
         if values.is_empty() {
             return None;
         }
+
         Some(
             values
                 .into_iter()
@@ -400,6 +445,7 @@ fn process_uids(pid: u32) -> Option<Vec<u32>> {
 fn process_start_time_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let end_comm = stat.rfind(')')?;
+
     stat.get(end_comm + 1..)?
         .split_whitespace()
         .nth(19)?
@@ -418,6 +464,7 @@ fn proc_addr_field(ip: IpAddr, port: u16) -> String {
             }
             format!("{reversed}:{port:04X}")
         }
+
         IpAddr::V6(v6) => {
             let octets = v6.octets();
             let mut reversed = String::with_capacity(32);
@@ -452,6 +499,7 @@ impl From<SocketProtocol> for FlowProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn proc_addr_field_ipv4_little_endian() {
         let field = proc_addr_field(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 443);
@@ -471,6 +519,7 @@ mod tests {
             OwnerResolution::<SocketIdentity>::Missing,
             OwnerResolution::Missing
         );
+
         assert_eq!(
             OwnerResolution::<SocketIdentity>::Ambiguous,
             OwnerResolution::Ambiguous
@@ -481,10 +530,12 @@ mod tests {
     fn resolves_current_process_loopback_tcp_snapshot() {
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
+
         let listener_addr = listener.local_addr().expect("listener address");
         let client = std::net::TcpStream::connect(listener_addr).expect("connect loopback client");
         let (_server, _) = listener.accept().expect("accept loopback client");
         let client_addr = client.local_addr().expect("client address");
+
         let tuple = SocketTuple::new(
             client_addr.ip(),
             client_addr.port(),
@@ -493,9 +544,11 @@ mod tests {
         );
 
         let resolution = resolve_owner_snapshot(SocketProtocol::Tcp, tuple);
+
         let OwnerResolution::Unique(snapshot) = resolution else {
             panic!("expected unique owner, got {resolution:?}");
         };
+
         assert_eq!(snapshot.pid_value(), std::process::id());
         assert_eq!(snapshot.tuple(), tuple);
         assert_ne!(snapshot.socket_inode().get(), 0);
@@ -508,9 +561,11 @@ mod tests {
         } else {
             identity.process_start_time_ticks().get() + 1
         };
+
         let invalid_process =
             ProcessIdentity::new(identity.pid().get(), identity.uid(), invalid_start_time)
                 .expect("non-zero invalid process start time");
+
         let invalid_identity = SocketIdentity::new(invalid_process, identity.socket_inode());
         assert!(!validate_socket_identity(invalid_identity));
     }
@@ -518,6 +573,7 @@ mod tests {
     #[test]
     fn missing_local_port_returns_missing() {
         let tuple = SocketTuple::from_local(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
         assert_eq!(
             resolve_owner_snapshot(SocketProtocol::Tcp, tuple),
             OwnerResolution::Missing

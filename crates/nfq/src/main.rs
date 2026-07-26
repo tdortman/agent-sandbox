@@ -6,9 +6,11 @@
 //! actively rejects the packet.
 
 mod attribution;
+
 mod owner;
 mod packet;
 mod policy;
+
 use std::{
     net::IpAddr,
     path::{Path, PathBuf},
@@ -22,6 +24,7 @@ use agent_sandbox_core::{
     OwnerSnapshot, SandboxPaths, lookup_dns_cache, mappings_from_response,
     sandbox_session_id_from_pid,
 };
+
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
 use tracing::{debug, info, warn};
@@ -121,6 +124,7 @@ struct Cli {
     #[arg(long, value_name = "UID", default_value_t = 0)]
     push_trusted_uid: u32,
 }
+
 struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
@@ -137,12 +141,16 @@ impl NfqState {
         // Mutex so the push-socket listener thread can insert without
         // contending with the NFQUEUE recv loop.
         let dns_cache = DnsCache::new(None::<PathBuf>, DEFAULT_MAX_TTL);
+
         // Cache path for on-demand disk reloads from the DNS forwarder.
         let cache_path = std::env::var_os("AGENT_SANDBOX_DNS_CACHE")
             .map_or_else(|| PathBuf::from(DEFAULT_CACHE_PATH), PathBuf::from);
+
         let approved_bindings_path = std::env::var("AGENT_SANDBOX_APPROVED_BINDINGS")
             .map_or_else(|_| PathBuf::from(APPROVED_BINDINGS_PATH), PathBuf::from);
+
         let approved_bindings = ApprovedBindings::load(&approved_bindings_path);
+
         Self {
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
@@ -160,6 +168,7 @@ impl NfqState {
         let Ok(mut attribution) = self.attribution.lock() else {
             return;
         };
+
         if let Err(error) = attribution.remember(session_id, ip, hostname) {
             warn!(
                 session_id,
@@ -184,23 +193,29 @@ impl NfqState {
             if let Some(session_id) = session_id {
                 self.remember_attribution(session_id, ip, &host);
             }
+
             return host;
         }
+
         if let Some(session_id) = session_id
             && let Ok(attribution) = self.attribution.lock()
             && let Some(host) = attribution.lookup(session_id, ip)
         {
             return host.to_owned();
         }
+
         let Some(host) = lookup_dns_cache(ip, Some(&self.cache_path)) else {
             return ip.to_string();
         };
+
         if let Ok(mut cache) = self.dns_cache.lock() {
             cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
         }
+
         if let Some(session_id) = session_id {
             self.remember_attribution(session_id, ip, &host);
         }
+
         host
     }
 }
@@ -218,6 +233,7 @@ fn main() {
 
     let cli = Cli::parse();
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
+
     let mut queue = match open_queue(cli.queue, cli.queue_len) {
         Ok(queue) => queue,
         Err(err) => {
@@ -228,14 +244,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+
     let _ready_marker = cli.ready_file.as_deref().map(write_ready_marker_or_exit);
     info!(queue = cli.queue, "nfqueue listening");
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
+
     let state = NfqState::new(&cli);
     spawn_push_socket_listener(&cli.push_socket, cli.push_trusted_uid, &state);
+
     loop {
         let mut message = match queue.recv() {
             Ok(message) => message,
@@ -245,8 +265,10 @@ fn main() {
                 continue;
             }
         };
+
         let verdict = handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
         message.set_verdict(verdict);
+
         if let Err(err) = queue.verdict(message) {
             warn!(error = %err, "nfqueue verdict error");
         }
@@ -263,10 +285,12 @@ fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &NfqS
     {
         let _ = std::fs::create_dir_all(parent);
     }
+
     // Remove any stale socket file so bind succeeds. The forwarder is a
     // client and does not own the socket file, so we always unlink before
     // binding.
     let _ = std::fs::remove_file(push_socket);
+
     let listener = match std::os::unix::net::UnixDatagram::bind(push_socket) {
         Ok(s) => s,
         Err(err) => {
@@ -274,23 +298,29 @@ fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &NfqS
             return;
         }
     };
+
     if let Err(err) = restrict_push_socket_permissions(push_socket) {
         warn!(socket = %push_socket.display(), error = %err, "push socket chmod failed");
     }
+
     if let Err(err) = enable_passcred(&listener) {
         warn!(socket = %push_socket.display(), error = %err, "push socket SO_PASSCRED failed");
         return;
     }
+
     info!(socket = %push_socket.display(), trusted_uid, "push socket listener bound");
     let cache = Arc::clone(&state.dns_cache);
+
     std::thread::Builder::new()
         .name("dns-push-listener".to_string())
         .spawn(move || {
             let mut buf = [0u8; 512];
+
             loop {
                 let Ok((n, cred)) = recv_datagram_with_creds(&listener, &mut buf) else {
                     continue;
                 };
+
                 if cred.uid != trusted_uid {
                     warn!(
                         peer_uid = cred.uid,
@@ -298,8 +328,10 @@ fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &NfqS
                         trusted_uid,
                         "push socket rejected untrusted peer"
                     );
+
                     continue;
                 }
+
                 let line = match std::str::from_utf8(&buf[..n]) {
                     Ok(s) => s,
                     Err(err) => {
@@ -307,12 +339,15 @@ fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &NfqS
                         continue;
                     }
                 };
+
                 let line = line.trim_end_matches(['\n', '\r', '\0']);
                 let parsed: Result<PushMapping, _> = serde_json::from_str(line);
+
                 let Ok(entry) = parsed else {
                     debug!(line, "push socket malformed JSON");
                     continue;
                 };
+
                 apply_push_mapping(&cache, &entry);
             }
         })
@@ -333,7 +368,6 @@ fn restrict_push_socket_permissions(path: &Path) -> std::io::Result<()> {
 
 fn enable_passcred(sock: &std::os::unix::net::UnixDatagram) -> std::io::Result<()> {
     use nix::sys::socket::{setsockopt, sockopt::PassCred};
-
     setsockopt(sock, PassCred, &true).map_err(std::io::Error::from)
 }
 
@@ -342,11 +376,10 @@ fn recv_datagram_with_creds(
     buf: &mut [u8],
 ) -> std::io::Result<(usize, UnixPeerCred)> {
     use std::{io::IoSliceMut, os::unix::io::AsRawFd};
-
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
-
     let mut cmsg = [0u8; 128];
     let mut iov = [IoSliceMut::new(buf)];
+
     let msg: nix::sys::socket::RecvMsg<'_, '_, ()> = recvmsg(
         sock.as_raw_fd(),
         &mut iov,
@@ -354,6 +387,7 @@ fn recv_datagram_with_creds(
         MsgFlags::empty(),
     )
     .map_err(std::io::Error::from)?;
+
     let cred = msg
         .cmsgs()?
         .find_map(|cmsg| match cmsg {
@@ -370,6 +404,7 @@ fn recv_datagram_with_creds(
                 "push socket frame missing SCM_CREDENTIALS",
             )
         })?;
+
     Ok((msg.bytes, cred))
 }
 
@@ -378,6 +413,7 @@ fn apply_push_mapping(cache: &Arc<std::sync::Mutex<DnsCache>>, entry: &PushMappi
     if entry.host.is_empty() {
         return;
     }
+
     if let Ok(mut cache) = cache.lock() {
         cache.remember_ephemeral(&entry.ip, &entry.host, entry.ttl.min(DEFAULT_MAX_TTL));
     }
@@ -387,6 +423,7 @@ fn apply_push_mapping(cache: &Arc<std::sync::Mutex<DnsCache>>, entry: &PushMappi
 struct PushMapping {
     ip: String,
     host: String,
+
     #[serde(default)]
     ttl: u32,
 }
@@ -417,6 +454,7 @@ fn validate_invocation_id(value: &str) -> std::io::Result<()> {
     {
         return Ok(());
     }
+
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "INVOCATION_ID must be exactly 32 lowercase hexadecimal characters",
@@ -426,6 +464,7 @@ fn validate_invocation_id(value: &str) -> std::io::Result<()> {
 fn write_ready_marker_or_exit(path: &Path) -> ReadyMarker {
     match write_ready_marker(path) {
         Ok(marker) => marker,
+
         Err(err) => {
             eprintln!(
                 "agent-sandbox-nfq: failed to write readiness marker {}: {err}",
@@ -443,21 +482,24 @@ fn write_ready_marker(path: &Path) -> std::io::Result<ReadyMarker> {
             "INVOCATION_ID is required when --ready-file is configured",
         )
     })?;
-    validate_invocation_id(&invocation_id)?;
 
+    validate_invocation_id(&invocation_id)?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&temporary, invocation_id.as_bytes())?;
     let mut permissions = std::fs::metadata(&temporary)?.permissions();
+
     {
         use std::os::unix::fs::PermissionsExt;
         permissions.set_mode(0o644);
     }
+
     if let Err(error) = std::fs::set_permissions(&temporary, permissions)
         .and_then(|()| std::fs::rename(&temporary, path))
     {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
+
     Ok(ReadyMarker(path.to_path_buf()))
 }
 
@@ -502,7 +544,9 @@ where
         IpAddr::V4(_) => "reject_v4",
         IpAddr::V6(_) => "reject_v6",
     };
+
     let element = format!("{{ {dst_ip} . {dst_port} timeout 5s }}");
+
     let args = [
         "add",
         "element",
@@ -511,12 +555,15 @@ where
         set_name,
         element.as_str(),
     ];
+
     let out = run_nft(&args);
+
     match out {
         Ok(o) if o.status.success() => {
             debug!(ip = %dst_ip, port = dst_port, "added transient reject element");
             Verdict::Repeat
         }
+
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             warn!(
@@ -525,6 +572,7 @@ where
             );
             Verdict::Drop
         }
+
         Err(e) => {
             warn!(
                 ip = %dst_ip, port = dst_port, error = %e,
@@ -534,6 +582,7 @@ where
         }
     }
 }
+
 const fn proxy_flow_port(protocol: packet::TransportProtocol, port: u16) -> bool {
     matches!(
         (protocol, port),
@@ -556,19 +605,24 @@ fn register_proxy_flow(
             protocol = meta.protocol.as_str(),
             "dropping proxy flow with no unique socket owner"
         );
+
         return Verdict::Drop;
     };
+
     let session_id = sandbox_session_id_from_pid(owner.pid_value());
     let dst_ip = meta.dst_ip.to_string();
     let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
+
     let Ok(policy_host) = NormalizedPolicyHost::parse(&hostname) else {
         warn!(host = %hostname, "dropping proxy flow with invalid policy host");
         return Verdict::Drop;
     };
+
     let protocol = match meta.protocol {
         packet::TransportProtocol::Tcp => FlowProtocol::Tcp,
         packet::TransportProtocol::Udp => FlowProtocol::Udp,
     };
+
     let Ok(flow) = NetworkFlowKey::try_new(
         protocol,
         meta.src_ip,
@@ -583,14 +637,17 @@ fn register_proxy_flow(
             dst_port = meta.dst_port,
             "dropping proxy flow with invalid typed tuple"
         );
+
         return Verdict::Drop;
     };
+
     let registration = FlowRegistration::new(
         flow,
         owner.identity(),
         policy_host,
         FlowContext::new(SandboxPaths::default(), session_id),
     );
+
     match register(registration) {
         Ok(true) => {
             info!(
@@ -603,10 +660,12 @@ fn register_proxy_flow(
             );
             Verdict::Accept
         }
+
         Ok(false) => {
             warn!("policyd rejected proxy flow registration");
             Verdict::Drop
         }
+
         Err(error) => {
             warn!(%error, "proxy flow registration failed");
             Verdict::Drop
@@ -640,6 +699,7 @@ where
 {
     // Try IPv4 first, then IPv6.
     let meta = packet::parse_ipv4(payload).or_else(|| packet::parse_ipv6(payload));
+
     let Some(meta) = meta else {
         warn!("dropping unparseable queued packet");
         return Verdict::Drop;
@@ -656,14 +716,17 @@ where
         && let Some(udp_data) = packet::udp_payload(payload, &meta)
     {
         let mappings = mappings_from_response(udp_data);
+
         if !mappings.is_empty() {
             if let Ok(mut cache) = state.dns_cache.lock() {
                 for m in &mappings {
                     cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
                 }
             }
+
             debug!(count = mappings.len(), "cached DNS response mappings");
         }
+
         return Verdict::Accept;
     }
 
@@ -703,6 +766,7 @@ where
             warn!("proxy mode has no registration RPC handler");
             return Verdict::Drop;
         };
+
         return register_proxy_flow(state, meta, register);
     }
 
@@ -735,6 +799,7 @@ where
             error = %err,
             "policy check failed"
         );
+
         false
     });
 
@@ -746,6 +811,7 @@ where
             port = meta.dst_port,
             "reject (policy)"
         );
+
         // Add a transient nft reject element so the client fails fast instead
         // of hanging. Falls back to Drop if nft add fails.
         return nft_reject_and_repeat(&state.nft_binary, meta.dst_ip, meta.dst_port, meta.protocol);
@@ -776,6 +842,7 @@ fn handle_packet(
     runtime: &tokio::runtime::Runtime,
 ) -> Verdict {
     let payload = message.get_payload();
+
     let mut check = |socket: &str,
                      hostname: &str,
                      dst_ip: &str,
@@ -831,14 +898,15 @@ mod tests {
     };
 
     use super::*;
-
     const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
+
     fn state_for_tests() -> NfqState {
         state_for_tests_with_attribution_path(None)
     }
 
     fn state_for_tests_with_attribution_path(attribution_path: Option<&Path>) -> NfqState {
         let mut approved_bindings_path = std::env::temp_dir();
+
         approved_bindings_path.push(format!(
             "agent-sandbox-nfq-bindings-{}-{}.json",
             std::process::id(),
@@ -846,10 +914,12 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
+
         let attribution = attribution_path.map_or_else(
             attribution::SessionAttribution::new,
             attribution::SessionAttribution::load,
         );
+
         NfqState {
             dns_cache: Arc::new(std::sync::Mutex::new(DnsCache::new(
                 None::<PathBuf>,
@@ -871,11 +941,13 @@ mod tests {
         for port in [80, 443, 8008, 8080, 8443] {
             assert!(proxy_flow_port(packet::TransportProtocol::Tcp, port));
         }
+
         assert!(proxy_flow_port(packet::TransportProtocol::Udp, 443));
         assert!(!proxy_flow_port(packet::TransportProtocol::Udp, 80));
         assert!(!proxy_flow_port(packet::TransportProtocol::Udp, 8080));
         assert!(!proxy_flow_port(packet::TransportProtocol::Tcp, 853));
     }
+
     #[test]
     fn loopback_127_0_0_1_is_policy_bound() {
         assert!(!is_bypass_traffic(
@@ -915,14 +987,16 @@ mod tests {
     #[test]
     fn loopback_tcp_syn_invokes_policy_check() {
         let state = state_for_tests();
+
         state
             .dns_cache
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("127.0.0.1", "localhost", 300);
-        let pkt = build_loopback_tcp_syn_packet();
 
+        let pkt = build_loopback_tcp_syn_packet();
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -943,7 +1017,9 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             1,
@@ -955,20 +1031,23 @@ mod tests {
     fn proxy_mode_registers_public_flow_without_transport_check() {
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
+
         let listener_addr = listener.local_addr().expect("listener address");
         let client = std::net::TcpStream::connect(listener_addr).expect("connect client");
         let (_server, _) = listener.accept().expect("accept client");
         let client_addr = client.local_addr().expect("client address");
-
         let mut state = state_for_tests();
         state.proxy_mode = true;
+
         state
             .dns_cache
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
+
         state.nft_binary = "true".to_string();
         let mut packet = build_loopback_tcp_syn_packet();
+
         packet[12..16].copy_from_slice(
             &client_addr
                 .ip()
@@ -977,11 +1056,12 @@ mod tests {
                 .expect("IPv4 client")
                 .octets(),
         );
+
         packet[16..20].copy_from_slice(&[93, 184, 216, 34]);
         packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
-
         let check_count = std::cell::Cell::new(0_u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -993,13 +1073,16 @@ mod tests {
             check_count.set(check_count.get() + 1);
             Ok(true)
         };
+
         let registration = std::cell::RefCell::new(None);
+
         let mut register = |flow: FlowRegistration| {
             assert_eq!(
                 check_count.get(),
                 0,
                 "proxy registration must precede transport fallback checks"
             );
+
             *registration.borrow_mut() = Some(flow);
             Ok(true)
         };
@@ -1012,21 +1095,27 @@ mod tests {
             &mut check,
             Some(&mut register),
         );
+
         assert_eq!(verdict, Verdict::Accept);
+
         assert_eq!(
             check_count.get(),
             0,
             "proxy mode must defer transport checks to decoded HTTP or fallback"
         );
+
         let registration = registration
             .into_inner()
             .expect("proxy mode must register the flow");
+
         assert_eq!(registration.flow.protocol, FlowProtocol::Tcp);
         assert_eq!(registration.flow.source_ip, client_addr.ip());
+
         assert_eq!(
             registration.flow.destination_ip,
             "93.184.216.34".parse::<Ipv4Addr>().expect("valid IPv4")
         );
+
         assert_eq!(registration.policy_host.to_string(), "example.test");
     }
 
@@ -1042,8 +1131,10 @@ mod tests {
                 .remember_ephemeral("127.0.0.1", "localhost", DEFAULT_MAX_TTL);
             state
         };
+
         let packet = build_loopback_tcp_syn_packet();
         let check_count = std::cell::Cell::new(0_u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1055,7 +1146,9 @@ mod tests {
             check_count.set(check_count.get() + 1);
             Ok(false)
         };
+
         let registration_count = std::cell::Cell::new(0_u32);
+
         let mut register = |_: FlowRegistration| {
             registration_count.set(registration_count.get() + 1);
             Ok(true)
@@ -1071,11 +1164,13 @@ mod tests {
         );
 
         assert_eq!(verdict, Verdict::Drop);
+
         assert_eq!(
             check_count.get(),
             1,
             "proxy mode must check loopback transport"
         );
+
         assert_eq!(
             registration_count.get(),
             0,
@@ -1086,14 +1181,16 @@ mod tests {
     #[test]
     fn loopback_ipv6_tcp_syn_invokes_policy_check() {
         let state = state_for_tests();
+
         state
             .dns_cache
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("::1", "localhost", 300);
-        let pkt = build_ipv6_loopback_tcp_syn_packet();
 
+        let pkt = build_ipv6_loopback_tcp_syn_packet();
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1114,7 +1211,9 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             1,
@@ -1126,13 +1225,16 @@ mod tests {
     fn proxy_mode_checks_ipv6_loopback_transport_without_proxy_registration() {
         let mut state = state_for_tests();
         state.proxy_mode = true;
+
         state
             .dns_cache
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("::1", "localhost", DEFAULT_MAX_TTL);
+
         let packet = build_ipv6_loopback_tcp_syn_packet();
         let check_count = std::cell::Cell::new(0_u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1144,7 +1246,9 @@ mod tests {
             check_count.set(check_count.get() + 1);
             Ok(false)
         };
+
         let registration_count = std::cell::Cell::new(0_u32);
+
         let mut register = |_: FlowRegistration| {
             registration_count.set(registration_count.get() + 1);
             Ok(true)
@@ -1160,11 +1264,13 @@ mod tests {
         );
 
         assert_eq!(verdict, Verdict::Drop);
+
         assert_eq!(
             check_count.get(),
             1,
             "proxy mode must check IPv6 loopback transport"
         );
+
         assert_eq!(
             registration_count.get(),
             0,
@@ -1189,6 +1295,7 @@ mod tests {
             443,
             DNS_IP
         ));
+
         assert!(!is_bypass_traffic(
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             53,
@@ -1215,6 +1322,7 @@ mod tests {
     #[test]
     fn repeated_destination_always_consults_policy() {
         let state = state_for_tests();
+
         state
             .dns_cache
             .lock()
@@ -1222,8 +1330,8 @@ mod tests {
             .remember_ephemeral("93.184.216.34", "example.com", 300);
 
         let pkt = build_udp_data_packet(443);
-
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1245,6 +1353,7 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v1, Verdict::Accept);
         assert_eq!(call_count.get(), 1);
 
@@ -1257,6 +1366,7 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v2, Verdict::Accept);
         assert_eq!(call_count.get(), 2);
     }
@@ -1271,12 +1381,14 @@ mod tests {
                 stderr: Vec::new(),
             })
         };
+
         let v = nft_reject_and_repeat_inner(
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             443,
             packet::TransportProtocol::Tcp,
             mock_run,
         );
+
         assert_eq!(v, Verdict::Repeat);
     }
 
@@ -1290,18 +1402,21 @@ mod tests {
                 stderr: b"nft: no such file".to_vec(),
             })
         };
+
         let v = nft_reject_and_repeat_inner(
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             443,
             packet::TransportProtocol::Tcp,
             mock_run,
         );
+
         assert_eq!(v, Verdict::Drop);
     }
 
     fn build_dns_response_packet(src_ip: [u8; 4]) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
@@ -1309,16 +1424,19 @@ mod tests {
                 60,
                 RData::A(A::new(93, 184, 216, 34)),
             ));
+
         let dns_payload = message.to_vec().expect("encode DNS response");
         let udp_len = 8 + dns_payload.len();
         let total_len = 20 + udp_len;
         let mut pkt = vec![0_u8; total_len];
         pkt[0] = 0x45;
+
         pkt[2..4].copy_from_slice(
             &u16::try_from(total_len)
                 .expect("packet length")
                 .to_be_bytes(),
         );
+
         pkt[9] = 17; // UDP
         pkt[12..16].copy_from_slice(&src_ip); // src_ip
         pkt[16..20].copy_from_slice(&[10, 0, 0, 1]); // dst_ip
@@ -1339,11 +1457,13 @@ mod tests {
         let total_len = 20 + udp_len;
         let mut pkt = vec![0_u8; total_len];
         pkt[0] = 0x45;
+
         pkt[2..4].copy_from_slice(
             &u16::try_from(total_len)
                 .expect("packet length")
                 .to_be_bytes(),
         );
+
         pkt[9] = 17; // UDP
         pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // src_ip
         pkt[16..20].copy_from_slice(&dst_ip); // dst_ip
@@ -1360,11 +1480,13 @@ mod tests {
         let total_len = 20 + udp_len;
         let mut pkt = vec![0_u8; total_len];
         pkt[0] = 0x45;
+
         pkt[2..4].copy_from_slice(
             &u16::try_from(total_len)
                 .expect("packet length")
                 .to_be_bytes(),
         );
+
         pkt[9] = 17; // UDP
         pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
         pkt[16..20].copy_from_slice(&[93, 184, 216, 34]);
@@ -1393,16 +1515,22 @@ mod tests {
     fn build_ipv6_loopback_tcp_syn_packet() -> Vec<u8> {
         // IPv6 header (40 bytes) + TCP header (20 bytes) = 60 bytes
         let total_len: u16 = 60;
+
         let mut pkt = vec![0_u8; usize::from(total_len)];
         pkt[0] = 0x60; // IPv6, version=6, traffic class=0, flow label=0
+
         // payload length: TCP header 20 bytes
         pkt[4..6].copy_from_slice(&20_u16.to_be_bytes());
+
         pkt[6] = 6; // next header = TCP
         pkt[7] = 64; // hop limit
+
         // src_ip = ::1 (loopback)
         pkt[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
         // dst_ip = ::1 (loopback)
         pkt[24..40].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
         pkt[40..42].copy_from_slice(&50001_u16.to_be_bytes()); // src_port
         pkt[42..44].copy_from_slice(&443_u16.to_be_bytes()); // dst_port
         pkt[52] = 0x50; // data offset = 5
@@ -1414,11 +1542,9 @@ mod tests {
     fn dns_response_caches_hostname_mapping() {
         let state = state_for_tests();
         let pkt = build_dns_response_packet([169, 254, 100, 1]);
-
         let meta = packet::parse_ipv4(&pkt).expect("parse IPv4");
         assert_eq!(meta.protocol, packet::TransportProtocol::Udp);
         assert_eq!(meta.src_port, 53);
-
         let udp_data = packet::udp_payload(&pkt, &meta).expect("udp payload");
         let mappings = mappings_from_response(udp_data);
         assert_eq!(mappings.len(), 1);
@@ -1437,6 +1563,7 @@ mod tests {
             .lock()
             .expect("lock dns cache")
             .lookup("93.184.216.34");
+
         assert_eq!(cached.as_deref(), Some("example.com"));
     }
 
@@ -1445,6 +1572,7 @@ mod tests {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.add_query(Query::query(name.clone(), RecordType::A));
+
         let ips: [[u8; 4]; 10] = [
             [93, 184, 216, 34],
             [93, 184, 216, 35],
@@ -1457,6 +1585,7 @@ mod tests {
             [93, 184, 216, 42],
             [93, 184, 216, 43],
         ];
+
         for &ip in &ips {
             message.add_answer(Record::from_rdata(
                 name.clone(),
@@ -1464,7 +1593,9 @@ mod tests {
                 RData::A(A::new(ip[0], ip[1], ip[2], ip[3])),
             ));
         }
+
         let dns_payload = message.to_vec().expect("encode DNS response");
+
         assert!(
             dns_payload.len() > 128,
             "DNS payload ({} bytes) must exceed 128 for this test",
@@ -1475,11 +1606,13 @@ mod tests {
         let total_len = 20 + udp_len;
         let mut pkt = vec![0_u8; total_len];
         pkt[0] = 0x45;
+
         pkt[2..4].copy_from_slice(
             &u16::try_from(total_len)
                 .expect("packet length")
                 .to_be_bytes(),
         );
+
         pkt[9] = 17; // UDP
         pkt[12..16].copy_from_slice(&[169, 254, 100, 1]); // src_ip
         pkt[16..20].copy_from_slice(&[10, 0, 0, 1]); // dst_ip
@@ -1487,13 +1620,12 @@ mod tests {
         pkt[22..24].copy_from_slice(&53000_u16.to_be_bytes()); // dst_port
         pkt[24..26].copy_from_slice(&u16::try_from(udp_len).expect("udp length").to_be_bytes());
         pkt[28..].copy_from_slice(&dns_payload);
-
         let meta = packet::parse_ipv4(&pkt).expect("parse IPv4");
         assert_eq!(meta.src_port, 53);
-
         let udp_data = packet::udp_payload(&pkt, &meta).expect("udp payload");
         let mappings = mappings_from_response(udp_data);
         assert_eq!(mappings.len(), ips.len());
+
         for m in &mappings {
             assert_eq!(m.hostname, "example.com");
         }
@@ -1533,11 +1665,13 @@ mod tests {
     #[test]
     fn resolve_host_uses_in_memory_cache() {
         let state = state_for_tests();
+
         state
             .dns_cache
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.com", 300);
+
         let result = state.resolve_host_for_session("93.184.216.34", None);
         assert_eq!(result, "example.com");
     }
@@ -1545,6 +1679,7 @@ mod tests {
     #[test]
     fn resolve_host_uses_forwarder_cache_file() {
         let mut path = std::env::temp_dir();
+
         path.push(format!(
             "agent-sandbox-nfq-dns-cache-{}-{}.json",
             std::process::id(),
@@ -1553,14 +1688,14 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
+
         let mut writer = DnsCache::new(Some(&path), DEFAULT_MAX_TTL);
         writer.remember("104.20.23.154", "example.com", 300);
         let mut state = state_for_tests();
         state.cache_path = path.clone();
-
         let result = state.resolve_host_for_session("104.20.23.154", None);
-
         assert_eq!(result, "example.com");
+
         assert_eq!(
             state
                 .dns_cache
@@ -1570,12 +1705,14 @@ mod tests {
                 .as_deref(),
             Some("example.com")
         );
+
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn disk_mapping_survives_dns_cache_expiry_only_for_attributed_session() {
         let mut path = std::env::temp_dir();
+
         path.push(format!(
             "agent-sandbox-nfq-dns-attribution-{}-{}.json",
             std::process::id(),
@@ -1584,6 +1721,7 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
+
         let mut writer = DnsCache::new(Some(&path), DEFAULT_MAX_TTL);
         writer.remember("104.20.23.154", "example.com", 300);
         let mut state = state_for_tests();
@@ -1593,6 +1731,7 @@ mod tests {
             state.resolve_host_for_session("104.20.23.154", Some("session-a")),
             "example.com"
         );
+
         let _ = std::fs::remove_file(&path);
 
         state
@@ -1600,41 +1739,50 @@ mod tests {
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("104.20.23.154", "temporary.example", 1);
+
         std::thread::sleep(Duration::from_millis(1_100));
 
         assert_eq!(
             state.resolve_host_for_session("104.20.23.154", Some("session-a")),
             "example.com"
         );
+
         assert_eq!(
             state.resolve_host_for_session("104.20.23.154", Some("session-b")),
             "104.20.23.154"
         );
+
         assert_eq!(
             state.resolve_host_for_session("104.20.23.154", None),
             "104.20.23.154"
         );
     }
+
     #[test]
     fn resolve_host_uses_persisted_attribution_after_nfqueue_restart() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+
         let attribution_path = std::env::temp_dir().join(format!(
             "agent-sandbox-nfq-restart-attribution-{}-{stamp}.json",
             std::process::id()
         ));
+
         let mut writer = attribution::SessionAttribution::load(&attribution_path);
+
         writer
             .remember("session-a", "93.184.216.34", "example.com")
             .expect("persist attribution");
 
         let restarted = state_for_tests_with_attribution_path(Some(&attribution_path));
+
         assert_eq!(
             restarted.resolve_host_for_session("93.184.216.34", Some("session-a")),
             "example.com"
         );
+
         assert_eq!(
             restarted.resolve_host_for_session("93.184.216.34", Some("session-b")),
             "93.184.216.34"
@@ -1647,8 +1795,8 @@ mod tests {
     fn forged_dns_response_from_wrong_src_ip_does_not_cache_mapping() {
         let state = state_for_tests();
         let pkt = build_dns_response_packet([10, 0, 0, 2]);
-
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1669,12 +1817,15 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             1,
             "forged DNS response must invoke the policy check"
         );
+
         assert!(
             state
                 .dns_cache
@@ -1690,8 +1841,8 @@ mod tests {
     fn dns_response_from_forwarder_caches_mapping() {
         let state = state_for_tests();
         let pkt = build_dns_response_packet([169, 254, 100, 1]);
-
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1712,12 +1863,15 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             0,
             "legitimate forwarder response must not invoke policy check"
         );
+
         assert_eq!(
             state
                 .dns_cache
@@ -1733,8 +1887,8 @@ mod tests {
     fn udp_53_to_non_forwarder_invokes_policy_check() {
         let state = state_for_tests();
         let pkt = build_dns_query_packet([8, 8, 8, 8]);
-
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1755,7 +1909,9 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             1,
@@ -1767,8 +1923,8 @@ mod tests {
     fn udp_53_to_forwarder_bypasses_policy_check() {
         let state = state_for_tests();
         let pkt = build_dns_query_packet([169, 254, 100, 1]);
-
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1789,7 +1945,9 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             0,
@@ -1800,12 +1958,15 @@ mod tests {
     #[test]
     fn approved_binding_aliases_passed_to_policy_check() {
         let state = state_for_tests();
+
         {
             let mut bindings = state.approved_bindings.lock().expect("lock bindings");
             bindings.record("chatgpt.com", "93.184.216.34");
         }
+
         let pkt = build_udp_data_packet(443);
         let aliases_seen = std::cell::RefCell::new(Vec::<String>::new());
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1826,7 +1987,9 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             aliases_seen.borrow().as_slice(),
             &["chatgpt.com".to_string()],
@@ -1837,12 +2000,15 @@ mod tests {
     #[test]
     fn push_mapping_applies_to_cache() {
         let state = state_for_tests();
+
         let entry = PushMapping {
             ip: "93.184.216.34".to_string(),
             host: "example.com".to_string(),
             ttl: 300,
         };
+
         apply_push_mapping(&state.dns_cache, &entry);
+
         assert_eq!(
             state
                 .dns_cache
@@ -1864,27 +2030,34 @@ mod tests {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
+
         let socket_path = std::env::temp_dir().join(format!(
             "agent-sandbox-nfq-push-{}-{stamp}.sock",
             std::process::id()
         ));
+
         let _ = std::fs::remove_file(&socket_path);
         let listener = std::os::unix::net::UnixDatagram::bind(&socket_path).expect("bind listener");
+
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod push socket");
-        enable_passcred(&listener).expect("SO_PASSCRED");
 
+        enable_passcred(&listener).expect("SO_PASSCRED");
         let state = state_for_tests();
         let cache = Arc::clone(&state.dns_cache);
         let listener_path = socket_path.clone();
+
         let listener_thread = std::thread::spawn(move || {
             let mut buf = [0_u8; 512];
+
             let Ok((n, cred)) = recv_datagram_with_creds(&listener, &mut buf) else {
                 return false;
             };
+
             if cred.uid != 0 {
                 return false;
             }
+
             let line = std::str::from_utf8(&buf[..n]).expect("utf8");
             let entry: PushMapping = serde_json::from_str(line.trim()).expect("json");
             apply_push_mapping(&cache, &entry);
@@ -1892,14 +2065,17 @@ mod tests {
         });
 
         let sender = std::os::unix::net::UnixDatagram::unbound().expect("unbound sender");
+
         sender
             .send_to(
                 br#"{"ip":"1.2.3.4","host":"evil.com","ttl":60}"#,
                 &listener_path,
             )
             .expect("send push frame");
+
         let accepted = listener_thread.join().expect("listener thread");
         assert!(!accepted, "untrusted peer uid must not apply push mappings");
+
         assert!(
             state
                 .dns_cache
@@ -1908,17 +2084,20 @@ mod tests {
                 .lookup("1.2.3.4")
                 .is_none()
         );
+
         let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]
     fn successful_accept_records_approved_binding() {
         let state = state_for_tests();
+
         state
             .dns_cache
             .lock()
             .expect("lock dns cache")
             .remember_ephemeral("93.184.216.34", "example.com", 300);
+
         let pkt = build_udp_data_packet(443);
 
         let mut check = |_: &str,
@@ -1938,20 +2117,24 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         let aliases = state
             .approved_bindings
             .lock()
             .expect("lock bindings")
             .aliases("93.184.216.34");
+
         assert_eq!(aliases, vec!["example.com".to_string()]);
     }
+
     #[test]
     fn loopback_udp_53_invokes_policy_check() {
         let state = state_for_tests();
         let pkt = build_dns_query_packet([127, 0, 0, 1]);
-
         let call_count = std::cell::Cell::new(0u32);
+
         let mut check = |_: &str,
                          _: &str,
                          _: &str,
@@ -1972,13 +2155,16 @@ mod tests {
             &mut check,
             None,
         );
+
         assert_eq!(v, Verdict::Accept);
+
         assert_eq!(
             call_count.get(),
             1,
             "UDP/53 to loopback must invoke policy check"
         );
     }
+
     #[test]
     fn readiness_marker_requires_lowercase_32_hex_invocation_id() {
         assert!(validate_invocation_id("0123456789abcdef0123456789abcdef").is_ok());
@@ -1991,16 +2177,19 @@ mod tests {
     fn cli_defaults_preserve_standalone_fallbacks() {
         let cli = Cli::try_parse_from(["agent-sandbox-nfq"])
             .expect("standalone invocation has valid defaults");
+
         assert_eq!(cli.queue, 0);
         assert_eq!(cli.policy_socket, "/run/agent-sandbox/policy.sock");
         assert!((cli.policy_timeout - 305.0).abs() < f64::EPSILON);
         assert_eq!(cli.nft_binary, "nft");
+
         assert_eq!(
             cli.dns_server_ip,
             "169.254.100.1"
                 .parse::<IpAddr>()
                 .expect("valid default gateway")
         );
+
         assert_eq!(
             cli.push_socket,
             PathBuf::from("/run/agent-sandbox/dns-push.sock")
@@ -2025,14 +2214,17 @@ mod tests {
             "/run/test/dns-push.sock",
         ])
         .expect("explicit launch facts parse");
+
         assert_eq!(cli.queue, 7);
         assert_eq!(cli.policy_socket, "/run/test/policy.sock");
         assert!((cli.policy_timeout - 12.5).abs() < f64::EPSILON);
         assert_eq!(cli.nft_binary, "/bin/nft-test");
+
         assert_eq!(
             cli.dns_server_ip,
             "192.0.2.1".parse::<IpAddr>().expect("valid test gateway")
         );
+
         assert_eq!(cli.push_socket, PathBuf::from("/run/test/dns-push.sock"));
     }
 }

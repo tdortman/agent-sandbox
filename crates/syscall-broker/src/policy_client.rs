@@ -16,6 +16,7 @@ fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestConte
         &SandboxPaths::default(),
         ProcessIds::from_options(Some(pid), None),
     );
+
     ctx.sandbox_session_id = sandbox_session_id;
     ctx
 }
@@ -62,12 +63,15 @@ impl PersistentPolicyClient {
             )),
             ctx: request_context(pid, sandbox_session_id),
         };
+
         match self.request(req, timeout).await {
             Ok(RpcReply::Check(reply)) => reply.allowed,
+
             Ok(_) => {
                 self.invalidate();
                 false
             }
+
             Err(_) => false,
         }
     }
@@ -94,10 +98,12 @@ impl PersistentPolicyClient {
             access: target.access,
             ctx: request_context(pid, sandbox_session_id),
         };
+
         if let RpcReply::ResourceCheck(reply) = self.request(req, timeout).await? {
             Ok(reply)
         } else {
             self.invalidate();
+
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "policyd returned a non-ResourceCheck reply for CheckResource",
@@ -125,10 +131,12 @@ impl PersistentPolicyClient {
             access,
             ctx: request_context(pid, sandbox_session_id),
         };
+
         if let RpcReply::FilesystemCheck(reply) = self.request(req, timeout).await? {
             Ok(reply)
         } else {
             self.invalidate();
+
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "policyd returned a non-FilesystemCheck reply for CheckFilesystem",
@@ -144,6 +152,7 @@ mod tests {
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
@@ -157,8 +166,10 @@ mod tests {
             "agent-sandbox-policy-client-{}.sock",
             std::process::id()
         ));
+
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).expect("bind test policy socket");
+
         let server = tokio::spawn(async move {
             let replies = [
                 RpcMessage::Reply(RpcReply::Check(CheckReply::allowed(VerdictSource::Static))),
@@ -185,6 +196,7 @@ mod tests {
         });
 
         let mut client = PersistentPolicyClient::new(&socket_path);
+
         let first = client
             .check_filesystem(
                 Path::new("/tmp/first"),
@@ -194,6 +206,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await;
+
         assert!(first.is_err(), "wrong reply variant must fail closed");
 
         let second = client
@@ -206,6 +219,7 @@ mod tests {
             )
             .await
             .expect("second request must reconnect");
+
         assert!(second.allowed);
         server.await.expect("policy test server");
         let _ = std::fs::remove_file(socket_path);

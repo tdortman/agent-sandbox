@@ -9,8 +9,8 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use uuid::Uuid;
-
 use super::request::RequestContext;
+
 use crate::{
     HttpRequest, HttpRuleTarget, SandboxPaths,
     hosts::{normalize_dns_name, normalize_host},
@@ -82,6 +82,7 @@ impl TryFrom<u64> for ProcessStartTimeTicks {
 pub struct ProcessIdentity {
     pid: NonZeroU32,
     uid: u32,
+
     #[serde(rename = "process_start_time_ticks")]
     start_time: ProcessStartTimeTicks,
 }
@@ -94,6 +95,7 @@ impl ProcessIdentity {
     pub fn new(pid: u32, uid: u32, start_time: u64) -> Result<Self, String> {
         let pid = NonZeroU32::new(pid).ok_or_else(|| "process pid must be non-zero".to_owned())?;
         let start_time = ProcessStartTimeTicks::new(start_time)?;
+
         Ok(Self {
             pid,
             uid,
@@ -170,8 +172,10 @@ impl SocketIdentity {
 struct WireSocketIdentity {
     pid: NonZeroU32,
     uid: u32,
+
     #[serde(rename = "process_start_time_ticks")]
     start_time: ProcessStartTimeTicks,
+
     socket_inode: SocketInode,
 }
 
@@ -180,8 +184,10 @@ struct WireSocketIdentity {
 struct OwnedWireSocketIdentity {
     pid: NonZeroU32,
     uid: u32,
+
     #[serde(rename = "process_start_time_ticks")]
     start_time: ProcessStartTimeTicks,
+
     socket_inode: SocketInode,
 }
 
@@ -206,6 +212,7 @@ impl<'de> Deserialize<'de> for SocketIdentity {
         D: Deserializer<'de>,
     {
         let wire = OwnedWireSocketIdentity::deserialize(deserializer)?;
+
         Ok(Self {
             process: ProcessIdentity::from_parts(wire.pid, wire.uid, wire.start_time),
             inode: wire.socket_inode,
@@ -231,14 +238,17 @@ impl ProxyConnectionId {
     pub fn parse(value: &str) -> Result<Self, String> {
         let uuid =
             Uuid::parse_str(value).map_err(|_| "invalid proxy connection UUID".to_owned())?;
+
         if value != uuid.hyphenated().to_string() {
             return Err(
                 "proxy connection id must be canonical lowercase hyphenated `UUIDv4`".to_owned(),
             );
         }
+
         if uuid.get_version() != Some(uuid::Version::Random) {
             return Err("proxy connection id must be `UUIDv4`".to_owned());
         }
+
         Ok(Self(uuid))
     }
 
@@ -296,14 +306,17 @@ impl ProxyRequestId {
     /// `UUIDv7` representation.
     pub fn parse(value: &str) -> Result<Self, String> {
         let uuid = Uuid::parse_str(value).map_err(|_| "invalid proxy request UUID".to_owned())?;
+
         if value != uuid.hyphenated().to_string() {
             return Err(
                 "proxy request id must be canonical lowercase hyphenated `UUIDv7`".to_owned(),
             );
         }
+
         if uuid.get_version() != Some(uuid::Version::SortRand) {
             return Err("proxy request id must be `UUIDv7`".to_owned());
         }
+
         Ok(Self(uuid))
     }
 
@@ -347,10 +360,12 @@ impl<'de> Deserialize<'de> for ProxyRequestId {
 fn encode_token(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(64);
+
     for byte in bytes {
         encoded.push(HEX[(byte >> 4) as usize] as char);
         encoded.push(HEX[(byte & 0x0F) as usize] as char);
     }
+
     encoded
 }
 
@@ -362,12 +377,15 @@ fn decode_token(value: &str) -> Result<[u8; 32], String> {
     {
         return Err("capability token must be 64 lowercase hex characters".to_owned());
     }
+
     let mut bytes = [0_u8; 32];
+
     for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_value(pair[0]);
         let low = hex_value(pair[1]);
         bytes[index] = (high << 4) | low;
     }
+
     Ok(bytes)
 }
 
@@ -515,8 +533,10 @@ impl NetworkFlowKey {
     ) -> Result<Self, String> {
         let source_port = NonZeroU16::new(source_port)
             .ok_or_else(|| "source port must be non-zero".to_owned())?;
+
         let destination_port = NonZeroU16::new(destination_port)
             .ok_or_else(|| "destination port must be non-zero".to_owned())?;
+
         Ok(Self::new(
             protocol,
             source_ip,
@@ -571,9 +591,11 @@ impl NormalizedPolicyHost {
     pub fn parse(value: &str) -> Result<Self, String> {
         let trimmed = value.trim();
         let bracketed = trimmed.starts_with('[') || trimmed.ends_with(']');
+
         if bracketed && trimmed.len() < 2 {
             return Err("policy host has malformed brackets".to_owned());
         }
+
         if bracketed
             && (!trimmed.starts_with('[')
                 || !trimmed.ends_with(']')
@@ -581,24 +603,31 @@ impl NormalizedPolicyHost {
         {
             return Err("policy host has malformed brackets".to_owned());
         }
+
         let normalized = normalize_host(trimmed);
+
         if normalized.is_empty()
             || normalized.contains(['/', '?', '#', '@'])
             || normalized.starts_with('*')
         {
             return Err("policy host must be a hostname or IP literal".to_owned());
         }
+
         if let Ok(ip) = normalized.parse::<IpAddr>() {
             return Ok(Self(NormalizedPolicyHostValue::Ip(ip)));
         }
+
         if bracketed {
             return Err("brackets are only valid around an IP literal".to_owned());
         }
+
         let dns = normalize_dns_name(&normalized)
             .map_err(|error| format!("invalid policy host: {error}"))?;
+
         if dns.len() > 253 {
             return Err("policy host exceeds 253 bytes".to_owned());
         }
+
         for label in dns.split('.') {
             if label.is_empty()
                 || label.len() > 63
@@ -611,6 +640,7 @@ impl NormalizedPolicyHost {
                 return Err("policy host contains an invalid DNS label".to_owned());
             }
         }
+
         Ok(Self(NormalizedPolicyHostValue::Dns(dns.into_boxed_str())))
     }
 
@@ -677,10 +707,13 @@ impl TryFrom<&str> for NormalizedPolicyHost {
 struct WireFlowContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     home: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_root: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sandbox_session_id: Option<String>,
 }
@@ -755,6 +788,7 @@ impl<'de> Deserialize<'de> for FlowContext {
         D: Deserializer<'de>,
     {
         let wire = WireFlowContext::deserialize(deserializer)?;
+
         Ok(Self {
             paths: SandboxPaths::from_wire(wire.cwd, wire.home, wire.project_root),
             sandbox_session_id: wire.sandbox_session_id,
@@ -823,8 +857,10 @@ pub struct HttpCheckRequest {
 pub struct HttpApprovalRequest {
     pub target: HttpRuleTarget,
     pub scope: crate::ApprovalScope,
+
     #[serde(default)]
     pub session_id: Option<String>,
+
     #[serde(default)]
     pub ctx: RequestContext,
 }
@@ -832,23 +868,24 @@ pub struct HttpApprovalRequest {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
-
     use serde_json::json;
-
     use super::*;
 
     #[test]
     fn proxy_ids_require_canonical_uuid_versions() {
         let connection = ProxyConnectionId::new();
         let connection_text = connection.to_string();
+
         assert_eq!(
             ProxyConnectionId::parse(&connection_text).expect("generated `UUIDv4` parses"),
             connection
         );
+
         assert!(
             ProxyConnectionId::parse(&connection_text.to_ascii_uppercase()).is_err(),
             "uppercase UUIDs are not canonical"
         );
+
         assert!(
             ProxyConnectionId::parse(&connection.uuid().as_simple().to_string()).is_err(),
             "simple UUIDs are not canonical"
@@ -856,10 +893,12 @@ mod tests {
 
         let request = ProxyRequestId::new();
         let request_text = request.to_string();
+
         assert_eq!(
             ProxyRequestId::parse(&request_text).expect("generated `UUIDv7` parses"),
             request
         );
+
         assert!(
             ProxyRequestId::parse(&connection_text).is_err(),
             "`UUIDv4` is not a valid proxy request ID"
@@ -870,16 +909,20 @@ mod tests {
     fn capability_tokens_are_random_wire_hex_but_redacted_in_debug() {
         let token = ProxySessionToken::new();
         let wire = serde_json::to_value(&token).expect("token serializes");
+
         let wire_text = wire
             .as_str()
             .expect("token wire value is a string")
             .to_owned();
+
         assert_eq!(wire_text.len(), 64);
         assert!(wire_text.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
         assert_eq!(
             serde_json::from_value::<ProxySessionToken>(wire).expect("token deserializes"),
             token
         );
+
         let debug = format!("{token:?}");
         assert!(!debug.contains(&wire_text));
         assert!(debug.contains("redacted"));
@@ -896,7 +939,9 @@ mod tests {
             443,
         )
         .expect("non-zero flow ports");
+
         let process = ProcessIdentity::new(123, 0, 456).expect("non-zero process identity");
+
         let registration = FlowRegistration::new(
             flow,
             SocketIdentity::new(process, SocketInode::new(789).expect("non-zero inode")),
@@ -906,7 +951,9 @@ mod tests {
                 Some("sandbox".to_owned()),
             ),
         );
+
         let wire = serde_json::to_value(&registration).expect("registration serializes");
+
         assert_eq!(
             wire,
             json!({
@@ -932,6 +979,7 @@ mod tests {
                 }
             })
         );
+
         assert_eq!(
             serde_json::from_value::<FlowRegistration>(wire).expect("registration deserializes"),
             registration
@@ -955,6 +1003,7 @@ mod tests {
             "policy_host": "example.com",
             "ctx": {}
         });
+
         assert!(serde_json::from_value::<FlowRegistration>(unknown).is_err());
 
         let zero_port = json!({
@@ -974,6 +1023,7 @@ mod tests {
             "policy_host": "example.com",
             "ctx": {}
         });
+
         assert!(serde_json::from_value::<FlowRegistration>(zero_port).is_err());
     }
 
@@ -985,12 +1035,14 @@ mod tests {
                 .to_string(),
             "example.com"
         );
+
         assert_eq!(
             NormalizedPolicyHost::parse("[2001:0db8::1]")
                 .expect("IPv6 host parses")
                 .to_string(),
             "2001:db8::1"
         );
+
         for invalid in [
             "",
             "*.example.com",

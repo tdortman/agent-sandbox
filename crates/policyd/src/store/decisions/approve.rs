@@ -15,6 +15,7 @@ use super::{
     },
     DecisionAction,
 };
+
 use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp},
@@ -35,6 +36,7 @@ impl PolicyStore {
             Ok(value) => value,
             Err(err) => return *err,
         };
+
         match decision.pending {
             Pending::Network(net) => {
                 self.apply_pending_network_decision(
@@ -46,6 +48,7 @@ impl PolicyStore {
                 )
                 .await
             }
+
             Pending::Elevation(elev) => {
                 self.apply_pending_sudo_decision(
                     elev,
@@ -56,6 +59,7 @@ impl PolicyStore {
                 )
                 .await
             }
+
             Pending::Filesystem(fs) => {
                 self.apply_pending_filesystem_decision(
                     fs,
@@ -66,6 +70,7 @@ impl PolicyStore {
                 )
                 .await
             }
+
             Pending::Resource(res) => {
                 self.apply_pending_resource_decision(
                     res,
@@ -76,6 +81,7 @@ impl PolicyStore {
                 )
                 .await
             }
+
             Pending::Dbus(dbus) => {
                 self.apply_pending_dbus_decision(
                     dbus,
@@ -86,6 +92,7 @@ impl PolicyStore {
                 )
                 .await
             }
+
             Pending::Http(http) => {
                 let target = match decision.target {
                     Some(ApprovalTarget::Http { target }) => Some(target),
@@ -116,6 +123,7 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = net.id.clone();
+
         let resolved = match Self::resolve_pending_network_target(&net, scope, target) {
             Ok(value) => value,
             Err(err) => {
@@ -134,6 +142,7 @@ impl PolicyStore {
                 Some(resolved.port),
                 scope.as_str(),
             );
+
             self.finish_network(
                 &pending_id,
                 true,
@@ -144,6 +153,7 @@ impl PolicyStore {
                 }),
             )
             .await;
+
             return RpcReply::ScopeAction(ScopeActionReply::ok_network(
                 resolved.host,
                 resolved.port,
@@ -179,6 +189,7 @@ impl PolicyStore {
                     )
                     .await;
                 }
+
                 DecisionAction::Deny => {
                     self.finish_network(
                         &pending_id,
@@ -209,6 +220,7 @@ impl PolicyStore {
                 .await
                 .insert_pending(Pending::Network(net));
         }
+
         result
     }
 
@@ -221,6 +233,7 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = elev.id.clone();
+
         let argv = match Self::resolve_pending_sudo_target(&elev, scope, target) {
             Ok(value) => value,
             Err(err) => {
@@ -231,16 +244,20 @@ impl PolicyStore {
                 return err.into();
             }
         };
+
         let scope_wire = Self::scope_wire_for_pending_elevation(wire, &elev);
 
         if action == DecisionAction::Deny {
             if scope == ApprovalScope::Once {
                 let detail = format!("id={pending_id} argv={argv:?}");
                 Self::audit(action.audit_verb(), None, None, &detail);
+
                 self.finish_elevation(&pending_id, ElevateReply::denied())
                     .await;
+
                 return RpcReply::ScopeAction(ScopeActionReply::ok_sudo(argv, scope, None));
             }
+
             let result = self
                 .apply_sudo_scope(
                     SudoScopeOp {
@@ -251,6 +268,7 @@ impl PolicyStore {
                     action,
                 )
                 .await;
+
             if result.scope_succeeded() {
                 self.finish_elevation(&pending_id, ElevateReply::denied())
                     .await;
@@ -260,6 +278,7 @@ impl PolicyStore {
                     .await
                     .insert_pending(Pending::Elevation(elev));
             }
+
             return result;
         }
 
@@ -288,6 +307,7 @@ impl PolicyStore {
 
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit(action.audit_verb(), None, None, &detail);
+
         let elevation = match self
             .exec_elevation(
                 &argv,
@@ -305,7 +325,9 @@ impl PolicyStore {
                 return err.into();
             }
         };
+
         self.finish_elevation(&pending_id, elevation).await;
+
         RpcReply::ScopeAction(ScopeActionReply::ok_elevation_approve(
             scope,
             saved_path.map(PathBuf::from),
@@ -321,6 +343,7 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = fs.id.clone();
+
         let path = match Self::resolve_pending_filesystem_target(
             &fs,
             scope,
@@ -343,7 +366,9 @@ impl PolicyStore {
                 path.display(),
                 fs.access
             );
+
             Self::audit(action.audit_verb(), None, None, &detail);
+
             self.finish_filesystem(
                 &pending_id,
                 path.clone(),
@@ -352,6 +377,7 @@ impl PolicyStore {
                 VerdictSource::Scope(ApprovalScope::Once),
             )
             .await;
+
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
                 path.clone(),
                 fs.access,
@@ -367,6 +393,7 @@ impl PolicyStore {
         if action == DecisionAction::Deny && scope == ApprovalScope::Once {
             let detail = format!("id={pending_id} path={}", path.display());
             Self::audit(action.audit_verb(), None, None, &detail);
+
             self.finish_filesystem(
                 &pending_id,
                 path.clone(),
@@ -375,6 +402,7 @@ impl PolicyStore {
                 VerdictSource::User,
             )
             .await;
+
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
                 path.clone(),
                 fs.access,
@@ -397,6 +425,7 @@ impl PolicyStore {
 
         if result.scope_succeeded() {
             let source = VerdictSource::from(scope);
+
             self.finish_filesystem(
                 &pending_id,
                 path.clone(),
@@ -414,6 +443,7 @@ impl PolicyStore {
                 .await
                 .insert_pending(Pending::Filesystem(fs));
         }
+
         result
     }
 
@@ -424,11 +454,13 @@ impl PolicyStore {
         scope: ApprovalScope,
     ) -> crate::wire::ScopeWire {
         let mut scope_wire = Self::scope_wire_for_pending_filesystem(wire, fs);
+
         if scope != ApprovalScope::Session {
             return scope_wire;
         }
 
         let session_ids = self.standalone_session_ids_for_filesystem_pending(fs).await;
+
         if scope_wire
             .session_id
             .as_ref()
@@ -436,9 +468,11 @@ impl PolicyStore {
         {
             return scope_wire;
         }
+
         if let Some(session_id) = session_ids.into_iter().min() {
             scope_wire.session_id = Some(session_id);
         }
+
         scope_wire
     }
 
@@ -450,6 +484,7 @@ impl PolicyStore {
     ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
         let project_root = project_root.or(pending.project_root.as_deref());
+
         let path = match target {
             None => pending_path.clone(),
             Some(ApprovalTarget::FilesystemPath { path }) => path.clone(),
@@ -461,6 +496,7 @@ impl PolicyStore {
             if path != *pending_path {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
+
             return Ok(path);
         }
 
@@ -500,13 +536,17 @@ impl PolicyStore {
                 return PolicydError::InvalidDecisionTarget.into();
             }
         };
+
         let allowed = action == DecisionAction::Approve;
+
         let source = if allowed {
             VerdictSource::Scope(scope)
         } else {
             VerdictSource::User
         };
+
         let path = res.path.clone();
+
         if scope == ApprovalScope::Once {
             self.finish_resource(
                 &res.id,
@@ -517,13 +557,16 @@ impl PolicyStore {
                 source,
             )
             .await;
+
             return RpcReply::ScopeAction(ScopeActionReply::ok_dbus(dbus_target, scope, None));
         }
 
         let scope_wire = Self::scope_wire_for_pending_dbus(wire, &res);
+
         let result = self
             .apply_dbus_scope(dbus_target, scope, scope_wire, action)
             .await;
+
         if result.scope_succeeded() {
             self.finish_resource(
                 &res.id,
@@ -537,6 +580,7 @@ impl PolicyStore {
         } else {
             self.inner.lock().await.insert_pending(Pending::Dbus(res));
         }
+
         result
     }
 
@@ -549,6 +593,7 @@ impl PolicyStore {
         action: DecisionAction,
     ) -> RpcReply {
         let pending_id = res.id.clone();
+
         let path = match Self::resolve_pending_resource_target(
             &res,
             scope,
@@ -567,11 +612,13 @@ impl PolicyStore {
 
         if scope == ApprovalScope::Once {
             let allowed = matches!(action, DecisionAction::Approve);
+
             let source = if allowed {
                 VerdictSource::Scope(ApprovalScope::Once)
             } else {
                 VerdictSource::User
             };
+
             let detail = if allowed {
                 format!(
                     "id={pending_id} kind={:?} path={} access={:?}",
@@ -586,7 +633,9 @@ impl PolicyStore {
                     path.display()
                 )
             };
+
             Self::audit(action.audit_verb(), None, None, &detail);
+
             self.finish_resource(
                 &pending_id,
                 res.kind,
@@ -596,6 +645,7 @@ impl PolicyStore {
                 source,
             )
             .await;
+
             return RpcReply::ScopeAction(ScopeActionReply::ok_resource(
                 res.kind, path, res.access, scope, None,
             ));
@@ -620,6 +670,7 @@ impl PolicyStore {
 
         if result.scope_succeeded() {
             let source = VerdictSource::from(scope);
+
             self.finish_resource(
                 &pending_id,
                 res.kind,
@@ -645,6 +696,7 @@ impl PolicyStore {
                 .await
                 .insert_pending(Pending::Resource(res));
         }
+
         result
     }
 
@@ -655,11 +707,13 @@ impl PolicyStore {
         scope: ApprovalScope,
     ) -> crate::wire::ScopeWire {
         let mut scope_wire = Self::scope_wire_for_pending_resource(wire, res);
+
         if scope != ApprovalScope::Session {
             return scope_wire;
         }
 
         let session_ids = self.standalone_session_ids_for_resource_pending(res).await;
+
         if scope_wire
             .session_id
             .as_ref()
@@ -667,9 +721,11 @@ impl PolicyStore {
         {
             return scope_wire;
         }
+
         if let Some(session_id) = session_ids.into_iter().min() {
             scope_wire.session_id = Some(session_id);
         }
+
         scope_wire
     }
 
@@ -681,6 +737,7 @@ impl PolicyStore {
     ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
         let project_root = project_root.or(pending.project_root.as_deref());
+
         let (kind, path) = match target {
             None => (pending.kind, pending_path.clone()),
             Some(ApprovalTarget::ResourcePath {
@@ -694,6 +751,7 @@ impl PolicyStore {
             }
             Some(_) => return Err(PolicydError::InvalidDecisionTarget),
         };
+
         let _ = kind;
 
         // For Once scope, only exact match is allowed.
@@ -701,6 +759,7 @@ impl PolicyStore {
             if path != *pending_path {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
+
             return Ok(path);
         }
 
@@ -730,6 +789,7 @@ impl PolicyStore {
     ) -> Result<NetworkRuleKey, PolicydError> {
         let pending_host = &pending.host;
         let pending_port = pending.port;
+
         let host = match target {
             None => pending_host.clone(),
             Some(ApprovalTarget::NetworkHost { host }) => host.clone(),
@@ -737,13 +797,17 @@ impl PolicyStore {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
         };
+
         let valid_host = host_pattern_matches(&host, pending_host);
+
         if !valid_host {
             return Err(PolicydError::InvalidDecisionTarget);
         }
+
         if scope == ApprovalScope::Once && host != *pending_host {
             return Err(PolicydError::InvalidDecisionTarget);
         }
+
         Ok(NetworkRuleKey::new(host, pending_port))
     }
 
@@ -753,6 +817,7 @@ impl PolicyStore {
         target: Option<&ApprovalTarget>,
     ) -> Result<Vec<String>, PolicydError> {
         let pending_argv = &pending.argv;
+
         let argv = match target {
             None => pending_argv.clone(),
             Some(ApprovalTarget::SudoCommand { argv }) => argv.clone(),
@@ -760,15 +825,19 @@ impl PolicyStore {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
         };
+
         let valid_argv = SudoRule::approval_prefixes(pending_argv)
             .into_iter()
             .any(|candidate| candidate == argv);
+
         if !valid_argv {
             return Err(PolicydError::InvalidDecisionTarget);
         }
+
         if scope == ApprovalScope::Once && argv != *pending_argv {
             return Err(PolicydError::InvalidDecisionTarget);
         }
+
         Ok(argv)
     }
 }
@@ -786,6 +855,7 @@ mod tests {
         PendingSummary, ProcessIds, ResourceAccess, ResourceKind, ResourceRuleKey, RpcReply,
         SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
     };
+
     use tokio::{net::UnixStream, sync::Mutex};
 
     use crate::{
@@ -812,9 +882,11 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::NetworkHost {
             host: "*.baz.com".into(),
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_network_target(
                 match &pending {
@@ -844,9 +916,11 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         };
+
         let target = ApprovalTarget::NetworkHost {
             host: "api.*.example.com".into(),
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_network_target(
                 &pending,
@@ -857,6 +931,7 @@ mod tests {
             NetworkRuleKey::new("api.*.example.com", 443)
         );
     }
+
     #[test]
     fn sudo_target_accepts_command_prefixes() {
         let pending = Pending::Elevation(PendingElevation {
@@ -868,9 +943,11 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::SudoCommand {
             argv: vec!["foo".into(), "bar".into()],
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_sudo_target(
                 match &pending {
@@ -897,9 +974,11 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::FilesystemPath {
             path: "/other/path".into(),
         };
+
         assert!(
             PolicyStore::resolve_pending_filesystem_target(
                 match &pending {
@@ -927,9 +1006,11 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::FilesystemPath {
             path: "/home/user/projects/foo".into(),
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_filesystem_target(
                 match &pending {
@@ -957,6 +1038,7 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         });
+
         // Once scope: exact match is valid
         assert!(
             PolicyStore::resolve_pending_filesystem_target(
@@ -975,6 +1057,7 @@ mod tests {
         let ancestor_target = ApprovalTarget::FilesystemPath {
             path: "/home/user".into(),
         };
+
         assert!(
             PolicyStore::resolve_pending_filesystem_target(
                 match &pending {
@@ -1002,9 +1085,11 @@ mod tests {
             project_root: Some("/home/user/repo".into()),
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::FilesystemPath {
             path: "./.gitattributes".into(),
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_filesystem_target(
                 match &pending {
@@ -1033,10 +1118,12 @@ mod tests {
             project_root: Some("/home/user/repo".into()),
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::ResourcePath {
             resource_kind: ResourceKind::UnixSocket,
             path: "./.sock".into(),
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_resource_target(
                 match &pending {
@@ -1064,9 +1151,11 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         });
+
         let target = ApprovalTarget::FilesystemPath {
             path: "./.git".into(),
         };
+
         assert_eq!(
             PolicyStore::resolve_pending_filesystem_target(
                 match &pending {
@@ -1085,13 +1174,16 @@ mod tests {
     #[tokio::test]
     async fn global_git_approval_works_when_pending_lacks_project_root() {
         let store = test_store("global-git-wire-root");
+
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-global-git-wire-{}",
             std::process::id()
         ));
+
         let project_root = home.join("dotfiles");
         std::fs::create_dir_all(&home).expect("create test home");
         std::fs::create_dir_all(project_root.join(".git")).expect("create git dir");
+
         let pending = PendingFilesystem {
             id: "fs-git-config-wire".into(),
             created_at: 0.0,
@@ -1102,7 +1194,9 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         };
+
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1131,6 +1225,7 @@ mod tests {
                 approver_uid: None,
             })
             .await;
+
         assert!(
             reply.scope_succeeded(),
             "global ./.git approval should succeed via wire project_root, got {reply:?}"
@@ -1140,13 +1235,16 @@ mod tests {
     #[tokio::test]
     async fn global_filesystem_git_dir_persists_project_relative_path() {
         let store = test_store("global-git-dir");
+
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-global-git-{}",
             std::process::id()
         ));
+
         let project_root = home.join("dotfiles");
         std::fs::create_dir_all(&home).expect("create test home");
         std::fs::create_dir_all(project_root.join(".git")).expect("create git dir");
+
         let pending = PendingFilesystem {
             id: "fs-git-config".into(),
             created_at: 0.0,
@@ -1157,7 +1255,9 @@ mod tests {
             project_root: Some(project_root.clone()),
             sandbox_session_id: None,
         };
+
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1186,6 +1286,7 @@ mod tests {
                 approver_uid: None,
             })
             .await;
+
         assert!(
             reply.scope_succeeded(),
             "global filesystem approval should succeed, got {reply:?}"
@@ -1193,14 +1294,18 @@ mod tests {
 
         let policy_path = home.join(".config/agent-sandbox/policy.json");
         let raw = std::fs::read_to_string(&policy_path).expect("read policy.json");
+
         assert!(
             raw.contains("./.git"),
             "global project-relative paths should persist literally, got: {raw}"
         );
+
         let policy = agent_sandbox_core::load_policy(&policy_path, Some(home.as_path()), None);
+
         let found = policy.filesystem.allow.iter().any(|rule| {
             rule.path == Path::new("./.git") && rule.access.covers(FileAccess::ReadWrite)
         });
+
         assert!(
             found,
             "global ./.git approval should persist as ./.git in {:?}, allow={:?}",
@@ -1214,11 +1319,14 @@ mod tests {
         // /dev/fd/* under Global scope must persist an allow rule to the
         // global policy.json rather than silently doing nothing.
         let store = test_store("global-devfd");
+
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-global-devfd-{}",
             std::process::id()
         ));
+
         std::fs::create_dir_all(&home).expect("create test home");
+
         let pending = PendingResource {
             id: "rs-devfd".into(),
             created_at: 0.0,
@@ -1230,7 +1338,9 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         };
+
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1256,6 +1366,7 @@ mod tests {
                 approver_uid: None,
             })
             .await;
+
         assert!(
             reply.scope_succeeded(),
             "global resource approval should succeed, got {reply:?}"
@@ -1263,6 +1374,7 @@ mod tests {
 
         let policy_path = home.join(".config/agent-sandbox/policy.json");
         let policy = load_policy(&policy_path, Some(home.as_path()), None);
+
         let found = policy.resources.allow.iter().any(|rule| {
             rule.kind == ResourceKind::UnixSocket
                 && rule.path == Path::new("/dev/fd/*")
@@ -1270,6 +1382,7 @@ mod tests {
                     .access
                     .covers(ResourceAccess::Socket(SocketAccess::Connect))
         });
+
         assert!(
             found,
             "global /dev/fd/* resource rule should be persisted to {:?}, allow={:?}",
@@ -1282,8 +1395,10 @@ mod tests {
             "agent-sandbox-fs-session-{name}-{}",
             std::process::id()
         ));
+
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test store dir");
+
         PolicyStore::new(crate::store::test_args(
             dir.join("policy.sock"),
             dir.join("sandbox-policy.sock"),
@@ -1318,6 +1433,7 @@ mod tests {
     #[tokio::test]
     async fn dbus_once_approval_caches_encoded_pending_path() {
         let store = test_store("dbus-once");
+
         let target = DbusTarget::session(
             "org.example.Service",
             "/org/example/Object",
@@ -1327,9 +1443,11 @@ mod tests {
             "s",
             Vec::new(),
         );
+
         let encoded = serde_json::to_string(&target).expect("encode D-Bus target");
         let path = PathBuf::from(format!("@dbus:{encoded}"));
         let pending_id = "dbus:once".to_owned();
+
         {
             let mut inner = store.inner.lock().await;
             inner.insert_pending(Pending::Dbus(PendingDbus {
@@ -1349,7 +1467,9 @@ mod tests {
             ids: ProcessIds::from_options(Some(123), Some(1000)),
             sandbox_session_id: None,
         };
+
         add_ui_sessions(&store).await;
+
         let reply = store
             .approve(PendingDecision {
                 pending_id,
@@ -1367,12 +1487,15 @@ mod tests {
             reply,
             RpcReply::ScopeAction(ScopeActionReply::Dbus(_))
         ));
+
         let inner = store.inner.lock().await;
+
         assert!(inner.resource_verdict_cache.contains_key(&ResourceRuleKey {
             kind: ResourceKind::UnixSocket,
             path: path.clone(),
             access: ResourceAccess::default(),
         }));
+
         assert!(
             !inner.resource_verdict_cache.contains_key(&ResourceRuleKey {
                 kind: ResourceKind::UnixSocket,
@@ -1380,17 +1503,21 @@ mod tests {
                 access: ResourceAccess::default(),
             })
         );
+
         drop(inner);
     }
 
     #[tokio::test]
     async fn dbus_global_approval_with_comment_persists_edited_target() {
         let store = test_store("dbus-global-comment");
+
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-dbus-comment-{}",
             std::process::id()
         ));
+
         std::fs::create_dir_all(&home).expect("create test home");
+
         let requested = DbusTarget::session(
             "org.example.Service",
             "/org/example/Object",
@@ -1400,6 +1527,7 @@ mod tests {
             "",
             Vec::new(),
         );
+
         let edited = DbusTarget {
             destination: "org.example.Service".into(),
             object_path: "**".into(),
@@ -1407,7 +1535,9 @@ mod tests {
             member: "*".into(),
             ..requested.clone()
         };
+
         let pending_id = "dbus-global-comment".to_owned();
+
         {
             let mut inner = store.inner.lock().await;
             inner.insert_pending(Pending::Dbus(PendingDbus {
@@ -1450,10 +1580,13 @@ mod tests {
 
         let policy_path = home.join(".config/agent-sandbox/policy.json");
         let policy = load_policy(&policy_path, Some(&home), None);
+
         let found = policy.dbus.allow.iter().find(|rule| {
             rule.target.destination == "org.example.Service" && rule.target.object_path == "**"
         });
+
         let found = found.expect("wildcard D-Bus rule persisted");
+
         assert_eq!(
             found.comment.as_deref(),
             Some("allow introspect"),
@@ -1463,10 +1596,12 @@ mod tests {
 
     async fn add_ui_sessions(store: &PolicyStore) {
         let mut inner = store.inner.lock().await;
+
         inner.ui_clients.insert(1, UiClient {
             session_id: "ui-session".into(),
             writer: writer(),
         });
+
         inner
             .ui_context_by_session
             .insert("ui-session".into(), ui_session_context());
@@ -1501,11 +1636,13 @@ mod tests {
         submitting_session_id: &str,
     ) {
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
             .await
             .insert_pending(Pending::Filesystem(pending));
+
         let reply = store
             .approve(PendingDecision {
                 pending_id,
@@ -1518,6 +1655,7 @@ mod tests {
                 approver_uid: None,
             })
             .await;
+
         assert!(reply.scope_succeeded());
     }
 
@@ -1539,6 +1677,7 @@ mod tests {
             let inner = store.inner.lock().await;
             inner.session_filesystem_allow.contains_key("ui-session")
         };
+
         assert!(has_allow);
 
         assert!(
@@ -1562,6 +1701,7 @@ mod tests {
             let inner = store.inner.lock().await;
             inner.session_filesystem_allow.contains_key("ui-session")
         };
+
         assert!(has_allow);
 
         assert!(
@@ -1578,6 +1718,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_session_pending_rejects_foreign_host_uid() {
         let store = test_store("sandbox-session-direct-approval");
+
         store.sandbox_sessions.write().unwrap().insert(
             "sandbox-a".into(),
             crate::store::types::SandboxSessionRegistration {
@@ -1586,9 +1727,11 @@ mod tests {
                 project_root: "/repo".into(),
             },
         );
+
         let mut pending = pending_filesystem();
         pending.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1616,8 +1759,10 @@ mod tests {
             matches!(&reply, RpcReply::Error(e) if e.error == "approval not authorized for this connection"),
             "foreign uid host approval must be rejected, got: {reply:?}"
         );
+
         let summaries = store.pending_summaries().await;
         assert_eq!(summaries.len(), 1);
+
         assert!(
             matches!(&summaries[0], PendingSummary::Filesystem { id, .. } if id == &pending_id),
             "rejected approval must leave pending request intact"
@@ -1627,6 +1772,7 @@ mod tests {
     #[tokio::test]
     async fn cross_connection_approve_rejects_foreign_sandbox_ui() {
         let store = test_store("cross-connection-approve");
+
         {
             let mut inner = store.inner.lock().await;
             inner.ui_clients.insert(1, UiClient {
@@ -1648,6 +1794,7 @@ mod tests {
         let mut pending = pending_filesystem();
         pending.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1669,8 +1816,10 @@ mod tests {
             matches!(&reply, RpcReply::Error(e) if e.error == "approval not authorized for this connection"),
             "cross-sandbox Approve must be rejected, got: {reply:?}"
         );
+
         let summaries = store.pending_summaries().await;
         assert_eq!(summaries.len(), 1);
+
         assert!(
             matches!(&summaries[0], PendingSummary::Filesystem { id, .. } if id == &pending_id),
             "rejected approval must leave pending request intact"
@@ -1680,6 +1829,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_session_pending_allows_matching_uifd_approval() {
         let store = test_store("sandbox-session-uifd-approval");
+
         {
             let mut inner = store.inner.lock().await;
             inner.ui_clients.insert(1, UiClient {
@@ -1701,6 +1851,7 @@ mod tests {
         let mut pending = pending_filesystem();
         pending.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1727,6 +1878,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_session_pending_allows_host_owner_cli_approval() {
         let store = test_store("sandbox-session-host-cli-approval");
+
         store.sandbox_sessions.write().unwrap().insert(
             "sandbox-a".into(),
             crate::store::types::SandboxSessionRegistration {
@@ -1735,9 +1887,11 @@ mod tests {
                 project_root: "/repo".into(),
             },
         );
+
         let mut pending = pending_filesystem();
         pending.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
+
         store
             .inner
             .lock()
@@ -1770,6 +1924,7 @@ mod tests {
     #[tokio::test]
     async fn session_network_rules_do_not_cross_sandbox_sessions_in_same_project() {
         let store = test_store("sandbox-session-isolation");
+
         {
             let mut inner = store.inner.lock().await;
             for (client_id, ui_session_id, sandbox_session_id) in
@@ -1810,6 +1965,7 @@ mod tests {
                 )
                 .await
         );
+
         assert!(
             !store
                 .session_allowed(

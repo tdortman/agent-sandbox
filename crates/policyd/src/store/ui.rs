@@ -5,6 +5,7 @@ use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Durati
 use agent_sandbox_core::{
     ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
 };
+
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ use super::{
     },
     ui_route::{UiRoute, paths_match},
 };
+
 use crate::wire::UiSpawnContext;
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
 const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
@@ -24,6 +26,7 @@ impl PolicyStore {
     fn route_for_context(ctx: &ResolvedRequestContext) -> UiRoute {
         let cwd = ctx.paths.cwd_path();
         let project_root = ctx.paths.project_root_path();
+
         UiRoute::from_parts(
             cwd.as_deref(),
             project_root.as_deref(),
@@ -94,6 +97,7 @@ impl PolicyStore {
             pending.project_root.as_deref(),
             pending.sandbox_session_id.as_deref(),
         );
+
         self.session_ids_for_route(&route).await
     }
 
@@ -106,6 +110,7 @@ impl PolicyStore {
             pending.project_root.as_deref(),
             pending.sandbox_session_id.as_deref(),
         );
+
         self.session_ids_for_route(&route).await
     }
 
@@ -131,12 +136,14 @@ impl PolicyStore {
     async fn ui_notification_targets_for(&self, route: &UiRoute) -> Vec<UiNotificationTarget> {
         let inner = self.inner.lock().await;
         let session_ids = Self::matching_ui_session_ids(&inner, route);
+
         let mut targets: Vec<_> = inner
             .ui_clients
             .iter()
             .filter(|(_, c)| session_ids.contains(&c.session_id))
             .map(|(id, c)| (*id, c.writer.clone()))
             .collect();
+
         targets.sort_unstable_by_key(|(id, _)| *id);
         drop(inner);
         targets
@@ -152,13 +159,16 @@ impl PolicyStore {
         let mut inner = self.inner.lock().await;
         let mut ctx = context;
         ctx.client_id = handle.id;
+
         if ctx.owner_uid.is_none() && peer.uid > 0 {
             ctx.owner_uid = Some(peer.uid);
         }
+
         inner.ui_clients.insert(handle.id, UiClient {
             session_id: session_id.clone(),
             writer: handle.writer.clone(),
         });
+
         inner.ui_context_by_session.insert(session_id.clone(), ctx);
         session_id
     }
@@ -171,11 +181,14 @@ impl PolicyStore {
         if peer.uid == 0 {
             return true;
         }
+
         let mut inner = self.inner.lock().await;
         let count = inner.connections_by_uid.entry(peer.uid).or_insert(0);
+
         if *count >= super::types::MAX_CONNECTIONS_PER_UID {
             return false;
         }
+
         *count += 1;
         drop(inner);
         true
@@ -185,9 +198,12 @@ impl PolicyStore {
         if peer.uid == 0 {
             return;
         }
+
         let mut inner = self.inner.lock().await;
+
         if let Some(count) = inner.connections_by_uid.get_mut(&peer.uid) {
             *count = count.saturating_sub(1);
+
             if *count == 0 {
                 inner.connections_by_uid.remove(&peer.uid);
             }
@@ -221,6 +237,7 @@ impl PolicyStore {
             let mut inner = self.inner.lock().await;
             Self::remove_ui_client_locked(&mut inner, client_id)
         };
+
         if removed && reroute_pending {
             self.reroute_orphaned_pending().await;
         }
@@ -232,15 +249,18 @@ impl PolicyStore {
         let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
         let deadline = tokio::time::Instant::now() + UI_SPAWN_WAIT;
         let mut registration_flush_observed = false;
+
         for p in pending {
             if registration_flush_observed && self.has_ui_for_pending(&p).await {
                 continue;
             }
+
             if !self.has_ui_for_pending(&p).await {
                 let spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(p.home()))
                     .ok()
                     .flatten()
                     .map(|u| u.uid.as_raw());
+
                 let spawn = UiSpawnContext {
                     has_matching_ui: false,
                     uid: spawn_uid,
@@ -249,7 +269,9 @@ impl PolicyStore {
                     project_root: p.project_root(),
                     sandbox_session_id: p.sandbox_session_id(),
                 };
+
                 self.spawn_policy_ui(spawn).await;
+
                 if self.args.ui_spawn_cmd.is_some()
                     && self.wait_for_ui_for_pending(&p, deadline).await
                 {
@@ -257,6 +279,7 @@ impl PolicyStore {
                     continue;
                 }
             }
+
             self.notify_pending_once(&p).await;
         }
     }
@@ -270,16 +293,20 @@ impl PolicyStore {
             if self.has_ui_for_pending(pending).await {
                 return true;
             }
+
             let now = tokio::time::Instant::now();
+
             if now >= deadline {
                 return false;
             }
+
             tokio::time::sleep(UI_SPAWN_POLL.min(deadline - now)).await;
         }
     }
 
     async fn notify_pending(&self, pending: &Pending) {
         let delivered = self.notify_pending_once(pending).await;
+
         if !delivered {
             self.reroute_orphaned_pending().await;
         }
@@ -338,6 +365,7 @@ impl PolicyStore {
                 sandbox_session_id: res.sandbox_session_id.clone(),
             },
         };
+
         let route = Self::route_for_pending(pending);
         self.notify_ui(&route, &push).await
     }
@@ -364,18 +392,22 @@ impl PolicyStore {
 
     async fn notify_ui(&self, route: &UiRoute, payload: &UiPush) -> bool {
         let targets = self.ui_notification_targets_for(route).await;
+
         if targets.is_empty() {
             tracing::warn!(
                 kind = ?payload,
                 "policy push dropped: no matching policy UI for route"
             );
+
             return false;
         }
+
         self.send_to_targets(payload, &targets).await
     }
 
     pub(crate) async fn notify_general_ui(&self, ctx: &ResolvedRequestContext, payload: &UiPush) {
         let route = Self::route_for_context(ctx);
+
         if !self.notify_ui(&route, payload).await {
             self.reroute_orphaned_pending().await;
         }
@@ -389,6 +421,7 @@ impl PolicyStore {
         payload: &UiPush,
     ) {
         let route = Self::route_for_context(ctx);
+
         if !self.notify_ui(&route, payload).await {
             self.reroute_orphaned_pending().await;
         }
@@ -405,18 +438,22 @@ impl PolicyStore {
 
         for (id, writer) in targets {
             let mut w = writer.lock().await;
+
             if w.write_all(line.as_bytes()).await.is_ok() {
                 return true;
             }
+
             drop(w);
             let mut inner = self.inner.lock().await;
             Self::remove_ui_client_locked(&mut inner, *id);
         }
+
         false
     }
 
     pub async fn flush_pending_to_ui(&self) {
         let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
+
         for p in pending {
             self.notify_pending(&p).await;
         }
@@ -426,8 +463,8 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
-
     use agent_sandbox_core::FileAccess;
+
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,
@@ -435,6 +472,7 @@ mod tests {
     };
 
     use super::PolicyStore;
+
     use crate::store::{
         Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
@@ -460,10 +498,12 @@ mod tests {
         let (_, write) = a.into_split();
         let (read, _) = b.into_split();
         let mut inner = store.inner.lock().await;
+
         inner.ui_clients.insert(client_id, UiClient {
             session_id: session_id.into(),
             writer: Arc::new(Mutex::new(write)),
         });
+
         inner
             .ui_context_by_session
             .insert(session_id.into(), UiSessionContext {
@@ -474,6 +514,7 @@ mod tests {
                 client_id,
                 ..Default::default()
             });
+
         read
     }
 
@@ -517,9 +558,9 @@ mod tests {
         inner.insert_pending(pending);
         inner.insert_pending(pending_second);
         drop(inner);
-
         let (read_tx, read_rx) = oneshot::channel();
         let registration_store = Arc::clone(&store);
+
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let read = register_ui(&registration_store, 1, "ui-spawned", "sandbox-a").await;
@@ -535,31 +576,41 @@ mod tests {
             .await
             .expect("spawned UI registration should complete")
             .expect("registration task should send its reader");
+
         let mut received = String::new();
+
         for _ in 0..2 {
             let mut buf = [0_u8; 1024];
+
             let n = tokio::time::timeout(Duration::from_secs(1), read.read(&mut buf))
                 .await
                 .expect("matching UI should receive the pending prompt")
                 .expect("read should succeed");
+
             received.push_str(&String::from_utf8_lossy(&buf[..n]));
+
             if received.contains("net:spawn-race") && received.contains("net:spawn-race-second") {
                 break;
             }
         }
+
         assert_eq!(
             received.matches("\"id\":\"net:spawn-race\"").count(),
             1,
             "first pending prompt should be delivered exactly once: {received}",
         );
+
         assert_eq!(
             received.matches("\"id\":\"net:spawn-race-second\"").count(),
             1,
             "second pending prompt should be delivered exactly once: {received}",
         );
+
         let mut duplicate_buf = [0_u8; 1024];
+
         let duplicate =
             tokio::time::timeout(Duration::from_millis(150), read.read(&mut duplicate_buf)).await;
+
         assert!(
             duplicate.is_err(),
             "registration flush and reroute must not duplicate prompts",
@@ -572,6 +623,7 @@ mod tests {
         let _dead_read = register_ui(&store, 1, "ui-dead", "sandbox-a").await;
         let mut foreign_read = register_ui(&store, 2, "ui-foreign", "sandbox-b").await;
         let mut live_read = register_ui(&store, 3, "ui-live", "sandbox-a").await;
+
         store
             .inner
             .lock()
@@ -579,24 +631,28 @@ mod tests {
             .insert_pending(pending_network("net:reroute"));
 
         store.end_ui_session(1).await;
-
         let mut live_buf = [0u8; 1024];
+
         let live_n = tokio::time::timeout(Duration::from_secs(1), live_read.read(&mut live_buf))
             .await
             .expect("matching sandbox UI should receive rerouted network prompt")
             .expect("read should succeed");
+
         let live_msg = String::from_utf8_lossy(&live_buf[..live_n]);
+
         assert!(
             live_msg.contains("net:reroute"),
             "expected rerouted network prompt, got: {live_msg}"
         );
 
         let mut foreign_buf = [0u8; 256];
+
         let foreign = tokio::time::timeout(
             Duration::from_millis(150),
             foreign_read.read(&mut foreign_buf),
         )
         .await;
+
         assert!(
             foreign.is_err(),
             "foreign sandbox UI must not receive rerouted general prompt"
@@ -609,6 +665,7 @@ mod tests {
         let _dead_read = register_ui(&store, 1, "ui-dead", "sandbox-a").await;
         let mut foreign_read = register_ui(&store, 2, "ui-foreign", "sandbox-b").await;
         let mut live_read = register_ui(&store, 3, "ui-live", "sandbox-a").await;
+
         store
             .inner
             .lock()
@@ -616,53 +673,59 @@ mod tests {
             .insert_pending(pending_filesystem("fs:reroute"));
 
         store.end_ui_session(1).await;
-
         let mut live_buf = [0u8; 1024];
+
         let live_n = tokio::time::timeout(Duration::from_secs(1), live_read.read(&mut live_buf))
             .await
             .expect("matching sandbox UI should receive rerouted filesystem prompt")
             .expect("read should succeed");
+
         let live_msg = String::from_utf8_lossy(&live_buf[..live_n]);
+
         assert!(
             live_msg.contains("fs:reroute"),
             "expected rerouted filesystem prompt, got: {live_msg}"
         );
 
         let mut foreign_buf = [0u8; 256];
+
         let foreign = tokio::time::timeout(
             Duration::from_millis(150),
             foreign_read.read(&mut foreign_buf),
         )
         .await;
+
         assert!(
             foreign.is_err(),
             "foreign sandbox UI must not receive rerouted standalone prompt"
         );
     }
+
     #[tokio::test]
     async fn notify_pending_arbitrates_matching_ui_clients_deterministically() {
         let store = test_store();
         let mut higher_id_read = register_ui(&store, 20, "ui-higher", "sandbox-a").await;
         let mut lower_id_read = register_ui(&store, 10, "ui-lower", "sandbox-a").await;
         let pending = pending_network("net:arbitrate");
-
         store.notify_pending(&pending).await;
-
         let mut lower_buf = [0u8; 1024];
+
         let lower_n =
             tokio::time::timeout(Duration::from_secs(1), lower_id_read.read(&mut lower_buf))
                 .await
                 .expect("one matching UI should receive the network prompt")
                 .expect("lower-id UI read should succeed");
+
         let lower_msg = String::from_utf8_lossy(&lower_buf[..lower_n]);
         assert!(lower_msg.contains("net:arbitrate"));
-
         let mut higher_buf = [0u8; 1024];
+
         let higher = tokio::time::timeout(
             Duration::from_millis(150),
             higher_id_read.read(&mut higher_buf),
         )
         .await;
+
         assert!(
             higher.is_err(),
             "a pending request must not be broadcast to a second matching UI"
@@ -675,6 +738,7 @@ mod tests {
                 .await
                 .expect("repeated dispatch should use the same matching UI")
                 .expect("lower-id UI read should succeed");
+
         let lower_msg = String::from_utf8_lossy(&lower_buf[..lower_n]);
         assert!(lower_msg.contains("net:arbitrate"));
 
@@ -683,11 +747,13 @@ mod tests {
             higher_id_read.read(&mut higher_buf),
         )
         .await;
+
         assert!(
             higher.is_err(),
             "repeated dispatch must remain deterministic"
         );
     }
+
     #[tokio::test]
     async fn notify_pending_fails_over_when_lowest_id_ui_is_stale() {
         let store = test_store();
@@ -695,21 +761,23 @@ mod tests {
         drop(dead_read);
         let mut live_read = register_ui(&store, 20, "ui-live", "sandbox-a").await;
         let pending = pending_network("net:failover");
-
         store.notify_pending(&pending).await;
-
         let mut live_buf = [0u8; 1024];
+
         let live_n = tokio::time::timeout(Duration::from_secs(1), live_read.read(&mut live_buf))
             .await
             .expect("live matching UI should receive after stale-client failover")
             .expect("live UI read should succeed");
+
         let live_msg = String::from_utf8_lossy(&live_buf[..live_n]);
         assert!(live_msg.contains("net:failover"));
+
         assert!(
             !store.inner.lock().await.ui_clients.contains_key(&10),
             "stale selected UI should be removed after write failure"
         );
     }
+
     #[tokio::test]
     async fn notify_pending_recovers_other_pending_routes_after_all_targets_die() {
         let store = test_store();
@@ -718,9 +786,11 @@ mod tests {
         let mut live_read = register_ui(&store, 20, "ui-live", "sandbox-b").await;
         let dead_pending = pending_network("net:dead");
         let mut recovered_pending = pending_network("net:recovered");
+
         if let Pending::Network(network) = &mut recovered_pending {
             network.sandbox_session_id = Some("sandbox-b".into());
         }
+
         {
             let mut inner = store.inner.lock().await;
             inner.insert_pending(dead_pending.clone());
@@ -728,15 +798,17 @@ mod tests {
         }
 
         store.notify_pending(&dead_pending).await;
-
         let mut live_buf = [0u8; 1024];
+
         let live_n = tokio::time::timeout(Duration::from_secs(1), live_read.read(&mut live_buf))
             .await
             .expect("orphan recovery should notify another live pending route")
             .expect("live UI read should succeed");
+
         let live_msg = String::from_utf8_lossy(&live_buf[..live_n]);
         assert!(live_msg.contains("net:recovered"));
         assert!(!live_msg.contains("net:dead"));
+
         assert!(
             !store.inner.lock().await.ui_clients.contains_key(&10),
             "all failed UI targets should be removed before orphan recovery"

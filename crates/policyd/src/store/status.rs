@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use agent_sandbox_core::{PendingSummary, Policy, ResolvedRequestContext, StatusReply};
-
 use super::types::{Pending, PolicyStore};
 
 impl PolicyStore {
     pub async fn status(self: &Arc<Self>, ctx: ResolvedRequestContext) -> StatusReply {
         let pending = self.pending_summaries().await;
         let merged = self.merged_for_async(&ctx).await;
+
         StatusReply {
             ok: true,
             merged,
@@ -20,6 +20,7 @@ impl PolicyStore {
     pub(crate) async fn merged_for_async(self: &Arc<Self>, ctx: &ResolvedRequestContext) -> Policy {
         let store = Arc::clone(self);
         let ctx = ctx.clone();
+
         tokio::task::spawn_blocking(move || store.merged_for(&ctx))
             .await
             .unwrap_or_else(|err| {
@@ -30,6 +31,7 @@ impl PolicyStore {
 
     pub(crate) async fn pending_summaries(&self) -> Vec<PendingSummary> {
         let inner = self.inner.lock().await;
+
         inner
             .pending_values()
             .map(|p| match p {

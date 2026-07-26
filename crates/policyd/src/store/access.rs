@@ -19,6 +19,7 @@ const MAX_DENY_INODE_ENTRIES: usize = 100_000;
 
 fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u16) -> bool {
     let keys = [NetworkRuleKey::new(host, port)];
+
     bucket.iter().any(|rule| {
         rule.port == port
             && keys
@@ -43,16 +44,19 @@ fn sandbox_filesystem_static_allow_key(ctx: &ResolvedRequestContext) -> String {
     if let Some(id) = &ctx.sandbox_session_id {
         return format!("sandbox:{id}");
     }
+
     let cwd = ctx
         .paths
         .cwd()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+
     let project_root = ctx
         .paths
         .project_root()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+
     format!("ctx:{cwd}:{project_root}")
 }
 
@@ -67,11 +71,13 @@ impl PolicyStore {
         let keys = [NetworkRuleKey::new(host, port)];
         let mut inner = self.inner.lock().await;
         let matched = keys.iter().any(|k| inner.once_allow.contains(k));
+
         if matched && consume {
             for key in keys {
                 inner.once_allow.remove(&key);
             }
         }
+
         matched
     }
 
@@ -82,10 +88,13 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> bool {
         let session_ids = self.session_ids_for_context(ctx).await;
+
         if session_ids.is_empty() {
             return false;
         }
+
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|session_id| {
             inner
                 .session_allow
@@ -101,10 +110,13 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> bool {
         let session_ids = self.session_ids_for_context(ctx).await;
+
         if session_ids.is_empty() {
             return false;
         }
+
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|session_id| {
             inner
                 .session_deny
@@ -121,6 +133,7 @@ impl PolicyStore {
     ) -> bool {
         let host = normalize_host(host);
         let merged = self.merged_for(ctx);
+
         merged
             .network
             .direct
@@ -150,6 +163,7 @@ impl PolicyStore {
     ) -> bool {
         let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_sudo_deny
@@ -165,6 +179,7 @@ impl PolicyStore {
     ) -> bool {
         let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_sudo_allow
@@ -212,17 +227,21 @@ fn session_filesystem_matches(
 /// `.git/objects` after `cd` into another repo or a stale launcher root.
 fn project_roots_for_allow(ctx_root: Option<&Path>, path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+
     let mut push = |root: PathBuf| {
         if !root.as_os_str().is_empty() && !roots.iter().any(|r| r == &root) {
             roots.push(root);
         }
     };
+
     if let Some(pr) = ctx_root {
         push(pr.to_path_buf());
     }
+
     if let Some(git_root) = discover_git_project_root(path) {
         push(git_root);
     }
+
     roots
 }
 
@@ -233,9 +252,11 @@ pub(super) fn filesystem_rules_match_allow(
     ctx_root: Option<&Path>,
 ) -> bool {
     let roots = project_roots_for_allow(ctx_root, path);
+
     if roots.is_empty() {
         return rules.iter().any(|rule| rule.matches(path, access, None));
     }
+
     roots.iter().any(|root| {
         rules
             .iter()
@@ -250,9 +271,11 @@ fn session_filesystem_bucket_matches_allow(
     ctx_root: Option<&Path>,
 ) -> bool {
     let roots = project_roots_for_allow(ctx_root, path);
+
     if roots.is_empty() {
         return session_filesystem_matches(bucket, path, access, None);
     }
+
     roots
         .iter()
         .any(|root| session_filesystem_matches(bucket, path, access, Some(root)))
@@ -270,14 +293,17 @@ impl PolicyStore {
         let ctx = ctx.clone();
         let merged = self.merged_for_worker(&ctx);
         let home = ctx.paths.home();
+
         let path_match = merged
             .filesystem
             .deny
             .iter()
             .any(|rule| rule.matches(path, access, project_root));
+
         if path_match {
             return true;
         }
+
         let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
         self.deny_inode_denied(path, access, &fingerprint).await
     }
@@ -291,6 +317,7 @@ impl PolicyStore {
         let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_filesystem_deny
@@ -310,6 +337,7 @@ impl PolicyStore {
         let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_filesystem_allow
@@ -332,8 +360,10 @@ impl PolicyStore {
         let Some(identity) = InodeIdentity::from_path(path) else {
             return false;
         };
+
         let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_filesystem_allow
@@ -357,6 +387,7 @@ impl PolicyStore {
         let key = sandbox_filesystem_static_allow_key(ctx);
         let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
+
         inner
             .sandbox_filesystem_static_allow
             .get(&key)
@@ -375,7 +406,9 @@ impl PolicyStore {
         if rules.is_empty() {
             return;
         }
+
         let key = sandbox_filesystem_static_allow_key(ctx);
+
         self.inner
             .lock()
             .await
@@ -393,16 +426,20 @@ impl PolicyStore {
             let inner = self.inner.lock().await;
             Self::fingerprint_changed(&inner.deny_inode_cache, fingerprint)
         };
+
         if needs_rebuild {
             // Single-flight: concurrent checks wait here instead of each
             // launching a full recursive walk of every denied directory.
             let _rebuild_guard = self.deny_inode_rebuild.lock().await;
+
             let still_stale = {
                 let inner = self.inner.lock().await;
                 Self::fingerprint_changed(&inner.deny_inode_cache, fingerprint)
             };
+
             if still_stale {
                 let fp = fingerprint.to_vec();
+
                 // The walk can hit disk for a long time; keep it off the
                 // async runtime so other requests stay responsive.
                 match tokio::task::spawn_blocking(move || Self::rebuild_deny_inode_cache(fp)).await
@@ -410,12 +447,14 @@ impl PolicyStore {
                     Ok(new_cache) => {
                         self.inner.lock().await.deny_inode_cache = new_cache;
                     }
+
                     Err(err) => {
                         tracing::error!(error = %err, "deny inode cache rebuild panicked");
                     }
                 }
             }
         }
+
         let inner = self.inner.lock().await;
         Self::is_denied_by_inode(path, access, &inner.deny_inode_cache)
     }
@@ -429,10 +468,13 @@ impl PolicyStore {
         project_root: Option<&Path>,
     ) -> Vec<DenyFingerprint> {
         let mut fps = Vec::new();
+
         for rule in &merged.filesystem.deny {
             let expanded = expand_policy_path(&rule.path, home, project_root);
+
             if !contains_glob_syntax(&expanded.to_string_lossy()) {
                 let mtime = std::fs::metadata(&expanded).and_then(|m| m.modified()).ok();
+
                 fps.push(DenyFingerprint {
                     path: expanded,
                     access: rule.access,
@@ -440,10 +482,13 @@ impl PolicyStore {
                 });
             }
         }
+
         for rule in &merged.resources.deny {
             let expanded = expand_policy_path(&rule.path, home, project_root);
+
             if !contains_glob_syntax(&expanded.to_string_lossy()) {
                 let mtime = std::fs::metadata(&expanded).and_then(|m| m.modified()).ok();
+
                 fps.push(DenyFingerprint {
                     path: expanded,
                     access: FileAccess::All,
@@ -451,6 +496,7 @@ impl PolicyStore {
                 });
             }
         }
+
         fps.sort_by(|a, b| a.path.cmp(&b.path));
         fps
     }
@@ -472,10 +518,12 @@ impl PolicyStore {
         use std::os::unix::fs::MetadataExt;
         let mut inodes: HashMap<InodeIdentity, Vec<DenyCacheEntry>> = HashMap::new();
         let mut budget = MAX_DENY_INODE_ENTRIES;
+
         for entry in &fingerprint {
             let Ok(meta) = std::fs::metadata(&entry.path) else {
                 continue;
             };
+
             if meta.is_dir() {
                 if !Self::walk_dir_inodes(&entry.path, entry.access, &mut inodes, &mut budget) {
                     tracing::warn!(
@@ -490,12 +538,14 @@ impl PolicyStore {
                     inode: meta.ino(),
                     device: meta.dev(),
                 };
+
                 inodes.entry(identity).or_default().push(DenyCacheEntry {
                     path: entry.path.clone(),
                     access: entry.access,
                 });
             }
         }
+
         DenyInodeCache {
             inodes,
             fingerprint,
@@ -513,32 +563,39 @@ impl PolicyStore {
         budget: &mut usize,
     ) -> bool {
         use std::os::unix::fs::MetadataExt;
+
         let Ok(entries) = std::fs::read_dir(dir) else {
             return true;
         };
+
         for entry in entries.flatten() {
             if *budget == 0 {
                 return false;
             }
+
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
+
             if meta.is_dir() {
                 if !Self::walk_dir_inodes(&entry.path(), access, inodes, budget) {
                     return false;
                 }
             } else {
                 *budget -= 1;
+
                 let identity = InodeIdentity {
                     inode: meta.ino(),
                     device: meta.dev(),
                 };
+
                 inodes.entry(identity).or_default().push(DenyCacheEntry {
                     path: entry.path(),
                     access,
                 });
             }
         }
+
         true
     }
 
@@ -589,10 +646,13 @@ fn is_protected_host_ipc_socket(kind: ResourceKind, path: &Path, access: Resourc
     {
         return false;
     }
+
     let path_string = path.to_string_lossy();
+
     if is_protected_abstract_socket(&path_string) {
         return true;
     }
+
     if path == Path::new("/run/dbus")
         || path.starts_with("/run/dbus/")
         || path == Path::new("/run/systemd")
@@ -600,7 +660,9 @@ fn is_protected_host_ipc_socket(kind: ResourceKind, path: &Path, access: Resourc
     {
         return true;
     }
+
     let mut components = path.components();
+
     matches!(
         (
             components.next(),
@@ -633,20 +695,25 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
         let home = ctx.paths.home();
+
         if is_protected_host_ipc_socket(kind, path, access) {
             return true;
         }
+
         let path_match = merged
             .resources
             .deny
             .iter()
             .any(|rule| rule.matches(kind, path, access, project_root));
+
         if path_match {
             return true;
         }
+
         // Hardlink defense: check if the request path's inode matches any
         // resource deny rule target.
         let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+
         self.deny_inode_denied(path, FileAccess::All, &fingerprint)
             .await
     }
@@ -660,6 +727,7 @@ impl PolicyStore {
     ) -> bool {
         let project_root = ctx.paths.project_root();
         let merged = self.merged_for(ctx);
+
         merged
             .resources
             .allow
@@ -676,6 +744,7 @@ impl PolicyStore {
     ) -> bool {
         let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_resource_deny
@@ -693,6 +762,7 @@ impl PolicyStore {
     ) -> bool {
         let session_ids = self.standalone_session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_resource_allow
@@ -708,6 +778,7 @@ impl PolicyStore {
     ) -> bool {
         let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_dbus_deny
@@ -723,6 +794,7 @@ impl PolicyStore {
     ) -> bool {
         let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
+
         session_ids.iter().any(|sid| {
             inner
                 .session_dbus_allow
@@ -742,12 +814,14 @@ mod tests {
         ResourceKind, SandboxPaths, SocketAccess, Verdict, VerdictSource, atomic_write_policy,
         trusted_project_policy_path,
     };
+
     use tokio::{net::UnixStream, sync::Mutex};
 
     use super::{
         is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
         session_sudo_matches,
     };
+
     use crate::store::{UiSessionContext, types::UiClient};
 
     #[test]
@@ -755,12 +829,14 @@ mod tests {
         let bucket = HashSet::from([FilesystemRuleKey::new("./.git", FileAccess::ReadWrite)]);
         let project = Path::new("/home/user/dotfiles");
         let config = Path::new("/home/user/dotfiles/.git/config");
+
         assert!(session_filesystem_matches(
             &bucket,
             config,
             FileAccess::ReadWrite,
             Some(project),
         ));
+
         assert!(!session_filesystem_matches(
             &bucket,
             config,
@@ -786,28 +862,33 @@ mod tests {
                 Path::new(path),
                 ResourceAccess::Socket(SocketAccess::Connect)
             ));
+
             assert!(is_protected_host_ipc_socket(
                 ResourceKind::UnixSocket,
                 Path::new(path),
                 ResourceAccess::Socket(SocketAccess::Send)
             ));
         }
+
         assert!(!is_protected_host_ipc_socket(
             ResourceKind::UnixSocket,
             Path::new("@abstract:nv_target_process_1234"),
             ResourceAccess::Socket(SocketAccess::Connect)
         ));
+
         assert!(!is_protected_host_ipc_socket(
             ResourceKind::UnixSocket,
             Path::new("/run/user/1000/portal-bus"),
             ResourceAccess::Socket(SocketAccess::Connect)
         ));
+
         assert!(!is_protected_host_ipc_socket(
             ResourceKind::Device,
             Path::new("/run/user/1000/bus"),
             ResourceAccess::Device(DeviceAccess::Read)
         ));
     }
+
     #[test]
     fn session_network_matches_wildcard_hosts() {
         let bucket = HashSet::from([NetworkRuleKey::new("*.baz.com", 443)]);
@@ -818,13 +899,18 @@ mod tests {
     #[test]
     fn session_network_matches_ipv4_prefix_wildcard() {
         let bucket = HashSet::from([NetworkRuleKey::new("34.230.40.*", 443)]);
+
         // Exact match within the prefix range
         assert!(session_network_matches(&bucket, "34.230.40.69", 443));
+
         assert!(session_network_matches(&bucket, "34.230.40.1", 443));
+
         // Different subnet: must NOT match
         assert!(!session_network_matches(&bucket, "34.230.41.69", 443));
+
         // Wrong port
         assert!(!session_network_matches(&bucket, "34.230.40.69", 80));
+
         // Partial octet match rejected
         assert!(!session_network_matches(&bucket, "34.230.4.1", 443));
     }
@@ -843,21 +929,27 @@ mod tests {
         // `<project_root>/.agent-sandbox/policy.json`. A deny
         // rule there is honored by the merged policy.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+
         std::fs::create_dir_all(project_root.join(".agent-sandbox"))
             .expect("create .agent-sandbox dir");
+
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
+
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
         let mut policy = Policy::default();
+
         policy
             .network
             .direct
             .deny
             .push(NetworkRule::new("34.230.40.*", 443, "test"));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -871,6 +963,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
@@ -884,15 +977,19 @@ mod tests {
     #[test]
     fn session_network_matches_ipv6_prefix_wildcard() {
         let bucket = HashSet::from([NetworkRuleKey::new("2001:db8:*", 443)]);
+
         // Exact match within the prefix range
         assert!(session_network_matches(&bucket, "2001:db8::1", 443));
+
         assert!(session_network_matches(
             &bucket,
             "2001:db8:0:0:0:0:0:1",
             443
         ));
+
         // Different subnet: must NOT match
         assert!(!session_network_matches(&bucket, "2001:db9::1", 443));
+
         // Wrong port
         assert!(!session_network_matches(&bucket, "2001:db8::1", 80));
     }
@@ -901,21 +998,27 @@ mod tests {
     async fn trusted_project_policy_ipv6_deny_applies() {
         // IPv6 deny rules in the trusted per-project policy file apply.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+
         std::fs::create_dir_all(project_root.join(".agent-sandbox"))
             .expect("create .agent-sandbox dir");
+
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
+
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
         let mut policy = Policy::default();
+
         policy
             .network
             .direct
             .deny
             .push(NetworkRule::new("2001:db8:*", 443, "test"));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -929,6 +1032,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
@@ -941,11 +1045,13 @@ mod tests {
     #[test]
     fn session_sudo_matches_prefixes() {
         let bucket = HashSet::from([vec![String::from("sudo"), String::from("apt")]]);
+
         let argv = vec![
             String::from("sudo"),
             String::from("apt"),
             String::from("update"),
         ];
+
         assert!(session_sudo_matches(&bucket, &argv));
     }
 
@@ -955,21 +1061,27 @@ mod tests {
         // every merge. Rewriting the file with an empty policy removes the
         // deny rule the next time the policy is merged.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+
         std::fs::create_dir_all(project_root.join(".agent-sandbox"))
             .expect("create .agent-sandbox dir");
+
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&home).expect("create home dir");
+
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
         let mut policy = Policy::default();
+
         policy
             .network
             .direct
             .deny
             .push(NetworkRule::new("example.com", 443, "test"));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -983,6 +1095,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
@@ -991,7 +1104,6 @@ mod tests {
 
         assert!(store.policy_denied("example.com", 443, &ctx));
         assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
-
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
 
@@ -1005,20 +1117,26 @@ mod tests {
         // The repo-local `.agent-sandbox/policy.json` file is loaded by the
         // policy daemon. A deny rule there is honored by the merged policy.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let project_root = dir.path().join("repo");
         let home = dir.path().join("home");
+
         std::fs::create_dir_all(project_root.join(".agent-sandbox"))
             .expect("create .agent-sandbox dir");
+
         std::fs::create_dir_all(&home).expect("create home dir");
+
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
 
         let mut policy = Policy::default();
+
         policy
             .network
             .direct
             .deny
             .push(NetworkRule::new("34.230.40.*", 443, "test"));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1032,6 +1150,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
@@ -1052,13 +1171,14 @@ mod tests {
         std::fs::create_dir_all(&project_root).expect("create project root dir");
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         let policy_path = policy_dir.join("policy.json");
-
         let mut policy = Policy::default();
+
         policy
             .network
             .direct
             .allow
             .push(NetworkRule::new("example.com", 443, "test"));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1072,6 +1192,7 @@ mod tests {
 
         let project_root = project_root.to_string_lossy().into_owned();
         let home = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
@@ -1079,10 +1200,8 @@ mod tests {
         };
 
         assert!(store.is_allowed("example.com", 443, &ctx, false).await);
-
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
-
         assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
     }
 
@@ -1096,13 +1215,14 @@ mod tests {
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         let policy_path = policy_dir.join("policy.json");
         let config_path = project_root.join(".git/config");
-
         let mut policy = Policy::default();
+
         policy.filesystem.allow.push(FilesystemRule::new(
             "./.git",
             FileAccess::ReadWrite,
             "global",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1116,11 +1236,13 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
+
         let with_root = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
+
         let without_root = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, ""),
             ids: ProcessIds::default(),
@@ -1134,6 +1256,7 @@ mod tests {
             Some(Verdict::allowed(VerdictSource::policy())),
             "global ./.git should match .git/config when project_root is set"
         );
+
         assert_eq!(
             store
                 .filesystem_allow_source(&config_path, FileAccess::ReadWrite, &without_root,)
@@ -1155,13 +1278,14 @@ mod tests {
         let policy_path = policy_dir.join("policy.json");
         let head_path = project_root.join(".git/HEAD");
         std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
-
         let mut policy = Policy::default();
+
         policy.filesystem.allow.push(FilesystemRule::new(
             "./.git/",
             FileAccess::ReadWrite,
             "global",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1175,11 +1299,13 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
+
         let with_root = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
         };
+
         let without_root = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, ""),
             ids: ProcessIds::default(),
@@ -1193,6 +1319,7 @@ mod tests {
             Some(Verdict::allowed(VerdictSource::policy())),
             "./.git/ prefix should match .git/HEAD when project_root is set"
         );
+
         assert_eq!(
             store
                 .filesystem_allow_source(&head_path, FileAccess::Read, &without_root,)
@@ -1213,13 +1340,14 @@ mod tests {
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         let policy_path = policy_dir.join("policy.json");
         let objects_path = project_root.join(".git/objects/pack");
-
         let mut policy = Policy::default();
+
         policy.filesystem.allow.push(FilesystemRule::new(
             "./.git",
             FileAccess::ReadWrite,
             "global",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1232,6 +1360,7 @@ mod tests {
         ));
 
         let home_s = home.to_string_lossy().into_owned();
+
         let stale_root = ResolvedRequestContext {
             paths: SandboxPaths::new("/tmp", &home_s, "/tmp"),
             ids: ProcessIds::default(),
@@ -1258,13 +1387,14 @@ mod tests {
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         let policy_path = policy_dir.join("policy.json");
         let pack_dir = project_root.join(".git/objects/pack");
-
         let mut policy = Policy::default();
+
         policy.filesystem.allow.push(FilesystemRule::new(
             "./.git",
             FileAccess::ReadWrite,
             "global",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1278,6 +1408,7 @@ mod tests {
 
         let root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
@@ -1303,13 +1434,14 @@ mod tests {
         std::fs::create_dir_all(&policy_dir).expect("create policy dir");
         let policy_path = policy_dir.join("policy.json");
         let pack_dir = project_root.join(".git/objects/pack");
-
         let mut policy = Policy::default();
+
         policy.filesystem.allow.push(FilesystemRule::new(
             "./.git",
             FileAccess::ReadWrite,
             "global",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1323,6 +1455,7 @@ mod tests {
 
         let session_id = "sandbox-git-session";
         let ui_session_id = "ui-git-session";
+
         {
             let (a, b) = tokio::net::UnixStream::pair().expect("unix stream pair");
             drop(a);
@@ -1343,6 +1476,7 @@ mod tests {
                 },
             );
         }
+
         {
             let mut inner = store.inner.lock().await;
             let super::super::types::PolicyDecisionState {
@@ -1363,6 +1497,7 @@ mod tests {
 
         let home_s = home.to_string_lossy().into_owned();
         let root_s = project_root.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
@@ -1391,12 +1526,15 @@ mod tests {
 
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
+
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             license_path.clone(),
             FileAccess::All,
             "deny license",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1410,11 +1548,13 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-test".into()),
         };
+
         {
             let mut inner = store.inner.lock().await;
             inner
@@ -1449,12 +1589,15 @@ mod tests {
 
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
+
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             secret_path.clone(),
             FileAccess::All,
             "deny secret",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1468,11 +1611,13 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-inode".into()),
         };
+
         {
             let mut inner = store.inner.lock().await;
             inner
@@ -1495,6 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn infrastructure_paths_are_allowed_without_merged_policy() {
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
             dir.path().join("sock"),
             dir.path().join("sandbox.sock"),
@@ -1503,7 +1649,9 @@ mod tests {
             std::time::Duration::from_mins(1),
             false,
         ));
+
         let ctx = ResolvedRequestContext::default();
+
         assert_eq!(
             store
                 .filesystem_allow_source(
@@ -1537,11 +1685,13 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-allow".into()),
         };
+
         {
             let mut inner = store.inner.lock().await;
             inner
@@ -1577,12 +1727,15 @@ mod tests {
 
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
+
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             secret_path.clone(),
             FileAccess::All,
             "deny secret",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1596,11 +1749,13 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob".into()),
         };
+
         {
             let mut inner = store.inner.lock().await;
             inner
@@ -1642,11 +1797,13 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob-allow".into()),
         };
+
         {
             let mut inner = store.inner.lock().await;
             inner.sandbox_filesystem_static_allow.insert(
@@ -1680,12 +1837,15 @@ mod tests {
 
         let policy_path =
             trusted_project_policy_path(&project_root).expect("trusted project policy path");
+
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             license_path.clone(),
             FileAccess::All,
             "deny license",
         ));
+
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -1699,11 +1859,13 @@ mod tests {
 
         let project_root_s = project_root.to_string_lossy().into_owned();
         let home_s = home.to_string_lossy().into_owned();
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-broad-glob-deny".into()),
         };
+
         {
             let mut inner = store.inner.lock().await;
             inner.sandbox_filesystem_static_allow.insert(
@@ -1724,8 +1886,10 @@ mod tests {
             "broad user-defined globs must not bypass concrete policy deny"
         );
     }
+
     async fn dbus_session_store() -> (super::super::types::PolicyStore, ResolvedRequestContext) {
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
             dir.path().join("sock"),
             dir.path().join("sandbox.sock"),
@@ -1734,13 +1898,16 @@ mod tests {
             std::time::Duration::from_mins(1),
             false,
         ));
+
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-dbus".into()),
         };
+
         let (stream, _) = UnixStream::pair().expect("unix stream pair");
         let (_, writer) = stream.into_split();
+
         {
             let mut inner = store.inner.lock().await;
             inner.ui_clients.insert(1, UiClient {
@@ -1757,12 +1924,14 @@ mod tests {
                     ..Default::default()
                 });
         }
+
         (store, ctx)
     }
 
     #[tokio::test]
     async fn dbus_session_allow_matches_exact_and_wildcard_targets() {
         let (store, ctx) = dbus_session_store().await;
+
         let concrete = DbusTarget::session(
             "org.example.Service",
             "/org/example/Object",
@@ -1772,6 +1941,7 @@ mod tests {
             "s",
             Vec::new(),
         );
+
         let other = DbusTarget::session(
             "org.example.Other",
             "/org/example/Object",
@@ -1789,6 +1959,7 @@ mod tests {
                 .session_dbus_allow
                 .insert("general-ui".into(), HashSet::from([concrete.clone()]));
         }
+
         assert!(store.session_dbus_allowed(&concrete, &ctx).await);
         assert!(!store.session_dbus_allowed(&other, &ctx).await);
 
@@ -1803,12 +1974,14 @@ mod tests {
             "*",
             Vec::new(),
         );
+
         {
             let mut inner = store.inner.lock().await;
             inner
                 .session_dbus_allow
                 .insert("general-ui".into(), HashSet::from([wildcard]));
         }
+
         assert!(store.session_dbus_allowed(&concrete, &ctx).await);
         assert!(!store.session_dbus_allowed(&other, &ctx).await);
     }

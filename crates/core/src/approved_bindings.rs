@@ -18,7 +18,6 @@ use crate::{
 
 pub const APPROVED_BINDINGS_PATH: &str = "/run/agent-sandbox/approved-bindings.json";
 pub const APPROVED_BINDINGS_TTL_SECS: u64 = 30 * 24 * 60 * 60;
-
 const FILE_VERSION: u32 = 1;
 const MAX_ALIASES_PER_IP: usize = 16;
 
@@ -61,12 +60,15 @@ impl ApprovedBindings {
         let Ok(raw) = std::fs::read_to_string(&self.path) else {
             return;
         };
+
         let Ok(file) = serde_json::from_str::<BindingsFile>(&raw) else {
             return;
         };
+
         if file.version != FILE_VERSION {
             return;
         }
+
         let wall_now = unix_now();
         let live_now = Instant::now();
         self.entries.clear();
@@ -146,6 +148,7 @@ impl ApprovedBindings {
         let Some(entry) = self.entries.get_mut(ip) else {
             return;
         };
+
         evict_oldest(&mut entry.hosts, MAX_ALIASES_PER_IP, |expires| *expires);
     }
 
@@ -181,6 +184,7 @@ impl ApprovedBindings {
             && let Ok(file) = serde_json::from_str::<BindingsFile>(&raw)
         {
             let wall_now = unix_now();
+
             for (ip, item) in file.entries {
                 let mut merged: HashMap<String, f64> = item
                     .hosts
@@ -206,6 +210,7 @@ impl ApprovedBindings {
             version: FILE_VERSION,
             entries,
         };
+
         write_json_atomic(&self.path, &snapshot)
     }
 }
@@ -254,7 +259,6 @@ mod tests {
         let mut writer = ApprovedBindings::load(&path);
         writer.record("chatgpt.com", "104.18.32.47");
         writer.save().expect("save bindings");
-
         let reader = ApprovedBindings::load(&path);
 
         assert_eq!(reader.aliases("104.18.32.47"), vec![
@@ -270,7 +274,6 @@ mod tests {
         let mut bindings = ApprovedBindings::load(&path);
         bindings.record("chatgpt.com", "104.18.32.47");
         bindings.save().expect("save bindings");
-
         let raw = std::fs::read_to_string(&path).expect("read bindings file");
         let file: BindingsFile = serde_json::from_str(&raw).expect("parse bindings json");
 
@@ -294,11 +297,9 @@ mod tests {
         let mut writer_a = ApprovedBindings::load(&path);
         writer_a.record("chatgpt.com", "104.18.32.47");
         writer_a.save().expect("save writer a");
-
         let mut writer_b = ApprovedBindings::load(&path);
         writer_b.record("example.com", "93.184.216.34");
         writer_b.save().expect("save writer b");
-
         let raw = std::fs::read_to_string(&path).expect("read bindings file");
         let file: BindingsFile = serde_json::from_str(&raw).expect("parse bindings json");
         assert_eq!(file.entries.len(), 2);

@@ -9,7 +9,6 @@ use std::{
 };
 
 use tracing::warn;
-
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_REGISTRY: &str = "/run/agent-sandbox/cgroup-freeze";
 
@@ -70,9 +69,11 @@ impl CgroupFreezeManager {
     fn new_with_recovery(recover: bool) -> Self {
         let registry = std::env::var_os("AGENT_SANDBOX_CGROUP_FREEZE_STATE")
             .map_or_else(|| PathBuf::from(DEFAULT_REGISTRY), PathBuf::from);
+
         if recover && let Err(error) = thaw_stale_registry(&registry) {
             warn!(%error, "failed to recover stale cgroup freeze registry");
         }
+
         Self {
             state: Arc::new(Mutex::new(FreezeState {
                 holds: HashMap::new(),
@@ -84,6 +85,7 @@ impl CgroupFreezeManager {
     pub fn cleanup_default_registry() -> Result<(), CgroupFreezeError> {
         let registry = std::env::var_os("AGENT_SANDBOX_CGROUP_FREEZE_STATE")
             .map_or_else(|| PathBuf::from(DEFAULT_REGISTRY), PathBuf::from);
+
         thaw_stale_registry(&registry)
     }
 
@@ -97,36 +99,45 @@ impl CgroupFreezeManager {
         let Some(pid) = pid else {
             return Ok(None);
         };
+
         let path = cgroup_for_pid(pid, expected_uid)?;
+
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         if state.holds.contains_key(&path) {
             *state
                 .holds
                 .get_mut(&path)
                 .expect("cgroup hold exists after contains_key") += 1;
+
             if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
                 *state
                     .holds
                     .get_mut(&path)
                     .expect("cgroup hold exists after failed persistence") -= 1;
+
                 return Err(error);
             }
         } else {
             state.holds.insert(path.clone(), 1);
+
             if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
                 state.holds.remove(&path);
                 return Err(error);
             }
+
             if let Err(error) = set_frozen(&path, true) {
                 state.holds.remove(&path);
                 let _ = persist_registry(&state.registry, state.holds.keys());
                 return Err(error);
             }
         }
+
         drop(state);
+
         Ok(Some(CgroupFreezeHold {
             manager: self.clone(),
             path: Some(path),
@@ -138,10 +149,12 @@ impl CgroupFreezeManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         match state.holds.get(path).copied() {
             Some(count) if count > 1 => {
                 state.holds.insert(path.to_path_buf(), count - 1);
             }
+
             Some(1) => match set_frozen(path, false) {
                 Ok(()) => {
                     state.holds.remove(path);
@@ -154,8 +167,10 @@ impl CgroupFreezeManager {
                     );
                 }
             },
+
             _ => {}
         }
+
         if let Err(error) = persist_registry(&state.registry, state.holds.keys()) {
             warn!(%error, "failed to persist cgroup freeze state after release");
         }
@@ -189,6 +204,7 @@ impl Drop for CgroupFreezeHold {
 fn cgroup_for_pid(pid: u32, expected_uid: Option<u32>) -> Result<PathBuf, CgroupFreezeError> {
     if let Some(expected_uid) = expected_uid {
         let actual_uid = process_uid(pid)?;
+
         if actual_uid != expected_uid {
             return Err(CgroupFreezeError::WrongOwner {
                 pid,
@@ -197,28 +213,36 @@ fn cgroup_for_pid(pid: u32, expected_uid: Option<u32>) -> Result<PathBuf, Cgroup
             });
         }
     }
+
     let proc_path = format!("/proc/{pid}/cgroup");
+
     let contents = fs::read_to_string(&proc_path)
         .map_err(|source| CgroupFreezeError::ProcessCgroup { pid, source })?;
+
     let Some(relative) = contents.lines().find_map(|line| {
         let (hierarchy, path) = line.split_once("::")?;
         (hierarchy == "0").then_some(path)
     }) else {
         return Err(CgroupFreezeError::NotCgroupV2 { pid });
     };
+
     let path = Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/'));
+
     if !is_agent_scope(&path) {
         return Err(CgroupFreezeError::UnmanagedScope { pid, path });
     }
+
     if !path.join("cgroup.freeze").is_file() {
         return Err(CgroupFreezeError::InvalidPath(path));
     }
+
     Ok(path)
 }
 
 fn process_uid(pid: u32) -> Result<u32, CgroupFreezeError> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|source| CgroupFreezeError::ProcessCgroup { pid, source })?;
+
     let uid = status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
@@ -228,12 +252,14 @@ fn process_uid(pid: u32) -> Result<u32, CgroupFreezeError> {
             pid,
             source: io::Error::new(io::ErrorKind::InvalidData, "missing process uid"),
         })?;
+
     Ok(uid)
 }
 
 fn is_agent_scope(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
+
         name.strip_prefix("agent-sandbox-").is_some_and(|suffix| {
             Path::new(suffix)
                 .extension()
@@ -244,6 +270,7 @@ fn is_agent_scope(path: &Path) -> bool {
 
 fn set_frozen(path: &Path, frozen: bool) -> Result<(), CgroupFreezeError> {
     let freeze_path = path.join("cgroup.freeze");
+
     fs::write(&freeze_path, if frozen { "1" } else { "0" }).map_err(|source| {
         CgroupFreezeError::Freeze {
             path: path.to_path_buf(),
@@ -262,11 +289,14 @@ fn persist_registry<'a>(
             "registry has no parent",
         )));
     };
+
     fs::create_dir_all(parent).map_err(CgroupFreezeError::Registry)?;
     let mut contents = String::new();
+
     for path in paths {
         writeln!(&mut contents, "{}", path.display()).expect("writing to String cannot fail");
     }
+
     let tmp = registry.with_extension("tmp");
     fs::write(&tmp, contents).map_err(CgroupFreezeError::Registry)?;
     fs::rename(tmp, registry).map_err(CgroupFreezeError::Registry)
@@ -278,11 +308,14 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(CgroupFreezeError::Registry(error)),
     };
+
     let mut first_error = None;
+
     for path in contents.lines().map(Path::new) {
         if !path.starts_with(CGROUP_ROOT) {
             continue;
         }
+
         if let Err(error) = set_frozen(path, false)
             && !matches!(error, CgroupFreezeError::Freeze { ref source, .. } if source.kind() == io::ErrorKind::NotFound)
             && first_error.is_none()
@@ -290,9 +323,11 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
             first_error = Some(error);
         }
     }
+
     if let Some(error) = first_error {
         return Err(error);
     }
+
     match fs::remove_file(registry) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -303,7 +338,6 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
-
     use super::*;
 
     fn manager_for(path: &Path, registry: &Path, count: usize) -> CgroupFreezeManager {
@@ -322,13 +356,15 @@ mod tests {
         fs::create_dir(&cgroup).expect("cgroup directory");
         fs::write(cgroup.join("cgroup.freeze"), "1").expect("freeze file");
         let manager = manager_for(&cgroup, &dir.path().join("state"), 2);
-
         manager.release(&cgroup);
+
         assert_eq!(
             fs::read_to_string(cgroup.join("cgroup.freeze")).unwrap(),
             "1"
         );
+
         manager.release(&cgroup);
+
         assert_eq!(
             fs::read_to_string(cgroup.join("cgroup.freeze")).unwrap(),
             "0"
@@ -341,9 +377,9 @@ mod tests {
         let cgroup = dir.path().join("missing");
         let registry = dir.path().join("state");
         let manager = manager_for(&cgroup, &registry, 1);
-
         manager.release(&cgroup);
         assert!(registry.exists());
+
         assert_eq!(
             fs::read_to_string(registry).unwrap().trim(),
             cgroup.display().to_string()
@@ -354,6 +390,7 @@ mod tests {
     fn stale_registry_cleanup_removes_missing_cgroup_entries() {
         let dir = tempdir().expect("temporary directory");
         let registry = dir.path().join("state");
+
         fs::write(
             &registry,
             "/sys/fs/cgroup/agent-sandbox-freeze-test-missing.scope\n",
@@ -361,7 +398,6 @@ mod tests {
         .expect("registry");
 
         thaw_stale_registry(&registry).expect("missing cgroup is already thawed");
-
         assert!(!registry.exists());
     }
 }

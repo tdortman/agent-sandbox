@@ -1,5 +1,4 @@
 use std::{path::Path, time::Duration};
-
 use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
 use tracing::info;
 
@@ -25,11 +24,13 @@ pub async fn resolve_choice(
     let Some(choice) = choice else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     if choice.scope == ApprovalScope::Session && session_id.is_none() {
         let noun = match action {
             PromptAction::Allow => "approval",
             PromptAction::Deny => "deny",
         };
+
         return Err(UiCliError::Register(format!(
             "session {noun} unavailable (policy UI not connected yet)"
         )));
@@ -37,6 +38,7 @@ pub async fn resolve_choice(
 
     let mut ctx = RequestContext::from(paths);
     ctx.sandbox_session_id = sandbox_session_id.map(str::to_owned);
+
     let req = match action {
         PromptAction::Allow => RpcRequest::Approve {
             id: id.to_string(),
@@ -55,7 +57,9 @@ pub async fn resolve_choice(
             ctx,
         },
     };
+
     let resp = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await?;
+
     match resp {
         RpcReply::Error(e) => {
             let verb = match action {
@@ -64,6 +68,7 @@ pub async fn resolve_choice(
             };
             eprintln!("agent-sandbox: {verb} failed ({})", e.error);
         }
+
         RpcReply::ScopeAction(s) if s.path().is_some() => {
             eprintln!(
                 "Project policy saved to {}.",
@@ -71,8 +76,10 @@ pub async fn resolve_choice(
                     .map_or_else(String::new, |p| p.display().to_string())
             );
         }
+
         _ => {}
     }
+
     Ok(())
 }
 
@@ -88,6 +95,7 @@ pub async fn deny_cancellation(
     info!(request_id = %id, "prompt cancelled by user; sending one-time deny");
     let mut ctx = RequestContext::from(paths);
     ctx.sandbox_session_id = sandbox_session_id.map(str::to_owned);
+
     let req = RpcRequest::Deny {
         id: id.to_string(),
         scope: ApprovalScope::Once,
@@ -96,15 +104,18 @@ pub async fn deny_cancellation(
         comment: None,
         ctx,
     };
+
     if let Err(err) = agent_sandbox_core::policy_rpc(socket, req, Duration::from_mins(1)).await {
         eprintln!("agent-sandbox: cancel-deny failed ({err})");
     }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::format_elevation_title;
+
     #[test]
     fn format_elevation_title_keeps_full_long_argv() {
         let argv: Vec<String> = std::iter::once("id".to_string())
@@ -113,12 +124,15 @@ mod tests {
                 20,
             ))
             .collect();
+
         let title = format_elevation_title(&argv);
         let expected_cmd = argv.join(" ");
+
         assert!(
             title.contains(&expected_cmd),
             "title must include the full command; got {title}"
         );
+
         assert!(!title.ends_with("..."), "title must not end with ellipsis");
         assert!(title.len() > 200, "long argv should produce a long title");
     }
@@ -134,13 +148,17 @@ mod tests {
             "adsfsdafsdafdasadsfsdafsdafsadfasd".repeat(20),
             "BLOB=".to_string() + &"a".repeat(500),
         ];
+
         let title = format_elevation_title(&argv);
+
         assert!(
             !title.contains('\n'),
             "CLI must not insert newlines; the dialog reflows. got {title}"
         );
+
         assert!(!title.ends_with("..."), "title must not end with ellipsis");
         let expected = argv.join(" ");
+
         assert!(
             title.contains(&expected),
             "title must contain the full command verbatim"

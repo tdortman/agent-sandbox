@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-
 use agent_sandbox_core::{DbusBus, rpc::RequestContext};
 use agent_sandbox_dbus_proxy::{RelayConfig, run};
 use clap::Parser;
@@ -51,6 +50,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
     let context = RequestContext {
         cwd: args.cwd,
         home: args.home,
@@ -59,13 +59,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uid: args.uid,
         sandbox_session_id: args.sandbox_session_id,
     };
+
     let mut config = RelayConfig::new(args.listen, args.upstream_address, args.policy_socket);
     config.context = context;
+
     config.bus = if args.bus == "system" {
         DbusBus::System
     } else {
         DbusBus::Session
     };
+
     run(config).await?;
     Ok(())
 }

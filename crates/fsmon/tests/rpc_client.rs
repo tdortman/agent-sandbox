@@ -8,6 +8,7 @@ use std::{
 use agent_sandbox_core::{
     FileAccess, FilesystemMonitorReply, FilesystemRule, RequestContext, RpcReply,
 };
+
 use agent_sandbox_fsmon::rpc_client::start_monitor;
 
 #[test]
@@ -16,8 +17,10 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
         "agent-sandbox-fsmon-start-{}.sock",
         std::process::id()
     ));
+
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept client");
         let mut request = String::new();
@@ -33,7 +36,6 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
         assert_eq!(request["ctx"]["pid"], std::process::id());
         assert_eq!(request["static_allow"][0]["path"], "/workspace");
         assert_eq!(request["static_allow"][0]["access"], "write");
-
         let reply = RpcReply::FilesystemMonitor(FilesystemMonitorReply::active());
 
         writeln!(
@@ -60,7 +62,6 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
     let reply = start_monitor(&socket_path, ctx, rules).expect("start monitor RPC");
     assert!(reply.ok);
     assert!(reply.active);
-
     server.join().expect("server thread");
     std::fs::remove_file(socket_path).expect("remove test socket");
 }

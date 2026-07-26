@@ -7,11 +7,10 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as DeError, SeqAccess, Visitor},
 };
+
 use thiserror::Error;
 use url::Url;
-
 use crate::hosts::{build_glob, normalize_dns_name};
-
 const MAX_METHOD_BYTES: usize = 64;
 
 /// A validated HTTP method token.
@@ -29,9 +28,11 @@ impl HttpMethod {
         if value.is_empty() || value.len() > MAX_METHOD_BYTES {
             return Err(HttpParseError::InvalidMethod);
         }
+
         if !value.bytes().all(is_method_byte) {
             return Err(HttpParseError::InvalidMethod);
         }
+
         Ok(Self(value.into()))
     }
 
@@ -90,12 +91,14 @@ impl HttpMethodMatcher {
             .iter()
             .map(|method| HttpMethod::parse(method))
             .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self::from_http_methods(methods))
     }
 
     fn from_http_methods(mut methods: Vec<HttpMethod>) -> Self {
         methods.sort();
         methods.dedup();
+
         match methods.as_slice() {
             [] => Self::All,
             [method] => Self::Exact(method.clone()),
@@ -119,10 +122,13 @@ impl HttpMethodMatcher {
             (Self::All, _) => true,
             (_, Self::All) => false,
             (Self::Exact(left), Self::Exact(right)) => left == right,
+
             (Self::Exact(left), Self::AnyOf(right)) => {
                 !right.is_empty() && right.iter().all(|method| method == left)
             }
+
             (Self::AnyOf(left), Self::Exact(right)) => left.iter().any(|method| method == right),
+
             (Self::AnyOf(left), Self::AnyOf(right)) => {
                 !right.is_empty() && right.iter().all(|method| left.contains(method))
             }
@@ -135,6 +141,7 @@ impl HttpMethodMatcher {
         if matches!(self, Self::All) || matches!(other, Self::All) {
             return Self::All;
         }
+
         let mut methods = self.to_methods();
         methods.extend(other.to_methods());
         Self::from_http_methods(methods)
@@ -209,6 +216,7 @@ impl<'de> Visitor<'de> for HttpMethodMatcherVisitor {
     {
         let methods =
             Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(sequence))?;
+
         HttpMethodMatcher::from_methods(&methods).map_err(A::Error::custom)
     }
 }
@@ -295,12 +303,15 @@ impl HttpHost {
     /// cannot be normalized as an IP address or DNS name.
     pub fn parse(host: &str) -> Result<Self, HttpParseError> {
         let host = host.trim();
+
         if host.is_empty() {
             return Err(HttpParseError::InvalidAuthority);
         }
+
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(Self::Ip(ip));
         }
+
         let normalized = normalize_dns_name(host).map_err(|_| HttpParseError::InvalidAuthority)?;
         Ok(Self::Dns(normalized.into_boxed_str()))
     }
@@ -341,22 +352,29 @@ impl HttpAuthority {
         {
             return Err(HttpParseError::InvalidAuthority);
         }
+
         let candidate = format!("{}://{authority}/", scheme.as_str());
         let parsed = Url::parse(&candidate).map_err(|_| HttpParseError::InvalidAuthority)?;
+
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(HttpParseError::CredentialsNotAllowed);
         }
+
         let host = parsed.host_str().ok_or(HttpParseError::InvalidAuthority)?;
+
         let host = host
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
             .unwrap_or(host);
+
         let port = parsed
             .port_or_known_default()
             .ok_or(HttpParseError::InvalidAuthority)?;
+
         if port == 0 || parsed.port() == Some(0) {
             return Err(HttpParseError::InvalidPort);
         }
+
         Ok(Self {
             host: HttpHost::parse(host)?,
             port: NonZeroU16::new(port).ok_or(HttpParseError::InvalidPort)?,
@@ -389,6 +407,7 @@ impl HttpAuthority {
         } else {
             self.host.to_string()
         };
+
         if self.is_default_port(scheme) {
             host
         } else {
@@ -412,35 +431,46 @@ impl NormalizedHttpPath {
         if raw.is_empty() {
             return Ok(Self("/".into()));
         }
+
         if !raw.starts_with('/') {
             return Err(HttpParseError::InvalidPath);
         }
+
         if raw.contains(['?', '#']) {
             return Err(HttpParseError::QueryOrFragmentNotAllowed);
         }
+
         let decoded = decode_path(raw)?;
         let mut segments = Vec::new();
+
         for (index, segment) in decoded.split('/').enumerate() {
             if index == 0 {
                 continue;
             }
+
             match segment {
                 "" => segments.push(String::new()),
                 "." => {}
+
                 ".." => {
                     let _ = segments.pop();
                 }
+
                 value => segments.push(value.to_string()),
             }
         }
+
         let mut normalized = String::from('/');
         normalized.push_str(&segments.join("/"));
+
         if normalized.is_empty() {
             normalized.push('/');
         }
+
         while normalized.len() > 1 && normalized.ends_with('/') {
             normalized.pop();
         }
+
         Ok(Self(normalized.into_boxed_str()))
     }
 
@@ -454,6 +484,7 @@ impl NormalizedHttpPath {
         if self.as_str() == "/" || self == request {
             return true;
         }
+
         request
             .as_str()
             .strip_prefix(self.as_str())
@@ -479,6 +510,7 @@ pub enum HttpTarget {
     Path(NormalizedHttpPath),
     Asterisk,
 }
+
 /// Canonical scheme, authority, and path used by HTTP policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpUrl {
@@ -487,6 +519,7 @@ pub struct HttpUrl {
     pub target: HttpTarget,
     pattern: Option<Box<str>>,
 }
+
 impl HttpUrl {
     ///
     /// # Errors
@@ -498,6 +531,7 @@ impl HttpUrl {
         if raw.contains(['?', '#']) {
             return Err(HttpParseError::QueryOrFragmentNotAllowed);
         }
+
         Self::parse_absolute_parts(raw, false)
     }
 
@@ -515,18 +549,24 @@ impl HttpUrl {
         if raw.ends_with(" *") {
             return Self::parse(raw);
         }
+
         let (sanitized, tokens) = replace_pattern_metacharacters(raw);
         let mut url = Self::parse(&sanitized)?;
+
         if tokens.is_empty() {
             return Ok(url);
         }
+
         let mut pattern = url.to_string();
+
         for (token, metacharacter) in tokens {
             if pattern.matches(&token).count() != 1 {
                 return Err(HttpParseError::InvalidUrl);
             }
+
             pattern = pattern.replacen(&token, &metacharacter.to_string(), 1);
         }
+
         build_glob(&pattern).map_err(|_| HttpParseError::InvalidUrl)?;
         url.pattern = Some(pattern.into_boxed_str());
         Ok(url)
@@ -548,11 +588,13 @@ impl HttpUrl {
     ) -> Result<Self, HttpParseError> {
         let scheme = HttpScheme::parse(scheme)?;
         let authority = HttpAuthority::parse(scheme, authority)?;
+
         let target = if path_or_target == "*" {
             HttpTarget::Asterisk
         } else {
             HttpTarget::Path(NormalizedHttpPath::parse(path_or_target)?)
         };
+
         Ok(Self {
             scheme,
             authority,
@@ -564,15 +606,19 @@ impl HttpUrl {
     fn parse_absolute_parts(raw: &str, allow_query: bool) -> Result<Self, HttpParseError> {
         let (scheme_raw, rest) = raw.split_once("://").ok_or(HttpParseError::InvalidUrl)?;
         let scheme = HttpScheme::parse(scheme_raw)?;
+
         if let Some(scheme_authority) = rest.strip_suffix(" *") {
             return Self::from_parts(scheme.as_str(), scheme_authority, "*");
         }
+
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority_raw = &rest[..authority_end];
         let suffix = &rest[authority_end..];
+
         if suffix.contains('#') {
             return Err(HttpParseError::QueryOrFragmentNotAllowed);
         }
+
         let path_raw = if let Some((path, _query)) = suffix.split_once('?') {
             if !allow_query {
                 return Err(HttpParseError::QueryOrFragmentNotAllowed);
@@ -581,7 +627,9 @@ impl HttpUrl {
         } else {
             suffix
         };
+
         let authority = HttpAuthority::parse(scheme, authority_raw)?;
+
         Ok(Self {
             scheme,
             authority,
@@ -604,6 +652,7 @@ impl HttpUrl {
             (Some(rule), Some(other)) => rule == other,
             (Some(_), None) => self.matches(request),
             (None, Some(_)) => false,
+
             (None, None) => {
                 self.scheme == request.scheme
                     && self.authority == request.authority
@@ -620,9 +669,11 @@ impl HttpUrl {
     pub fn matches(&self, request: &Self) -> bool {
         if let Some(pattern) = &self.pattern {
             let pattern = glob_pattern_for_matching(self, pattern);
+
             return build_glob(&pattern)
                 .is_ok_and(|glob| glob.compile_matcher().is_match(request.to_string()));
         }
+
         self.covers(request)
     }
 }
@@ -632,12 +683,14 @@ impl fmt::Display for HttpUrl {
         if let Some(pattern) = &self.pattern {
             return f.write_str(pattern);
         }
+
         write!(
             f,
             "{}://{}",
             self.scheme.as_str(),
             self.authority.display(self.scheme)
         )?;
+
         match &self.target {
             HttpTarget::Path(path) => f.write_str(path.as_str()),
             HttpTarget::Asterisk => f.write_str(" *"),
@@ -681,6 +734,7 @@ impl Serialize for HttpRequest {
             method: &'a HttpMethod,
             url: &'a HttpUrl,
         }
+
         Wire {
             method: &self.method,
             url: &self.url,
@@ -699,6 +753,7 @@ impl<'de> Deserialize<'de> for HttpRequest {
             method: HttpMethod,
             url: HttpUrl,
         }
+
         let wire = Wire::deserialize(deserializer)?;
         Self::validate(wire.method, wire.url).map_err(D::Error::custom)
     }
@@ -736,9 +791,11 @@ impl HttpRequest {
         if matches!(url.target, HttpTarget::Asterisk) && method.as_str() != "OPTIONS" {
             return Err(HttpParseError::AsteriskRequiresOptions);
         }
+
         Ok(Self { method, url })
     }
 }
+
 /// Typed policy target used by approvals and persisted HTTP rules.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpRuleTarget {
@@ -758,6 +815,7 @@ impl HttpRuleTarget {
         {
             return Err(HttpParseError::AsteriskRequiresOptions);
         }
+
         Ok(Self { method, url })
     }
 
@@ -794,6 +852,7 @@ impl Serialize for HttpRuleTarget {
             method: &'a HttpMethodMatcher,
             url: &'a HttpUrl,
         }
+
         Wire {
             method: &self.method,
             url: &self.url,
@@ -812,6 +871,7 @@ impl<'de> Deserialize<'de> for HttpRuleTarget {
             method: HttpMethodMatcher,
             url: String,
         }
+
         let wire = Wire::deserialize(deserializer)?;
         let url = HttpUrl::parse_pattern(&wire.url).map_err(D::Error::custom)?;
         Self::new(wire.method, url).map_err(D::Error::custom)
@@ -824,6 +884,7 @@ impl<'de> Deserialize<'de> for HttpRuleTarget {
 pub struct HttpRule {
     #[serde(default)]
     pub methods: Vec<String>,
+
     pub url: String,
     pub comment: Option<String>,
 }
@@ -837,9 +898,11 @@ impl Serialize for HttpRule {
         struct Wire<'a> {
             methods: &'a [String],
             url: &'a str,
+
             #[serde(skip_serializing_if = "Option::is_none")]
             comment: &'a Option<String>,
         }
+
         Wire {
             methods: &self.methods,
             url: &self.url,
@@ -871,11 +934,11 @@ impl HttpRule {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HttpContextKey {
     pub cwd: Option<std::path::PathBuf>,
-
     pub home: Option<std::path::PathBuf>,
     pub project_root: Option<std::path::PathBuf>,
     pub sandbox_session_id: Option<String>,
 }
+
 /// Opaque pending HTTP request identifier encoded as `http:<simple-v7>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PendingHttpId(uuid::Uuid);
@@ -895,13 +958,17 @@ impl PendingHttpId {
         let raw = value
             .strip_prefix("http:")
             .ok_or(HttpParseError::InvalidPendingId)?;
+
         if raw.len() != 32 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(HttpParseError::InvalidPendingId);
         }
+
         let uuid = uuid::Uuid::parse_str(raw).map_err(|_| HttpParseError::InvalidPendingId)?;
+
         if uuid.get_version() != Some(uuid::Version::SortRand) {
             return Err(HttpParseError::InvalidPendingId);
         }
+
         Ok(Self(uuid))
     }
 }
@@ -978,20 +1045,26 @@ pub enum HttpParseError {
     #[error("OPTIONS is required for the HTTP asterisk target")]
     AsteriskRequiresOptions,
 }
+
 fn glob_pattern_for_matching(url: &HttpUrl, pattern: &str) -> String {
     if !url.authority.host.is_ipv6() {
         return pattern.to_owned();
     }
+
     let authority_start = format!("{}://", url.scheme.as_str()).len();
+
     let open = pattern[authority_start..]
         .find('[')
         .map_or(authority_start, |offset| authority_start + offset);
+
     let close = pattern[open..]
         .find(']')
         .map_or(open, |offset| open + offset);
+
     if open == close {
         return pattern.to_owned();
     }
+
     format!(
         "{}\\[{}\\]{}",
         &pattern[..open],
@@ -1005,9 +1078,11 @@ fn replace_pattern_metacharacters(raw: &str) -> (String, Vec<(String, char)>) {
     let mut replacements = Vec::new();
     let mut index = 0usize;
     let authority_start = raw.find("://").map_or(raw.len(), |offset| offset + 3);
+
     let authority_end = raw[authority_start..]
         .find(['/', '?', '#'])
         .map_or(raw.len(), |offset| authority_start + offset);
+
     let ipv6_end = raw[authority_start..authority_end]
         .strip_prefix('[')
         .and_then(|authority| {
@@ -1020,10 +1095,12 @@ fn replace_pattern_metacharacters(raw: &str) -> (String, Vec<(String, char)>) {
     for (position, character) in raw.char_indices() {
         let in_ipv6_literal =
             position >= authority_start && ipv6_end.is_some_and(|end| position <= end);
+
         if in_ipv6_literal || !matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
             sanitized.push(character);
             continue;
         }
+
         let token = loop {
             let candidate = format!("glob{index}x");
             index += 1;
@@ -1031,9 +1108,11 @@ fn replace_pattern_metacharacters(raw: &str) -> (String, Vec<(String, char)>) {
                 break candidate;
             }
         };
+
         sanitized.push_str(&token);
         replacements.push((token, character));
     }
+
     (sanitized, replacements)
 }
 
@@ -1062,11 +1141,14 @@ fn decode_path(raw: &str) -> Result<String, HttpParseError> {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let mut index = 0;
+
     while index < bytes.len() {
         let byte = bytes[index];
+
         if byte >= 0x80 || byte.is_ascii_control() || byte == b'\\' {
             return Err(HttpParseError::InvalidPathByte);
         }
+
         if byte != b'%' {
             out.push(char::from(byte));
             index += 1;
@@ -1076,12 +1158,15 @@ fn decode_path(raw: &str) -> Result<String, HttpParseError> {
         if index + 2 >= bytes.len() {
             return Err(HttpParseError::MalformedEscape);
         }
+
         let high = hex_value(bytes[index + 1]).ok_or(HttpParseError::MalformedEscape)?;
         let low = hex_value(bytes[index + 2]).ok_or(HttpParseError::MalformedEscape)?;
         let decoded = (high << 4) | low;
+
         if matches!(decoded, b'/' | b'\\' | b'%' | 0..=0x1F | 0x7F) {
             return Err(HttpParseError::EncodedForbiddenByte);
         }
+
         if is_unreserved(decoded) {
             out.push(char::from(decoded));
         } else {
@@ -1089,6 +1174,7 @@ fn decode_path(raw: &str) -> Result<String, HttpParseError> {
             out.push(hex_digit(high));
             out.push(hex_digit(low));
         }
+
         index += 3;
     }
 
@@ -1142,10 +1228,13 @@ mod tests {
             HttpUrl::parse("https://example.com/v1/api").expect("valid rule URL"),
         )
         .expect("valid rule target");
+
         let request = HttpRequest::from_parts("GET", "https", "example.com", "/v1/api/test")
             .expect("valid request");
+
         let sibling = HttpRequest::from_parts("GET", "https", "example.com", "/v1/apix")
             .expect("valid request");
+
         assert!(rule.matches(&request));
         assert!(!rule.matches(&sibling));
     }
@@ -1157,12 +1246,15 @@ mod tests {
             "https://github.com/**/releases/**",
             "GitHub releases",
         );
+
         let target = rule.target().expect("valid URL pattern");
+
         let request = HttpRequest::parse_absolute(
             "GET",
             "https://github.com/owner/repo/releases/download/v1.0.0",
         )
         .expect("valid request");
+
         assert!(target.matches(&request));
         assert_eq!(target.url.to_string(), "https://github.com/**/releases/**");
     }
@@ -1176,32 +1268,42 @@ mod tests {
         )
         .target()
         .expect("valid URL pattern");
+
         let matching =
             HttpRequest::parse_absolute("GET", "https://api.github.com/repos/owner/repo")
                 .expect("valid request");
+
         let wrong_host =
             HttpRequest::parse_absolute("GET", "https://api.example.com/repos/owner/repo")
                 .expect("valid request");
+
         assert!(target.matches(&matching));
         assert!(!target.matches(&wrong_host));
     }
+
     #[test]
     fn url_glob_star_stays_within_path_segment() {
         let single = HttpRule::new(vec![], "https://example.com/a/*/c", "");
         let double = HttpRule::new(vec![], "https://example.com/a/**/c", "");
+
         let one =
             HttpRequest::parse_absolute("GET", "https://example.com/a/b/c").expect("valid request");
+
         let nested = HttpRequest::parse_absolute("GET", "https://example.com/a/b/d/c")
             .expect("valid request");
+
         assert!(single.target().expect("valid rule").matches(&one));
         assert!(!single.target().expect("valid rule").matches(&nested));
         assert!(double.target().expect("valid rule").matches(&nested));
     }
+
     #[test]
     fn url_globset_supports_question_mark_classes_and_alternates() {
         let question = HttpRule::new(vec![], "https://example.com/file?.txt", "");
+
         let question_request = HttpRequest::parse_absolute("GET", "https://example.com/file1.txt")
             .expect("valid request");
+
         assert!(
             question
                 .target()
@@ -1210,12 +1312,16 @@ mod tests {
         );
 
         let class = HttpRule::new(vec![], "https://[ab].example.com/{one,two}/file", "");
+
         let class_request = HttpRequest::parse_absolute("GET", "https://a.example.com/two/file")
             .expect("valid request");
+
         let wrong_class_request =
             HttpRequest::parse_absolute("GET", "https://c.example.com/two/file")
                 .expect("valid request");
+
         assert!(class.target().expect("valid rule").matches(&class_request));
+
         assert!(
             !class
                 .target()
@@ -1227,18 +1333,24 @@ mod tests {
     #[test]
     fn url_globset_escapes_match_literal_metacharacters() {
         let rule = HttpRule::new(vec![], r"https://example.com/file\*.txt", "");
+
         let literal = HttpRequest::parse_absolute("GET", "https://example.com/file*.txt")
             .expect("valid request");
+
         let wildcard = HttpRequest::parse_absolute("GET", "https://example.com/file1.txt")
             .expect("valid request");
+
         assert!(rule.target().expect("valid rule").matches(&literal));
         assert!(!rule.target().expect("valid rule").matches(&wildcard));
     }
+
     #[test]
     fn url_globset_escapes_ipv6_authority_brackets() {
         let rule = HttpRule::new(vec![], "https://[::1]/file?.txt", "");
+
         let matching =
             HttpRequest::parse_absolute("GET", "https://[::1]/file1.txt").expect("valid request");
+
         assert!(rule.target().expect("valid rule").matches(&matching));
     }
 
@@ -1246,9 +1358,11 @@ mod tests {
     fn concrete_request_url_accepts_literal_wildcards() {
         let request = HttpRequest::parse_absolute("GET", "https://example.com/files/*.txt")
             .expect("valid request");
+
         let target = HttpRule::new(vec![], "https://example.com/files/*.txt", "")
             .target()
             .expect("valid URL glob");
+
         assert!(target.matches(&request));
     }
 
@@ -1257,6 +1371,7 @@ mod tests {
         for path in ["/a%2fb", "/a%5Cb", "/a%25b", "/a%00b", "/a%zz"] {
             assert!(NormalizedHttpPath::parse(path).is_err(), "{path}");
         }
+
         assert!(NormalizedHttpPath::parse("/a/%E2%98%83").is_ok());
     }
 
@@ -1281,11 +1396,14 @@ mod tests {
         let canonical: HttpRule =
             serde_json::from_str(r#"{"methods":["POST","GET"],"url":"https://example.com"}"#)
                 .expect("canonical methods");
+
         assert_eq!(canonical.methods, vec!["POST", "GET"]);
+
         assert_eq!(
             serde_json::to_string(&canonical).expect("serialize canonical"),
             r#"{"methods":["POST","GET"],"url":"https://example.com"}"#
         );
+
         assert!(
             serde_json::from_str::<HttpRule>(r#"{"method":"GET","url":"https://example.com"}"#)
                 .is_err()
@@ -1299,24 +1417,29 @@ mod tests {
             url: "https://example.com *".into(),
             comment: None,
         };
+
         let target = rule.target().expect("valid asterisk rule");
         assert!(matches!(target.url.target, HttpTarget::Asterisk));
         assert_eq!(target.url.to_string(), "https://example.com *");
         assert!(HttpRequest::from_parts("GET", "https", "example.com", "*").is_err());
+
         let invalid = HttpRule {
             methods: vec!["GET".into()],
             url: "https://example.com *".into(),
             comment: None,
         };
+
         assert_eq!(
             invalid.target(),
             Err(HttpParseError::AsteriskRequiresOptions)
         );
+
         let wildcard = HttpRule {
             methods: vec![],
             url: "https://example.com *".into(),
             comment: None,
         };
+
         assert_eq!(
             wildcard.target(),
             Err(HttpParseError::AsteriskRequiresOptions)
@@ -1336,9 +1459,11 @@ mod tests {
             HttpUrl::parse("https://example.com *").expect("valid asterisk URL"),
         )
         .expect("valid target");
+
         let json = serde_json::to_string(&target).expect("serialize target");
         let decoded: HttpRuleTarget = serde_json::from_str(&json).expect("deserialize target");
         assert_eq!(decoded, target);
+
         assert_eq!(
             json,
             r#"{"method":"OPTIONS","url":"https://example.com *"}"#
@@ -1352,11 +1477,13 @@ mod tests {
             HttpUrl::parse("https://example.com/").expect("valid URL"),
         )
         .expect("valid target");
+
         let json = serde_json::to_string(&target).expect("serialize target");
         assert_eq!(json, r#"{"method":null,"url":"https://example.com/"}"#);
         let decoded: HttpRuleTarget = serde_json::from_str(&json).expect("deserialize target");
         assert_eq!(decoded, target);
     }
+
     #[test]
     fn serializes_and_deserializes_url_glob_target() {
         let target = HttpRule::new(
@@ -1366,9 +1493,11 @@ mod tests {
         )
         .target()
         .expect("valid URL glob");
+
         let json = serde_json::to_string(&target).expect("serialize target");
         let decoded: HttpRuleTarget = serde_json::from_str(&json).expect("deserialize target");
         assert_eq!(decoded, target);
+
         assert_eq!(
             json,
             r#"{"method":"GET","url":"https://api.github.com/repos/*/*"}"#

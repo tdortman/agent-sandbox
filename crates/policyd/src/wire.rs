@@ -54,6 +54,7 @@ impl ScopeWire {
     #[must_use]
     pub fn from_resolved(ctx: &ResolvedRequestContext, session_id: Option<String>) -> Self {
         let owner_uid = ctx.ids.uid();
+
         Self {
             paths: ctx.paths.clone(),
             session_id,
@@ -161,6 +162,7 @@ pub struct PendingDecision {
     pub target: Option<ApprovalTarget>,
     pub wire: ScopeWire,
     pub client_id: u64,
+
     /// `SO_PEERCRED` uid of the connection issuing Approve/Deny.
     pub approver_uid: Option<u32>,
 }

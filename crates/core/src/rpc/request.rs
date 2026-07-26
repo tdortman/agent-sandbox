@@ -11,23 +11,30 @@ use super::{
     },
     scope::ApprovalScope,
 };
+
 use crate::{
     ProcessIds, ResolvedRequestContext, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_session_id: Option<String>,
 }
@@ -111,19 +118,24 @@ pub enum ApprovalTarget {
     NetworkHost {
         host: String,
     },
+
     Http {
         target: HttpRuleTarget,
     },
+
     SudoCommand {
         argv: Vec<String>,
     },
+
     FilesystemPath {
         path: PathBuf,
     },
+
     ResourcePath {
         resource_kind: ResourceKind,
         path: PathBuf,
     },
+
     Dbus {
         target: DbusTarget,
     },
@@ -139,128 +151,173 @@ pub enum RpcRequest {
     RegisterUi {
         #[serde(default)]
         ui_client: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     UnregisterUi,
     OpenProxySession,
+
     RegisterNetworkFlow {
         registration: FlowRegistration,
     },
+
     ClaimNetworkFlow {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
         connection_id: ProxyConnectionId,
     },
+
     CheckHttp {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
         request: HttpRequest,
     },
+
     CheckNetworkFlow {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
     },
+
     CancelCheck {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
     },
+
     ReleaseNetworkFlow {
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
     },
+
     Check {
         #[serde(default)]
         host: Option<String>,
+
         #[serde(default)]
         connect_host: Option<String>,
+
         #[serde(default)]
         port: Option<u16>,
+
         #[serde(default = "default_https")]
         scheme: String,
+
         url: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     CheckFilesystem {
         path: PathBuf,
+
         #[serde(default)]
         access: FileAccess,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     CheckResource {
         kind: ResourceKind,
         path: PathBuf,
+
         #[serde(default)]
         access: ResourceAccess,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     CheckDbus {
         target: DbusTarget,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     StartFilesystemMonitor {
         #[serde(default)]
         ctx: RequestContext,
+
         #[serde(default)]
         static_allow: Vec<FilesystemRule>,
     },
+
     Elevate {
         argv: Vec<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Approve {
         id: String,
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     ApproveHost {
         host: String,
         port: u16,
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     ApproveHttp {
         target: HttpRuleTarget,
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Deny {
         id: String,
+
         #[serde(default = "default_once_scope")]
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Status {
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Reload {
         #[serde(default)]
         ctx: RequestContext,
@@ -273,128 +330,173 @@ enum RpcRequestWire {
     RegisterUi {
         #[serde(default)]
         ui_client: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     UnregisterUi,
     OpenProxySession,
+
     RegisterNetworkFlow {
         registration: FlowRegistration,
     },
+
     ClaimNetworkFlow {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
         connection_id: ProxyConnectionId,
     },
+
     CheckHttp {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
         request: HttpRequest,
     },
+
     CheckNetworkFlow {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
     },
+
     CancelCheck {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
     },
+
     ReleaseNetworkFlow {
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
     },
+
     Check {
         #[serde(default)]
         host: Option<String>,
+
         #[serde(default)]
         connect_host: Option<String>,
+
         #[serde(default)]
         port: Option<u16>,
+
         #[serde(default = "default_https")]
         scheme: String,
+
         url: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     CheckFilesystem {
         path: PathBuf,
+
         #[serde(default)]
         access: FileAccess,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     CheckDbus {
         target: DbusTarget,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     CheckResource {
         kind: ResourceKind,
         path: PathBuf,
+
         #[serde(default)]
         access: ResourceAccess,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     StartFilesystemMonitor {
         #[serde(default)]
         ctx: RequestContext,
+
         #[serde(default)]
         static_allow: Vec<FilesystemRule>,
     },
+
     Elevate {
         argv: Vec<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Approve {
         id: String,
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     ApproveHost {
         host: String,
         port: u16,
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     ApproveHttp {
         target: HttpRuleTarget,
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Deny {
         id: String,
+
         #[serde(default = "default_once_scope")]
         scope: ApprovalScope,
+
         #[serde(default)]
         session_id: Option<String>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<ApprovalTarget>,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Status {
         #[serde(default)]
         ctx: RequestContext,
     },
+
     Reload {
         #[serde(default)]
         ctx: RequestContext,
@@ -408,8 +510,10 @@ impl<'de> Deserialize<'de> for RpcRequest {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         validate_proxy_fields(&value).map_err(serde::de::Error::custom)?;
+
         let wire: RpcRequestWire =
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+
         Ok(wire.into())
     }
 }
@@ -418,9 +522,11 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
     let Some(object) = value.as_object() else {
         return Ok(());
     };
+
     let Some(op) = object.get("op").and_then(serde_json::Value::as_str) else {
         return Ok(());
     };
+
     let allowed = match op {
         "open_proxy_session" => &["op"][..],
         "register_network_flow" => &["op", "registration"][..],
@@ -437,12 +543,14 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
         "release_network_flow" => &["op", "proxy_session", "attribution_token"][..],
         _ => return Ok(()),
     };
+
     if let Some(field) = object
         .keys()
         .find(|field| !allowed.contains(&field.as_str()))
     {
         return Err(format!("unknown field `{field}`"));
     }
+
     Ok(())
 }
 
@@ -618,33 +726,40 @@ impl From<RpcRequestWire> for RpcRequest {
             RpcRequestWire::RegisterUi { ui_client, ctx } => Self::RegisterUi { ui_client, ctx },
             RpcRequestWire::UnregisterUi => Self::UnregisterUi,
             RpcRequestWire::OpenProxySession => Self::OpenProxySession,
+
             RpcRequestWire::RegisterNetworkFlow { registration } => {
                 Self::register_network_flow(registration)
             }
+
             RpcRequestWire::ClaimNetworkFlow {
                 proxy_session,
                 flow,
                 connection_id,
             } => Self::claim_network_flow(proxy_session, flow, connection_id),
+
             RpcRequestWire::CheckHttp {
                 proxy_session,
                 request_id,
                 attribution_token,
                 request,
             } => Self::check_http(proxy_session, request_id, attribution_token, request),
+
             RpcRequestWire::CheckNetworkFlow {
                 proxy_session,
                 request_id,
                 attribution_token,
             } => Self::check_network_flow(proxy_session, request_id, attribution_token),
+
             RpcRequestWire::CancelCheck {
                 proxy_session,
                 request_id,
             } => Self::cancel_check(proxy_session, request_id),
+
             RpcRequestWire::ReleaseNetworkFlow {
                 proxy_session,
                 attribution_token,
             } => Self::release_network_flow(proxy_session, attribution_token),
+
             RpcRequestWire::Check {
                 host,
                 connect_host,
@@ -653,20 +768,26 @@ impl From<RpcRequestWire> for RpcRequest {
                 url,
                 ctx,
             } => Self::check(host, connect_host, port, scheme, url, ctx),
+
             RpcRequestWire::CheckFilesystem { path, access, ctx } => {
                 Self::CheckFilesystem { path, access, ctx }
             }
+
             RpcRequestWire::CheckResource {
                 kind,
                 path,
                 access,
                 ctx,
             } => Self::check_resource(kind, path, access, ctx),
+
             RpcRequestWire::CheckDbus { target, ctx } => Self::CheckDbus { target, ctx },
+
             RpcRequestWire::StartFilesystemMonitor { ctx, static_allow } => {
                 Self::start_filesystem_monitor(ctx, static_allow)
             }
+
             RpcRequestWire::Elevate { argv, ctx } => Self::Elevate { argv, ctx },
+
             RpcRequestWire::Approve {
                 id,
                 scope,
@@ -675,6 +796,7 @@ impl From<RpcRequestWire> for RpcRequest {
                 comment,
                 ctx,
             } => Self::approve(id, scope, session_id, target, comment, ctx),
+
             RpcRequestWire::ApproveHost {
                 host,
                 port,
@@ -682,12 +804,14 @@ impl From<RpcRequestWire> for RpcRequest {
                 session_id,
                 ctx,
             } => Self::approve_host(host, port, scope, session_id, ctx),
+
             RpcRequestWire::ApproveHttp {
                 target,
                 scope,
                 session_id,
                 ctx,
             } => Self::approve_http(target, scope, session_id, ctx),
+
             RpcRequestWire::Deny {
                 id,
                 scope,
@@ -696,6 +820,7 @@ impl From<RpcRequestWire> for RpcRequest {
                 comment,
                 ctx,
             } => Self::deny(id, scope, session_id, target, comment, ctx),
+
             RpcRequestWire::Status { ctx } => Self::Status { ctx },
             RpcRequestWire::Reload { ctx } => Self::Reload { ctx },
         }
@@ -719,6 +844,7 @@ impl RpcRequest {
             | Self::Deny { ctx, .. }
             | Self::Status { ctx }
             | Self::Reload { ctx } => Some(ctx),
+
             Self::UnregisterUi
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
@@ -745,6 +871,7 @@ impl RpcRequest {
             | Self::Deny { ctx, .. }
             | Self::Status { ctx }
             | Self::Reload { ctx } => Some(ctx),
+
             Self::UnregisterUi
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
@@ -765,6 +892,7 @@ pub fn attach_check_aliases(url: Option<String>, aliases: &[String]) -> Option<S
     if aliases.is_empty() {
         return url;
     }
+
     let base = url.unwrap_or_default();
     let payload = serde_json::to_string(aliases).ok()?;
     Some(format!("{base}{CHECK_ALIASES_MARKER}{payload}"))
@@ -785,13 +913,16 @@ pub fn split_check_aliases(url: Option<String>) -> AliasSplit {
             aliases: Vec::new(),
         };
     };
+
     let Some((base, raw)) = url.split_once(CHECK_ALIASES_MARKER) else {
         return AliasSplit {
             url: Some(url),
             aliases: Vec::new(),
         };
     };
+
     let aliases = serde_json::from_str(raw).unwrap_or_default();
+
     AliasSplit {
         url: Some(base.to_string()),
         aliases,
@@ -809,7 +940,6 @@ const fn default_once_scope() -> ApprovalScope {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-
     use super::{ApprovalTarget, RequestContext, RpcRequest};
     use crate::{FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths};
 
@@ -819,6 +949,7 @@ mod tests {
             Some("tcp://104.18.32.47:443".into()),
             &["chatgpt.com".into()],
         ));
+
         assert_eq!(result.url.as_deref(), Some("tcp://104.18.32.47:443"));
         assert_eq!(result.aliases, vec!["chatgpt.com".to_string()]);
     }
@@ -829,6 +960,7 @@ mod tests {
             r#"{"op":"check","host":"example.com","port":443,"scheme":"https","ctx":{"cwd":"/tmp"}}"#,
         )
         .unwrap();
+
         assert!(matches!(req, RpcRequest::Check { .. }));
     }
 
@@ -837,6 +969,7 @@ mod tests {
         let error =
             serde_json::from_str::<RpcRequest>(r#"{"op":"open_proxy_session","unexpected":true}"#)
                 .expect_err("proxy wire must reject unknown fields");
+
         assert!(error.to_string().contains("unknown field"));
     }
 
@@ -846,6 +979,7 @@ mod tests {
             r#"{"op":"approve","id":"p1","scope":"project","target":{"kind":"network_host","host":"*.baz.com"},"ctx":{"cwd":"/tmp"}}"#,
         )
         .unwrap();
+
         assert!(matches!(req, RpcRequest::Approve {
             target: Some(ApprovalTarget::NetworkHost { .. }),
             ..
@@ -859,16 +993,20 @@ mod tests {
             ProcessIds::new(42, 1000),
             Some("sandbox-a".into()),
         );
+
         let bridged = RequestContext::from(&resolved);
         assert_eq!(bridged.cwd.as_deref(), Some(std::path::Path::new("/cwd")));
+
         assert_eq!(
             bridged.home.as_deref(),
             Some(std::path::Path::new("/home/user"))
         );
+
         assert_eq!(
             bridged.project_root.as_deref(),
             Some(std::path::Path::new("/repo"))
         );
+
         assert_eq!(bridged.pid, Some(42));
         assert_eq!(bridged.uid, Some(1000));
         assert_eq!(bridged.sandbox_session_id.as_deref(), Some("sandbox-a"));
@@ -879,6 +1017,7 @@ mod tests {
         let req: RpcRequest =
             serde_json::from_str(r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"}}"#)
                 .unwrap();
+
         match req {
             RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
                 assert!(
@@ -886,6 +1025,7 @@ mod tests {
                     "static_allow must default to empty"
                 );
             }
+
             _ => panic!("expected StartFilesystemMonitor"),
         }
     }
@@ -896,12 +1036,14 @@ mod tests {
             r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"},"static_allow":[{"path":"/home/user","access":"all"}]}"#,
         )
         .unwrap();
+
         match req {
             RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
                 assert_eq!(static_allow.len(), 1);
                 assert_eq!(static_allow[0].path, PathBuf::from("/home/user"));
                 assert_eq!(static_allow[0].access, FileAccess::All);
             }
+
             _ => panic!("expected StartFilesystemMonitor"),
         }
     }

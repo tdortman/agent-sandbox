@@ -1,6 +1,6 @@
 use std::{io, path::Path, time::Duration};
-
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
+
 use agent_sandbox_syscall_broker::{
     FilesystemTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif, SyscallTarget,
     target_from_notification,
@@ -49,24 +49,30 @@ pub fn normalize(notif: &SeccompNotif) -> Result<NormalizedNotification, io::Err
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponsePlan {
     Continue,
+
     DenyErrno {
         errno: i32,
     },
+
     EmulateResource {
         target: ResourceTarget,
     },
+
     RevalidateFilesystemThenContinue {
         target: FilesystemTarget,
     },
+
     ResourcePolicyDenied {
         target: ResourceTarget,
         source: VerdictSource,
         error: Option<String>,
     },
+
     ResourceRpcFailure {
         target: ResourceTarget,
         error: String,
     },
+
     FilesystemPolicyDenied {
         errno: i32,
         path: std::path::PathBuf,
@@ -74,6 +80,7 @@ pub enum ResponsePlan {
         source: VerdictSource,
         error: Option<String>,
     },
+
     FilesystemRpcFailure {
         errno: i32,
         path: std::path::PathBuf,
@@ -108,13 +115,16 @@ pub async fn decide(
         | NormalizedNotification::ClassificationFailure {
             transient: true, ..
         } => ResponsePlan::Continue,
+
         NormalizedNotification::Deny { errno }
         | NormalizedNotification::Target {
             target: SyscallTarget::Errno(errno),
         } => ResponsePlan::deny(errno),
+
         NormalizedNotification::ClassificationFailure {
             transient: false, ..
         } => ResponsePlan::deny(libc::EACCES),
+
         NormalizedNotification::Target {
             target: SyscallTarget::Network(target),
         } => ResponsePlan::plan_network(
@@ -122,6 +132,7 @@ pub async fn decide(
                 .check_target(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
                 .await,
         ),
+
         NormalizedNotification::Target {
             target: SyscallTarget::Resource(target),
         } => resource_plan(
@@ -130,6 +141,7 @@ pub async fn decide(
                 .check_resource(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
                 .await,
         ),
+
         NormalizedNotification::Target {
             target: SyscallTarget::Filesystem(target),
         } => {
@@ -158,11 +170,13 @@ pub async fn decide(
 fn resource_plan(target: ResourceTarget, reply: io::Result<ResourceCheckReply>) -> ResponsePlan {
     match reply {
         Ok(reply) if reply.allowed => ResponsePlan::emulate_resource(target),
+
         Ok(reply) => ResponsePlan::ResourcePolicyDenied {
             target,
             source: reply.source,
             error: reply.error,
         },
+
         Err(error) => ResponsePlan::ResourceRpcFailure {
             target,
             error: error.to_string(),
@@ -177,6 +191,7 @@ fn filesystem_plan(
 ) -> Option<ResponsePlan> {
     match reply {
         Ok(reply) if reply.allowed => None,
+
         Ok(reply) => Some(ResponsePlan::FilesystemPolicyDenied {
             errno: libc::EACCES,
             path: reply.path,
@@ -184,6 +199,7 @@ fn filesystem_plan(
             source: reply.source,
             error: reply.error,
         }),
+
         Err(error) => Some(ResponsePlan::FilesystemRpcFailure {
             errno: libc::EACCES,
             path: path.to_path_buf(),
@@ -206,6 +222,7 @@ impl ResponsePlan {
 pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
     match normalize(notif) {
         Ok(facts) => facts,
+
         Err(error) => {
             let transient = agent_sandbox_syscall_broker::is_transient_tracee_io_err(&error);
             NormalizedNotification::classification_failure(error, transient)
@@ -221,8 +238,8 @@ mod tests {
         DeviceAccess, FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply,
         ResourceKind, VerdictSource,
     };
-    use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
 
+    use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
     use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
 
     fn resource_target() -> ResourceTarget {
@@ -245,6 +262,7 @@ mod tests {
     #[tokio::test]
     async fn decision_routes_policy_independent_facts() {
         let mut client = PersistentPolicyClient::new("/tmp/agent-sandbox-test-policy.sock");
+
         assert_eq!(
             decide(
                 &mut client,
@@ -256,6 +274,7 @@ mod tests {
             .await,
             ResponsePlan::Continue
         );
+
         assert_eq!(
             decide(
                 &mut client,
@@ -269,6 +288,7 @@ mod tests {
                 errno: libc::ENOSYS
             }
         );
+
         assert_eq!(
             decide(
                 &mut client,
@@ -290,6 +310,7 @@ mod tests {
     #[test]
     fn network_verdict_maps_to_plan() {
         assert_eq!(ResponsePlan::plan_network(true), ResponsePlan::Continue);
+
         assert_eq!(ResponsePlan::plan_network(false), ResponsePlan::DenyErrno {
             errno: libc::EACCES
         });
@@ -298,6 +319,7 @@ mod tests {
     #[test]
     fn resource_verdict_maps_to_plan() {
         let target = resource_target();
+
         let allowed = ResourceCheckReply {
             ok: true,
             allowed: true,
@@ -307,6 +329,7 @@ mod tests {
             access: target.access,
             error: None,
         };
+
         assert_eq!(
             resource_plan(target.clone(), Ok(allowed)),
             ResponsePlan::EmulateResource {
@@ -325,6 +348,7 @@ mod tests {
             access: target.access,
             error: Some("blocked".into()),
         };
+
         assert_eq!(
             resource_plan(target.clone(), Ok(denied)),
             ResponsePlan::ResourcePolicyDenied {
@@ -335,6 +359,7 @@ mod tests {
                 error: Some("blocked".into()),
             }
         );
+
         assert!(matches!(
             resource_plan(
                 target,
@@ -348,6 +373,7 @@ mod tests {
     fn filesystem_verdict_maps_to_plan() {
         let target = filesystem_target();
         let (path, access) = &target.checks[0];
+
         let allowed = FilesystemCheckReply {
             ok: true,
             allowed: true,
@@ -356,6 +382,7 @@ mod tests {
             access: *access,
             error: None,
         };
+
         assert!(filesystem_plan(path, *access, Ok(allowed)).is_none());
 
         let denied = FilesystemCheckReply {
@@ -368,10 +395,12 @@ mod tests {
             access: *access,
             error: Some("blocked".into()),
         };
+
         assert!(matches!(
             filesystem_plan(path, *access, Ok(denied)),
             Some(ResponsePlan::FilesystemPolicyDenied { .. })
         ));
+
         assert!(matches!(
             filesystem_plan(
                 Path::new("/tmp/example"),

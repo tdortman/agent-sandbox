@@ -25,6 +25,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
 
     let wire = serde_json::to_string(&request).expect("serialize RPC request");
     let decoded: RpcRequest = serde_json::from_str(&wire).expect("deserialize RPC request");
+
     match decoded {
         RpcRequest::Check {
             host,
@@ -47,6 +48,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
             assert_eq!(ctx.uid, Some(1000));
             assert_eq!(ctx.sandbox_session_id.as_deref(), Some("session-1"));
         }
+
         other => panic!("unexpected request variant: {other:?}"),
     }
 }
@@ -55,16 +57,19 @@ fn check_request_round_trips_with_context_over_json_wire() {
 fn proxy_http_reply_round_trips_as_a_single_json_line() {
     let request =
         HttpRequest::parse_absolute("GET", "https://example.com/api/v1").expect("request");
+
     let request_id = ProxyRequestId::new();
+
     let reply = HttpCheckReply::from_verdict(
         request.clone(),
         Verdict::allowed(VerdictSource::Scope(ApprovalScope::Session)),
     );
+
     let proxy = ProxyReply::from_reply(request_id, RpcReply::HttpCheck(reply));
     let line = RpcMessage::Reply(RpcReply::Proxy(proxy)).to_string();
-
     assert!(line.ends_with('\n'));
     let decoded: RpcMessage = serde_json::from_str(line.trim_end()).expect("decode RPC line");
+
     match decoded {
         RpcMessage::Reply(RpcReply::Proxy(proxy)) => {
             assert_eq!(proxy.request_id, request_id);
@@ -78,6 +83,7 @@ fn proxy_http_reply_round_trips_as_a_single_json_line() {
                 other => panic!("unexpected proxy body: {other:?}"),
             }
         }
+
         other => panic!("unexpected message variant: {other:?}"),
     }
 }
@@ -86,12 +92,13 @@ fn proxy_http_reply_round_trips_as_a_single_json_line() {
 fn denied_proxy_http_reply_round_trips_as_a_single_json_line() {
     let request =
         HttpRequest::parse_absolute("GET", "https://example.com/api/v1").expect("request");
+
     let request_id = ProxyRequestId::new();
     let reply = HttpCheckReply::from_verdict(request.clone(), Verdict::denied(VerdictSource::User));
     let proxy = ProxyReply::from_reply(request_id, RpcReply::HttpCheck(reply));
     let line = RpcMessage::Reply(RpcReply::Proxy(proxy)).to_string();
-
     let decoded: RpcMessage = serde_json::from_str(line.trim_end()).expect("decode RPC line");
+
     match decoded {
         RpcMessage::Reply(RpcReply::Proxy(proxy)) => match proxy.reply {
             ProxyReplyBody::HttpCheck(reply) => {
@@ -102,6 +109,7 @@ fn denied_proxy_http_reply_round_trips_as_a_single_json_line() {
             }
             other => panic!("unexpected proxy body: {other:?}"),
         },
+
         other => panic!("unexpected message variant: {other:?}"),
     }
 }

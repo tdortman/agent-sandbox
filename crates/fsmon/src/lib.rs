@@ -12,6 +12,7 @@ pub mod rpc_client {
         FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, RequestContext,
         RpcReply, RpcRequest,
     };
+
     use serde_json;
 
     /// Error from the fsmon RPC client.
@@ -58,6 +59,7 @@ pub mod rpc_client {
         /// Returns [`Error::Io`] if the Unix socket cannot be opened.
         pub fn connect(socket_path: &Path) -> Result<Self, Error> {
             let stream = UnixStream::connect(socket_path).map_err(Error::Io)?;
+
             Ok(Self {
                 socket_path: socket_path.to_path_buf(),
                 stream: Some(BufReader::new(stream)),
@@ -81,13 +83,17 @@ pub mod rpc_client {
                 access,
                 ctx,
             };
+
             let reply = self.request(&req)?;
+
             match reply {
                 RpcReply::FilesystemCheck(r) => Ok(r),
+
                 RpcReply::Error(_) => {
                     self.stream = None;
                     Err(Error::Reply("policyd returned an error"))
                 }
+
                 _ => {
                     self.stream = None;
                     Err(Error::Reply("unexpected reply type from policyd"))
@@ -100,6 +106,7 @@ pub mod rpc_client {
                 let stream = UnixStream::connect(&self.socket_path).map_err(Error::Io)?;
                 self.stream = Some(BufReader::new(stream));
             }
+
             Ok(())
         }
 
@@ -118,17 +125,20 @@ pub mod rpc_client {
                     .and_then(|()| reader.get_mut().write_all(b"\n"))
                     .and_then(|()| reader.get_mut().flush())
             };
+
             if let Err(error) = io_result {
                 self.stream = None;
                 return Err(Error::Io(error));
             }
 
             let mut response = String::new();
+
             let read_result = self
                 .stream
                 .as_mut()
                 .expect("persistent client connected after request write")
                 .read_line(&mut response);
+
             let bytes_read = match read_result {
                 Ok(bytes_read) => bytes_read,
                 Err(error) => {
@@ -136,10 +146,12 @@ pub mod rpc_client {
                     return Err(Error::Io(error));
                 }
             };
+
             if bytes_read == 0 {
                 self.stream = None;
                 return Err(Error::Reply("policyd closed the connection"));
             }
+
             if !response.ends_with('\n') {
                 self.stream = None;
                 return Err(Error::Reply("policyd returned an incomplete reply"));
@@ -147,6 +159,7 @@ pub mod rpc_client {
 
             match serde_json::from_str(response.trim()) {
                 Ok(reply) => Ok(reply),
+
                 Err(error) => {
                     self.stream = None;
                     Err(Error::Json(error))
@@ -168,6 +181,7 @@ pub mod rpc_client {
     ) -> Result<FilesystemMonitorReply, Error> {
         let req = RpcRequest::StartFilesystemMonitor { ctx, static_allow };
         let reply = PersistentClient::new(socket_path).request(&req)?;
+
         match reply {
             RpcReply::FilesystemMonitor(r) => Ok(r),
             RpcReply::Error(_) => Err(Error::Reply("policyd returned an error")),
@@ -191,11 +205,11 @@ mod tests {
     };
 
     use super::rpc_client::PersistentClient;
-
     static SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn socket_path(label: &str) -> PathBuf {
         let id = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+
         std::env::temp_dir().join(format!(
             "agent-sandbox-fsmon-{label}-{}-{id}.sock",
             std::process::id()
@@ -223,9 +237,11 @@ mod tests {
         let path = socket_path("reuse");
         let listener = UnixListener::bind(&path).expect("bind test socket");
         let reply = reply_line();
+
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept persistent client");
             let mut reader = BufReader::new(stream.try_clone().expect("clone test stream"));
+
             for _ in 0..2 {
                 read_request(&mut reader);
                 writeln!(stream, "{reply}").expect("write filesystem reply");
@@ -234,6 +250,7 @@ mod tests {
         });
 
         let mut client = PersistentClient::connect(&path).expect("connect persistent client");
+
         let first = client
             .check_filesystem(
                 Path::new("/tmp/first"),
@@ -241,6 +258,7 @@ mod tests {
                 RequestContext::default(),
             )
             .expect("first filesystem check");
+
         let second = client
             .check_filesystem(
                 Path::new("/tmp/second"),
@@ -248,9 +266,9 @@ mod tests {
                 RequestContext::default(),
             )
             .expect("second filesystem check");
+
         assert!(first.allowed);
         assert!(second.allowed);
-
         server.join().expect("persistent server");
         std::fs::remove_file(path).expect("remove test socket");
     }
@@ -260,23 +278,28 @@ mod tests {
         let path = socket_path("eof");
         let listener = UnixListener::bind(&path).expect("bind test socket");
         let reply = reply_line();
+
         let server = thread::spawn(move || {
             let (first, _) = listener.accept().expect("accept first connection");
+
             let mut first_reader =
                 BufReader::new(first.try_clone().expect("clone first test stream"));
+
             read_request(&mut first_reader);
             drop(first_reader);
             drop(first);
-
             let (mut second, _) = listener.accept().expect("accept reconnect");
+
             let mut second_reader =
                 BufReader::new(second.try_clone().expect("clone second test stream"));
+
             read_request(&mut second_reader);
             writeln!(second, "{reply}").expect("write reconnect reply");
             second.flush().expect("flush reconnect reply");
         });
 
         let mut client = PersistentClient::connect(&path).expect("connect persistent client");
+
         assert!(
             client
                 .check_filesystem(
@@ -287,6 +310,7 @@ mod tests {
                 .is_err(),
             "EOF must deny the in-flight event"
         );
+
         let reply = client
             .check_filesystem(
                 Path::new("/tmp/second"),
@@ -294,8 +318,8 @@ mod tests {
                 RequestContext::default(),
             )
             .expect("reconnected filesystem check");
-        assert!(reply.allowed);
 
+        assert!(reply.allowed);
         server.join().expect("reconnect server");
         std::fs::remove_file(path).expect("remove test socket");
     }
@@ -305,25 +329,30 @@ mod tests {
         let path = socket_path("malformed");
         let listener = UnixListener::bind(&path).expect("bind test socket");
         let reply = reply_line();
+
         let server = thread::spawn(move || {
             let (mut first, _) = listener.accept().expect("accept first connection");
+
             let mut first_reader =
                 BufReader::new(first.try_clone().expect("clone first test stream"));
+
             read_request(&mut first_reader);
             writeln!(first, "{{malformed").expect("write malformed reply");
             first.flush().expect("flush malformed reply");
             drop(first_reader);
             drop(first);
-
             let (mut second, _) = listener.accept().expect("accept reconnect");
+
             let mut second_reader =
                 BufReader::new(second.try_clone().expect("clone second test stream"));
+
             read_request(&mut second_reader);
             writeln!(second, "{reply}").expect("write reconnect reply");
             second.flush().expect("flush reconnect reply");
         });
 
         let mut client = PersistentClient::connect(&path).expect("connect persistent client");
+
         assert!(
             client
                 .check_filesystem(
@@ -334,6 +363,7 @@ mod tests {
                 .is_err(),
             "malformed reply must deny the in-flight event"
         );
+
         let reply = client
             .check_filesystem(
                 Path::new("/tmp/second"),
@@ -341,8 +371,8 @@ mod tests {
                 RequestContext::default(),
             )
             .expect("reconnected filesystem check");
-        assert!(reply.allowed);
 
+        assert!(reply.allowed);
         server.join().expect("malformed reply server");
         std::fs::remove_file(path).expect("remove test socket");
     }

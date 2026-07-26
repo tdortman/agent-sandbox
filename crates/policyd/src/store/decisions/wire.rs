@@ -6,6 +6,7 @@ use super::super::types::{
     Pending, PendingContext, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
     PendingResource, PolicyStore,
 };
+
 use crate::wire::{PendingDecision, ScopeWire};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ impl PolicyStore {
             sandbox_session_id,
             comment,
         } = wire;
+
         ScopeWire {
             paths: paths.merged_with(
                 context.cwd.map(std::path::Path::to_path_buf),
@@ -123,8 +125,10 @@ impl PolicyStore {
         let Some(pending_session) = sandbox_session_id else {
             return true;
         };
+
         // Registered UI for this exact sandbox session (UiFd after RegisterUi).
         let inner = self.inner.lock().await;
+
         let ui_authorized = inner
             .ui_clients
             .get(&client_id)
@@ -133,10 +137,13 @@ impl PolicyStore {
                 ctx.client_id == client_id
                     && ctx.sandbox_session_id.as_deref() == Some(pending_session)
             });
+
         drop(inner);
+
         if ui_authorized {
             return true;
         }
+
         // Host-side CLI (`agent-sandbox-approve`) and auto-spawned UI: the
         // sandbox socket cannot reach the host socket, so matching session
         // owner uid is sufficient. Blocks cross-user approval and a
@@ -144,6 +151,7 @@ impl PolicyStore {
         let Some(uid) = approver_uid.filter(|&u| u > 0) else {
             return false;
         };
+
         self.sandbox_sessions
             .read()
             .ok()
@@ -167,14 +175,17 @@ impl PolicyStore {
             client_id,
             approver_uid,
         } = decision;
+
         let pending = {
             let mut inner = self.inner.lock().await;
             inner.take_pending(&pending_id)
         };
+
         let pending = pending.ok_or_else(|| {
             let err: RpcReply = crate::error::PolicydError::UnknownPendingId.into();
             Box::new(err)
         })?;
+
         if !self
             .approval_client_authorized(client_id, pending.sandbox_session_id(), approver_uid)
             .await
@@ -182,10 +193,12 @@ impl PolicyStore {
             let mut inner = self.inner.lock().await;
             inner.restore_pending(pending);
             drop(inner);
+
             return Err(Box::new(
                 crate::error::PolicydError::UnauthorizedApprovalClient.into(),
             ));
         }
+
         Ok(TakenPendingDecision {
             pending,
             wire,

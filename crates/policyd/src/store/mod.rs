@@ -1,6 +1,7 @@
 //! Policy merge, pending approvals, and UI session state.
 
 mod access;
+
 mod context;
 mod dbus;
 mod decisions;
@@ -22,22 +23,26 @@ mod types;
 mod ui;
 mod ui_route;
 mod util;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
     time::Instant,
 };
+
 #[cfg(test)]
 use std::{path::PathBuf, time::Duration};
 
 pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
 pub(crate) use types::evict_oldest;
+
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
     MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation, PendingFilesystem, PendingHttp,
     PendingKind, PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ProxyFlowState,
     ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
+
 use types::{MergedPolicyCache, PolicyDecisionState};
 
 fn apply_session_rule<T>(
@@ -59,6 +64,7 @@ fn apply_session_rule<T>(
                 deny_bucket.remove(key);
             }
         }
+
         decisions::DecisionAction::Deny => {
             deny.entry(session_id.to_owned())
                 .or_default()

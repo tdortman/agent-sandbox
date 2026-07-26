@@ -7,20 +7,25 @@ use crate::merge_policy::ProjectPolicyContext;
 #[must_use]
 pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {
     let path = format!("/proc/{pid}/environ");
+
     let Ok(raw) = std::fs::read(&path) else {
         return std::collections::HashMap::new();
     };
+
     let mut env = std::collections::HashMap::new();
+
     for item in raw.split(|&b| b == 0) {
         if let Some(eq) = item.iter().position(|&b| b == b'=') {
             let (key, value) = item.split_at(eq);
             let value = &value[1..];
+
             env.insert(
                 String::from_utf8_lossy(key).into_owned(),
                 String::from_utf8_lossy(value).into_owned(),
             );
         }
     }
+
     env
 }
 
@@ -33,6 +38,7 @@ pub fn read_proc_cwd(pid: u32) -> Option<PathBuf> {
 #[must_use]
 pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
     let uid = uid?;
+
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
         .flatten()
@@ -65,21 +71,26 @@ pub fn context_from_pid(pid: u32) -> ProcContext {
             project_root: None,
         };
     }
+
     let env = read_proc_environ(pid);
+
     let cwd = env
         .get("AGENT_SANDBOX_CWD")
         .cloned()
         .map(PathBuf::from)
         .or_else(|| read_proc_cwd(pid));
+
     let home = env
         .get("AGENT_SANDBOX_HOME")
         .cloned()
         .or_else(|| env.get("HOME").cloned())
         .map(PathBuf::from);
+
     let project_root = env
         .get("AGENT_SANDBOX_PROJECT_ROOT")
         .cloned()
         .map(PathBuf::from);
+
     ProcContext {
         cwd,
         home,
@@ -96,31 +107,39 @@ pub fn trusted_context_from_pid(pid: u32, uid: Option<u32>) -> ProcContext {
     if pid == 0 {
         return ProcContext::default();
     }
+
     let env = read_proc_environ(pid);
+
     let mut cwd = env
         .get("AGENT_SANDBOX_CWD")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| read_proc_cwd(pid));
+
     let home = env
         .get("AGENT_SANDBOX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from));
+
     let mut project_root = env
         .get("AGENT_SANDBOX_PROJECT_ROOT")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
+
     if project_root.is_none() {
         let project =
             ProjectPolicyContext::new(home.as_deref().map(Path::new), cwd.as_deref(), None);
+
         project_root = project.project_root().map(Path::to_path_buf);
     }
+
     if cwd.is_none()
         && let Some(root) = project_root.as_deref()
     {
         cwd = Some(root.to_path_buf());
     }
+
     ProcContext {
         cwd,
         home,
@@ -138,11 +157,14 @@ pub fn trusted_context_from_pid(pid: u32, uid: Option<u32>) -> ProcContext {
 #[must_use]
 pub fn discover_git_project_root(path: &Path) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
+
     loop {
         let git_meta = current.join(".git");
+
         if git_meta.is_dir() || git_meta.is_file() {
             return Some(current);
         }
+
         if !current.pop() {
             return None;
         }
@@ -155,9 +177,11 @@ pub fn is_path_descendant(child: &Path, ancestor: &Path) -> bool {
     let Ok(child) = child.canonicalize() else {
         return false;
     };
+
     let Ok(ancestor) = ancestor.canonicalize() else {
         return false;
     };
+
     child == ancestor || child.starts_with(&ancestor)
 }
 
@@ -166,6 +190,7 @@ pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
+
     read_proc_environ(pid)
         .get("AGENT_SANDBOX_SESSION_ID")
         .filter(|value| !value.is_empty())
@@ -187,12 +212,15 @@ pub fn read_proc_ppid(pid: u32) -> Option<u32> {
     if pid == 0 {
         return None;
     }
+
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("PPid:") {
             return rest.trim().parse().ok();
         }
     }
+
     None
 }
 
@@ -203,22 +231,29 @@ pub fn is_descendant_of(ancestor: u32, pid: u32) -> bool {
     if ancestor == 0 || pid == 0 {
         return false;
     }
+
     if ancestor == pid {
         return true;
     }
+
     let mut current = pid;
+
     for _ in 0..256 {
         let Some(parent_pid) = read_proc_ppid(current) else {
             break;
         };
+
         if parent_pid == ancestor {
             return true;
         }
+
         if parent_pid <= 1 {
             break;
         }
+
         current = parent_pid;
     }
+
     false
 }
 
@@ -232,6 +267,7 @@ mod discover_git_tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git/objects/pack")).expect("git tree");
         let objects = repo.join(".git/objects/pack");
+
         assert_eq!(
             discover_git_project_root(&objects),
             Some(repo.canonicalize().expect("canonicalize"))
@@ -244,6 +280,7 @@ mod discover_git_tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("git dir");
         std::fs::write(repo.join(".git/config"), "[core]\n").expect("config");
+
         assert_eq!(
             discover_git_project_root(&repo.join(".git/config")),
             Some(repo.canonicalize().expect("canonicalize"))

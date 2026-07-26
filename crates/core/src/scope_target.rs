@@ -18,13 +18,16 @@ use crate::{
 pub enum ScopeTarget {
     /// `once`: in-memory only for this policyd process.
     Ephemeral,
+
     Session {
         session_id: String,
     },
+
     Project {
         policy_path: PathBuf,
         project_root: PathBuf,
     },
+
     Global {
         policy_path: PathBuf,
         home: PathBuf,
@@ -55,6 +58,7 @@ impl ScopeTarget {
     pub fn resolve(ctx: &ScopeContext<'_>) -> Result<Self, ScopeResolveError> {
         match ctx.scope {
             ApprovalScope::Once => Ok(Self::Ephemeral),
+
             ApprovalScope::Session => {
                 let session_id = ctx.session_id.ok_or(ScopeResolveError::SessionRequired)?;
                 if !ctx.active_session_ids.contains(session_id) {
@@ -64,6 +68,7 @@ impl ScopeTarget {
                     session_id: session_id.to_string(),
                 })
             }
+
             ApprovalScope::Project => {
                 let project_root = ctx
                     .project_root
@@ -74,6 +79,7 @@ impl ScopeTarget {
                     project_root: PathBuf::from(project_root),
                 })
             }
+
             ApprovalScope::Global => {
                 let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
                 let policy_path = global_policy_path(Path::new(home));
@@ -93,6 +99,7 @@ impl ScopeTarget {
         }
     }
 }
+
 fn global_policy_path(home: &Path) -> PathBuf {
     let canonical_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     canonical_home.join(".config/agent-sandbox/policy.json")

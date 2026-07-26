@@ -32,6 +32,7 @@ pub fn ui_spawn_env(
         || user.dir.to_string_lossy().into_owned(),
         |h| h.to_string_lossy().into_owned(),
     );
+
     let mut env = HashMap::from([
         ("HOME".into(), home_dir.clone()),
         ("USER".into(), user.name.clone()),
@@ -41,24 +42,28 @@ pub fn ui_spawn_env(
             args.host_socket.display().to_string(),
         ),
     ]);
+
     if let Some(home) = home {
         env.insert(
             "AGENT_SANDBOX_HOME".into(),
             home.to_string_lossy().into_owned(),
         );
     }
+
     if let Some(cwd) = cwd {
         env.insert(
             "AGENT_SANDBOX_CWD".into(),
             cwd.to_string_lossy().into_owned(),
         );
     }
+
     if let Some(project_root) = project_root {
         env.insert(
             "AGENT_SANDBOX_PROJECT_ROOT".into(),
             project_root.to_string_lossy().into_owned(),
         );
     }
+
     if let Some(sandbox_session_id) = sandbox_session_id {
         env.insert(
             "AGENT_SANDBOX_SESSION_ID".into(),
@@ -78,14 +83,16 @@ pub fn ui_spawn_env(
             env.insert(key.to_string(), val);
         }
     }
+
     env.extend(graphical_session_env(uid, Some(Path::new(&home_dir))));
     env.insert("AGENT_SANDBOX_UI_PREFER_GRAPHICAL".into(), "1".into());
-
     let profile_bin = format!("/etc/profiles/per-user/{}/bin", user.name);
+
     if Path::new(&profile_bin).is_dir() {
         let path = env.get("PATH").cloned().unwrap_or_default();
         env.insert("PATH".into(), format!("{profile_bin}:{path}"));
     }
+
     env
 }
 
@@ -101,6 +108,7 @@ impl PolicyStore {
         if spawn.has_matching_ui {
             return;
         }
+
         let _ui_spawn_guard = self.ui_spawn_lock.lock().await;
         let args = self.args.clone();
         let sandbox_session_id = spawn.sandbox_session_id.map(str::to_owned);
@@ -108,10 +116,12 @@ impl PolicyStore {
         let cwd = spawn.cwd.map(PathBuf::from);
         let project_root = spawn.project_root.map(PathBuf::from);
         let uid = spawn.uid;
+
         let mut throttle = {
             let inner = self.inner.lock().await;
             inner.ui_spawn_last.clone()
         };
+
         let throttle = match tokio::task::spawn_blocking(move || {
             let spawn = UiSpawnContext {
                 has_matching_ui: false,
@@ -121,6 +131,7 @@ impl PolicyStore {
                 cwd: cwd.as_deref(),
                 project_root: project_root.as_deref(),
             };
+
             maybe_spawn_ui(&args, &mut throttle, &spawn);
             throttle
         })
@@ -132,6 +143,7 @@ impl PolicyStore {
                 return;
             }
         };
+
         let mut inner = self.inner.lock().await;
         inner.ui_spawn_last = throttle;
     }
@@ -149,17 +161,21 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     else {
         return;
     };
+
     if spawn.has_matching_ui {
         return;
     }
+
     let Some(uid) = spawn.uid.filter(|u| *u > 0) else {
         tracing::warn!(
             cwd = opt_path_str(spawn.cwd),
             project_root = opt_path_str(spawn.project_root),
             "cannot spawn policy UI (missing uid)"
         );
+
         return;
     };
+
     let spawn_key = format!(
         "{}:{}:{}:{}",
         uid,
@@ -167,20 +183,23 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         opt_path_str(spawn.cwd),
         opt_path_str(spawn.project_root)
     );
+
     let now = Instant::now();
+
     if ui_spawn_last
         .get(&spawn_key)
         .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(10))
     {
         return;
     }
-    ui_spawn_last.insert(spawn_key.clone(), now);
 
+    ui_spawn_last.insert(spawn_key.clone(), now);
     evict_oldest(ui_spawn_last, MAX_UI_SPAWN_THROTTLES, |instant| *instant);
 
     let Ok(Some(user)) = User::from_uid(nix::unistd::Uid::from_raw(uid)) else {
         return;
     };
+
     let Some(runuser) = tool_path("AGENT_SANDBOX_RUNUSER", "runuser") else {
         tracing::warn!("cannot spawn policy UI (runuser not found)");
         return;
@@ -193,14 +212,17 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
     } = build_ui_spawn_command_env(&runuser, args, &cmd, &user, uid, spawn);
 
     let spawn_result = command.spawn();
+
     let Ok(mut child) = spawn_result else {
         if let Err(err) = spawn_result {
             tracing::warn!(uid, error = %err, "policy UI spawn failed");
         }
+
         return;
     };
 
     std::thread::sleep(Duration::from_millis(100));
+
     match child.try_wait() {
         Ok(Some(status)) => {
             ui_spawn_last.remove(&spawn_key);
@@ -212,7 +234,9 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
             );
             return;
         }
+
         Ok(None) => {}
+
         Err(err) => {
             tracing::warn!(uid, error = %err, "policy UI spawn wait failed");
             return;
@@ -268,7 +292,9 @@ fn build_ui_spawn_command_env(
         spawn.project_root,
         spawn.sandbox_session_id,
     );
+
     let ui_log_path = PathBuf::from(format!("/run/user/{uid}/agent-sandbox-ui.log"));
+
     let stderr = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -276,21 +302,26 @@ fn build_ui_spawn_command_env(
         .map_or_else(|_| Stdio::null(), Stdio::from);
 
     let mut command = std::process::Command::new(runuser);
+
     command
         .arg("-p")
         .arg("-u")
         .arg(&user.name)
         .arg("--")
         .arg(cmd);
+
     if let Some(cwd) = spawn.cwd {
         command.arg("--cwd").arg(cwd);
     }
+
     if let Some(home) = spawn.home {
         command.arg("--home").arg(home);
     }
+
     if let Some(project_root) = spawn.project_root {
         command.arg("--project-root").arg(project_root);
     }
+
     command
         .envs(&env)
         .stdin(Stdio::null())

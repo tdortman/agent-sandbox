@@ -24,6 +24,7 @@ pub mod nr {
         SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE, SYS_write as WRITE,
         SYS_writev as WRITEV,
     };
+
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for
     /// the target.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -107,6 +108,7 @@ fn push_filesystem_mutation_syscalls(syscalls: &mut BTreeSet<i64>) {
         FTRUNCATE, LINK, LINKAT, RENAME, RENAMEAT, RENAMEAT2, SYMLINK, SYMLINKAT, TRUNCATE, UNLINK,
         UNLINKAT,
     };
+
     for nr in [
         RENAME, RENAMEAT, RENAMEAT2, LINK, LINKAT, SYMLINK, SYMLINKAT, UNLINK, UNLINKAT, TRUNCATE,
         FTRUNCATE,
@@ -126,23 +128,31 @@ mod tests {
     #[test]
     fn default_syscalls_contains_udp_entry_points() {
         let syscalls = default_syscalls();
+
         // Network egress set.
         assert!(syscalls.contains(&nr::SENDTO));
+
         assert!(syscalls.contains(&nr::SENDMSG));
+
         // io_uring setup/operation syscalls are trapped and denied with ENOSYS
         // by the broker; otherwise IORING_OP_OPENAT bypasses path mediation.
         assert!(syscalls.contains(&nr::IO_URING_SETUP));
+
         assert!(syscalls.contains(&nr::IO_URING_ENTER));
         assert!(syscalls.contains(&nr::IO_URING_REGISTER));
         assert!(syscalls.contains(&nr::SENDMMSG));
         assert!(syscalls.contains(&nr::CONNECT));
+
         // Resource open* set (the broker policy-gates device access).
         assert!(syscalls.contains(&nr::OPEN));
+
         assert!(syscalls.contains(&nr::OPENAT));
         assert!(syscalls.contains(&nr::OPENAT2));
         assert!(syscalls.contains(&nr::CREAT));
+
         // Filesystem mutation set (broker policy-gates via CheckFilesystem).
         assert!(syscalls.contains(&nr::RENAME));
+
         assert!(syscalls.contains(&nr::RENAMEAT));
         assert!(syscalls.contains(&nr::RENAMEAT2));
         assert!(syscalls.contains(&nr::LINK));
@@ -161,6 +171,7 @@ mod tests {
         // The aarch64 default syscalls are the same resource-gate set as
         // x86_64; the broker path is the only thing that differs.
         let syscalls = default_syscalls();
+
         assert!(syscalls.contains(&nr::SENDTO));
         assert!(syscalls.contains(&nr::SENDMSG));
         assert!(syscalls.contains(&nr::SENDMMSG));
@@ -214,6 +225,7 @@ mod tests {
     #[test]
     fn default_syscalls_is_non_empty_on_supported_arch() {
         let syscalls = default_syscalls();
+
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert!(!syscalls.is_empty());
     }
@@ -226,6 +238,7 @@ mod tests {
     #[test]
     fn default_syscalls_traps_filesystem_mutation_syscalls() {
         let syscalls = default_syscalls();
+
         for nr in [
             nr::RENAME,
             nr::RENAMEAT,
@@ -250,6 +263,7 @@ mod tests {
     #[test]
     fn default_syscalls_traps_io_uring_syscalls() {
         let syscalls = default_syscalls();
+
         for nr in [
             nr::IO_URING_SETUP,
             nr::IO_URING_ENTER,

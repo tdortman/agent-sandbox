@@ -14,23 +14,28 @@ impl PolicyStore {
     pub async fn check_dbus(&self, req: DbusCheckRequest) -> DbusCheckReply {
         let DbusCheckRequest { target, ctx } = req;
         let policy_verdict = self.dbus_verdict(&target, &ctx);
+
         if let Some(verdict) = policy_verdict.as_ref()
             && !verdict.allowed
         {
             return DbusCheckReply::from_verdict(verdict.clone(), target);
         }
+
         if self.session_dbus_denied(&target, &ctx).await {
             return DbusCheckReply::denied(VerdictSource::policy(), target);
         }
+
         if self.session_dbus_allowed(&target, &ctx).await {
             return DbusCheckReply::from_verdict(
                 Verdict::allowed(VerdictSource::Scope(ApprovalScope::Session)),
                 target,
             );
         }
+
         if let Some(verdict) = policy_verdict {
             return DbusCheckReply::from_verdict(verdict, target);
         }
+
         let encoded = match serde_json::to_string(&target) {
             Ok(value) => value,
             Err(err) => {
@@ -40,12 +45,14 @@ impl PolicyStore {
                 );
             }
         };
+
         let Some(pid) = ctx.ids.pid() else {
             return DbusCheckReply::blocked(
                 "agent-sandbox: cannot identify sandbox process for D-Bus approval",
                 target,
             );
         };
+
         let _freeze_hold = match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
             Ok(hold) => hold,
             Err(error) => {
@@ -55,6 +62,7 @@ impl PolicyStore {
                 );
             }
         };
+
         let reply = self
             .request_resource_approval_with_target(
                 crate::wire::ResourceCheckRequest {
@@ -66,6 +74,7 @@ impl PolicyStore {
                 Some(target.clone()),
             )
             .await;
+
         let mut result = DbusCheckReply::from_verdict(
             Verdict {
                 allowed: reply.allowed,
@@ -73,6 +82,7 @@ impl PolicyStore {
             },
             target,
         );
+
         result.error = reply.error;
         result
     }

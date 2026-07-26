@@ -1,23 +1,9 @@
 [workspace]
 resolver = "2"
-members = [
-  "crates/cli",
-  "crates/core",
-  "crates/dbus-proxy",
-  "crates/dns",
-  "crates/enter",
-  "crates/fsmon",
-  "crates/nfq",
-  "crates/policyd",
-  "crates/proxy",
-  "crates/syscall",
-  "crates/syscall-arm",
-  "crates/syscall-broker",
-  "crates/sysutil",
-]
+members = ["crates/*"]
 
 [workspace.package]
-version = "0.23.2"
+version = "0.23.3"
 edition = "2024"
 license = "MIT"
 

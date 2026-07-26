@@ -13,7 +13,9 @@ pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error>
         .literal_separator(true)
         .build()
 }
+
 use crate::dns_cache::lookup_dns_cache;
+
 #[must_use]
 pub fn is_ip_literal(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
@@ -23,8 +25,10 @@ pub fn is_ip_literal(host: &str) -> bool {
 #[must_use]
 pub fn normalize_host(host: &str) -> String {
     let host = host.trim();
+
     // Strip surrounding brackets from IPv6 literals for policy matching.
     let host = host.trim_start_matches('[').trim_end_matches(']');
+
     host.to_lowercase().trim_end_matches('.').to_string()
 }
 
@@ -76,6 +80,7 @@ pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
                 DnsNameError::LabelTooLong
             });
         }
+
         if label.starts_with('-') || label.ends_with('-') {
             return Err(DnsNameError::Invalid);
         }
@@ -122,6 +127,7 @@ impl NetworkSortKey {
         }
 
         let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+
         if labels.len() < 2 {
             return Self {
                 domain: host,
@@ -141,6 +147,7 @@ impl NetworkSortKey {
         }
     }
 }
+
 #[must_use]
 pub fn approval_host_patterns(host: &str) -> Vec<String> {
     let host = normalize_host(host);
@@ -148,6 +155,7 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
     if host.is_empty() {
         return Vec::new();
     }
+
     let labels: Vec<_> = host.split('.').collect();
     let mut patterns = vec![host.clone()];
 
@@ -163,6 +171,7 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
         // "2001:db8::1" -> ["2001:db8::1", "2001:db8:0:0:0:0:0:*",
         // "2001:db8:0:0:0:0:*", ..., "2001:*"]
         let segments: Vec<String> = ipv6.segments().iter().map(|s| format!("{s:x}")).collect();
+
         for len in (1..=7).rev() {
             let prefix = segments[..len].join(":");
             patterns.push(format!("{prefix}:*"));
@@ -171,11 +180,13 @@ pub fn approval_host_patterns(host: &str) -> Vec<String> {
         // DNS hostname: suffix wildcards.
         for idx in 1..labels.len() {
             let suffix = labels[idx..].join(".");
+
             if suffix.contains('.') {
                 patterns.push(format!("*.{suffix}"));
             }
         }
     }
+
     patterns
 }
 
@@ -193,6 +204,7 @@ pub fn reverse_hostname(ip: &str) -> Option<String> {
 pub struct HostResolution {
     /// Normalized hostname used for policy matching (DNS name or IP literal).
     pub policy_host: String,
+
     /// Original connect target (IP or hostname) used for transport connections.
     pub connect_host: String,
 }
@@ -215,6 +227,7 @@ impl HostResolution {
 #[must_use]
 pub fn policy_host_for_connect(connect_host: &str, cache_path: Option<&Path>) -> HostResolution {
     let connect_host = connect_host.trim();
+
     if !is_ip_literal(connect_host) {
         let name = normalize_host(connect_host);
         return HostResolution::new(name, connect_host);
@@ -286,6 +299,7 @@ fn parse_ipv4_prefix(prefix: &str) -> Option<Ipv4Prefix> {
         if count == octets.len() {
             return None;
         }
+
         octets[count] = part.parse().ok()?;
         count += 1;
     }
@@ -322,6 +336,7 @@ fn parse_ipv6_hextets(prefix: &str) -> Option<Vec<u16>> {
         if h.is_empty() || h.len() > 4 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
+
         result.push(u16::from_str_radix(h, 16).ok()?);
     }
 
@@ -345,10 +360,8 @@ mod tests {
     fn policy_host_uses_dns_cache() {
         let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
         let path = dir.path().join("dns-cache.json");
-
         let mut cache = DnsCache::new(Some(&path), 300);
         cache.remember("104.18.32.47", "example.com", 300);
-
         let result = policy_host_for_connect("104.18.32.47", Some(&path));
         assert_eq!(result.policy_host, "example.com");
         assert_eq!(result.connect_host, "104.18.32.47");
@@ -389,6 +402,7 @@ mod tests {
         assert_eq!(patterns[0], "::1");
         assert_eq!(patterns.len(), 8);
     }
+
     #[test]
     fn approval_host_patterns_ipv4_loopback_prefix_wildcards() {
         assert_eq!(approval_host_patterns("127.0.0.1"), vec![
@@ -398,6 +412,7 @@ mod tests {
             "127.*".to_string(),
         ]);
     }
+
     #[test]
     fn approval_host_patterns_include_parent_domains() {
         assert_eq!(approval_host_patterns("Foo.Bar.Baz.com."), vec![
@@ -413,37 +428,45 @@ mod tests {
             "api.*.example.com",
             "API.V1.EXAMPLE.COM"
         ));
+
         assert!(!host_pattern_matches(
             "api.*.example.com",
             "api.example.com"
         ));
+
         assert!(!host_pattern_matches(
             "api.*.example.com",
             "api.v1.example.net"
         ));
     }
+
     #[test]
     fn host_pattern_matches_full_globset_syntax() {
         assert!(host_pattern_matches(
             "{api,cdn}.example.com",
             "cdn.example.com"
         ));
+
         assert!(!host_pattern_matches(
             "{api,cdn}.example.com",
             "www.example.com"
         ));
+
         assert!(host_pattern_matches(
             "[a-c]pi.example.com",
             "api.example.com"
         ));
+
         assert!(!host_pattern_matches(
             "[a-c]pi.example.com",
             "dpi.example.com"
         ));
+
         assert!(host_pattern_matches(
             r"api\*.example.com",
             "api*.example.com"
         ));
+
         assert!(!host_pattern_matches(
             r"api\*.example.com",
             "api1.example.com"
@@ -471,12 +494,13 @@ mod tests {
         // Even for an IP that would produce a PTR like "lb-*.github.com",
         // the policy host must be the raw IP literal on cache miss.
         let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");
-        let path = dir.path().join("dns-cache.json");
 
+        let path = dir.path().join("dns-cache.json");
         let result = policy_host_for_connect("93.184.216.34", Some(&path));
         assert_eq!(result.policy_host, "93.184.216.34");
         assert_eq!(result.connect_host, "93.184.216.34");
     }
+
     #[test]
     fn policy_host_for_ipv6_literal_cache_miss() {
         let dir = tempfile::tempdir().expect("create temp dir for hosts policy test");

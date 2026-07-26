@@ -10,7 +10,6 @@ fn run(binary: &str, args: &[&str]) -> std::process::Output {
 #[test]
 fn elevate_without_command_reports_usage_without_contacting_policyd() {
     let output = run(env!("CARGO_BIN_EXE_agent-sandbox-elevate"), &[]);
-
     assert!(!output.status.success());
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -32,7 +31,6 @@ fn approve_rejects_unknown_subcommand() {
 #[test]
 fn ui_help_describes_context_options() {
     let output = run(env!("CARGO_BIN_EXE_agent-sandbox-ui"), &["--help"]);
-
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: agent-sandbox-ui [OPTIONS]"));

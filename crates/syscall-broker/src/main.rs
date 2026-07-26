@@ -10,10 +10,12 @@ use std::{
 
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
+
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
     SeccompNotif, normalize_path, recv_notification, send_addfd, send_response,
 };
+
 use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
 use clap::Parser;
 use tokio::time;
@@ -107,12 +109,10 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
-
     let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
-
     let mut policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());
 
     // Don't SIGCONT the child until the broker is inside its notification
@@ -124,16 +124,20 @@ async fn main() -> std::io::Result<()> {
 
     loop {
         propagate_child_exit(cli.child_pid);
+
         if !child_was_resumed {
             if let Some(pid) = cli.child_pid {
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGCONT,
                 );
+
                 debug!(child_pid = pid, "resumed sandboxed child");
             }
+
             child_was_resumed = true;
         }
+
         let notif = match recv_notification(cli.listener_fd) {
             Ok(notif) => notif,
             Err(err) => match err.raw_os_error() {
@@ -168,6 +172,7 @@ async fn main() -> std::io::Result<()> {
                 }
             },
         };
+
         dispatch::dispatch_notification_with_mode(
             &cli.policy_socket,
             &mut policy_client,
@@ -206,14 +211,18 @@ fn propagate_child_exit(child_pid: Option<i32>) {
         sys::wait::{WaitPidFlag, WaitStatus, waitpid},
         unistd::Pid,
     };
+
     let Some(pid) = child_pid else {
         return;
     };
+
     match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::Exited(_, code)) => std::process::exit(code),
+
         Ok(WaitStatus::Signaled(_, signal, _)) => {
             std::process::exit(128 + signal as i32);
         }
+
         _ => {}
     }
 }
@@ -234,11 +243,13 @@ fn is_policy_socket_bypass(target: &ResourceTarget, policy_socket: &Path) -> boo
     if target.kind != ResourceKind::UnixSocket {
         return false;
     }
+
     match (
         InodeIdentity::from_path(&target.path),
         InodeIdentity::from_path(policy_socket),
     ) {
         (Some(a), Some(b)) => a == b,
+
         // Fall back to canonical path comparison if either stat fails
         // (e.g. socket deleted between canonicalize and stat).
         _ => normalize_path(&target.path) == normalize_path(policy_socket),
@@ -284,12 +295,14 @@ fn emulate_unix_socket(
 ) -> std::io::Result<()> {
     let nr_val = i64::from(notif.data.nr);
     let sockfd = i32::try_from(notif.data.args[0]).unwrap_or(-1);
+
     if sockfd < 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid sockfd in notification",
         ));
     }
+
     let dup = agent_sandbox_sysutil::dup_tracee_fd(notif.pid, sockfd)?;
 
     match nr_val {
@@ -314,8 +327,10 @@ fn emulate_unix_socket(
                 }
             }
         }
+
         nr::SENDTO => enhance_sendto_emulation(listener_fd, notif, &dup, target),
         nr::SENDMSG => enhance_sendmsg_emulation(listener_fd, notif, &dup, target),
+
         nr::SENDMMSG => {
             // For connected SOCK_STREAM / SOCK_SEQPACKET, the kernel ignores
             // per-message msg_name, so the destination is fixed by the prior
@@ -338,6 +353,7 @@ fn emulate_unix_socket(
             info!("sendmmsg on AF_UNIX denied: multi-message emulation not supported");
             send_response(listener_fd, notif.id, 0, -libc::EACCES, 0)
         }
+
         _ => {
             // Unknown socket syscall, deny to be safe.
             send_response(listener_fd, notif.id, 0, -libc::EACCES, 0)
@@ -359,20 +375,24 @@ fn enhance_sendto_emulation(
     let buf_ptr = notif.data.args[1];
     let len = usize::try_from(notif.data.args[2]).unwrap_or(0);
     let flags = i32::try_from(notif.data.args[3]).unwrap_or(0);
+
     // For a resource target, the destination was non-null when approved.
     // Use target.raw unconditionally: if it is empty, something is wrong
     // and we deny rather than CONTINUE (which would bypass the resource gate).
     if target.raw.is_empty() {
         return send_response(listener_fd, notif.id, 0, -libc::EACCES, 0);
     }
+
     // Copy the payload from the tracee's address space into a broker-owned
     // buffer. The user namespace does NOT share the address space, so tracee
     // pointers are invalid in the broker.
     if len > MAX_PAYLOAD {
         return send_response(listener_fd, notif.id, 0, -libc::E2BIG, 0);
     }
+
     let payload =
         agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, buf_ptr, len.min(MAX_PAYLOAD))?;
+
     let sent = match sendto_raw(dup, &payload, flags, &target.raw) {
         Ok(n) => n,
         Err(err) => {
@@ -380,6 +400,7 @@ fn enhance_sendto_emulation(
             return send_response(listener_fd, notif.id, 0, -errno, 0);
         }
     };
+
     send_response(
         listener_fd,
         notif.id,
@@ -388,6 +409,7 @@ fn enhance_sendto_emulation(
         0,
     )
 }
+
 /// Emulate `sendmsg(sockfd, msg, flags)` on a duplicated tracee socket.
 /// If `msg` is null or `msg_name` is null the socket is already connected
 /// and the broker continues. If the `msghdr` carries control data
@@ -403,6 +425,7 @@ fn enhance_sendmsg_emulation(
     const MAX_PAYLOAD: usize = 1024 * 1024;
     let msg_ptr = notif.data.args[1];
     let flags = i32::try_from(notif.data.args[2]).unwrap_or(0);
+
     if msg_ptr == 0 {
         return send_response(
             listener_fd,
@@ -412,6 +435,7 @@ fn enhance_sendmsg_emulation(
             SECCOMP_USER_NOTIF_FLAG_CONTINUE,
         );
     }
+
     // Connected SOCK_STREAM / SOCK_SEQPACKET sockets: the kernel ignores
     // msg_name, so the destination is fixed by the prior approved connect.
     // CONTINUE is safe because the tracee cannot redirect the destination.
@@ -430,57 +454,76 @@ fn enhance_sendmsg_emulation(
             SECCOMP_USER_NOTIF_FLAG_CONTINUE,
         );
     }
+
     // Read the msghdr to check for control data and find iovec locations.
     // The destination sockaddr is NOT re-read: use target.raw (captured
     // during policy parsing) to prevent a TOCTOU swap.
     let bytes = agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, msg_ptr, 56)?;
+
     if bytes.len() < 56 {
         return send_response(listener_fd, notif.id, 0, -libc::EINVAL, 0);
     }
+
     // For a resource target, the destination was non-null when approved.
     // Use target.raw unconditionally: if empty, deny rather than CONTINUE.
     if target.raw.is_empty() {
         return send_response(listener_fd, notif.id, 0, -libc::EACCES, 0);
     }
+
     let msg_control = u64::from_ne_bytes(bytes[32..40].try_into().expect("8 bytes"));
     let msg_controllen = u64::from_ne_bytes(bytes[40..48].try_into().expect("8 bytes"));
+
     if msg_control != 0 && msg_controllen != 0 {
         // Control data present (SCM_RIGHTS, SCM_CREDENTIALS, etc.). The
         // broker cannot safely relay ancillary data, so deny.
         info!("sendmsg with control data denied");
+
         return send_response(listener_fd, notif.id, 0, -libc::EACCES, 0);
     }
+
     let msg_iov = u64::from_ne_bytes(bytes[16..24].try_into().expect("8 bytes"));
     let msg_iovlen = u64::from_ne_bytes(bytes[24..32].try_into().expect("8 bytes"));
+
     // Copy each iovec's payload from the tracee into broker-owned buffers.
     let iov_count = msg_iovlen.min(1024) as usize;
+
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(iov_count);
     let mut total: usize = 0;
+
     for i in 0..iov_count {
         let iov_offset = i * 16;
+
         let iov_buf = agent_sandbox_syscall_broker::read_tracee_bytes(
             notif.pid,
             msg_iov + iov_offset as u64,
             16,
         )?;
+
         if iov_buf.len() < 16 {
             return send_response(listener_fd, notif.id, 0, -libc::EINVAL, 0);
         }
+
         let iov_base = u64::from_ne_bytes(iov_buf[0..8].try_into().expect("8 bytes"));
         let iov_len = u64::from_ne_bytes(iov_buf[8..16].try_into().expect("8 bytes"));
+
         if iov_len == 0 {
             payloads.push(Vec::new());
             continue;
         }
+
         let iov_len_usize = usize::try_from(iov_len).unwrap_or(0);
         total = total.saturating_add(iov_len_usize);
+
         if total > MAX_PAYLOAD {
             return send_response(listener_fd, notif.id, 0, -libc::E2BIG, 0);
         }
+
         let payload =
             agent_sandbox_syscall_broker::read_tracee_bytes(notif.pid, iov_base, iov_len_usize)?;
+
         payloads.push(payload);
     }
+
     // Build broker-owned iovec array pointing into our payloads.
     let mut iovs: Vec<libc::iovec> = payloads
         .iter_mut()
@@ -489,6 +532,7 @@ fn enhance_sendmsg_emulation(
             iov_len: buf.len(),
         })
         .collect();
+
     // Build a broker-owned msghdr. Use target.raw as the destination
     // sockaddr, never re-read the tracee pointer.
     let mut msg = libc::msghdr {
@@ -500,10 +544,12 @@ fn enhance_sendmsg_emulation(
         msg_controllen: 0,
         msg_flags: 0,
     };
+
     if !target.raw.is_empty() {
         msg.msg_name = target.raw.as_ptr().cast::<libc::c_void>().cast_mut();
         msg.msg_namelen = u32::try_from(target.raw.len()).unwrap_or(u32::MAX);
     }
+
     // SAFETY: `msg` is a broker-owned msghdr with iovecs and a captured
     // sockaddr. All pointers are valid for the kernel call.
     #[allow(unsafe_code)]
@@ -514,6 +560,7 @@ fn enhance_sendmsg_emulation(
             return send_response(listener_fd, notif.id, 0, -errno, 0);
         }
     };
+
     send_response(listener_fd, notif.id, i64::try_from(rc).unwrap_or(0), 0, 0)
 }
 
@@ -549,8 +596,10 @@ fn emulate_open_with_path(
 ) -> std::io::Result<()> {
     let path = std::str::from_utf8(raw_path)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 path"))?;
+
     let oflag = nix::fcntl::OFlag::from_bits_truncate(flags);
     let mode = nix::sys::stat::Mode::from_bits_truncate(mode);
+
     let opened = match nix::fcntl::open(path, oflag, mode) {
         Ok(fd) => fd,
         Err(err) => {
@@ -558,7 +607,9 @@ fn emulate_open_with_path(
             return send_response(listener_fd, notif_id, 0, -errno, 0);
         }
     };
+
     let cloexec = oflag.contains(nix::fcntl::OFlag::O_CLOEXEC);
+
     // `opened` (OwnedFd) closes on drop after the fd is installed into the
     // tracee via SECCOMP_IOCTL_NOTIF_ADDFD.
     send_addfd(listener_fd, notif_id, opened.as_raw_fd(), cloexec)
@@ -567,10 +618,8 @@ fn emulate_open_with_path(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-
     use agent_sandbox_core::{DeviceAccess, ResourceAccess, ResourceKind, SocketAccess};
     use agent_sandbox_syscall_broker::ResourceTarget;
-
     use super::is_policy_socket_bypass;
 
     fn make_unix_target(path: &str) -> ResourceTarget {
@@ -587,6 +636,7 @@ mod tests {
     #[test]
     fn is_socket_connected_detects_connected_stream() {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+
         let fds = socketpair(
             AddressFamily::Unix,
             SockType::Stream,
@@ -594,10 +644,12 @@ mod tests {
             SockFlag::empty(),
         )
         .expect("socketpair failed");
+
         assert!(
             agent_sandbox_sysutil::is_socket_connected(&fds.0),
             "socketpair fd should be connected"
         );
+
         assert!(
             agent_sandbox_sysutil::is_socket_connected(&fds.1),
             "socketpair fd should be connected"
@@ -607,6 +659,7 @@ mod tests {
     #[test]
     fn is_socket_connected_rejects_unconnected_dgram() {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+
         let fd = socket(
             AddressFamily::Unix,
             SockType::Datagram,
@@ -614,6 +667,7 @@ mod tests {
             None,
         )
         .expect("socket creation failed");
+
         assert!(
             !agent_sandbox_sysutil::is_socket_connected(&fd),
             "unconnected dgram should report not connected"
@@ -623,6 +677,7 @@ mod tests {
     #[test]
     fn socket_type_reads_stream() {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+
         let fds = socketpair(
             AddressFamily::Unix,
             SockType::Stream,
@@ -630,6 +685,7 @@ mod tests {
             SockFlag::empty(),
         )
         .expect("socketpair failed");
+
         assert_eq!(
             agent_sandbox_sysutil::socket_type(&fds.0),
             Some(libc::SOCK_STREAM)
@@ -639,6 +695,7 @@ mod tests {
     #[test]
     fn socket_type_reads_dgram() {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+
         let fd = socket(
             AddressFamily::Unix,
             SockType::Datagram,
@@ -646,6 +703,7 @@ mod tests {
             None,
         )
         .expect("socket creation failed");
+
         assert_eq!(
             agent_sandbox_sysutil::socket_type(&fd),
             Some(libc::SOCK_DGRAM)
@@ -655,6 +713,7 @@ mod tests {
     #[test]
     fn policy_socket_bypass_matches_exact_path() {
         let target = make_unix_target("/run/agent-sandbox/policy.sock");
+
         assert!(is_policy_socket_bypass(
             &target,
             Path::new("/run/agent-sandbox/policy.sock")
@@ -664,6 +723,7 @@ mod tests {
     #[test]
     fn policy_socket_bypass_rejects_other_paths() {
         let target = make_unix_target("/run/user/1000/op-daemon.sock");
+
         assert!(!is_policy_socket_bypass(
             &target,
             Path::new("/run/agent-sandbox/policy.sock")
@@ -680,6 +740,7 @@ mod tests {
             open_flags: 0,
             open_mode: 0,
         };
+
         assert!(!is_policy_socket_bypass(
             &target,
             Path::new("/run/agent-sandbox/policy.sock")
@@ -689,20 +750,22 @@ mod tests {
     #[test]
     fn policy_socket_bypass_detects_hardlink() {
         use std::os::unix::net::UnixListener;
+
         // Create a real Unix socket, hardlink it, and verify the bypass
         // detects the alias via inode comparison.
         let dir = std::env::temp_dir();
+
         let orig = dir.join("asbx_bypass_orig.sock");
         let alias = dir.join("asbx_bypass_alias.sock");
         let _ = std::fs::remove_file(&orig);
         let _ = std::fs::remove_file(&alias);
-
         let _listener = UnixListener::bind(&orig).expect("bind failed");
 
         // Create hardlink: both paths share the same inode.
         std::fs::hard_link(&orig, &alias).expect("hard_link failed");
 
         let target = make_unix_target(alias.to_string_lossy().as_ref());
+
         assert!(
             is_policy_socket_bypass(&target, &orig),
             "hardlink to policy socket should be detected via inode comparison"
@@ -715,10 +778,9 @@ mod tests {
     #[test]
     fn environment_defaults_are_declared_on_cli_arguments() {
         use clap::CommandFactory;
-
         use super::Cli;
-
         let command = Cli::command();
+
         for (argument, environment) in [
             ("network_mode", "AGENT_SANDBOX_NETWORK_MODE"),
             ("dns_endpoint", "AGENT_SANDBOX_DNS_ENDPOINT"),
@@ -728,6 +790,7 @@ mod tests {
                 .get_arguments()
                 .find(|candidate| candidate.get_id().as_str() == argument)
                 .expect("environment-backed argument should exist");
+
             assert_eq!(
                 argument.get_env().and_then(|value| value.to_str()),
                 Some(environment)

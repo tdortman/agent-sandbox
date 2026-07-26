@@ -43,11 +43,13 @@ fn expected_mutation_numbers() -> BTreeSet<i64> {
 fn filesystem_mutation_syscalls_are_in_default_trap_set() {
     let trapped = default_syscalls();
     let expected = expected_mutation_numbers();
+
     assert_eq!(
         expected.len(),
         FILESYSTEM_MUTATION_SYSCALLS.len(),
         "test table must track every filesystem mutation syscall"
     );
+
     for nr in expected {
         assert!(
             trapped.contains(&nr),
@@ -60,10 +62,13 @@ fn filesystem_mutation_syscalls_are_in_default_trap_set() {
 #[test]
 fn filesystem_mutation_trap_set_matches_bpf_filter_input() {
     let filter_syscalls = agent_sandbox_syscall::build_filter(&default_syscalls());
+
     // If default_syscalls omits a mutation syscall, the compiled filter cannot
     // route it to the broker for CheckFilesystem gating.
     let _ = filter_syscalls;
+
     let trapped = default_syscalls();
+
     for nr in expected_mutation_numbers() {
         assert!(
             trapped.contains(&nr),

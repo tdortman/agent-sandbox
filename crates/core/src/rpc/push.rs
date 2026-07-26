@@ -21,6 +21,7 @@ pub enum PendingSummary {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
     },
+
     Http {
         id: PendingHttpId,
         request: HttpRequest,
@@ -29,12 +30,14 @@ pub enum PendingSummary {
         project_root: Option<PathBuf>,
         sandbox_session_id: Option<String>,
     },
+
     Elevation {
         id: String,
         argv: Option<Vec<String>>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
     },
+
     Filesystem {
         id: String,
         path: Option<PathBuf>,
@@ -42,6 +45,7 @@ pub enum PendingSummary {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
     },
+
     Resource {
         id: String,
         resource_kind: ResourceKind,
@@ -50,6 +54,7 @@ pub enum PendingSummary {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
     },
+
     Dbus {
         id: String,
         target: DbusTarget,
@@ -59,6 +64,7 @@ pub enum PendingSummary {
         sandbox_session_id: Option<String>,
     },
 }
+
 /// UI push after `register_ui` (not a request response).
 ///
 /// `NetworkRequest` attribution hints may be embedded in `url` via
@@ -76,6 +82,7 @@ pub enum UiPush {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
     },
+
     HttpRequest {
         id: PendingHttpId,
         request: HttpRequest,
@@ -84,6 +91,7 @@ pub enum UiPush {
         project_root: Option<PathBuf>,
         sandbox_session_id: Option<String>,
     },
+
     ElevationRequest {
         id: String,
         argv: Option<Vec<String>>,
@@ -91,6 +99,7 @@ pub enum UiPush {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
     },
+
     FilesystemRequest {
         id: String,
         path: PathBuf,
@@ -99,6 +108,7 @@ pub enum UiPush {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
     },
+
     ResourceRequest {
         id: String,
         kind: ResourceKind,
@@ -108,6 +118,7 @@ pub enum UiPush {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
     },
+
     DbusRequest {
         id: String,
         target: DbusTarget,

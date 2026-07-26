@@ -80,18 +80,19 @@ pub async fn register_network_flow(
     match response {
         RpcReply::Simple(reply) => Ok(reply.ok),
         RpcReply::Error(error) => Err(std::io::Error::other(error.error)),
+
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "policyd returned an unexpected reply for RegisterNetworkFlow",
         )),
     }
 }
+
 /// Resolve sandbox paths and process IDs from a PID by reading
 /// `/proc/<pid>/environ`.
 fn resolve_context(pid: Option<u32>) -> PolicyContext {
     let pid = pid.unwrap_or(0);
     let uid = pid_uid(pid).unwrap_or(0);
-
     let ids = ProcessIds::new(pid, uid);
     let paths = agent_sandbox_core::resolve_daemon_paths(ids);
     agent_sandbox_core::persist_session_paths(&paths);
@@ -113,29 +114,29 @@ fn pid_uid(pid: u32) -> Option<u32> {
     if pid == 0 {
         return None;
     }
+
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             return parts.first().and_then(|s| s.parse().ok());
         }
     }
+
     None
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
-
     use super::request_context;
 
     #[test]
     fn request_context_preserves_sandbox_session_id() {
         let paths = SandboxPaths::new("/work", "/home/user", "/work");
         let ctx = request_context(&paths, ProcessIds::new(0, 1000), Some("s1".into()));
-
         assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
         assert_eq!(ctx.cwd.as_deref(), Some(Path::new("/work")));
         assert_eq!(ctx.home.as_deref(), Some(Path::new("/home/user")));

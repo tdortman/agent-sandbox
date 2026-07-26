@@ -5,6 +5,7 @@ use std::{path::PathBuf, time::Duration};
 use agent_sandbox_core::{
     ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
+
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -35,6 +36,7 @@ struct Cli {
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     socket: PathBuf,
+
     /// The full argv of the command to run with elevated privileges on the
     /// host. Leading dashes are preserved (e.g. "--list").
     #[arg(
@@ -55,6 +57,7 @@ struct Cli {
 /// reply.
 pub async fn run() -> Result<(), ElevateCliError> {
     let cli = Cli::parse();
+
     if cli.argv.is_empty() {
         eprintln!("agent-sandbox: usage: sudo <command>");
         return Err(ElevateCliError::Usage);
@@ -70,7 +73,6 @@ pub async fn run() -> Result<(), ElevateCliError> {
 
     let pid = std::process::id();
     let uid = nix::unistd::getuid().as_raw();
-
     let mut ctx = RequestContext::from_paths_and_ids(&paths, ProcessIds::new(pid, uid));
     ctx.sandbox_session_id = std::env::var("AGENT_SANDBOX_SESSION_ID").ok();
 
@@ -88,6 +90,7 @@ pub async fn run() -> Result<(), ElevateCliError> {
             eprintln!("agent-sandbox: {}", e.error);
             Err(ElevateCliError::Policyd)
         }
+
         RpcReply::Elevate(e) if !e.allowed => {
             let msg = if e.stderr.is_empty() {
                 "agent-sandbox: elevation denied".to_string()
@@ -97,6 +100,7 @@ pub async fn run() -> Result<(), ElevateCliError> {
             eprintln!("{msg}");
             std::process::exit(e.exit_code);
         }
+
         RpcReply::Elevate(e) => {
             if !e.stdout.is_empty() {
                 print!("{}", ensure_nl(&e.stdout));
@@ -106,6 +110,7 @@ pub async fn run() -> Result<(), ElevateCliError> {
             }
             std::process::exit(e.exit_code);
         }
+
         other => {
             eprintln!("agent-sandbox: unexpected reply: {other:?}");
             Err(ElevateCliError::Policyd)

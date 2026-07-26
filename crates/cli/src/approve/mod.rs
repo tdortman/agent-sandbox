@@ -9,8 +9,8 @@ use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
     RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
-use clap::{Args, Parser, Subcommand};
 
+use clap::{Args, Parser, Subcommand};
 use crate::ui::{bus_name, message_kind_name, signature_display};
 
 #[derive(Parser, Debug)]
@@ -111,6 +111,7 @@ enum Command {
         /// "session".
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
+
         #[command(flatten)]
         context: ContextArgs,
     },
@@ -182,6 +183,7 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             } = context;
             handle_pending(socket, home, cwd, project_root).await
         }
+
         Command::Approve {
             id,
             scope,
@@ -191,6 +193,7 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             let ctx = request_context(context);
             handle_approve(socket, id, scope, session_id, ctx).await
         }
+
         Command::ApproveHost {
             host,
             port,
@@ -201,6 +204,7 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             let ctx = request_context(context);
             handle_approve_host(socket, host, port, scope, session_id, ctx).await
         }
+
         Command::ApproveHttp {
             url,
             scope,
@@ -212,6 +216,7 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             let ctx = request_context(context);
             handle_approve_http(socket, url, scope, method, all_methods, session_id, ctx).await
         }
+
         Command::Deny {
             id,
             scope,
@@ -244,6 +249,7 @@ async fn handle_approve(
         comment: None,
         ctx,
     };
+
     print_json(&rpc(socket, req).await?)
 }
 
@@ -262,6 +268,7 @@ async fn handle_approve_host(
         session_id,
         ctx,
     };
+
     print_json(&rpc(socket, req).await?)
 }
 
@@ -279,11 +286,13 @@ async fn handle_approve_http(
             "HTTP pre-approval requires a persistent scope".into(),
         ));
     }
+
     if scope == ApprovalScope::Session && session_id.is_none() {
         return Err(ApproveCliError::Policyd(
             "session scope requires --session-id".into(),
         ));
     }
+
     let matcher = match (method, all_methods) {
         (Some(method), false) => HttpMethod::parse(&method)
             .map(HttpMethodMatcher::Exact)
@@ -295,16 +304,20 @@ async fn handle_approve_http(
             ));
         }
     };
+
     let url = HttpUrl::parse_pattern(&url)
         .map_err(|error| ApproveCliError::Policyd(error.to_string()))?;
+
     let target = HttpRuleTarget::new(matcher, url)
         .map_err(|error| ApproveCliError::Policyd(error.to_string()))?;
+
     let req = RpcRequest::ApproveHttp {
         target,
         scope,
         session_id,
         ctx,
     };
+
     print_json(&rpc(socket, req).await?)
 }
 
@@ -323,8 +336,10 @@ async fn handle_deny(
         comment: None,
         ctx,
     };
+
     print_json(&rpc(socket, req).await?)
 }
+
 /// Fetch and display the list of pending approval requests.
 async fn handle_pending(
     socket: &Path,
@@ -333,31 +348,39 @@ async fn handle_pending(
     project_root: Option<PathBuf>,
 ) -> Result<(), ApproveCliError> {
     let p = SandboxPaths::from_wire(cwd, home, project_root);
+
     let req = RpcRequest::Status {
         ctx: RequestContext::from(&p),
     };
+
     let resp = rpc(socket, req).await?;
+
     let RpcReply::Status(body) = resp else {
         return Err(approve_error(&resp));
     };
+
     if body.pending.is_empty() {
         println!("No pending approvals.");
         return Ok(());
     }
+
     for item in body.pending {
         match item {
             PendingSummary::Elevation { id, argv, .. } => {
                 let argv = argv.unwrap_or_default();
                 println!("{id}\televation\t\t{}", argv.join(" "));
             }
+
             PendingSummary::Network { id, host, port, .. } => {
                 let host = host.unwrap_or_default();
                 let port = port.unwrap_or(0);
                 println!("{id}\tnetwork\t\t{host}:{port}");
             }
+
             PendingSummary::Http { id, request, .. } => {
                 println!("{id}\thttp\t{}\t{}", request.method.as_str(), request.url);
             }
+
             PendingSummary::Filesystem {
                 id, path, access, ..
             } => {
@@ -365,6 +388,7 @@ async fn handle_pending(
                 let access = access.map_or_else(String::new, |value| value.to_string());
                 println!("{id}\tfilesystem\t{access}\t{}", path.display());
             }
+
             PendingSummary::Resource {
                 id,
                 resource_kind,
@@ -377,6 +401,7 @@ async fn handle_pending(
                 let access = access.map_or_else(String::new, |value| value.to_string());
                 println!("{id}\tresource\t{kind}\t{access}\t{}", path.display());
             }
+
             PendingSummary::Dbus { id, target, .. } => {
                 println!(
                     "{id}\tdbus\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -393,6 +418,7 @@ async fn handle_pending(
             }
         }
     }
+
     Ok(())
 }
 
@@ -416,8 +442,10 @@ async fn rpc(socket: &Path, req: RpcRequest) -> Result<RpcReply, ApproveCliError
         .await
         .map_err(ApproveCliError::Rpc)
 }
+
 fn print_json(resp: &RpcReply) -> Result<(), ApproveCliError> {
     println!("{}", serde_json::to_string_pretty(resp)?);
+
     if resp.is_ok() {
         Ok(())
     } else {
@@ -447,16 +475,17 @@ pub enum ApproveCliError {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
-
     use super::Cli;
 
     #[test]
     fn context_arguments_declare_environment_defaults() {
         let command = Cli::command();
+
         for name in ["pending", "approve", "approve-host", "approve-http", "deny"] {
             let subcommand = command
                 .find_subcommand(name)
                 .expect("context subcommand should exist");
+
             for (argument, environment) in [
                 ("home", "AGENT_SANDBOX_HOME"),
                 ("cwd", "AGENT_SANDBOX_CWD"),
@@ -466,6 +495,7 @@ mod tests {
                     .get_arguments()
                     .find(|candidate| candidate.get_id().as_str() == argument)
                     .expect("context argument should exist");
+
                 assert_eq!(
                     argument.get_env().and_then(|value| value.to_str()),
                     Some(environment)

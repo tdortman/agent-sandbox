@@ -1,6 +1,7 @@
 //! Long-lived policyd UI client (graphical Qt / zenity prompts).
 
 mod choice;
+
 mod dialog;
 mod error;
 mod options;
@@ -18,6 +19,7 @@ use agent_sandbox_core::{
     DbusBus, DbusMessageKind, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest,
     SandboxPaths, UiPush,
 };
+
 use clap::Parser;
 pub use error::UiCliError;
 use nix::fcntl::{Flock, FlockArg, OFlag};
@@ -56,11 +58,13 @@ fn is_safe_runtime_dir(path: &Path, uid: u32) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;
     };
+
     metadata.file_type().is_dir() && metadata.uid() == uid && metadata.mode().trailing_zeros() >= 6
 }
 
 fn prompt_lock_path() -> Result<PathBuf, UiCliError> {
     let uid = nix::unistd::Uid::current().as_raw();
+
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && is_safe_runtime_dir(path, uid))
@@ -68,6 +72,7 @@ fn prompt_lock_path() -> Result<PathBuf, UiCliError> {
             let path = PathBuf::from("/run/user").join(uid.to_string());
             is_safe_runtime_dir(&path, uid).then_some(path)
         });
+
     runtime_dir
         .map(|path| path.join(PROMPT_LOCK_FILE_NAME))
         .ok_or_else(|| {
@@ -157,19 +162,23 @@ struct Cli {
         default_value = "/run/agent-sandbox/policy.sock"
     )]
     socket: PathBuf,
+
     /// Working directory inside the sandbox. Forwarded to policyd so
     /// per-project rules resolve correctly. Defaults to the env var
     /// "`AGENT_SANDBOX_CWD`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_CWD")]
     cwd: Option<PathBuf>,
+
     /// Home directory inside the sandbox. Used to scope "global" rules.
     /// Defaults to the env var "`AGENT_SANDBOX_HOME`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<PathBuf>,
+
     /// Project root inside the sandbox. Used to scope "project" rules. Defaults
     /// to the env var "`AGENT_SANDBOX_PROJECT_ROOT`".
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<PathBuf>,
+
     /// Sandbox session id. Routes this UI client to a specific sandbox
     /// session's pending requests. Defaults to the env var
     /// "`AGENT_SANDBOX_SESSION_ID`".
@@ -184,6 +193,7 @@ struct Cli {
 /// Returns [`UiCliError`] when the RPC connection or push processing fails.
 pub async fn run() -> Result<(), UiCliError> {
     let cli = Cli::parse();
+
     let mut ctx = RequestContext::from(&SandboxPaths::from_wire(
         cli.cwd,
         cli.home,
@@ -192,6 +202,7 @@ pub async fn run() -> Result<(), UiCliError> {
 
     ctx.sandbox_session_id = cli.sandbox_session_id;
     let paths = ctx.sandbox_paths();
+
     UiClient::new(cli.socket, paths, ctx.sandbox_session_id)
         .run()
         .await
@@ -217,6 +228,7 @@ impl UiClient {
             if let Err(err) = self.session().await {
                 warn!(error = %err, "disconnected; retrying");
             }
+
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
@@ -225,6 +237,7 @@ impl UiClient {
         let mut conn = RpcConnection::connect(&self.socket).await?;
         let mut ctx = RequestContext::from(&self.paths);
         ctx.sandbox_session_id.clone_from(&self.sandbox_session_id);
+
         conn.write_request(&RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
             ctx,
@@ -232,6 +245,7 @@ impl UiClient {
         .await?;
 
         let mut queued_pushes = Vec::new();
+
         let session_id = loop {
             let msg = conn.read_message().await?;
             match msg {
@@ -248,10 +262,12 @@ impl UiClient {
                 RpcMessage::Reply(_) => {}
             }
         };
+
         process_prompts(queued_pushes, |push| self.handle_prompt(&session_id, push)).await;
 
         loop {
             let msg = conn.read_message().await?;
+
             if let RpcMessage::UiPush(push) = msg {
                 process_prompts(std::iter::once(push), |push| {
                     self.handle_prompt(&session_id, push)
@@ -269,6 +285,7 @@ impl UiClient {
                 return;
             }
         };
+
         let _prompt_lock = match acquire_prompt_lock(lock_path).await {
             Ok(lock) => lock,
             Err(err) => {
@@ -329,6 +346,7 @@ mod tests {
                 project_root: None,
             })
             .collect::<Vec<_>>();
+
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_handler = Arc::clone(&seen);
         let active = Arc::new(AtomicUsize::new(0));
@@ -338,12 +356,15 @@ mod tests {
             let seen = Arc::clone(&seen_by_handler);
             let active = Arc::clone(&active);
             let max_active = Arc::clone(&max_active);
+
             async move {
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(current, Ordering::SeqCst);
+
                 if let UiPush::NetworkRequest { id, .. } = push {
                     seen.lock().await.push(id);
                 }
+
                 tokio::task::yield_now().await;
                 active.fetch_sub(1, Ordering::SeqCst);
             }
@@ -360,6 +381,7 @@ mod tests {
         let lock_path = temp_dir.path().join("prompt.lock");
         let (first_acquired_tx, first_acquired_rx) = oneshot::channel();
         let (first_release_tx, first_release_rx) = oneshot::channel();
+
         let first_worker = tokio::spawn({
             let lock_path = lock_path.clone();
             async move {
@@ -373,6 +395,7 @@ mod tests {
                 drop(lock);
             }
         });
+
         timeout(Duration::from_secs(1), first_acquired_rx)
             .await
             .expect("first worker acquisition timed out")
@@ -380,6 +403,7 @@ mod tests {
 
         let (second_attempted_tx, second_attempted_rx) = oneshot::channel();
         let second_acquired = Arc::new(Notify::new());
+
         let second_worker = tokio::spawn({
             let lock_path = lock_path.clone();
             let second_acquired = Arc::clone(&second_acquired);
@@ -394,9 +418,11 @@ mod tests {
                 drop(lock);
             }
         });
+
         second_attempted_rx
             .await
             .expect("second worker attempt channel closed");
+
         assert!(
             timeout(Duration::from_millis(100), second_acquired.notified())
                 .await
@@ -407,10 +433,13 @@ mod tests {
         first_release_tx
             .send(())
             .expect("first worker release receiver");
+
         first_worker.await.expect("first worker task");
+
         timeout(Duration::from_secs(1), second_acquired.notified())
             .await
             .expect("second worker acquisition timed out");
+
         second_worker.await.expect("second worker task");
     }
 }

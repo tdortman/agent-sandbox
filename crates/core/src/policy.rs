@@ -21,6 +21,7 @@ use crate::{
 pub enum FileAccess {
     #[default]
     Read,
+
     Write,
     ReadWrite,
     Execute,
@@ -78,12 +79,15 @@ impl FileAccess {
         if self == other {
             return self;
         }
+
         if self == Self::All || other == Self::All {
             return Self::All;
         }
+
         if self == Self::ReadWrite || other == Self::ReadWrite {
             return Self::ReadWrite;
         }
+
         if matches!(
             (self, other),
             (Self::Read, Self::Write) | (Self::Write, Self::Read)
@@ -143,6 +147,7 @@ pub fn open_flags_to_file_access(flags: i32) -> FileAccess {
         libc::O_WRONLY => FileAccess::Write,
         _ => FileAccess::ReadWrite,
     };
+
     if flags & (libc::O_CREAT | libc::O_TRUNC) != 0 {
         access.combine_observed(FileAccess::Write)
     } else {
@@ -178,6 +183,7 @@ impl FilesystemRuleKey {
 enum CompiledPath {
     /// Literal path used for exact/descendant prefix matching.
     Prefix(PathBuf),
+
     /// Compiled glob matcher.
     Glob(GlobMatcher),
 }
@@ -186,6 +192,7 @@ fn expand_match_path(path: &Path, project_root: Option<&Path>, canonicalize: boo
     if canonicalize {
         return expand_policy_path(path, None, project_root);
     }
+
     project_root.map_or_else(
         || expand_home_path(path, None),
         |root| expand_project_relative(&expand_home_path(path, None), root),
@@ -232,12 +239,15 @@ fn prefix_matches(rule_path: &Path, requested: &Path, require_directory_boundary
     if rule_path == Path::new("/") {
         return requested.starts_with("/");
     }
+
     if rule_path == requested {
         return true;
     }
+
     let Ok(rest) = requested.strip_prefix(rule_path) else {
         return false;
     };
+
     !require_directory_boundary || rest.starts_with("/")
 }
 
@@ -250,6 +260,7 @@ fn compiled_matches(
         CompiledPath::Prefix(rule_path) => {
             prefix_matches(&rule_path, requested, require_directory_boundary)
         }
+
         CompiledPath::Glob(matcher) => matcher.is_match(requested),
     }
 }
@@ -262,16 +273,19 @@ fn path_matches_rule(
 ) -> bool {
     let requested = normalize_rule_path(requested);
     let raw = CompiledPath::compile_raw(rule_path, project_root);
+
     if let Ok(compiled) = raw
         && compiled_matches(compiled, &requested, require_directory_boundary)
     {
         return true;
     }
+
     let Ok(compiled) = CompiledPath::compile(rule_path, project_root) else {
         // A malformed glob saved as a rule (user-typed, free-form) cannot match.
         // Previously a panic via .expect; now degrades gracefully.
         return false;
     };
+
     compiled_matches(compiled, &requested, require_directory_boundary)
 }
 
@@ -279,6 +293,7 @@ fn path_matches_rule(
 pub struct FilesystemRule {
     pub path: PathBuf,
     pub access: FileAccess,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
@@ -305,11 +320,13 @@ impl FilesystemRule {
         if path_matches_rule(&self.path, requested, project_root, false) {
             return true;
         }
+
         // Symlink alias fallback: e.g. /var/run → /run. Only runs on a
         // miss, so the common case (exact path match) is O(1) with no
         // stat() syscall. Falls back to the raw path if canonicalization
         // fails (socket deleted between checks).
         let canonical = expand_policy_path(requested, None, project_root);
+
         canonical.as_path() != requested
             && path_matches_rule(&self.path, &canonical, project_root, false)
     }
@@ -324,6 +341,7 @@ impl FilesystemRule {
 fn normalize_rule_path(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     let trimmed = s.trim_end_matches('/');
+
     if trimmed.is_empty() {
         PathBuf::from("/")
     } else {
@@ -338,22 +356,28 @@ pub fn contract_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return path.to_path_buf();
     };
+
     let s = path.to_string_lossy();
     let trimmed = s.trim_end_matches('/');
     let home_trimmed = home.to_string_lossy().trim_end_matches('/').to_string();
+
     if trimmed.is_empty() || home_trimmed.is_empty() {
         return path.to_path_buf();
     }
+
     if trimmed == home_trimmed {
         return PathBuf::from("~");
     }
+
     if let Some(rest) = trimmed.strip_prefix(&home_trimmed)
         && let Some(stripped) = rest.strip_prefix('/')
     {
         return PathBuf::from(format!("~/{stripped}"));
     }
+
     path.to_path_buf()
 }
+
 /// Convert an absolute path under `project_root` to the `./...` shorthand.
 /// Paths outside `project_root` are returned unchanged.
 #[must_use]
@@ -361,16 +385,21 @@ pub fn contract_project_path(path: &Path, project_root: Option<&Path>) -> PathBu
     let Some(project_root) = project_root.filter(|root| !root.as_os_str().is_empty()) else {
         return path.to_path_buf();
     };
+
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
     let canonical_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
+
     let Some(relative) = canonical_path.strip_prefix(&canonical_root).ok() else {
         return path.to_path_buf();
     };
+
     if relative.as_os_str().is_empty() {
         return PathBuf::from(".");
     }
+
     PathBuf::from(".").join(relative)
 }
 
@@ -382,17 +411,22 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return path.to_path_buf();
     };
+
     let s = path.to_string_lossy();
     let home_str = home.to_string_lossy();
+
     if s == "~" {
         return PathBuf::from(home_str.trim_end_matches('/'));
     }
+
     if let Some(rest) = s.strip_prefix("~/") {
         if rest.split('/').any(|part| part == "..") {
             return path.to_path_buf();
         }
+
         let base = home_str.trim_end_matches('/');
         let expanded = PathBuf::from(format!("{base}/{rest}"));
+
         if let Ok(home_canon) = home.canonicalize() {
             match expanded.canonicalize() {
                 Ok(canonical) if canonical.starts_with(&home_canon) => return canonical,
@@ -401,8 +435,10 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
                 Err(_) => return expanded,
             }
         }
+
         return expanded;
     }
+
     path.to_path_buf()
 }
 
@@ -415,13 +451,16 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
 pub fn expand_project_relative(path: &Path, project_root: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     let pr = project_root.to_string_lossy();
+
     if s == "." {
         return PathBuf::from(pr.trim_end_matches('/'));
     }
+
     if let Some(rest) = s.strip_prefix("./") {
         let base = pr.trim_end_matches('/');
         return PathBuf::from(format!("{base}/{rest}"));
     }
+
     path.to_path_buf()
 }
 
@@ -438,12 +477,15 @@ pub fn expand_policy_path(
     project_root: Option<&Path>,
 ) -> PathBuf {
     let expanded = expand_home_path(path, home);
+
     let expanded = if let Some(pr) = project_root {
         expand_project_relative(&expanded, pr)
     } else {
         expanded
     };
+
     let s = expanded.to_string_lossy();
+
     // Only canonicalize absolute literal paths. Glob patterns are left as-is
     // since canonicalize would fail on them.
     if s.starts_with('/') && !contains_glob_syntax(&s) {
@@ -463,6 +505,7 @@ pub fn expand_policy_path(
 pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let path_str = path.to_string_lossy();
     let norm = path_str.trim_end_matches('/');
+
     if norm.is_empty() {
         return vec![PathBuf::from("/")];
     }
@@ -470,8 +513,8 @@ pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<PathBu
     let home_trimmed = home.map(|h| h.to_string_lossy().trim_end_matches('/').to_string());
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
-
     let mut current = norm.to_string();
+
     loop {
         if seen.insert(current.clone()) {
             result.push(PathBuf::from(&current));
@@ -495,6 +538,7 @@ pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<PathBu
             if seen.insert("/".to_string()) {
                 result.push(PathBuf::from("/"));
             }
+
             break;
         }
 
@@ -505,6 +549,7 @@ pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<PathBu
             if seen.insert(parent.clone()) {
                 result.push(PathBuf::from(&parent));
             }
+
             break;
         }
 
@@ -518,6 +563,7 @@ pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<PathBu
 pub struct FilesystemSection {
     #[serde(default)]
     pub allow: Vec<FilesystemRule>,
+
     #[serde(default)]
     pub deny: Vec<FilesystemRule>,
 }
@@ -530,6 +576,7 @@ pub struct FilesystemSection {
 pub enum ResourceKind {
     #[default]
     UnixSocket,
+
     Device,
 }
 
@@ -554,6 +601,7 @@ impl std::fmt::Display for ResourceKind {
 pub enum SocketAccess {
     #[default]
     Connect,
+
     Send,
     All,
 }
@@ -649,10 +697,12 @@ impl ResourceAccess {
                 | (Self::Socket(SocketAccess::Send), Self::Socket(SocketAccess::Connect)) => {
                     Some(Self::Socket(SocketAccess::All))
                 }
+
                 (Self::Device(DeviceAccess::Read), Self::Device(DeviceAccess::Write))
                 | (Self::Device(DeviceAccess::Write), Self::Device(DeviceAccess::Read)) => {
                     Some(Self::Device(DeviceAccess::ReadWrite))
                 }
+
                 _ => None,
             }
         }
@@ -680,6 +730,7 @@ impl<'de> Deserialize<'de> for ResourceAccess {
             "open_read" => Ok(Self::Device(DeviceAccess::Read)),
             "open_write" => Ok(Self::Device(DeviceAccess::Write)),
             "open_read_write" => Ok(Self::Device(DeviceAccess::ReadWrite)),
+
             value => Err(serde::de::Error::custom(format!(
                 "invalid resource access {value:?}"
             ))),
@@ -692,6 +743,7 @@ impl std::fmt::Display for ResourceAccess {
         f.write_str(self.as_str())
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceRuleKey {
     pub kind: ResourceKind,
@@ -724,6 +776,7 @@ pub struct ResourceRule {
     pub kind: ResourceKind,
     pub path: PathBuf,
     pub access: ResourceAccess,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
@@ -756,11 +809,13 @@ impl ResourceRule {
         if path_matches_rule(&self.path, requested, project_root, false) {
             return true;
         }
+
         // Symlink alias fallback: e.g. /var/run → /run. Only runs on a
         // miss, so the common case (exact path match) is O(1) with no
         // stat() syscall. Falls back to the raw path if canonicalization
         // fails (socket deleted between checks).
         let canonical = expand_policy_path(requested, None, project_root);
+
         canonical.as_path() != requested
             && path_matches_rule(&self.path, &canonical, project_root, false)
     }
@@ -780,10 +835,12 @@ impl ResourceRule {
             && self.access.covers(access)
     }
 }
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceSection {
     #[serde(default)]
     pub allow: Vec<ResourceRule>,
+
     #[serde(default)]
     pub deny: Vec<ResourceRule>,
 }
@@ -796,6 +853,7 @@ pub struct ResourceSection {
 pub enum DbusBus {
     #[default]
     Session,
+
     System,
 }
 
@@ -807,6 +865,7 @@ pub enum DbusBus {
 pub enum DbusMessageKind {
     #[default]
     MethodCall,
+
     MethodReturn,
     Error,
     Signal,
@@ -817,6 +876,7 @@ pub enum DbusMessageKind {
 pub struct DbusFdMetadata {
     #[serde(default)]
     pub kind: String,
+
     #[serde(default)]
     pub read_only: bool,
 }
@@ -831,6 +891,7 @@ pub struct DbusTarget {
     pub member: String,
     pub message_kind: DbusMessageKind,
     pub signature: String,
+
     #[serde(default)]
     pub fd_metadata: Vec<DbusFdMetadata>,
 }
@@ -863,6 +924,7 @@ impl DbusTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DbusRule {
     pub target: DbusTarget,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
@@ -884,6 +946,7 @@ impl DbusRule {
         {
             return false;
         }
+
         glob_matches(&self.target.destination, &target.destination)
             && glob_matches(&self.target.object_path, &target.object_path)
             && glob_matches(&self.target.interface, &target.interface)
@@ -900,6 +963,7 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 pub struct DbusSection {
     #[serde(default)]
     pub allow: Vec<DbusRule>,
+
     #[serde(default)]
     pub deny: Vec<DbusRule>,
 }
@@ -908,12 +972,16 @@ pub struct DbusSection {
 pub struct Policy {
     #[serde(default)]
     pub network: NetworkSection,
+
     #[serde(default)]
     pub sudo: SudoSection,
+
     #[serde(default)]
     pub filesystem: FilesystemSection,
+
     #[serde(default)]
     pub resources: ResourceSection,
+
     #[serde(default)]
     pub dbus: DbusSection,
 }
@@ -922,12 +990,16 @@ pub struct Policy {
 struct PolicyWire {
     #[serde(default)]
     network: NetworkSection,
+
     #[serde(default)]
     sudo: SudoSection,
+
     #[serde(default)]
     filesystem: FilesystemSection,
+
     #[serde(default)]
     resources: ResourceSection,
+
     #[serde(default)]
     dbus: DbusSection,
 }
@@ -938,6 +1010,7 @@ impl<'de> Deserialize<'de> for Policy {
         D: serde::Deserializer<'de>,
     {
         let wire = PolicyWire::deserialize(deserializer)?;
+
         Ok(Self {
             network: wire.network,
             sudo: wire.sudo,
@@ -952,6 +1025,7 @@ impl<'de> Deserialize<'de> for Policy {
 pub struct DirectNetworkSection {
     #[serde(default)]
     pub allow: Vec<NetworkRule>,
+
     #[serde(default)]
     pub deny: Vec<NetworkRule>,
 }
@@ -960,6 +1034,7 @@ pub struct DirectNetworkSection {
 pub struct NetworkSection {
     #[serde(default)]
     pub direct: DirectNetworkSection,
+
     #[serde(default)]
     pub http: HttpSection,
 }
@@ -968,6 +1043,7 @@ pub struct NetworkSection {
 pub struct HttpSection {
     #[serde(default)]
     pub allow: Vec<HttpRule>,
+
     #[serde(default)]
     pub deny: Vec<HttpRule>,
 }
@@ -976,6 +1052,7 @@ pub struct HttpSection {
 pub struct SudoSection {
     #[serde(default)]
     pub allow: Vec<SudoRule>,
+
     #[serde(default)]
     pub deny: Vec<SudoRule>,
 }
@@ -984,6 +1061,7 @@ pub struct SudoSection {
 pub struct NetworkRule {
     pub host: String,
     pub port: u16,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
@@ -991,6 +1069,7 @@ pub struct NetworkRule {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SudoRule {
     pub argv: Vec<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
@@ -1035,9 +1114,11 @@ impl SudoRule {
     #[must_use]
     pub fn approval_prefixes(argv: &[String]) -> Vec<Vec<String>> {
         let mut prefixes = Vec::with_capacity(argv.len());
+
         for len in (1..=argv.len()).rev() {
             prefixes.push(argv[..len].to_vec());
         }
+
         prefixes
     }
 }
@@ -1056,6 +1137,7 @@ impl InodeIdentity {
     #[must_use]
     pub fn from_path(path: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
+
         std::fs::metadata(path)
             .map(|m| Self {
                 inode: m.ino(),
@@ -1088,12 +1170,12 @@ mod dbus_tests {
         assert!(rule.matches(&target("ReadAll")));
         assert!(!rule.matches(&target("Write")));
     }
+
     #[test]
     fn dbus_globset_supports_question_mark_and_character_classes() {
         let question = DbusRule::new(target("Read?"), "");
         assert!(question.matches(&target("Read1")));
         assert!(!question.matches(&target("Read12")));
-
         let class = DbusRule::new(target("[RW]ead"), "");
         assert!(class.matches(&target("Read")));
         assert!(class.matches(&target("Wead")));
@@ -1106,7 +1188,6 @@ mod dbus_tests {
         assert!(alternate.matches(&target("Read")));
         assert!(alternate.matches(&target("Write")));
         assert!(!alternate.matches(&target("Close")));
-
         let escaped = DbusRule::new(target(r"Read\*"), "");
         assert!(escaped.matches(&target("Read*")));
         assert!(!escaped.matches(&target("ReadAll")));
@@ -1121,6 +1202,7 @@ mod dbus_tests {
             },
             "",
         );
+
         let double = DbusRule::new(
             DbusTarget {
                 object_path: "/org/**/Object".into(),
@@ -1128,10 +1210,12 @@ mod dbus_tests {
             },
             "",
         );
+
         let nested = DbusTarget {
             object_path: "/org/example/team/Object".into(),
             ..target("Read")
         };
+
         assert!(!single.matches(&nested));
         assert!(double.matches(&nested));
     }
@@ -1142,16 +1226,19 @@ mod dbus_tests {
         system.bus = DbusBus::System;
         assert!(!DbusRule::new(target("Read"), "").matches(&system));
     }
+
     #[test]
     fn dbus_rules_match_all_structured_fields() {
         let mut rule_target = target("Read");
         rule_target.object_path = "/org/example/*".into();
         rule_target.interface = "org.example.*".into();
         rule_target.signature = "s*".into();
+
         rule_target.fd_metadata = vec![DbusFdMetadata {
             kind: "memfd".into(),
             read_only: true,
         }];
+
         let fd_metadata = rule_target.fd_metadata.clone();
         let rule = DbusRule::new(rule_target, "structured");
 
@@ -1159,13 +1246,16 @@ mod dbus_tests {
             fd_metadata,
             ..target("Read")
         };
+
         assert!(rule.matches(&matching));
+
         let mutations: [fn(&mut DbusTarget); 4] = [
             |target| target.object_path = "/other".into(),
             |target| target.interface = "org.other.Interface".into(),
             |target| target.signature = "a{sv}".into(),
             |target| target.fd_metadata.clear(),
         ];
+
         for mutate in mutations {
             let mut non_matching = matching.clone();
             mutate(&mut non_matching);
@@ -1191,6 +1281,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside dir");
         let escaped = expand_home_path(Path::new("~/../outside"), Some(home));
+
         assert_eq!(
             escaped,
             Path::new("~/../outside"),
@@ -1210,6 +1301,7 @@ mod tests {
     #[test]
     fn sudo_rule_approval_prefixes_descend_from_most_specific() {
         let argv = vec!["systemctl".into(), "restart".into(), "nginx".into()];
+
         assert_eq!(SudoRule::approval_prefixes(&argv), vec![
             vec![
                 "systemctl".to_string(),
@@ -1226,12 +1318,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join(".git/objects/pack");
         std::fs::create_dir_all(&pack).expect("pack dir");
+
         assert_eq!(
             super::normalize_directory_traverse_access(&pack, FileAccess::Execute),
             FileAccess::Read
         );
+
         let pack_file = pack.join("pack-abc.pack");
         std::fs::write(&pack_file, b"x").expect("pack file");
+
         assert_eq!(
             super::normalize_directory_traverse_access(&pack_file, FileAccess::Execute),
             FileAccess::Execute
@@ -1254,18 +1349,22 @@ mod tests {
     #[test]
     fn file_access_union_uses_smallest_covering_access() {
         assert_eq!(FileAccess::Read.union(FileAccess::Read), FileAccess::Read);
+
         assert_eq!(
             FileAccess::Read.union(FileAccess::Write),
             FileAccess::ReadWrite
         );
+
         assert_eq!(
             FileAccess::ReadWrite.union(FileAccess::Read),
             FileAccess::ReadWrite
         );
+
         assert_eq!(
             FileAccess::ReadWrite.union(FileAccess::Execute),
             FileAccess::All
         );
+
         assert_eq!(FileAccess::All.union(FileAccess::Read), FileAccess::All);
     }
 
@@ -1275,10 +1374,12 @@ mod tests {
             FileAccess::Read.combine_observed(FileAccess::Write),
             FileAccess::ReadWrite
         );
+
         assert_eq!(
             FileAccess::Read.combine_observed(FileAccess::Execute),
             FileAccess::All
         );
+
         assert_eq!(
             FileAccess::Read.combine_observed(FileAccess::ReadWrite),
             FileAccess::ReadWrite
@@ -1289,29 +1390,35 @@ mod tests {
     fn open_flags_classify_to_file_access() {
         assert_eq!(open_flags_to_file_access(libc::O_RDONLY), FileAccess::Read);
         assert_eq!(open_flags_to_file_access(libc::O_WRONLY), FileAccess::Write);
+
         assert_eq!(
             open_flags_to_file_access(libc::O_RDWR),
             FileAccess::ReadWrite
         );
+
         assert_eq!(
             open_flags_to_file_access(libc::O_RDWR | libc::O_APPEND),
             FileAccess::ReadWrite
         );
+
         assert_eq!(
             open_flags_to_file_access(libc::O_RDONLY | libc::O_CREAT),
             FileAccess::ReadWrite
         );
+
         assert_eq!(
             open_flags_to_file_access(libc::O_RDONLY | libc::O_TRUNC),
             FileAccess::ReadWrite
         );
     }
+
     #[test]
     fn filesystem_rule_matches_exact_path() {
         let rule = FilesystemRule::new("/home/user", FileAccess::Read, "");
         assert!(rule.path_matches(Path::new("/home/user"), None));
         assert!(!rule.path_matches(Path::new("/home/userx"), None));
     }
+
     #[test]
     fn filesystem_rule_matches_descendant() {
         let rule = FilesystemRule::new("/home", FileAccess::ReadWrite, "");
@@ -1328,10 +1435,13 @@ mod tests {
         // but previously not the rule path, so the descendant prefix check
         // failed ("model.json" has no leading '/').
         let rule = FilesystemRule::new("/home/user/state/opencode/", FileAccess::ReadWrite, "");
+
         assert!(rule.path_matches(Path::new("/home/user/state/opencode"), None));
         assert!(rule.path_matches(Path::new("/home/user/state/opencode/model.json"), None));
+
         // Prefix boundary: a longer name sharing the prefix stem must not match.
         assert!(!rule.path_matches(Path::new("/home/user/state/opencode-other"), None));
+
         assert!(!rule.path_matches(Path::new("/home/user/elsewhere"), None));
     }
 
@@ -1341,7 +1451,6 @@ mod tests {
         assert!(rule.matches(Path::new("/tmp"), FileAccess::Read, None));
         assert!(rule.matches(Path::new("/tmp"), FileAccess::Write, None));
         assert!(!rule.matches(Path::new("/tmp"), FileAccess::Execute, None));
-
         let all_rule = FilesystemRule::new("/nix/store", FileAccess::All, "");
         assert!(all_rule.matches(Path::new("/nix/store/something"), FileAccess::Execute, None));
         assert!(all_rule.matches(Path::new("/nix/store"), FileAccess::Write, None));
@@ -1350,8 +1459,10 @@ mod tests {
     #[test]
     fn glob_match_dot_slash_dot_env() {
         let rule = FilesystemRule::new("./**/.env", FileAccess::Read, "");
+
         // With project_root="/work", ./**/.env -> /work/**/.env
         assert!(rule.path_matches(Path::new("/work/.env"), Some(Path::new("/work"))));
+
         assert!(rule.path_matches(Path::new("/work/sub/.env"), Some(Path::new("/work"))));
         assert!(!rule.path_matches(Path::new("/etc/.env"), Some(Path::new("/work"))));
     }
@@ -1377,6 +1488,7 @@ mod tests {
         assert!(!rule.path_matches(Path::new("/work/.env"), None));
         assert!(rule.path_matches(Path::new("/work/secret"), None));
     }
+
     #[test]
     fn filesystem_globset_question_mark_matches_one_character() {
         let rule = FilesystemRule::new("/work/file?.txt", FileAccess::Read, "");
@@ -1429,11 +1541,13 @@ mod tests {
         let root = Path::new("/home/user/dotfiles");
         assert!(rule.matches(&root.join(".git"), FileAccess::ReadWrite, Some(root)));
         assert!(rule.matches(&root.join(".git/config"), FileAccess::ReadWrite, Some(root)));
+
         assert!(rule.matches(
             &root.join(".git/objects/pack"),
             FileAccess::Read,
             Some(root)
         ));
+
         assert!(rule.matches(
             &root.join(".git/objects/39/2aff17307d2091111c7a71e95580c632d90421"),
             FileAccess::ReadWrite,
@@ -1451,9 +1565,11 @@ mod tests {
     #[test]
     fn globset_star_matches_across_slashes_by_default() {
         use globset::{Glob, GlobBuilder};
+
         let default = Glob::new("/home/user/dotfiles/.git*")
             .expect("glob")
             .compile_matcher();
+
         assert!(default.is_match("/home/user/dotfiles/.git/config"));
 
         let literal = GlobBuilder::new("/home/user/dotfiles/.git*")
@@ -1461,6 +1577,7 @@ mod tests {
             .build()
             .expect("glob")
             .compile_matcher();
+
         assert!(!literal.is_match("/home/user/dotfiles/.git/config"));
     }
 
@@ -1477,6 +1594,7 @@ mod tests {
             Path::new("/home/user/.local/share/foo"),
             Some(Path::new("/home/user")),
         );
+
         assert_eq!(
             paths[0],
             PathBuf::from("/home/user/.local/share/foo"),
@@ -1490,6 +1608,7 @@ mod tests {
             Path::new("/home/user/.local/share/foo"),
             Some(Path::new("/home/user")),
         );
+
         assert_eq!(paths, vec![
             PathBuf::from("/home/user/.local/share/foo"),
             PathBuf::from("/home/user/.local/share"),
@@ -1504,6 +1623,7 @@ mod tests {
             Path::new("/nix/store/abc123/bin/hello"),
             Some(Path::new("/home/user")),
         );
+
         assert_eq!(paths, vec![
             PathBuf::from("/nix/store/abc123/bin/hello"),
             PathBuf::from("/nix/store/abc123/bin"),
@@ -1524,6 +1644,7 @@ mod tests {
     fn filesystem_approval_paths_home_exact_returns_just_home() {
         let paths =
             filesystem_approval_paths(Path::new("/home/user"), Some(Path::new("/home/user")));
+
         assert_eq!(paths, vec![PathBuf::from("/home/user")]);
     }
 
@@ -1539,14 +1660,17 @@ mod tests {
     #[test]
     fn contract_home_path_converts_under_home() {
         let home = Path::new("/home/user");
+
         assert_eq!(
             contract_home_path(Path::new("/home/user/.local/share/foo"), Some(home)),
             PathBuf::from("~/.local/share/foo")
         );
+
         assert_eq!(
             contract_home_path(Path::new("/home/user"), Some(home)),
             PathBuf::from("~")
         );
+
         assert_eq!(
             contract_home_path(Path::new("/home/user/"), Some(home)),
             PathBuf::from("~")
@@ -1556,10 +1680,12 @@ mod tests {
     #[test]
     fn contract_project_path_converts_unix_socket_under_project() {
         let project = Path::new("/home/user/repo");
+
         assert_eq!(
             contract_project_path(Path::new("/home/user/repo/.agent.sock"), Some(project)),
             PathBuf::from("./.agent.sock")
         );
+
         assert_eq!(
             contract_project_path(Path::new("/tmp/agent.sock"), Some(project)),
             PathBuf::from("/tmp/agent.sock")
@@ -1569,18 +1695,22 @@ mod tests {
     #[test]
     fn contract_home_path_leaves_non_home_paths_unchanged() {
         let home = Path::new("/home/user");
+
         assert_eq!(
             contract_home_path(Path::new("/nix/store"), Some(home)),
             PathBuf::from("/nix/store")
         );
+
         assert_eq!(
             contract_home_path(Path::new("/"), Some(home)),
             PathBuf::from("/")
         );
+
         assert_eq!(
             contract_home_path(Path::new("/home"), Some(home)),
             PathBuf::from("/home")
         );
+
         assert_eq!(
             contract_home_path(Path::new("/home/user2/file"), Some(home)),
             PathBuf::from("/home/user2/file")
@@ -1598,10 +1728,12 @@ mod tests {
     #[test]
     fn expand_home_path_converts_tilde() {
         let home = Path::new("/home/user");
+
         assert_eq!(
             expand_home_path(Path::new("~/.local/share/foo"), Some(home)),
             PathBuf::from("/home/user/.local/share/foo")
         );
+
         assert_eq!(
             expand_home_path(Path::new("~"), Some(home)),
             PathBuf::from("/home/user")
@@ -1611,10 +1743,12 @@ mod tests {
     #[test]
     fn expand_home_path_leaves_absolute_paths_unchanged() {
         let home = Path::new("/home/user");
+
         assert_eq!(
             expand_home_path(Path::new("/nix/store"), Some(home)),
             PathBuf::from("/nix/store")
         );
+
         assert_eq!(
             expand_home_path(Path::new("/"), Some(home)),
             PathBuf::from("/")
@@ -1634,10 +1768,12 @@ mod tests {
         let home = Path::new("/home/user");
         let original = Path::new("/home/user/.local/share/foo/agent/models.db-wal");
         let contracted = contract_home_path(original, Some(home));
+
         assert_eq!(
             contracted,
             PathBuf::from("~/.local/share/foo/agent/models.db-wal")
         );
+
         let expanded = expand_home_path(&contracted, Some(home));
         assert_eq!(expanded, original);
     }
@@ -1650,24 +1786,28 @@ mod tests {
             ResourceAccess::Device(DeviceAccess::ReadWrite),
             "",
         );
+
         assert!(rule.matches(
             ResourceKind::Device,
             Path::new("/dev/fd/3"),
             ResourceAccess::Device(DeviceAccess::Read),
             None
         ));
+
         assert!(rule.matches(
             ResourceKind::Device,
             Path::new("/dev/fd/3"),
             ResourceAccess::Device(DeviceAccess::Write),
             None
         ));
+
         assert!(!rule.matches(
             ResourceKind::Device,
             Path::new("/dev/fd/3"),
             ResourceAccess::Socket(SocketAccess::Connect),
             None
         ));
+
         assert!(!rule.matches(
             ResourceKind::UnixSocket,
             Path::new("/dev/fd/3"),
@@ -1684,12 +1824,14 @@ mod tests {
             ResourceAccess::Socket(SocketAccess::Connect),
             "",
         );
+
         assert!(connect_rule.matches(
             ResourceKind::UnixSocket,
             Path::new("/tmp/example.sock"),
             ResourceAccess::Socket(SocketAccess::Connect),
             None
         ));
+
         assert!(!connect_rule.matches(
             ResourceKind::UnixSocket,
             Path::new("/tmp/example.sock"),
@@ -1703,30 +1845,36 @@ mod tests {
             ResourceAccess::Socket(SocketAccess::Send),
             "",
         );
+
         assert!(send_rule.matches(
             ResourceKind::UnixSocket,
             Path::new("/tmp/example.sock"),
             ResourceAccess::Socket(SocketAccess::Send),
             None
         ));
+
         assert!(!send_rule.matches(
             ResourceKind::UnixSocket,
             Path::new("/tmp/example.sock"),
             ResourceAccess::Socket(SocketAccess::Connect),
             None
         ));
+
         let all = ResourceAccess::Socket(SocketAccess::All);
         assert!(all.covers(ResourceAccess::Socket(SocketAccess::Connect)));
         assert!(all.covers(ResourceAccess::Socket(SocketAccess::Send)));
+
         assert_eq!(
             ResourceAccess::Socket(SocketAccess::Connect)
                 .union(ResourceAccess::Socket(SocketAccess::Send)),
             Some(all)
         );
+
         assert_eq!(
             serde_json::to_string(&all).expect("serialize socket all"),
             "\"all\""
         );
+
         assert_eq!(
             serde_json::from_str::<ResourceAccess>("\"all\"").expect("deserialize socket all"),
             all
@@ -1741,6 +1889,7 @@ mod tests {
             ResourceAccess::Socket(SocketAccess::Connect),
             "",
         );
+
         assert!(rule.path_matches(Path::new("/run/user/1000/bus"), None));
         assert!(rule.path_matches(Path::new("/run/user/1000/bus/socket"), None));
         assert!(!rule.path_matches(Path::new("/run/user/1000/bus-other"), None));

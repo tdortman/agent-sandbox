@@ -48,7 +48,9 @@ fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&P
     let Some(home) = home else {
         return;
     };
+
     let home = home.to_string_lossy();
+
     for rule in static_allow {
         if let Ok(rest) = rule.path.strip_prefix("~/") {
             rule.path = PathBuf::from(format!("{}/{}", home.trim_end_matches('/'), rest.display()));
@@ -64,9 +66,11 @@ fn main() {
 
     // Gather context from environment (set by bubblewrap wrapper).
     let cwd = std::env::var("AGENT_SANDBOX_CWD").ok();
+
     let home = std::env::var("AGENT_SANDBOX_HOME").ok();
     let project_root = std::env::var("AGENT_SANDBOX_PROJECT_ROOT").ok();
     let sandbox_session_id = std::env::var("AGENT_SANDBOX_SESSION_ID").ok();
+
     let socket_path = std::env::var("AGENT_SANDBOX_POLICY_SOCKET")
         .unwrap_or_else(|_| "/run/agent-sandbox/policy.sock".to_owned());
 
@@ -87,6 +91,7 @@ fn main() {
 
     expand_home_static_allow(&mut static_allow, home.as_deref().map(Path::new));
     eprintln!("agent-sandbox-fs-arm: starting filesystem monitor...");
+
     // Connect to policyd and request monitor startup.
     let reply = rpc_client::start_monitor(Path::new(&socket_path), ctx, static_allow)
         .unwrap_or_else(|e| {
@@ -101,13 +106,16 @@ fn main() {
             "agent-sandbox-fs-arm: monitor did not activate: {}",
             reply.error.as_deref().unwrap_or("unknown error")
         );
+
         process::exit(1);
     }
+
     // Exec the real command. nix::unistd::execvp null-terminates argv.
     let cargs: Vec<CString> = real_args
         .iter()
         .map(|a| CString::new(a.as_os_str().as_bytes()).expect("arg contains null byte"))
         .collect();
+
     let cstr_refs: Vec<&CStr> = cargs.iter().map(CString::as_c_str).collect();
     let _ = nix::unistd::execvp(cargs[0].as_c_str(), &cstr_refs);
 
@@ -116,5 +124,6 @@ fn main() {
         "agent-sandbox-fs-arm: execvp failed: {}",
         std::io::Error::last_os_error()
     );
+
     process::exit(1);
 }

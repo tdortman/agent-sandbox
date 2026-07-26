@@ -1,15 +1,13 @@
 //! Route incoming RPC requests to store methods.
 
 mod auth;
+
 pub use auth::SocketRole;
 mod check;
 mod context;
 mod handlers;
-
 use std::sync::Arc;
-
 use agent_sandbox_core::{RpcReply, RpcRequest};
-
 use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
 
 pub async fn dispatch(
@@ -20,9 +18,11 @@ pub async fn dispatch(
     req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     auth::ensure_allowed(role, &req)?;
+
     if matches!(&req, RpcRequest::RegisterNetworkFlow { .. }) && peer.uid != 0 {
         return Err(PolicydError::UnauthorizedRequest);
     }
+
     let req = context::plan(store, peer, role, req);
     handlers::handle(store, client, peer, req).await
 }
@@ -36,8 +36,8 @@ mod tests {
         NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
         SocketInode,
     };
-    use tokio::{net::UnixStream, sync::Mutex};
 
+    use tokio::{net::UnixStream, sync::Mutex};
     use super::{SocketRole, dispatch};
     use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
 

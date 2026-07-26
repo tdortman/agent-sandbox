@@ -18,6 +18,7 @@ pub fn merge_layers(layers: &[Policy]) -> Policy {
     if layers.is_empty() {
         return Policy::default();
     }
+
     Policy {
         network: merge_network(layers),
         sudo: merge_sudo(layers),
@@ -39,6 +40,7 @@ fn merge_dbus(layers: &[Policy]) -> DbusSection {
         |rule| Some(rule.clone()),
         dbus_rules_overlap,
     );
+
     DbusSection { allow, deny }
 }
 
@@ -46,9 +48,11 @@ fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {
     if deny.port != allow.port {
         return false;
     }
+
     if host_pattern_has_glob(&deny.host) && host_pattern_has_glob(&allow.host) {
         return deny.host.eq_ignore_ascii_case(&allow.host);
     }
+
     host_pattern_matches(&deny.host, &allow.host) || host_pattern_matches(&allow.host, &deny.host)
 }
 
@@ -69,39 +73,47 @@ where
 {
     let mut allow: BTreeMap<K, R> = BTreeMap::new();
     let mut deny: BTreeMap<K, R> = BTreeMap::new();
+
     for layer in layers {
         for rule in allow_rules(layer) {
             if let Some(key) = key(rule) {
                 allow.insert(key, rule.clone());
             }
         }
+
         for rule in deny_rules(layer) {
             if let Some(key) = key(rule) {
                 deny.insert(key, rule.clone());
             }
         }
     }
+
     allow.retain(|_, allow_rule| {
         !deny
             .values()
             .any(|deny_rule| overlaps(deny_rule, allow_rule))
     });
+
     (allow.into_values().collect(), deny.into_values().collect())
 }
 
 fn merge_http_rules(layers: &[Policy], allow_rules: bool) -> Vec<HttpRule> {
     let mut merged: BTreeMap<HttpUrl, (HttpMethodMatcher, Option<String>)> = BTreeMap::new();
+
     for layer in layers {
         let rules = if allow_rules {
             &layer.network.http.allow
         } else {
             &layer.network.http.deny
         };
+
         for rule in rules {
             let Ok(target) = rule.target() else {
                 continue;
             };
+
             let url = target.url;
+
             if let Some((methods, comment)) = merged.get_mut(&url) {
                 *methods = methods.union(&target.method);
                 comment.clone_from(&rule.comment);
@@ -110,6 +122,7 @@ fn merge_http_rules(layers: &[Policy], allow_rules: bool) -> Vec<HttpRule> {
             }
         }
     }
+
     merged
         .into_iter()
         .map(|(url, (methods, comment))| HttpRule {
@@ -136,20 +149,24 @@ fn merge_network(layers: &[Policy]) -> NetworkSection {
         |rule| Some(rule.key()),
         network_rules_overlap,
     );
+
     let http_allow = merge_http_rules(layers, true);
     let http_deny = merge_http_rules(layers, false);
     let http_deny_targets: Vec<_> = http_deny.iter().filter_map(http_rule_target).collect();
+
     let http_allow = http_allow
         .into_iter()
         .filter(|allow| {
             let Some(allow_target) = http_rule_target(allow) else {
                 return true;
             };
+
             !http_deny_targets
                 .iter()
                 .any(|deny_target| deny_target.covers(&allow_target))
         })
         .collect();
+
     NetworkSection {
         direct: DirectNetworkSection {
             allow: direct_allow,
@@ -174,6 +191,7 @@ fn merge_sudo(layers: &[Policy]) -> SudoSection {
         SudoRule::key,
         sudo_rules_overlap,
     );
+
     SudoSection { allow, deny }
 }
 
@@ -202,6 +220,7 @@ fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
         |rule| Some(filesystem_rule_key(rule)),
         filesystem_rules_overlap,
     );
+
     FilesystemSection { allow, deny }
 }
 
@@ -225,12 +244,14 @@ fn merge_resources(layers: &[Policy]) -> ResourceSection {
         |rule| Some(resource_rule_key(rule)),
         resource_rules_overlap,
     );
+
     ResourceSection { allow, deny }
 }
 
 #[cfg(test)]
 mod tests {
     use super::merge_layers;
+
     use crate::policy::{
         DeviceAccess, FileAccess, FilesystemRule, FilesystemSection, Policy, ResourceAccess,
         ResourceKind, ResourceRule, ResourceSection,
@@ -258,6 +279,7 @@ mod tests {
             },
             ..empty_policy()
         };
+
         let high = Policy {
             resources: ResourceSection {
                 allow: vec![],
@@ -278,6 +300,7 @@ mod tests {
             1,
             "broad /dev/fd allow must survive narrow /dev/fd/3 deny"
         );
+
         assert_eq!(merged.resources.deny.len(), 1);
     }
 
@@ -296,6 +319,7 @@ mod tests {
             },
             ..empty_policy()
         };
+
         let high = Policy {
             resources: ResourceSection {
                 allow: vec![],
@@ -315,6 +339,7 @@ mod tests {
             merged.resources.allow.is_empty(),
             "deny OpenReadWrite on /dev/fd/3 fully shadows allow OpenRead"
         );
+
         assert_eq!(merged.resources.deny.len(), 1);
     }
 
@@ -332,6 +357,7 @@ mod tests {
             },
             ..empty_policy()
         };
+
         let high = Policy {
             resources: ResourceSection {
                 allow: vec![ResourceRule::new(
@@ -346,8 +372,8 @@ mod tests {
         };
 
         let merged = merge_layers(&[low, high]);
-
         assert_eq!(merged.resources.allow.len(), 1);
+
         assert_eq!(
             merged.resources.allow[0].path.as_path(),
             std::path::Path::new("/dev/fd")
@@ -370,6 +396,7 @@ mod tests {
             },
             ..empty_policy()
         };
+
         let high = Policy {
             filesystem: FilesystemSection {
                 allow: vec![],
@@ -389,6 +416,7 @@ mod tests {
             1,
             "broad ./.git/ allow must survive narrow ./.git/hooks/* deny"
         );
+
         assert_eq!(merged.filesystem.deny.len(), 1);
     }
 
@@ -402,6 +430,7 @@ mod tests {
             },
             ..empty_policy()
         };
+
         let high = Policy {
             filesystem: FilesystemSection {
                 allow: vec![],

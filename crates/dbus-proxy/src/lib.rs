@@ -7,17 +7,19 @@ use agent_sandbox_core::{
     rpc::{RequestContext, RpcReply, RpcRequest},
     rpc_client::PersistentRpcClient,
 };
+
 use futures_util::StreamExt;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
+
 use zbus::{
     Connection, Guid, MessageStream,
     connection::Builder,
     message::{Builder as MessageBuilder, Flags, Message, Type},
 };
-use zvariant::Fd;
 
+use zvariant::Fd;
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const HELLO: &str = "Hello";
@@ -72,8 +74,10 @@ impl SerialMap {
 
     fn next_serial(&mut self) -> NonZeroU32 {
         let serial = self.next;
+
         self.next = NonZeroU32::new(serial.get().wrapping_add(1))
             .unwrap_or_else(|| NonZeroU32::new(1).expect("constant is non-zero"));
+
         serial
     }
 
@@ -108,30 +112,37 @@ impl SerialMap {
 #[must_use]
 pub fn target_from_message(message: &Message, bus: DbusBus) -> DbusTarget {
     let header = message.header();
+
     let kind = match message.message_type() {
         Type::MethodCall => DbusMessageKind::MethodCall,
         Type::MethodReturn => DbusMessageKind::MethodReturn,
         Type::Error => DbusMessageKind::Error,
         Type::Signal => DbusMessageKind::Signal,
     };
+
     let destination = header
         .destination()
         .map(ToString::to_string)
         .unwrap_or_default();
+
     let object_path = header.path().map(ToString::to_string).unwrap_or_default();
+
     let interface = header
         .interface()
         .map(ToString::to_string)
         .unwrap_or_default();
+
     let member = header.member().map(ToString::to_string).unwrap_or_default();
     let signature = header.signature().to_string();
     let fd_count = header.unix_fds().unwrap_or(0);
+
     let fd_metadata = (0..fd_count)
         .map(|_| DbusFdMetadata {
             kind: "unknown".to_owned(),
             read_only: false,
         })
         .collect();
+
     DbusTarget {
         bus,
         destination,
@@ -153,11 +164,14 @@ pub async fn run(config: RelayConfig) -> Result<(), RelayError> {
     if config.listen.exists() {
         tokio::fs::remove_file(&config.listen).await?;
     }
+
     let listener = UnixListener::bind(&config.listen)?;
     info!(path = %config.listen.display(), "D-Bus relay listening");
+
     loop {
         let (stream, _) = listener.accept().await?;
         let client_config = config.clone();
+
         tokio::spawn(async move {
             if let Err(error) = handle_client(stream, client_config).await {
                 debug!(%error, "D-Bus relay client closed");
@@ -208,6 +222,7 @@ async fn handle_client(
 
     let client_connection = Connection::from(&client_stream);
     let upstream_connection = Connection::from(&upstream_stream);
+
     let upstream_name = upstream_connection
         .unique_name()
         .map(ToString::to_string)
@@ -244,6 +259,7 @@ async fn relay_loop(
         client_connection,
         upstream_connection,
     } = channels;
+
     loop {
         tokio::select! {
             client_message = client_stream.next() => {
@@ -336,12 +352,15 @@ async fn policy_check(
         target,
         ctx: context,
     };
+
     match policy.request(request, timeout).await {
         Ok(RpcReply::DbusCheck(reply)) => reply.ok && reply.allowed,
+
         Ok(other) => {
             warn!(reply = %other, "policyd returned an unexpected reply for D-Bus check");
             false
         }
+
         Err(error) => {
             warn!(%error, "policyd check failed; denying D-Bus message");
             false
@@ -352,6 +371,7 @@ async fn policy_check(
 async fn send_access_denied(connection: &Connection, message: &Message) -> Result<(), zbus::Error> {
     let reply = Message::error(&message.header(), "org.freedesktop.DBus.Error.AccessDenied")?
         .build(&("blocked by agent-sandbox policy",))?;
+
     connection.send(&reply).await
 }
 
@@ -367,6 +387,7 @@ fn is_hello(message: &Message) -> bool {
 
 fn is_bus_method(message: &Message, member_matches: impl FnOnce(&str) -> bool) -> bool {
     let header = message.header();
+
     message.message_type() == Type::MethodCall
         && header
             .destination()
@@ -386,6 +407,7 @@ fn rewrite_message(
     reply_serial: Option<NonZeroU32>,
 ) -> Result<Message, RelayError> {
     let body = message.body();
+
     let fds = body
         .data()
         .fds()
@@ -423,9 +445,7 @@ fn build_raw_body(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
-
     use zbus::{message::Message, zvariant::Endian};
-
     use super::{DbusBus, SerialMap, is_forbidden_bus_control, target_from_message};
 
     #[test]

@@ -10,7 +10,6 @@ fn run(args: &[&str]) -> std::process::Output {
 #[test]
 fn help_describes_namespace_and_forwarded_command() {
     let output = run(&["--help"]);
-
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: agent-sandbox-enter <NETNS> [COMMAND]..."));
@@ -21,7 +20,6 @@ fn help_describes_namespace_and_forwarded_command() {
 #[test]
 fn missing_namespace_is_rejected_without_touching_namespace_state() {
     let output = run(&[]);
-
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("the following required arguments were not provided"));

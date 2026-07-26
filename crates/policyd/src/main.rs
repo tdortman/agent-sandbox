@@ -139,6 +139,7 @@ async fn main() -> Result<(), PolicydError> {
     if cli.cleanup_cgroup_freeze {
         agent_sandbox_policyd::cleanup_cgroup_freeze()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+
         return Ok(());
     }
 
@@ -165,7 +166,6 @@ async fn main() -> Result<(), PolicydError> {
     store.enable_cgroup_freezer();
     let store = Arc::new(store);
     store.export_policy_files(SandboxPaths::default())?;
-
     let server = PolicyServer::new(store.clone());
     server.run().await?;
     Ok(())
@@ -174,7 +174,6 @@ async fn main() -> Result<(), PolicydError> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-
     use super::*;
 
     #[test]

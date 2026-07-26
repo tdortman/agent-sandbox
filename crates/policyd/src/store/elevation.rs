@@ -9,8 +9,8 @@ use std::{
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
-
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore};
+
 use crate::{
     error::PolicydError,
     wire::{ElevationRequest, UiSpawnContext},
@@ -23,8 +23,10 @@ impl PolicyStore {
         let Some(home) = home else {
             return "root".into();
         };
+
         if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
             let home_str = home.to_string_lossy();
+
             for line in passwd.lines() {
                 let mut parts = line.splitn(7, ':');
                 let _ = parts.next();
@@ -33,6 +35,7 @@ impl PolicyStore {
                 let _ = parts.next();
                 let _ = parts.next();
                 let dir = parts.next().unwrap_or("");
+
                 if dir == home_str.as_ref()
                     && let Some(user) = line.split(':').next()
                     && !user.is_empty()
@@ -41,6 +44,7 @@ impl PolicyStore {
                 }
             }
         }
+
         home.file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
@@ -50,6 +54,7 @@ impl PolicyStore {
 
     pub(crate) fn elevation_env(home: Option<&Path>) -> HashMap<String, String> {
         let user = Self::user_for_home(home);
+
         HashMap::from([
             ("AGENT_SANDBOX_ELEVATE_USER".into(), user),
             ("PATH".into(), ELEVATION_PATH.into()),
@@ -60,7 +65,9 @@ impl PolicyStore {
         let Some(program) = argv.first() else {
             return Err(PolicydError::ArgvRequired);
         };
+
         let path = Path::new(program);
+
         let candidate = if path.is_absolute() {
             // Reject absolute paths outside the trusted system profile before
             // following links. The suffix must contain only normal
@@ -89,17 +96,21 @@ impl PolicyStore {
             }
             Path::new(ELEVATION_PATH).join(program)
         };
+
         // Preserve the trusted candidate's name for multi-call binaries
         // (e.g. coreutils), which dispatch on argv[0], rather than the
         // canonical store path's name.
         let arg0_name = candidate.to_string_lossy().into_owned();
+
         // Canonicalize and require a regular file in the immutable Nix store.
         let canonical = candidate
             .canonicalize()
             .map_err(|_| PolicydError::ElevationArgvNotAbsolute)?;
+
         if !canonical.is_file() || !canonical.starts_with("/nix/store/") {
             return Err(PolicydError::ElevationArgvNotAbsolute);
         }
+
         Ok((canonical, arg0_name))
     }
 
@@ -110,11 +121,14 @@ impl PolicyStore {
         home: Option<&Path>,
     ) -> Result<ElevateReply, PolicydError> {
         let (prog, arg0_name) = Self::resolve_elevation_argv(argv)?;
+
         let work_dir = cwd
             .and_then(|dir| dir.canonicalize().ok())
             .filter(|dir| dir.is_dir())
             .unwrap_or_else(|| PathBuf::from("/"));
+
         let mut cmd = tokio::process::Command::new(&prog);
+
         // Preserve the original argv[0] for multi-call binaries (e.g.
         // coreutils) that dispatch on the program name.
         cmd.arg0(&arg0_name)
@@ -124,7 +138,9 @@ impl PolicyStore {
             .envs(Self::elevation_env(home))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
         let output = cmd.output().await;
+
         match output {
             Ok(out) => {
                 let exit_code = out.status.code().unwrap_or(1);
@@ -139,12 +155,14 @@ impl PolicyStore {
                     String::from_utf8_lossy(&out.stderr).into_owned(),
                 ))
             }
+
             Err(err) => Ok(ElevateReply::exec_failed(err)),
         }
     }
 
     pub(crate) async fn finish_elevation(&self, pending_id: &str, result: ElevateReply) {
         let mut inner = self.inner.lock().await;
+
         if let Some(tx) = inner.elevation_futures.remove(pending_id) {
             let _ = tx.send(result);
         }
@@ -158,10 +176,12 @@ impl PolicyStore {
         let home = ctx.paths.home_path();
         let project_root = ctx.paths.project_root_path();
         let sandbox_session_id = ctx.sandbox_session_id.clone();
+
         if self.sudo_policy_denied(&argv, &ctx) || self.session_sudo_denied(&argv, &ctx).await {
             tracing::info!(argv = %argv.join(" "), "sudo deny (policy)");
             return ElevateReply::denied();
         }
+
         if self.sudo_policy_allowed(&argv, &ctx) || self.session_sudo_allowed(&argv, &ctx).await {
             return match self
                 .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
@@ -212,6 +232,7 @@ impl PolicyStore {
             project_root: project_root.clone(),
         })
         .await;
+
         self.maybe_spawn_elevation_ui(
             &ctx,
             &wire_ids,
@@ -236,6 +257,7 @@ impl PolicyStore {
     ) -> Option<PendingResult<String, ElevateReply>> {
         let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
+
         {
             let mut inner = self.inner.lock().await;
             if inner.pending_len() >= MAX_PENDING_APPROVALS {
@@ -258,8 +280,10 @@ impl PolicyStore {
                 sandbox_session_id: sandbox_session_id.map(String::from),
             }));
         }
+
         let detail = format!("id={pending_id} argv={argv:?}");
         Self::audit("pending", None, None, &detail);
+
         Some(PendingResult {
             id: pending_id,
             is_new: true,
@@ -279,7 +303,9 @@ impl PolicyStore {
         if self.has_ui_for_context(ctx).await {
             return;
         }
+
         let mut spawn_uid = wire_ids.uid();
+
         if spawn_uid.is_none_or(|u| u == 0)
             && let Some(h) = home
         {
@@ -288,6 +314,7 @@ impl PolicyStore {
                 .flatten()
                 .map(|u| u.uid.as_raw());
         }
+
         let spawn = UiSpawnContext {
             has_matching_ui: false,
             uid: spawn_uid,
@@ -296,6 +323,7 @@ impl PolicyStore {
             project_root,
             sandbox_session_id,
         };
+
         self.spawn_policy_ui(spawn).await;
     }
 
@@ -310,18 +338,23 @@ impl PolicyStore {
         // Preserve the existing two-timeout contract: a short wait for the
         // UI to register, then a full approval_timeout for the verdict.
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
+
         loop {
             if self.has_ui_for_context(ctx).await {
                 break;
             }
+
             let now = Instant::now();
+
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
                 inner.take_pending(pending_id);
                 inner.elevation_futures.remove(pending_id);
                 drop(inner);
+
                 return ElevateReply {
                     ok: true,
                     allowed: false,
@@ -332,7 +365,9 @@ impl PolicyStore {
                         .into(),
                 };
             }
+
             let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
+
             tokio::select! {
                 biased;
                 () = time::sleep(sleep_dur) => {}
@@ -345,6 +380,7 @@ impl PolicyStore {
         match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => ElevateReply::denied(),
+
             Err(_) => {
                 let mut inner = self.inner.lock().await;
                 inner.take_pending(pending_id);
@@ -373,7 +409,6 @@ mod tests {
     };
 
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
-
     use super::ELEVATION_PATH;
     use crate::{store::types::PolicyStore, wire::ElevationRequest};
 
@@ -381,6 +416,7 @@ mod tests {
         let path = Path::new(ELEVATION_PATH).join("true");
         path.is_file().then_some(path)
     }
+
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(
             "/tmp/test.sock".into(),
@@ -413,7 +449,9 @@ mod tests {
         // UI-registration wait used to be ignored. The request would only
         // return after the (multi-minute) UI wait timed out.
         let store = Arc::new(test_store());
+
         let store_for_task = store.clone();
+
         let task = tokio::spawn(async move {
             store_for_task
                 .request_elevation(elevation_request(vec![
@@ -422,6 +460,7 @@ mod tests {
                 ]))
                 .await
         });
+
         // Wait for the request to register a pending. The task is now
         // inside the UI-registration wait loop.
         let pending_id = {
@@ -443,33 +482,37 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
+
         // No UI is registered; CLI approves via the same path
         // `apply_pending_sudo_decision` would use.
         let reply = ElevateReply::executed(0, String::new(), String::new());
+
         store.finish_elevation(&pending_id, reply).await;
+
         let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
+
         assert!(result.allowed, "expected allowed reply, got: {result:?}");
     }
 
     #[test]
     fn forged_home_does_not_auto_elevate_via_attacker_policy() {
         use agent_sandbox_core::{Policy, SudoRule};
-
         use crate::store::types::TrustedPeer;
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_home = tmp.path().join("home/user");
         let evil = tmp.path().join("evil");
         std::fs::create_dir_all(real_home.join(".config/agent-sandbox")).expect("real config");
         std::fs::create_dir_all(evil.join(".config/agent-sandbox")).expect("evil config");
+
         std::fs::write(
             real_home.join(".config/agent-sandbox/policy.json"),
             r#"{"network":{"direct":{"allow":[],"deny":[]},"http":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]},"filesystem":{"allow":[],"deny":[]},"resources":{"allow":[],"deny":[]}}"#,
         )
         .expect("real policy");
+
         std::fs::write(
             evil.join(".config/agent-sandbox/policy.json"),
             serde_json::to_string(&Policy {
@@ -485,12 +528,15 @@ mod tests {
 
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
+
         let forged = crate::wire::MergeContext {
             paths: SandboxPaths::from_wire(Some(evil.clone()), Some(evil.clone()), Some(evil)),
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,
         };
+
         let resolved = store.resolve_context_with_peer(&forged, Some(TrustedPeer { pid: 0, uid }));
+
         assert!(
             !store.sudo_policy_allowed(&["id".into()], &resolved),
             "forged home must not auto-approve elevation via attacker sudo policy"
@@ -503,10 +549,12 @@ mod tests {
         let fake_bin = tmp.path().join("evil");
         std::fs::write(&fake_bin, b"#!/bin/sh\necho pwned\n").expect("write fake binary");
         let store = test_store();
+
         let err = store
             .exec_elevation(&[fake_bin.to_string_lossy().into_owned()], None, None)
             .await
             .expect_err("must reject");
+
         assert!(
             matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
             "expected ElevationArgvNotAbsolute, got {err:?}"
@@ -518,37 +566,47 @@ mod tests {
         let Some(profile_true) = system_profile_true() else {
             return;
         };
+
         let store_path = profile_true
             .canonicalize()
             .expect("system-profile true must resolve");
+
         assert!(store_path.starts_with("/nix/store/"));
         let store = test_store();
+
         let err = store
             .exec_elevation(&[store_path.to_string_lossy().into_owned()], None, None)
             .await
             .expect_err("direct Nix store paths must be rejected");
+
         assert!(
             matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
             "expected ElevationArgvNotAbsolute, got {err:?}"
         );
     }
+
     #[tokio::test]
     async fn elevation_resolves_bare_system_profile_binary() {
         let Some(profile_true) = system_profile_true() else {
             return;
         };
+
         let canonical = profile_true
             .canonicalize()
             .expect("system-profile true must resolve");
+
         assert!(
             canonical.is_file() && canonical.starts_with("/nix/store/"),
             "system-profile true must be a regular Nix-store file: {canonical:?}"
         );
+
         let store = test_store();
+
         let reply = store
             .exec_elevation(&["true".into()], None, None)
             .await
             .expect("true must resolve and execute");
+
         assert_eq!(reply.exit_code, 0, "true must exit 0, got {reply:?}");
     }
 
@@ -557,11 +615,14 @@ mod tests {
         let Some(profile_true) = system_profile_true() else {
             return;
         };
+
         let store = test_store();
+
         let reply = store
             .exec_elevation(&[profile_true.to_string_lossy().into_owned()], None, None)
             .await
             .expect("absolute system-profile true must resolve and execute");
+
         assert_eq!(
             reply.exit_code, 0,
             "absolute system-profile true must exit 0, got {reply:?}"
@@ -572,19 +633,24 @@ mod tests {
     async fn elevation_rejects_traversal_symlink_alias() {
         let tmp = tempfile::tempdir_in("/tmp").expect("tempdir");
         let alias = tmp.path().join("rm");
+
         std::os::unix::fs::symlink("/nix/store/fake-coreutils/bin/true", &alias)
             .expect("create symlink alias");
+
         let name = tmp
             .path()
             .file_name()
             .expect("tempdir name")
             .to_string_lossy();
+
         let traversal = format!("../../../../tmp/{name}/rm");
         let store = test_store();
+
         let err = store
             .exec_elevation(&[traversal], None, None)
             .await
             .expect_err("relative symlink alias must be rejected");
+
         assert!(
             matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
             "expected ElevationArgvNotAbsolute for traversal alias, got {err:?}"
@@ -595,19 +661,24 @@ mod tests {
     async fn elevation_rejects_absolute_traversal_symlink_alias() {
         let tmp = tempfile::tempdir_in("/tmp").expect("tempdir");
         let alias = tmp.path().join("rm");
+
         std::os::unix::fs::symlink("/nix/store/fake-coreutils/bin/true", &alias)
             .expect("create symlink alias");
+
         let name = tmp
             .path()
             .file_name()
             .expect("tempdir name")
             .to_string_lossy();
+
         let traversal = format!("/run/current-system/../../../../tmp/{name}/rm");
         let store = test_store();
+
         let err = store
             .exec_elevation(&[traversal], None, None)
             .await
             .expect_err("absolute traversal alias must be rejected");
+
         assert!(
             matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
             "expected ElevationArgvNotAbsolute for absolute traversal alias, got {err:?}"
@@ -620,14 +691,19 @@ mod tests {
         // are followed. Otherwise an attacker could create /tmp/rm pointing
         // at a multi-call binary and spoof its applet dispatch via argv[0].
         let tmp = tempfile::tempdir().expect("tempdir");
+
         let alias = tmp.path().join("rm");
+
         std::os::unix::fs::symlink("/nix/store/fake-coreutils/bin/true", &alias)
             .expect("create symlink alias");
+
         let store = test_store();
+
         let err = store
             .exec_elevation(&[alias.to_string_lossy().into_owned()], None, None)
             .await
             .expect_err("symlink alias must be rejected");
+
         assert!(
             matches!(err, crate::error::PolicydError::ElevationArgvNotAbsolute),
             "expected ElevationArgvNotAbsolute for symlink alias, got {err:?}"

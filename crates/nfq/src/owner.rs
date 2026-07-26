@@ -24,7 +24,9 @@ pub fn owner_snapshot(
         TransportProtocol::Tcp => SocketProtocol::Tcp,
         TransportProtocol::Udp => SocketProtocol::Udp,
     };
+
     let tuple = SocketTuple::from_local(src_ip, src_port);
+
     match resolve_owner_snapshot(protocol, tuple) {
         OwnerResolution::Unique(snapshot) => Some(snapshot),
         OwnerResolution::Missing | OwnerResolution::Ambiguous => None,
@@ -34,13 +36,13 @@ pub fn owner_snapshot(
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
-
     use super::*;
 
     #[test]
     fn owner_snapshot_resolves_current_process_for_loopback_tcp_client() {
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
+
         let listener_addr = listener.local_addr().expect("listener address");
         let client = std::net::TcpStream::connect(listener_addr).expect("connect loopback client");
         let (_server, _) = listener.accept().expect("accept loopback client");

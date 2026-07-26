@@ -18,36 +18,43 @@ pub(super) enum ResolvedRpcRequest {
     RegisterUi {
         ctx: ResolvedRequestContext,
     },
-    UnregisterUi,
 
+    UnregisterUi,
     OpenProxySession,
+
     RegisterNetworkFlow {
         registration: FlowRegistration,
     },
+
     ClaimNetworkFlow {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
         connection_id: ProxyConnectionId,
     },
+
     CheckHttp {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
         request: HttpRequest,
     },
+
     CheckNetworkFlow {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
     },
+
     CancelCheck {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
     },
+
     ReleaseNetworkFlow {
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
     },
+
     Check {
         host: Option<String>,
         connect_host: Option<String>,
@@ -56,30 +63,36 @@ pub(super) enum ResolvedRpcRequest {
         url: Option<String>,
         ctx: ResolvedRequestContext,
     },
+
     CheckFilesystem {
         path: PathBuf,
         access: FileAccess,
         ctx: ResolvedRequestContext,
     },
+
     CheckResource {
         kind: ResourceKind,
         path: PathBuf,
         access: ResourceAccess,
         ctx: ResolvedRequestContext,
     },
+
     CheckDbus {
         target: agent_sandbox_core::DbusTarget,
         ctx: ResolvedRequestContext,
     },
+
     StartFilesystemMonitor {
         peer_pid: u32,
         ctx: ResolvedRequestContext,
         static_allow: Vec<FilesystemRule>,
     },
+
     Elevate {
         argv: Vec<String>,
         ctx: ResolvedRequestContext,
     },
+
     Approve {
         id: String,
         scope: ApprovalScope,
@@ -88,6 +101,7 @@ pub(super) enum ResolvedRpcRequest {
         comment: Option<String>,
         ctx: ResolvedRequestContext,
     },
+
     ApproveHost {
         host: String,
         port: u16,
@@ -95,12 +109,14 @@ pub(super) enum ResolvedRpcRequest {
         session_id: Option<String>,
         ctx: ResolvedRequestContext,
     },
+
     ApproveHttp {
         target: HttpRuleTarget,
         scope: ApprovalScope,
         session_id: Option<String>,
         ctx: ResolvedRequestContext,
     },
+
     Deny {
         id: String,
         scope: ApprovalScope,
@@ -109,9 +125,11 @@ pub(super) enum ResolvedRpcRequest {
         comment: Option<String>,
         ctx: ResolvedRequestContext,
     },
+
     Status {
         ctx: ResolvedRequestContext,
     },
+
     Reload {
         ctx: ResolvedRequestContext,
     },
@@ -135,7 +153,9 @@ fn resolve_request_context(
             &sandbox_session_id,
         );
     }
+
     let mc = crate::wire::MergeContext::from(ctx);
+
     store.resolve_context_with_peer(
         &mc,
         Some(TrustedPeer {
@@ -149,9 +169,11 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
     match req {
         RpcRequest::UnregisterUi => Ok(ResolvedRpcRequest::UnregisterUi),
         RpcRequest::OpenProxySession => Ok(ResolvedRpcRequest::OpenProxySession),
+
         RpcRequest::RegisterNetworkFlow { registration } => {
             Ok(ResolvedRpcRequest::RegisterNetworkFlow { registration })
         }
+
         RpcRequest::ClaimNetworkFlow {
             proxy_session,
             flow,
@@ -161,6 +183,7 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
             flow,
             connection_id,
         }),
+
         RpcRequest::CheckHttp {
             proxy_session,
             request_id,
@@ -172,6 +195,7 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
             attribution_token,
             request,
         }),
+
         RpcRequest::CheckNetworkFlow {
             proxy_session,
             request_id,
@@ -181,6 +205,7 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
             request_id,
             attribution_token,
         }),
+
         RpcRequest::CancelCheck {
             proxy_session,
             request_id,
@@ -188,6 +213,7 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
             proxy_session,
             request_id,
         }),
+
         RpcRequest::ReleaseNetworkFlow {
             proxy_session,
             attribution_token,
@@ -195,6 +221,7 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
             proxy_session,
             attribution_token,
         }),
+
         req => Err(Box::new(req)),
     }
 }
@@ -206,6 +233,7 @@ fn plan_approval_context(
     req: RpcRequest,
 ) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
     let resolve = |ctx: RequestContext| resolve_request_context(store, peer, role, &ctx);
+
     match req {
         RpcRequest::Approve {
             id,
@@ -222,6 +250,7 @@ fn plan_approval_context(
             comment,
             ctx: resolve(ctx),
         }),
+
         RpcRequest::ApproveHost {
             host,
             port,
@@ -235,6 +264,7 @@ fn plan_approval_context(
             session_id,
             ctx: resolve(ctx),
         }),
+
         RpcRequest::ApproveHttp {
             target,
             scope,
@@ -246,6 +276,7 @@ fn plan_approval_context(
             session_id,
             ctx: resolve(ctx),
         }),
+
         RpcRequest::Deny {
             id,
             scope,
@@ -261,6 +292,7 @@ fn plan_approval_context(
             comment,
             ctx: resolve(ctx),
         }),
+
         req => Err(Box::new(req)),
     }
 }
@@ -275,11 +307,14 @@ fn plan_context(
         Ok(resolved) => return resolved,
         Err(req) => *req,
     };
+
     let resolve = |ctx: RequestContext| resolve_request_context(store, peer, role, &ctx);
+
     match req {
         RpcRequest::RegisterUi { ui_client: _, ctx } => {
             ResolvedRpcRequest::RegisterUi { ctx: resolve(ctx) }
         }
+
         RpcRequest::Check {
             host,
             connect_host,
@@ -295,11 +330,13 @@ fn plan_context(
             url,
             ctx: resolve(ctx),
         },
+
         RpcRequest::CheckFilesystem { path, access, ctx } => ResolvedRpcRequest::CheckFilesystem {
             path,
             access,
             ctx: resolve(ctx),
         },
+
         RpcRequest::CheckResource {
             kind,
             path,
@@ -311,6 +348,7 @@ fn plan_context(
             access,
             ctx: resolve(ctx),
         },
+
         RpcRequest::CheckDbus { target, ctx } => {
             let ctx = if role == SocketRole::Host {
                 crate::store::PolicyStore::resolve_dbus_proxy_context(
@@ -325,6 +363,7 @@ fn plan_context(
             };
             ResolvedRpcRequest::CheckDbus { target, ctx }
         }
+
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
             let ctx = resolve(ctx);
             let peer_pid = if peer.pid > 0 {
@@ -338,10 +377,12 @@ fn plan_context(
                 static_allow,
             }
         }
+
         RpcRequest::Elevate { argv, ctx } => ResolvedRpcRequest::Elevate {
             argv,
             ctx: resolve(ctx),
         },
+
         RpcRequest::Status { ctx } => ResolvedRpcRequest::Status { ctx: resolve(ctx) },
         RpcRequest::Reload { ctx } => ResolvedRpcRequest::Reload { ctx: resolve(ctx) },
         req => unreachable!("unhandled non-context request: {req:?}"),
@@ -373,6 +414,7 @@ mod tests {
     };
 
     use super::{ResolvedRpcRequest, plan};
+
     use crate::{
         server::{dispatch::SocketRole, peer::ClientPeer},
         store::PolicyStore,
@@ -394,11 +436,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let store = test_store(&dir);
         let peer_pid = std::process::id();
+
         let socket_uid = match nix::unistd::getuid().as_raw() {
             0 => 1,
             uid => uid,
         };
+
         let expected_home = home_from_uid(Some(socket_uid)).map(PathBuf::from);
+
         let req = RpcRequest::CheckFilesystem {
             path: "/tmp/allowed".into(),
             access: FileAccess::Read,
@@ -428,14 +473,17 @@ mod tests {
         assert_eq!(ctx.ids, ProcessIds::new(peer_pid, socket_uid));
         assert_eq!(ctx.paths.home_path(), expected_home);
         assert_ne!(ctx.paths.home(), Some(Path::new("/attacker/home")));
+
         assert_ne!(
             ctx.paths.project_root(),
             Some(Path::new("/attacker/project"))
         );
+
         assert_eq!(ctx.sandbox_session_id.as_deref(), Some("sandbox-a"));
 
         let rehydrated =
             ResolvedRequestContext::new(ctx.paths.clone(), ctx.ids, ctx.sandbox_session_id);
+
         assert_eq!(rehydrated.ids, ProcessIds::new(peer_pid, socket_uid));
         assert_eq!(rehydrated.paths.home_path(), expected_home);
         assert_ne!(rehydrated.paths.home(), Some(Path::new("/attacker/home")));

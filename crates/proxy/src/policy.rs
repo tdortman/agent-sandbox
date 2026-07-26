@@ -66,6 +66,7 @@ impl PolicySession {
         };
 
         let ready_path = session_ready_path();
+
         Ok(Self {
             socket,
             _connection: connection,
@@ -85,6 +86,7 @@ impl PolicySession {
         if let Some(path) = &self.ready_path {
             mark_session_ready(path)?;
         }
+
         Ok(())
     }
 
@@ -172,6 +174,7 @@ impl PolicySession {
             self.clear_session_ready();
             PolicyError::Rpc(error.to_string())
         })?;
+
         Ok(())
     }
 
@@ -194,6 +197,7 @@ impl PolicySession {
             self.clear_session_ready();
             PolicyError::Rpc(error.to_string())
         })?;
+
         Ok(())
     }
 
@@ -223,6 +227,7 @@ fn decode_http_check_reply(
             ProxyReplyBody::Error(error) => Err(PolicyError::Rpc(error.error)),
             _ => Err(PolicyError::UnexpectedReply("check_http")),
         },
+
         _ => Err(PolicyError::UnexpectedReply("check_http")),
     }
 }
@@ -246,6 +251,7 @@ fn mark_session_ready(path: &Path) -> Result<(), PolicyError> {
     }
 
     let temporary = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+
     fs::write(&temporary, format!("{invocation_id}\n"))
         .map_err(|error| PolicyError::Rpc(format!("write proxy readiness marker: {error}")))?;
 
@@ -256,6 +262,7 @@ fn mark_session_ready(path: &Path) -> Result<(), PolicyError> {
 
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
+
         return Err(PolicyError::Rpc(format!(
             "install proxy readiness marker: {error}"
         )));
@@ -336,6 +343,7 @@ mod tests {
     #[test]
     fn accepts_matching_pipelined_http_reply() -> Result<(), Box<dyn std::error::Error>> {
         let request_id = ProxyRequestId::new();
+
         let reply = RpcReply::Proxy(ProxyReply {
             request_id,
             reply: ProxyReplyBody::HttpCheck(HttpCheckReply::blocked("approval pending")),
@@ -348,6 +356,7 @@ mod tests {
     #[test]
     fn rejects_pipelined_http_reply_for_another_request() {
         let request_id = ProxyRequestId::new();
+
         let reply = RpcReply::Proxy(ProxyReply {
             request_id: ProxyRequestId::new(),
             reply: ProxyReplyBody::HttpCheck(HttpCheckReply::blocked("approval pending")),
@@ -359,6 +368,7 @@ mod tests {
     #[test]
     fn reports_pipelined_policy_errors() {
         let request_id = ProxyRequestId::new();
+
         let reply = RpcReply::Proxy(ProxyReply {
             request_id,
             reply: ProxyReplyBody::Error(ErrorReply::new("policy unavailable")),
@@ -376,6 +386,7 @@ mod tests {
             normalize_authority("example.test:8080", 80)?,
             "example.test:8080"
         );
+
         Ok(())
     }
 
@@ -385,6 +396,7 @@ mod tests {
             normalize_authority("[2001:db8::1]:8443", 443)?,
             "[2001:db8::1]:8443"
         );
+
         Ok(())
     }
 }

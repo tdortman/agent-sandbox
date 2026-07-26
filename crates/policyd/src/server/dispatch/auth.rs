@@ -73,9 +73,11 @@ pub const fn is_uifd_request(req: &RpcRequest) -> bool {
 pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), PolicydError> {
     match role {
         SocketRole::Proxy if !is_proxy_request(req) => Err(PolicydError::UnauthorizedRequest),
+
         SocketRole::Host | SocketRole::Sandbox | SocketRole::UiFd if is_proxy_request(req) => {
             Err(PolicydError::UnauthorizedRequest)
         }
+
         SocketRole::Sandbox if !is_sandbox_request(req) => Err(PolicydError::UnauthorizedRequest),
         SocketRole::UiFd if !is_uifd_request(req) => Err(PolicydError::UnauthorizedUiFdRequest),
         _ => Ok(()),
@@ -125,6 +127,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn sandbox_socket_allows_network_flow_registration() {
         let registration = FlowRegistration::new(
@@ -143,6 +146,7 @@ mod tests {
             NormalizedPolicyHost::parse("example.com").expect("valid test policy host"),
             FlowContext::default(),
         );
+
         let request = RpcRequest::RegisterNetworkFlow { registration };
 
         assert!(
@@ -161,6 +165,7 @@ mod tests {
             ui_client: Some("standalone".into()),
             ctx: RequestContext::default(),
         };
+
         assert!(
             matches!(
                 ensure_allowed(SocketRole::Sandbox, &req),
@@ -273,6 +278,7 @@ mod tests {
                 ctx: RequestContext::default(),
             },
         ];
+
         for req in &all {
             assert!(
                 ensure_allowed(SocketRole::Host, req).is_ok(),
@@ -364,6 +370,7 @@ mod tests {
             ui_client: Some("standalone".into()),
             ctx: RequestContext::default(),
         };
+
         assert!(
             matches!(
                 ensure_allowed(SocketRole::UiFd, &req),

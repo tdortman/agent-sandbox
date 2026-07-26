@@ -61,10 +61,12 @@ const fn target_arch() -> TargetArch {
     {
         TargetArch::x86_64
     }
+
     #[cfg(target_arch = "aarch64")]
     {
         TargetArch::aarch64
     }
+
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // The agent only ships for x86_64 and aarch64. This branch exists
@@ -77,10 +79,10 @@ const fn target_arch() -> TargetArch {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-
     use super::build_filter;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
     const RET_ALLOW: u32 = 0x7FFF_0000;
+
     // `BPF_RET | BPF_K` per the BPF instruction encoding. The seccomp
     // program ends with a return of `SECCOMP_RET_ALLOW` as the default
     // action; we read the last instruction directly to verify. The
@@ -97,6 +99,7 @@ mod tests {
     fn default_syscalls_produce_a_compilable_filter() {
         let filter = build_filter(&crate::policy::default_syscalls());
         assert!(!filter.is_empty(), "filter must contain instructions");
+
         assert!(
             filter.len() < BPF_MAX_LEN,
             "filter length {} must stay under the kernel limit",
@@ -107,10 +110,12 @@ mod tests {
     #[test]
     fn empty_syscall_set_still_produces_a_filter() {
         let filter = build_filter(&BTreeSet::new());
+
         // No syscalls matched means the program is effectively a no-op
         // (everything is allowed), but it still has the arch-check prefix
         // and the trailing allow return.
         assert!(!filter.is_empty());
+
         let last = filter.last().expect("filter is non-empty");
         assert_eq!(last.code, BPF_RET_K);
         assert_eq!(last.k, RET_ALLOW);
@@ -132,11 +137,14 @@ mod tests {
     #[test]
     fn filter_size_scales_with_syscall_count() {
         let small: BTreeSet<i64> = std::iter::once(1).collect();
+
         let large: BTreeSet<i64> = [1, 20, 40, 41, 42, 44, 46, 53, 272, 307, 435]
             .into_iter()
             .collect();
+
         let small_filter = build_filter(&small);
         let large_filter = build_filter(&large);
+
         assert!(
             large_filter.len() > small_filter.len(),
             "more syscalls should produce a larger program: small={} large={}",
@@ -151,9 +159,11 @@ mod tests {
         // additions. 1024 syscalls is an unrealistic stress input that
         // overflows BPF_MAX_LEN, which is the kernel's hard cap.
         let mut syscalls = crate::policy::default_syscalls();
+
         for extra in 0..64 {
             syscalls.insert(1000 + extra);
         }
+
         let filter = build_filter(&syscalls);
         assert!(filter.len() < BPF_MAX_LEN);
     }
@@ -163,6 +173,7 @@ mod tests {
         // seccompiler prepends an arch check: mismatch returns KILL_PROCESS
         // so x32/i686 compat syscalls cannot fall through to SECCOMP_RET_ALLOW.
         let filter = build_filter(&crate::policy::default_syscalls());
+
         assert!(
             filter.iter().any(|insn| insn.k == RET_KILL_PROCESS),
             "filter must kill non-native audit arch before allow fallback"

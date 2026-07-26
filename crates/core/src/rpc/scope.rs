@@ -3,8 +3,8 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-
 use crate::error::InvalidScopeError;
+
 /// Approval scope for network and sudo rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

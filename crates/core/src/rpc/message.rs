@@ -3,7 +3,6 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-
 use super::{push::UiPush, reply::RpcReply};
 
 /// Outgoing RPC / UI push message.
@@ -49,6 +48,7 @@ mod tests {
             home: None,
             project_root: None,
         });
+
         assert!(message.to_string().ends_with('\n'));
     }
 }

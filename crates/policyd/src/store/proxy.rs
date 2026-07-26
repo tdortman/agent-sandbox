@@ -7,13 +7,14 @@ use agent_sandbox_core::{
     NetworkFlowKey, ProcessIds, ProxyConnectionId, ProxyRequestId, ProxySessionReply,
     ProxySessionToken, ResolvedRequestContext, socket_owner::validate_socket_identity,
 };
+
 use tokio::sync::oneshot;
 
 use super::types::{
     MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState,
 };
-use crate::{error::PolicydError, wire::NetworkCheckRequest};
 
+use crate::{error::PolicydError, wire::NetworkCheckRequest};
 const UNCLAIMED_TTL: Duration = Duration::from_secs(30);
 const CLAIMED_IDLE_TTL: Duration = Duration::from_hours(1);
 const MAX_PROXY_CANCEL_TOMBSTONES: usize = 4096;
@@ -43,16 +44,21 @@ impl PolicyStore {
         connection_id: u64,
     ) -> Result<ProxySessionReply, PolicydError> {
         let mut inner = self.inner.lock().await;
+
         if inner.proxy_session.is_some() {
             return Err(proxy_error("a proxy session is already active"));
         }
+
         let token = ProxySessionToken::try_new().map_err(proxy_error)?;
+
         inner.proxy_session = Some(ProxySessionState {
             token: token.clone(),
             connection_id,
             opened_at: Instant::now(),
         });
+
         drop(inner);
+
         Ok(ProxySessionReply {
             ok: true,
             proxy_session: token,
@@ -72,35 +78,43 @@ impl PolicyStore {
         let now = Instant::now();
         let owner = registration.owner();
         let (paths, sandbox_session_id) = registration.context().clone().into_parts();
+
         let raw_context = ResolvedRequestContext::new(
             paths,
             ProcessIds::new(owner.pid().get(), owner.uid()),
             sandbox_session_id,
         );
+
         // nfq registers flows with empty paths; enrich home/cwd/project_root
         // from the verified owner uid and pid so HTTP pendings carry enough
         // context for global/project scope resolution.
         let context = Self::resolve_trusted_context(&raw_context);
+
         let key = registration.flow().clone();
         let mut inner = self.inner.lock().await;
         prune_flows(&mut inner.proxy_flows, now);
+
         if let Some(existing) = inner.proxy_flows.get_mut(&key) {
             if existing.registration != registration {
                 return Err(proxy_error(
                     "flow registration conflicts with an existing owner",
                 ));
             }
+
             if existing.attribution_token.is_none() {
                 existing.registration = registration;
                 existing.context = context;
             }
+
             existing.last_check = now;
             drop(inner);
             return Ok(());
         }
+
         if inner.proxy_flows.len() >= MAX_PROXY_FLOWS {
             return Err(proxy_error("proxy flow registry is full"));
         }
+
         inner.proxy_flows.insert(key, ProxyFlowState {
             owner,
             registration,
@@ -110,6 +124,7 @@ impl PolicyStore {
             claimed_at: None,
             last_check: now,
         });
+
         drop(inner);
         Ok(())
     }
@@ -129,13 +144,16 @@ impl PolicyStore {
         let mut inner = self.inner.lock().await;
         prune_flows(&mut inner.proxy_flows, Instant::now());
         validate_session(&inner, &proxy_session)?;
+
         let state = inner
             .proxy_flows
             .get_mut(&flow)
             .ok_or_else(|| proxy_error("flow is not registered"))?;
+
         if state.attribution_token.is_some() {
             return Err(proxy_error("flow is already claimed"));
         }
+
         let attribution_token = AttributionToken::try_new().map_err(proxy_error)?;
         let now = Instant::now();
         state.attribution_token = Some(attribution_token.clone());
@@ -143,6 +161,7 @@ impl PolicyStore {
         state.claimed_at = Some(now);
         state.last_check = now;
         drop(inner);
+
         Ok(agent_sandbox_core::FlowClaimReply {
             ok: true,
             attribution_token,
@@ -163,6 +182,7 @@ impl PolicyStore {
     ) -> Result<CheckReply, PolicydError> {
         let key = (proxy_session.clone(), request_id);
         let (cancel_tx, cancel_rx) = oneshot::channel();
+
         {
             let mut inner = self.inner.lock().await;
             validate_session(&inner, &proxy_session)?;
@@ -186,6 +206,7 @@ impl PolicyStore {
                 }
             }
         }
+
         let (host, port, ctx, protocol) = match self
             .flow_for_check(&proxy_session, &attribution_token)
             .await
@@ -196,6 +217,7 @@ impl PolicyStore {
                 return Err(err);
             }
         };
+
         let reply = self
             .request_network_approval_with_aliases_cancellable(
                 NetworkCheckRequest {
@@ -210,6 +232,7 @@ impl PolicyStore {
                 Some(cancel_rx),
             )
             .await;
+
         self.inner.lock().await.proxy_cancellations.remove(&key);
         Ok(reply)
     }
@@ -229,6 +252,7 @@ impl PolicyStore {
     ) -> Result<HttpCheckReply, PolicydError> {
         let key = (proxy_session.clone(), request_id);
         let (cancel_tx, cancel_rx) = oneshot::channel();
+
         {
             let mut inner = self.inner.lock().await;
             validate_session(&inner, &proxy_session)?;
@@ -252,6 +276,7 @@ impl PolicyStore {
                 }
             }
         }
+
         let (_host, _port, ctx, _protocol) = match self
             .flow_for_check(&proxy_session, &attribution_token)
             .await
@@ -262,6 +287,7 @@ impl PolicyStore {
                 return Err(err);
             }
         };
+
         let approval = self.request_http_approval(
             proxy_session.clone(),
             request_id,
@@ -269,7 +295,9 @@ impl PolicyStore {
             request,
             ctx,
         );
+
         tokio::pin!(approval);
+
         let result = tokio::select! {
             reply = &mut approval => reply,
             _ = cancel_rx => {
@@ -277,6 +305,7 @@ impl PolicyStore {
                 Ok(HttpCheckReply::blocked("agent-sandbox: HTTP check cancelled"))
             },
         };
+
         self.inner.lock().await.proxy_cancellations.remove(&key);
         result
     }
@@ -311,9 +340,11 @@ impl PolicyStore {
                 }
             }
         };
+
         if let Some(cancel) = cancel {
             let _ = cancel.send(());
         }
+
         self.cancel_http_check(proxy_session, request_id).await
     }
 
@@ -329,6 +360,7 @@ impl PolicyStore {
     ) -> Result<(), PolicydError> {
         let mut inner = self.inner.lock().await;
         validate_session(&inner, &proxy_session)?;
+
         if let Some(state) = inner
             .proxy_flows
             .values_mut()
@@ -339,6 +371,7 @@ impl PolicyStore {
             state.claimed_at = None;
             state.last_check = Instant::now();
         }
+
         drop(inner);
         Ok(())
     }
@@ -392,6 +425,7 @@ impl PolicyStore {
             }
             canceled
         };
+
         for sender in canceled {
             let _ = sender.send(HttpCheckReply::blocked(
                 "agent-sandbox: proxy session closed",
@@ -430,21 +464,25 @@ impl PolicyStore {
         .await
         .map_err(|_| proxy_error("socket owner revalidation timed out"))?
         .map_err(|_| proxy_error("socket owner revalidation failed"))?;
+
         if !identity_valid {
             return Err(proxy_error("socket owner changed"));
         }
 
         let mut inner = self.inner.lock().await;
         validate_session(&inner, proxy_session)?;
+
         let state = inner
             .proxy_flows
             .get_mut(&flow)
             .ok_or_else(|| proxy_error("flow registration expired"))?;
+
         if state.registration != registration
             || state.attribution_token.as_ref() != Some(attribution_token)
         {
             return Err(proxy_error("flow claim changed during revalidation"));
         }
+
         state.last_check = Instant::now();
         let host = registration.policy_host().to_string();
         let port = registration.flow().destination_port().get();
@@ -478,6 +516,7 @@ fn prune_flows(
         } else {
             UNCLAIMED_TTL
         };
+
         now.saturating_duration_since(state.last_check) <= ttl
     });
 }
@@ -531,12 +570,14 @@ mod tests {
             443.try_into().expect("non-zero port"),
         )
         .expect("valid flow key");
+
         let registration = FlowRegistration::new(
             flow,
             test_owner(),
             NormalizedPolicyHost::parse("example.com").expect("valid host"),
             FlowContext::new(SandboxPaths::default(), Some("test-session".into())),
         );
+
         store
             .register_network_flow(registration)
             .await
@@ -554,6 +595,7 @@ mod tests {
                 .home()
                 .map(std::path::Path::to_path_buf)
         };
+
         assert!(
             enriched_home.is_some(),
             "flow context home must be enriched from owner uid"
@@ -564,13 +606,16 @@ mod tests {
     async fn check_network_flow_requests_deferred_transport_approval_and_honors_cancellation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
+
         let owner = match resolve_owner_snapshot(
             SocketProtocol::Udp,
             SocketTuple::from_local(source.ip(), source.port()),
@@ -578,6 +623,7 @@ mod tests {
             OwnerResolution::Unique(snapshot) => snapshot.identity(),
             other => panic!("expected unique UDP owner, got {other:?}"),
         };
+
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             source.ip(),
@@ -586,6 +632,7 @@ mod tests {
             443,
         )
         .expect("valid flow");
+
         store
             .register_network_flow(FlowRegistration::new(
                 flow.clone(),
@@ -595,6 +642,7 @@ mod tests {
             ))
             .await
             .expect("register flow");
+
         let claim = store
             .claim_network_flow(session.clone(), flow, ProxyConnectionId::new())
             .await
@@ -604,11 +652,13 @@ mod tests {
         let task_store = store.clone();
         let task_session = session.clone();
         let attribution_token = claim.attribution_token.clone();
+
         let task = tokio::spawn(async move {
             task_store
                 .check_network_flow(task_session, request_id, attribution_token)
                 .await
         });
+
         let pending_id = {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
@@ -629,6 +679,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
+
         store
             .finish_network(
                 &pending_id,
@@ -637,29 +688,37 @@ mod tests {
                 None,
             )
             .await;
+
         let reply = task
             .await
             .expect("check task should not panic")
             .expect("check should succeed");
+
         assert!(reply.allowed, "expected allowed reply, got {reply:?}");
+
         assert_eq!(
             reply.source,
             VerdictSource::policy_with_comment("test"),
             "raw fallback must use the transport policy verdict"
         );
+
         assert!(
             store.inner.lock().await.network_futures.is_empty(),
             "finished transport approval must release its waiter"
         );
+
         let canceled_request_id = ProxyRequestId::new();
+
         store
             .cancel_check(session.clone(), canceled_request_id)
             .await
             .expect("cancel check");
+
         let canceled = store
             .check_network_flow(session, canceled_request_id, claim.attribution_token)
             .await
             .expect("canceled check should return a verdict");
+
         assert!(!canceled.allowed, "canceled check must be blocked");
     }
 }

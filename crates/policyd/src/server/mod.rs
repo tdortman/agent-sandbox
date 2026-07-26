@@ -1,15 +1,15 @@
 //! JSON-line RPC server over Unix domain sockets.
 
 mod client;
+
 mod dispatch;
 pub(crate) mod peer;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
 use std::{path::Path, sync::Arc};
-
 use tokio::net::UnixListener;
-
 use crate::store::PolicyStore;
 
 pub struct PolicyServer {
@@ -72,6 +72,7 @@ impl PolicyServer {
                         }
                     });
                 }
+
                 Err(err) => {
                     tracing::error!(error = %err, "policyd accept error");
                 }
@@ -97,6 +98,7 @@ impl PolicyServer {
 
         let proxy_path = self.store.args().proxy_socket.clone();
         let proxy_gid = self.store.args().proxy_gid;
+
         if let Some(proxy_path) = proxy_path.as_ref()
             && (proxy_path == &host_socket_path || proxy_path == &sandbox_socket_path)
         {
@@ -118,10 +120,12 @@ impl PolicyServer {
         // UI/approve CLI could never register. Sensitive ops still bind to
         // SO_PEERCRED. Sandbox socket: same mode; RPC auth limits it to request ops.
         let host_listener = Self::bind_socket(&host_socket_path, 0o666, None)?;
+
         let sandbox_listener = Self::bind_socket(&sandbox_socket_path, 0o666, None)?;
 
         if let Some(proxy_path) = proxy_path {
             let proxy_listener = Self::bind_socket(&proxy_path, 0o660, proxy_gid)?;
+
             tokio::join!(
                 Self::accept_loop(
                     host_listener,

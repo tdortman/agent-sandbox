@@ -6,6 +6,7 @@ use super::{
     ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
     StatusReply, UiPush, Verdict, VerdictSource,
 };
+
 use crate::{
     ResourceKind,
     http::HttpRequest,
@@ -18,6 +19,7 @@ fn check_request_deserializes() {
         r#"{"op":"check","host":"example.com","port":443,"scheme":"https","cwd":"/tmp"}"#,
     )
     .expect("parse request json");
+
     assert!(matches!(req, RpcRequest::Check { .. }));
 }
 
@@ -29,6 +31,7 @@ fn register_ui_reply_serializes() {
         session_id: "abc".into(),
     })
     .to_string();
+
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("deserialize rpc reply");
     assert_eq!(v["ok"], true);
     assert_eq!(v["role"], "ui");
@@ -48,6 +51,7 @@ fn ui_push_network_request() {
         project_root: None,
     })
     .to_string();
+
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("deserialize rpc reply");
     assert_eq!(v["type"], "network_request");
     assert_eq!(v["id"], "n1");
@@ -65,8 +69,10 @@ fn check_reply_roundtrip() {
 #[test]
 fn proxy_reply_envelopes_preserve_request_id_and_body() {
     let request_id = ProxyRequestId::new();
+
     let request =
         HttpRequest::from_parts("GET", "https", "example.com", "/api").expect("valid HTTP request");
+
     let replies = [
         ProxyReplyBody::HttpCheck(HttpCheckReply::from_verdict(
             request,
@@ -83,13 +89,16 @@ fn proxy_reply_envelopes_preserve_request_id_and_body() {
             reply: body,
         }))
         .expect("serialize proxy reply");
+
         let value: serde_json::Value = serde_json::from_str(&wire).expect("parse proxy reply wire");
         assert_eq!(value["request_id"], request_id.to_string());
         assert!(value["reply"]["kind"].is_string());
         let parsed: RpcReply = serde_json::from_str(&wire).expect("deserialize proxy reply");
+
         let RpcReply::Proxy(parsed) = parsed else {
             panic!("proxy reply envelope was not selected");
         };
+
         assert_eq!(parsed.request_id, request_id);
     }
 }
@@ -98,11 +107,13 @@ fn proxy_reply_envelopes_preserve_request_id_and_body() {
 fn proxy_replies_can_be_reordered_without_losing_identity() {
     let first = ProxyRequestId::new();
     let second = ProxyRequestId::new();
+
     let first_wire = serde_json::to_string(&RpcReply::Proxy(ProxyReply {
         request_id: first,
         reply: ProxyReplyBody::NetworkFlow(CheckReply::blocked("first")),
     }))
     .expect("serialize first reply");
+
     let second_wire = serde_json::to_string(&RpcReply::Proxy(ProxyReply {
         request_id: second,
         reply: ProxyReplyBody::NetworkFlow(CheckReply::blocked("second")),
@@ -113,6 +124,7 @@ fn proxy_replies_can_be_reordered_without_losing_identity() {
         .into_iter()
         .map(|wire| serde_json::from_str::<RpcReply>(&wire).expect("deserialize proxy reply"))
         .collect::<Vec<_>>();
+
     assert!(matches!(
         &reordered[..],
         [RpcReply::Proxy(second_reply), RpcReply::Proxy(first_reply)]
@@ -126,6 +138,7 @@ fn blocked_http_reply_without_request_deserializes() {
         r#"{"ok":false,"allowed":false,"source":"blocked","error":"cancelled"}"#,
     )
     .expect("blocked HTTP reply without request");
+
     assert!(reply.request.is_none());
 }
 
@@ -135,6 +148,7 @@ fn filesystem_monitor_error_reply_deserializes_as_monitor() {
         r#"{"ok":true,"active":false,"error":"fs_monitor_cmd not configured"}"#,
     )
     .expect("deserialize monitor reply");
+
     assert!(matches!(
         reply,
         RpcReply::FilesystemMonitor(FilesystemMonitorReply { active: false, .. })
@@ -148,7 +162,9 @@ fn status_reply_includes_merged_policy() {
         merged: Policy::default(),
         pending: vec![],
     };
+
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");
+
     assert!(
         json.get("merged")
             .expect("merged field present")
@@ -162,7 +178,9 @@ fn check_reply_deserializes_as_check_not_simple() {
         ApprovalScope::Once,
     )))
     .expect("serialize rpc reply");
+
     let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
+
     assert!(matches!(
         reply,
         RpcReply::Check(c) if c.allowed && c.source == VerdictSource::Scope(ApprovalScope::Once)
@@ -173,7 +191,9 @@ fn check_reply_deserializes_as_check_not_simple() {
 fn elevate_reply_deserializes_as_elevate_not_simple() {
     let line = serde_json::to_string(&ElevateReply::executed(0, "root\n".into(), String::new()))
         .expect("serialize rpc reply");
+
     let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
+
     assert!(matches!(
         reply,
         RpcReply::Elevate(e) if e.allowed && e.exit_code == 0 && e.stdout == "root\n"
@@ -187,6 +207,7 @@ fn filesystem_check_reply_roundtrip() {
         "/home/user/file.txt".into(),
         FileAccess::Read,
     );
+
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");
     assert_eq!(json["allowed"], false);
     assert_eq!(json["source"], "blocked");
@@ -202,6 +223,7 @@ fn filesystem_check_reply_denied_preserves_deny_wire_string() {
         "/tmp".into(),
         FileAccess::ReadWrite,
     );
+
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");
     assert_eq!(json["allowed"], false);
     assert_eq!(json["source"], "deny");
@@ -225,7 +247,9 @@ fn filesystem_check_reply_deserializes_as_filesystem_check() {
         FileAccess::All,
     ))
     .expect("serialize rpc reply");
+
     let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
+
     assert!(matches!(
         reply,
         RpcReply::FilesystemCheck(c)
@@ -239,6 +263,7 @@ fn filesystem_check_reply_deserializes_as_filesystem_check() {
 fn check_reply_roundtrips_allow_comment_wire_string() {
     let line = r#"{"ok":true,"allowed":true,"source":"allow:trusted policy file"}"#;
     let reply: RpcReply = serde_json::from_str(line).expect("deserialize rpc reply");
+
     assert!(matches!(
         &reply,
         RpcReply::Check(CheckReply {
@@ -248,6 +273,7 @@ fn check_reply_roundtrips_allow_comment_wire_string() {
             ..
         }) if source == &VerdictSource::policy_with_comment("trusted policy file")
     ));
+
     let json = serde_json::to_value(&reply).expect("serialize rpc reply");
     assert_eq!(json["source"], "allow:trusted policy file");
 }
@@ -258,6 +284,7 @@ fn check_reply_rejects_allowed_false_with_allow_source() {
         r#"{"ok":true,"allowed":false,"source":"allow:trusted policy file"}"#,
     )
     .expect_err("mismatched allowed/source must fail");
+
     assert!(err.to_string().contains("allow"));
 }
 
@@ -265,6 +292,7 @@ fn check_reply_rejects_allowed_false_with_allow_source() {
 fn check_reply_rejects_allowed_true_with_denied_source() {
     let err = serde_json::from_str::<CheckReply>(r#"{"ok":true,"allowed":true,"source":"denied"}"#)
         .expect_err("mismatched allowed/source must fail");
+
     assert!(err.to_string().contains("denied"));
 }
 
@@ -274,6 +302,7 @@ fn filesystem_check_reply_rejects_allowed_false_with_once_source() {
         r#"{"ok":true,"allowed":false,"source":"once","path":"/data","access":"read"}"#,
     )
     .expect_err("mismatched allowed/source must fail");
+
     assert!(err.to_string().contains("once"));
 }
 
@@ -285,6 +314,7 @@ fn resource_and_scope_replies_preserve_wire_strings() {
         PathBuf::from("/dev/fd/3"),
         ResourceAccess::Device(DeviceAccess::Read),
     );
+
     let resource_json = serde_json::to_value(&resource).expect("serialize resource reply");
     assert_eq!(resource_json["source"], "infrastructure");
 
@@ -296,6 +326,7 @@ fn resource_and_scope_replies_preserve_wire_strings() {
             "/home/user/.config/agent-sandbox/policy.json",
         )),
     );
+
     let scope_json = serde_json::to_value(&scope).expect("serialize scope reply");
     assert_eq!(scope_json["scope"], "global");
 }
@@ -306,6 +337,7 @@ fn check_filesystem_request_deserializes() {
         r#"{"op":"check_filesystem","path":"/home/user/doc.txt","access":"read","cwd":"/home/user"}"#,
     )
     .expect("parse request json");
+
     assert!(matches!(req, RpcRequest::CheckFilesystem { .. }));
 }
 
@@ -314,6 +346,7 @@ fn start_filesystem_monitor_request_deserializes() {
     let req: RpcRequest =
         serde_json::from_str(r#"{"op":"start_filesystem_monitor","cwd":"/home/user"}"#)
             .expect("parse request json");
+
     assert!(matches!(req, RpcRequest::StartFilesystemMonitor { .. }));
 }
 
@@ -323,12 +356,14 @@ fn start_filesystem_monitor_with_static_allow() {
         r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"},"static_allow":[{"path":"/nix/store","access":"all"}]}"#,
     )
     .expect("parse request json");
+
     match req {
         RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
             assert_eq!(static_allow.len(), 1);
             assert_eq!(static_allow[0].path, Path::new("/nix/store"));
             assert_eq!(static_allow[0].access, FileAccess::All);
         }
+
         _ => panic!("expected StartFilesystemMonitor"),
     }
 }
@@ -338,6 +373,7 @@ fn start_filesystem_monitor_defaults_static_allow_empty() {
     let req: RpcRequest =
         serde_json::from_str(r#"{"op":"start_filesystem_monitor","ctx":{"cwd":"/home/user"}}"#)
             .expect("parse request json");
+
     match req {
         RpcRequest::StartFilesystemMonitor { static_allow, .. } => {
             assert!(
@@ -345,6 +381,7 @@ fn start_filesystem_monitor_defaults_static_allow_empty() {
                 "static_allow must default to empty"
             );
         }
+
         _ => panic!("expected StartFilesystemMonitor"),
     }
 }

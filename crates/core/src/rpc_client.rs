@@ -20,10 +20,13 @@ use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
 pub enum RpcClientError {
     #[error("policyd RPC timed out")]
     Timeout,
+
     #[error("policyd closed connection")]
     Closed,
+
     #[error("invalid JSON from policyd")]
     InvalidJson(#[from] serde_json::Error),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -42,6 +45,7 @@ impl RpcConnection {
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, RpcClientError> {
         let stream = UnixStream::connect(socket_path).await?;
         let (reader, writer) = stream.into_split();
+
         Ok(Self {
             reader: BufReader::new(reader),
             writer,
@@ -68,12 +72,15 @@ impl RpcConnection {
     /// JSON, or [`RpcClientError::Io`] on I/O errors.
     pub async fn read_message(&mut self) -> Result<RpcMessage, RpcClientError> {
         let mut buf = String::new();
+
         if self.reader.read_line(&mut buf).await? == 0 {
             return Err(RpcClientError::Closed);
         }
+
         if !buf.ends_with('\n') {
             return Err(RpcClientError::Closed);
         }
+
         Ok(serde_json::from_str(buf.trim())?)
     }
 
@@ -84,8 +91,10 @@ impl RpcConnection {
     /// [`read_message`](Self::read_message).
     pub async fn request(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
         self.write_request(&req).await?;
+
         loop {
             let msg = self.read_message().await?;
+
             if let RpcMessage::Reply(reply) = msg {
                 return Ok(reply);
             }
@@ -147,10 +156,12 @@ impl PersistentRpcClient {
 
         match result {
             Ok(Ok(reply)) => Ok(reply),
+
             Ok(Err(error)) => {
                 self.connection = None;
                 Err(error)
             }
+
             Err(_) => {
                 self.connection = None;
                 Err(RpcClientError::Timeout)
@@ -181,8 +192,8 @@ pub async fn policy_rpc(
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-
     use tempfile::tempdir;
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
@@ -210,6 +221,7 @@ mod tests {
         let dir = tempdir().expect("temporary directory");
         let socket = dir.path().join("policy.sock");
         let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let (read, mut write) = stream.into_split();
@@ -224,13 +236,16 @@ mod tests {
         });
 
         let mut client = PersistentRpcClient::new(socket);
+
         for _ in 0..2 {
             let reply = client
                 .request(request(), Duration::from_secs(1))
                 .await
                 .expect("request succeeds");
+
             assert!(matches!(reply, RpcReply::Check(reply) if reply.allowed));
         }
+
         server.await.expect("server task");
     }
 
@@ -239,6 +254,7 @@ mod tests {
         let dir = tempdir().expect("temporary directory");
         let socket = dir.path().join("policy.sock");
         let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept first");
             let (read, _) = stream.into_split();
@@ -269,14 +285,17 @@ mod tests {
         });
 
         let mut client = PersistentRpcClient::new(socket);
+
         assert!(matches!(
             client.request(request(), Duration::from_secs(1)).await,
             Err(RpcClientError::Closed)
         ));
+
         let reply = client
             .request(request(), Duration::from_secs(1))
             .await
             .expect("next request reconnects");
+
         assert!(matches!(reply, RpcReply::Check(reply) if reply.allowed));
         server.await.expect("server task");
     }
@@ -286,6 +305,7 @@ mod tests {
         let dir = tempdir().expect("temporary directory");
         let socket = dir.path().join("policy.sock");
         let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut line = String::new();
@@ -299,10 +319,12 @@ mod tests {
         });
 
         let mut client = PersistentRpcClient::new(socket);
+
         assert!(matches!(
             client.request(request(), Duration::from_secs(1)).await,
             Err(RpcClientError::Closed)
         ));
+
         server.await.expect("server task");
     }
 }

@@ -26,8 +26,10 @@ pub enum EchRewrite {
     ///
     /// Contains the complete DNS response bytes.
     Rewritten(Vec<u8>),
+
     /// No ECH configuration was present, or the message was not changed.
     Unchanged,
+
     /// The response contains DNSSEC evidence and must not be rewritten.
     DnssecProtected,
 }
@@ -79,6 +81,7 @@ pub fn rewrite_ech_config(data: &[u8], replacement: &[u8]) -> Result<EchRewrite,
     }
 
     let mut rewritten = false;
+
     for record in message
         .answers
         .iter_mut()
@@ -96,6 +99,7 @@ pub fn rewrite_ech_config(data: &[u8], replacement: &[u8]) -> Result<EchRewrite,
                 let SvcParamValue::EchConfigList(config) = value else {
                     continue;
                 };
+
                 config.0 = replacement.to_vec();
                 rewritten = true;
             }
@@ -134,18 +138,23 @@ fn allowed_owner_names(message: &Message, qname: &str) -> HashSet<String> {
 
     loop {
         let mut added = false;
+
         for record in &message.answers {
             let owner = normalize_owner(&record.name);
+
             if !allowed.contains(&owner) {
                 continue;
             }
+
             if let RData::CNAME(cname) = &record.data {
                 let target = normalize_owner(&cname.0);
+
                 if allowed.insert(target) {
                     added = true;
                 }
             }
         }
+
         if !added {
             break;
         }
@@ -174,6 +183,7 @@ fn mappings_from_svcb_rdata(rdata: &RData, ttl: u32, qname: &str) -> Vec<DnsMapp
                     });
                 }
             }
+
             SvcParamValue::Ipv6Hint(hint) => {
                 for addr in &hint.0 {
                     mappings.push(DnsMapping {
@@ -183,9 +193,11 @@ fn mappings_from_svcb_rdata(rdata: &RData, ttl: u32, qname: &str) -> Vec<DnsMapp
                     });
                 }
             }
+
             _ => {}
         }
     }
+
     mappings
 }
 
@@ -210,11 +222,14 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
 
     for record in &message.answers {
         let owner = normalize_owner(&record.name);
+
         if !allowed.contains(&owner) {
             continue;
         }
+
         let ttl = record.ttl;
         let rdata = &record.data;
+
         if let Some(ip) = ip_from_rdata(rdata) {
             mappings.push(DnsMapping {
                 ip,
@@ -264,6 +279,7 @@ mod tests {
     #[test]
     fn mappings_from_a_response() {
         let pkt = build_a_response("api.openai.com", [52, 54, 28, 178], 120);
+
         assert_eq!(mappings_from_response(&pkt), vec![DnsMapping {
             ip: "52.54.28.178".to_string(),
             hostname: "api.openai.com".to_string(),
@@ -275,6 +291,7 @@ mod tests {
     fn mappings_from_response_keeps_every_address_for_question() {
         let name = Name::from_ascii("example.com.").expect("valid name");
         let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(name.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
@@ -287,6 +304,7 @@ mod tests {
                 300,
                 RData::A(A::new(104, 20, 23, 154)),
             ));
+
         let pkt = message.to_vec().expect("encode");
 
         assert_eq!(mappings_from_response(&pkt), vec![
@@ -308,6 +326,7 @@ mod tests {
         let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
         let cname_target = Name::from_ascii("edge.cursor-cdn.example.").expect("valid name");
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(qname.clone(), RecordType::A))
             .add_answer(Record::from_rdata(
@@ -320,6 +339,7 @@ mod tests {
                 300,
                 RData::A(A::new(1, 2, 3, 4)),
             ));
+
         let pkt = message.to_vec().expect("encode");
 
         assert_eq!(mappings_from_response(&pkt), vec![DnsMapping {
@@ -334,6 +354,7 @@ mod tests {
         let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
         let unrelated = Name::from_ascii("unrelated.example.").expect("valid name");
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(qname, RecordType::A))
             .add_answer(Record::from_rdata(
@@ -341,14 +362,15 @@ mod tests {
                 300,
                 RData::A(A::new(9, 9, 9, 9)),
             ));
-        let pkt = message.to_vec().expect("encode");
 
+        let pkt = message.to_vec().expect("encode");
         assert!(mappings_from_response(&pkt).is_empty());
     }
 
     #[test]
     fn mappings_extract_https_ip_hints() {
         let qname = Name::from_ascii("api.cursor.example.").expect("valid name");
+
         let svcb = SVCB::new(1, Name::root(), vec![
             (
                 SvcParamKey::Ipv4Hint,
@@ -361,10 +383,13 @@ mod tests {
                 ))])),
             ),
         ]);
+
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(qname.clone(), RecordType::HTTPS))
             .add_answer(Record::from_rdata(qname, 120, RData::HTTPS(HTTPS(svcb))));
+
         let pkt = message.to_vec().expect("encode");
 
         assert_eq!(mappings_from_response(&pkt), vec![
@@ -384,24 +409,31 @@ mod tests {
     #[test]
     fn rewrites_advertised_ech_config() {
         let qname = Name::from_ascii("example.com.").expect("valid name");
+
         let svcb = SVCB::new(1, Name::root(), vec![(
             SvcParamKey::EchConfigList,
             SvcParamValue::EchConfigList(EchConfigList(vec![1, 2, 3])),
         )]);
+
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+
         message
             .add_query(Query::query(qname.clone(), RecordType::HTTPS))
             .add_answer(Record::from_rdata(qname, 60, RData::HTTPS(HTTPS(svcb))));
 
         let result =
             rewrite_ech_config(&message.to_vec().expect("encode"), &[4, 5, 6]).expect("rewrite");
+
         let EchRewrite::Rewritten(bytes) = result else {
             panic!("expected rewritten response");
         };
+
         let rewritten = Message::from_vec(&bytes).expect("decode rewritten response");
+
         let RData::HTTPS(https) = &rewritten.answers[0].data else {
             panic!("expected HTTPS answer");
         };
+
         assert_eq!(
             https.0.svc_params[0].1,
             SvcParamValue::EchConfigList(EchConfigList(vec![4, 5, 6]))
@@ -411,12 +443,15 @@ mod tests {
     #[test]
     fn refuses_to_rewrite_authenticated_ech_config() {
         let qname = Name::from_ascii("example.com.").expect("valid name");
+
         let svcb = SVCB::new(1, Name::root(), vec![(
             SvcParamKey::EchConfigList,
             SvcParamValue::EchConfigList(EchConfigList(vec![1, 2, 3])),
         )]);
+
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message.metadata.authentic_data = true;
+
         message
             .add_query(Query::query(qname.clone(), RecordType::HTTPS))
             .add_answer(Record::from_rdata(qname, 60, RData::HTTPS(HTTPS(svcb))));
@@ -430,10 +465,12 @@ mod tests {
     #[test]
     fn non_response_returns_empty() {
         let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+
         message.add_query(Query::query(
             Name::from_ascii("test.").expect("valid name"),
             RecordType::A,
         ));
+
         let pkt = message.to_vec().expect("encode");
         assert!(mappings_from_response(&pkt).is_empty());
     }

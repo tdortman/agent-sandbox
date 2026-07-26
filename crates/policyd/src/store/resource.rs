@@ -9,6 +9,7 @@ use agent_sandbox_core::{
     DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
     ResourceRuleKey, UiPush, VerdictSource,
 };
+
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
     VerdictEntry, enforce_verdict_cache_limit,
 };
+
 use crate::wire::{ResourceCheckRequest, UiSpawnContext};
 
 struct PendingResResult {
@@ -42,9 +44,11 @@ impl PolicyStore {
             access,
             ctx,
         } = req;
+
         if let Some(verdict) = self.resource_allow_source(kind, &path, access, &ctx).await {
             return ResourceCheckReply::from_verdict(verdict, kind, path.clone(), access);
         }
+
         self.request_resource_approval(ResourceCheckRequest {
             kind,
             path,
@@ -69,14 +73,17 @@ impl PolicyStore {
             access,
             ctx,
         } = req;
+
         let wire_ids = ctx.ids;
         let cwd = ctx.paths.cwd_path();
         let home = ctx.paths.home_path();
         let project_root = ctx.paths.project_root_path();
         let sandbox_session_id = ctx.sandbox_session_id.clone();
+
         if dbus_target.is_none() && self.resource_policy_denied(kind, &path, access, &ctx).await {
             return ResourceCheckReply::denied(VerdictSource::policy(), kind, path.clone(), access);
         }
+
         if !self.args.interactive_approval {
             return ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access);
         }
@@ -124,10 +131,12 @@ impl PolicyStore {
                     project_root: project_root.clone(),
                 },
             };
+
             self.notify_standalone_ui(&ctx, &push).await;
 
             if !self.has_standalone_ui_for_context(&ctx).await {
                 let mut spawn_uid = wire_ids.uid();
+
                 if spawn_uid.is_none_or(|u| u == 0)
                     && let Some(h) = &home
                 {
@@ -137,6 +146,7 @@ impl PolicyStore {
                             .flatten()
                             .map(|u| u.uid.as_raw());
                 }
+
                 let spawn = UiSpawnContext {
                     has_matching_ui: false,
                     uid: spawn_uid,
@@ -145,6 +155,7 @@ impl PolicyStore {
                     project_root: project_root.as_deref(),
                     sandbox_session_id: sandbox_session_id.as_deref(),
                 };
+
                 self.spawn_policy_ui(spawn).await;
             }
         }
@@ -160,6 +171,7 @@ impl PolicyStore {
         access: ResourceAccess,
     ) -> Option<ResourceCheckReply> {
         let inner = self.inner.lock().await;
+
         if let Some(entry) = inner.resource_verdict_cache.get(&ResourceRuleKey {
             kind,
             path: path.to_path_buf(),
@@ -172,6 +184,7 @@ impl PolicyStore {
                 ResourceCheckReply::denied(entry.source.clone(), kind, path.to_path_buf(), access)
             });
         }
+
         drop(inner);
         None
     }
@@ -186,6 +199,7 @@ impl PolicyStore {
     ) -> Result<PendingResResult, ResourceCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
+
         // Deduplicate: if a pending already exists for the same resource
         // kind, path, and access type, join its waiters instead of creating
         // a new prompt.
@@ -206,8 +220,10 @@ impl PolicyStore {
             }
             _ => None,
         });
+
         if let Some(existing_id) = existing_id {
             let waiter_count = inner.resource_futures.get(&existing_id).map_or(0, Vec::len);
+
             if waiter_count >= MAX_WAITERS_PER_PENDING {
                 return Err(ResourceCheckReply::blocked(
                     "agent-sandbox: too many waiters for one resource approval",
@@ -216,18 +232,22 @@ impl PolicyStore {
                     access,
                 ));
             }
+
             inner
                 .resource_futures
                 .entry(existing_id.clone())
                 .or_default()
                 .push(tx);
+
             drop(inner);
+
             return Ok(PendingResResult {
                 id: existing_id,
                 is_new: false,
                 rx,
             });
         }
+
         if inner.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(ResourceCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
@@ -236,11 +256,14 @@ impl PolicyStore {
                 access,
             ));
         }
+
         let pending_id = format!("res:{}", Uuid::now_v7().simple());
         inner.resource_futures.insert(pending_id.clone(), vec![tx]);
+
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
+
         let pending = dbus_target.map_or_else(
             || {
                 Pending::Resource(PendingResource {
@@ -268,8 +291,10 @@ impl PolicyStore {
                 })
             },
         );
+
         inner.insert_pending(pending);
         drop(inner);
+
         Ok(PendingResResult {
             id: pending_id,
             is_new: true,
@@ -289,18 +314,23 @@ impl PolicyStore {
         // Race UI registration against the verdict channel so a CLI approval
         // can unblock the request even if no policy UI ever appears.
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
+
         loop {
             if self.has_standalone_ui_for_context(ctx).await {
                 break;
             }
+
             let now = Instant::now();
+
             if now >= ui_deadline {
                 let mut inner = self.inner.lock().await;
                 inner.take_pending(pending_id);
                 inner.resource_futures.remove(pending_id);
                 drop(inner);
+
                 return ResourceCheckReply::blocked(
                     "agent-sandbox: no standalone resource policy UI registered (agent-sandbox-ui \
                      or auto-spawn)",
@@ -309,7 +339,9 @@ impl PolicyStore {
                     access,
                 );
             }
+
             let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
+
             tokio::select! {
                 biased;
                 () = time::sleep(sleep_dur) => {}
@@ -321,9 +353,11 @@ impl PolicyStore {
 
         match time::timeout(self.args.approval_timeout, &mut rx).await {
             Ok(Ok(v)) => v,
+
             Ok(Err(_)) => {
                 ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access)
             }
+
             Err(_) => {
                 let mut inner = self.inner.lock().await;
                 inner.take_pending(pending_id);
@@ -349,16 +383,19 @@ impl PolicyStore {
         source: VerdictSource,
     ) {
         let mut inner = self.inner.lock().await;
+
         if let Some(waiters) = inner.resource_futures.remove(pending_id) {
             let reply = if allowed {
                 ResourceCheckReply::allowed(source.clone(), kind, path.clone(), access)
             } else {
                 ResourceCheckReply::denied(source.clone(), kind, path.clone(), access)
             };
+
             for tx in waiters {
                 let _ = tx.send(reply.clone());
             }
         }
+
         // Cache the verdict for deduplication.
         inner
             .resource_verdict_cache
@@ -367,6 +404,7 @@ impl PolicyStore {
                 source,
                 time: Instant::now(),
             });
+
         enforce_verdict_cache_limit(&mut inner.resource_verdict_cache);
     }
 }
@@ -383,9 +421,10 @@ mod tests {
         ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess, VerdictSource,
     };
-    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
+    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
     use super::PolicyStore;
+
     use crate::{
         store::{UiSessionContext, types::UiClient},
         wire::ResourceCheckRequest,
@@ -444,6 +483,7 @@ mod tests {
         }
 
         let store_for_task = store.clone();
+
         let task = tokio::spawn(async move {
             store_for_task
                 .request_resource_approval(unique_request("/repo/fast.sock"))
@@ -451,11 +491,14 @@ mod tests {
         });
 
         let mut buf = [0u8; 4096];
+
         let n = tokio::time::timeout(Duration::from_millis(200), standalone_read.read(&mut buf))
             .await
             .expect("standalone UI should receive resource prompt within 200ms")
             .expect("read should succeed");
+
         let received = String::from_utf8_lossy(&buf[..n]);
+
         assert!(
             received.contains("res:") && received.contains("/repo/fast.sock"),
             "expected pending id and resource path in prompt, got: {received}"
@@ -469,6 +512,7 @@ mod tests {
                 .cloned()
                 .expect("pending resource request should be tracked")
         };
+
         store
             .finish_resource(
                 &pending_id,
@@ -489,6 +533,7 @@ mod tests {
     async fn cli_approval_during_ui_wait_unblocks_resource_promptly() {
         let store = Arc::new(test_store());
         let store_for_task = store.clone();
+
         let task = tokio::spawn(async move {
             store_for_task
                 .request_resource_approval(unique_request("/repo/slow.sock"))
@@ -530,6 +575,7 @@ mod tests {
             .await
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
+
         assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
         assert_eq!(reply.source, VerdictSource::policy_with_comment("cli"));
     }

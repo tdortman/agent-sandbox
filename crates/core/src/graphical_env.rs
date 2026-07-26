@@ -34,6 +34,7 @@ const ENV_INHERIT: &[&str] = &[
 pub fn tool_path(env_key: &str, binary: &str) -> Option<String> {
     if let Ok(explicit) = std::env::var(env_key) {
         let path = Path::new(&explicit);
+
         if path.is_file() && is_executable(path) {
             return Some(explicit);
         }
@@ -64,6 +65,7 @@ fn environ_for_pid(pid: u32) -> HashMap<String, String> {
         if let Some(eq) = item.iter().position(|&b| b == b'=') {
             let (key, value) = item.split_at(eq);
             let value = &value[1..];
+
             if let (Ok(k), Ok(v)) = (std::str::from_utf8(key), std::str::from_utf8(value)) {
                 env.insert(k.to_string(), v.to_string());
             }
@@ -115,6 +117,7 @@ pub fn inherit_plasma_env(uid: u32) -> HashMap<String, String> {
             .filter_map(|key| proc_env.get(*key).map(|v| ((*key).to_string(), v.clone())))
             .collect();
     }
+
     HashMap::new()
 }
 
@@ -144,29 +147,38 @@ pub fn x11_display_for_uid(uid: u32) -> Option<String> {
 
     for line in sessions.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
+
         if parts.len() < 2 || !parts.contains(&"active") {
             continue;
         }
+
         let sid = parts[0];
+
         let display_out = Command::new(&loginctl)
             .args(["show-session", sid, "-pDisplay", "--value"])
             .output()
             .ok()?;
+
         if !display_out.status.success() {
             continue;
         }
+
         let display = String::from_utf8_lossy(&display_out.stdout)
             .trim()
             .to_string();
+
         if display.is_empty() {
             continue;
         }
+
         if display.chars().all(|c| c.is_ascii_digit()) {
             return Some(format!(":{display}"));
         }
+
         if display.starts_with(':') || display.contains('.') {
             return Some(display);
         }
+
         return Some(format!(":{display}"));
     }
 
@@ -185,18 +197,23 @@ pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(&path) {
             let mut in_general = false;
+
             for line in content.lines() {
                 let line = line.trim();
+
                 if line == "[General]" {
                     in_general = true;
                     continue;
                 }
+
                 if line.starts_with('[') && line.ends_with(']') {
                     in_general = false;
                     continue;
                 }
+
                 if in_general && let Some(scheme) = line.strip_prefix("ColorScheme=") {
                     let scheme = scheme.trim();
+
                     if !scheme.is_empty() {
                         return Some(scheme.to_string());
                     }
@@ -220,6 +237,7 @@ pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, S
     }
 
     let runtime = format!("/run/user/{uid}");
+
     if !Path::new(&runtime).is_dir() {
         return env;
     }
@@ -231,8 +249,10 @@ pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, S
         for name in ["wayland-0", "wayland-1"] {
             if Path::new(&runtime).join(name).exists() {
                 env.insert("WAYLAND_DISPLAY".into(), name.into());
+
                 env.entry("QT_QPA_PLATFORM".into())
                     .or_insert_with(|| "wayland".into());
+
                 break;
             }
         }
@@ -243,6 +263,7 @@ pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, S
         && let Some(display) = x11_display_for_uid(uid)
     {
         env.insert("DISPLAY".into(), display);
+
         env.entry("QT_QPA_PLATFORM".into())
             .or_insert_with(|| "xcb".into());
     }
@@ -259,5 +280,6 @@ pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, S
 
     env.entry("PATH".into())
         .or_insert_with(|| "/run/current-system/sw/bin".into());
+
     env
 }

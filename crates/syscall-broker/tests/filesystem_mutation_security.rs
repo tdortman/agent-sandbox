@@ -11,6 +11,7 @@ use std::{
 
 use agent_sandbox_core::FileAccess;
 use agent_sandbox_syscall::policy::nr;
+
 use agent_sandbox_syscall_broker::{
     FilesystemTarget, SeccompData, SeccompNotif, SyscallTarget, revalidate_filesystem_mutation,
     target_from_notification,
@@ -25,12 +26,16 @@ fn notif_with_path_args(syscall_nr: i64, paths: &[&str]) -> SeccompNotif {
         .iter()
         .map(|path| CString::new(*path).expect("nul-free test path"))
         .collect();
+
     let mut args = [0_u64; 6];
+
     for (index, path) in cstrings.iter().enumerate() {
         args[index] = path.as_ptr().cast::<u8>() as u64;
     }
+
     // Keep CString values alive until the notification is consumed.
     std::mem::forget(cstrings);
+
     SeccompNotif {
         pid: std::process::id(),
         data: SeccompData {
@@ -44,9 +49,11 @@ fn notif_with_path_args(syscall_nr: i64, paths: &[&str]) -> SeccompNotif {
 
 fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
     let target = target_from_notification(notif).expect("classify notification");
+
     let Some(SyscallTarget::Filesystem(FilesystemTarget { checks })) = target else {
         panic!("expected filesystem mutation target");
     };
+
     checks
 }
 
@@ -62,6 +69,7 @@ where
             return false;
         }
     }
+
     true
 }
 
@@ -72,6 +80,7 @@ fn rename_and_link_register_all_mutation_endpoints() {
         "/repo/old.txt",
         "/repo/new.txt",
     ]));
+
     assert_eq!(
         rename_checks,
         vec![
@@ -85,6 +94,7 @@ fn rename_and_link_register_all_mutation_endpoints() {
         "/repo/src.txt",
         "/repo/dst.txt",
     ]));
+
     assert_eq!(
         link_checks,
         vec![
@@ -102,6 +112,7 @@ fn symlink_checks_target_read_and_linkpath_write() {
         "/tmp/target",
         "/tmp/link",
     ]));
+
     assert_eq!(
         symlink_checks,
         vec![
@@ -117,6 +128,7 @@ fn symlink_checks_target_read_and_linkpath_write() {
 fn single_path_mutation_syscalls_require_write_access() {
     for (syscall_nr, path) in [(nr::UNLINK, "/tmp/gone"), (nr::TRUNCATE, "/tmp/file")] {
         let checks = filesystem_checks(&notif_with_path_args(syscall_nr, &[path]));
+
         assert_eq!(
             checks,
             vec![(PathBuf::from(path), FileAccess::Write)],
@@ -132,11 +144,12 @@ fn filesystem_mutation_revalidation_rejects_path_swap() {
     let swapped = CString::new("/tmp/agent-sandbox-swapped-path").expect("nul-free path");
     let mut notif = notif_with_path_args(nr::UNLINK, &[stable.to_string_lossy().as_ref()]);
     let target = target_from_notification(&notif).expect("classify unlink");
+
     let Some(SyscallTarget::Filesystem(fs_target)) = target else {
         panic!("expected filesystem target");
     };
-    revalidate_filesystem_mutation(&notif, &fs_target).expect("initial paths match");
 
+    revalidate_filesystem_mutation(&notif, &fs_target).expect("initial paths match");
     notif.data.args[0] = swapped.as_ptr().cast::<u8>() as u64;
     std::mem::forget(swapped);
     std::mem::forget(stable);
@@ -152,17 +165,21 @@ async fn filesystem_mutation_dispatch_denies_when_any_endpoint_denied() {
             (PathBuf::from("/repo/denied.txt"), FileAccess::ReadWrite),
         ],
     };
+
     let mut calls = 0_u32;
+
     let allowed = filesystem_mutation_allowed(&target, |path, _access| {
         calls += 1;
         let ok = path != Path::new("/repo/denied.txt");
         async move { ok }
     })
     .await;
+
     assert!(
         !allowed,
         "broker must deny the syscall when any mutation endpoint fails CheckFilesystem"
     );
+
     assert_eq!(
         calls, 2,
         "broker must evaluate every endpoint up to the first denial"
@@ -177,14 +194,18 @@ async fn filesystem_mutation_dispatch_short_circuits_on_first_denial() {
             (PathBuf::from("/repo/allowed.txt"), FileAccess::ReadWrite),
         ],
     };
+
     let mut calls = 0_u32;
+
     let allowed = filesystem_mutation_allowed(&target, |path, _access| {
         calls += 1;
         let ok = path != Path::new("/repo/denied.txt");
         async move { ok }
     })
     .await;
+
     assert!(!allowed);
+
     assert_eq!(
         calls, 1,
         "broker should stop checking once a mutation endpoint is denied"

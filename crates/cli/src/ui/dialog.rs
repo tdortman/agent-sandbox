@@ -8,9 +8,7 @@ use std::{
 
 use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
-
 use super::options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator};
-
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_RESULT_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_VALUE_BYTES: usize = 8 * 1024;
@@ -24,6 +22,7 @@ pub enum ApprovalReviewOutcome {
 
 /// Mutex serialising graphical prompts: only one prompt UI at a time.
 static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+
 trait PolicyUiBackend {
     fn select_option(&self, title: &str, options: &[&str]) -> Option<String>;
     fn input_text(&self, title: &str, default_text: &str) -> Option<String>;
@@ -64,8 +63,10 @@ pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
         if let Some(c) = pick_with_backends(title, options) {
             return Some(c);
         }
+
         info!("no graphical backend available; use agent-sandbox-approve");
     }
+
     None
 }
 
@@ -76,8 +77,10 @@ pub fn pick_text(title: &str, default_text: &str) -> Option<String> {
         if let Some(c) = input_with_backends(title, default_text) {
             return Some(c);
         }
+
         info!("no graphical backend available; use agent-sandbox-approve");
     }
+
     None
 }
 
@@ -85,6 +88,7 @@ fn prefer_graphical() -> bool {
     if std::env::var("AGENT_SANDBOX_UI_PREFER_GRAPHICAL").as_deref() == Ok("1") {
         return true;
     }
+
     std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok()
 }
 
@@ -111,9 +115,11 @@ fn first_input_text<'a>(
 fn graphical_env() -> HashMap<String, String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     let uid = nix::unistd::getuid().as_raw();
+
     if uid > 0 {
         env.extend(graphical_session_env(uid, env.get("HOME").map(Path::new)));
     }
+
     env
 }
 
@@ -124,12 +130,15 @@ fn graphical_backends(env: &HashMap<String, String>) -> Vec<Box<dyn PolicyUiBack
                 vec![Box::new(QtDialogBackend { binary, env }) as Box<dyn PolicyUiBackend + '_>]
             })
             .unwrap_or_default(),
+
         Some("zenity") => resolve_zenity(env)
             .map(|binary| {
                 vec![Box::new(ZenityBackend { binary, env }) as Box<dyn PolicyUiBackend + '_>]
             })
             .unwrap_or_default(),
+
         Some("none") => Vec::new(),
+
         Some(_) | None => {
             let mut backends: Vec<Box<dyn PolicyUiBackend + '_>> = Vec::new();
             if let Some(binary) = resolve_qt_dialog(env) {
@@ -154,6 +163,7 @@ fn input_with_backends(title: &str, default_text: &str) -> Option<String> {
     let backends = graphical_backends(&env);
     first_input_text(backends.iter().map(Box::as_ref), title, default_text)
 }
+
 pub fn review_approval(
     request: &ApprovalFormRequest,
     validate: Option<&ReviewValidator>,
@@ -161,16 +171,20 @@ pub fn review_approval(
     if !prefer_graphical() {
         return ApprovalReviewOutcome::Unavailable;
     }
+
     let env = graphical_env();
+
     if matches!(
         env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str),
         Some("zenity" | "none")
     ) {
         return ApprovalReviewOutcome::Unavailable;
     }
+
     let Some(binary) = resolve_qt_dialog(&env) else {
         return ApprovalReviewOutcome::Unavailable;
     };
+
     qt_dialog_review(&binary, request, &env, validate).map_or(
         ApprovalReviewOutcome::Cancelled,
         ApprovalReviewOutcome::Submitted,
@@ -185,11 +199,13 @@ fn qt_dialog_review(
 ) -> Option<ApprovalFormResult> {
     let mut encoded = serde_json::to_vec(&request.to_json()).ok()?;
     encoded.push(b'\n');
+
     if encoded.len() > MAX_REVIEW_REQUEST_BYTES {
         return None;
     }
 
     let _lock = GRAPHICAL_LOCK.lock().ok()?;
+
     let mut child = Command::new(binary)
         .arg("--review")
         .envs(env)
@@ -202,16 +218,17 @@ fn qt_dialog_review(
     let stdin = child.stdin.as_mut()?;
     stdin.write_all(&encoded).ok()?;
     stdin.flush().ok()?;
-
     let stdout = child.stdout.take()?;
     let mut reader = std::io::BufReader::new(stdout);
 
     loop {
         let mut line = String::new();
+
         if reader.read_line(&mut line).ok()? == 0 {
             let _ = child.wait();
             return None;
         }
+
         let result = parse_review_result(line.as_bytes())?;
 
         // Cancel exits without validation. Deny with a persistent scope
@@ -219,11 +236,14 @@ fn qt_dialog_review(
         if result.action.is_none() {
             writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
             stdin.flush().ok()?;
+
             if !child.wait().ok()?.success() {
                 return None;
             }
+
             return Some(result);
         }
+
         if let Some(validator) = validate {
             match validator(&result) {
                 Ok(()) => {
@@ -234,6 +254,7 @@ fn qt_dialog_review(
                     }
                     return Some(result);
                 }
+
                 Err(error) => {
                     let response = serde_json::json!({"valid": false, "error": error});
                     writeln!(stdin, "{response}").ok()?;
@@ -243,9 +264,11 @@ fn qt_dialog_review(
         } else {
             writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
             stdin.flush().ok()?;
+
             if !child.wait().ok()?.success() {
                 return None;
             }
+
             return Some(result);
         }
     }
@@ -255,22 +278,29 @@ fn parse_review_result(raw: &[u8]) -> Option<ApprovalFormResult> {
     if raw.len() > MAX_REVIEW_RESULT_BYTES {
         return None;
     }
+
     let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
     let object = value.as_object()?;
+
     let action = match object.get("action")?.as_str()? {
         "allow" => Some(super::options::PromptAction::Allow),
         "deny" => Some(super::options::PromptAction::Deny),
         "cancel" => None,
         _ => return None,
     };
+
     let scope = object.get("scope")?.as_str()?.parse().ok()?;
     let raw_values = object.get("values")?.as_object()?;
+
     if raw_values.len() > 16 {
         return None;
     }
+
     let mut values = HashMap::with_capacity(raw_values.len());
+
     for (key, value) in raw_values {
         let value = value.as_str()?;
+
         if key.is_empty()
             || key.len() > 64
             || value.len() > MAX_REVIEW_VALUE_BYTES
@@ -279,19 +309,23 @@ fn parse_review_result(raw: &[u8]) -> Option<ApprovalFormResult> {
             return None;
         }
     }
+
     Some(ApprovalFormResult {
         action,
         scope,
         values,
     })
 }
+
 fn resolve_qt_dialog(env: &HashMap<String, String>) -> Option<String> {
     if let Some(p) = env.get("AGENT_SANDBOX_QT_DIALOG") {
         let path = std::path::Path::new(p);
+
         if path.is_file() {
             return Some(p.clone());
         }
     }
+
     tool_path("AGENT_SANDBOX_QT_DIALOG", "agent-sandbox-qt-dialog")
 }
 
@@ -301,6 +335,7 @@ fn run_graphical_dialog(
     env: &HashMap<String, String>,
 ) -> Option<String> {
     let _lock = GRAPHICAL_LOCK.lock().ok()?;
+
     let output = Command::new(binary)
         .args(args)
         .envs(env)
@@ -309,6 +344,7 @@ fn run_graphical_dialog(
         .stderr(Stdio::piped())
         .output()
         .ok()?;
+
     output
         .status
         .success()
@@ -329,10 +365,12 @@ fn qt_dialog_select(
         "--text".into(),
         title.into(),
     ];
+
     for label in options {
         args.push("--option".into());
         args.push((*label).into());
     }
+
     let trimmed = run_graphical_dialog(binary, &args, env)?;
     options.contains(&trimmed.as_str()).then_some(trimmed)
 }
@@ -351,6 +389,7 @@ fn qt_dialog_input(
         "--input".into(),
         default_text.into(),
     ];
+
     let trimmed = run_graphical_dialog(binary, &args, env)?;
     (!trimmed.is_empty()).then_some(trimmed)
 }
@@ -358,10 +397,12 @@ fn qt_dialog_input(
 fn resolve_zenity(env: &HashMap<String, String>) -> Option<String> {
     if let Some(p) = env.get("AGENT_SANDBOX_ZENITY") {
         let path = std::path::Path::new(p);
+
         if path.is_file() {
             return Some(p.clone());
         }
     }
+
     tool_path("AGENT_SANDBOX_ZENITY", "zenity")
 }
 
@@ -380,6 +421,7 @@ fn zenity_select(
         "--column".into(),
         "Options".into(),
     ];
+
     args.extend(options.iter().map(|option| (*option).into()));
     let trimmed = run_graphical_dialog(binary, &args, env)?;
     options.contains(&trimmed.as_str()).then_some(trimmed)
@@ -400,6 +442,7 @@ fn zenity_input(
         "--entry-text".into(),
         default_text.into(),
     ];
+
     let trimmed = run_graphical_dialog(binary, &args, env)?;
     (!trimmed.is_empty()).then_some(trimmed)
 }
@@ -407,7 +450,6 @@ fn zenity_input(
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, io::Write as _, os::unix::fs::PermissionsExt};
-
     use agent_sandbox_core::ApprovalScope;
     use tempfile::{NamedTempFile, TempPath};
 
@@ -415,6 +457,7 @@ mod tests {
         ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
         parse_review_result, qt_dialog_review,
     };
+
     use crate::ui::options::{ApprovalFormContext, ReviewValidator};
 
     struct EofReviewHelper {
@@ -448,8 +491,10 @@ mod tests {
             None
         }
     }
+
     fn fake_review_helper() -> TempPath {
         let mut helper = NamedTempFile::new().expect("create fake review helper");
+
         helper
             .write_all(
                 br#"#!/bin/sh
@@ -475,21 +520,27 @@ case "$response" in
 "#,
             )
             .expect("write fake review helper");
+
         let mut permissions = helper
             .as_file()
             .metadata()
             .expect("stat fake review helper")
             .permissions();
+
         permissions.set_mode(0o700);
+
         helper
             .as_file()
             .set_permissions(permissions)
             .expect("make fake review helper executable");
+
         helper.into_temp_path()
     }
+
     fn eof_review_helper() -> EofReviewHelper {
         let mut helper = NamedTempFile::new().expect("create EOF review helper");
         let pid_file = NamedTempFile::new().expect("create PID file");
+
         helper
             .write_all(
                 br#"#!/bin/sh
@@ -498,16 +549,20 @@ printf '%s' "$$" > "$PID_FILE"
 "#,
             )
             .expect("write EOF review helper");
+
         let mut permissions = helper
             .as_file()
             .metadata()
             .expect("stat EOF review helper")
             .permissions();
+
         permissions.set_mode(0o700);
+
         helper
             .as_file()
             .set_permissions(permissions)
             .expect("make EOF review helper executable");
+
         EofReviewHelper {
             executable: helper.into_temp_path(),
             pid_file: pid_file.into_temp_path(),
@@ -540,6 +595,7 @@ printf '%s' "$$" > "$PID_FILE"
         let mut env = HashMap::new();
         env.insert("MODE".into(), "multi".into());
         let request = review_request();
+
         let result = qt_dialog_review(
             helper.to_str().expect("helper path is UTF-8"),
             &request,
@@ -557,6 +613,7 @@ printf '%s' "$$" > "$PID_FILE"
         let mut env = HashMap::new();
         env.insert("MODE".into(), "none".into());
         let request = review_request();
+
         let result = qt_dialog_review(
             helper.to_str().expect("helper path is UTF-8"),
             &request,
@@ -567,10 +624,12 @@ printf '%s' "$$" > "$PID_FILE"
 
         assert_eq!(result.values["target"], "bad");
     }
+
     #[test]
     fn qt_dialog_review_reaps_helper_when_stdout_closes() {
         let helper = eof_review_helper();
         let mut env = HashMap::new();
+
         env.insert(
             "PID_FILE".into(),
             helper
@@ -588,10 +647,12 @@ printf '%s' "$$" > "$PID_FILE"
         );
 
         assert!(result.is_none());
+
         let pid = std::fs::read_to_string(&helper.pid_file)
             .expect("helper should write its PID")
             .parse::<u32>()
             .expect("helper PID should be numeric");
+
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "helper process {pid} should be reaped"
@@ -604,14 +665,14 @@ printf '%s' "$$" > "$PID_FILE"
             select_result: None,
             input_result: None,
         };
+
         let b = FakeBackend {
             select_result: Some("Allow once".to_string()),
             input_result: None,
         };
+
         let backends: [&dyn PolicyUiBackend; 2] = [&a, &b];
-
         let result = first_selected_option(backends, "title", &["Allow once"]);
-
         assert_eq!(result, Some("Allow once".to_string()));
     }
 
@@ -621,14 +682,14 @@ printf '%s' "$$" > "$PID_FILE"
             select_result: None,
             input_result: None,
         };
+
         let b = FakeBackend {
             select_result: None,
             input_result: Some("./src".to_string()),
         };
+
         let backends: [&dyn PolicyUiBackend; 2] = [&a, &b];
-
         let result = first_input_text(backends, "title", "./");
-
         assert_eq!(result, Some("./src".to_string()));
     }
 
@@ -638,13 +699,13 @@ printf '%s' "$$" > "$PID_FILE"
             select_result: Some("A".to_string()),
             input_result: None,
         };
+
         let b = PanicSelectBackend;
         let backends: [&dyn PolicyUiBackend; 2] = [&a, &b];
-
         let result = first_selected_option(backends, "title", &["A", "B"]);
-
         assert_eq!(result, Some("A".to_string()));
     }
+
     #[test]
     fn review_result_parses_typed_values() {
         let result = parse_review_result(
@@ -662,9 +723,11 @@ printf '%s' "$$" > "$PID_FILE"
         assert!(
             parse_review_result(br#"{"action":"approve","scope":"once","values":{}}"#).is_none()
         );
+
         assert!(
             parse_review_result(br#"{"action":"deny","scope":"forever","values":{}}"#).is_none()
         );
+
         assert!(
             parse_review_result(br#"{"action":"deny","scope":"once","values":{"target":42}}"#)
                 .is_none()

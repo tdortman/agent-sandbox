@@ -32,11 +32,13 @@ fn project_or_cwd_matches(ui: &UiSessionContext, route: &UiRoute) -> bool {
     {
         return true;
     }
+
     if let (Some(a), Some(b)) = (&ui.cwd, &route.cwd)
         && a == b
     {
         return true;
     }
+
     false
 }
 
@@ -47,15 +49,16 @@ pub(super) fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
             .as_ref()
             .is_some_and(|ui_session| ui_session == route_session);
     }
+
     project_or_cwd_matches(ui, route)
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-
     use super::{UiRoute, paths_match};
     use crate::store::types::{UiClient, UiSessionContext};
+
     fn ctx(cwd: &Path, project_root: &Path) -> UiSessionContext {
         UiSessionContext {
             cwd: Some(cwd.to_path_buf()),
@@ -68,6 +71,7 @@ mod tests {
     fn make_client(session_id: &str) -> UiClient {
         let (a, b) = tokio::net::UnixStream::pair().expect("unix stream pair");
         let _ = a;
+
         UiClient {
             session_id: session_id.into(),
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(b.into_split().1)),
@@ -97,17 +101,21 @@ mod tests {
         let client = make_client("ui1");
         let mut client_ctx = ctx(Path::new("/repo"), Path::new("/repo"));
         client_ctx.sandbox_session_id = Some("sandbox-a".into());
+
         let route = UiRoute::from_parts(
             Some(Path::new("/repo")),
             Some(Path::new("/repo")),
             Some("sandbox-b"),
         );
+
         assert!(!paths_match(&client_ctx, &route));
+
         let route = UiRoute::from_parts(
             Some(Path::new("/repo")),
             Some(Path::new("/repo")),
             Some("sandbox-a"),
         );
+
         assert!(paths_match(&client_ctx, &route));
         let _ = client;
     }

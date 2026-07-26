@@ -199,9 +199,11 @@ pub fn resolve_sandbox_paths(
     if project_root.is_none() || home.is_none() {
         let project =
             ProjectPolicyContext::new(home.as_deref(), cwd.as_deref(), project_root.as_deref());
+
         if project_root.is_none() {
             project_root = project.project_root().map(PathBuf::from);
         }
+
         if home.is_none() {
             home = project.home_hint().map(PathBuf::from);
         }
@@ -254,7 +256,6 @@ pub fn persist_session_paths(paths: &SandboxPaths) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-
     use super::{ProcessIds, SandboxPaths};
     use crate::SessionContext;
 

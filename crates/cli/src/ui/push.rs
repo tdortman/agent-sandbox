@@ -9,6 +9,7 @@ use agent_sandbox_core::{
     ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
     host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
 };
+
 use tracing::warn;
 
 use super::{
@@ -36,12 +37,14 @@ fn suggest_project_rule_path(path: &Path, project_root: Option<&Path>) -> String
 fn approval_context(paths: &SandboxPaths, session_id: Option<&str>) -> Vec<ApprovalFormContext> {
     let mut context = Vec::new();
     let project_root = paths.project_root();
+
     if let Some(project) = project_root {
         context.push(ApprovalFormContext {
             label: "Project".into(),
             value: project.display().to_string(),
         });
     }
+
     if let Some(cwd) = paths.cwd()
         && project_root.is_none_or(|project| project != cwd)
     {
@@ -50,10 +53,12 @@ fn approval_context(paths: &SandboxPaths, session_id: Option<&str>) -> Vec<Appro
             value: cwd.display().to_string(),
         });
     }
+
     context.push(ApprovalFormContext {
         label: "Session".into(),
         value: session_id.map_or_else(|| "Unavailable".into(), str::to_owned),
     });
+
     context
 }
 
@@ -83,6 +88,7 @@ fn build_elevation_review(
     title: &str,
 ) -> ElevationReview {
     let prefixes = SudoRule::approval_prefixes(argv);
+
     let prefix_options = prefixes
         .iter()
         .enumerate()
@@ -91,6 +97,7 @@ fn build_elevation_review(
             label: format_command(prefix),
         })
         .collect();
+
     ElevationReview {
         request: ApprovalFormRequest::new(
             title.to_owned(),
@@ -122,10 +129,12 @@ fn validated_review_action(
 ) -> Option<ReviewActionScope> {
     let action = result.action?;
     let scope = result.scope;
+
     let allowed = scope == ApprovalScope::Once
         || scope == ApprovalScope::Project
         || scope == ApprovalScope::Global
         || (scope == ApprovalScope::Session && session_available);
+
     allowed.then_some(ReviewActionScope { action, scope })
 }
 
@@ -133,6 +142,7 @@ fn persistent_comment(result: &ApprovalFormResult, scope: ApprovalScope) -> Opti
     if !matches!(scope, ApprovalScope::Project | ApprovalScope::Global) {
         return None;
     }
+
     result
         .values
         .get("comment")
@@ -148,11 +158,13 @@ fn reviewed_choice(
     target: impl FnOnce(&ApprovalFormResult) -> Option<ApprovalTarget>,
 ) -> Option<ReviewedChoice> {
     let ReviewActionScope { action, scope } = validated_review_action(result, session_available)?;
+
     let target = if scope == ApprovalScope::Once {
         None
     } else {
         Some(target(result)?)
     };
+
     Some(ReviewedChoice {
         action,
         choice: ScopeOption {
@@ -175,9 +187,11 @@ fn make_validator(
         if validated_review_action(result, session_available).is_none() {
             return Err("This scope is not available.".into());
         }
+
         if result.scope == ApprovalScope::Once {
             return Ok(());
         }
+
         if parse_target(result).is_some() {
             Ok(())
         } else {
@@ -197,6 +211,7 @@ fn text_field(id: &'static str, label: &str, value: String) -> ApprovalFormField
 fn comment_field() -> ApprovalFormField {
     text_field("comment", "Policy comment (optional)", String::new())
 }
+
 fn filesystem_presentation(access: FileAccess, subject: &str) -> ApprovalFormPresentation {
     let heading = match access {
         FileAccess::Read => "Read this file?",
@@ -205,6 +220,7 @@ fn filesystem_presentation(access: FileAccess, subject: &str) -> ApprovalFormPre
         FileAccess::Execute => "Execute this file?",
         FileAccess::All => "Allow full access to this file?",
     };
+
     ApprovalFormPresentation {
         heading: heading.into(),
         subject: subject.into(),
@@ -220,6 +236,7 @@ fn resource_presentation(
         ResourceKind::UnixSocket => "Unix socket",
         ResourceKind::Device => "device",
     };
+
     let heading = match access {
         ResourceAccess::Socket(SocketAccess::Connect) => {
             format!("Connect to this {kind_label}?")
@@ -240,6 +257,7 @@ fn resource_presentation(
             format!("Read and write this {kind_label}?")
         }
     };
+
     ApprovalFormPresentation {
         heading,
         subject: path.display().to_string(),
@@ -269,6 +287,7 @@ fn elevation_presentation(argv: &[String]) -> ApprovalFormPresentation {
 
 fn dbus_fd_display(target: &DbusTarget) -> String {
     let mut value = format!("count={}", target.fd_metadata.len());
+
     for (index, metadata) in target.fd_metadata.iter().enumerate() {
         let _ = write!(
             value,
@@ -276,6 +295,7 @@ fn dbus_fd_display(target: &DbusTarget) -> String {
             metadata.kind, metadata.read_only
         );
     }
+
     value
 }
 
@@ -320,20 +340,25 @@ fn valid_rule_path(value: &str) -> Option<PathBuf> {
 
 fn valid_network_host(value: &str) -> Option<String> {
     let value = value.trim();
+
     if is_ip_literal(value) {
         return Some(value.to_owned());
     }
+
     normalize_dns_name(value).ok()
 }
+
 /// Parse and validate an editable network host against the request.
 fn parse_network_target(
     result: &ApprovalFormResult,
     requested_host: &str,
 ) -> Option<ApprovalTarget> {
     let host = valid_network_host(result.values.get("target")?)?;
+
     if !host_pattern_matches(&host, requested_host) {
         return None;
     }
+
     Some(ApprovalTarget::NetworkHost { host })
 }
 
@@ -344,11 +369,13 @@ fn parse_filesystem_target(
     project_root: Option<&Path>,
 ) -> Option<ApprovalTarget> {
     let path = valid_rule_path(result.values.get("target")?)?;
+
     if !FilesystemRule::new(path.clone(), FileAccess::Read, "")
         .path_matches(requested_path, project_root)
     {
         return None;
     }
+
     Some(ApprovalTarget::FilesystemPath { path })
 }
 
@@ -360,6 +387,7 @@ fn parse_resource_target(
     project_root: Option<&Path>,
 ) -> Option<ApprovalTarget> {
     let path = valid_rule_path(result.values.get("target")?)?;
+
     if !ResourceRule::new(
         kind,
         path.clone(),
@@ -370,6 +398,7 @@ fn parse_resource_target(
     {
         return None;
     }
+
     Some(ApprovalTarget::ResourcePath {
         resource_kind: kind,
         path,
@@ -387,6 +416,7 @@ fn parse_dbus_target(
     {
         return None;
     }
+
     let target = DbusTarget {
         bus: requested.bus,
         destination: result.values.get("destination")?.clone(),
@@ -400,11 +430,14 @@ fn parse_dbus_target(
         },
         fd_metadata: requested.fd_metadata.clone(),
     };
+
     if !DbusRule::new(target.clone(), "").matches(requested) {
         return None;
     }
+
     Some(ApprovalTarget::Dbus { target })
 }
+
 async fn handle_dbus_unavailable(
     socket: &Path,
     paths: &SandboxPaths,
@@ -422,6 +455,7 @@ async fn handle_dbus_unavailable(
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} D-Bus scope?", action.verb()),
         session_id.is_some(),
@@ -430,7 +464,9 @@ async fn handle_dbus_unavailable(
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     let target = (scope != ApprovalScope::Once).then_some(ApprovalTarget::Dbus { target });
+
     resolve_choice(
         socket,
         paths,
@@ -466,7 +502,9 @@ async fn handle_dbus_push(
     else {
         unreachable!("D-Bus variant was validated by the dispatcher")
     };
+
     let paths = paths.merged_with(cwd, home, project_root);
+
     let review = ApprovalFormRequest::new(
         format!(
             "D-Bus {} {}",
@@ -496,7 +534,9 @@ async fn handle_dbus_push(
             comment_field(),
         ],
     );
+
     let requested = target.clone();
+
     match rich_review(
         review,
         Some(make_validator(session_id.is_some(), move |result| {
@@ -524,9 +564,11 @@ async fn handle_dbus_push(
             )
             .await
         }
+
         ApprovalReviewOutcome::Cancelled => {
             deny_cancellation(socket, &paths, sandbox_session_id.as_deref(), &id).await
         }
+
         ApprovalReviewOutcome::Unavailable => {
             handle_dbus_unavailable(
                 socket,
@@ -540,6 +582,7 @@ async fn handle_dbus_push(
         }
     }
 }
+
 /// Prompt the user for a network request approval.
 async fn handle_network_push(
     socket: &Path,
@@ -561,11 +604,13 @@ async fn handle_network_push(
     else {
         unreachable!("network variant was validated by the dispatcher")
     };
+
     let host = host.unwrap_or_default();
     let port = port.unwrap_or(0);
     let transport = transport.unwrap_or_else(|| "https".into());
     let scheme = network_prompt_scheme(&transport, port);
     let result = split_check_aliases(requested_url);
+
     let url = network_prompt_with_transport_hint(
         network_prompt_with_aliases(
             &host,
@@ -581,8 +626,10 @@ async fn handle_network_push(
         &transport,
         port,
     );
+
     let url = url.split(['?', '#']).next().unwrap_or_default().to_owned();
     let paths = paths.merged_with(cwd, home, project_root);
+
     let review = ApprovalFormRequest::new(
         format!("Network request to {url}"),
         approval_context(&paths, session_id),
@@ -593,6 +640,7 @@ async fn handle_network_push(
             comment_field(),
         ],
     );
+
     match rich_review(
         review,
         Some(make_validator(session_id.is_some(), {
@@ -621,11 +669,14 @@ async fn handle_network_push(
             )
             .await;
         }
+
         ApprovalReviewOutcome::Cancelled => {
             return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
         }
+
         ApprovalReviewOutcome::Unavailable => {}
     }
+
     network_push_cli_fallback(
         socket,
         &paths,
@@ -650,6 +701,7 @@ async fn network_push_cli_fallback(
     let Some(action) = choose_action(&format!("agent-sandbox: {url}")).await? else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} {url} scope?", action.verb()),
         session_id.is_some(),
@@ -658,6 +710,7 @@ async fn network_push_cli_fallback(
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     let target = if scope == ApprovalScope::Once {
         None
     } else {
@@ -669,12 +722,14 @@ async fn network_push_cli_fallback(
             None => return deny_cancellation(socket, paths, sandbox_session_id, id).await,
         }
     };
+
     let choice = ScopeOption {
         label: String::new(),
         scope,
         target,
         comment: None,
     };
+
     resolve_choice(
         socket,
         paths,
@@ -705,6 +760,7 @@ async fn handle_http_review(
             label: "All methods".into(),
         },
     ];
+
     let review = ApprovalFormRequest::new(
         format!("HTTP {} {}", request.method.as_str(), request.url),
         approval_context(paths, session_id),
@@ -716,9 +772,11 @@ async fn handle_http_review(
             comment_field(),
         ],
     );
+
     let method = request.method.clone();
     let request_url = request.url.clone();
     let session = session_id.is_some();
+
     match rich_review(
         review,
         Some(make_validator(session, move |result| {
@@ -727,8 +785,10 @@ async fn handle_http_review(
                 "all" => HttpMethodMatcher::All,
                 _ => return None,
             };
+
             let url = HttpUrl::parse_pattern(result.values.get("url")?).ok()?;
             let target = HttpRuleTarget::new(matcher, url).ok()?;
+
             target
                 .url
                 .covers(&request_url)
@@ -745,8 +805,10 @@ async fn handle_http_review(
                         "all" => HttpMethodMatcher::All,
                         _ => return None,
                     };
+
                     let url = HttpUrl::parse_pattern(result.values.get("url")?).ok()?;
                     let target = HttpRuleTarget::new(matcher, url).ok()?;
+
                     target
                         .url
                         .covers(&request.url)
@@ -769,11 +831,13 @@ async fn handle_http_review(
             .await
             .map(|()| true)
         }
+
         ApprovalReviewOutcome::Cancelled => {
             deny_cancellation(socket, paths, sandbox_session_id, id)
                 .await
                 .map(|()| true)
         }
+
         ApprovalReviewOutcome::Unavailable => Ok(false),
     }
 }
@@ -796,10 +860,12 @@ async fn handle_http_push(
     else {
         unreachable!("HTTP variant was validated by the dispatcher")
     };
+
     let sandbox_session_id = push_session_id.as_deref();
     let id = id.to_string();
     let paths = paths.merged_with(cwd, home, project_root);
     let title = format!("agent-sandbox: {} {}", request.method.as_str(), request.url);
+
     if handle_http_review(
         socket,
         &paths,
@@ -812,9 +878,11 @@ async fn handle_http_push(
     {
         return Ok(());
     }
+
     let Some(action) = choose_action(&title).await? else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
+
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} HTTP scope?", action.verb()),
         session_id.is_some(),
@@ -823,6 +891,7 @@ async fn handle_http_push(
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
+
     let target = if scope == ApprovalScope::Once {
         None
     } else {
@@ -867,12 +936,14 @@ async fn handle_http_push(
         )
         .await?
     };
+
     let choice = ScopeOption {
         label: String::new(),
         scope,
         target,
         comment: None,
     };
+
     resolve_choice(
         socket,
         &paths,
@@ -903,12 +974,14 @@ async fn handle_elevation_push(
     else {
         unreachable!("elevation variant was validated by the dispatcher")
     };
+
     let argv = argv.unwrap_or_default();
     let paths = paths.merged_with(cwd, home, project_root);
     let title = format_elevation_title(&argv);
     let elevation_review = build_elevation_review(&argv, &paths, session_id, &title);
     let prefixes = elevation_review.prefixes;
     let prefixes_clone = prefixes.clone();
+
     match rich_review(
         elevation_review.request,
         Some(make_validator(session_id.is_some(), move |result| {
@@ -940,14 +1013,18 @@ async fn handle_elevation_push(
             )
             .await;
         }
+
         ApprovalReviewOutcome::Cancelled => {
             return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
         }
+
         ApprovalReviewOutcome::Unavailable => {}
     }
+
     let Some(action) = choose_action(&title).await? else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
+
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} sudo scope?", action.verb()),
         session_id.is_some(),
@@ -970,12 +1047,14 @@ async fn handle_elevation_push(
             None => return deny_cancellation(socket, &paths, sandbox_session_id, &id).await,
         }
     };
+
     let choice = ScopeOption {
         label: String::new(),
         scope,
         target,
         comment: None,
     };
+
     resolve_choice(
         socket,
         &paths,
@@ -987,6 +1066,7 @@ async fn handle_elevation_push(
     )
     .await
 }
+
 /// Returns [`UiCliError`] when RPC communication with policyd fails.
 pub async fn handle_push(
     socket: &Path,
@@ -999,22 +1079,28 @@ pub async fn handle_push(
         push @ UiPush::NetworkRequest { .. } => {
             handle_network_push(socket, paths, session_id, sandbox_session_id, push).await?;
         }
+
         push @ UiPush::HttpRequest { .. } => {
             handle_http_push(socket, paths, session_id, push).await?;
         }
+
         push @ UiPush::ElevationRequest { .. } => {
             handle_elevation_push(socket, paths, session_id, sandbox_session_id, push).await?;
         }
+
         push @ UiPush::FilesystemRequest { .. } => {
             handle_filesystem_push(socket, paths, session_id, sandbox_session_id, push).await?;
         }
+
         push @ UiPush::DbusRequest { .. } => {
             handle_dbus_push(socket, paths, session_id, push).await?;
         }
+
         push @ UiPush::ResourceRequest { .. } => {
             handle_resource_push(socket, paths, session_id, sandbox_session_id, push).await?;
         }
     }
+
     Ok(())
 }
 
@@ -1037,8 +1123,10 @@ async fn handle_filesystem_push(
     else {
         unreachable!("filesystem variant was validated by the dispatcher")
     };
+
     let paths = paths.merged_with(cwd, home, project_root.clone());
     let default_rule_path = suggest_project_rule_path(&path, paths.project_root());
+
     let review = ApprovalFormRequest::new(
         format!("Filesystem {access} request for {}", path.display()),
         approval_context(&paths, session_id),
@@ -1049,6 +1137,7 @@ async fn handle_filesystem_push(
             comment_field(),
         ],
     );
+
     match rich_review(
         review,
         Some(make_validator(session_id.is_some(), {
@@ -1078,9 +1167,11 @@ async fn handle_filesystem_push(
             )
             .await;
         }
+
         ApprovalReviewOutcome::Cancelled => {
             return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
         }
+
         ApprovalReviewOutcome::Unavailable => {}
     }
 
@@ -1089,6 +1180,7 @@ async fn handle_filesystem_push(
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
+
     resolve_choice(
         socket,
         &paths,
@@ -1111,6 +1203,7 @@ async fn choose_filesystem_choice(
     else {
         return Ok(None);
     };
+
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} filesystem scope?", action.verb()),
         session_available,
@@ -1119,6 +1212,7 @@ async fn choose_filesystem_choice(
     else {
         return Ok(None);
     };
+
     let target = if scope == ApprovalScope::Once {
         None
     } else {
@@ -1133,12 +1227,14 @@ async fn choose_filesystem_choice(
         };
         Some(target)
     };
+
     let choice = ScopeOption {
         label: String::new(),
         scope,
         target,
         comment: None,
     };
+
     Ok(Some((action, choice)))
 }
 
@@ -1168,8 +1264,10 @@ async fn handle_resource_push(
     else {
         unreachable!("resource variant was validated by the dispatcher")
     };
+
     let paths = paths.merged_with(cwd, home, project_root);
     let display_path = suggest_project_rule_path(&path, paths.project_root());
+
     let review = ApprovalFormRequest::new(
         format!("{kind} {access} request for {display_path}"),
         approval_context(&paths, session_id),
@@ -1184,9 +1282,11 @@ async fn handle_resource_push(
             comment_field(),
         ],
     );
+
     let validator_kind = kind;
     let validator_path = path.clone();
     let project_root = paths.project_root_path();
+
     match rich_review(
         review,
         Some(make_validator(session_id.is_some(), move |result| {
@@ -1219,11 +1319,14 @@ async fn handle_resource_push(
             )
             .await;
         }
+
         ApprovalReviewOutcome::Cancelled => {
             return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
         }
+
         ApprovalReviewOutcome::Unavailable => {}
     }
+
     resource_push_cli_fallback(
         socket,
         &paths,
@@ -1250,9 +1353,11 @@ async fn resource_push_cli_fallback(
     let ResourcePrompt { kind, access, path } = prompt;
     let display_path = suggest_project_rule_path(path, paths.project_root());
     let title = format!("agent-sandbox: {kind} {access} {display_path}");
+
     let Some(action) = choose_action(&title).await? else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     let Some(scope) = choose_scope_only(
         &format!("agent-sandbox: {} {} scope?", action.verb(), kind),
         session_id.is_some(),
@@ -1261,6 +1366,7 @@ async fn resource_push_cli_fallback(
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
+
     let target = if scope == ApprovalScope::Once {
         None
     } else {
@@ -1278,12 +1384,14 @@ async fn resource_push_cli_fallback(
             None => return deny_cancellation(socket, paths, sandbox_session_id, id).await,
         }
     };
+
     let choice = ScopeOption {
         label: String::new(),
         scope,
         target,
         comment: None,
     };
+
     resolve_choice(
         socket,
         paths,
@@ -1301,6 +1409,7 @@ async fn choose_action(title: &str) -> Result<Option<PromptAction>, UiCliError> 
     let choice = prompt_blocking(move || pick_option(&title, ACTION_OPTIONS)).await?;
     Ok(choice.as_deref().and_then(PromptAction::from_label))
 }
+
 async fn choose_http_target(
     title: &str,
     request: &HttpRequest,
@@ -1308,13 +1417,16 @@ async fn choose_http_target(
 ) -> Result<Option<ApprovalTarget>, UiCliError> {
     let title = title.to_owned();
     let default_url = request.url.to_string();
+
     loop {
         let prompt_title = title.clone();
         let default_url = default_url.clone();
+
         let Some(raw_url) = prompt_blocking(move || pick_text(&prompt_title, &default_url)).await?
         else {
             return Ok(None);
         };
+
         let url = match HttpUrl::parse(&raw_url) {
             Ok(url) => url,
             Err(error) => {
@@ -1322,6 +1434,7 @@ async fn choose_http_target(
                 continue;
             }
         };
+
         let target = match HttpRuleTarget::new(method.clone(), url) {
             Ok(target) => target,
             Err(error) => {
@@ -1329,10 +1442,12 @@ async fn choose_http_target(
                 continue;
             }
         };
+
         if !target.matches(request) {
             warn!("rejecting HTTP approval target outside the observed request");
             continue;
         }
+
         return Ok(Some(ApprovalTarget::Http { target }));
     }
 }
@@ -1342,6 +1457,7 @@ async fn choose_scope(
     options: Vec<ScopeOption>,
 ) -> Result<Option<ScopeOption>, UiCliError> {
     let title = title.to_string();
+
     let choice = prompt_blocking({
         let option_labels: Vec<String> =
             options.iter().map(|option| option.label.clone()).collect();
@@ -1351,6 +1467,7 @@ async fn choose_scope(
         }
     })
     .await?;
+
     Ok(choice.and_then(|label| options.into_iter().find(|option| option.label == label)))
 }
 
@@ -1414,20 +1531,25 @@ fn network_prompt_with_aliases(
     aliases: Option<Vec<String>>, // parsed from URL fragment when present
 ) -> String {
     let base = network_prompt_url(host, port, scheme, fallback_url);
+
     if !is_ip_literal(host) {
         return base;
     }
+
     let Some(aliases) = aliases else {
         return base;
     };
+
     let hints: Vec<&str> = aliases
         .iter()
         .map(String::as_str)
         .filter(|alias| !alias.is_empty() && !is_ip_literal(alias))
         .collect();
+
     if hints.is_empty() {
         return base;
     }
+
     format!("{base} (previously seen as: {})", hints.join(", "))
 }
 
@@ -1448,6 +1570,7 @@ mod tests {
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
+
     #[test]
     fn resource_presentation_uses_human_readable_unix_socket_label() {
         let presentation = resource_presentation(
@@ -1462,7 +1585,6 @@ mod tests {
     #[test]
     fn network_presentation_uses_connection_copy_and_destination() {
         let presentation = network_presentation("https://example.com:443");
-
         assert_eq!(presentation.heading, "Allow this network connection?");
         assert_eq!(presentation.subject, "https://example.com:443");
     }
@@ -1471,8 +1593,8 @@ mod tests {
     fn http_presentation_uses_method_and_destination() {
         let request = HttpRequest::from_parts("GET", "https", "example.com", "/path")
             .expect("valid HTTP request");
-        let presentation = http_presentation(&request);
 
+        let presentation = http_presentation(&request);
         assert_eq!(presentation.heading, "Allow this GET request?");
         assert_eq!(presentation.subject, "https://example.com/path");
     }
@@ -1486,6 +1608,7 @@ mod tests {
             presentation.heading,
             "Run this command with elevated privileges?"
         );
+
         assert_eq!(presentation.subject, "sudo nixos-rebuild switch");
     }
 
@@ -1499,12 +1622,11 @@ mod tests {
             "./.agent.sock"
         );
     }
+
     #[test]
     fn approval_context_omits_cwd_when_it_matches_project() {
         let paths = SandboxPaths::new("/work/project", "/home/user", "/work/project");
-
         let context = approval_context(&paths, Some("session-id"));
-
         assert_eq!(context.len(), 2);
         assert_eq!(context[0].label, "Project");
         assert_eq!(context[1].label, "Session");
@@ -1513,9 +1635,7 @@ mod tests {
     #[test]
     fn approval_context_keeps_distinct_cwd() {
         let paths = SandboxPaths::new("/work/project/src", "/home/user", "/work/project");
-
         let context = approval_context(&paths, Some("session-id"));
-
         assert_eq!(context.len(), 3);
         assert_eq!(context[1].label, "Working directory");
     }
@@ -1539,6 +1659,7 @@ mod tests {
             network_prompt_scheme("http3", 443),
             None,
         );
+
         assert_eq!(
             network_prompt_with_transport_hint(base, "http3", 443),
             "https://example.com:443 (HTTP/3 over QUIC)"
@@ -1553,6 +1674,7 @@ mod tests {
             "tcp",
             Some("tcp://104.18.32.47:443".to_string()),
         );
+
         assert_eq!(url, "tcp://example.com:443");
     }
 
@@ -1571,6 +1693,7 @@ mod tests {
             Some("tcp://104.18.32.47:443".to_string()),
             Some(vec!["chatgpt.com".to_string()]),
         );
+
         assert_eq!(
             url,
             "tcp://104.18.32.47:443 (previously seen as: chatgpt.com)"
@@ -1586,6 +1709,7 @@ mod tests {
             None,
             Some(vec!["example.com".to_string()]),
         );
+
         assert_eq!(url, "tcp://chatgpt.com:443");
     }
 
@@ -1601,6 +1725,7 @@ mod tests {
                 "www.chatgpt.com".to_string(),
             ]),
         );
+
         assert_eq!(
             url,
             "tcp://104.18.32.47:443 (previously seen as: chatgpt.com, www.chatgpt.com)"
@@ -1614,6 +1739,7 @@ mod tests {
             scope: ApprovalScope::Once,
             values: HashMap::new(),
         };
+
         let choice = reviewed_choice(&result, false, |_| {
             panic!("target validator must not run for Once")
         })
@@ -1630,6 +1756,7 @@ mod tests {
             scope: ApprovalScope::Project,
             values: HashMap::from([("target".into(), String::new())]),
         };
+
         let choice = reviewed_choice(&result, false, |result| {
             valid_rule_path(result.values.get("target")?)
                 .map(|path| ApprovalTarget::FilesystemPath { path })
@@ -1645,6 +1772,7 @@ mod tests {
             scope: ApprovalScope::Session,
             values: HashMap::new(),
         };
+
         assert!(reviewed_choice(&unavailable, false, |_| None).is_none());
 
         let cancelled = ApprovalFormResult {
@@ -1652,6 +1780,7 @@ mod tests {
             scope: ApprovalScope::Once,
             values: HashMap::new(),
         };
+
         assert!(reviewed_choice(&cancelled, true, |_| None).is_none());
     }
 
@@ -1661,8 +1790,10 @@ mod tests {
             valid_network_host(" Example.COM. "),
             Some("example.com".into())
         );
+
         assert!(valid_network_host("bad host").is_none());
         assert!(valid_rule_path("   ").is_none());
+
         assert_eq!(
             valid_rule_path(" ./src "),
             Some(Path::new("./src").to_path_buf())
@@ -1680,6 +1811,7 @@ mod tests {
             "",
             Vec::new(),
         );
+
         let result = ApprovalFormResult {
             action: Some(PromptAction::Allow),
             scope: ApprovalScope::Project,
@@ -1697,6 +1829,7 @@ mod tests {
                 ("fd_metadata".into(), "count=0".into()),
             ]),
         };
+
         let expected = DbusTarget {
             destination: "*".into(),
             object_path: "**".into(),
@@ -1720,6 +1853,7 @@ mod tests {
     #[test]
     fn network_target_matches_requested_host() {
         let result = form_result("example.com");
+
         assert_eq!(
             parse_network_target(&result, "example.com"),
             Some(ApprovalTarget::NetworkHost {
@@ -1743,6 +1877,7 @@ mod tests {
     #[test]
     fn filesystem_target_rejects_typo_path() {
         let result = form_result("./some/.conff");
+
         assert!(
             parse_filesystem_target(
                 &result,
@@ -1756,6 +1891,7 @@ mod tests {
     #[test]
     fn filesystem_target_accepts_exact_path() {
         let result = form_result("./config/.conf");
+
         assert_eq!(
             parse_filesystem_target(
                 &result,
@@ -1771,6 +1907,7 @@ mod tests {
     #[test]
     fn filesystem_target_accepts_ancestor_glob() {
         let result = form_result("./config/*");
+
         assert!(
             parse_filesystem_target(
                 &result,
@@ -1784,6 +1921,7 @@ mod tests {
     #[test]
     fn resource_target_rejects_nonmatching_path() {
         let result = form_result("/run/other.sock");
+
         assert!(
             parse_resource_target(
                 &result,
@@ -1798,6 +1936,7 @@ mod tests {
     #[test]
     fn resource_target_accepts_matching_path() {
         let result = form_result("/run/agent-sandbox/*");
+
         assert_eq!(
             parse_resource_target(
                 &result,

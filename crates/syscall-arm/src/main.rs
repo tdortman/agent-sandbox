@@ -12,6 +12,7 @@ use std::{
 use agent_sandbox_syscall::{build_filter, default_syscalls};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
+
 use nix::{
     fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     sys::{
@@ -28,6 +29,7 @@ fn die(msg: &str) -> ! {
         "agent-sandbox-syscall-arm: {msg}: {}",
         std::io::Error::last_os_error()
     );
+
     process::exit(1);
 }
 
@@ -44,6 +46,7 @@ fn install_filter() -> OwnedFd {
         .unwrap_or_else(|()| die("prctl PR_SET_NO_NEW_PRIVS failed"));
 
     let filter = build_filter(&default_syscalls());
+
     // `seccompiler::BpfProgram` is `Vec<seccompiler::sock_filter>`. The
     // seccomp syscall takes a `*mut libc::sock_filter`, both struct types
     // are `#[repr(C)]` with identical field layout (code: u16, jt: u8,
@@ -53,6 +56,7 @@ fn install_filter() -> OwnedFd {
         len: u16::try_from(filter.len()).unwrap_or(u16::MAX),
         filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
     };
+
     install_seccomp_notify(&mut prog)
         .unwrap_or_else(|_| die("seccomp user notification install failed"))
 }
@@ -73,6 +77,7 @@ fn write_listener_fd(write_end: OwnedFd, listener_fd: i32) {
     let mut buf = listener_fd.to_string();
     buf.push('\n');
     let mut file = std::fs::File::from(write_end);
+
     file.write_all(buf.as_bytes())
         .unwrap_or_else(|_| die("writing listener fd to handoff pipe failed"));
 }
@@ -83,15 +88,19 @@ fn read_listener_fd(read_end: OwnedFd) -> i32 {
     let file = std::fs::File::from(read_end);
     let mut reader = BufReader::new(file);
     let mut text = String::new();
+
     let bytes_read = reader
         .read_line(&mut text)
         .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
+
     if bytes_read == 0 {
         die("handoff pipe closed before listener fd was sent");
     }
+
     let fd: i32 = text.trim().parse().unwrap_or_else(|_| {
         die("listener fd on handoff pipe was not a decimal integer");
     });
+
     fd
 }
 
@@ -100,10 +109,13 @@ fn exec_command(os_args: &[OsString]) -> ! {
         .iter()
         .map(|arg| cstring(arg.as_os_str().as_bytes()))
         .collect();
+
     let cstr_refs: Vec<&CStr> = cargs.iter().map(CString::as_c_str).collect();
+
     let _ = execvp(&cargs[0], &cstr_refs)
         .map_err(|_| die("execvp command failed"))
         .map(|never| match never {});
+
     die("execvp command failed");
 }
 
@@ -111,8 +123,10 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
     let broker = cstring(b"agent-sandbox-syscall-broker");
     let fd_arg = listener_fd.as_raw_fd().to_string();
     let child_arg = child_pid.as_raw().to_string();
+
     let policy_socket = env::var("AGENT_SANDBOX_POLICY_SOCKET")
         .unwrap_or_else(|_| DEFAULT_POLICY_SOCKET.to_string());
+
     let mut broker_args = vec![
         cstring(b"agent-sandbox-syscall-broker"),
         cstring(b"--listener-fd"),
@@ -122,14 +136,18 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
         cstring(b"--policy-socket"),
         cstring(policy_socket.as_bytes()),
     ];
+
     if let Ok(session) = env::var("AGENT_SANDBOX_SESSION_ID") {
         broker_args.push(cstring(b"--sandbox-session-id"));
         broker_args.push(cstring(session.as_bytes()));
     }
+
     let cstr_refs: Vec<&CStr> = broker_args.iter().map(CString::as_c_str).collect();
+
     let _ = execvp(&broker, &cstr_refs)
         .map_err(|_| die("execvp broker failed"))
         .map(|never| match never {});
+
     die("execvp broker failed");
 }
 
@@ -170,15 +188,19 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
     let command = cli.command;
+
     if command.is_empty() {
         eprintln!(
             "agent-sandbox-syscall-arm: missing command\n\nUSAGE:\nagent-sandbox-syscall-arm [--] \
              <command> [args...]"
         );
+
         process::exit(2);
     }
+
     let (read_end, write_end) = handoff_pipe();
     let fork_result = pre_exec_fork().unwrap_or_else(|_| die("fork failed"));
+
     match fork_result {
         ForkResult::Child => {
             // Child: drop the read end (we only write our side), install the
@@ -193,6 +215,7 @@ fn main() {
                 .unwrap_or_else(|()| die("raise SIGSTOP failed"));
             exec_command(&command);
         }
+
         ForkResult::Parent { child } => {
             // Parent: drop the write end, read the listener fd number from the
             // pipe, reopen the actual listener fd file descriptor from the child

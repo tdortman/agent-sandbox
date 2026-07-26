@@ -72,23 +72,27 @@ pub fn parse_ipv4(payload: &[u8]) -> Option<PacketMeta> {
     let version_ihl = payload[0];
     let version = version_ihl >> 4;
     let ihl = usize::from(version_ihl & 0x0F) * 4;
+
     if version != 4 || ihl < 20 || payload.len() < ihl {
         return None;
     }
 
     let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
     let packet_len = total_len.min(payload.len());
+
     if packet_len < ihl {
         return None;
     }
 
     let protocol = payload[9];
+
     let src_ip = IpAddr::V4(Ipv4Addr::new(
         payload[12],
         payload[13],
         payload[14],
         payload[15],
     ));
+
     let dst_ip = IpAddr::V4(Ipv4Addr::new(
         payload[16],
         payload[17],
@@ -102,6 +106,7 @@ pub fn parse_ipv4(payload: &[u8]) -> Option<PacketMeta> {
         _ => None,
     }
 }
+
 /// Walk IPv6 extension headers to find the transport protocol and its total
 /// offset.
 ///
@@ -129,6 +134,7 @@ fn walk_ipv6_ext_headers(payload: &[u8], packet_len: usize) -> Option<Ipv6ExtRes
                 next_header = payload[offset];
                 offset += hdr_len;
             }
+
             44 => {
                 // Fragment header: fixed 8 bytes
                 if offset + 8 > packet_len {
@@ -142,6 +148,7 @@ fn walk_ipv6_ext_headers(payload: &[u8], packet_len: usize) -> Option<Ipv6ExtRes
                 next_header = payload[offset];
                 offset += 8;
             }
+
             51 => {
                 // Authentication Header
                 if offset + 2 > packet_len {
@@ -155,12 +162,14 @@ fn walk_ipv6_ext_headers(payload: &[u8], packet_len: usize) -> Option<Ipv6ExtRes
                 next_header = payload[offset];
                 offset += hdr_len;
             }
+
             6 | 17 => {
                 return Some(Ipv6ExtResult {
                     protocol: next_header,
                     transport_offset: offset,
                 });
             }
+
             // No Next Header (59), ESP (50), or unknown
             _ => return None,
         }
@@ -177,12 +186,14 @@ pub fn parse_ipv6(payload: &[u8]) -> Option<PacketMeta> {
     }
 
     let version = payload[0] >> 4;
+
     if version != 6 {
         return None;
     }
 
     let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
     let packet_len = (40 + payload_len).min(payload.len());
+
     if packet_len < 40 {
         return None;
     }
@@ -192,17 +203,19 @@ pub fn parse_ipv6(payload: &[u8]) -> Option<PacketMeta> {
         b.copy_from_slice(&payload[8..24]);
         b
     };
+
     let dst_bytes = {
         let mut b = [0u8; 16];
         b.copy_from_slice(&payload[24..40]);
         b
     };
+
     let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
     let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
-
     let ext = walk_ipv6_ext_headers(payload, packet_len)?;
     let protocol = ext.protocol;
     let ip_hdr_len = ext.transport_offset;
+
     match protocol {
         6 => parse_tcp(&payload[..packet_len], ip_hdr_len, src_ip, dst_ip),
         17 => parse_udp(&payload[..packet_len], ip_hdr_len, src_ip, dst_ip),
@@ -217,15 +230,19 @@ fn parse_tcp(
     dst_ip: IpAddr,
 ) -> Option<PacketMeta> {
     let tcp_start = ip_hdr_len;
+
     if payload.len() < tcp_start + 20 {
         return None;
     }
+
     let src_port = u16::from_be_bytes([payload[tcp_start], payload[tcp_start + 1]]);
     let dst_port = u16::from_be_bytes([payload[tcp_start + 2], payload[tcp_start + 3]]);
     let tcp_header_len = usize::from(payload[tcp_start + 12] >> 4) * 4;
+
     if tcp_header_len < 20 || payload.len() < tcp_start + tcp_header_len {
         return None;
     }
+
     let flags = payload[tcp_start + 13];
     let tcp_syn = flags & 0x02 != 0 && flags & 0x10 == 0;
 
@@ -246,9 +263,11 @@ const fn parse_udp(
     dst_ip: IpAddr,
 ) -> Option<PacketMeta> {
     let udp_start = ip_hdr_len;
+
     if payload.len() < udp_start + 8 {
         return None;
     }
+
     let src_port = u16::from_be_bytes([payload[udp_start], payload[udp_start + 1]]);
     let dst_port = u16::from_be_bytes([payload[udp_start + 2], payload[udp_start + 3]]);
 
@@ -272,6 +291,7 @@ pub fn udp_payload<'a>(payload: &'a [u8], meta: &PacketMeta) -> Option<&'a [u8]>
     if meta.protocol != TransportProtocol::Udp {
         return None;
     }
+
     let ip_hdr_len = if meta.ip_version() == 6 {
         if payload.len() < 40 {
             return None;
@@ -289,9 +309,11 @@ pub fn udp_payload<'a>(payload: &'a [u8], meta: &PacketMeta) -> Option<&'a [u8]>
         }
         ihl
     };
+
     if payload.len() < ip_hdr_len + 8 {
         return None;
     }
+
     let total_len = {
         let raw = if meta.ip_version() == 6 {
             u16::from_be_bytes([payload[4], payload[5]])
@@ -304,21 +326,27 @@ pub fn udp_payload<'a>(payload: &'a [u8], meta: &PacketMeta) -> Option<&'a [u8]>
             usize::from(raw).min(payload.len())
         }
     };
+
     if total_len < ip_hdr_len + 8 {
         return None;
     }
+
     let udp_len = usize::from(u16::from_be_bytes([
         payload[ip_hdr_len + 4],
         payload[ip_hdr_len + 5],
     ]));
+
     if udp_len < 8 {
         return None;
     }
+
     let udp_data_start = ip_hdr_len + 8;
     let udp_data_end = (ip_hdr_len + udp_len).min(total_len);
+
     if udp_data_end < udp_data_start {
         return None;
     }
+
     Some(&payload[udp_data_start..udp_data_end])
 }
 
@@ -355,16 +383,22 @@ mod tests {
     fn build_tcp_syn_v6(dst_ip: [u8; 16], dst_port: u16, src_port: u16) -> Vec<u8> {
         let mut pkt = vec![0_u8; 60]; // 40 IPv6 + 20 TCP
         pkt[0] = 0x60;
+
         // Payload length = TCP header = 20
         pkt[4..6].copy_from_slice(&20_u16.to_be_bytes());
+
         pkt[6] = 6; // Next header: TCP
         pkt[7] = 64; // Hop limit
+
         // src_ip: bytes 8..23
         pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
         // dst_ip: bytes 24..39
         pkt[24..40].copy_from_slice(&dst_ip);
+
         // TCP header at byte 40
         pkt[40..42].copy_from_slice(&src_port.to_be_bytes());
+
         pkt[42..44].copy_from_slice(&dst_port.to_be_bytes());
         pkt[52] = 0x50; // data offset = 5 words
         pkt[53] = 0x02; // SYN flag
@@ -387,18 +421,25 @@ mod tests {
     fn build_tcp_syn_v6_with_dest_opts(dst_ip: [u8; 16], dst_port: u16, src_port: u16) -> Vec<u8> {
         // 40 IPv6 + 8 DestOpts + 20 TCP = 68 bytes
         let mut pkt = vec![0_u8; 68];
+
         pkt[0] = 0x60;
+
         // Payload length = 8 DestOpts + 20 TCP = 28
         pkt[4..6].copy_from_slice(&28_u16.to_be_bytes());
+
         pkt[6] = 60; // Next header: Destination Options
         pkt[7] = 64;
         pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         pkt[24..40].copy_from_slice(&dst_ip);
+
         // Destination Options header at byte 40 (hdr_ext_len = 0 -> 8 bytes)
         pkt[40] = 6; // Next header: TCP
+
         pkt[41] = 0; // Hdr Ext Len
+
         // TCP header at byte 48
         pkt[48..50].copy_from_slice(&src_port.to_be_bytes());
+
         pkt[50..52].copy_from_slice(&dst_port.to_be_bytes());
         pkt[60] = 0x50; // data offset = 5 words
         pkt[61] = 0x02; // SYN flag
@@ -413,30 +454,39 @@ mod tests {
     ) -> Vec<u8> {
         // 40 IPv6 + 8 DestOpts + 8 UDP + payload
         let total = 56 + udp_payload.len();
+
         let mut pkt = vec![0_u8; total];
         let plen = 16 + udp_payload.len(); // 8 DestOpts + 8 UDP + payload
         pkt[0] = 0x60;
+
         pkt[4..6].copy_from_slice(
             &u16::try_from(plen)
                 .expect("convert packet length to u16")
                 .to_be_bytes(),
         );
+
         pkt[6] = 60; // Next header: Destination Options
         pkt[7] = 64;
         pkt[8..24].copy_from_slice(&[0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         pkt[24..40].copy_from_slice(&dst_ip);
+
         // Destination Options header at byte 40
         pkt[40] = 17; // Next header: UDP
+
         pkt[41] = 0; // Hdr Ext Len
+
         // UDP header at byte 48
         pkt[48..50].copy_from_slice(&src_port.to_be_bytes());
+
         pkt[50..52].copy_from_slice(&dst_port.to_be_bytes());
         let udp_len = 8 + udp_payload.len();
+
         pkt[52..54].copy_from_slice(
             &u16::try_from(udp_len)
                 .expect("convert udp length to u16")
                 .to_be_bytes(),
         );
+
         pkt[56..56 + udp_payload.len()].copy_from_slice(udp_payload);
         pkt
     }
@@ -444,14 +494,18 @@ mod tests {
     fn build_ipv6_fragment(next_header: u8, frag_offset: u16, more_frags: bool) -> Vec<u8> {
         // 40 IPv6 + 8 Fragment header = 48 bytes
         let mut pkt = vec![0_u8; 48];
+
         pkt[0] = 0x60;
         pkt[4..6].copy_from_slice(&8_u16.to_be_bytes()); // payload = 8 (fragment header only)
         pkt[6] = 44; // Next header: Fragment
         pkt[7] = 64;
+
         // Fragment header at byte 40
         pkt[40] = next_header;
+
         // Fragment offset (13 bits) + More Fragments flag
         let frag_field = (frag_offset << 3) | u16::from(more_frags);
+
         pkt[42..44].copy_from_slice(&frag_field.to_be_bytes());
         pkt
     }
@@ -507,16 +561,20 @@ mod tests {
         let dst = [
             0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
         ];
+
         let pkt = build_tcp_syn_v6(dst, 443, 54321);
         let meta = parse_ipv6(&pkt).expect("parse IPv6");
+
         assert_eq!(
             meta.src_ip,
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1))
         );
+
         assert_eq!(
             meta.dst_ip,
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 0x20))
         );
+
         assert_eq!(meta.dst_port, 443);
         assert_eq!(meta.src_port, 54321);
         assert_eq!(meta.protocol, TransportProtocol::Tcp);
@@ -539,16 +597,20 @@ mod tests {
         let dst = [
             0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
         ];
+
         let pkt = build_udp_v6(dst, 53, 53000);
         let meta = parse_ipv6(&pkt).expect("parse IPv6");
+
         assert_eq!(
             meta.src_ip,
             IpAddr::V6(Ipv6Addr::new(0xFE80, 0, 0, 0, 0, 0, 0, 2))
         );
+
         assert_eq!(
             meta.dst_ip,
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888))
         );
+
         assert_eq!(meta.dst_port, 53);
         assert_eq!(meta.src_port, 53000);
         assert_eq!(meta.protocol, TransportProtocol::Udp);
@@ -579,16 +641,20 @@ mod tests {
         let dst = [
             0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
         ];
+
         let pkt = build_tcp_syn_v6_with_dest_opts(dst, 443, 54321);
         let meta = parse_ipv6(&pkt).expect("parse IPv6 with DestOpts");
+
         assert_eq!(
             meta.src_ip,
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1))
         );
+
         assert_eq!(
             meta.dst_ip,
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 0x20))
         );
+
         assert_eq!(meta.dst_port, 443);
         assert_eq!(meta.src_port, 54321);
         assert_eq!(meta.protocol, TransportProtocol::Tcp);
@@ -623,7 +689,6 @@ mod tests {
         pkt[22..24].copy_from_slice(&53_u16.to_be_bytes());
         pkt[24..26].copy_from_slice(&12_u16.to_be_bytes());
         pkt[28..32].copy_from_slice(b"test");
-
         let meta = parse_ipv4(&pkt).expect("parse");
         let data = udp_payload(&pkt, &meta).expect("udp_payload");
         assert_eq!(data, b"test");
@@ -640,7 +705,6 @@ mod tests {
         pkt[20..22].copy_from_slice(&53_u16.to_be_bytes());
         pkt[22..24].copy_from_slice(&53000_u16.to_be_bytes());
         pkt[24..26].copy_from_slice(&8_u16.to_be_bytes());
-
         let meta = parse_ipv4(&pkt).expect("parse");
         let data = udp_payload(&pkt, &meta).expect("udp_payload");
         assert!(data.is_empty());
@@ -659,7 +723,6 @@ mod tests {
         pkt[42..44].copy_from_slice(&53_u16.to_be_bytes());
         pkt[44..46].copy_from_slice(&12_u16.to_be_bytes()); // UDP length
         pkt[48..52].copy_from_slice(b"test");
-
         let meta = parse_ipv6(&pkt).expect("parse IPv6");
         let data = udp_payload(&pkt, &meta).expect("udp_payload");
         assert_eq!(data, b"test");
