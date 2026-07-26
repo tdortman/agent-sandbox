@@ -23,6 +23,7 @@ mod types;
 mod ui;
 mod ui_route;
 mod util;
+pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -33,7 +34,6 @@ use std::{
 #[cfg(test)]
 use std::{path::PathBuf, time::Duration};
 
-pub use freeze::cleanup_default_registry as cleanup_cgroup_freeze;
 pub(crate) use types::evict_oldest;
 
 pub use types::{

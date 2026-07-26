@@ -1,9 +1,6 @@
 //! Host CLI for pending policy approvals.
 
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use crate::ui::{bus_name, message_kind_name, signature_display};
 
 use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
@@ -11,7 +8,11 @@ use agent_sandbox_core::{
 };
 
 use clap::{Args, Parser, Subcommand};
-use crate::ui::{bus_name, message_kind_name, signature_display};
+
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -474,8 +475,8 @@ pub enum ApproveCliError {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
     use super::Cli;
+    use clap::CommandFactory;
 
     #[test]
     fn context_arguments_declare_environment_defaults() {

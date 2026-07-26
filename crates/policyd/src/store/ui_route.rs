@@ -1,8 +1,8 @@
 //! Match pending requests to the UI client that owns the agent.
 
-use std::path::{Path, PathBuf};
-
 use super::types::UiSessionContext;
+
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub(super) struct UiRoute {
@@ -55,9 +55,9 @@ pub(super) fn paths_match(ui: &UiSessionContext, route: &UiRoute) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
     use super::{UiRoute, paths_match};
     use crate::store::types::{UiClient, UiSessionContext};
+    use std::path::{Path, PathBuf};
 
     fn ctx(cwd: &Path, project_root: &Path) -> UiSessionContext {
         UiSessionContext {

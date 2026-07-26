@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-};
+use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
 
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
@@ -10,7 +7,10 @@ use agent_sandbox_core::{
     expand_policy_path, normalize_directory_traverse_access, normalize_host,
 };
 
-use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 /// Upper bound on files indexed by the deny inode cache across all deny
 /// rules. Keeps a deny rule on a huge tree (e.g. a btrfs snapshot dir with
@@ -806,7 +806,12 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::Path, sync::Arc};
+    use super::{
+        is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
+        session_sudo_matches,
+    };
+
+    use crate::store::{UiSessionContext, types::UiClient};
 
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRule, FilesystemRuleKey,
@@ -815,14 +820,8 @@ mod tests {
         trusted_project_policy_path,
     };
 
+    use std::{collections::HashSet, path::Path, sync::Arc};
     use tokio::{net::UnixStream, sync::Mutex};
-
-    use super::{
-        is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
-        session_sudo_matches,
-    };
-
-    use crate::store::{UiSessionContext, types::UiClient};
 
     #[test]
     fn session_filesystem_matches_honors_project_relative_paths() {

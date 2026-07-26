@@ -1,6 +1,11 @@
 //! Policy store: context.
 
-use std::path::{Path, PathBuf};
+use super::types::PolicyStore;
+
+use crate::{
+    store::types::{SandboxSessionRegistration, TrustedPeer},
+    wire::MergeContext,
+};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
@@ -9,12 +14,7 @@ use agent_sandbox_core::{
     trusted_context_from_pid, trusted_project_policy_path,
 };
 
-use super::types::PolicyStore;
-
-use crate::{
-    store::types::{SandboxSessionRegistration, TrustedPeer},
-    wire::MergeContext,
-};
+use std::path::{Path, PathBuf};
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     let target = resolve_policy_write_path(path, None)?;
@@ -466,9 +466,9 @@ fn policy_file_mtime(path: &Path) -> Option<super::types::MtimeKey> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-    use agent_sandbox_core::SudoRule;
     use super::*;
+    use agent_sandbox_core::SudoRule;
+    use std::time::Duration;
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

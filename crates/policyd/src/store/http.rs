@@ -1,18 +1,18 @@
 //! Typed HTTP policy evaluation, pending requests, and cancellation.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use agent_sandbox_core::{
-    ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
-    PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
-};
-
 use super::types::{
     HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
     PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
 };
 
 use crate::{error::PolicydError, wire::UiSpawnContext};
+
+use agent_sandbox_core::{
+    ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
+    PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
+};
+
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub(super) fn http_context(ctx: &ResolvedRequestContext) -> HttpContextKey {
@@ -528,7 +528,7 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use super::super::types::{PendingResult, PolicyStore};
 
     use agent_sandbox_core::{
         ApprovalScope, AttributionToken, FlowContext, FlowProtocol, FlowRegistration,
@@ -538,7 +538,7 @@ mod tests {
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
 
-    use super::super::types::{PendingResult, PolicyStore};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn documented_network_http_rule_allows_without_prompt() {

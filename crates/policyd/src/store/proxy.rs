@@ -1,6 +1,10 @@
 //! Trusted transparent-proxy session and flow registry.
 
-use std::time::{Duration, Instant};
+use super::types::{
+    MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState,
+};
+
+use crate::{error::PolicydError, wire::NetworkCheckRequest};
 
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
@@ -8,13 +12,8 @@ use agent_sandbox_core::{
     ProxySessionToken, ResolvedRequestContext, socket_owner::validate_socket_identity,
 };
 
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-
-use super::types::{
-    MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState,
-};
-
-use crate::{error::PolicydError, wire::NetworkCheckRequest};
 const UNCLAIMED_TTL: Duration = Duration::from_secs(30);
 const CLAIMED_IDLE_TTL: Duration = Duration::from_hours(1);
 const MAX_PROXY_CANCEL_TOMBSTONES: usize = 4096;
@@ -523,7 +522,8 @@ fn prune_flows(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use super::*;
+    use crate::store::types::{Pending, PolicyStore};
 
     use agent_sandbox_core::{
         FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
@@ -531,8 +531,7 @@ mod tests {
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
 
-    use super::*;
-    use crate::store::types::{Pending, PolicyStore};
+    use std::{sync::Arc, time::Duration};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

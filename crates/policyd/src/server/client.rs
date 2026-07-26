@@ -1,23 +1,23 @@
 //! Per-connection read loop and reply framing.
 
-use std::sync::Arc;
-
-use agent_sandbox_core::{
-    ProxyReply, ProxyRequestId, ProxySessionToken, RpcMessage, RpcReply, RpcRequest,
-};
-
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixStream, unix::OwnedWriteHalf},
-    sync::Mutex,
-};
-
 use super::dispatch::SocketRole;
 
 use crate::{
     error::PolicydError,
     server::peer::ClientPeer,
     store::{MAX_RPC_LINE_BYTES, PolicyStore, UiClientHandle},
+};
+
+use agent_sandbox_core::{
+    ProxyReply, ProxyRequestId, ProxySessionToken, RpcMessage, RpcReply, RpcRequest,
+};
+
+use std::sync::Arc;
+
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixStream, unix::OwnedWriteHalf},
+    sync::Mutex,
 };
 
 pub async fn handle_client(

@@ -5,6 +5,15 @@
 //! sandboxes can `setns` without keeping ambient/file capabilities (required
 //! for bubblewrap).
 
+use caps::CapSet;
+
+use clap::Parser as _;
+
+use nix::{
+    sched::{CloneFlags, setns},
+    unistd::execvp,
+};
+
 use std::{
     ffi::CString,
     fs::OpenOptions,
@@ -12,14 +21,6 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     process,
-};
-
-use caps::CapSet;
-use clap::Parser as _;
-
-use nix::{
-    sched::{CloneFlags, setns},
-    unistd::execvp,
 };
 
 fn die(msg: &str, err: &io::Error) -> ! {

@@ -1,8 +1,8 @@
 //! Explicit `project_root` handling and home inference for policy resolution.
 
-use std::path::{Path, PathBuf};
-
 use crate::error::ProjectPolicyError;
+
+use std::path::{Path, PathBuf};
 
 /// Cached inputs for explicit valid `project_root` handling and home inference.
 #[derive(Debug, Clone, Default)]
@@ -124,8 +124,8 @@ pub fn trusted_project_policy_path(project_root: &Path) -> Result<PathBuf, Proje
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
     use super::{ProjectPolicyContext, ProjectPolicyError, trusted_project_policy_path};
+    use std::{fs, path::Path};
 
     #[test]
     fn project_root_returns_explicit_value() {

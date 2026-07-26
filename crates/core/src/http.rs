@@ -1,16 +1,16 @@
 //! Typed HTTP request and rule normalization shared by policy, RPC, and
 //! proxies.
 
-use std::{fmt, net::IpAddr, num::NonZeroU16};
+use crate::hosts::{build_glob, normalize_dns_name};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as DeError, SeqAccess, Visitor},
 };
 
+use std::{fmt, net::IpAddr, num::NonZeroU16};
 use thiserror::Error;
 use url::Url;
-use crate::hosts::{build_glob, normalize_dns_name};
 const MAX_METHOD_BYTES: usize = 64;
 
 /// A validated HTTP method token.

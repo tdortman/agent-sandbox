@@ -1,7 +1,5 @@
 //! Load and atomically write policy JSON on disk.
 
-use std::path::{Path, PathBuf};
-
 use crate::{
     hosts::NetworkSortKey,
     http::HttpRule,
@@ -10,6 +8,8 @@ use crate::{
         SudoRule, contract_home_path, expand_policy_path,
     },
 };
+
+use std::path::{Path, PathBuf};
 
 /// Maximum on-disk policy JSON size policyd/core will load.
 pub const MAX_POLICY_JSON_BYTES: usize = 1 << 20;

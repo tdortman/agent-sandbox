@@ -1,7 +1,5 @@
 //! Unix-socket D-Bus relay with policy checks.
 
-use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, time::Duration};
-
 use agent_sandbox_core::{
     policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusTarget},
     rpc::{RequestContext, RpcReply, RpcRequest},
@@ -10,6 +8,7 @@ use agent_sandbox_core::{
 
 use futures_util::StreamExt;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, time::Duration};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
@@ -444,9 +443,9 @@ fn build_raw_body(
 
 #[cfg(test)]
 mod tests {
+    use super::{DbusBus, SerialMap, is_forbidden_bus_control, target_from_message};
     use std::num::NonZeroU32;
     use zbus::{message::Message, zvariant::Endian};
-    use super::{DbusBus, SerialMap, is_forbidden_bus_control, target_from_message};
 
     #[test]
     fn serial_map_correlates_and_removes_replies() {

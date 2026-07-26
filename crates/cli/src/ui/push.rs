@@ -1,17 +1,3 @@
-use std::{
-    fmt::Write as _,
-    path::{Path, PathBuf},
-};
-
-use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
-    HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
-    ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
-    host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
-};
-
-use tracing::warn;
-
 use super::{
     bus_name,
     choice::{deny_cancellation, format_elevation_title, resolve_choice},
@@ -26,6 +12,20 @@ use super::{
     },
     prompt_blocking, signature_display,
 };
+
+use agent_sandbox_core::{
+    ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
+    HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
+    ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
+    host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
+};
+
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
+
+use tracing::warn;
 
 /// Default project-relative rule path shown in approval prompts.
 fn suggest_project_rule_path(path: &Path, project_root: Option<&Path>) -> String {
@@ -1555,13 +1555,6 @@ fn network_prompt_with_aliases(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path};
-
-    use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
-        SocketAccess,
-    };
-
     use super::{
         ApprovalFormResult, ApprovalScope, ApprovalTarget, PromptAction, approval_context,
         elevation_presentation, http_presentation, network_presentation, network_prompt_scheme,
@@ -1570,6 +1563,13 @@ mod tests {
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
+
+    use agent_sandbox_core::{
+        DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
+        SocketAccess,
+    };
+
+    use std::{collections::HashMap, path::Path};
 
     #[test]
     fn resource_presentation_uses_human_readable_unix_socket_label() {

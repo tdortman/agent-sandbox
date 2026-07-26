@@ -1,11 +1,11 @@
-use std::{path::Path, time::Duration};
-use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
-use tracing::info;
-
 use super::{
     error::UiCliError,
     options::{PromptAction, ScopeOption},
 };
+
+use agent_sandbox_core::{ApprovalScope, RequestContext, RpcReply, RpcRequest, SandboxPaths};
+use std::{path::Path, time::Duration};
+use tracing::info;
 
 pub fn format_elevation_title(argv: &[String]) -> String {
     let cmd = argv.join(" ");

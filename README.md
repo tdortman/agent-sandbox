@@ -26,8 +26,7 @@ Run agent CLIs inside a bubblewrap jail on NixOS. `policyd` checks network, HTTP
 
 Use `sudoPolicy = "approve"` to gate sudo. Set `uiBackend = "none"` for headless systems. The full option reference is `nix/modules/nixos/agent-sandbox/agent-sandbox.nix`.
 
-For an upstream WebSocket endpoint that does not accept HTTP/2 Extended
-CONNECT, pin only that URL pattern to HTTP/1.1:
+For an upstream WebSocket endpoint that does not accept HTTP/2 Extended CONNECT, pin only that URL pattern to HTTP/1.1:
 
 ```nix
 agent-sandbox.network.httpProxy.websocketHttp11Urls = [
@@ -40,7 +39,7 @@ agent-sandbox.network.httpProxy.websocketHttp11Urls = [
 | Gate       | Behavior                                                                                                                                        |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Network    | Per-sandbox network namespace and outbound TCP/UDP checks.                                                                                      |
-| HTTP proxy | Optional HTTP/1.1 and HTTP/2 inspection, including WebSocket upgrade relay, through the transparent proxy. |
+| HTTP proxy | Optional HTTP/1.1 and HTTP/2 inspection, including WebSocket upgrade relay, through the transparent proxy.                                      |
 | Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
 | Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
 | Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |

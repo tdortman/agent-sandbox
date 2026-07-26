@@ -1,9 +1,5 @@
 //! Incoming RPC request types (`op` tag).
 
-use std::path::PathBuf;
-
-use serde::{Deserialize, Deserializer, Serialize};
-
 use super::{
     proxy::{
         AttributionToken, FlowRegistration, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
@@ -17,6 +13,9 @@ use crate::{
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
+
+use serde::{Deserialize, Deserializer, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestContext {
@@ -939,9 +938,9 @@ const fn default_once_scope() -> ApprovalScope {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::{ApprovalTarget, RequestContext, RpcRequest};
     use crate::{FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths};
+    use std::path::PathBuf;
 
     #[test]
     fn attach_check_aliases_roundtrip() {

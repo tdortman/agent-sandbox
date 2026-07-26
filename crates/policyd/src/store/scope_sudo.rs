@@ -1,9 +1,5 @@
 //! Policy store: sudo scope application.
 
-use std::path::PathBuf;
-
-use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
-
 use super::{
     apply_session_rule,
     decisions::DecisionAction,
@@ -14,6 +10,9 @@ use crate::{
     error::PolicydError,
     wire::{ScopeWire, SudoScopeOp},
 };
+
+use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
+use std::path::PathBuf;
 
 impl PolicyStore {
     fn finalize_sudo_scope(

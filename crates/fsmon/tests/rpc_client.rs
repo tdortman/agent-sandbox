@@ -1,15 +1,15 @@
+use agent_sandbox_core::{
+    FileAccess, FilesystemMonitorReply, FilesystemRule, RequestContext, RpcReply,
+};
+
+use agent_sandbox_fsmon::rpc_client::start_monitor;
+
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixListener,
     path::PathBuf,
     thread,
 };
-
-use agent_sandbox_core::{
-    FileAccess, FilesystemMonitorReply, FilesystemRule, RequestContext, RpcReply,
-};
-
-use agent_sandbox_fsmon::rpc_client::start_monitor;
 
 #[test]
 fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {

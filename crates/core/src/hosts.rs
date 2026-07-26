@@ -1,10 +1,10 @@
 //! Hostname normalization and policy host resolution.
 
-use std::{net::IpAddr, path::Path};
-
 use globset::GlobBuilder;
+
 use hickory_proto::rr::Name;
 use idna::domain_to_ascii;
+use std::{net::IpAddr, path::Path};
 use thiserror::Error;
 
 pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error> {

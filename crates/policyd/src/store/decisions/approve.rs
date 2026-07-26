@@ -1,13 +1,5 @@
 //! Apply pending network or elevation decisions.
 
-use std::path::{Path, PathBuf};
-
-use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
-    NetworkRuleKey, ResourceAccess, ResourceKind, ResourceRule, RpcReply, ScopeActionReply,
-    SocketAccess, SudoRule, VerdictSource, host_pattern_matches,
-};
-
 use super::{
     super::types::{
         Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
@@ -20,6 +12,14 @@ use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp},
 };
+
+use agent_sandbox_core::{
+    ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
+    NetworkRuleKey, ResourceAccess, ResourceKind, ResourceRule, RpcReply, ScopeActionReply,
+    SocketAccess, SudoRule, VerdictSource, host_pattern_matches,
+};
+
+use std::path::{Path, PathBuf};
 
 impl PolicyStore {
     pub async fn approve(&self, decision: PendingDecision) -> RpcReply {
@@ -844,20 +844,6 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
-    };
-
-    use agent_sandbox_core::{
-        ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
-        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, ResourceRuleKey, RpcReply,
-        SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
-    };
-
-    use tokio::{net::UnixStream, sync::Mutex};
-
     use crate::{
         store::{
             Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
@@ -866,6 +852,20 @@ mod tests {
         },
         wire::{PendingDecision, ScopeWire},
     };
+
+    use agent_sandbox_core::{
+        ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
+        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, ResourceRuleKey, RpcReply,
+        SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
+    };
+
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use tokio::{net::UnixStream, sync::Mutex};
 
     #[test]
     fn network_target_accepts_parent_domain_patterns() {

@@ -1,14 +1,5 @@
 //! Policy store: ui.
 
-use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
-
-use agent_sandbox_core::{
-    ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
-};
-
-use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
-use uuid::Uuid;
-
 use super::{
     types::{
         CLIENT_ID, Pending, PendingFilesystem, PendingResource, PolicyStore, UiClient,
@@ -18,6 +9,14 @@ use super::{
 };
 
 use crate::wire::UiSpawnContext;
+
+use agent_sandbox_core::{
+    ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
+};
+
+use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
+use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
+use uuid::Uuid;
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
 const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
 type UiNotificationTarget = (u64, std::sync::Arc<Mutex<OwnedWriteHalf>>);
@@ -462,19 +461,19 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use super::PolicyStore;
+
+    use crate::store::{
+        Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
+    };
+
     use agent_sandbox_core::FileAccess;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,
         sync::{Mutex, oneshot},
-    };
-
-    use super::PolicyStore;
-
-    use crate::store::{
-        Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
 
     fn test_store() -> PolicyStore {

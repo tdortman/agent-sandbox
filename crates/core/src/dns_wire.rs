@@ -1,6 +1,4 @@
 //! Extract policy-relevant IP→hostname mappings from DNS response packets.
-use std::collections::HashSet;
-
 use hickory_proto::{
     op::{Message, MessageType},
     rr::{
@@ -8,6 +6,8 @@ use hickory_proto::{
         rdata::svcb::{SvcParamKey, SvcParamValue},
     },
 };
+
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsMapping {
@@ -246,7 +246,7 @@ pub fn mappings_from_response(data: &[u8]) -> Vec<DnsMapping> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv6Addr;
+    use super::{DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config};
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
@@ -259,7 +259,7 @@ mod tests {
         },
     };
 
-    use super::{DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config};
+    use std::net::Ipv6Addr;
 
     fn build_a_response(qname: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
         let name = Name::from_ascii(format!("{qname}.")).expect("valid name");

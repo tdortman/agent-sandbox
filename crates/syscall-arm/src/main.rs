@@ -1,14 +1,3 @@
-use std::{
-    env,
-    ffi::{CStr, CString, OsString},
-    io::{BufRead, BufReader, Write},
-    os::{
-        fd::{AsRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
-    },
-    process,
-};
-
 use agent_sandbox_syscall::{build_filter, default_syscalls};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
@@ -20,6 +9,17 @@ use nix::{
         signal::{Signal, raise},
     },
     unistd::{ForkResult, Pid, execvp, pipe2},
+};
+
+use std::{
+    env,
+    ffi::{CStr, CString, OsString},
+    io::{BufRead, BufReader, Write},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
+    process,
 };
 
 const DEFAULT_POLICY_SOCKET: &str = "/run/agent-sandbox/policy.sock";

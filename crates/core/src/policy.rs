@@ -4,15 +4,14 @@
 //! Paths can be absolute (`/foo`), home-relative (`~/foo`), or project-relative
 //! (`./foo`). Paths containing glob syntax are compiled with [`globset`].
 
-use std::path::{Path, PathBuf};
-
-use globset::GlobMatcher;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     hosts::{NetworkRuleKey, build_glob},
     http::HttpRule,
 };
+
+use globset::GlobMatcher;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -1266,13 +1265,13 @@ mod dbus_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
     use super::{
         DeviceAccess, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule,
         SocketAccess, SudoRule, contract_home_path, contract_project_path, expand_home_path,
         filesystem_approval_paths, open_flags_to_file_access,
     };
+
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn expand_home_path_blocks_parent_traversal() {

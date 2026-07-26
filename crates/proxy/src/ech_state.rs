@@ -1,5 +1,7 @@
 //! Persistent ECH key material and DNS configuration for the transparent proxy.
 
+use rama_tls_boring::core::x25519::X25519PrivateKey;
+
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -7,8 +9,6 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-
-use rama_tls_boring::core::x25519::X25519PrivateKey;
 
 /// Directory containing the proxy's persistent ECH key and configuration.
 pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";

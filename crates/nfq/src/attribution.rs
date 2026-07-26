@@ -1,11 +1,12 @@
 //! Session-scoped hostname attribution persisted across NFQUEUE restarts.
 
+use serde::{Deserialize, Serialize};
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
 pub const SESSION_ATTRIBUTION_PATH: &str = "/run/agent-sandbox/session-attribution.json";
 const FILE_VERSION: u32 = 1;
 
@@ -173,8 +174,8 @@ impl Default for SessionAttribution {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::SessionAttribution;
+    use std::path::PathBuf;
 
     fn test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

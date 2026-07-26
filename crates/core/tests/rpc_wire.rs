@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-
 use agent_sandbox_core::{
     ApprovalScope, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody, ProxyRequestId,
     RequestContext, RpcMessage, RpcReply, RpcRequest, Verdict, VerdictSource,
 };
+
+use std::path::PathBuf;
 
 #[test]
 fn check_request_round_trips_with_context_over_json_wire() {

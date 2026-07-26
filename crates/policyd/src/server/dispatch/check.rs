@@ -1,13 +1,13 @@
 //! Network `Check` RPC handling.
 
-use std::sync::Arc;
+use crate::{error::PolicydError, store::PolicyStore, wire::NetworkCheckRequest};
 
 use agent_sandbox_core::{
     CheckReply, ResolvedRequestContext, RpcReply, Verdict, VerdictSource, is_ip_literal,
     normalize_host, policy_host_for_connect,
 };
 
-use crate::{error::PolicydError, store::PolicyStore, wire::NetworkCheckRequest};
+use std::sync::Arc;
 
 /// Inputs for `handle_check`, grouped to keep the call signature small.
 pub struct CheckArgs {
@@ -135,16 +135,16 @@ pub async fn handle_check(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use super::{CheckArgs, PromptHost, handle_check, prompt_url};
+    use crate::store::PolicyStore;
 
     use agent_sandbox_core::{
         ApprovalScope, NetworkRuleKey, ProcessIds, ResolvedRequestContext, RpcReply, SandboxPaths,
         VerdictSource,
     };
 
+    use std::{sync::Arc, time::Duration};
     use uuid::Uuid;
-    use super::{CheckArgs, PromptHost, handle_check, prompt_url};
-    use crate::store::PolicyStore;
 
     fn test_store() -> PolicyStore {
         let base =

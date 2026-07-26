@@ -5,16 +5,16 @@
 //! of the audited functions in this crate. Callers never write their own
 //! `unsafe` syscall code.
 
+use nix::{
+    sys::socket::{SockaddrStorage, getpeername},
+    unistd::Pid,
+};
+
 use std::{
     ffi::CStr,
     io::{self, Read, Seek, SeekFrom},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     path::Path,
-};
-
-use nix::{
-    sys::socket::{SockaddrStorage, getpeername},
-    unistd::Pid,
 };
 
 /// Open a pidfd referring to `pid` (Linux 5.3+ `pidfd_open(2)`).

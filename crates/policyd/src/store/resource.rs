@@ -1,24 +1,24 @@
 //! Policy store: resource gate (declarative approval flow).
 
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-
-use agent_sandbox_core::{
-    DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
-    ResourceRuleKey, UiPush, VerdictSource,
-};
-
-use tokio::{sync::oneshot, time};
-use uuid::Uuid;
-
 use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
     VerdictEntry, enforce_verdict_cache_limit,
 };
 
 use crate::wire::{ResourceCheckRequest, UiSpawnContext};
+
+use agent_sandbox_core::{
+    DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
+    ResourceRuleKey, UiPush, VerdictSource,
+};
+
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use tokio::{sync::oneshot, time};
+use uuid::Uuid;
 
 struct PendingResResult {
     id: String,
@@ -411,10 +411,11 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::Arc,
-        time::{Duration, Instant},
+    use super::PolicyStore;
+
+    use crate::{
+        store::{UiSessionContext, types::UiClient},
+        wire::ResourceCheckRequest,
     };
 
     use agent_sandbox_core::{
@@ -422,13 +423,13 @@ mod tests {
         SocketAccess, VerdictSource,
     };
 
-    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
-    use super::PolicyStore;
-
-    use crate::{
-        store::{UiSessionContext, types::UiClient},
-        wire::ResourceCheckRequest,
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
     };
+
+    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

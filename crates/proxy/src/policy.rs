@@ -1,3 +1,9 @@
+use agent_sandbox_core::{
+    AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
+    ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
+    ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest, policy_rpc,
+};
+
 use std::{
     env, fs,
     io::ErrorKind,
@@ -6,12 +12,6 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
-};
-
-use agent_sandbox_core::{
-    AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
-    ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
-    ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest, policy_rpc,
 };
 
 pub struct PolicySession {
@@ -334,11 +334,11 @@ pub fn normalize_authority(value: &str, fallback_port: u16) -> Result<String, Po
 
 #[cfg(test)]
 mod tests {
+    use super::{PolicyError, decode_http_check_reply, normalize_authority};
+
     use agent_sandbox_core::{
         ErrorReply, HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RpcReply,
     };
-
-    use super::{PolicyError, decode_http_check_reply, normalize_authority};
 
     #[test]
     fn accepts_matching_pipelined_http_reply() -> Result<(), Box<dyn std::error::Error>> {

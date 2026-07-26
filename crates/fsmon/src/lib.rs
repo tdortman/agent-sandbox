@@ -2,18 +2,18 @@
 
 /// Minimal RPC client for connecting to policyd over a Unix socket.
 pub mod rpc_client {
-    use std::{
-        io::{BufRead, BufReader, Write},
-        os::unix::net::UnixStream,
-        path::{Path, PathBuf},
-    };
-
     use agent_sandbox_core::{
         FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, RequestContext,
         RpcReply, RpcRequest,
     };
 
     use serde_json;
+
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixStream,
+        path::{Path, PathBuf},
+    };
 
     /// Error from the fsmon RPC client.
     #[derive(Debug)]
@@ -192,6 +192,12 @@ pub mod rpc_client {
 
 #[cfg(test)]
 mod tests {
+    use super::rpc_client::PersistentClient;
+
+    use agent_sandbox_core::{
+        FileAccess, FilesystemCheckReply, RequestContext, RpcReply, VerdictSource,
+    };
+
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::net::UnixListener,
@@ -200,11 +206,6 @@ mod tests {
         thread,
     };
 
-    use agent_sandbox_core::{
-        FileAccess, FilesystemCheckReply, RequestContext, RpcReply, VerdictSource,
-    };
-
-    use super::rpc_client::PersistentClient;
     static SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn socket_path(label: &str) -> PathBuf {

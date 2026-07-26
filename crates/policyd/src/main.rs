@@ -1,10 +1,10 @@
 //! Agent sandbox policy daemon entry point.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
-
 use agent_sandbox_core::SandboxPaths;
+
 use agent_sandbox_policyd::{PolicyServer, PolicyStore, PolicydArgs, PolicydError};
 use clap::Parser;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -173,8 +173,8 @@ async fn main() -> Result<(), PolicydError> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn cli_defaults_preserve_standalone_fallbacks() {

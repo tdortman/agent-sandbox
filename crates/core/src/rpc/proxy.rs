@@ -1,5 +1,14 @@
 //! Typed capabilities and flow-registration wire values for the proxy socket.
 
+use super::request::RequestContext;
+
+use crate::{
+    HttpRequest, HttpRuleTarget, SandboxPaths,
+    hosts::{normalize_dns_name, normalize_host},
+};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
+
 use std::{
     fmt,
     net::IpAddr,
@@ -7,14 +16,7 @@ use std::{
     path::PathBuf,
 };
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use uuid::Uuid;
-use super::request::RequestContext;
-
-use crate::{
-    HttpRequest, HttpRuleTarget, SandboxPaths,
-    hosts::{normalize_dns_name, normalize_host},
-};
 
 /// A non-zero inode number identifying a local socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -867,9 +869,9 @@ pub struct HttpApprovalRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
-    use serde_json::json;
     use super::*;
+    use serde_json::json;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn proxy_ids_require_canonical_uuid_versions() {

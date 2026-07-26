@@ -1,11 +1,11 @@
 //! Grouped wire/context fields for policyd.
 
-use std::path::{Path, PathBuf};
-
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusTarget, FileAccess, FilesystemRule, ProcessIds,
     RequestContext, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
 };
+
+use std::path::{Path, PathBuf};
 
 /// Attacker-controlled request context as received on the wire.
 ///

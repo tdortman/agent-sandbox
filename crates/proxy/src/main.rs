@@ -1,15 +1,6 @@
 mod ech_state;
-
-use std::{
-    error::Error,
-    fmt::{self, Display, Formatter},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
-
 use agent_sandbox_core::{EchRewrite, HttpRequest, HttpUrl, ProxyRequestId, rewrite_ech_config};
+
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
     policy::{PolicySession, authority_for_policy, flow_key, normalize_authority},
@@ -65,6 +56,16 @@ use rama_tls_boring::{
 };
 
 use rama_tls_rustls::client::TlsConnector;
+
+use std::{
+    error::Error,
+    fmt::{self, Display, Formatter},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 const MAX_ACTIVE_CHECKS: usize = 256;
@@ -279,6 +280,7 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     let args = Args::parse();
+
     let websocket_http11_urls = args
         .websocket_http11_urls
         .iter()
@@ -290,6 +292,7 @@ async fn main() -> Result<(), BoxError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+
     let websocket_http11_urls = Arc::new(websocket_http11_urls);
 
     if args.init_ech_state_only {
@@ -883,11 +886,14 @@ fn blocked_http_request(request: &Request) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        pin::Pin,
-        task::{Context, Poll},
+    use super::{
+        Body, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode,
+        TargetHttpVersion, Version, adapt_response_version, blocked_http_request,
+        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
+        is_websocket_upgrade_response, policy_denied_response, select_ech_config_list,
     };
+
+    use crate::ech_state::EchState;
 
     use rama_core::{
         Service,
@@ -906,19 +912,16 @@ mod tests {
 
     use rama_net::proxy::IoForwardService;
 
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         time::{Duration, timeout},
     };
-
-    use super::{
-        Body, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode,
-        TargetHttpVersion, Version, adapt_response_version, blocked_http_request,
-        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
-        is_websocket_upgrade_response, policy_denied_response, select_ech_config_list,
-    };
-
-    use crate::ech_state::EchState;
 
     struct TestIo {
         stream: DuplexStream,
@@ -1011,12 +1014,15 @@ mod tests {
 
         let live_pattern =
             HttpUrl::parse_pattern("https://api.openai.com/v1/live").expect("live URL pattern");
+
         let live_target = HttpUrl::parse("https://api.openai.com/v1/live/rtc").expect("live URL");
+
         let ordinary_target =
             HttpUrl::parse("https://api.openai.com/v1/responses").expect("ordinary URL");
-        let patterns = [live_pattern];
 
+        let patterns = [live_pattern];
         force_websocket_http11(&request, &live_target, &[]);
+
         assert!(
             request
                 .extensions()
@@ -1025,6 +1031,7 @@ mod tests {
         );
 
         force_websocket_http11(&request, &ordinary_target, &patterns);
+
         assert!(
             request
                 .extensions()
@@ -1038,6 +1045,7 @@ mod tests {
             .expect("test request");
 
         force_websocket_http11(&ordinary, &live_target, &patterns);
+
         assert!(
             ordinary
                 .extensions()

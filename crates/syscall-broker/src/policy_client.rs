@@ -1,15 +1,15 @@
-use std::{
-    io,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use crate::{NetworkTarget, ResourceTarget};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
     ResourceCheckReply, RpcReply, RpcRequest, SandboxPaths,
 };
 
-use crate::{NetworkTarget, ResourceTarget};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestContext {
     let mut ctx = RequestContext::from_paths_and_ids(
@@ -147,18 +147,18 @@ impl PersistentPolicyClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use super::PersistentPolicyClient;
 
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
 
+    use std::{path::Path, time::Duration};
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
-
-    use super::PersistentPolicyClient;
 
     #[tokio::test]
     async fn mismatched_reply_invalidates_connection_before_next_request() {

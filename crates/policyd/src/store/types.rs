@@ -1,18 +1,18 @@
 //! Policy store types and shared state.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{Arc, RwLock, atomic::AtomicU64},
-    time::{Duration, Instant},
-};
-
 use agent_sandbox_core::{
     AttributionToken, CheckReply, DbusTarget, ElevateReply, FileAccess, FilesystemCheckReply,
     FilesystemRule, FilesystemRuleKey, FlowRegistration, HttpCheckReply, HttpContextKey,
     HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId, ProxyConnectionId,
     ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
+};
+
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock, atomic::AtomicU64},
+    time::{Duration, Instant},
 };
 
 use tokio::{

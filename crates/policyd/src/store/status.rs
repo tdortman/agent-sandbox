@@ -1,9 +1,9 @@
 //! Policy store: status.
 
-use std::sync::Arc;
+use super::types::{Pending, PolicyStore};
 
 use agent_sandbox_core::{PendingSummary, Policy, ResolvedRequestContext, StatusReply};
-use super::types::{Pending, PolicyStore};
+use std::sync::Arc;
 
 impl PolicyStore {
     pub async fn status(self: &Arc<Self>, ctx: ResolvedRequestContext) -> StatusReply {

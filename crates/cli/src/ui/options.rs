@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use agent_sandbox_core::{ApprovalScope, ApprovalTarget, SudoRule};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 pub const ACTION_OPTIONS: &[&str] = &["Allow", "Deny"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

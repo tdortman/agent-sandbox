@@ -1,24 +1,6 @@
 //! Root fanotify monitor: setns into the sandbox mount namespace,
 //! mark each mountpoint, then event-loop handling permission events.
 
-use std::{
-    ffi::CString,
-    fs,
-    fs::File,
-    io,
-    io::{Read, Write},
-    mem::size_of,
-    os::{
-        fd::{AsFd, AsRawFd, OwnedFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{FileExt, MetadataExt},
-        },
-    },
-    path::{Path, PathBuf},
-    process,
-};
-
 use agent_sandbox_core::{
     FileAccess, normalize_directory_traverse_access, open_flags_to_file_access,
 };
@@ -35,6 +17,24 @@ use nix::{
     dir::Dir,
     fcntl::{AtFlags, OFlag, openat, readlinkat},
     sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
+};
+
+use std::{
+    ffi::CString,
+    fs,
+    fs::File,
+    io,
+    io::{Read, Write},
+    mem::size_of,
+    os::{
+        fd::{AsFd, AsRawFd, OwnedFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{FileExt, MetadataExt},
+        },
+    },
+    path::{Path, PathBuf},
+    process,
 };
 
 #[derive(Parser, Debug)]
@@ -1075,8 +1075,8 @@ fn respond(fan_fd: impl AsFd, event_fd: &OwnedFd, response: u32) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write};
     use super::*;
+    use std::{fs::File, io::Write};
 
     fn test_host_proc() -> HostProc {
         HostProc::open().expect("open host proc")

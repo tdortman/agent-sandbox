@@ -337,8 +337,8 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
     use super::*;
+    use tempfile::tempdir;
 
     fn manager_for(path: &Path, registry: &Path, count: usize) -> CgroupFreezeManager {
         CgroupFreezeManager {

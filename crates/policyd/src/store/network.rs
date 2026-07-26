@@ -1,9 +1,11 @@
 //! Policy store, network.
 
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
+use super::types::{
+    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
+    PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
+
+use crate::wire::{NetworkCheckRequest, UiSpawnContext};
 
 use agent_sandbox_core::{
     CheckReply, NetworkRuleKey, ProcessIds, ProxyRequestId, ProxySessionToken,
@@ -11,15 +13,13 @@ use agent_sandbox_core::{
     normalize_host,
 };
 
-use tokio::{sync::oneshot, time};
-use uuid::Uuid;
-
-use super::types::{
-    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
-    PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
-use crate::wire::{NetworkCheckRequest, UiSpawnContext};
+use tokio::{sync::oneshot, time};
+use uuid::Uuid;
 
 /// How long a network verdict is cached after the first policy check for the
 /// same hostname plus port. This deduplicates prompts when curl tries multiple
@@ -589,9 +589,9 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use agent_sandbox_core::{ApprovalScope, NetworkRuleKey, VerdictSource};
     use super::{NetworkRequestIdentity, PendingNetwork};
+    use agent_sandbox_core::{ApprovalScope, NetworkRuleKey, VerdictSource};
+    use std::path::Path;
 
     fn pending_network(host: &str, sandbox_session_id: Option<&str>) -> PendingNetwork {
         PendingNetwork {
@@ -630,21 +630,21 @@ mod tests {
         assert!(!identity.matches(&pending_network("other.example", Some("sandbox-a"))));
     }
 
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
+    use crate::{
+        store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
+        wire::NetworkCheckRequest,
     };
 
     use agent_sandbox_core::{
         FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
     };
 
-    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
-
-    use crate::{
-        store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
-        wire::NetworkCheckRequest,
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
     };
+
+    use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

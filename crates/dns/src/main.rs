@@ -6,14 +6,6 @@
 //! upstream resolver, records IP→hostname mappings from upstream responses for
 //! NFQUEUE prompts, and returns the upstream bytes unchanged.
 
-use std::{
-    net::{IpAddr, SocketAddr},
-    os::unix::net::UnixDatagram,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
-
 use agent_sandbox_core::{
     DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, EchRewrite, mappings_from_response,
     rewrite_ech_config,
@@ -25,6 +17,14 @@ use clap::Parser;
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
     rr::{RData, rdata::svcb::SvcParamKey},
+};
+
+use std::{
+    net::{IpAddr, SocketAddr},
+    os::unix::net::UnixDatagram,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 
 use tokio::{
@@ -527,17 +527,17 @@ impl DnsForwarder {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{Ipv4Addr, SocketAddr},
-        os::unix::net::UnixDatagram,
-    };
+    use super::*;
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query, ResponseCode},
         rr::{Name, RData, Record, RecordType, rdata::TXT},
     };
 
-    use super::*;
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        os::unix::net::UnixDatagram,
+    };
 
     fn example_query(record_type: RecordType) -> Vec<u8> {
         let name = Name::from_ascii("example.com.").expect("valid name");

@@ -1,8 +1,8 @@
 //! Read sandbox context from a client process via /proc (host pid namespace).
 
-use std::path::{Path, PathBuf};
-
 use crate::merge_policy::ProjectPolicyContext;
+
+use std::path::{Path, PathBuf};
 
 #[must_use]
 pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {

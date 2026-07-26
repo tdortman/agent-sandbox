@@ -1,13 +1,13 @@
 //! Policy RPC client for NFQUEUE, calls policyd's `Check` endpoint.
 
-use std::time::Duration;
+use crate::packet::TransportProtocol;
 
 use agent_sandbox_core::{
     FlowRegistration, ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths,
     attach_check_aliases, policy_rpc,
 };
 
-use crate::packet::TransportProtocol;
+use std::time::Duration;
 
 struct PolicyContext {
     paths: SandboxPaths,
@@ -129,9 +129,9 @@ fn pid_uid(pid: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use agent_sandbox_core::{ProcessIds, SandboxPaths};
     use super::request_context;
+    use agent_sandbox_core::{ProcessIds, SandboxPaths};
+    use std::path::Path;
 
     #[test]
     fn request_context_preserves_sandbox_session_id() {

@@ -1,6 +1,6 @@
-use std::{num::NonZeroU32, path::PathBuf};
 use agent_sandbox_core::{DbusBus, DbusMessageKind};
 use agent_sandbox_dbus_proxy::{RelayConfig, SerialMap, target_from_message};
+use std::{num::NonZeroU32, path::PathBuf};
 use zbus::message::Message;
 
 #[test]

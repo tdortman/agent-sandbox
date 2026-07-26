@@ -3,9 +3,9 @@
 //! Untrapped rename/link/symlink/unlink/truncate mutations bypass fanotify
 //! (open/access only) and let a sandbox rewrite paths outside declared rules.
 
-use std::collections::BTreeSet;
-
 use agent_sandbox_syscall::{default_syscalls, policy::nr};
+
+use std::collections::BTreeSet;
 
 const FILESYSTEM_MUTATION_SYSCALLS: &[&str] = &[
     "rename",

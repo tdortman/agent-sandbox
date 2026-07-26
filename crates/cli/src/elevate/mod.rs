@@ -1,12 +1,11 @@
 //! Request host-side root execution via policyd.
 
-use std::{path::PathBuf, time::Duration};
-
 use agent_sandbox_core::{
     ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths, policy_rpc,
 };
 
 use clap::Parser;
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(

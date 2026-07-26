@@ -9,8 +9,8 @@ pub fn strip_alt_svc<B>(response: &mut Response<B>) {
 
 #[cfg(test)]
 mod tests {
-    use rama_http::{HeaderName, HeaderValue, Response};
     use super::strip_alt_svc;
+    use rama_http::{HeaderName, HeaderValue, Response};
 
     #[test]
     fn strips_alt_svc_from_responses() -> Result<(), Box<dyn std::error::Error>> {

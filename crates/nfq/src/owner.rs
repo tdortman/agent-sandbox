@@ -1,12 +1,12 @@
 //! NFQ compatibility wrapper for shared procfs socket-owner resolution.
 
-use std::net::IpAddr;
+use crate::packet::TransportProtocol;
 
 use agent_sandbox_core::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };
 
-use crate::packet::TransportProtocol;
+use std::net::IpAddr;
 
 /// Find the checked process/socket snapshot for the socket bound to
 /// `src_ip:src_port`.
@@ -35,8 +35,8 @@ pub fn owner_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn owner_snapshot_resolves_current_process_for_loopback_tcp_client() {

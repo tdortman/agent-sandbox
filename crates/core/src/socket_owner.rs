@@ -5,6 +5,8 @@
 //! identity. Every candidate is checked against the socket table's UID and
 //! inode, the process start-time ticks, and the descriptor's socket target.
 
+use crate::{FlowProtocol, ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
+
 use std::{
     collections::HashMap,
     fmt::Write as _,
@@ -13,8 +15,6 @@ use std::{
     num::NonZeroU32,
     os::unix::fs::MetadataExt,
 };
-
-use crate::{FlowProtocol, ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
 
 /// Transport protocol used by a procfs socket table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

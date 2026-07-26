@@ -1,14 +1,5 @@
 //! Policy store: elevation.
 
-use std::{
-    collections::HashMap,
-    path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
-};
-
-use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
-use tokio::{sync::oneshot, time};
-use uuid::Uuid;
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore};
 
 use crate::{
@@ -16,6 +7,16 @@ use crate::{
     wire::{ElevationRequest, UiSpawnContext},
 };
 
+use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
+
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use tokio::{sync::oneshot, time};
+use uuid::Uuid;
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
 impl PolicyStore {
@@ -402,15 +403,15 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use super::ELEVATION_PATH;
+    use crate::{store::types::PolicyStore, wire::ElevationRequest};
+    use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
         time::{Duration, Instant},
     };
-
-    use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
-    use super::ELEVATION_PATH;
-    use crate::{store::types::PolicyStore, wire::ElevationRequest};
 
     fn system_profile_true() -> Option<PathBuf> {
         let path = Path::new(ELEVATION_PATH).join("true");
@@ -499,8 +500,8 @@ mod tests {
 
     #[test]
     fn forged_home_does_not_auto_elevate_via_attacker_policy() {
-        use agent_sandbox_core::{Policy, SudoRule};
         use crate::store::types::TrustedPeer;
+        use agent_sandbox_core::{Policy, SudoRule};
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_home = tmp.path().join("home/user");
         let evil = tmp.path().join("evil");

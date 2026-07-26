@@ -11,13 +11,6 @@ mod owner;
 mod packet;
 mod policy;
 
-use std::{
-    net::IpAddr,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost,
@@ -27,6 +20,14 @@ use agent_sandbox_core::{
 
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
+
+use std::{
+    net::IpAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
 use tracing::{debug, info, warn};
 
 /// Number of bytes to copy from each queued packet.
@@ -375,8 +376,8 @@ fn recv_datagram_with_creds(
     sock: &std::os::unix::net::UnixDatagram,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, UnixPeerCred)> {
-    use std::{io::IoSliceMut, os::unix::io::AsRawFd};
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::{io::IoSliceMut, os::unix::io::AsRawFd};
     let mut cmsg = [0u8; 128];
     let mut iov = [IoSliceMut::new(buf)];
 
@@ -885,6 +886,13 @@ fn handle_packet(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType, rdata::A},
+    };
+
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         os::unix::process::ExitStatusExt,
@@ -892,12 +900,6 @@ mod tests {
         time::Duration,
     };
 
-    use hickory_proto::{
-        op::{Message, MessageType, OpCode, Query},
-        rr::{Name, RData, Record, RecordType, rdata::A},
-    };
-
-    use super::*;
     const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
 
     fn state_for_tests() -> NfqState {
