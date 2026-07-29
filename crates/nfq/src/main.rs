@@ -364,11 +364,13 @@ struct UnixPeerCred {
 
 fn restrict_push_socket_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 fn enable_passcred(sock: &std::os::unix::net::UnixDatagram) -> std::io::Result<()> {
     use nix::sys::socket::{setsockopt, sockopt::PassCred};
+
     setsockopt(sock, PassCred, &true).map_err(std::io::Error::from)
 }
 
@@ -378,6 +380,7 @@ fn recv_datagram_with_creds(
 ) -> std::io::Result<(usize, UnixPeerCred)> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
     use std::{io::IoSliceMut, os::unix::io::AsRawFd};
+
     let mut cmsg = [0u8; 128];
     let mut iov = [IoSliceMut::new(buf)];
 

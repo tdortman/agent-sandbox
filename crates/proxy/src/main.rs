@@ -68,6 +68,7 @@ use std::{
 
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
+
 const MAX_ACTIVE_CHECKS: usize = 256;
 const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 

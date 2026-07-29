@@ -995,6 +995,7 @@ mod tests {
     fn expand_static_allow_rules_canonicalizes_home_symlinks() {
         use super::expand_static_allow_rules;
         use std::os::unix::fs::symlink;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path();
         let target = home.join("dotfiles/home/dot_omp");

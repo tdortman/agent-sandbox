@@ -13,6 +13,7 @@ use agent_sandbox_core::{
 };
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub(super) fn http_context(ctx: &ResolvedRequestContext) -> HttpContextKey {

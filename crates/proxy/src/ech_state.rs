@@ -16,6 +16,7 @@ pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";
 const CONFIG_FILE: &str = "ech-config-list";
 const PRIVATE_KEY_FILE: &str = "ech-private-key";
 const PUBLIC_NAME: &[u8] = b"proxy.agent-sandbox.invalid";
+const CIPHER_SUITES: &[(u16, u16)] = &[(0x0001, 0x0002), (0x0001, 0x0001)];
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// ECH state loaded by the proxy for client-facing TLS and DNS rewriting.
@@ -134,12 +135,17 @@ fn unique_temporary_path(path: &Path) -> PathBuf {
 /// Encode the proxy's ECH configuration in RFC 9849 wire format.
 ///
 /// The result is an `ECHConfigList` containing one version `0xfe0d`
-/// `ECHConfig` with config ID `1`, an X25519 KEM public key, the
-/// `HKDF-SHA256/AES-128-GCM` cipher suite, the proxy's synthetic public name,
-/// and no extensions. The outer two-byte length is the redundant list length
-/// required by RFC 9848 for the DNS `ech` `SvcParam`.
+/// `ECHConfig` with config ID `1`, an `X25519 KEM` public key, the
+/// `HKDF-SHA256/AES-256-GCM` cipher suite followed by the compatibility
+/// `HKDF-SHA256/AES-128-GCM` suite, the proxy's synthetic public name, and no
+/// extensions. The outer two-byte length is the redundant list length required
+/// by RFC 9848 for the DNS `ech` `SvcParam`.
 fn encode_config_list(public_key: &[u8; 32]) -> Vec<u8> {
-    let config_data_len = 1 + 2 + 2 + public_key.len() + 2 + 4 + 1 + 1 + PUBLIC_NAME.len() + 2;
+    let cipher_suites_len = 4 * CIPHER_SUITES.len();
+
+    let config_data_len =
+        1 + 2 + 2 + public_key.len() + 2 + cipher_suites_len + 1 + 1 + PUBLIC_NAME.len() + 2;
+
     let config_len = 4 + config_data_len;
     let mut config = Vec::with_capacity(2 + config_len);
 
@@ -164,9 +170,17 @@ fn encode_config_list(public_key: &[u8; 32]) -> Vec<u8> {
     );
 
     config.extend_from_slice(public_key);
-    push_u16(&mut config, 4);
-    push_u16(&mut config, 1);
-    push_u16(&mut config, 1);
+
+    push_u16(
+        &mut config,
+        u16::try_from(cipher_suites_len).expect("ECH cipher suites length fits in u16"),
+    );
+
+    for (kdf_id, aead_id) in CIPHER_SUITES {
+        push_u16(&mut config, *kdf_id);
+        push_u16(&mut config, *aead_id);
+    }
+
     config.push(0);
     config.push(u8::try_from(PUBLIC_NAME.len()).expect("ECH public name length fits in u8"));
     config.extend_from_slice(PUBLIC_NAME);
@@ -210,7 +224,8 @@ mod tests {
             first.config_list.len() - 2
         );
 
-        assert_eq!(first.config_list.len(), 80);
+        assert_eq!(&first.config_list[43..53], &[0, 8, 0, 1, 0, 2, 0, 1, 0, 1],);
+        assert_eq!(first.config_list.len(), 84);
         fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 

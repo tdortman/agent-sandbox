@@ -17,6 +17,7 @@ use std::{
 
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
+
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
 impl PolicyStore {
@@ -502,6 +503,7 @@ mod tests {
     fn forged_home_does_not_auto_elevate_via_attacker_policy() {
         use crate::store::types::TrustedPeer;
         use agent_sandbox_core::{Policy, SudoRule};
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_home = tmp.path().join("home/user");
         let evil = tmp.path().join("evil");

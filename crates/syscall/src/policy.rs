@@ -216,6 +216,7 @@ mod tests {
     #[test]
     fn compat_audit_arch_constants_match_linux_headers() {
         use super::{AUDIT_ARCH_I686, AUDIT_ARCH_X86_32};
+
         assert_eq!(AUDIT_ARCH_X86_32, 0x4000_0002);
         assert_eq!(AUDIT_ARCH_I686, 0x4000_0003);
         assert_ne!(AUDIT_ARCH_X86_32, super::AUDIT_ARCH_NATIVE);

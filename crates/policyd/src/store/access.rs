@@ -516,6 +516,7 @@ impl PolicyStore {
     /// comparison regardless of the path the tracee used.
     fn rebuild_deny_inode_cache(fingerprint: Vec<DenyFingerprint>) -> DenyInodeCache {
         use std::os::unix::fs::MetadataExt;
+
         let mut inodes: HashMap<InodeIdentity, Vec<DenyCacheEntry>> = HashMap::new();
         let mut budget = MAX_DENY_INODE_ENTRIES;
 

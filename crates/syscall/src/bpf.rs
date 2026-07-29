@@ -80,6 +80,7 @@ const fn target_arch() -> TargetArch {
 mod tests {
     use super::build_filter;
     use std::collections::BTreeSet;
+
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
     const RET_ALLOW: u32 = 0x7FFF_0000;
 

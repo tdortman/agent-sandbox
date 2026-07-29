@@ -782,6 +782,7 @@ fn run_event_loop(
     socket_path: &Path,
 ) -> ! {
     use std::os::fd::AsFd;
+
     let mut buf = vec![0u8; 4096];
 
     let mut rpc = match rpc_client::PersistentClient::connect(socket_path) {
@@ -1386,6 +1387,7 @@ mod tests {
     #[test]
     fn context_arguments_declare_environment_defaults() {
         use clap::CommandFactory;
+
         let command = Cli::command();
 
         for (argument, environment) in [

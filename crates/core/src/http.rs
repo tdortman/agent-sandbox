@@ -11,6 +11,7 @@ use serde::{
 use std::{fmt, net::IpAddr, num::NonZeroU16};
 use thiserror::Error;
 use url::Url;
+
 const MAX_METHOD_BYTES: usize = 64;
 
 /// A validated HTTP method token.

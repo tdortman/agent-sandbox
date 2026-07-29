@@ -779,6 +779,7 @@ mod tests {
     fn environment_defaults_are_declared_on_cli_arguments() {
         use super::Cli;
         use clap::CommandFactory;
+
         let command = Cli::command();
 
         for (argument, environment) in [

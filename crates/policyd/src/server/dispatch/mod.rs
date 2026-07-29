@@ -3,6 +3,7 @@
 mod auth;
 
 pub use auth::SocketRole;
+
 mod check;
 mod context;
 mod handlers;

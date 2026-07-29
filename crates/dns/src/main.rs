@@ -585,6 +585,7 @@ mod tests {
     #[test]
     fn suppresses_https_and_svcb_answers() -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::SVCB;
+
         let name = Name::from_ascii("example.com.")?;
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
 
@@ -604,6 +605,7 @@ mod tests {
     #[test]
     fn refuses_to_strip_dnssec_authenticated_metadata() -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::SVCB;
+
         let name = Name::from_ascii("example.com.")?;
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.metadata.authentic_data = true;
@@ -628,6 +630,7 @@ mod tests {
     #[test]
     fn suppresses_metadata_but_keeps_rewritten_ech() -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue};
+
         let name = Name::from_ascii("example.com.")?;
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
 

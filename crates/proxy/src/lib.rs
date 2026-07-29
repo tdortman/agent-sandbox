@@ -1,6 +1,7 @@
 pub mod cert;
 pub mod policy;
 use rama_http::{HeaderName, Response};
+
 pub const ALT_SVC: HeaderName = HeaderName::from_static("alt-svc");
 
 pub fn strip_alt_svc<B>(response: &mut Response<B>) {

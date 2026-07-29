@@ -9,6 +9,7 @@ use std::{
 };
 
 use tracing::warn;
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_REGISTRY: &str = "/run/agent-sandbox/cgroup-freeze";
 
