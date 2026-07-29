@@ -1842,6 +1842,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dbus_signature_with_braces_matches_requested_message() {
+        let requested = DbusTarget::session(
+            "org.freedesktop.secrets",
+            "/org/freedesktop/secrets/aliases/default",
+            "org.freedesktop.Secret.Collection",
+            "SearchItems",
+            DbusMessageKind::MethodCall,
+            "a{ss}",
+            Vec::new(),
+        );
+
+        let result = ApprovalFormResult {
+            action: Some(PromptAction::Allow),
+            scope: ApprovalScope::Project,
+            values: HashMap::from([
+                ("bus".into(), "session".into()),
+                ("destination".into(), "org.freedesktop.secrets".into()),
+                (
+                    "object_path".into(),
+                    "/org/freedesktop/secrets/aliases/default".into(),
+                ),
+                (
+                    "interface".into(),
+                    "org.freedesktop.Secret.Collection".into(),
+                ),
+                ("member".into(), "SearchItems".into()),
+                ("message_kind".into(), "method_call".into()),
+                ("signature".into(), "a{ss}".into()),
+                ("fd_metadata".into(), "count=0".into()),
+            ]),
+        };
+
+        assert!(parse_dbus_target(&result, &requested).is_some());
+    }
+
     fn form_result(target: &str) -> ApprovalFormResult {
         ApprovalFormResult {
             action: Some(PromptAction::Allow),

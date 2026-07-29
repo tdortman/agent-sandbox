@@ -950,7 +950,9 @@ impl DbusRule {
             && glob_matches(&self.target.object_path, &target.object_path)
             && glob_matches(&self.target.interface, &target.interface)
             && glob_matches(&self.target.member, &target.member)
-            && glob_matches(&self.target.signature, &target.signature)
+            // D-Bus signatures use braces that globset treats as alternation syntax.
+            && (self.target.signature == target.signature
+                || glob_matches(&self.target.signature, &target.signature))
     }
 }
 
@@ -1193,10 +1195,37 @@ mod dbus_tests {
     }
 
     #[test]
+    fn dbus_rules_match_literal_signatures_with_braces() {
+        let base_target = target("SearchItems");
+        let rule = DbusRule::new(
+            DbusTarget {
+                signature: "a{ss}".into(),
+                ..base_target
+            },
+            "",
+        );
+
+        let requested = DbusTarget {
+            signature: "a{ss}".into(),
+            ..target("SearchItems")
+        };
+
+        assert!(rule.matches(&requested));
+    }
+
+    #[test]
     fn dbus_globset_literal_separator_requires_double_star_for_paths() {
         let single = DbusRule::new(
             DbusTarget {
                 object_path: "/org/*/Object".into(),
+                ..target("Read")
+            },
+            "",
+        );
+
+        let star = DbusRule::new(
+            DbusTarget {
+                object_path: "*".into(),
                 ..target("Read")
             },
             "",
@@ -1216,6 +1245,7 @@ mod dbus_tests {
         };
 
         assert!(!single.matches(&nested));
+        assert!(!star.matches(&nested));
         assert!(double.matches(&nested));
     }
 
