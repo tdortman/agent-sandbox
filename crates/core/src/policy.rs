@@ -1197,6 +1197,7 @@ mod dbus_tests {
     #[test]
     fn dbus_rules_match_literal_signatures_with_braces() {
         let base_target = target("SearchItems");
+
         let rule = DbusRule::new(
             DbusTarget {
                 signature: "a{ss}".into(),
