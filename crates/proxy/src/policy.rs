@@ -3,7 +3,6 @@ use agent_sandbox_core::{
     ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
     ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest, policy_rpc,
 };
-
 use std::{
     env, fs,
     io::ErrorKind,
@@ -335,7 +334,6 @@ pub fn normalize_authority(value: &str, fallback_port: u16) -> Result<String, Po
 #[cfg(test)]
 mod tests {
     use super::{PolicyError, decode_http_check_reply, normalize_authority};
-
     use agent_sandbox_core::{
         ErrorReply, HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RpcReply,
     };

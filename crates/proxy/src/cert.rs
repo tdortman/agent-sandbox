@@ -1,11 +1,9 @@
 use rama_tls_rustls::dep::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rcgen::{CertificateParams, Issuer, KeyPair};
-
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]

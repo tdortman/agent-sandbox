@@ -1,4 +1,5 @@
 mod ech_state;
+pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
@@ -13,16 +14,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
-    Layer, Service,
+    Service,
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
-    extensions::ExtensionsRef,
+    extensions::{ExtensionsRef, Ingress},
     io::Io,
     matcher::{match_fn, service::MatcherServicePair},
     rt::Executor,
     service::service_fn,
 };
-use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
     Body, HeaderMap, HeaderValue, Request, Response, StatusCode, Version,
     body::{Frame, StreamingBody, util::BodyExt},
@@ -30,18 +30,19 @@ use rama_http::{
     io::upgrade::OnUpgrade,
     layer::{
         upgrade::mitm::HttpUpgradeMitmRelay,
-        version_adapter::{RequestVersionAdapter, ResponseVersionAdaptCtx, adapt_response_version},
+        version_adapter::{ResponseVersionAdaptCtx, adapt_response_version},
     },
 };
-use rama_http_backend::{client::HttpConnector, server::HttpServer};
+use rama_http_backend::server::HttpServer;
 use rama_net::{
     address::SocketAddress,
+    http::server::HttpPeekRouter,
     proxy::IoForwardService,
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
-use rama_tcp::{TcpStream, client::service::TcpConnector, server::TcpListener};
-use rama_tls::{client::TlsClientConfig, server::TlsPeekRouter};
+use rama_tcp::{TcpStream, server::TcpListener};
+use rama_tls::server::TlsPeekRouter;
 use rama_tls_boring::{
     TlsStream,
     core::{
@@ -50,7 +51,6 @@ use rama_tls_boring::{
         x509::X509,
     },
 };
-use rama_tls_rustls::client::TlsConnector;
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
@@ -63,6 +63,7 @@ use std::{
 };
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
+use upstream::UpstreamClients;
 
 const MAX_ACTIVE_CHECKS: usize = 256;
 const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
@@ -160,6 +161,7 @@ struct Args {
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     test_destination: Option<SocketAddr>,
+
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     test_tls: bool,
@@ -169,6 +171,9 @@ struct Args {
 
     #[arg(long = "websocket-http11-url", value_name = "URL")]
     websocket_http11_urls: Vec<String>,
+
+    #[arg(long = "http10-upstream-origin", value_name = "ORIGIN")]
+    http10_upstream_origins: Vec<String>,
 
     #[arg(long, env = "AGENT_SANDBOX_ECH_CONFIG_LIST")]
     ech_config_list: Option<String>,
@@ -181,6 +186,41 @@ struct Args {
     ech_state_dir: Option<PathBuf>,
 }
 
+fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
+    let origin = HttpUrl::parse(value)
+        .map_err(|error| BoxError::from(format!("invalid HTTP/1.0 upstream origin: {error}")))?;
+
+    if origin.path().is_none_or(|path| path.as_str() != "/") {
+        return Err(BoxError::from(format!(
+            "HTTP/1.0 upstream origin must not include a path: {value:?}"
+        )));
+    }
+
+    let parsed = url::Url::parse(value)?;
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| BoxError::from_static_str("HTTP/1.0 upstream origin has no host"))?;
+
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| BoxError::from_static_str("HTTP/1.0 upstream origin has no port"))?;
+
+    Ok(format!(
+        "{}://{}",
+        parsed.scheme(),
+        authority_for_policy(host, port)
+    ))
+}
+
+fn canonical_http10_origins(values: &[String]) -> Result<Vec<String>, BoxError> {
+    values
+        .iter()
+        .map(String::as_str)
+        .map(canonical_http10_origin)
+        .collect()
+}
+
 #[derive(Clone)]
 struct FlowState {
     destination: SocketAddr,
@@ -190,7 +230,14 @@ struct FlowState {
     attribution_token: agent_sandbox_core::AttributionToken,
     ech_config_list: Option<Arc<Vec<u8>>>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
+    http10_upstream_origins: Arc<Vec<String>>,
+    upstream_clients: Arc<UpstreamClients>,
 }
+
+#[derive(Debug, Clone)]
+struct TlsServerName(String);
+
+impl rama_core::extensions::Extension for TlsServerName {}
 
 type DestinationResolver =
     Arc<dyn Fn(&TcpStream, u16) -> Result<SocketAddr, BoxError> + Send + Sync>;
@@ -306,6 +353,9 @@ async fn main() -> Result<(), BoxError> {
 
     let websocket_http11_urls = Arc::new(websocket_http11_urls);
 
+    let http10_upstream_origins =
+        Arc::new(canonical_http10_origins(&args.http10_upstream_origins)?);
+
     if args.init_ech_state_only {
         let state_dir = args
             .ech_state_dir
@@ -359,6 +409,7 @@ async fn main() -> Result<(), BoxError> {
         ech_config_list,
         ech_private_key,
         websocket_http11_urls,
+        http10_upstream_origins,
         #[cfg(debug_assertions)]
         destination_resolver: args
             .test_destination
@@ -475,6 +526,7 @@ struct ListenerConfig {
     ech_config_list: Option<Arc<Vec<u8>>>,
     ech_private_key: Option<[u8; 32]>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
+    http10_upstream_origins: Arc<Vec<String>>,
     destination_resolver: DestinationResolver,
     test_tls: bool,
 }
@@ -494,6 +546,7 @@ fn build_listener_service(
         let ech_config_list = listener_config.ech_config_list.clone();
         let ech_private_key = listener_config.ech_private_key;
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
+        let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
         let shutdown = shutdown.clone();
         let destination_resolver = listener_config.destination_resolver.clone();
         let test_tls = listener_config.test_tls;
@@ -505,7 +558,9 @@ fn build_listener_service(
             let source = peer;
             info!(%peer, %source, %destination, "accepted transparent proxy stream");
             let flow = flow_key(source, destination)?;
+            let upstream_clients = Arc::new(UpstreamClients::new()?);
             let attribution_token = policy.claim(flow).await?;
+
             let state = FlowState {
                 destination,
                 tls: test_tls || matches!(destination.port(), 443 | 8443),
@@ -514,13 +569,25 @@ fn build_listener_service(
                 attribution_token: attribution_token.clone(),
                 ech_config_list: ech_config_list.clone(),
                 websocket_http11_urls: websocket_http11_urls.clone(),
+                http10_upstream_origins,
+                upstream_clients,
             };
 
-            let request_service = service_fn(move |request| {
+            let request_service = service_fn(move |request: Request| {
                 let state = state.clone();
                 let shutdown = shutdown.clone();
 
                 async move {
+                    let tls_server_name = request
+                        .extensions()
+                        .get_ref::<Ingress<TlsStream<TcpStream>>>()
+                        .and_then(|ingress| ingress.ssl_ref().servername(NameType::HOST_NAME))
+                        .map(str::to_owned);
+
+                    if let Some(server_name) = tls_server_name {
+                        request.extensions().insert(TlsServerName(server_name));
+                    }
+
                     match proxy_request(request, state, shutdown).await {
                         Ok(response) => Ok(response),
 
@@ -553,14 +620,14 @@ fn build_listener_service(
             let mut http_server = HttpServer::auto(executor.clone());
             http_server.h2_mut().set_enable_connect_protocol();
             let http = http_server.service(request_service);
-            let fallback_http = http.clone();
+            let fallback_http = HttpPeekRouter::new_http1(http.clone());
 
             let tls = BoringTlsService {
                 issuer,
                 ech_config_list: ech_config_list.clone(),
                 ech_private_key,
                 fallback_name: destination.ip().to_string(),
-                inner: http.clone(),
+                inner: http,
             };
 
             let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
@@ -728,21 +795,68 @@ async fn check_http_policy(
     state: &FlowState,
     shutdown: &Arc<Notify>,
 ) -> Result<(SemanticRequest, HttpCheckReply, String, String), BoxError> {
-    let host = request
+    let header_host = request
         .headers()
         .get("host")
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| request.uri().authority().map(|value| value.to_string()))
+        .map(str::to_owned);
+
+    let uri_host = request.uri().authority().map(|value| value.to_string());
+
+    if let (Some(header_host), Some(uri_host)) = (&header_host, &uri_host) {
+        let header_authority = normalize_authority(header_host, state.destination.port())?;
+        let uri_authority = normalize_authority(uri_host, state.destination.port())?;
+
+        if header_authority != uri_authority {
+            return Err(BoxError::from_static_str(
+                "HTTP request has conflicting origin authorities",
+            ));
+        }
+    }
+
+    let tls_host = request
+        .extensions()
+        .get_ref::<TlsServerName>()
+        .map(|name| name.0.clone());
+
+    if let Some(tls_host) = tls_host.as_deref()
+        && let Some(request_host) = header_host.as_deref().or(uri_host.as_deref())
+    {
+        let tls_authority = normalize_authority(tls_host, state.destination.port())?;
+        let request_authority = normalize_authority(request_host, state.destination.port())?;
+
+        if tls_authority != request_authority {
+            return Err(BoxError::from_static_str(
+                "HTTP request conflicts with TLS server identity",
+            ));
+        }
+    }
+
+    let host = header_host
+        .or(uri_host)
+        .or(tls_host)
+        .or_else(|| {
+            (request.version() == Version::HTTP_10).then(|| {
+                authority_for_policy(
+                    &state.destination.ip().to_string(),
+                    state.destination.port(),
+                )
+            })
+        })
         .ok_or_else(|| BoxError::from_static_str("HTTP request has no authority"))?;
+
     let scheme = if state.tls { "https" } else { "http" };
     let authority = normalize_authority(&host, state.destination.port())?;
     let target = request_target(request);
+
     let path = target
         .split_once('?')
         .map_or(target.as_str(), |(path, _)| path)
         .to_owned();
+
     let raw_query = request.uri().query().map(|query| query.to_string());
+    let semantic_version = semantic_http_version(request.version())?;
+
     let semantic_request = SemanticRequest::from_parts(
         request.method().as_str(),
         scheme,
@@ -750,18 +864,22 @@ async fn check_http_policy(
         &path,
         raw_query.as_deref(),
         semantic_request_headers(request)?,
-        semantic_http_version(request.version())?,
-        SemanticHttpVersion::Http11,
+        semantic_version,
+        semantic_version,
         None,
         BoundedRequestBody::empty(),
     )?;
+
     let request_id = ProxyRequestId::new();
+
     let _permit = state
         .active_checks
         .clone()
         .try_acquire_owned()
         .map_err(|_| BoxError::from_static_str("too many active policy checks"))?;
+
     let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
+
     let check = tokio::select! {
         result = state.policy.check_http(request_id, state.attribution_token.clone(), semantic_request.policy_request()?) => result?,
         () = shutdown.notified() => {
@@ -770,16 +888,18 @@ async fn check_http_policy(
             return Err(BoxError::from_static_str("proxy shutting down"));
         }
     };
+
     pending.disarm();
     Ok((semantic_request, check, authority, path))
 }
 
 async fn proxy_request(
-    mut request: Request,
+    request: Request,
     state: FlowState,
     shutdown: Arc<Notify>,
 ) -> Result<Response, BoxError> {
     let websocket = is_websocket_upgrade_request(&request);
+    let downstream_version = request.version();
 
     if blocked_http_request(&request) {
         return Err(Box::new(PolicyDenied));
@@ -805,36 +925,18 @@ async fn proxy_request(
         BoxError::from_static_str("policy allowed request without normalized target")
     })?;
 
-    let upstream_url = url::Url::parse(&normalized.url.to_string())?;
-
-    let upstream_host = upstream_url
-        .host_str()
-        .ok_or_else(|| BoxError::from_static_str("normalized policy target has no host"))?;
-
-    let upstream_port = upstream_url
-        .port_or_known_default()
-        .ok_or_else(|| BoxError::from_static_str("normalized policy target has no port"))?;
-
-    let upstream_authority = authority_for_policy(upstream_host, upstream_port);
     let original_uri = request.uri().to_string();
-    let target = semantic_request.forwarding_target();
-    let semantic_body = semantic_request.into_body();
-    let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
-    *request.uri_mut() = uri.parse()?;
 
-    request
-        .headers_mut()
-        .insert("host", upstream_authority.parse()?);
+    let (mut response, upstream_authority) = upstream::send_upstream_request(
+        request,
+        &state,
+        semantic_request,
+        &normalized,
+        downstream_version,
+        websocket,
+    )
+    .await?;
 
-    force_websocket_http11(&request, &normalized.url, &state.websocket_http11_urls);
-    request = request.map(|body| Body::new(SemanticRequestBody::new(body, semantic_body)));
-
-    let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
-    let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
-    let connector = RequestVersionAdapter::new(connector).with_default_version(Version::HTTP_11);
-    let client = HttpConnector::new(connector, Executor::default());
-    let connection = client.serve(request).await?;
-    let mut response = connection.conn.serve(connection.input).await?;
     let response_status = response.status();
     let response_version = response.version();
 
@@ -843,6 +945,11 @@ async fn proxy_request(
     }
 
     adapt_response_version(&mut response, &response_context)?;
+
+    if downstream_version == Version::HTTP_10 {
+        response = adapt_http10_response(response);
+    }
+
     strip_alt_svc(&mut response);
 
     if doh {
@@ -852,6 +959,7 @@ async fn proxy_request(
         )
         .await?;
     }
+
     response = bridge_response_body(response)?;
 
     info!(
@@ -865,6 +973,109 @@ async fn proxy_request(
     );
 
     Ok(response)
+}
+
+fn request_head_clone(request: &Request, version: Version, body: Body) -> Request {
+    let mut clone = Request::builder()
+        .method(request.method().clone())
+        .uri(request.uri().clone())
+        .version(version)
+        .body(body)
+        .expect("request head is already valid");
+
+    *clone.headers_mut() = request.headers().clone();
+    clone.extensions().extend(request.extensions());
+    clone.extensions().insert(TargetHttpVersion(version));
+    clone
+}
+
+fn is_protocol_negotiation_failure(error: &dyn Display) -> bool {
+    let error = error.to_string().to_ascii_lowercase();
+
+    [
+        "targethttpversion incompatible",
+        "http/2 handshake",
+        "h2 handshake",
+        "unsupported http version",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+fn adapt_http10_response(mut response: Response) -> Response {
+    response.headers_mut().remove("content-length");
+    response.headers_mut().remove("transfer-encoding");
+    response.headers_mut().remove("trailer");
+
+    response
+        .headers_mut()
+        .insert("connection", HeaderValue::from_static("close"));
+
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    *response.body_mut() = Body::new(Http10ResponseBody::new(body));
+    response
+}
+
+struct Http10ResponseBody {
+    inner: Body,
+    terminal: bool,
+}
+
+impl Http10ResponseBody {
+    const fn new(inner: Body) -> Self {
+        Self {
+            inner,
+            terminal: false,
+        }
+    }
+}
+
+impl StreamingBody for Http10ResponseBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        loop {
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+
+                Poll::Ready(None) => {
+                    self.terminal = true;
+                    return Poll::Ready(None);
+                }
+
+                Poll::Ready(Some(Err(error))) => {
+                    self.terminal = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => return Poll::Ready(Some(Ok(Frame::data(data)))),
+                    Err(frame) => {
+                        if frame.into_trailers().is_ok() {
+                            continue;
+                        }
+
+                        self.terminal = true;
+                        return Poll::Ready(Some(Err(BoxError::from_static_str(
+                            "HTTP body frame has unknown type",
+                        ))));
+                    }
+                },
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminal
+    }
+
+    fn size_hint(&self) -> rama_http::body::SizeHint {
+        rama_http::body::SizeHint::default()
+    }
 }
 
 fn is_websocket_upgrade_request(request: &Request) -> bool {
@@ -933,9 +1144,11 @@ struct SemanticRequestBody {
 impl SemanticRequestBody {
     fn new(inner: Body, mut semantic: BoundedRequestBody) -> Self {
         let terminal = inner.is_end_stream();
+
         if terminal {
             let _ = semantic.finish();
         }
+
         Self {
             inner,
             semantic,
@@ -961,16 +1174,19 @@ impl StreamingBody for SemanticRequestBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Pending => Poll::Pending,
+
             Poll::Ready(None) => {
                 self.finish(RequestTerminal::Complete);
                 Poll::Ready(None)
             }
+
             Poll::Ready(Some(Err(error))) => {
                 self.finish(RequestTerminal::Error(TerminalError::Transport(
                     error.to_string().into_boxed_str(),
                 )));
                 Poll::Ready(Some(Err(error)))
             }
+
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
                     for chunk in data.chunks(SEMANTIC_BODY_CHUNK_BYTES) {
@@ -1074,16 +1290,19 @@ impl StreamingBody for SemanticResponseBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Pending => Poll::Pending,
+
             Poll::Ready(None) => {
                 self.finish(ResponseEvent::Complete);
                 Poll::Ready(None)
             }
+
             Poll::Ready(Some(Err(error))) => {
                 self.finish(ResponseEvent::Error(TerminalError::Transport(
                     error.to_string().into_boxed_str(),
                 )));
                 Poll::Ready(Some(Err(error)))
             }
+
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
                     if let Err(error) = record_response_event(
@@ -1152,9 +1371,11 @@ impl Drop for SemanticResponseBody {
 
 fn semantic_headers_from_map(headers: &HeaderMap) -> Result<SemanticHeaders, BoxError> {
     let mut semantic = SemanticHeaders::new();
+
     for (name, value) in headers {
         semantic.try_push(name.as_str(), value.as_bytes())?;
     }
+
     Ok(semantic)
 }
 
@@ -1171,12 +1392,15 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
 fn semantic_response_headers(headers: &HeaderMap) -> Result<SemanticHeaders, BoxError> {
     let connection_tokens = connection_tokens(headers);
     let mut semantic = SemanticHeaders::new();
+
     for (name, value) in headers {
         if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
             continue;
         }
+
         semantic.try_push(name.as_str(), value.as_bytes())?;
     }
+
     Ok(semantic)
 }
 
@@ -1185,6 +1409,7 @@ fn record_response_event(
     event: ResponseEvent,
 ) -> Result<(), BoxError> {
     sequence.push(event)?;
+
     sequence
         .pop_event()
         .ok_or_else(|| BoxError::from_static_str("semantic response event was not queued"))
@@ -1195,6 +1420,7 @@ fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
     if response.status().as_u16() < 200 || is_websocket_upgrade_response(&response) {
         return Ok(response);
     }
+
     let headers = semantic_response_headers(response.headers())?;
     let head = ResponseHead::final_head(response.status().as_u16(), headers)?;
     let body = std::mem::replace(response.body_mut(), Body::empty());
@@ -1205,17 +1431,21 @@ fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
 fn semantic_request_headers(request: &Request) -> Result<SemanticHeaders, BoxError> {
     let connection_tokens = connection_tokens(request.headers());
     let mut headers = SemanticHeaders::new();
+
     for (name, value) in request.headers() {
         if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
             continue;
         }
+
         headers.try_push(name.as_str(), value.as_bytes())?;
     }
+
     Ok(headers)
 }
 
 fn is_hop_by_hop_header(name: &str, connection_tokens: &[String]) -> bool {
     let name = name.to_ascii_lowercase();
+
     matches!(
         name.as_str(),
         "connection"
@@ -1251,6 +1481,20 @@ fn blocked_http_request(request: &Request) -> bool {
         return true;
     }
 
+    if request.headers().get("http2-settings").is_some()
+        || request
+            .headers()
+            .get("upgrade")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("h2c"))
+            })
+    {
+        return true;
+    }
+
     ["protocol", ":protocol", "upgrade"].iter().any(|name| {
         request
             .headers()
@@ -1265,8 +1509,9 @@ mod tests {
     use super::{
         Body, BoundedRequestBody, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx,
         SemanticRequestBody, StatusCode, TargetHttpVersion, Version, adapt_response_version,
-        blocked_http_request, bridge_response_body, force_websocket_http11, is_doh_request,
-        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
+        blocked_http_request, bridge_response_body, canonical_http10_origin,
+        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
+        is_websocket_upgrade_response, policy_denied_response, request_head_clone,
         select_ech_config_list, semantic_request_headers, semantic_response_headers,
     };
     use crate::ech_state::EchState;
@@ -1350,11 +1595,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_http10_origin_normalizes_defaults() {
+        assert_eq!(
+            canonical_http10_origin("http://example.com").expect("origin"),
+            "http://example.com:80"
+        );
+
+        assert_eq!(
+            canonical_http10_origin("https://example.com/").expect("origin"),
+            "https://example.com:443"
+        );
+
+        assert!(canonical_http10_origin("http://example.com *").is_err());
+        assert!(canonical_http10_origin("http://example.com/path").is_err());
+    }
+
+    #[test]
     fn semantic_headers_preserve_opaque_values() {
         let mut request = Request::builder()
             .uri("http://localhost/")
             .body(Body::empty())
             .expect("request");
+
         request.headers_mut().insert(
             "x-opaque",
             HeaderValue::from_bytes(&[0x80, b'a']).expect("opaque header"),
@@ -1375,11 +1637,13 @@ mod tests {
             .expect("request");
 
         let headers = semantic_request_headers(&request).expect("semantic headers");
+
         assert!(
             headers.as_slice().iter().all(|header| {
                 !["connection", "x-remove", "keep-alive"].contains(&header.name())
             })
         );
+
         assert!(
             headers
                 .as_slice()
@@ -1408,6 +1672,37 @@ mod tests {
             .expect("test request");
 
         assert!(blocked_http_request(&request));
+    }
+
+    #[test]
+    fn request_head_clone_preserves_h2_protocol() {
+        let request = Request::builder()
+            .method("CONNECT")
+            .body(Body::empty())
+            .expect("test request");
+
+        request
+            .extensions()
+            .insert(rama_http::proto::h2::ext::Protocol::from_static(
+                "websocket",
+            ));
+
+        let clone = request_head_clone(&request, Version::HTTP_11, Body::empty());
+
+        assert_eq!(
+            clone
+                .extensions()
+                .get_ref::<rama_http::proto::h2::ext::Protocol>()
+                .map(rama_http::proto::h2::ext::Protocol::as_str),
+            Some("websocket")
+        );
+        assert_eq!(
+            clone
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .map(|target| target.0),
+            Some(Version::HTTP_11)
+        );
     }
 
     #[test]
@@ -1507,6 +1802,20 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("upgrade")
         );
+    }
+
+    #[test]
+    fn blocks_h2c_upgrade_requests() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://example.com/")
+            .header("connection", "Upgrade, HTTP2-Settings")
+            .header("upgrade", "h2c")
+            .header("http2-settings", "AAMAAABkAAQAAP__")
+            .body(Body::empty())
+            .expect("test request");
+
+        assert!(blocked_http_request(&request));
     }
 
     #[test]
@@ -1614,14 +1923,15 @@ mod tests {
         headers.insert("x-private", HeaderValue::from_static("hidden"));
         headers.insert("keep-alive", HeaderValue::from_static("hidden"));
         headers.insert("x-visible", HeaderValue::from_static("visible"));
-
         let semantic = semantic_response_headers(&headers).expect("response headers");
+
         assert!(
             semantic
                 .as_slice()
                 .iter()
                 .any(|header| { header.name() == "x-visible" && header.value() == b"visible" })
         );
+
         assert!(
             !semantic
                 .as_slice()
@@ -1636,6 +1946,7 @@ mod tests {
             Body::empty(),
             BoundedRequestBody::empty(),
         ));
+
         assert!(body.frame().await.is_none());
     }
 
@@ -1644,6 +1955,7 @@ mod tests {
         let mut trailers = HeaderMap::new();
         trailers.insert("x-request-trailer", HeaderValue::from_static("present"));
         let source = Body::from("request-body").with_trailer_headers(trailers);
+
         let mut body = Body::new(SemanticRequestBody::new(
             source,
             BoundedRequestBody::empty(),
@@ -1656,6 +1968,7 @@ mod tests {
             .expect("data frame result")
             .into_data()
             .expect("data");
+
         assert_eq!(data, "request-body");
 
         let trailers = body
@@ -1665,6 +1978,7 @@ mod tests {
             .expect("trailer frame result")
             .into_trailers()
             .expect("trailers");
+
         assert_eq!(
             trailers
                 .get("x-request-trailer")
@@ -1673,6 +1987,7 @@ mod tests {
                 .expect("trailer value"),
             "present"
         );
+
         assert!(body.frame().await.is_none());
     }
 
@@ -1680,10 +1995,12 @@ mod tests {
     async fn semantic_response_bridge_preserves_data_and_trailers() {
         let mut trailers = HeaderMap::new();
         trailers.insert("x-response-trailer", HeaderValue::from_static("present"));
+
         let response = Response::builder()
             .status(StatusCode::OK)
             .body(Body::from("response-body").with_trailer_headers(trailers))
             .expect("response");
+
         let mut response = bridge_response_body(response).expect("bridge response");
 
         let data = response
@@ -1694,6 +2011,7 @@ mod tests {
             .expect("data frame result")
             .into_data()
             .expect("data");
+
         assert_eq!(data, "response-body");
 
         let trailers = response
@@ -1704,6 +2022,7 @@ mod tests {
             .expect("trailer frame result")
             .into_trailers()
             .expect("trailers");
+
         assert_eq!(
             trailers
                 .get("x-response-trailer")
@@ -1712,6 +2031,7 @@ mod tests {
                 .expect("trailer value"),
             "present"
         );
+
         assert!(response.body_mut().frame().await.is_none());
     }
 

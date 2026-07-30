@@ -48,6 +48,7 @@ impl FakePolicy {
         let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
         let events = Arc::new(Mutex::new(PolicyEvents::default()));
         let task_events = events.clone();
+
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -136,6 +137,7 @@ impl FakePolicy {
                 });
             }
         });
+
         Self {
             socket,
             events,
@@ -163,6 +165,7 @@ impl TcpOrigin {
         let listener = TcpListener::bind(SocketAddr::new(ip, port))
             .await
             .expect("bind TCP origin");
+
         let address = listener.local_addr().expect("origin address");
         let attempts = Arc::new(AtomicUsize::new(0));
         let stream_gate = Arc::new(Notify::new());
@@ -170,6 +173,7 @@ impl TcpOrigin {
         let resets = Arc::new(AtomicUsize::new(0));
         let task_resets = resets.clone();
         let task_attempts = attempts.clone();
+
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -243,6 +247,7 @@ impl TcpOrigin {
                 });
             }
         });
+
         Self {
             address,
             stream_gate,
@@ -269,6 +274,7 @@ async fn start_tls_origin(
 ) -> (TcpOrigin, TlsOrigin) {
     let listener = TcpListener::bind(address).await.expect("bind TLS origin");
     let inner_port = free_port(ip);
+
     let child = Command::new("openssl")
         .args([
             "s_server",
@@ -284,9 +290,11 @@ async fn start_tls_origin(
         .stdout(Stdio::null())
         .spawn()
         .expect("start TLS origin");
+
     wait_for_socket(SocketAddr::new(ip, inner_port)).await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = attempts.clone();
+
     let task = tokio::spawn(async move {
         loop {
             let Ok((mut downstream, _)) = listener.accept().await else {
@@ -299,6 +307,7 @@ async fn start_tls_origin(
             let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
         }
     });
+
     (
         TcpOrigin {
             address,
@@ -323,11 +332,13 @@ impl UdpOrigin {
         let socket = UdpSocket::bind(SocketAddr::new(ip, 0))
             .await
             .expect("bind UDP origin");
+
         let address = socket.local_addr().expect("UDP origin address");
         let attempts = Arc::new(AtomicUsize::new(0));
         let received = Arc::new(Mutex::new(Vec::new()));
         let task_attempts = attempts.clone();
         let task_received = received.clone();
+
         let task = tokio::spawn(async move {
             let mut packet = [0; 2048];
             loop {
@@ -342,6 +353,7 @@ impl UdpOrigin {
                 let _ = socket.send_to(&packet[..size], peer).await;
             }
         });
+
         Self {
             address,
             attempts,
@@ -400,6 +412,7 @@ impl TransparentHarness {
         let origin_cert = ca_cert.clone();
         let origin_key = ca_key.clone();
         let origin_address = SocketAddr::new(ip, origin_port);
+
         let (origin, tls_origin) = if tls {
             let (origin, tls_origin) =
                 start_tls_origin(ip, origin_address, &origin_cert, &origin_key).await;
@@ -410,12 +423,14 @@ impl TransparentHarness {
                 None,
             )
         };
+
         let udp_origin = UdpOrigin::start(ip).await;
         let ready = root.path().join("ready");
         let state = root.path().join("ech");
         let proxy_port = free_port(ip);
         let proxy_address = SocketAddr::new(ip, proxy_port);
         let mut proxy_command = Command::new(env!("CARGO_BIN_EXE_agent-sandbox-proxy"));
+
         proxy_command.args([
             "--policy-socket",
             policy.socket.to_str().expect("policy socket path"),
@@ -430,12 +445,15 @@ impl TransparentHarness {
             "--test-destination",
             &origin.address.to_string(),
         ]);
+
         if tls {
             proxy_command.arg("--test-tls");
         }
+
         if tls_origin.is_some() {
             proxy_command.env("SSL_CERT_FILE", &origin_cert);
         }
+
         let proxy = proxy_command
             .env("AGENT_SANDBOX_PROXY_SESSION_READY", &ready)
             .env("INVOCATION_ID", "0123456789abcdef0123456789abcdef")
@@ -443,7 +461,9 @@ impl TransparentHarness {
             .stderr(Stdio::null())
             .spawn()
             .expect("start proxy");
+
         wait_for_path(&ready).await;
+
         Self {
             proxy_address,
             origin,
@@ -459,19 +479,46 @@ impl TransparentHarness {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
+
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
             self.origin.address.port()
         );
+
         stream
             .write_all(request.as_bytes())
             .await
             .expect("write client request");
+
         let mut response = Vec::new();
+
         stream
             .read_to_end(&mut response)
             .await
             .expect("read client response");
+
+        response
+    }
+
+    pub async fn http10_request(&self, path: &str) -> Vec<u8> {
+        let mut stream = TcpStream::connect(self.proxy_address)
+            .await
+            .expect("connect proxy");
+
+        let request = format!("GET {path} HTTP/1.0\r\nConnection: close\r\n\r\n");
+
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write HTTP/1.0 request");
+
+        let mut response = Vec::new();
+
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read HTTP/1.0 response");
+
         response
     }
 
@@ -479,35 +526,46 @@ impl TransparentHarness {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
+
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
             self.origin.address.port()
         );
+
         stream
             .write_all(request.as_bytes())
             .await
             .expect("write client request");
+
         let mut first = Vec::new();
+
         while !first.ends_with(b"\r\n\r\n") {
             let mut byte = [0; 1];
+
             stream
                 .read_exact(&mut byte)
                 .await
                 .expect("read response header");
+
             first.push(byte[0]);
         }
+
         let mut first_body = [0; 7];
+
         stream
             .read_exact(&mut first_body)
             .await
             .expect("read first response body chunk");
+
         first.extend_from_slice(&first_body);
         self.origin.stream_gate.notify_one();
         let mut rest = Vec::new();
+
         stream
             .read_to_end(&mut rest)
             .await
             .expect("read remaining response");
+
         (first, rest)
     }
 
@@ -515,32 +573,42 @@ impl TransparentHarness {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
+
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
             self.origin.address.port()
         );
+
         stream
             .write_all(request.as_bytes())
             .await
             .expect("write client request");
+
         let mut headers = Vec::new();
+
         while !headers.ends_with(b"\r\n\r\n") {
             let mut byte = [0; 1];
+
             stream
                 .read_exact(&mut byte)
                 .await
                 .expect("read response headers");
+
             headers.push(byte[0]);
         }
+
         let mut first_body = [0; 7];
+
         stream
             .read_exact(&mut first_body)
             .await
             .expect("read first response body chunk");
+
         let linger = libc::linger {
             l_onoff: 1,
             l_linger: 0,
         };
+
         setsockopt(&stream.as_fd(), Linger, &linger).expect("set reset linger");
         drop(stream);
         self.origin.stream_gate.notify_one();
@@ -548,11 +616,13 @@ impl TransparentHarness {
 
     pub fn tls_request(&self, path: &str) -> Vec<u8> {
         let ip = self.proxy_address.ip().to_string();
+
         let endpoint = if self.proxy_address.is_ipv6() {
             format!("[{ip}]:{}", self.proxy_address.port())
         } else {
             format!("{ip}:{}", self.proxy_address.port())
         };
+
         let mut client = Command::new("openssl")
             .args([
                 "s_client",
@@ -567,6 +637,7 @@ impl TransparentHarness {
             .stderr(Stdio::null())
             .spawn()
             .expect("start TLS client");
+
         client
             .stdin
             .take()
@@ -579,6 +650,7 @@ impl TransparentHarness {
                 .as_bytes(),
             )
             .expect("write TLS request");
+
         client
             .wait_with_output()
             .expect("read TLS client response")

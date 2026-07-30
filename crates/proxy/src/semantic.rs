@@ -13,10 +13,13 @@ use std::{collections::VecDeque, fmt};
 pub enum HttpVersion {
     #[serde(rename = "HTTP/1.0")]
     Http10,
+
     #[serde(rename = "HTTP/1.1")]
     Http11,
+
     #[serde(rename = "HTTP/2")]
     Http2,
+
     #[serde(rename = "HTTP/3")]
     Http3,
 }
@@ -56,9 +59,11 @@ impl SemanticHeader {
         V: AsRef<[u8]>,
     {
         let value = value.as_ref();
+
         if name.is_empty() || !name.bytes().all(is_header_name_byte) {
             return Err(HeaderError::InvalidName);
         }
+
         if value.iter().copied().any(is_invalid_header_value_byte) {
             return Err(HeaderError::InvalidValue);
         }
@@ -168,6 +173,7 @@ impl RawQuery {
         {
             return Err(ValueError::InvalidQuery);
         }
+
         Ok(Self(value.into()))
     }
 
@@ -184,6 +190,7 @@ impl TryFrom<String> for RawQuery {
         Self::parse(&value)
     }
 }
+
 impl TryFrom<&str> for RawQuery {
     type Error = ValueError;
 
@@ -290,6 +297,7 @@ impl BoundedRequestBody {
         if max_chunk_bytes == 0 || max_buffered_bytes < max_chunk_bytes {
             return Err(BodyError::InvalidLimit);
         }
+
         Ok(Self {
             chunks: VecDeque::new(),
             buffered_bytes: 0,
@@ -314,12 +322,15 @@ impl BoundedRequestBody {
         if self.terminal.is_some() || self.trailers.is_some() {
             return Err(BodyError::AfterTerminal);
         }
+
         if chunk.len() > self.max_chunk_bytes {
             return Err(BodyError::ChunkTooLarge);
         }
+
         if chunk.len() > self.max_buffered_bytes.saturating_sub(self.buffered_bytes) {
             return Err(BodyError::BufferFull);
         }
+
         self.buffered_bytes += chunk.len();
         self.chunks.push_back(chunk);
         Ok(())
@@ -337,9 +348,11 @@ impl BoundedRequestBody {
         if self.terminal.is_some() {
             return Err(BodyError::AfterTerminal);
         }
+
         if self.trailers.is_some() {
             return Err(BodyError::TrailersAlreadySet);
         }
+
         self.trailers = Some(trailers);
         Ok(())
     }
@@ -356,6 +369,7 @@ impl BoundedRequestBody {
         if self.terminal.is_some() {
             return Err(BodyError::AfterTerminal);
         }
+
         self.terminal = Some(terminal);
         Ok(())
     }
@@ -396,18 +410,23 @@ impl TryFrom<BoundedRequestBodyWire> for BoundedRequestBody {
 
     fn try_from(wire: BoundedRequestBodyWire) -> Result<Self, Self::Error> {
         let mut body = Self::new(wire.max_chunk_bytes, wire.max_buffered_bytes)?;
+
         for chunk in wire.chunks {
             body.push_chunk(chunk)?;
         }
+
         if body.buffered_bytes != wire.buffered_bytes {
             return Err(BodyError::InvalidBufferedBytes);
         }
+
         if let Some(trailers) = wire.trailers {
             body.set_trailers(trailers)?;
         }
+
         if let Some(terminal) = wire.terminal {
             body.terminate(terminal)?;
         }
+
         Ok(body)
     }
 }
@@ -578,6 +597,7 @@ impl TryFrom<SemanticRequestWire> for SemanticRequest {
 
     fn try_from(wire: SemanticRequestWire) -> Result<Self, Self::Error> {
         let expected_path = wire.path;
+
         let request = Self::from_parts(
             wire.method.as_str(),
             wire.scheme.as_str(),
@@ -592,12 +612,15 @@ impl TryFrom<SemanticRequestWire> for SemanticRequest {
             wire.session,
             wire.body,
         )?;
+
         if request.path != expected_path {
             return Err(SemanticRequestError::PathMismatch);
         }
+
         Ok(request)
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "SemanticPathWire")]
 pub struct SemanticPath(SemanticPathValue);
@@ -614,8 +637,10 @@ impl SemanticPath {
             if method != "OPTIONS" {
                 return Err(SemanticRequestError::AsteriskRequiresOptions);
             }
+
             return Ok(Self(SemanticPathValue::Asterisk));
         }
+
         let normalized = agent_sandbox_core::NormalizedHttpPath::parse(value)?;
         Ok(Self(SemanticPathValue::Path(normalized.as_str().into())))
     }
@@ -638,6 +663,7 @@ impl Serialize for SemanticPath {
             SemanticPathValue::Path(value) => {
                 serializer.serialize_newtype_variant("SemanticPath", 0, "Path", value)
             }
+
             SemanticPathValue::Asterisk => {
                 serializer.serialize_unit_variant("SemanticPath", 1, "Asterisk")
             }
@@ -691,6 +717,7 @@ impl ResponseHead {
         if !(100..200).contains(&status) {
             return Err(EventError::InvalidInformationalStatus);
         }
+
         Ok(Self { status, headers })
     }
 
@@ -700,6 +727,7 @@ impl ResponseHead {
         if !(200..1000).contains(&status) {
             return Err(EventError::InvalidFinalStatus);
         }
+
         Ok(Self { status, headers })
     }
 
@@ -737,14 +765,19 @@ impl TryFrom<ResponseHeadWire> for ResponseHead {
 pub enum TerminalError {
     #[error("policy denied request: {0}")]
     PolicyDenied(Box<str>),
+
     #[error("request cancelled")]
     Cancellation,
+
     #[error("stream reset with code {0}")]
     StreamReset(u64),
+
     #[error("transport failure: {0}")]
     Transport(Box<str>),
+
     #[error("protocol violation: {0}")]
     ProtocolViolation(Box<str>),
+
     #[error("upstream refused request: {0}")]
     UpstreamRefused(Box<str>),
 }
@@ -794,6 +827,7 @@ impl ResponseSequence {
         if max_events == 0 {
             return Err(EventError::InvalidLimit);
         }
+
         let mut sequence = Self::new();
         sequence.max_events = max_events;
         sequence.max_body_bytes = max_body_bytes;
@@ -807,21 +841,25 @@ impl ResponseSequence {
         if self.terminal_seen {
             return Err(EventError::AfterTerminal);
         }
+
         if self.events.len() >= self.max_events {
             return Err(EventError::BufferFull);
         }
+
         match &event {
             ResponseEvent::Informational(head) => {
                 if self.final_seen || !(100..200).contains(&head.status()) {
                     return Err(EventError::InvalidOrdering);
                 }
             }
+
             ResponseEvent::Final(head) => {
                 if self.final_seen || !(200..1000).contains(&head.status()) {
                     return Err(EventError::InvalidOrdering);
                 }
                 self.final_seen = true;
             }
+
             ResponseEvent::BodyChunk(chunk) => {
                 if !self.final_seen || self.trailers_seen {
                     return Err(EventError::InvalidOrdering);
@@ -831,31 +869,37 @@ impl ResponseSequence {
                 }
                 self.body_bytes += chunk.len();
             }
+
             ResponseEvent::Trailers(_) => {
                 if !self.final_seen || self.trailers_seen {
                     return Err(EventError::InvalidOrdering);
                 }
                 self.trailers_seen = true;
             }
+
             ResponseEvent::Complete => {
                 if !self.final_seen {
                     return Err(EventError::InvalidOrdering);
                 }
                 self.terminal_seen = true;
             }
+
             ResponseEvent::Cancelled | ResponseEvent::Reset(_) | ResponseEvent::Error(_) => {
                 self.terminal_seen = true;
             }
         }
+
         self.events.push_back(event);
         Ok(())
     }
 
     pub fn pop_event(&mut self) -> Option<ResponseEvent> {
         let event = self.events.pop_front()?;
+
         match &event {
             ResponseEvent::Final(_) => self.consumed_phase = ResponsePhase::Final,
             ResponseEvent::Trailers(_) => self.consumed_phase = ResponsePhase::Trailers,
+
             ResponseEvent::Complete
             | ResponseEvent::Cancelled
             | ResponseEvent::Reset(_)
@@ -867,11 +911,14 @@ impl ResponseSequence {
                     phase => phase,
                 };
             }
+
             ResponseEvent::Informational(_) | ResponseEvent::BodyChunk(_) => {}
         }
+
         if let ResponseEvent::BodyChunk(chunk) = &event {
             self.body_bytes -= chunk.len();
         }
+
         Some(event)
     }
 
@@ -907,8 +954,10 @@ impl TryFrom<ResponseSequenceWire> for ResponseSequence {
             wire.max_events.unwrap_or(1024),
             wire.max_body_bytes.unwrap_or(1024 * 1024),
         )?;
+
         let consumed_phase = wire.consumed_phase.unwrap_or(ResponsePhase::Initial);
         sequence.consumed_phase = consumed_phase;
+
         sequence.final_seen = matches!(
             consumed_phase,
             ResponsePhase::Final
@@ -916,10 +965,12 @@ impl TryFrom<ResponseSequenceWire> for ResponseSequence {
                 | ResponsePhase::TerminalAfterFinal
                 | ResponsePhase::TerminalAfterTrailers
         );
+
         sequence.trailers_seen = matches!(
             consumed_phase,
             ResponsePhase::Trailers | ResponsePhase::TerminalAfterTrailers
         );
+
         sequence.terminal_seen = matches!(
             consumed_phase,
             ResponsePhase::TerminalBeforeFinal
@@ -930,6 +981,7 @@ impl TryFrom<ResponseSequenceWire> for ResponseSequence {
         for event in wire.events {
             sequence.push(event)?;
         }
+
         if wire
             .final_seen
             .is_some_and(|value| value != sequence.final_seen)
@@ -945,6 +997,7 @@ impl TryFrom<ResponseSequenceWire> for ResponseSequence {
         {
             return Err(EventError::InvalidState);
         }
+
         Ok(sequence)
     }
 }
@@ -953,6 +1006,7 @@ impl TryFrom<ResponseSequenceWire> for ResponseSequence {
 pub enum HeaderError {
     #[error("invalid header name")]
     InvalidName,
+
     #[error("invalid header value")]
     InvalidValue,
 }
@@ -961,6 +1015,7 @@ pub enum HeaderError {
 pub enum ValueError {
     #[error("invalid raw query")]
     InvalidQuery,
+
     #[error("session metadata contains an invalid value")]
     InvalidSessionMetadata,
 }
@@ -969,14 +1024,19 @@ pub enum ValueError {
 pub enum BodyError {
     #[error("body limit is invalid")]
     InvalidLimit,
+
     #[error("body chunk exceeds the configured limit")]
     ChunkTooLarge,
+
     #[error("body buffer is full")]
     BufferFull,
+
     #[error("body is already terminal")]
     AfterTerminal,
+
     #[error("request trailers are already set")]
     TrailersAlreadySet,
+
     #[error("body buffered byte count is inconsistent")]
     InvalidBufferedBytes,
 }
@@ -985,10 +1045,13 @@ pub enum BodyError {
 pub enum SemanticRequestError {
     #[error(transparent)]
     Parse(#[from] HttpParseError),
+
     #[error(transparent)]
     Query(#[from] ValueError),
+
     #[error("serialized path does not match raw path normalization")]
     PathMismatch,
+
     #[error("OPTIONS is required for the asterisk request target")]
     AsteriskRequiresOptions,
 }
@@ -997,16 +1060,22 @@ pub enum SemanticRequestError {
 pub enum EventError {
     #[error("response event occurs after a terminal event")]
     AfterTerminal,
+
     #[error("response event is out of order")]
     InvalidOrdering,
+
     #[error("informational status is not in the 1xx range")]
     InvalidInformationalStatus,
+
     #[error("final status is in the 1xx range")]
     InvalidFinalStatus,
+
     #[error("response event limit is invalid")]
     InvalidLimit,
+
     #[error("response event buffer is full")]
     BufferFull,
+
     #[error("response sequence state does not match its events")]
     InvalidState,
 }
@@ -1017,6 +1086,7 @@ fn validate_optional(value: Option<&str>) -> Result<Option<Box<str>>, ValueError
             if value.is_empty() || value.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
                 return Err(ValueError::InvalidSessionMetadata);
             }
+
             Ok(value.into())
         })
         .transpose()
@@ -1028,6 +1098,7 @@ fn canonical_authority(scheme: HttpScheme, authority: &HttpAuthority) -> String 
     } else {
         authority.host().to_string()
     };
+
     if authority.is_default_port(scheme) {
         host
     } else {
@@ -1066,11 +1137,14 @@ mod tests {
             BoundedRequestBody::empty(),
         )
         .expect("valid request");
+
         assert_eq!(
             request.raw_query.as_ref().expect("query").as_str(),
             "x=1&x=2"
         );
+
         assert_eq!(request.path.as_str(), "/b");
+
         assert_eq!(
             request
                 .policy_request()
@@ -1079,6 +1153,7 @@ mod tests {
                 .to_string(),
             "https://example.com/b"
         );
+
         assert_eq!(request.forwarding_target(), "/a/../b?x=1&x=2");
     }
 
@@ -1093,20 +1168,25 @@ mod tests {
     #[test]
     fn response_events_are_ordered_and_terminal() {
         let mut sequence = ResponseSequence::new();
+
         sequence
             .push(ResponseEvent::Informational(
                 ResponseHead::informational(103, SemanticHeaders::new()).expect("1xx"),
             ))
             .expect("info");
+
         sequence
             .push(ResponseEvent::Final(
                 ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
             ))
             .expect("final");
+
         sequence
             .push(ResponseEvent::BodyChunk(vec![1]))
             .expect("body");
+
         sequence.push(ResponseEvent::Complete).expect("complete");
+
         assert_eq!(
             sequence.push(ResponseEvent::BodyChunk(vec![2])),
             Err(EventError::AfterTerminal)
@@ -1116,16 +1196,18 @@ mod tests {
     #[test]
     fn response_sequence_round_trips_and_drains() {
         let mut sequence = ResponseSequence::new();
+
         sequence
             .push(ResponseEvent::Final(
                 ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
             ))
             .expect("final");
+
         sequence
             .push(ResponseEvent::BodyChunk(vec![1]))
             .expect("body");
-        sequence.push(ResponseEvent::Complete).expect("complete");
 
+        sequence.push(ResponseEvent::Complete).expect("complete");
         let encoded = serde_json::to_string(&sequence).expect("wire");
         let mut decoded: ResponseSequence = serde_json::from_str(&encoded).expect("decode");
         assert!(decoded.pop_event().is_some());
@@ -1133,8 +1215,10 @@ mod tests {
         assert!(decoded.pop_event().is_some());
         assert!(decoded.pop_event().is_none());
         let drained = serde_json::to_string(&decoded).expect("drained wire");
+
         let mut restored: ResponseSequence =
             serde_json::from_str(&drained).expect("drained decode");
+
         assert!(restored.pop_event().is_none());
     }
 
@@ -1142,6 +1226,7 @@ mod tests {
     fn invalid_values_are_rejected() {
         assert!(SemanticHeader::new("bad name", "value").is_err());
         assert!(RawQuery::parse("x=1#fragment").is_err());
+
         assert!(
             SemanticRequest::from_parts(
                 "GET",
@@ -1157,20 +1242,25 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(SemanticHeader::new("x-opaque", [0x80, b'a']).is_ok());
     }
+
     #[test]
     fn response_order_rejects_body_before_final_and_second_final() {
         let mut sequence = ResponseSequence::new();
+
         assert_eq!(
             sequence.push(ResponseEvent::BodyChunk(vec![1])),
             Err(EventError::InvalidOrdering)
         );
+
         sequence
             .push(ResponseEvent::Final(
                 ResponseHead::final_head(204, SemanticHeaders::new()).expect("final"),
             ))
             .expect("final");
+
         assert_eq!(
             sequence.push(ResponseEvent::Final(
                 ResponseHead::final_head(205, SemanticHeaders::new()).expect("final")
@@ -1183,10 +1273,12 @@ mod tests {
     fn terminal_errors_are_typed_and_serializable() {
         let error = TerminalError::PolicyDenied("approval required".into());
         let event = ResponseEvent::Error(error.clone());
+
         assert_eq!(
             error.to_string(),
             "policy denied request: approval required"
         );
+
         assert!(
             serde_json::to_string(&event)
                 .expect("wire")
@@ -1204,9 +1296,11 @@ mod tests {
             ResponseEvent::Error(TerminalError::ProtocolViolation("bad frame".into())),
             ResponseEvent::Error(TerminalError::UpstreamRefused("refused".into())),
         ];
+
         for event in events {
             let mut sequence = ResponseSequence::new();
             sequence.push(event).expect("pre-head terminal");
+
             assert_eq!(
                 sequence.push(ResponseEvent::BodyChunk(vec![1])),
                 Err(EventError::AfterTerminal)
@@ -1218,22 +1312,26 @@ mod tests {
     fn request_trailers_and_response_buffers_are_bounded() {
         let mut body = BoundedRequestBody::empty();
         body.set_trailers(SemanticHeaders::new()).expect("trailers");
+
         assert_eq!(
             body.set_trailers(SemanticHeaders::new()),
             Err(BodyError::TrailersAlreadySet)
         );
+
         body.finish().expect("finish");
         assert_eq!(body.push_chunk(vec![1]), Err(BodyError::AfterTerminal));
-
         let mut sequence = ResponseSequence::with_limits(3, 1).expect("limits");
+
         sequence
             .push(ResponseEvent::Final(
                 ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
             ))
             .expect("final");
+
         sequence
             .push(ResponseEvent::BodyChunk(vec![1]))
             .expect("body");
+
         assert_eq!(
             sequence.push(ResponseEvent::BodyChunk(vec![2])),
             Err(EventError::BufferFull)
@@ -1245,11 +1343,14 @@ mod tests {
         assert!(
             serde_json::from_str::<SemanticHeader>(r#"{"name":"bad name","value":"x"}"#).is_err()
         );
+
         assert!(serde_json::from_str::<RawQuery>(r#""x=1#bad""#).is_err());
         assert!(serde_json::from_str::<ResponseHead>(r#"{"status":99,"headers":[]}"#).is_err());
+
         assert!(
             serde_json::from_str::<ResponseSequence>(r#"{"events":[{"BodyChunk":[1]}]}"#).is_err()
         );
+
         assert!(serde_json::from_str::<BoundedRequestBody>(
             r#"{"chunks":[[1,2,3]],"buffered_bytes":3,"max_chunk_bytes":2,"max_buffered_bytes":3}"#
         ).is_err());
@@ -1260,6 +1361,7 @@ mod tests {
         let mut headers = SemanticHeaders::new();
         headers.try_push("X-Test", "one").expect("header");
         headers.try_push("x-test", "two").expect("header");
+
         let request = SemanticRequest::from_parts(
             "GET",
             "http",
@@ -1273,16 +1375,21 @@ mod tests {
             BoundedRequestBody::empty(),
         )
         .expect("request");
+
         let wire = serde_json::to_string(&request).expect("wire");
+
         assert_eq!(
             wire,
             r#"{"method":"GET","scheme":"http","authority":"example.com","path":{"Path":"/"},"raw_path":"/","raw_query":"a=1&b=2","headers":[{"name":"x-test","value":[111,110,101]},{"name":"x-test","value":[116,119,111]}],"source_version":"HTTP/1.1","target_version":"HTTP/1.1","session":null,"body":{"chunks":[],"buffered_bytes":0,"max_chunk_bytes":16384,"max_buffered_bytes":1048576,"trailers":null,"terminal":null}}"#
         );
+
         assert!(wire.contains("\"raw_query\":\"a=1&b=2\""));
+
         let malformed = wire.replace(
             "\"path\":{\"Path\":\"/\"}",
             "\"path\":{\"Path\":\"/wrong\"}",
         );
+
         assert!(serde_json::from_str::<SemanticRequest>(&malformed).is_err());
         assert!(wire.contains("\"path\":{\"Path\":\"/\"}"));
     }
