@@ -79,6 +79,55 @@ async fn transparent_http10_hostless_request_reaches_origin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_reuses_same_origin_pool() {
+    let harness = TransparentHarness::start_keep_alive(loopback(IpVersion::V4), 0).await;
+    let (first, second) = harness.pooled_requests().await;
+    wait_for_release(&harness).await;
+
+    assert!(first.ends_with(b"origin-response"));
+    assert!(second.ends_with(b"origin-response"));
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_websocket_upgrade_reaches_origin() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let response = harness.websocket_request().await;
+    wait_for_release(&harness).await;
+
+    assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols"));
+    assert!(response.ends_with(b"ping"));
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_conflicting_authorities_are_rejected() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+    let request = format!(
+        "GET http://127.0.0.1:{}/allow HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port(),
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write conflicting request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read conflicting response");
+    wait_for_release(&harness).await;
+
+    assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway"));
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_cleartext_http2_prior_knowledge_is_rejected() {
     let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
     let mut stream = TcpStream::connect(harness.proxy_address)

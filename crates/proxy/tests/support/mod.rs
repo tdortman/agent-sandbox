@@ -152,6 +152,37 @@ impl Drop for FakePolicy {
     }
 }
 
+async fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .expect("read response header");
+        response.push(byte[0]);
+    }
+
+    let headers = String::from_utf8_lossy(&response);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then_some(value)
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .expect("response content length");
+    let body_start = response.len();
+    response.resize(body_start + content_length, 0);
+    stream
+        .read_exact(&mut response[body_start..])
+        .await
+        .expect("read response body");
+
+    response
+}
+
 pub struct TcpOrigin {
     pub address: SocketAddr,
     pub stream_gate: Arc<Notify>,
@@ -160,12 +191,126 @@ pub struct TcpOrigin {
     task: Option<JoinHandle<()>>,
 }
 
+async fn serve_tcp_origin_connection(
+    mut stream: TcpStream,
+    body: &'static [u8],
+    keep_alive: bool,
+    stream_gate: Arc<Notify>,
+    stream_resets: Arc<AtomicUsize>,
+) {
+    loop {
+        let mut request = Vec::new();
+        let read_result = timeout(Duration::from_secs(2), async {
+            loop {
+                let mut byte = [0; 1];
+                stream.read_exact(&mut byte).await?;
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            Ok::<_, std::io::Error>(())
+        })
+        .await;
+
+        if !matches!(read_result, Ok(Ok(()))) {
+            break;
+        }
+
+        let websocket = request
+            .windows(b"upgrade: websocket".len())
+            .any(|window| window.eq_ignore_ascii_case(b"upgrade: websocket"));
+
+        if websocket {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Connection: Upgrade\r\n\
+                      Upgrade: websocket\r\n\
+                      Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .await;
+            let mut payload = [0; 4];
+            if stream.read_exact(&mut payload).await.is_ok() {
+                let _ = stream.write_all(&payload).await;
+            }
+            break;
+        }
+
+        let abort_probe = request
+            .windows(b"/stream-abort".len())
+            .any(|window| window == b"/stream-abort");
+        let declared_length = body.len() + usize::from(abort_probe) * 4 * 1024 * 1024;
+        let connection = if keep_alive { "keep-alive" } else { "close" };
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: \
+             {connection}\r\n\r\n"
+        );
+        let _ = stream.write_all(header.as_bytes()).await;
+        let split = body.len() / 2;
+        let _ = stream.write_all(&body[..split]).await;
+        if request
+            .windows(b"/stream".len())
+            .any(|window| window == b"/stream")
+        {
+            stream_gate.notified().await;
+        }
+
+        if let Err(error) = stream.write_all(&body[split..]).await {
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
+            ) {
+                stream_resets.fetch_add(1, Ordering::SeqCst);
+            }
+        } else if abort_probe {
+            let probe = vec![0_u8; 65_536];
+            let probe_error = timeout(Duration::from_secs(2), async {
+                for _ in 0..64 {
+                    if let Err(error) = stream.write_all(&probe).await {
+                        return Some(error.kind());
+                    }
+                }
+                None
+            })
+            .await;
+            if matches!(
+                probe_error,
+                Ok(Some(
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionAborted,
+                ))
+            ) {
+                stream_resets.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        if !keep_alive {
+            break;
+        }
+    }
+}
+
 impl TcpOrigin {
     pub async fn start(ip: IpAddr, port: u16, body: &'static [u8]) -> Self {
+        Self::start_with_keep_alive(ip, port, body, false).await
+    }
+
+    pub async fn start_keep_alive(ip: IpAddr, port: u16, body: &'static [u8]) -> Self {
+        Self::start_with_keep_alive(ip, port, body, true).await
+    }
+
+    async fn start_with_keep_alive(
+        ip: IpAddr,
+        port: u16,
+        body: &'static [u8],
+        keep_alive: bool,
+    ) -> Self {
         let listener = TcpListener::bind(SocketAddr::new(ip, port))
             .await
             .expect("bind TCP origin");
-
         let address = listener.local_addr().expect("origin address");
         let attempts = Arc::new(AtomicUsize::new(0));
         let stream_gate = Arc::new(Notify::new());
@@ -176,75 +321,19 @@ impl TcpOrigin {
 
         let task = tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
                 let stream_resets = task_resets.clone();
                 let stream_gate = task_stream_gate.clone();
                 task_attempts.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    let _ = timeout(Duration::from_secs(2), async {
-                        loop {
-                            let mut byte = [0; 1];
-                            stream.read_exact(&mut byte).await?;
-                            request.push(byte[0]);
-                            if request.ends_with(b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Ok::<_, std::io::Error>(())
-                    })
-                    .await;
-                    let abort_probe = request
-                        .windows(b"/stream-abort".len())
-                        .any(|window| window == b"/stream-abort");
-                    let declared_length = body.len() + usize::from(abort_probe) * 4 * 1024 * 1024;
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: \
-                         close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let split = body.len() / 2;
-                    let _ = stream.write_all(&body[..split]).await;
-                    if request
-                        .windows(b"/stream".len())
-                        .any(|window| window == b"/stream")
-                    {
-                        stream_gate.notified().await;
-                    }
-                    if let Err(error) = stream.write_all(&body[split..]).await {
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::ConnectionReset
-                                | ErrorKind::BrokenPipe
-                                | ErrorKind::ConnectionAborted
-                        ) {
-                            stream_resets.fetch_add(1, Ordering::SeqCst);
-                        }
-                    } else if abort_probe {
-                        let probe = vec![0_u8; 65_536];
-                        let probe_error = timeout(Duration::from_secs(2), async {
-                            for _ in 0..64 {
-                                if let Err(error) = stream.write_all(&probe).await {
-                                    return Some(error.kind());
-                                }
-                            }
-                            None
-                        })
-                        .await;
-                        if matches!(
-                            probe_error,
-                            Ok(Some(
-                                ErrorKind::ConnectionReset
-                                    | ErrorKind::BrokenPipe
-                                    | ErrorKind::ConnectionAborted,
-                            ))
-                        ) {
-                            stream_resets.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                });
+                tokio::spawn(serve_tcp_origin_connection(
+                    stream,
+                    body,
+                    keep_alive,
+                    stream_gate,
+                    stream_resets,
+                ));
             }
         });
 
@@ -394,14 +483,18 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false).await
+        Self::start_inner(ip, origin_port, false, false).await
+    }
+
+    pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
+        Self::start_inner(ip, origin_port, false, true).await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), true).await
+        Self::start_inner(ip, free_port(ip), true, false).await
     }
 
-    async fn start_inner(ip: IpAddr, origin_port: u16, tls: bool) -> Self {
+    async fn start_inner(ip: IpAddr, origin_port: u16, tls: bool, keep_alive: bool) -> Self {
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = FakePolicy::start(root.path());
         let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
@@ -419,7 +512,11 @@ impl TransparentHarness {
             (origin, Some(tls_origin))
         } else {
             (
-                TcpOrigin::start(ip, origin_port, b"origin-response").await,
+                if keep_alive {
+                    TcpOrigin::start_keep_alive(ip, origin_port, b"origin-response").await
+                } else {
+                    TcpOrigin::start(ip, origin_port, b"origin-response").await
+                },
                 None,
             )
         };
@@ -497,6 +594,67 @@ impl TransparentHarness {
             .await
             .expect("read client response");
 
+        response
+    }
+
+    pub async fn pooled_requests(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut stream = TcpStream::connect(self.proxy_address)
+            .await
+            .expect("connect proxy");
+        let host = format!("localhost:{}", self.origin.address.port());
+
+        let first_request = format!("GET /pool-first HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        stream
+            .write_all(first_request.as_bytes())
+            .await
+            .expect("write first pooled request");
+        let first_response = read_http_response(&mut stream).await;
+
+        let second_request = format!("GET /pool-second HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        stream
+            .write_all(second_request.as_bytes())
+            .await
+            .expect("write second pooled request");
+        let second_response = read_http_response(&mut stream).await;
+
+        (first_response, second_response)
+    }
+
+    pub async fn websocket_request(&self) -> Vec<u8> {
+        let mut stream = TcpStream::connect(self.proxy_address)
+            .await
+            .expect("connect proxy");
+        let request = format!(
+            "GET /websocket HTTP/1.1\r\nHost: localhost:{}\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n",
+            self.origin.address.port()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write websocket request");
+
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read websocket response");
+            response.push(byte[0]);
+        }
+
+        stream
+            .write_all(b"ping")
+            .await
+            .expect("write websocket payload");
+        let mut payload = [0; 4];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("read websocket payload");
+        response.extend_from_slice(&payload);
         response
     }
 
