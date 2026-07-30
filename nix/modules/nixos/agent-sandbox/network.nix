@@ -352,15 +352,27 @@ let
 
     text = ''
       set -euo pipefail
-      exec ${sandboxPkg}/bin/agent-sandbox-proxy \
-        --policy-socket ${lib.escapeShellArg runtime.httpProxy.socketPath} \
-        --ca-certificate ${lib.escapeShellArg "${proxyStateDir}/proxy-ca-cert.pem"} \
-        --ca-private-key ${lib.escapeShellArg "${proxyStateDir}/proxy-ca.key"} \
-        --ech-state-dir ${lib.escapeShellArg proxyStateDir} \
-        ${lib.concatMapStringsSep "\n" (
-          url: "        --websocket-http11-url ${lib.escapeShellArg url} \\"
-        ) runtime.httpProxy.websocketHttp11Urls}
-        --listen-port 18080
+      exec ${
+        lib.escapeShellArgs (
+          [
+            "${sandboxPkg}/bin/agent-sandbox-proxy"
+            "--policy-socket"
+            runtime.httpProxy.socketPath
+            "--ca-certificate"
+            "${proxyStateDir}/proxy-ca-cert.pem"
+            "--ca-private-key"
+            "${proxyStateDir}/proxy-ca.key"
+            "--ech-state-dir"
+            proxyStateDir
+            "--listen-port"
+            "18080"
+          ]
+          ++ lib.concatMap (url: [
+            "--websocket-http11-url"
+            url
+          ]) runtime.httpProxy.websocketHttp11Urls
+        )
+      }
     '';
   };
 
