@@ -1,5 +1,6 @@
 pub mod cert;
 pub mod policy;
+pub mod semantic;
 use rama_http::{HeaderName, Response};
 
 pub const ALT_SVC: HeaderName = HeaderName::from_static("alt-svc");

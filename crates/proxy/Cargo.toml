@@ -24,6 +24,7 @@ rama-tls.workspace = true
 rama-tls-boring.workspace = true
 rama-tls-rustls.workspace = true
 rcgen.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio = {
   workspace = true,
@@ -40,6 +41,10 @@ tokio = {
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
