@@ -4,7 +4,8 @@ use agent_sandbox_proxy::{
     cert::CertificateIssuer,
     policy::{PolicySession, authority_for_policy, flow_key, normalize_authority},
     semantic::{
-        BoundedRequestBody, HttpVersion as SemanticHttpVersion, SemanticHeaders, SemanticRequest,
+        BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
+        ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, TerminalError,
     },
     strip_alt_svc,
 };
@@ -13,6 +14,7 @@ use clap::Parser;
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
     Layer, Service,
+    bytes::Bytes,
     error::{BoxError, BoxErrorExt},
     extensions::ExtensionsRef,
     io::Io,
@@ -22,8 +24,8 @@ use rama_core::{
 };
 use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
-    Body, HeaderValue, Request, Response, StatusCode, Version,
-    body::util::BodyExt,
+    Body, HeaderMap, HeaderValue, Request, Response, StatusCode, Version,
+    body::{Frame, StreamingBody, util::BodyExt},
     conn::TargetHttpVersion,
     io::upgrade::OnUpgrade,
     layer::{
@@ -54,7 +56,9 @@ use std::{
     fmt::{self, Display, Formatter},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::sync::{Notify, Semaphore};
@@ -814,6 +818,7 @@ async fn proxy_request(
     let upstream_authority = authority_for_policy(upstream_host, upstream_port);
     let original_uri = request.uri().to_string();
     let target = semantic_request.forwarding_target();
+    let semantic_body = semantic_request.into_body();
     let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
     *request.uri_mut() = uri.parse()?;
 
@@ -822,6 +827,8 @@ async fn proxy_request(
         .insert("host", upstream_authority.parse()?);
 
     force_websocket_http11(&request, &normalized.url, &state.websocket_http11_urls);
+    request = request.map(|body| Body::new(SemanticRequestBody::new(body, semantic_body)));
+
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
     let connector = RequestVersionAdapter::new(connector).with_default_version(Version::HTTP_11);
@@ -845,6 +852,7 @@ async fn proxy_request(
         )
         .await?;
     }
+    response = bridge_response_body(response)?;
 
     info!(
         %original_uri,
@@ -914,15 +922,288 @@ fn request_target(request: &Request) -> String {
     }
 }
 
-fn semantic_request_headers(request: &Request) -> Result<SemanticHeaders, BoxError> {
-    let connection_tokens: Vec<String> = request
-        .headers()
+const SEMANTIC_BODY_CHUNK_BYTES: usize = 16 * 1024;
+
+struct SemanticRequestBody {
+    inner: Body,
+    semantic: BoundedRequestBody,
+    terminal: bool,
+}
+
+impl SemanticRequestBody {
+    fn new(inner: Body, mut semantic: BoundedRequestBody) -> Self {
+        let terminal = inner.is_end_stream();
+        if terminal {
+            let _ = semantic.finish();
+        }
+        Self {
+            inner,
+            semantic,
+            terminal,
+        }
+    }
+
+    fn finish(&mut self, terminal: RequestTerminal) {
+        if !self.terminal {
+            let _ = self.semantic.terminate(terminal);
+            self.terminal = true;
+        }
+    }
+}
+
+impl StreamingBody for SemanticRequestBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.finish(RequestTerminal::Complete);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish(RequestTerminal::Error(TerminalError::Transport(
+                    error.to_string().into_boxed_str(),
+                )));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    for chunk in data.chunks(SEMANTIC_BODY_CHUNK_BYTES) {
+                        if let Err(error) = self.semantic.push_chunk(chunk.to_vec()) {
+                            self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
+                                error.to_string().into_boxed_str(),
+                            )));
+                            return Poll::Ready(Some(Err(Box::new(error))));
+                        }
+                        let _ = self.semantic.pop_chunk();
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(data))))
+                }
+                Err(frame) => {
+                    if let Ok(trailers) = frame.into_trailers() {
+                        let semantic = match semantic_headers_from_map(&trailers) {
+                            Ok(semantic) => semantic,
+                            Err(error) => {
+                                self.finish(RequestTerminal::Error(
+                                    TerminalError::ProtocolViolation(
+                                        error.to_string().into_boxed_str(),
+                                    ),
+                                ));
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        };
+
+                        if let Err(error) = self.semantic.set_trailers(semantic) {
+                            self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
+                                error.to_string().into_boxed_str(),
+                            )));
+                            return Poll::Ready(Some(Err(Box::new(error))));
+                        }
+
+                        Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                    } else {
+                        let error = BoxError::from_static_str("HTTP body frame has unknown type");
+                        self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
+                            error.to_string().into_boxed_str(),
+                        )));
+                        Poll::Ready(Some(Err(error)))
+                    }
+                }
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> rama_http::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for SemanticRequestBody {
+    fn drop(&mut self) {
+        self.finish(RequestTerminal::Cancellation);
+    }
+}
+
+struct SemanticResponseBody {
+    inner: Body,
+    sequence: ResponseSequence,
+    terminal: bool,
+}
+
+impl SemanticResponseBody {
+    fn new(inner: Body, head: ResponseHead) -> Result<Self, BoxError> {
+        let terminal = inner.is_end_stream();
+        let mut sequence = ResponseSequence::new();
+        record_response_event(&mut sequence, ResponseEvent::Final(head))?;
+
+        if terminal {
+            record_response_event(&mut sequence, ResponseEvent::Complete)?;
+        }
+
+        Ok(Self {
+            inner,
+            sequence,
+            terminal,
+        })
+    }
+
+    fn finish(&mut self, event: ResponseEvent) {
+        if !self.terminal {
+            let _ = record_response_event(&mut self.sequence, event);
+            self.terminal = true;
+        }
+    }
+}
+
+impl StreamingBody for SemanticResponseBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.finish(ResponseEvent::Complete);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish(ResponseEvent::Error(TerminalError::Transport(
+                    error.to_string().into_boxed_str(),
+                )));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    if let Err(error) = record_response_event(
+                        &mut self.sequence,
+                        ResponseEvent::BodyChunk(data.to_vec()),
+                    ) {
+                        self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
+                            error.to_string().into_boxed_str(),
+                        )));
+                        return Poll::Ready(Some(Err(error)));
+                    }
+
+                    Poll::Ready(Some(Ok(Frame::data(data))))
+                }
+                Err(frame) => {
+                    if let Ok(trailers) = frame.into_trailers() {
+                        let semantic = match semantic_headers_from_map(&trailers) {
+                            Ok(semantic) => semantic,
+                            Err(error) => {
+                                self.finish(ResponseEvent::Error(
+                                    TerminalError::ProtocolViolation(
+                                        error.to_string().into_boxed_str(),
+                                    ),
+                                ));
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        };
+
+                        if let Err(error) = record_response_event(
+                            &mut self.sequence,
+                            ResponseEvent::Trailers(semantic),
+                        ) {
+                            self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
+                                error.to_string().into_boxed_str(),
+                            )));
+                            return Poll::Ready(Some(Err(error)));
+                        }
+
+                        Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                    } else {
+                        let error = BoxError::from_static_str("HTTP body frame has unknown type");
+                        self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
+                            error.to_string().into_boxed_str(),
+                        )));
+                        Poll::Ready(Some(Err(error)))
+                    }
+                }
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> rama_http::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for SemanticResponseBody {
+    fn drop(&mut self) {
+        self.finish(ResponseEvent::Cancelled);
+    }
+}
+
+fn semantic_headers_from_map(headers: &HeaderMap) -> Result<SemanticHeaders, BoxError> {
+    let mut semantic = SemanticHeaders::new();
+    for (name, value) in headers {
+        semantic.try_push(name.as_str(), value.as_bytes())?;
+    }
+    Ok(semantic)
+}
+
+fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
+    headers
         .get_all("connection")
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .map(|token| token.trim().to_ascii_lowercase())
-        .collect();
+        .collect()
+}
+
+fn semantic_response_headers(headers: &HeaderMap) -> Result<SemanticHeaders, BoxError> {
+    let connection_tokens = connection_tokens(headers);
+    let mut semantic = SemanticHeaders::new();
+    for (name, value) in headers {
+        if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
+            continue;
+        }
+        semantic.try_push(name.as_str(), value.as_bytes())?;
+    }
+    Ok(semantic)
+}
+
+fn record_response_event(
+    sequence: &mut ResponseSequence,
+    event: ResponseEvent,
+) -> Result<(), BoxError> {
+    sequence.push(event)?;
+    sequence
+        .pop_event()
+        .ok_or_else(|| BoxError::from_static_str("semantic response event was not queued"))
+        .map(|_| ())
+}
+
+fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
+    if response.status().as_u16() < 200 || is_websocket_upgrade_response(&response) {
+        return Ok(response);
+    }
+    let headers = semantic_response_headers(response.headers())?;
+    let head = ResponseHead::final_head(response.status().as_u16(), headers)?;
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    *response.body_mut() = Body::new(SemanticResponseBody::new(body, head)?);
+    Ok(response)
+}
+
+fn semantic_request_headers(request: &Request) -> Result<SemanticHeaders, BoxError> {
+    let connection_tokens = connection_tokens(request.headers());
     let mut headers = SemanticHeaders::new();
     for (name, value) in request.headers() {
         if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
@@ -982,11 +1263,11 @@ fn blocked_http_request(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Body, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx, StatusCode,
-        TargetHttpVersion, Version, adapt_response_version, blocked_http_request,
-        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
-        is_websocket_upgrade_response, policy_denied_response, select_ech_config_list,
-        semantic_request_headers,
+        Body, BoundedRequestBody, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx,
+        SemanticRequestBody, StatusCode, TargetHttpVersion, Version, adapt_response_version,
+        blocked_http_request, bridge_response_body, force_websocket_http11, is_doh_request,
+        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
+        select_ech_config_list, semantic_request_headers, semantic_response_headers,
     };
     use crate::ech_state::EchState;
     use rama_core::{
@@ -998,7 +1279,8 @@ mod tests {
         service::service_fn,
     };
     use rama_http::{
-        HeaderValue, Response,
+        HeaderMap, HeaderValue, Response,
+        body::util::BodyExt,
         io::upgrade::{Upgraded, pending},
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
@@ -1323,6 +1605,114 @@ mod tests {
         .expect("read relayed egress bytes");
 
         assert_eq!(&received, b"pong");
+    }
+
+    #[test]
+    fn filters_hop_by_hop_response_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("x-private"));
+        headers.insert("x-private", HeaderValue::from_static("hidden"));
+        headers.insert("keep-alive", HeaderValue::from_static("hidden"));
+        headers.insert("x-visible", HeaderValue::from_static("visible"));
+
+        let semantic = semantic_response_headers(&headers).expect("response headers");
+        assert!(
+            semantic
+                .as_slice()
+                .iter()
+                .any(|header| { header.name() == "x-visible" && header.value() == b"visible" })
+        );
+        assert!(
+            !semantic
+                .as_slice()
+                .iter()
+                .any(|header| header.name() == "x-private")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_semantic_body_finishes_without_frames() {
+        let mut body = Body::new(SemanticRequestBody::new(
+            Body::empty(),
+            BoundedRequestBody::empty(),
+        ));
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_body_bridges_data_and_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-request-trailer", HeaderValue::from_static("present"));
+        let source = Body::from("request-body").with_trailer_headers(trailers);
+        let mut body = Body::new(SemanticRequestBody::new(
+            source,
+            BoundedRequestBody::empty(),
+        ));
+
+        let data = body
+            .frame()
+            .await
+            .expect("data frame")
+            .expect("data frame result")
+            .into_data()
+            .expect("data");
+        assert_eq!(data, "request-body");
+
+        let trailers = body
+            .frame()
+            .await
+            .expect("trailer frame")
+            .expect("trailer frame result")
+            .into_trailers()
+            .expect("trailers");
+        assert_eq!(
+            trailers
+                .get("x-request-trailer")
+                .expect("request trailer")
+                .to_str()
+                .expect("trailer value"),
+            "present"
+        );
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_response_bridge_preserves_data_and_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-response-trailer", HeaderValue::from_static("present"));
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("response-body").with_trailer_headers(trailers))
+            .expect("response");
+        let mut response = bridge_response_body(response).expect("bridge response");
+
+        let data = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("data frame")
+            .expect("data frame result")
+            .into_data()
+            .expect("data");
+        assert_eq!(data, "response-body");
+
+        let trailers = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("trailer frame")
+            .expect("trailer frame result")
+            .into_trailers()
+            .expect("trailers");
+        assert_eq!(
+            trailers
+                .get("x-response-trailer")
+                .expect("response trailer")
+                .to_str()
+                .expect("trailer value"),
+            "present"
+        );
+        assert!(response.body_mut().frame().await.is_none());
     }
 
     #[test]
