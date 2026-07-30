@@ -459,6 +459,7 @@ let
     baseNode
     // (httpServers [
       { port = 8008; }
+      { port = 8080; }
       {
         certificate = "${tlsFixture}/server-cert.pem";
         port = 8443;
@@ -485,6 +486,10 @@ let
               {
                 methods = [ "GET" ];
                 url = "http://169.254.100.1:8008/allowed";
+              }
+              {
+                methods = [ "GET" ];
+                url = "http://169.254.100.1:8080/allowed";
               }
               {
                 methods = [ "GET" ];
@@ -524,6 +529,7 @@ let
 
       networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [
         8008
+        8080
         8443
       ];
     };
@@ -1101,6 +1107,7 @@ let
       print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy"))
       proxy.wait_for_unit("user@1000.service")
       proxy.wait_for_open_port(8008)
+      proxy.wait_for_open_port(8080)
       proxy.wait_for_open_port(8443)
       proxy.succeed("curl --fail --silent -X POST http://127.0.0.1:8008/allowed | grep -q post-ok")
       proxy.succeed("curl --fail --silent http://127.0.0.1:8008/unlisted | grep -q unlisted-get")
@@ -1109,6 +1116,7 @@ let
       print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox"))
       print(proxy.succeed("ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list ruleset"))
       sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed | grep -q allowed-get", wrapper=session_wrapper)
+      sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8080/allowed | grep -q allowed-get", wrapper=session_wrapper)
       sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 https://169.254.100.1:8443/allowed | grep -q allowed-get", wrapper=session_wrapper)
       sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 3 curl --no-buffer --fail --silent --show-error 'http://169.254.100.1:8008/stream?alt=sse' | grep -q 'data: first'", wrapper=session_wrapper)
       sandbox_shell(
