@@ -13,6 +13,15 @@ use std::{
     time::Duration,
 };
 
+/// One claimed intercepted flow and the stable connection identity that owns
+/// the claim. The proxy presents both when it rebinds or releases the
+/// association, so policyd can reject unknown identifiers.
+#[derive(Debug, Clone)]
+pub struct FlowClaim {
+    pub attribution_token: AttributionToken,
+    pub connection_id: ProxyConnectionId,
+}
+
 pub struct PolicySession {
     socket: PathBuf,
     _connection: RpcConnection,
@@ -94,13 +103,14 @@ impl PolicySession {
     /// # Errors
     ///
     /// Returns an error when policyd rejects or cannot identify the flow.
-    pub async fn claim(&self, flow: NetworkFlowKey) -> Result<AttributionToken, PolicyError> {
+    pub async fn claim(&self, flow: NetworkFlowKey) -> Result<FlowClaim, PolicyError> {
+        let connection_id = ProxyConnectionId::new();
         let reply = policy_rpc(
             &self.socket,
             RpcRequest::ClaimNetworkFlow {
                 proxy_session: self.token.clone(),
                 flow,
-                connection_id: ProxyConnectionId::new(),
+                connection_id,
             },
             self.timeout,
         )
@@ -115,11 +125,42 @@ impl PolicySession {
             attribution_token,
         }) = reply
         {
-            Ok(attribution_token)
+            Ok(FlowClaim {
+                attribution_token,
+                connection_id,
+            })
         } else {
             self.clear_session_ready();
             Err(PolicyError::UnexpectedReply("claim_network_flow"))
         }
+    }
+
+    /// Rebind a claimed association to a migrated UDP path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when policyd rejects the attribution, connection
+    /// identifier, owner, tuple, or destination.
+    pub async fn rebind(&self, claim: &FlowClaim, flow: NetworkFlowKey) -> Result<(), PolicyError> {
+        let reply = policy_rpc(
+            &self.socket,
+            RpcRequest::RebindNetworkFlow {
+                proxy_session: self.token.clone(),
+                attribution_token: claim.attribution_token.clone(),
+                connection_id: claim.connection_id,
+                flow,
+            },
+            self.timeout,
+        )
+        .await
+        .map_err(|error| {
+            self.clear_session_ready();
+            PolicyError::Rpc(error.to_string())
+        })?;
+
+        decode_simple_reply(reply, "rebind_network_flow").inspect_err(|_| {
+            self.clear_session_ready();
+        })
     }
 
     /// Ask policyd for a decision on one normalized HTTP request.
@@ -181,13 +222,15 @@ impl PolicySession {
     ///
     /// # Errors
     ///
-    /// Returns an error when the release RPC fails.
-    pub async fn release(&self, attribution_token: AttributionToken) -> Result<(), PolicyError> {
-        policy_rpc(
+    /// Returns an error when the release RPC fails or policyd rejects the
+    /// claim identifier.
+    pub async fn release(&self, claim: &FlowClaim) -> Result<(), PolicyError> {
+        let reply = policy_rpc(
             &self.socket,
             RpcRequest::ReleaseNetworkFlow {
                 proxy_session: self.token.clone(),
-                attribution_token,
+                attribution_token: claim.attribution_token.clone(),
+                connection_id: claim.connection_id,
             },
             self.timeout,
         )
@@ -197,7 +240,9 @@ impl PolicySession {
             PolicyError::Rpc(error.to_string())
         })?;
 
-        Ok(())
+        decode_simple_reply(reply, "release_network_flow").inspect_err(|_| {
+            self.clear_session_ready();
+        })
     }
 
     fn clear_session_ready(&self) {
@@ -210,6 +255,14 @@ impl PolicySession {
 impl Drop for PolicySession {
     fn drop(&mut self) {
         self.clear_session_ready();
+    }
+}
+
+fn decode_simple_reply(reply: RpcReply, operation: &'static str) -> Result<(), PolicyError> {
+    match reply {
+        RpcReply::Simple(ok) if ok.ok => Ok(()),
+        RpcReply::Error(error) => Err(PolicyError::Rpc(error.error)),
+        _ => Err(PolicyError::UnexpectedReply(operation)),
     }
 }
 

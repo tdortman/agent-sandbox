@@ -3,7 +3,7 @@ pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
-    policy::{PolicySession, authority_for_policy, flow_key, normalize_authority},
+    policy::{FlowClaim, PolicySession, authority_for_policy, flow_key, normalize_authority},
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
         ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, TerminalError,
@@ -227,7 +227,7 @@ struct FlowState {
     tls: bool,
     active_checks: Arc<Semaphore>,
     policy: Arc<PolicySession>,
-    attribution_token: agent_sandbox_core::AttributionToken,
+    claim: FlowClaim,
     ech_config_list: Option<Arc<Vec<u8>>>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
     http10_upstream_origins: Arc<Vec<String>>,
@@ -566,14 +566,14 @@ fn build_listener_service(
             info!(%peer, %source, %destination, "accepted transparent proxy stream");
             let flow = flow_key(source, destination)?;
             let upstream_clients = Arc::new(UpstreamClients::new()?);
-            let attribution_token = policy.claim(flow).await?;
+            let claim = policy.claim(flow).await?;
 
             let state = FlowState {
                 destination,
                 tls: test_tls || matches!(destination.port(), 443 | 8443),
                 active_checks: active_checks.clone(),
                 policy: policy.clone(),
-                attribution_token: attribution_token.clone(),
+                claim: claim.clone(),
                 ech_config_list: ech_config_list.clone(),
                 websocket_http11_urls: websocket_http11_urls.clone(),
                 http10_upstream_origins,
@@ -639,7 +639,7 @@ fn build_listener_service(
 
             let service = TlsPeekRouter::new(tls).with_fallback(fallback_http);
             let result = service.serve(stream).await;
-            let release_result = policy.release(attribution_token).await;
+            let release_result = policy.release(&claim).await;
             release_result?;
             result
         }
@@ -888,7 +888,11 @@ async fn check_http_policy(
     let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
 
     let check = tokio::select! {
-        result = state.policy.check_http(request_id, state.attribution_token.clone(), semantic_request.policy_request()?) => result?,
+        result = state.policy.check_http(
+            request_id,
+            state.claim.attribution_token.clone(),
+            semantic_request.policy_request()?,
+        ) => result?,
         () = shutdown.notified() => {
             state.policy.cancel(request_id).await?;
             pending.disarm();

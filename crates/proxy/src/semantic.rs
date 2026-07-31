@@ -4,6 +4,7 @@
 
 use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
+    HttpSessionMetadata as CoreHttpSessionMetadata,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use std::{collections::VecDeque, fmt};
@@ -207,65 +208,11 @@ impl std::str::FromStr for RawQuery {
     }
 }
 
-/// An optional session attribution for extended HTTP sessions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "SessionMetadataWire")]
-pub struct SessionMetadata {
-    kind: Option<Box<str>>,
-    protocol: Option<Box<str>>,
-    target: Option<Box<str>>,
-}
-
-impl SessionMetadata {
-    /// # Errors
-    /// Returns [`ValueError::InvalidSessionMetadata`] for an empty or
-    /// control-containing field.
-    pub fn new(
-        kind: Option<&str>,
-        protocol: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<Self, ValueError> {
-        Ok(Self {
-            kind: validate_optional(kind)?,
-            protocol: validate_optional(protocol)?,
-            target: validate_optional(target)?,
-        })
-    }
-
-    #[must_use]
-    pub fn kind(&self) -> Option<&str> {
-        self.kind.as_deref()
-    }
-
-    #[must_use]
-    pub fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
-    }
-
-    #[must_use]
-    pub fn target(&self) -> Option<&str> {
-        self.target.as_deref()
-    }
-}
-
-#[derive(Deserialize)]
-struct SessionMetadataWire {
-    kind: Option<String>,
-    protocol: Option<String>,
-    target: Option<String>,
-}
-
-impl TryFrom<SessionMetadataWire> for SessionMetadata {
-    type Error = ValueError;
-
-    fn try_from(wire: SessionMetadataWire) -> Result<Self, Self::Error> {
-        Self::new(
-            wire.kind.as_deref(),
-            wire.protocol.as_deref(),
-            wire.target.as_deref(),
-        )
-    }
-}
+/// Optional session attribution for extended HTTP sessions.
+///
+/// The core type owns the wire shape and validation; the semantic request
+/// carries it unchanged into policy requests.
+pub type SessionMetadata = CoreHttpSessionMetadata;
 
 /// Terminal state for a streamed request body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,12 +443,18 @@ impl SemanticRequest {
     ///
     /// Returns [`HttpParseError`] when the normalized policy target is invalid.
     pub fn policy_request(&self) -> Result<CoreHttpRequest, HttpParseError> {
-        CoreHttpRequest::from_parts(
+        let request = CoreHttpRequest::from_parts(
             self.method.as_str(),
             self.scheme.as_str(),
             &self.authority,
             self.path.as_str(),
-        )
+        )?;
+
+        if let Some(session) = &self.session {
+            return Ok(request.with_session(Some(session.clone())));
+        }
+
+        Ok(request)
     }
 
     #[must_use]
@@ -1015,9 +968,6 @@ pub enum HeaderError {
 pub enum ValueError {
     #[error("invalid raw query")]
     InvalidQuery,
-
-    #[error("session metadata contains an invalid value")]
-    InvalidSessionMetadata,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1078,18 +1028,6 @@ pub enum EventError {
 
     #[error("response sequence state does not match its events")]
     InvalidState,
-}
-
-fn validate_optional(value: Option<&str>) -> Result<Option<Box<str>>, ValueError> {
-    value
-        .map(|value| {
-            if value.is_empty() || value.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
-                return Err(ValueError::InvalidSessionMetadata);
-            }
-
-            Ok(value.into())
-        })
-        .transpose()
 }
 
 fn canonical_authority(scheme: HttpScheme, authority: &HttpAuthority) -> String {
