@@ -205,9 +205,61 @@ fn select_upstream_version(
     }
 }
 
+/// Offer `http/1.1` over TLS ALPN for an HTTP/1.0 upstream target.
+///
+/// ALPN has no `http/1.0` token, but the TLS connector derives the offered
+/// ALPN from `TargetHttpVersion` and would offer the invalid `http/1.0`
+/// value. Shadow the target with `HTTP/1.1` during the handshake so the
+/// connector offers `http/1.1`, then restore `HTTP/1.0` afterwards so the
+/// version adapter still sends HTTP/1.0. The newest extension value wins.
+#[derive(Clone, Debug)]
+struct Http10AlpnConnector<S> {
+    inner: S,
+}
+
+impl<S> Http10AlpnConnector<S> {
+    const fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S, C> Service<Request> for Http10AlpnConnector<S>
+where
+    S: Service<Request, Output = EstablishedClientConnection<C, Request>, Error: Into<BoxError>>,
+    C: ExtensionsRef + Send + 'static,
+{
+    type Error = S::Error;
+    type Output = EstablishedClientConnection<C, Request>;
+
+    async fn serve(&self, request: Request) -> Result<Self::Output, Self::Error> {
+        let http10_target = request
+            .extensions()
+            .get_ref::<TargetHttpVersion>()
+            .is_some_and(|target| target.0 == Version::HTTP_10);
+
+        if http10_target {
+            request
+                .extensions()
+                .insert(TargetHttpVersion(Version::HTTP_11));
+        }
+
+        let established = self.inner.serve(request).await?;
+
+        if http10_target {
+            established
+                .input
+                .extensions()
+                .insert(TargetHttpVersion(Version::HTTP_10));
+        }
+
+        Ok(established)
+    }
+}
+
 fn build_upstream_client() -> Result<Arc<dyn UpstreamClient>, BoxError> {
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
+    let connector = Http10AlpnConnector::new(connector);
 
     let connector = rama_http::layer::version_adapter::RequestVersionAdapter::new(connector)
         .with_default_version(Version::HTTP_11);
@@ -299,6 +351,13 @@ pub async fn send_upstream_request(
         .extensions()
         .get_ref::<TargetHttpVersion>()
         .map_or(upstream_version, |target| target.0);
+
+    // Pooled connections skip the version adapter, so the request version
+    // must already match an in-class target. Cross-class translations (h2
+    // extended CONNECT to HTTP/1.1) are left to the adapter.
+    if request.version() <= Version::HTTP_11 && selected_version <= Version::HTTP_11 {
+        *request.version_mut() = selected_version;
+    }
 
     request = request.map(|body| Body::new(SemanticRequestBody::new(body, semantic_body)));
     let source = std::mem::replace(request.body_mut(), Body::empty());
