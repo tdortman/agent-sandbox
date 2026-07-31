@@ -87,6 +87,23 @@ impl ReplayBody {
     }
 }
 
+impl Drop for ReplayBody {
+    fn drop(&mut self) {
+        if self.state.started.load(Ordering::Acquire) {
+            return;
+        }
+
+        let Some(body) = self.inner.take() else {
+            return;
+        };
+
+        let mut shared = self.state.body.lock().expect("replay body lock");
+        if shared.is_none() {
+            *shared = Some(body);
+        }
+    }
+}
+
 impl StreamingBody for ReplayBody {
     type Data = Bytes;
     type Error = BoxError;
@@ -96,7 +113,6 @@ impl StreamingBody for ReplayBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if self.inner.is_none() {
-            self.state.started.store(true, Ordering::Release);
             let body = self.state.body.lock().expect("replay body lock").take();
             self.inner = body;
         }
@@ -105,7 +121,11 @@ impl StreamingBody for ReplayBody {
             return Poll::Ready(None);
         };
 
-        Pin::new(inner).poll_frame(cx)
+        let result = Pin::new(inner).poll_frame(cx);
+        if matches!(&result, Poll::Ready(Some(Ok(_)))) {
+            self.state.started.store(true, Ordering::Release);
+        }
+        result
     }
 
     fn is_end_stream(&self) -> bool {
@@ -273,29 +293,66 @@ pub async fn send_upstream_request(
     request = request.map(|_| Body::new(ReplayBody::new(replay_state.clone())));
     let client = state.upstream_clients.for_version(selected_version);
 
-    let connection = match client.connect(request).await {
-        Ok(connection) => connection,
+    let first_result = match client.connect(request).await {
+        Ok(connection) => connection.send().await,
+        Err(error) => Err(error),
+    };
+
+    let response = match first_result {
+        Ok(response) => response,
         Err(error)
             if retry_request.is_some()
                 && !replay_state.started.load(Ordering::Acquire)
                 && is_protocol_negotiation_failure(&error) =>
         {
-            state
+            let retry_request = retry_request.expect("retry request was checked");
+            let connection = state
                 .upstream_clients
                 .for_version(Version::HTTP_11)
-                .connect(retry_request.expect("retry request was checked"))
-                .await?
+                .connect(retry_request)
+                .await?;
+            connection.send().await?
         }
         Err(error) => return Err(error),
     };
 
-    Ok((connection.send().await?, upstream_authority))
+    Ok((response, upstream_authority))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_protocol_negotiation_failure, select_upstream_version};
-    use rama_http::Version;
+    use super::{
+        ReplayBody, ReplayBodyState, StreamingBody, is_protocol_negotiation_failure,
+        select_upstream_version,
+    };
+    use rama_http::{Body, Version};
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex, atomic::AtomicBool},
+        task::{Context, Poll, Waker},
+    };
+
+    #[test]
+    fn unstarted_replay_body_is_available_for_retry() {
+        let state = Arc::new(ReplayBodyState {
+            body: Mutex::new(None),
+            started: AtomicBool::new(false),
+        });
+        let mut body = ReplayBody {
+            state: state.clone(),
+            inner: Some(Body::empty()),
+        };
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut context),
+            Poll::Ready(None)
+        ));
+
+        drop(body);
+
+        assert!(state.body.lock().expect("replay body lock").is_some());
+    }
 
     #[test]
     fn cleartext_http2_uses_http11_upstream() {
@@ -332,6 +389,7 @@ mod tests {
     #[test]
     fn only_protocol_negotiation_errors_trigger_retry() {
         assert!(is_protocol_negotiation_failure(&"h2 handshake failed"));
+        assert!(is_protocol_negotiation_failure(&"NoApplicationProtocol"));
         assert!(!is_protocol_negotiation_failure(&"upstream policy denied"));
     }
 }

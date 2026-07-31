@@ -996,6 +996,9 @@ fn is_protocol_negotiation_failure(error: &dyn Display) -> bool {
         "targethttpversion incompatible",
         "http/2 handshake",
         "h2 handshake",
+        "no application protocol",
+        "no_application_protocol",
+        "noapplicationprotocol",
         "unsupported http version",
     ]
     .iter()
@@ -1481,20 +1484,6 @@ fn blocked_http_request(request: &Request) -> bool {
         return true;
     }
 
-    if request.headers().get("http2-settings").is_some()
-        || request
-            .headers()
-            .get("upgrade")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("h2c"))
-            })
-    {
-        return true;
-    }
-
     ["protocol", ":protocol", "upgrade"].iter().any(|name| {
         request
             .headers()
@@ -1805,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_h2c_upgrade_requests() {
+    fn allows_h2c_upgrade_requests() {
         let request = Request::builder()
             .method("GET")
             .uri("http://example.com/")
@@ -1815,7 +1804,7 @@ mod tests {
             .body(Body::empty())
             .expect("test request");
 
-        assert!(blocked_http_request(&request));
+        assert!(!blocked_http_request(&request));
     }
 
     #[test]

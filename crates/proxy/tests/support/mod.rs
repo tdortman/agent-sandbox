@@ -369,6 +369,8 @@ async fn start_tls_origin(
             "s_server",
             "-quiet",
             "-www",
+            "-alpn",
+            "http/1.1",
             "-accept",
             &inner_port.to_string(),
             "-cert",

@@ -1,6 +1,16 @@
 #![cfg(debug_assertions)]
 
 mod support;
+use rama_core::{Service, extensions::ExtensionsRef, rt::Executor};
+use rama_http::{Body, Request, StatusCode, Version, body::util::BodyExt, conn::TargetHttpVersion};
+use rama_http_backend::client::HttpConnector;
+use rama_net::{
+    address::{Host, HostWithPort},
+    client::{ConnectorService, ConnectorTarget, EstablishedClientConnection},
+};
+use rama_tcp::client::service::TcpConnector;
+use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
+use rama_tls_boring::client::TlsConnector;
 use std::{sync::atomic::Ordering, time::Duration};
 use support::{IpVersion, TransparentHarness, loopback};
 use tokio::{
@@ -230,6 +240,72 @@ fn transparent_https_allow_reaches_tls_origin() {
         ]);
         drop(events);
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http2_downstream_falls_back_to_http11_upstream() {
+    let harness = TransparentHarness::start_tls(loopback(IpVersion::V4)).await;
+    let origin = format!("https://localhost:{}/allow", harness.origin.address.port());
+    let proxy_target = ConnectorTarget(HostWithPort::new(
+        Host::from(harness.proxy_address.ip()),
+        harness.proxy_address.port(),
+    ));
+
+    let connector = TlsConnector::secure(TcpConnector::default()).with_base_config(
+        TlsClientConfig::default_http().with_server_verify(ServerVerifyMode::Disable),
+    );
+    let connector = rama_http::layer::version_adapter::RequestVersionAdapter::new(connector)
+        .with_default_version(Version::HTTP_11);
+    let client = HttpConnector::new(connector, Executor::default());
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(origin)
+        .version(Version::HTTP_2)
+        .body(Body::empty())
+        .expect("build HTTP/2 request");
+    request.extensions().insert(proxy_target);
+    request
+        .extensions()
+        .insert(TargetHttpVersion(Version::HTTP_2));
+
+    let connection = timeout(Duration::from_secs(5), client.connect(request))
+        .await
+        .expect("connect through proxy timed out")
+        .expect("connect through proxy");
+    let EstablishedClientConnection { input, conn } = connection;
+    let response = timeout(Duration::from_secs(5), conn.serve(input))
+        .await
+        .expect("send HTTP/2 request timed out")
+        .expect("send HTTP/2 request");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "origin attempts: {}",
+        harness.origin.attempts.load(Ordering::SeqCst)
+    );
+    assert_eq!(response.version(), Version::HTTP_2);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("read response body");
+    assert!(
+        body.to_bytes()
+            .windows(b"<html>".len())
+            .any(|window| window.eq_ignore_ascii_case(b"<html>"))
+    );
+    drop(conn);
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 2);
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 1);
+    assert_eq!(events.decisions, [true]);
+    assert_eq!(events.releases, [
+        agent_sandbox_core::AttributionToken::from_bytes([2; 32])
+    ]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
