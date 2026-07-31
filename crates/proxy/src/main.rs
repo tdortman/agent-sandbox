@@ -1543,11 +1543,12 @@ fn blocked_http_request(request: &Request) -> bool {
 mod tests {
     use super::{
         Body, BoundedRequestBody, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx,
-        SemanticRequestBody, StatusCode, TargetHttpVersion, Version, adapt_response_version,
-        blocked_http_request, bridge_response_body, canonical_http10_origin,
-        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
-        is_websocket_upgrade_response, policy_denied_response, request_head_clone,
-        select_ech_config_list, semantic_request_headers, semantic_response_headers,
+        SemanticRequestBody, StatusCode, TargetHttpVersion, Version, adapt_http10_response,
+        adapt_response_version, blocked_http_request, bridge_response_body,
+        canonical_http10_origin, force_websocket_http11, is_doh_request,
+        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
+        request_head_clone, select_ech_config_list, semantic_request_headers,
+        semantic_response_headers,
     };
     use crate::ech_state::EchState;
     use rama_core::{
@@ -2024,6 +2025,45 @@ mod tests {
         );
 
         assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http10_adaptation_removes_framing_and_drops_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-trailer", HeaderValue::from_static("dropped"));
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", "11")
+            .header("transfer-encoding", "chunked")
+            .header("trailer", "x-trailer")
+            .body(Body::from("http10-body").with_trailer_headers(trailers))
+            .expect("response");
+
+        let mut response = adapt_http10_response(response);
+
+        assert!(response.headers().get("content-length").is_none());
+        assert!(response.headers().get("transfer-encoding").is_none());
+        assert!(response.headers().get("trailer").is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get("connection")
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+
+        let data = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("data frame")
+            .expect("data frame result")
+            .into_data()
+            .expect("data");
+
+        assert_eq!(data, "http10-body");
+        assert!(response.body_mut().frame().await.is_none());
     }
 
     #[tokio::test]

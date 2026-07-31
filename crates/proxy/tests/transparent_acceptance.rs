@@ -89,6 +89,29 @@ async fn transparent_http10_hostless_request_reaches_origin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http10_origin_controls_upstream_version() {
+    let harness = TransparentHarness::start_with_http10_origin(loopback(IpVersion::V4), 0).await;
+    let response = harness.request("/allow").await;
+    wait_for_release(&harness).await;
+
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+    assert!(response.ends_with(b"origin-response"));
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
+
+    let heads = harness
+        .origin
+        .request_heads
+        .lock()
+        .expect("request heads lock");
+    let head = heads[0].clone();
+    drop(heads);
+    assert!(
+        head.starts_with("GET /allow HTTP/1.0"),
+        "unexpected upstream request head: {head}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http_reuses_same_origin_pool() {
     let harness = TransparentHarness::start_keep_alive(loopback(IpVersion::V4), 0).await;
     let (first, second) = harness.pooled_requests().await;
@@ -239,6 +262,61 @@ fn transparent_https_allow_reaches_tls_origin() {
             agent_sandbox_core::AttributionToken::from_bytes([2; 32])
         ]);
         drop(events);
+    });
+}
+
+#[test]
+fn transparent_https_http10_hostless_request_uses_sni_authority() {
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+
+    runtime.block_on(async {
+        let harness = TransparentHarness::start_tls(loopback(IpVersion::V4)).await;
+
+        let response = harness.tls_http10_request("/allow");
+        wait_for_release(&harness).await;
+
+        assert!(
+            response
+                .windows(b"HTTP/1.0 200".len())
+                .any(|window| window.eq_ignore_ascii_case(b"HTTP/1.0 200")),
+            "unexpected HTTPS response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
+
+        let events = harness.policy_events();
+        let events = events.lock().expect("policy events lock");
+        assert_eq!(
+            events.checks[0].url.to_string(),
+            format!("https://localhost:{}/allow", harness.origin.address.port())
+        );
+        drop(events);
+    });
+}
+
+#[test]
+fn transparent_https_conflicting_sni_and_host_are_rejected() {
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+
+    runtime.block_on(async {
+        let harness = TransparentHarness::start_tls(loopback(IpVersion::V4)).await;
+
+        let request = format!(
+            "GET /allow HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            harness.origin.address.port()
+        );
+
+        let response = harness.tls_raw_request(&request, Some("localhost"));
+        wait_for_release(&harness).await;
+
+        assert!(
+            response
+                .windows(b"502".len())
+                .any(|window| window == b"502"),
+            "unexpected HTTPS response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
     });
 }
 

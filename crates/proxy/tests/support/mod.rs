@@ -188,6 +188,7 @@ pub struct TcpOrigin {
     pub stream_gate: Arc<Notify>,
     pub attempts: Arc<AtomicUsize>,
     pub resets: Arc<AtomicUsize>,
+    pub request_heads: Arc<Mutex<Vec<String>>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -197,6 +198,7 @@ async fn serve_tcp_origin_connection(
     keep_alive: bool,
     stream_gate: Arc<Notify>,
     stream_resets: Arc<AtomicUsize>,
+    request_heads: Arc<Mutex<Vec<String>>>,
 ) {
     loop {
         let mut request = Vec::new();
@@ -217,6 +219,11 @@ async fn serve_tcp_origin_connection(
         if !matches!(read_result, Ok(Ok(()))) {
             break;
         }
+
+        request_heads
+            .lock()
+            .expect("request heads lock")
+            .push(String::from_utf8_lossy(&request).into_owned());
 
         let websocket = request
             .windows(b"upgrade: websocket".len())
@@ -318,6 +325,8 @@ impl TcpOrigin {
         let resets = Arc::new(AtomicUsize::new(0));
         let task_resets = resets.clone();
         let task_attempts = attempts.clone();
+        let request_heads = Arc::new(Mutex::new(Vec::new()));
+        let task_request_heads = request_heads.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -326,6 +335,7 @@ impl TcpOrigin {
                 };
                 let stream_resets = task_resets.clone();
                 let stream_gate = task_stream_gate.clone();
+                let request_heads = task_request_heads.clone();
                 task_attempts.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(serve_tcp_origin_connection(
                     stream,
@@ -333,6 +343,7 @@ impl TcpOrigin {
                     keep_alive,
                     stream_gate,
                     stream_resets,
+                    request_heads,
                 ));
             }
         });
@@ -342,6 +353,7 @@ impl TcpOrigin {
             stream_gate,
             attempts,
             resets,
+            request_heads,
             task: Some(task),
         }
     }
@@ -405,6 +417,7 @@ async fn start_tls_origin(
             attempts,
             resets: Arc::new(AtomicUsize::new(0)),
             stream_gate: Arc::new(Notify::new()),
+            request_heads: Arc::new(Mutex::new(Vec::new())),
             task: None,
         },
         TlsOrigin { child, task },
@@ -485,18 +498,29 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false).await
+        Self::start_inner(ip, origin_port, false, false, false).await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, true).await
+        Self::start_inner(ip, origin_port, false, true, false).await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), true, false).await
+        Self::start_inner(ip, free_port(ip), true, false, false).await
     }
 
-    async fn start_inner(ip: IpAddr, origin_port: u16, tls: bool, keep_alive: bool) -> Self {
+    /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
+    pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
+        Self::start_inner(ip, origin_port, false, false, true).await
+    }
+
+    async fn start_inner(
+        ip: IpAddr,
+        origin_port: u16,
+        tls: bool,
+        keep_alive: bool,
+        http10_origin: bool,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = FakePolicy::start(root.path());
         let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
@@ -547,6 +571,13 @@ impl TransparentHarness {
 
         if tls {
             proxy_command.arg("--test-tls");
+        }
+
+        if http10_origin {
+            proxy_command.args([
+                "--http10-upstream-origin",
+                &format!("http://localhost:{}", origin.address.port()),
+            ]);
         }
 
         if tls_origin.is_some() {
@@ -774,7 +805,11 @@ impl TransparentHarness {
         self.origin.stream_gate.notify_one();
     }
 
-    pub fn tls_request(&self, path: &str) -> Vec<u8> {
+    /// Send raw bytes over TLS to the proxy and return the client output.
+    ///
+    /// `servername` selects the TLS SNI value, which the proxy treats as the
+    /// verified TLS identity for authority resolution.
+    pub fn tls_raw_request(&self, request: &str, servername: Option<&str>) -> Vec<u8> {
         let ip = self.proxy_address.ip().to_string();
 
         let endpoint = if self.proxy_address.is_ipv6() {
@@ -783,15 +818,21 @@ impl TransparentHarness {
             format!("{ip}:{}", self.proxy_address.port())
         };
 
-        let mut client = Command::new("openssl")
-            .args([
-                "s_client",
-                "-quiet",
-                "-connect",
-                &endpoint,
-                "-CAfile",
-                self.root.path().join("ca.pem").to_str().expect("CA path"),
-            ])
+        let mut command = Command::new("openssl");
+        command.args([
+            "s_client",
+            "-quiet",
+            "-connect",
+            &endpoint,
+            "-CAfile",
+            self.root.path().join("ca.pem").to_str().expect("CA path"),
+        ]);
+
+        if let Some(servername) = servername {
+            command.args(["-servername", servername]);
+        }
+
+        let mut client = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -802,19 +843,26 @@ impl TransparentHarness {
             .stdin
             .take()
             .expect("TLS client stdin")
-            .write_all(
-                format!(
-                    "GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
-                    self.origin.address.port()
-                )
-                .as_bytes(),
-            )
+            .write_all(request.as_bytes())
             .expect("write TLS request");
 
         client
             .wait_with_output()
             .expect("read TLS client response")
             .stdout
+    }
+
+    pub fn tls_request(&self, path: &str) -> Vec<u8> {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            self.origin.address.port()
+        );
+        self.tls_raw_request(&request, None)
+    }
+
+    /// Send a hostless HTTP/1.0 request over TLS with SNI.
+    pub fn tls_http10_request(&self, path: &str) -> Vec<u8> {
+        self.tls_raw_request(&format!("GET {path} HTTP/1.0\r\n\r\n"), Some("localhost"))
     }
 
     pub fn policy_events(&self) -> Arc<Mutex<PolicyEvents>> {
