@@ -592,7 +592,7 @@ let
         basicConstraints=critical,CA:false
         keyUsage=critical,digitalSignature,keyEncipherment
         extendedKeyUsage=serverAuth
-        subjectAltName=IP:169.254.100.1,IP:fd00:dead:beef::1
+        subjectAltName=IP:169.254.100.1
         EOF
 
         openssl x509 -req -sha256 -days 3650 \
