@@ -304,7 +304,7 @@ let
     })
 
     (mkBash "sandbox-proxy-bash" {
-      extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
+      extraPkgs = commonExtraPkgs ++ [ (pkgs.curl.override { http3Support = true; }) ];
     })
   ];
   proxyNode =
@@ -592,7 +592,7 @@ let
         basicConstraints=critical,CA:false
         keyUsage=critical,digitalSignature,keyEncipherment
         extendedKeyUsage=serverAuth
-        subjectAltName=IP:169.254.100.1
+        subjectAltName=IP:169.254.100.1,IP:fd00:dead:beef::1
         EOF
 
         openssl x509 -req -sha256 -days 3650 \
@@ -1222,19 +1222,19 @@ let
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
-          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 https://169.254.100.1:443/allowed | grep -q allowed-get",
+          "curl --http3-only --fail --silent --show-error --max-time 15 https://169.254.100.1:443/allowed | grep -q allowed-get",
           wrapper=session_wrapper,
       )
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
-          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 'https://[fd00:dead:beef::1]:443/allowed' | grep -q allowed-get",
+          "curl --http3-only --fail --silent --show-error --max-time 15 'https://[fd00:dead:beef::1]:443/allowed' | grep -q allowed-get",
           wrapper=session_wrapper,
       )
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
-          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 https://denied.test:443/denied",
+          "curl --http3-only --fail --silent --show-error --max-time 15 https://denied.test:443/denied",
           wrapper=session_wrapper,
           expect_success=False,
       )
