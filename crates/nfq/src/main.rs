@@ -17,17 +17,15 @@ use agent_sandbox_core::{
     OwnerSnapshot, SandboxPaths, lookup_dns_cache, mappings_from_response,
     sandbox_session_id_from_pid,
 };
-
 use clap::Parser;
 use nfq_updated::{Queue, Verdict};
-
 use std::{
+    collections::HashMap,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
-
 use tracing::{debug, info, warn};
 
 /// Number of bytes to copy from each queued packet.
@@ -35,6 +33,16 @@ use tracing::{debug, info, warn};
 /// for hickory-proto parsing (CNAME chains and multi-answer responses
 /// routinely exceed the standard Ethernet MTU's 1500-byte segment).
 const COPY_RANGE: u16 = u16::MAX;
+
+/// How long a registered proxy flow stays on the verdict fast path.
+///
+/// QUIC sends its opening burst of datagrams before the first packet's
+/// registration RPC can confirm the conntrack entry, so the burst would
+/// otherwise queue behind the serialised verdict loop.
+const APPROVED_FLOW_TTL: Duration = Duration::from_secs(30);
+
+/// Upper bound for the approved-flow fast path.
+const MAX_APPROVED_FLOWS: usize = 4096;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -130,6 +138,7 @@ struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
+    approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, Instant>>>,
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
     nft_binary: String,
@@ -155,6 +164,7 @@ impl NfqState {
         Self {
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
+            approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path,
             attribution: Arc::new(Mutex::new(attribution::SessionAttribution::load(
                 attribution::SESSION_ATTRIBUTION_PATH,
@@ -597,6 +607,48 @@ const fn proxy_flow_port(protocol: packet::TransportProtocol, port: u16) -> bool
     )
 }
 
+/// Whether this flow was registered recently and can skip the verdict RPCs.
+///
+/// The cache covers the QUIC opening burst: every datagram of a flow is a
+/// policy boundary, but only the first one needs the owner snapshot and the
+/// policyd registration round trip.
+fn is_approved_flow(state: &NfqState, meta: packet::PacketMeta) -> bool {
+    let protocol = match meta.protocol {
+        packet::TransportProtocol::Tcp => FlowProtocol::Tcp,
+        packet::TransportProtocol::Udp => FlowProtocol::Udp,
+    };
+
+    let Ok(flow) = NetworkFlowKey::try_new(
+        protocol,
+        meta.src_ip,
+        meta.src_port,
+        meta.dst_ip,
+        meta.dst_port,
+    ) else {
+        return false;
+    };
+
+    state.approved_flows.lock().is_ok_and(|flows| {
+        flows
+            .get(&flow)
+            .is_some_and(|inserted| inserted.elapsed() < APPROVED_FLOW_TTL)
+    })
+}
+
+/// Remember a registered flow on the verdict fast path, pruning expired
+/// entries so the cache stays bounded.
+fn remember_approved_flow(state: &NfqState, key: &NetworkFlowKey) {
+    let Ok(mut flows) = state.approved_flows.lock() else {
+        return;
+    };
+
+    flows.retain(|_, inserted| inserted.elapsed() < APPROVED_FLOW_TTL);
+
+    if flows.len() < MAX_APPROVED_FLOWS {
+        flows.insert(key.clone(), Instant::now());
+    }
+}
+
 fn register_proxy_flow(
     state: &NfqState,
     meta: packet::PacketMeta,
@@ -646,7 +698,7 @@ fn register_proxy_flow(
     };
 
     let registration = FlowRegistration::new(
-        flow,
+        flow.clone(),
         owner.identity(),
         policy_host,
         FlowContext::new(SandboxPaths::default(), session_id),
@@ -662,6 +714,7 @@ fn register_proxy_flow(
                 dst_port = meta.dst_port,
                 "registered proxy flow"
             );
+            remember_approved_flow(state, &flow);
             Verdict::Accept
         }
 
@@ -753,19 +806,36 @@ where
         return Verdict::Accept;
     }
 
-    // Loopback traffic never traverses the transparent proxy route. Proxy-mode
-    // HTTP(S) flows are registered and accepted here so the proxy can decode
-    // them; all other destinations stay on the ordinary kernel route and are
-    // checked synchronously below.
+    // Loopback traffic never traverses the transparent proxy route. TCP
+    // proxy-mode flows are registered and accepted here so the proxy can
+    // decode them and enforce HTTP policy per request; UDP proxy-mode flows
+    // (HTTP/3) are checked against transport policy and then registered so
+    // the proxy can claim local-destination associations. All other
+    // destinations stay on the ordinary kernel route and are checked
+    // synchronously below.
     let src_pid = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port)
         .map(OwnerSnapshot::pid_value);
 
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
 
-    if state.proxy_mode
+    let tcp_proxy_flow = state.proxy_mode
         && !meta.dst_ip.is_loopback()
-        && proxy_flow_port(meta.protocol, meta.dst_port)
-    {
+        && meta.protocol == packet::TransportProtocol::Tcp
+        && proxy_flow_port(meta.protocol, meta.dst_port);
+
+    let udp_proxy_flow = state.proxy_mode
+        && !meta.dst_ip.is_loopback()
+        && meta.protocol == packet::TransportProtocol::Udp
+        && proxy_flow_port(meta.protocol, meta.dst_port);
+
+    // QUIC sends its opening burst of datagrams before the first packet's
+    // verdict can confirm the flow, so already-registered flows skip the
+    // verdict RPCs entirely.
+    if (tcp_proxy_flow || udp_proxy_flow) && is_approved_flow(state, meta) {
+        return Verdict::Accept;
+    }
+
+    if tcp_proxy_flow {
         let Some(register) = register else {
             warn!("proxy mode has no registration RPC handler");
             return Verdict::Drop;
@@ -774,8 +844,85 @@ where
         return register_proxy_flow(state, meta, register);
     }
 
+    let allowed = match transport_check(
+        state,
+        policy_socket,
+        timeout,
+        meta,
+        src_pid,
+        session_id.as_deref(),
+        check,
+    ) {
+        TransportCheck::Rejected(verdict) => return verdict,
+        TransportCheck::Allowed(destination) => destination,
+    };
+
+    // UDP proxy-mode flows (HTTP/3) cannot be redirected to the transparent
+    // proxy for external destinations: the kernel only supports tproxy in
+    // prerouting, which locally generated packets never traverse, so the
+    // transport check above is the enforcement point for HTTP/3. The flow is
+    // still registered so the proxy can claim associations whose destination
+    // is local to the sandbox.
+    if udp_proxy_flow {
+        let Some(register) = register else {
+            warn!("proxy mode has no registration RPC handler");
+            return Verdict::Drop;
+        };
+
+        return register_proxy_flow(state, meta, register);
+    }
+
+    info!(
+        protocol = meta.protocol.as_str(),
+        host = %allowed.hostname,
+        dst = %allowed.dst_ip,
+        port = meta.dst_port,
+        "accept"
+    );
+
+    Verdict::Accept
+}
+
+/// One allowed destination with the hostname resolved for policy.
+struct AllowedDestination {
+    hostname: String,
+    dst_ip: String,
+}
+
+/// Result of a transport policy check for one packet.
+enum TransportCheck {
+    Rejected(Verdict),
+    Allowed(AllowedDestination),
+}
+
+/// Run the destination policy check for one packet and apply its side
+/// effects.
+///
+/// Approved destinations are recorded in the on-disk bindings cache so later
+/// packets resolve faster.
+fn transport_check<F>(
+    state: &NfqState,
+    policy_socket: &str,
+    timeout: Duration,
+    meta: packet::PacketMeta,
+    src_pid: Option<u32>,
+    session_id: Option<&str>,
+    check: &mut F,
+) -> TransportCheck
+where
+    F: FnMut(
+        &str,
+        &str,
+        &str,
+        u16,
+        packet::TransportProtocol,
+        Option<u32>,
+        &[String],
+        Duration,
+    ) -> std::io::Result<bool>,
+{
     let dst_ip = meta.dst_ip.to_string();
-    let hostname = state.resolve_host_for_session(&dst_ip, session_id.as_deref());
+    let hostname = state.resolve_host_for_session(&dst_ip, session_id);
 
     let aliases = state
         .approved_bindings
@@ -818,7 +965,12 @@ where
 
         // Add a transient nft reject element so the client fails fast instead
         // of hanging. Falls back to Drop if nft add fails.
-        return nft_reject_and_repeat(&state.nft_binary, meta.dst_ip, meta.dst_port, meta.protocol);
+        return TransportCheck::Rejected(nft_reject_and_repeat(
+            &state.nft_binary,
+            meta.dst_ip,
+            meta.dst_port,
+            meta.protocol,
+        ));
     }
 
     if let Ok(mut bindings) = state.approved_bindings.lock() {
@@ -826,15 +978,7 @@ where
         let _ = bindings.save();
     }
 
-    info!(
-        protocol = meta.protocol.as_str(),
-        host = %hostname,
-        dst = %dst_ip,
-        port = meta.dst_port,
-        "accept"
-    );
-
-    Verdict::Accept
+    TransportCheck::Allowed(AllowedDestination { hostname, dst_ip })
 }
 
 /// Production wrapper: calls `policy::check_destination` via the tokio runtime.
@@ -890,12 +1034,10 @@ fn handle_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType, rdata::A},
     };
-
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         os::unix::process::ExitStatusExt,
@@ -934,6 +1076,7 @@ mod tests {
             approved_bindings: Arc::new(std::sync::Mutex::new(ApprovedBindings::load(
                 &approved_bindings_path,
             ))),
+            approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
@@ -1122,6 +1265,232 @@ mod tests {
         );
 
         assert_eq!(registration.policy_host.to_string(), "example.test");
+    }
+
+    #[test]
+    fn proxy_mode_udp_flow_is_transport_checked_then_registered() {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
+
+        let client_addr = socket.local_addr().expect("socket address");
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
+
+        state.nft_binary = "true".to_string();
+        let mut packet = build_udp_data_packet(443);
+
+        packet[12..16].copy_from_slice(
+            &client_addr
+                .ip()
+                .to_string()
+                .parse::<Ipv4Addr>()
+                .expect("IPv4 client")
+                .octets(),
+        );
+
+        packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
+        let check_count = std::cell::Cell::new(0_u32);
+        let mut seen_hostname = None;
+
+        let mut check = |socket: &str,
+                         hostname: &str,
+                         _: &str,
+                         dst_port: u16,
+                         protocol: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            seen_hostname = Some(hostname.to_owned());
+            assert_eq!(socket, "");
+            assert_eq!(hostname, "example.test");
+            assert_eq!(dst_port, 443);
+            assert_eq!(protocol, packet::TransportProtocol::Udp);
+            Ok(true)
+        };
+
+        let registration = std::cell::RefCell::new(None);
+
+        let mut register = |flow: FlowRegistration| {
+            assert_eq!(
+                check_count.get(),
+                1,
+                "transport check must run before UDP proxy registration"
+            );
+
+            *registration.borrow_mut() = Some(flow);
+            Ok(true)
+        };
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(verdict, Verdict::Accept);
+        assert_eq!(check_count.get(), 1);
+        assert_eq!(seen_hostname.as_deref(), Some("example.test"));
+
+        let registration = registration
+            .into_inner()
+            .expect("UDP proxy flow must register after approval");
+
+        assert_eq!(registration.flow.protocol, FlowProtocol::Udp);
+        assert_eq!(registration.flow.source_ip, client_addr.ip());
+        assert_eq!(
+            registration.flow.destination_ip,
+            "93.184.216.34".parse::<Ipv4Addr>().expect("valid IPv4")
+        );
+    }
+
+    #[test]
+    fn proxy_mode_udp_flow_fast_path_skips_verdict_rpcs() {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
+
+        let client_addr = socket.local_addr().expect("socket address");
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+        state.nft_binary = "true".to_string();
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
+
+        let mut packet = build_udp_data_packet(443);
+
+        packet[12..16].copy_from_slice(
+            &client_addr
+                .ip()
+                .to_string()
+                .parse::<Ipv4Addr>()
+                .expect("IPv4 client")
+                .octets(),
+        );
+
+        packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
+        let check_count = std::cell::Cell::new(0_u32);
+        let registration_count = std::cell::Cell::new(0_u32);
+
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            Ok(true)
+        };
+
+        let mut register = |_: FlowRegistration| {
+            registration_count.set(registration_count.get() + 1);
+            Ok(true)
+        };
+
+        // First packet of the flow: transport check plus registration.
+        let first = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(first, Verdict::Accept);
+        assert_eq!(check_count.get(), 1);
+        assert_eq!(registration_count.get(), 1);
+
+        // QUIC opening burst: the same flow skips both RPCs on the fast path.
+        let second = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(second, Verdict::Accept);
+        assert_eq!(check_count.get(), 1);
+        assert_eq!(registration_count.get(), 1);
+    }
+
+    #[test]
+    fn proxy_mode_udp_flow_rejects_before_registration() {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
+
+        let client_addr = socket.local_addr().expect("socket address");
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "denied.test", DEFAULT_MAX_TTL);
+
+        state.nft_binary = "true".to_string();
+        let mut packet = build_udp_data_packet(443);
+
+        packet[12..16].copy_from_slice(
+            &client_addr
+                .ip()
+                .to_string()
+                .parse::<Ipv4Addr>()
+                .expect("IPv4 client")
+                .octets(),
+        );
+
+        packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
+        let check_count = std::cell::Cell::new(0_u32);
+        let registration_count = std::cell::Cell::new(0_u32);
+
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            Ok(false)
+        };
+
+        let mut register = |_: FlowRegistration| {
+            registration_count.set(registration_count.get() + 1);
+            Ok(true)
+        };
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(verdict, Verdict::Repeat);
+        assert_eq!(check_count.get(), 1);
+        assert_eq!(
+            registration_count.get(),
+            0,
+            "denied UDP proxy flow must not register"
+        );
     }
 
     #[test]
