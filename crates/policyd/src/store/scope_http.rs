@@ -4,9 +4,7 @@ use super::{
     http::http_context,
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
-
 use crate::{error::PolicydError, wire::ScopeWire};
-
 use agent_sandbox_core::{
     ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
     ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
@@ -45,6 +43,7 @@ fn build_once_keys(
             request: HttpRequest {
                 method,
                 url: target.url.clone(),
+                session: None,
             },
             context: context.clone(),
         })
@@ -315,12 +314,10 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use agent_sandbox_core::{
         HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingHttpId,
         ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, load_policy,
     };
-
     use std::{path::PathBuf, time::Duration};
 
     #[test]
@@ -334,6 +331,7 @@ mod tests {
             request: HttpRequest {
                 method: HttpMethod::parse("GET").expect("valid method"),
                 url: HttpUrl::parse("https://example.com/").expect("valid URL"),
+                session: None,
             },
             context: HttpContextKey {
                 cwd: Some(PathBuf::from("/pending/cwd")),
@@ -390,6 +388,7 @@ mod tests {
             request: HttpRequest {
                 method: HttpMethod::parse("GET").expect("valid method"),
                 url: HttpUrl::parse("https://example.com/").expect("valid URL"),
+                session: None,
             },
             context: HttpContextKey {
                 cwd: Some("/pending/cwd".into()),
@@ -492,6 +491,7 @@ mod tests {
         let request = HttpRequest {
             method: HttpMethod::parse("GET").expect("valid method"),
             url: HttpUrl::parse("https://api.example.com/v1").expect("valid URL"),
+            session: None,
         };
 
         let pending = PendingHttp {

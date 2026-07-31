@@ -2,12 +2,10 @@
 //! proxies.
 
 use crate::hosts::{build_glob, normalize_dns_name};
-
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as DeError, SeqAccess, Visitor},
 };
-
 use std::{fmt, net::IpAddr, num::NonZeroU16};
 use thiserror::Error;
 use url::Url;
@@ -718,11 +716,108 @@ impl<'de> Deserialize<'de> for HttpUrl {
     }
 }
 
+/// Optional session attribution for an extended HTTP session approval.
+///
+/// These fields describe an extended CONNECT session (WebSocket, WebTransport,
+/// or CONNECT-UDP). They are metadata only: policy matching stays on `method`
+/// and `url` and never inspects session values. The type is valid by
+/// construction: values only come from [`Self::new`] or validated wire
+/// deserialization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSessionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+}
+
+impl HttpSessionMetadata {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpParseError::InvalidSessionMetadata`] when any present
+    /// field is empty or contains a control character.
+    pub fn new(
+        kind: Option<&str>,
+        protocol: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<Self, HttpParseError> {
+        Ok(Self {
+            kind: validate_session_value(kind)?,
+            protocol: validate_session_value(protocol)?,
+            target: validate_session_value(target)?,
+        })
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
+    }
+
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+}
+
+impl<'de> Deserialize<'de> for HttpSessionMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            kind: Option<String>,
+
+            #[serde(default)]
+            protocol: Option<String>,
+
+            #[serde(default)]
+            target: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.kind.as_deref(),
+            wire.protocol.as_deref(),
+            wire.target.as_deref(),
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+fn validate_session_value(value: Option<&str>) -> Result<Option<String>, HttpParseError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    if value.is_empty() || value.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
+        return Err(HttpParseError::InvalidSessionMetadata);
+    }
+
+    Ok(Some(value.to_owned()))
+}
+
 /// One observed HTTP request. Query strings are intentionally outside policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url: HttpUrl,
+
+    /// Optional extended-session attribution carried for approval and UI use.
+    pub session: Option<HttpSessionMetadata>,
 }
 
 impl Serialize for HttpRequest {
@@ -734,11 +829,15 @@ impl Serialize for HttpRequest {
         struct Wire<'a> {
             method: &'a HttpMethod,
             url: &'a HttpUrl,
+
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session: Option<&'a HttpSessionMetadata>,
         }
 
         Wire {
             method: &self.method,
             url: &self.url,
+            session: self.session.as_ref(),
         }
         .serialize(serializer)
     }
@@ -753,10 +852,13 @@ impl<'de> Deserialize<'de> for HttpRequest {
         struct Wire {
             method: HttpMethod,
             url: HttpUrl,
+
+            #[serde(default)]
+            session: Option<HttpSessionMetadata>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::validate(wire.method, wire.url).map_err(D::Error::custom)
+        Self::validate(wire.method, wire.url, wire.session).map_err(D::Error::custom)
     }
 }
 
@@ -774,7 +876,7 @@ impl HttpRequest {
     ) -> Result<Self, HttpParseError> {
         let method = HttpMethod::parse(method)?;
         let url = HttpUrl::from_parts(scheme, authority, path_or_target)?;
-        Self::validate(method, url)
+        Self::validate(method, url, None)
     }
 
     ///
@@ -785,15 +887,32 @@ impl HttpRequest {
     pub fn parse_absolute(method: &str, raw_url: &str) -> Result<Self, HttpParseError> {
         let method = HttpMethod::parse(method)?;
         let url = HttpUrl::parse_request_absolute(raw_url)?;
-        Self::validate(method, url)
+        Self::validate(method, url, None)
     }
 
-    fn validate(method: HttpMethod, url: HttpUrl) -> Result<Self, HttpParseError> {
+    /// Attach session metadata to an existing request.
+    ///
+    /// The metadata type is valid by construction, so this cannot fail.
+    #[must_use]
+    pub fn with_session(mut self, session: Option<HttpSessionMetadata>) -> Self {
+        self.session = session;
+        self
+    }
+
+    fn validate(
+        method: HttpMethod,
+        url: HttpUrl,
+        session: Option<HttpSessionMetadata>,
+    ) -> Result<Self, HttpParseError> {
         if matches!(url.target, HttpTarget::Asterisk) && method.as_str() != "OPTIONS" {
             return Err(HttpParseError::AsteriskRequiresOptions);
         }
 
-        Ok(Self { method, url })
+        Ok(Self {
+            method,
+            url,
+            session,
+        })
     }
 }
 
@@ -1045,6 +1164,9 @@ pub enum HttpParseError {
 
     #[error("OPTIONS is required for the HTTP asterisk target")]
     AsteriskRequiresOptions,
+
+    #[error("session metadata contains an invalid value")]
+    InvalidSessionMetadata,
 }
 
 fn glob_pattern_for_matching(url: &HttpUrl, pattern: &str) -> String {
@@ -1518,5 +1640,68 @@ mod tests {
         assert!(HttpUrl::parse_pattern("https://example.com/path?query").is_ok());
         assert!(HttpUrl::parse_pattern("https://example.com/path/*?query").is_ok());
         assert!(HttpUrl::parse_pattern("https://example.com/path/*#fragment").is_err());
+    }
+
+    #[test]
+    fn session_metadata_round_trips_optional_fields() {
+        let request = HttpRequest::parse_absolute("CONNECT", "https://example.com/chat")
+            .expect("valid request")
+            .with_session(Some(
+                HttpSessionMetadata::new(
+                    Some("webtransport"),
+                    Some("webtransport"),
+                    Some("example.com:443"),
+                )
+                .expect("valid session metadata"),
+            ));
+
+        let wire = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            wire["session"],
+            serde_json::json!({
+                "kind": "webtransport",
+                "protocol": "webtransport",
+                "target": "example.com:443"
+            })
+        );
+
+        assert_eq!(
+            serde_json::from_value::<HttpRequest>(wire).expect("deserialize request"),
+            request
+        );
+
+        let plain =
+            HttpRequest::parse_absolute("GET", "https://example.com/").expect("valid request");
+        let plain_wire = serde_json::to_value(&plain).expect("serialize plain request");
+        assert!(
+            plain_wire.get("session").is_none(),
+            "absent session metadata must not be serialized"
+        );
+        assert_eq!(
+            serde_json::from_value::<HttpRequest>(plain_wire).expect("deserialize plain request"),
+            plain
+        );
+    }
+
+    #[test]
+    fn session_metadata_rejects_empty_and_control_values() {
+        for (kind, protocol, target) in [
+            (Some(""), None, None),
+            (None, Some("\n"), None),
+            (None, None, Some("bad\u{1}target")),
+        ] {
+            assert!(
+                HttpSessionMetadata::new(kind, protocol, target).is_err(),
+                "invalid session values must be rejected"
+            );
+        }
+
+        let invalid = serde_json::from_str::<HttpRequest>(
+            r#"{"method":"CONNECT","url":"https://example.com/","session":{"kind":"","protocol":null,"target":null}}"#,
+        );
+        assert!(
+            invalid.is_err(),
+            "invalid session wire values must fail closed"
+        );
     }
 }
