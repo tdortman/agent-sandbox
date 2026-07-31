@@ -1473,6 +1473,19 @@ fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, BoxErr
 }
 
 fn blocked_http_request(request: &Request) -> bool {
+    if request
+        .headers()
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("h2c"))
+        })
+    {
+        return true;
+    }
+
     if is_websocket_upgrade_request(request) {
         return false;
     }
@@ -1794,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_h2c_upgrade_requests() {
+    fn rejects_h2c_upgrade_requests() {
         let request = Request::builder()
             .method("GET")
             .uri("http://example.com/")
@@ -1804,7 +1817,7 @@ mod tests {
             .body(Body::empty())
             .expect("test request");
 
-        assert!(!blocked_http_request(&request));
+        assert!(blocked_http_request(&request));
     }
 
     #[test]
