@@ -23,45 +23,21 @@ let
     try-readonly
     unsafe-add-raw-args
     ;
-
-  # Shared static/dynamic base: bind host /dev/pts instead of `--dev /dev` (which tries to
-  # recreate the caller's pts node and fails with --disable-userns). Dynamic mode exposes
-  # the full host filesystem via --bind / / for fanotify approval.
-  mk-agent-sandbox-base =
-    dynamic:
-    compose (
-      lib.optional dynamic (unsafe-add-raw-args "--bind / /")
-      ++ [
-        (unsafe-add-raw-args "--proc /proc")
-        (unsafe-add-raw-args "--tmpfs /dev")
-        (unsafe-add-raw-args "--dev-bind /dev/null /dev/null")
-        (unsafe-add-raw-args "--dev-bind /dev/zero /dev/zero")
-        (unsafe-add-raw-args "--dev-bind /dev/random /dev/random")
-        (unsafe-add-raw-args "--dev-bind /dev/urandom /dev/urandom")
-        (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
-        (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
-        (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
-        (unsafe-add-raw-args "--tmpfs /tmp")
-      ]
-      ++ lib.optionals (!dynamic) [
-        (ro-bind "${pkgs.bash}/bin/sh" "/bin/sh")
-        (add-path "/bin")
-      ]
-      ++ [
-        (add-pkg-deps [
-          pkgs.coreutils
-          pkgs.bash
-        ])
-        (unsafe-add-raw-args "--clearenv")
-        (fwd-env "LANG")
-        (fwd-env "HOME")
-        (fwd-env "TERM")
-      ]
-    );
-
   agent-sandbox-base = mk-agent-sandbox-base false;
   agent-sandbox-dynamic-base = mk-agent-sandbox-base true;
-
+  home-mounts =
+    bindFlag: rels:
+    if rels == [ ] then
+      (s: s)
+    else
+      add-runtime ''
+        realHome=$(readlink -f "$HOME")
+        declare -A _agent_sandbox_canon=()
+        ${mountHomePathFn}
+        ${lib.concatMapStringsSep "\n" (rel: ''
+          mount_home_path "$realHome/${rel}" ${bindFlag}
+        '') rels}
+      '';
   inheritShellEnvRuntime = ''
     declare -A _asbx_bound=()
     _asbx_wants_store=0
@@ -156,7 +132,6 @@ let
       RUNTIME_ARGS+=(--ro-bind /nix/store /nix/store)
     fi
   '';
-
   # Dynamic-FS variant: forward env vars via --setenv but skip all --ro-bind
   # mounts.  The entire host filesystem is already visible via --bind / /,
   # so scanning env vars for paths and rebinding them is both redundant and
@@ -177,16 +152,40 @@ let
       RUNTIME_ARGS+=(--setenv "$_asbx_name" "$_asbx_val")
     done < <(env -0)
   '';
-
-  rebind-cwd = add-runtime ''
-    if [[ -n "''${PWD:-}" && -d "$PWD" ]]; then
-      _asbx_cwd_root=$(readlink -f "$PWD" 2>/dev/null) || _asbx_cwd_root=""
-      if [[ -n "$_asbx_cwd_root" ]]; then
-        RUNTIME_ARGS+=(--bind "$_asbx_cwd_root" "$_asbx_cwd_root")
-      fi
-    fi
-  '';
-
+  # Shared static/dynamic base: bind host /dev/pts instead of `--dev /dev` (which tries to
+  # recreate the caller's pts node and fails with --disable-userns). Dynamic mode exposes
+  # the full host filesystem via --bind / / for fanotify approval.
+  mk-agent-sandbox-base =
+    dynamic:
+    compose (
+      lib.optional dynamic (unsafe-add-raw-args "--bind / /")
+      ++ [
+        (unsafe-add-raw-args "--proc /proc")
+        (unsafe-add-raw-args "--tmpfs /dev")
+        (unsafe-add-raw-args "--dev-bind /dev/null /dev/null")
+        (unsafe-add-raw-args "--dev-bind /dev/zero /dev/zero")
+        (unsafe-add-raw-args "--dev-bind /dev/random /dev/random")
+        (unsafe-add-raw-args "--dev-bind /dev/urandom /dev/urandom")
+        (unsafe-add-raw-args "--dev-bind /dev/full /dev/full")
+        (unsafe-add-raw-args "--dev-bind /dev/pts /dev/pts")
+        (unsafe-add-raw-args "--dev-bind /dev/tty /dev/tty")
+        (unsafe-add-raw-args "--tmpfs /tmp")
+      ]
+      ++ lib.optionals (!dynamic) [
+        (ro-bind "${pkgs.bash}/bin/sh" "/bin/sh")
+        (add-path "/bin")
+      ]
+      ++ [
+        (add-pkg-deps [
+          pkgs.coreutils
+          pkgs.bash
+        ])
+        (unsafe-add-raw-args "--clearenv")
+        (fwd-env "LANG")
+        (fwd-env "HOME")
+        (fwd-env "TERM")
+      ]
+    );
   # Shared bash: mount path at $hostPath, follow symlinks (chezmoi → dotfiles),
   # exposing each resolved target at its real path (read-only).
   mountHomePathFn = ''
@@ -222,21 +221,14 @@ let
       fi
     }
   '';
-
-  home-mounts =
-    bindFlag: rels:
-    if rels == [ ] then
-      (s: s)
-    else
-      add-runtime ''
-        realHome=$(readlink -f "$HOME")
-        declare -A _agent_sandbox_canon=()
-        ${mountHomePathFn}
-        ${lib.concatMapStringsSep "\n" (rel: ''
-          mount_home_path "$realHome/${rel}" ${bindFlag}
-        '') rels}
-      '';
-
+  rebind-cwd = add-runtime ''
+    if [[ -n "''${PWD:-}" && -d "$PWD" ]]; then
+      _asbx_cwd_root=$(readlink -f "$PWD" 2>/dev/null) || _asbx_cwd_root=""
+      if [[ -n "$_asbx_cwd_root" ]]; then
+        RUNTIME_ARGS+=(--bind "$_asbx_cwd_root" "$_asbx_cwd_root")
+      fi
+    fi
+  '';
   restrictedNet =
     dynamic:
     include-once "agent-sandbox-restricted-net" (

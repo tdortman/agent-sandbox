@@ -6,27 +6,11 @@
   ...
 }:
 let
-  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
-
-  rootCfg = config.agent-sandbox;
+  agentSandboxLib = import ./lib.nix {
+    inherit lib;
+    inherit (flake) jail-nix;
+  };
   cfg = config.agent-sandbox.network;
-
-  httpRuleJson =
-    rule:
-    assert lib.assertMsg
-      (
-        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
-        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
-      )
-      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
-    {
-      inherit (rule) url;
-      methods = if rule.allMethods then [ ] else rule.methods;
-    }
-    // lib.optionalAttrs (rule.comment != null) {
-      inherit (rule) comment;
-    };
-
   dbusRuleJson =
     rule:
     {
@@ -51,41 +35,93 @@ let
     // lib.optionalAttrs (rule.comment != null) {
       inherit (rule) comment;
     };
-
-  policyEnabled =
-    cfg.enable
-    || rootCfg.policy.dbus.enable
-    || rootCfg.sudoPolicy == "approve"
-    || rootCfg.gates.filesystem.enable;
-
-  sandboxPkg = flake.package "agent-sandbox";
-
-  agentSandboxLib = import ./lib.nix {
-    inherit lib;
-    inherit (flake) jail-nix;
-  };
-
-  runtime = agentSandboxLib.mkRuntime { inherit rootCfg; };
-
   dnsTargetHost =
     let
       parts = lib.splitString ":" runtime.dnsForwardTarget;
     in
     if builtins.length parts > 1 then builtins.elemAt parts 0 else runtime.dnsForwardTarget;
+  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
+  hostNatPkg = mkNetnsLauncher {
+    name = "agent-sandbox-host-nat";
 
-  # forwards raw DNS queries to the configured upstream resolver and writes
-  # IP->hostname mappings to a shared cache for NFQUEUE prompts.
-  resolvConfText = ''
-    nameserver ${runtime.hostIp}
-    options edns0 trust-ad
-  '';
+    runtimeInputs = [
+      pkgs.nftables
+      pkgs.procps # sysctl
+    ];
 
-  # Inside the jail we cannot use nss-resolve (no /run/systemd/resolve). Plain DNS only.
-  nsswitchConfText = ''
-    hosts: files dns
-    networks: files
-  '';
+    script = hostNatScript;
+  };
+  hostNatScript = pkgs.replaceVars ./netns/host-nat.sh {
+    inherit dnsTargetHost;
+    vethHost = runtime.network.vethHost;
+  };
+  httpRuleJson =
+    rule:
+    assert lib.assertMsg
+      (
+        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
+        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
+      )
+      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
+    {
+      inherit (rule) url;
+      methods = if rule.allMethods then [ ] else rule.methods;
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
+  mkNetnsLauncher =
+    {
+      name,
+      runtimeInputs,
+      script,
+    }:
+    pkgs.writeShellApplication {
+      inherit name runtimeInputs;
 
+      text = ''
+        exec ${pkgs.bash}/bin/bash ${script} "$@"
+      '';
+    };
+  netnsDownPkg = mkNetnsLauncher {
+    name = "agent-sandbox-netns-down";
+    runtimeInputs = [ pkgs.iproute2 ];
+    script = netnsDownScript;
+  };
+  netnsDownScript = pkgs.replaceVars ./netns/down.sh {
+    netnsName = runtime.network.netnsName;
+    vethHost = runtime.network.vethHost;
+  };
+  netnsUpPkg = mkNetnsLauncher {
+    name = "agent-sandbox-netns-up";
+
+    runtimeInputs = [
+      hostNatPkg
+      pkgs.coreutils
+      pkgs.iproute2
+      pkgs.nftables
+    ];
+
+    script = netnsUpScript;
+  };
+  netnsUpScript = pkgs.replaceVars ./netns/up.sh {
+    inherit (runtime) hostIp hostIp6;
+    inherit nftRules;
+    hostIp6Cidr = "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}";
+    hostIpCidr = "${runtime.hostIp}/30";
+    hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
+    netnsIp = runtime.network.netnsIp;
+    netnsIp6Cidr = "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}";
+    netnsName = runtime.network.netnsName;
+    vethHost = runtime.network.vethHost;
+    vethNetns = runtime.network.vethNetns;
+  };
+  # These daemons do not execute approved host commands, so they can be
+  # confined without changing the policy daemon's executor namespace.
+  networkDaemonHardening = networkHardening // {
+    NoNewPrivileges = true;
+    ReadWritePaths = [ "/run/agent-sandbox" ];
+  };
   # These daemons do not execute approved host commands, so they can be
   # confined without changing the policy daemon's executor namespace.
   networkHardening = {
@@ -104,14 +140,17 @@ let
 
     RestrictSUIDSGID = true;
   };
-
-  # These daemons do not execute approved host commands, so they can be
-  # confined without changing the policy daemon's executor namespace.
-  networkDaemonHardening = networkHardening // {
-    NoNewPrivileges = true;
-    ReadWritePaths = [ "/run/agent-sandbox" ];
+  # The namespace creator must publish its /run/netns bind mount to PID 1.
+  # Mount/filesystem isolation here would leave only an empty path behind when
+  # the oneshot exits, so keep only restrictions that do not create a private
+  # mount namespace.
+  networkNamespaceSetupHardening = {
+    inherit (networkHardening)
+      LockPersonality
+      RestrictAddressFamilies
+      RestrictSUIDSGID
+      ;
   };
-
   # Setup units retain their existing root capabilities for netlink/nftables
   # operations, but do not need host home directories or a shared /tmp.
   networkSetupHardening = networkHardening // {
@@ -121,19 +160,7 @@ let
       "/var/lib/agent-sandbox"
     ];
   };
-
-  # The namespace creator must publish its /run/netns bind mount to PID 1.
-  # Mount/filesystem isolation here would leave only an empty path behind when
-  # the oneshot exits, so keep only restrictions that do not create a private
-  # mount namespace.
-  networkNamespaceSetupHardening = {
-    inherit (networkHardening)
-      RestrictSUIDSGID
-      LockPersonality
-      RestrictAddressFamilies
-      ;
-  };
-
+  nfqReadyPath = "/run/agent-sandbox/nfq-ready";
   # The DNS forwarder runs on the host and listens on the veth gateway. It
   # forwards raw DNS queries to the upstream resolver (configured via
   # `agent-sandbox.network.dnsForwardTarget`) and writes IP->hostname mappings
@@ -195,108 +222,20 @@ let
       }
     }
   '';
-
-  hostNatScript = pkgs.replaceVars ./netns/host-nat.sh {
-    inherit dnsTargetHost;
-    vethHost = runtime.network.vethHost;
-  };
-
-  mkNetnsLauncher =
-    {
-      name,
-      runtimeInputs,
-      script,
-    }:
-    pkgs.writeShellApplication {
-      inherit name runtimeInputs;
-
-      text = ''
-        exec ${pkgs.bash}/bin/bash ${script} "$@"
-      '';
-    };
-
-  hostNatPkg = mkNetnsLauncher {
-    name = "agent-sandbox-host-nat";
-
-    runtimeInputs = [
-      pkgs.nftables
-      pkgs.procps # sysctl
-    ];
-
-    script = hostNatScript;
-  };
-
-  netnsUpScript = pkgs.replaceVars ./netns/up.sh {
-    inherit (runtime) hostIp hostIp6;
-    inherit nftRules;
-    hostIp6Cidr = "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}";
-    hostIpCidr = "${runtime.hostIp}/30";
-    hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
-    netnsIp = runtime.network.netnsIp;
-    netnsIp6Cidr = "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}";
-    netnsName = runtime.network.netnsName;
-    vethHost = runtime.network.vethHost;
-    vethNetns = runtime.network.vethNetns;
-  };
-
-  netnsUpPkg = mkNetnsLauncher {
-    name = "agent-sandbox-netns-up";
-
-    runtimeInputs = [
-      hostNatPkg
-      pkgs.coreutils
-      pkgs.iproute2
-      pkgs.nftables
-    ];
-
-    script = netnsUpScript;
-  };
-
-  netnsDownScript = pkgs.replaceVars ./netns/down.sh {
-    netnsName = runtime.network.netnsName;
-    vethHost = runtime.network.vethHost;
-  };
-
-  netnsDownPkg = mkNetnsLauncher {
-    name = "agent-sandbox-netns-down";
-    runtimeInputs = [ pkgs.iproute2 ];
-    script = netnsDownScript;
-  };
-
-  proxyStateDir = "/var/lib/agent-sandbox/proxy";
+  # Inside the jail we cannot use nss-resolve (no /run/systemd/resolve). Plain DNS only.
+  nsswitchConfText = ''
+    hosts: files dns
+    networks: files
+  '';
+  policyEnabled =
+    cfg.enable
+    || rootCfg.policy.dbus.enable
+    || rootCfg.sudoPolicy == "approve"
+    || rootCfg.gates.filesystem.enable;
   proxyBundlePath = "/run/agent-sandbox/proxy-ca-bundle.pem";
-  proxyReadyPath = "${proxyStateDir}/proxy-ready";
-  nfqReadyPath = "/run/agent-sandbox/nfq-ready";
-  proxyCidrsPath = "/etc/agent-sandbox/proxy-upstream-cidrs.json";
-  proxyUser = "agent-sandbox-proxy";
-  proxyGroup = "agent-sandbox-proxy";
   proxyCaCertificate = cfg.httpProxy.caCertificateFile;
   proxyCaPrivateKey = cfg.httpProxy.caPrivateKeyFile;
-
-  proxyGroupLookupPkg = pkgs.writeShellApplication {
-    name = "agent-sandbox-proxy-group-gid";
-
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.getent
-      pkgs.glibc.bin
-    ];
-
-    text = builtins.readFile ./proxy-group-gid.sh;
-  };
-
-  proxyInitPkg = pkgs.writeShellApplication {
-    name = "agent-sandbox-proxy-init";
-
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.gnugrep
-      pkgs.openssl
-    ];
-
-    text = builtins.readFile ./proxy-init.sh;
-  };
-
+  proxyCidrsPath = "/etc/agent-sandbox/proxy-upstream-cidrs.json";
   proxyFirewallPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-proxy-firewall";
 
@@ -308,44 +247,29 @@ let
 
     text = builtins.readFile ./proxy-firewall.sh;
   };
-
-  proxyTproxyRoutePkg = pkgs.writeShellApplication {
-    name = "agent-sandbox-proxy-tproxy-route";
+  proxyGroup = "agent-sandbox-proxy";
+  proxyGroupLookupPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-group-gid";
 
     runtimeInputs = [
       pkgs.coreutils
-      pkgs.iproute2
-      pkgs.nftables
-      pkgs.systemd
+      pkgs.getent
+      pkgs.glibc.bin
     ];
 
-    text = builtins.readFile ./proxy-tproxy-route.sh;
+    text = builtins.readFile ./proxy-group-gid.sh;
   };
+  proxyInitPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-init";
 
-  readinessMarkerPkg = pkgs.writeShellApplication {
-    name = "agent-sandbox-readiness-marker";
-    runtimeInputs = [ pkgs.coreutils ];
-    text = builtins.readFile ./readiness-marker.sh;
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.gnugrep
+      pkgs.openssl
+    ];
+
+    text = builtins.readFile ./proxy-init.sh;
   };
-
-  proxyPolicyLauncher = pkgs.writeShellApplication {
-    name = "agent-sandbox-policy-launch";
-    runtimeInputs = [ proxyGroupLookupPkg ];
-
-    text = ''
-      set -euo pipefail
-      proxy_gid="''${AGENT_SANDBOX_PROXY_GID_OVERRIDE:-}"
-      if [[ -z "$proxy_gid" ]]; then
-        proxy_gid="$(${proxyGroupLookupPkg}/bin/agent-sandbox-proxy-group-gid ${lib.escapeShellArg proxyGroup})"
-      fi
-      [[ "$proxy_gid" =~ ^[1-9][0-9]*$ ]] || {
-        echo "agent-sandbox policy: proxy group ID is invalid" >&2
-        exit 1
-      }
-      exec ${sandboxPkg}/bin/agent-sandbox-policyd "$@" --proxy-gid "$proxy_gid"
-    '';
-  };
-
   proxyLaunchPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-proxy-launch";
     runtimeInputs = [ pkgs.coreutils ];
@@ -375,6 +299,52 @@ let
       }
     '';
   };
+  proxyPolicyLauncher = pkgs.writeShellApplication {
+    name = "agent-sandbox-policy-launch";
+    runtimeInputs = [ proxyGroupLookupPkg ];
+
+    text = ''
+      set -euo pipefail
+      proxy_gid="''${AGENT_SANDBOX_PROXY_GID_OVERRIDE:-}"
+      if [[ -z "$proxy_gid" ]]; then
+        proxy_gid="$(${proxyGroupLookupPkg}/bin/agent-sandbox-proxy-group-gid ${lib.escapeShellArg proxyGroup})"
+      fi
+      [[ "$proxy_gid" =~ ^[1-9][0-9]*$ ]] || {
+        echo "agent-sandbox policy: proxy group ID is invalid" >&2
+        exit 1
+      }
+      exec ${sandboxPkg}/bin/agent-sandbox-policyd "$@" --proxy-gid "$proxy_gid"
+    '';
+  };
+  proxyReadyPath = "${proxyStateDir}/proxy-ready";
+  proxyStateDir = "/var/lib/agent-sandbox/proxy";
+  proxyTproxyRoutePkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-proxy-tproxy-route";
+
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.iproute2
+      pkgs.nftables
+      pkgs.systemd
+    ];
+
+    text = builtins.readFile ./proxy-tproxy-route.sh;
+  };
+  proxyUser = "agent-sandbox-proxy";
+  readinessMarkerPkg = pkgs.writeShellApplication {
+    name = "agent-sandbox-readiness-marker";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = builtins.readFile ./readiness-marker.sh;
+  };
+  # forwards raw DNS queries to the configured upstream resolver and writes
+  # IP->hostname mappings to a shared cache for NFQUEUE prompts.
+  resolvConfText = ''
+    nameserver ${runtime.hostIp}
+    options edns0 trust-ad
+  '';
+  rootCfg = config.agent-sandbox;
+  runtime = agentSandboxLib.mkRuntime { inherit rootCfg; };
+  sandboxPkg = flake.package "agent-sandbox";
 
 in
 lib.mkIf policyEnabled (

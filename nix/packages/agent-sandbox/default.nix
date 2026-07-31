@@ -7,8 +7,6 @@
   ...
 }:
 let
-  rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
-
   qtDialog = pkgs.stdenv.mkDerivation {
     src = ./qt-helper;
 
@@ -20,7 +18,7 @@ let
     buildInputs = [ pkgs.qt6.qtbase ];
     name = "agent-sandbox-qt-dialog";
   };
-
+  rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
   src = inputs.self;
   workspacePackage = (fromTOML (builtins.readFile "${src}/Cargo.toml")).workspace.package;
 

@@ -3,178 +3,6 @@
   jail-nix,
 }:
 let
-  policyContextScript = ''
-    # Reuse outer context if already set.
-    if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
-      _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
-    else
-      IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
-    fi
-    if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
-      _agent_sandbox_home="$AGENT_SANDBOX_HOME"
-    else
-      _agent_sandbox_home=$(readlink -f "$HOME")
-    fi
-    if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
-      _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
-    else
-      _agent_sandbox_cwd="$PWD"
-    fi
-    if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
-      _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
-    else
-      _agent_sandbox_project_root="$PWD"
-      if command -v git >/dev/null 2>&1; then
-        _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
-        [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
-      fi
-    fi
-    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
-    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
-    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
-    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
-  '';
-
-  nvidiaSetupScript = bindDevices: ''
-    ${lib.optionalString bindDevices ''
-      for _gpu in /dev/nvidia*; do
-        [[ -e "$_gpu" ]] || continue
-        RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
-      done
-      if [[ -d /dev/nvidia-caps ]]; then
-        for _cap in /dev/nvidia-caps/*; do
-          [[ -e "$_cap" ]] || continue
-          RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
-        done
-      fi
-    ''}
-    if [[ -d /run/opengl-driver/lib ]]; then
-      _asbx_ld="/run/opengl-driver/lib"
-      if [[ -n "''${LD_LIBRARY_PATH:-}" ]]; then
-        case ":$LD_LIBRARY_PATH:" in
-          *":$_asbx_ld:"*) ;;
-          *) _asbx_ld="$_asbx_ld:$LD_LIBRARY_PATH" ;;
-        esac
-      fi
-      RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
-    fi
-  '';
-
-  defaultCommonPkgs =
-    pkgs: with pkgs; [
-      bashInteractive
-      curl
-      wget
-      jq
-      git
-      which
-      ripgrep
-      gnugrep
-      gawkInteractive
-      ps
-      findutils
-      gzip
-      unzip
-      gnutar
-      diffutils
-      gnused
-    ];
-
-  defaultBlockEnvVars = [
-    "AWS_ACCESS_KEY_ID"
-    "AWS_SECRET_ACCESS_KEY"
-    "AWS_SESSION_TOKEN"
-    "GITHUB_TOKEN"
-    "GH_TOKEN"
-    "OPENAI_API_KEY"
-    "ANTHROPIC_API_KEY"
-    "CURSOR_API_KEY"
-    "NIXOS_CONFIG_GITHUB_TOKEN"
-  ];
-
-  defaultRuntimeReadonlyDirs = [
-    "/run/current-system"
-    "/run/opengl-driver"
-    "/run/opengl-driver-32"
-  ];
-
-  # Extra device nodes (agent-sandbox-nvidia-gpu binds the standard NVIDIA set).
-  defaultDevicePaths = [ ];
-
-  isHomeMountPath = path: path == "~" || lib.hasPrefix "~/" path;
-
-  isHostMountPath = path: lib.hasPrefix "/" path;
-
-  homeMountRel = path: if path == "~" then "" else lib.removePrefix "~/" path;
-
-  splitMountPaths =
-    paths:
-    let
-      invalid = lib.filter (p: !isHomeMountPath p && !isHostMountPath p) paths;
-    in
-    if invalid != [ ] then
-      throw ''
-        agent-sandbox: mount paths must start with ~/ or / (for example "~/.agents" or "/run/user/1000").
-        Invalid: ${lib.concatStringsSep ", " (map (p: ''"${p}"'') invalid)}
-      ''
-    else
-      {
-        abs = lib.filter isHostMountPath paths;
-        home = map homeMountRel (lib.filter isHomeMountPath paths);
-      };
-
-  mkRuntime =
-    {
-      rootCfg,
-      netnsEnter ? null,
-    }:
-    let
-      inherit (rootCfg) policy network;
-      policyContext =
-        network.enable
-        || policy.dbus.enable
-        || rootCfg.gates.filesystem.enable
-        || rootCfg.sudoPolicy == "approve";
-    in
-    {
-      inherit policyContext;
-
-      inherit (policy)
-        exportedJson
-        exportedNix
-        interactiveApproval
-        approvalTimeout
-        autoSpawnPolicyUi
-        uiBackend
-        ;
-
-      inherit (network) queueNumber hostIp hostIp6;
-      inherit (network) dnsForwardTarget;
-      inherit (policy) dbus;
-      httpProxy = network.httpProxy or { enable = false; };
-
-      network =
-        if network.enable then
-          {
-            inherit (network)
-              netnsName
-              vethHost
-              vethNetns
-              netnsIp
-              netnsIp6
-              netnsIp6Prefix
-              ;
-
-            inherit netnsEnter;
-          }
-        else
-          null;
-
-      policySocket = policy.socketPath;
-      policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
-      sandboxPolicySocket = policy.sandboxSocketPath;
-    };
-
   buildPermissions =
     c:
     {
@@ -195,26 +23,23 @@ let
       ...
     }@cfg:
     let
-      readonlyDirs' = splitMountPaths readonlyDirs;
-      readwriteDirs' = splitMountPaths readwriteDirs;
-      readonlyFiles' = splitMountPaths readonlyFiles;
-      readwriteFiles' = splitMountPaths readwriteFiles;
-
-      homeReadonly = readonlyDirs'.home ++ readonlyFiles'.home;
-      homeReadwrite = readwriteDirs'.home ++ readwriteFiles'.home;
-
       absReadonly = readonlyDirs'.abs ++ readonlyFiles'.abs;
       absReadwrite = readwriteDirs'.abs ++ readwriteFiles'.abs;
+      homeReadonly = readonlyDirs'.home ++ readonlyFiles'.home;
+      homeReadwrite = readwriteDirs'.home ++ readwriteFiles'.home;
+      # In dynamic-FS mode the full host filesystem is visible via --bind / /.
+      # All bind-mount combinators are redundant and broken (bwrap cannot mkdir
+      # through symlinks on a root-bound tree), so we skip them entirely.
+      inheritShell = if dynamicFs then c.inherit-shell-env-dynamic else c.inherit-shell-env;
+      readonlyDirs' = splitMountPaths readonlyDirs;
+      readonlyFiles' = splitMountPaths readonlyFiles;
+      readwriteDirs' = splitMountPaths readwriteDirs;
+      readwriteFiles' = splitMountPaths readwriteFiles;
       # sudoGuard must be in sandboxPkgs (add-pkg-deps), not only add-runtime PATH:
       # policyd-built shells build PATH from package deps, not the jail launcher exports.
       sandboxPkgs = lib.unique (
         [ cfg.package ] ++ commonPkgs ++ extraPkgs ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
-
-      # In dynamic-FS mode the full host filesystem is visible via --bind / /.
-      # All bind-mount combinators are redundant and broken (bwrap cannot mkdir
-      # through symlinks on a root-bound tree), so we skip them entirely.
-      inheritShell = if dynamicFs then c.inherit-shell-env-dynamic else c.inherit-shell-env;
     in
     with c;
     [
@@ -248,15 +73,176 @@ let
       (unsafe-add-raw-args "--dir /run")
       (unsafe-add-raw-args "--tmpfs /run/wrappers")
     ];
+  defaultBlockEnvVars = [
+    "AWS_ACCESS_KEY_ID"
+    "AWS_SECRET_ACCESS_KEY"
+    "AWS_SESSION_TOKEN"
+    "GITHUB_TOKEN"
+    "GH_TOKEN"
+    "OPENAI_API_KEY"
+    "ANTHROPIC_API_KEY"
+    "CURSOR_API_KEY"
+    "NIXOS_CONFIG_GITHUB_TOKEN"
+  ];
+  defaultCommonPkgs =
+    pkgs: with pkgs; [
+      bashInteractive
+      curl
+      wget
+      jq
+      git
+      which
+      ripgrep
+      gnugrep
+      gawkInteractive
+      ps
+      findutils
+      gzip
+      unzip
+      gnutar
+      diffutils
+      gnused
+    ];
+  # Extra device nodes (agent-sandbox-nvidia-gpu binds the standard NVIDIA set).
+  defaultDevicePaths = [ ];
+  defaultRuntimeReadonlyDirs = [
+    "/run/current-system"
+    "/run/opengl-driver"
+    "/run/opengl-driver-32"
+  ];
+  homeMountRel = path: if path == "~" then "" else lib.removePrefix "~/" path;
+  isHomeMountPath = path: path == "~" || lib.hasPrefix "~/" path;
+  isHostMountPath = path: lib.hasPrefix "/" path;
+  mkRuntime =
+    {
+      rootCfg,
+      netnsEnter ? null,
+    }:
+    let
+      inherit (rootCfg) network policy;
+      policyContext =
+        network.enable
+        || policy.dbus.enable
+        || rootCfg.gates.filesystem.enable
+        || rootCfg.sudoPolicy == "approve";
+    in
+    {
+      inherit policyContext;
+
+      inherit (policy)
+        approvalTimeout
+        autoSpawnPolicyUi
+        exportedJson
+        exportedNix
+        interactiveApproval
+        uiBackend
+        ;
+
+      inherit (network) hostIp hostIp6 queueNumber;
+      inherit (network) dnsForwardTarget;
+      inherit (policy) dbus;
+      httpProxy = network.httpProxy or { enable = false; };
+
+      network =
+        if network.enable then
+          {
+            inherit (network)
+              netnsIp
+              netnsIp6
+              netnsIp6Prefix
+              netnsName
+              vethHost
+              vethNetns
+              ;
+
+            inherit netnsEnter;
+          }
+        else
+          null;
+
+      policySocket = policy.socketPath;
+      policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
+      sandboxPolicySocket = policy.sandboxSocketPath;
+    };
+  nvidiaSetupScript = bindDevices: ''
+    ${lib.optionalString bindDevices ''
+      for _gpu in /dev/nvidia*; do
+        [[ -e "$_gpu" ]] || continue
+        RUNTIME_ARGS+=(--dev-bind "$_gpu" "$_gpu")
+      done
+      if [[ -d /dev/nvidia-caps ]]; then
+        for _cap in /dev/nvidia-caps/*; do
+          [[ -e "$_cap" ]] || continue
+          RUNTIME_ARGS+=(--dev-bind "$_cap" "$_cap")
+        done
+      fi
+    ''}
+    if [[ -d /run/opengl-driver/lib ]]; then
+      _asbx_ld="/run/opengl-driver/lib"
+      if [[ -n "''${LD_LIBRARY_PATH:-}" ]]; then
+        case ":$LD_LIBRARY_PATH:" in
+          *":$_asbx_ld:"*) ;;
+          *) _asbx_ld="$_asbx_ld:$LD_LIBRARY_PATH" ;;
+        esac
+      fi
+      RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
+    fi
+  '';
+  policyContextScript = ''
+    # Reuse outer context if already set.
+    if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
+      _agent_sandbox_session_id="$AGENT_SANDBOX_SESSION_ID"
+    else
+      IFS= read -r _agent_sandbox_session_id < /proc/sys/kernel/random/uuid
+    fi
+    if [[ -n "''${AGENT_SANDBOX_HOME:-}" ]]; then
+      _agent_sandbox_home="$AGENT_SANDBOX_HOME"
+    else
+      _agent_sandbox_home=$(readlink -f "$HOME")
+    fi
+    if [[ -n "''${AGENT_SANDBOX_CWD:-}" ]]; then
+      _agent_sandbox_cwd="$AGENT_SANDBOX_CWD"
+    else
+      _agent_sandbox_cwd="$PWD"
+    fi
+    if [[ -n "''${AGENT_SANDBOX_PROJECT_ROOT:-}" ]]; then
+      _agent_sandbox_project_root="$AGENT_SANDBOX_PROJECT_ROOT"
+    else
+      _agent_sandbox_project_root="$PWD"
+      if command -v git >/dev/null 2>&1; then
+        _git_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || true
+        [[ -n "$_git_root" ]] && _agent_sandbox_project_root="$_git_root"
+      fi
+    fi
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_CWD "$_agent_sandbox_cwd")
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_HOME "$_agent_sandbox_home")
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
+    RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
+  '';
+  splitMountPaths =
+    paths:
+    let
+      invalid = lib.filter (p: !isHomeMountPath p && !isHostMountPath p) paths;
+    in
+    if invalid != [ ] then
+      throw ''
+        agent-sandbox: mount paths must start with ~/ or / (for example "~/.agents" or "/run/user/1000").
+        Invalid: ${lib.concatStringsSep ", " (map (p: ''"${p}"'') invalid)}
+      ''
+    else
+      {
+        abs = lib.filter isHostMountPath paths;
+        home = map homeMountRel (lib.filter isHomeMountPath paths);
+      };
 
 in
 {
   inherit
-    mkRuntime
-    defaultCommonPkgs
     defaultBlockEnvVars
-    defaultRuntimeReadonlyDirs
+    defaultCommonPkgs
     defaultDevicePaths
+    defaultRuntimeReadonlyDirs
+    mkRuntime
     ;
 
   mkWrapPackage =
@@ -291,42 +277,182 @@ in
       unsafeAliasPrefix ? "unsafe-",
     }:
     let
-      binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
-
-      sandboxedName = "sandboxed-${binName}";
-
-      builtinCombinators = (jail-nix.lib.init pkgs).combinators;
-
       agentCombinators = import ./combinators.nix {
-        inherit pkgs lib policyContextScript;
+        inherit lib pkgs policyContextScript;
         nvidiaSetupScript = nvidiaSetupScript true;
       } builtinCombinators;
-
-      # Syscall gate: when wired, prepend `agent-sandbox-syscall-arm --` to
-      # the entry chain. The arm helper installs a seccomp filter inside the
-      # sandbox, then execs its argv tail. The chain is composable with the
-      # fs-arm helper so dynamic-FS and syscall-gate can both be active.
-      syscallGate = syscallArmPkg != null;
-      proxyMode = runtime != null && runtime.httpProxy.enable;
+      binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
+      blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
+      builtinCombinators = (jail-nix.lib.init pkgs).combinators;
+      dbusCleanupScript = lib.optionalString dbusMode ''
+        kill "$_asbx_dbus_pid" 2>/dev/null || true
+        wait "$_asbx_dbus_pid" 2>/dev/null || true
+        rm -rf "$_asbx_dbus_dir"
+      '';
       dbusMode = dbus != null && dbus.enable && dbusProxyPkg != null;
-      freezeNeedsScope = dbusMode || proxyMode;
+      dbusScript = lib.optionalString dbusMode ''
+        _asbx_dbus_root="${dbusSocketDirectory}/''${UID}"
+        mkdir -p "$_asbx_dbus_root"
+        _asbx_dbus_dir="$(mktemp -d "$_asbx_dbus_root/agent-sandbox-dbus.XXXXXX")"
+        _asbx_dbus_socket="$_asbx_dbus_dir/session.sock"
+        _asbx_dbus_upstream=${
+          if dbusUpstreamAddress != null then
+            lib.escapeShellArg dbusUpstreamAddress
+          else
+            ''"''${DBUS_SESSION_BUS_ADDRESS:-}"''
+        }
+        [[ -n "$_asbx_dbus_upstream" ]] || {
+          echo "agent-sandbox D-Bus: DBUS_SESSION_BUS_ADDRESS is unset" >&2
+          rm -rf "$_asbx_dbus_dir"
+          exit 1
+        }
+        ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
+          --listen "$_asbx_dbus_socket" \
+          --upstream-address "$_asbx_dbus_upstream" \
+          --policy-socket ${lib.escapeShellArg policySocket} \
+          --bus session \
+          --cwd "$_agent_sandbox_cwd" \
+          --home "$_agent_sandbox_home" \
+          --project-root "$_agent_sandbox_project_root" \
+          --uid "$UID" \
+          --sandbox-session-id "$_agent_sandbox_session_id" &
+        _asbx_dbus_pid=$!
+        trap '${dbusCleanupScript}' EXIT
+        trap 'exit 143' INT TERM
+        while [[ ! -S "$_asbx_dbus_socket" ]]; do
+          if ! kill -0 "$_asbx_dbus_pid" 2>/dev/null; then
+            wait "$_asbx_dbus_pid" || true
+            echo "agent-sandbox D-Bus: relay failed to start" >&2
+            rm -rf "$_asbx_dbus_dir"
+            exit 1
+          fi
+          sleep 0.01
+        done
+        RUNTIME_ARGS+=(--ro-bind "$_asbx_dbus_dir" "$_asbx_dbus_dir")
+        RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_socket")
+      '';
       dbusSocketDirectory = if dbus != null then dbus.socketDirectory else "/run/user";
       dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;
-      networkMode = if proxyMode then "proxy" else "direct";
+      deviceBindScript = lib.concatMapStringsSep "\n" (path: ''
+        if [[ -e "${path}" ]]; then
+          RUNTIME_ARGS+=(--dev-bind "${path}" "${path}")
+        fi
+      '') devicePaths;
       dnsEndpoint = if runtime != null && runtime.network != null then "${runtime.hostIp}:53" else null;
-      proxyTrustBundle = "/run/agent-sandbox/proxy-ca-bundle.pem";
-      runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
-
+      dnsScript = lib.optionalString hasNetwork ''
+        if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
+          _real_ns=$(readlink -f /etc/nsswitch.conf 2>/dev/null) || _real_ns=""
+          if [[ -n "$_real_ns" ]]; then
+            RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf "$_real_ns")
+          fi
+        fi
+        if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
+          # The resolved symlink target may be inside /run (tmpfs in bwrap).
+          # Write a temp file and bind-mount to the resolved path, creating
+          # the parent directory first so the mount point exists.
+          _asbx_resolv_tmp=$(mktemp)
+          cp /etc/agent-sandbox/resolv.conf "$_asbx_resolv_tmp"
+          _real_resolv=$(readlink -f /etc/resolv.conf 2>/dev/null) || _real_resolv=""
+          if [[ -n "$_real_resolv" ]]; then
+            mkdir -p "$(dirname "$_real_resolv")"
+            RUNTIME_ARGS+=(--ro-bind "$_asbx_resolv_tmp" "$_real_resolv")
+          fi
+        fi
+        if [[ -d /run/nscd ]]; then
+          RUNTIME_ARGS+=(--tmpfs /run/nscd)
+        fi
+      '';
       dynamicFs = fsArmPkg != null;
+      dynamicInner = pkgs.writeShellApplication {
+        name = sandboxedName;
 
+        runtimeInputs = [
+          pkgs.bubblewrap
+          pkgs.coreutils
+        ];
+
+        text = ''
+          RUNTIME_ARGS=()
+
+          if [ ! -e ~/.local/share/jail.nix/passwd ] || [ ! -e ~/.local/share/jail.nix/group ]; then
+            NOLOGIN=${pkgs.shadow}/bin/nologin
+            mkdir -p ~/.local/share/jail.nix
+            echo "root:x:0:0:System administrator:/root:$NOLOGIN" > ~/.local/share/jail.nix/passwd
+            echo "$(id -un):x:$(id -u):$(id -g)::$HOME:$NOLOGIN" >> ~/.local/share/jail.nix/passwd
+            echo "root:x:0:" > ~/.local/share/jail.nix/group
+            echo "$(id -gn):x:$(id -g):" >> ~/.local/share/jail.nix/group
+          fi
+
+          ${blockScript}
+
+          while IFS= read -r -d $'\0' _asbx_line; do
+            case "$_asbx_line" in
+              *=*) ;;
+              *) continue ;;
+            esac
+            _asbx_name="''${_asbx_line%%=*}"
+            _asbx_val="''${_asbx_line#*=}"
+            case "$_asbx_name" in
+              *[!A-Za-z0-9_]*|"") continue ;;
+              TMPDIR|TEMP|TMP|PATH) continue ;;
+            esac
+            RUNTIME_ARGS+=(--setenv "$_asbx_name" "$_asbx_val")
+          done < <(env -0)
+
+          ${policyScript}
+          ${dbusScript}
+          ${dnsScript}
+
+          ${nvidiaSetupScript (!resourceGate)}
+          ${lib.optionalString (!resourceGate) deviceBindScript}
+
+          ${networkModeScript}
+          ${fsArmScript}
+          ${hidePathsScript}
+          ${proxyTrustScript}
+
+
+          ${freezeLaunchPrefix}${pkgs.bubblewrap}/bin/bwrap \
+            --bind / / \
+            --tmpfs /tmp \
+            --proc /proc \
+            --dev-bind /dev /dev \
+            --clearenv \
+            --ro-bind ~/.local/share/jail.nix/passwd /etc/passwd \
+            --ro-bind ~/.local/share/jail.nix/group /etc/group \
+            ${lib.optionalString hasNetwork "--disable-userns"} \
+            ${namespaceFlags} \
+            --new-session --die-with-parent \
+            ${extraBwrapStr} \
+            --setenv TERM "''${TERM:-xterm}" \
+            --setenv PATH "${sandboxPathStr}:$PATH" \
+            --setenv LANG "''${LANG:-C.UTF-8}" \
+            --setenv HOME "$HOME" \
+            "''${RUNTIME_ARGS[@]}" \
+            -- ${entryCmd} "$@"
+          _asbx_status=$?
+          exit "$_asbx_status"
+        '';
+      };
+      dynamicLauncher =
+        if hasNetwork then
+          pkgs.writeShellApplication {
+            name = sandboxedName;
+
+            text = ''
+              set -euo pipefail
+              exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
+                ${lib.getExe dynamicInner} "$@"
+            '';
+          }
+        else
+          dynamicInner;
       entryBase =
         if fsArmPkg != null then
           "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package}"
         else
           lib.getExe package;
-
-      syscallArmPrefix = if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
-
+      entryCmd = "${syscallArmPrefix} ${entryBase}";
       entryPackage =
         if syscallGate || fsArmPkg != null then
           pkgs.writeShellScriptBin binName ''
@@ -334,34 +460,56 @@ in
           ''
         else
           package;
-
+      extraBwrapStr = lib.concatStringsSep " " extraBwrapArgs;
       extraPkgs' =
         extraPkgs
         ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ]
         ++ lib.optionals (syscallArmPkg != null) [ syscallArmPkg ];
-
-      staticAllowRules = [
-        {
-          access = "all";
-          path = "/nix/store";
-        }
-        {
-          access = "all";
-          path = "/tmp";
-        }
-      ]
-      ++ (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
-        inherit path;
-        access = "read";
-      }))
-      ++ (lib.lists.forEach (readwriteDirs ++ readwriteFiles) (path: {
-        inherit path;
-        access = "read_write";
-      }));
-
-      staticAllowJson = builtins.toJSON staticAllowRules;
-      staticAllowJsonArg = lib.escapeShellArg staticAllowJson;
-
+      finalLauncher = scopedLauncher;
+      freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no --unit=\"agent-sandbox-$$_$RANDOM.scope\" -- ";
+      freezeNeedsScope = dbusMode || proxyMode;
+      fsArmScript = lib.optionalString (fsArmPkg != null) ''
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
+      '';
+      # ---- Dynamic-FS direct wrapper (bypasses jail-nix entirely) ----
+      # When dynamic FS approval is active, --bind / / exposes the full host
+      # filesystem.  Sandbox-private /proc and /tmp overlay that bind.  Every
+      # jail-nix bind-mount combinator is both redundant and broken (bwrap
+      # cannot mkdir through symlinks on a root-bound tree).  Generate the
+      # wrapper directly to guarantee zero unexpected bind mounts.
+      hasNetwork = network != null;
+      # Mask paths so the sandbox cannot see their contents even though the
+      # dynamic-FS wrapper binds the whole host root. Resolve existing symlinks
+      # before adding mounts because bubblewrap destinations cannot traverse a
+      # symlink; this also masks the object reached through aliases such as
+      # NixOS-managed files under /etc. Directories are shadowed with an empty
+      # tmpfs, files with /dev/null. Appended after all other mounts so nothing
+      # re-exposes them. Entries may start with `~/` to refer to the invoking
+      # user's home (expanded at wrapper generation time so the runtime script
+      # never contains bare `~`, which shellcheck rejects).
+      hidePathAssignment =
+        path:
+        if path == "~" then
+          ''_asbx_hide="$HOME"''
+        else if lib.hasPrefix "~/" path then
+          ''_asbx_hide="$HOME/${lib.removePrefix "~/" path}"''
+        else
+          "_asbx_hide=${lib.escapeShellArg path}";
+      hidePathsScript = ''
+        RUNTIME_ARGS+=(--tmpfs /run/wrappers)
+      ''
+      + lib.concatMapStringsSep "\n" (path: ''
+          ${hidePathAssignment path}
+        _asbx_hide_target=""
+        if [[ -e "$_asbx_hide" ]]; then
+          _asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)" || _asbx_hide_target=""
+        fi
+        if [[ -d "$_asbx_hide_target" ]]; then
+          RUNTIME_ARGS+=(--tmpfs "$_asbx_hide_target")
+        elif [[ -e "$_asbx_hide_target" ]]; then
+          RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
+        fi
+      '') hiddenPaths;
       jailFn = jail-nix.lib.extend {
         inherit pkgs;
         additionalCombinators = _: agentCombinators;
@@ -379,26 +527,53 @@ in
             fake-passwd
           ];
       };
+      jailedDrv = jailFn sandboxedName entryPackage permissions;
+      launcher =
+        if dynamicFs then
+          dynamicLauncher
+        else if network != null then
+          pkgs.writeShellApplication {
+            name = sandboxedName;
 
+            text = ''
+              set -euo pipefail
+              exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
+                ${lib.getExe jailedDrv} "$@"
+            '';
+          }
+        else
+          jailedDrv;
+      namespaceFlags =
+        if hasNetwork then
+          "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
+        else
+          "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
+      networkMode = if proxyMode then "proxy" else "direct";
+      networkModeScript = lib.optionalString syscallGate ''
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
+        ${lib.optionalString (dnsEndpoint != null) ''
+          RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT ${lib.escapeShellArg dnsEndpoint})
+        ''}
+      '';
       permissions =
         buildPermissions (builtinCombinators // agentCombinators) {
           inherit
-            dynamicFs
-            package
-            readonlyDirs
-            readwriteDirs
-            readonlyFiles
-            readwriteFiles
             blockEnvVars
+            commonPkgs
+            devicePaths
+            dynamicFs
             exposeWorkingDirectory
             extraBwrapArgs
             extraPkgs
+            fsArmPkg
+            package
+            readonlyDirs
+            readonlyFiles
+            readwriteDirs
+            readwriteFiles
             runtime
             sudoGuard
-            fsArmPkg
             syscallArmPkg
-            commonPkgs
-            devicePaths
             ;
 
           runtimeReadonlyDirs = runtimeReadonlyDirs';
@@ -435,91 +610,6 @@ in
             (builtinCombinators.set-env "NODE_EXTRA_CA_CERTS" proxyTrustBundle)
           ])
         ];
-
-      jailedDrv = jailFn sandboxedName entryPackage permissions;
-
-      # ---- Dynamic-FS direct wrapper (bypasses jail-nix entirely) ----
-      # When dynamic FS approval is active, --bind / / exposes the full host
-      # filesystem.  Sandbox-private /proc and /tmp overlay that bind.  Every
-      # jail-nix bind-mount combinator is both redundant and broken (bwrap
-      # cannot mkdir through symlinks on a root-bound tree).  Generate the
-      # wrapper directly to guarantee zero unexpected bind mounts.
-      hasNetwork = network != null;
-
-      sandboxPkgsList = lib.unique (
-        [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
-      );
-
-      sandboxPathStr = lib.makeBinPath sandboxPkgsList;
-      entryCmd = "${syscallArmPrefix} ${entryBase}";
-      blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
-
-      namespaceFlags =
-        if hasNetwork then
-          "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
-        else
-          "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
-
-      dnsScript = lib.optionalString hasNetwork ''
-        if [[ -f /etc/agent-sandbox/nsswitch.conf ]]; then
-          _real_ns=$(readlink -f /etc/nsswitch.conf 2>/dev/null) || _real_ns=""
-          if [[ -n "$_real_ns" ]]; then
-            RUNTIME_ARGS+=(--ro-bind /etc/agent-sandbox/nsswitch.conf "$_real_ns")
-          fi
-        fi
-        if [[ -f /etc/agent-sandbox/resolv.conf ]]; then
-          # The resolved symlink target may be inside /run (tmpfs in bwrap).
-          # Write a temp file and bind-mount to the resolved path, creating
-          # the parent directory first so the mount point exists.
-          _asbx_resolv_tmp=$(mktemp)
-          cp /etc/agent-sandbox/resolv.conf "$_asbx_resolv_tmp"
-          _real_resolv=$(readlink -f /etc/resolv.conf 2>/dev/null) || _real_resolv=""
-          if [[ -n "$_real_resolv" ]]; then
-            mkdir -p "$(dirname "$_real_resolv")"
-            RUNTIME_ARGS+=(--ro-bind "$_asbx_resolv_tmp" "$_real_resolv")
-          fi
-        fi
-        if [[ -d /run/nscd ]]; then
-          RUNTIME_ARGS+=(--tmpfs /run/nscd)
-        fi
-      '';
-
-      # Rebind explicit narrow /run/* mounts configured by the package
-      # definition. Skip the broad /run path so the host's runtime sockets
-      # stay hidden by the surrounding tmpfs.
-      runBindScript =
-        bindFlag: paths:
-        lib.concatMapStringsSep "\n" (
-          path:
-          if path == "/run" then
-            ""
-          else
-            ''
-              if [[ -e "${path}" ]]; then
-                RUNTIME_ARGS+=(${bindFlag} "${path}" "${path}")
-              fi
-            ''
-        ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique paths));
-
-      runReadonlyBindScript = runBindScript "--ro-bind" (readonlyDirs ++ readonlyFiles);
-      runReadwriteBindScript = runBindScript "--bind" (readwriteDirs ++ readwriteFiles);
-
-      runMaskScript =
-        if resourceGate then
-          ''
-            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
-          ''
-        else
-          ''
-            RUNTIME_ARGS+=(--tmpfs /run)
-            for _asbx_safe_runtime in /run/current-system /run/opengl-driver /run/opengl-driver-32 /run/netns; do
-              if [[ -e "$_asbx_safe_runtime" ]]; then
-                RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
-              fi
-            done
-            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
-          '';
-
       policyScript =
         lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
           ''
@@ -622,18 +712,8 @@ in
             # control socket stays hidden by tmpfs.
             RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
           '';
-
-      fsArmScript = lib.optionalString (fsArmPkg != null) ''
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
-      '';
-
-      networkModeScript = lib.optionalString syscallGate ''
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
-        ${lib.optionalString (dnsEndpoint != null) ''
-          RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT ${lib.escapeShellArg dnsEndpoint})
-        ''}
-      '';
-
+      proxyMode = runtime != null && runtime.httpProxy.enable;
+      proxyTrustBundle = "/run/agent-sandbox/proxy-ca-bundle.pem";
       proxyTrustScript = lib.optionalString proxyMode ''
         [[ -f ${proxyTrustBundle} ]] || {
           echo "agent-sandbox proxy trust bundle is unavailable" >&2
@@ -646,200 +726,45 @@ in
         RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS ${proxyTrustBundle})
       '';
-
-      dbusScript = lib.optionalString dbusMode ''
-        _asbx_dbus_root="${dbusSocketDirectory}/''${UID}"
-        mkdir -p "$_asbx_dbus_root"
-        _asbx_dbus_dir="$(mktemp -d "$_asbx_dbus_root/agent-sandbox-dbus.XXXXXX")"
-        _asbx_dbus_socket="$_asbx_dbus_dir/session.sock"
-        _asbx_dbus_upstream=${
-          if dbusUpstreamAddress != null then
-            lib.escapeShellArg dbusUpstreamAddress
+      # Rebind explicit narrow /run/* mounts configured by the package
+      # definition. Skip the broad /run path so the host's runtime sockets
+      # stay hidden by the surrounding tmpfs.
+      runBindScript =
+        bindFlag: paths:
+        lib.concatMapStringsSep "\n" (
+          path:
+          if path == "/run" then
+            ""
           else
-            ''"''${DBUS_SESSION_BUS_ADDRESS:-}"''
-        }
-        [[ -n "$_asbx_dbus_upstream" ]] || {
-          echo "agent-sandbox D-Bus: DBUS_SESSION_BUS_ADDRESS is unset" >&2
-          rm -rf "$_asbx_dbus_dir"
-          exit 1
-        }
-        ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
-          --listen "$_asbx_dbus_socket" \
-          --upstream-address "$_asbx_dbus_upstream" \
-          --policy-socket ${lib.escapeShellArg policySocket} \
-          --bus session \
-          --cwd "$_agent_sandbox_cwd" \
-          --home "$_agent_sandbox_home" \
-          --project-root "$_agent_sandbox_project_root" \
-          --uid "$UID" \
-          --sandbox-session-id "$_agent_sandbox_session_id" &
-        _asbx_dbus_pid=$!
-        trap '${dbusCleanupScript}' EXIT
-        trap 'exit 143' INT TERM
-        while [[ ! -S "$_asbx_dbus_socket" ]]; do
-          if ! kill -0 "$_asbx_dbus_pid" 2>/dev/null; then
-            wait "$_asbx_dbus_pid" || true
-            echo "agent-sandbox D-Bus: relay failed to start" >&2
-            rm -rf "$_asbx_dbus_dir"
-            exit 1
-          fi
-          sleep 0.01
-        done
-        RUNTIME_ARGS+=(--ro-bind "$_asbx_dbus_dir" "$_asbx_dbus_dir")
-        RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_socket")
-      '';
-
-      dbusCleanupScript = lib.optionalString dbusMode ''
-        kill "$_asbx_dbus_pid" 2>/dev/null || true
-        wait "$_asbx_dbus_pid" 2>/dev/null || true
-        rm -rf "$_asbx_dbus_dir"
-      '';
-
-      # Mask paths so the sandbox cannot see their contents even though the
-      # dynamic-FS wrapper binds the whole host root. Resolve existing symlinks
-      # before adding mounts because bubblewrap destinations cannot traverse a
-      # symlink; this also masks the object reached through aliases such as
-      # NixOS-managed files under /etc. Directories are shadowed with an empty
-      # tmpfs, files with /dev/null. Appended after all other mounts so nothing
-      # re-exposes them. Entries may start with `~/` to refer to the invoking
-      # user's home (expanded at wrapper generation time so the runtime script
-      # never contains bare `~`, which shellcheck rejects).
-      hidePathAssignment =
-        path:
-        if path == "~" then
-          ''_asbx_hide="$HOME"''
-        else if lib.hasPrefix "~/" path then
-          ''_asbx_hide="$HOME/${lib.removePrefix "~/" path}"''
+            ''
+              if [[ -e "${path}" ]]; then
+                RUNTIME_ARGS+=(${bindFlag} "${path}" "${path}")
+              fi
+            ''
+        ) (lib.filter (p: lib.hasPrefix "/run/" p) (lib.unique paths));
+      runMaskScript =
+        if resourceGate then
+          ''
+            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
+          ''
         else
-          "_asbx_hide=${lib.escapeShellArg path}";
-
-      hidePathsScript = ''
-        RUNTIME_ARGS+=(--tmpfs /run/wrappers)
-      ''
-      + lib.concatMapStringsSep "\n" (path: ''
-          ${hidePathAssignment path}
-        _asbx_hide_target=""
-        if [[ -e "$_asbx_hide" ]]; then
-          _asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)" || _asbx_hide_target=""
-        fi
-        if [[ -d "$_asbx_hide_target" ]]; then
-          RUNTIME_ARGS+=(--tmpfs "$_asbx_hide_target")
-        elif [[ -e "$_asbx_hide_target" ]]; then
-          RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
-        fi
-      '') hiddenPaths;
-
-      deviceBindScript = lib.concatMapStringsSep "\n" (path: ''
-        if [[ -e "${path}" ]]; then
-          RUNTIME_ARGS+=(--dev-bind "${path}" "${path}")
-        fi
-      '') devicePaths;
-
-      extraBwrapStr = lib.concatStringsSep " " extraBwrapArgs;
-      freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no --unit=\"agent-sandbox-$$_$RANDOM.scope\" -- ";
-
-      dynamicInner = pkgs.writeShellApplication {
-        name = sandboxedName;
-
-        runtimeInputs = [
-          pkgs.bubblewrap
-          pkgs.coreutils
-        ];
-
-        text = ''
-          RUNTIME_ARGS=()
-
-          if [ ! -e ~/.local/share/jail.nix/passwd ] || [ ! -e ~/.local/share/jail.nix/group ]; then
-            NOLOGIN=${pkgs.shadow}/bin/nologin
-            mkdir -p ~/.local/share/jail.nix
-            echo "root:x:0:0:System administrator:/root:$NOLOGIN" > ~/.local/share/jail.nix/passwd
-            echo "$(id -un):x:$(id -u):$(id -g)::$HOME:$NOLOGIN" >> ~/.local/share/jail.nix/passwd
-            echo "root:x:0:" > ~/.local/share/jail.nix/group
-            echo "$(id -gn):x:$(id -g):" >> ~/.local/share/jail.nix/group
-          fi
-
-          ${blockScript}
-
-          while IFS= read -r -d $'\0' _asbx_line; do
-            case "$_asbx_line" in
-              *=*) ;;
-              *) continue ;;
-            esac
-            _asbx_name="''${_asbx_line%%=*}"
-            _asbx_val="''${_asbx_line#*=}"
-            case "$_asbx_name" in
-              *[!A-Za-z0-9_]*|"") continue ;;
-              TMPDIR|TEMP|TMP|PATH) continue ;;
-            esac
-            RUNTIME_ARGS+=(--setenv "$_asbx_name" "$_asbx_val")
-          done < <(env -0)
-
-          ${policyScript}
-          ${dbusScript}
-          ${dnsScript}
-
-          ${nvidiaSetupScript (!resourceGate)}
-          ${lib.optionalString (!resourceGate) deviceBindScript}
-
-          ${networkModeScript}
-          ${fsArmScript}
-          ${hidePathsScript}
-          ${proxyTrustScript}
-
-
-          ${freezeLaunchPrefix}${pkgs.bubblewrap}/bin/bwrap \
-            --bind / / \
-            --tmpfs /tmp \
-            --proc /proc \
-            --dev-bind /dev /dev \
-            --clearenv \
-            --ro-bind ~/.local/share/jail.nix/passwd /etc/passwd \
-            --ro-bind ~/.local/share/jail.nix/group /etc/group \
-            ${lib.optionalString hasNetwork "--disable-userns"} \
-            ${namespaceFlags} \
-            --new-session --die-with-parent \
-            ${extraBwrapStr} \
-            --setenv TERM "''${TERM:-xterm}" \
-            --setenv PATH "${sandboxPathStr}:$PATH" \
-            --setenv LANG "''${LANG:-C.UTF-8}" \
-            --setenv HOME "$HOME" \
-            "''${RUNTIME_ARGS[@]}" \
-            -- ${entryCmd} "$@"
-          _asbx_status=$?
-          exit "$_asbx_status"
-        '';
-      };
-
-      dynamicLauncher =
-        if hasNetwork then
-          pkgs.writeShellApplication {
-            name = sandboxedName;
-
-            text = ''
-              set -euo pipefail
-              exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
-                ${lib.getExe dynamicInner} "$@"
-            '';
-          }
-        else
-          dynamicInner;
-
-      launcher =
-        if dynamicFs then
-          dynamicLauncher
-        else if network != null then
-          pkgs.writeShellApplication {
-            name = sandboxedName;
-
-            text = ''
-              set -euo pipefail
-              exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
-                ${lib.getExe jailedDrv} "$@"
-            '';
-          }
-        else
-          jailedDrv;
-
+          ''
+            RUNTIME_ARGS+=(--tmpfs /run)
+            for _asbx_safe_runtime in /run/current-system /run/opengl-driver /run/opengl-driver-32 /run/netns; do
+              if [[ -e "$_asbx_safe_runtime" ]]; then
+                RUNTIME_ARGS+=(--ro-bind "$_asbx_safe_runtime" "$_asbx_safe_runtime")
+              fi
+            done
+            RUNTIME_ARGS+=(--tmpfs /run/agent-sandbox)
+          '';
+      runReadonlyBindScript = runBindScript "--ro-bind" (readonlyDirs ++ readonlyFiles);
+      runReadwriteBindScript = runBindScript "--bind" (readwriteDirs ++ readwriteFiles);
+      runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
+      sandboxPathStr = lib.makeBinPath sandboxPkgsList;
+      sandboxPkgsList = lib.unique (
+        [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
+      );
+      sandboxedName = "sandboxed-${binName}";
       scopedLauncher =
         if freezeNeedsScope && !dynamicFs then
           pkgs.writeShellApplication {
@@ -853,8 +778,32 @@ in
           }
         else
           launcher;
-
-      finalLauncher = scopedLauncher;
+      staticAllowJson = builtins.toJSON staticAllowRules;
+      staticAllowJsonArg = lib.escapeShellArg staticAllowJson;
+      staticAllowRules = [
+        {
+          access = "all";
+          path = "/nix/store";
+        }
+        {
+          access = "all";
+          path = "/tmp";
+        }
+      ]
+      ++ (lib.lists.forEach (readonlyDirs ++ readonlyFiles) (path: {
+        inherit path;
+        access = "read";
+      }))
+      ++ (lib.lists.forEach (readwriteDirs ++ readwriteFiles) (path: {
+        inherit path;
+        access = "read_write";
+      }));
+      syscallArmPrefix = if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
+      # Syscall gate: when wired, prepend `agent-sandbox-syscall-arm --` to
+      # the entry chain. The arm helper installs a seccomp filter inside the
+      # sandbox, then execs its argv tail. The chain is composable with the
+      # fs-arm helper so dynamic-FS and syscall-gate can both be active.
+      syscallGate = syscallArmPkg != null;
 
     in
     pkgs.symlinkJoin {

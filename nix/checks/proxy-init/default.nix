@@ -3,18 +3,6 @@
   ...
 }:
 let
-  proxyInit = pkgs.writeShellApplication {
-    name = "proxy-init-regression";
-
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.gnugrep
-      pkgs.openssl
-    ];
-
-    text = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-init.sh;
-  };
-
   echInit = pkgs.writeShellApplication {
     name = "proxy-ech-init-regression";
     runtimeInputs = [ pkgs.coreutils ];
@@ -29,6 +17,17 @@ let
       printf '%s\n' "$*" >> "$state/ech-init-args"
       : > "$state/ech-config-list"
     '';
+  };
+  proxyInit = pkgs.writeShellApplication {
+    name = "proxy-init-regression";
+
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.gnugrep
+      pkgs.openssl
+    ];
+
+    text = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-init.sh;
   };
 in
 pkgs.runCommand "proxy-init-regression"

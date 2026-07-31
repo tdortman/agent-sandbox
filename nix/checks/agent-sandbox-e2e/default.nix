@@ -5,291 +5,6 @@
   ...
 }:
 let
-  module = ../../modules/nixos/agent-sandbox;
-
-  mkBash =
-    name: options:
-    options
-    // {
-      package = pkgs.writeShellScriptBin name ''
-        exec ${lib.getExe pkgs.bashInteractive} "$@"
-      '';
-
-      binary = name;
-    };
-
-  mkCurl =
-    name: options:
-    options
-    // {
-      package = pkgs.writeShellScriptBin name ''
-        exec ${lib.getExe pkgs.curl} "$@"
-      '';
-
-      binary = name;
-    };
-
-  commonExtraPkgs = with pkgs; [
-    coreutils
-    dbus
-    socat
-    sudo
-    util-linux
-  ];
-
-  tlsFixture =
-    pkgs.runCommand "agent-sandbox-vm-tls-fixture" { nativeBuildInputs = [ pkgs.openssl ]; }
-      ''
-        mkdir -p "$out"
-
-        openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
-          -subj '/CN=agent-sandbox VM test CA' \
-          -addext 'basicConstraints=critical,CA:true,pathlen:1' \
-          -addext 'keyUsage=critical,keyCertSign,cRLSign' \
-          -keyout "$out/ca-key.pem" -out "$out/ca-cert.pem" >/dev/null 2>&1
-
-        openssl req -new -newkey rsa:2048 -sha256 -nodes \
-          -subj '/CN=169.254.100.1' \
-          -keyout "$out/server-key.pem" -out "$out/server.csr" >/dev/null 2>&1
-
-        cat > server.ext <<'EOF'
-        basicConstraints=critical,CA:false
-        keyUsage=critical,digitalSignature,keyEncipherment
-        extendedKeyUsage=serverAuth
-        subjectAltName=IP:169.254.100.1
-        EOF
-
-        openssl x509 -req -sha256 -days 3650 \
-          -in "$out/server.csr" \
-          -CA "$out/ca-cert.pem" -CAkey "$out/ca-key.pem" -CAcreateserial \
-          -extfile server.ext -out "$out/server-cert.pem" >/dev/null 2>&1
-        rm "$out/server.csr" "$out/ca-cert.srl"
-      '';
-
-  staticPackages = [
-    (mkBash "sandbox-static-bash" {
-      devicePaths = [ "/dev/agent-sandbox-test-device" ];
-      exposeWorkingDirectory = true;
-      extraPkgs = commonExtraPkgs;
-      readonlyDirs = [ "/var/lib/agent-sandbox-test/readonly-dir" ];
-
-      readonlyFiles = [
-        "/var/lib/agent-sandbox-test/readonly-file"
-        "~/sandbox-home-readonly"
-      ];
-
-      readwriteDirs = [ "~/sandbox-readwrite" ];
-      readwriteFiles = [ "/var/lib/agent-sandbox-test/readwrite-file" ];
-    })
-
-    (mkBash "sandbox-static-options-bash" {
-      blockEnvVars = [ "CUSTOM_SECRET" ];
-
-      extraBwrapArgs = [
-        "--setenv"
-        "AGENT_SANDBOX_EXTRA_BWRAP"
-        "covered"
-      ];
-
-      extraPkgs = commonExtraPkgs;
-      runtimeReadonlyDirs = [ "/run/agent-sandbox-test-runtime" ];
-    })
-
-    (mkBash "sandbox-static-no-cwd-bash" {
-      exposeWorkingDirectory = false;
-      extraPkgs = commonExtraPkgs;
-      runtimeReadonlyDirs = [ ];
-    })
-
-    (mkCurl "sandbox-static-curl" {
-      extraPkgs = commonExtraPkgs;
-    })
-
-    {
-      package = pkgs.writeShellScriptBin "sandbox-inferred-binary" ''
-        printf 'inferred-binary\n'
-      '';
-
-      extraPkgs = commonExtraPkgs;
-    }
-  ];
-
-  wrappingPackages = [
-    (mkBash "sandbox-wrapping-bash" {
-      extraPkgs = commonExtraPkgs;
-    })
-  ];
-
-  dynamicPackages = [
-    (mkBash "sandbox-dynamic-bash" {
-      extraPkgs = commonExtraPkgs ++ [ pkgs.python3 ];
-
-      hiddenPaths = [
-        "/etc/agent-sandbox-test/hidden-file"
-        "/var/lib/agent-sandbox-test/hidden-file"
-        "~/sandbox-hidden-dir"
-      ];
-    })
-
-    (mkCurl "sandbox-dynamic-curl" {
-      extraPkgs = commonExtraPkgs;
-      hiddenPaths = [ "/var/lib/agent-sandbox-test/hidden-file" ];
-    })
-  ];
-
-  resourcePackages = [
-    (mkBash "sandbox-resource-bash" {
-      extraPkgs = commonExtraPkgs;
-    })
-  ];
-
-  directNetworkPackages = [
-    (mkCurl "sandbox-direct-curl" {
-      extraPkgs = commonExtraPkgs;
-    })
-
-    (mkBash "sandbox-direct-bash" {
-      extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
-    })
-  ];
-
-  proxyNetworkPackages = [
-    (mkCurl "sandbox-proxy-curl" {
-      extraPkgs = commonExtraPkgs;
-    })
-
-    (mkBash "sandbox-proxy-bash" {
-      extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
-    })
-  ];
-
-  sudoDenyPackages = [
-    (mkBash "sandbox-sudo-deny-bash" {
-      extraPkgs = commonExtraPkgs;
-    })
-  ];
-
-  sudoApprovePackages = [
-    (mkBash "sandbox-sudo-approve-bash" {
-      extraPkgs = commonExtraPkgs;
-      readonlyDirs = [ "~/.config/agent-sandbox" ];
-    })
-  ];
-
-  emptyPolicySection = ''{ "allow": [], "deny": [] }'';
-
-  mkPolicy =
-    name:
-    {
-      dbus ? emptyPolicySection,
-      filesystem ? emptyPolicySection,
-      resources ? emptyPolicySection,
-      sudo ? emptyPolicySection,
-    }:
-    pkgs.writeText "agent-sandbox-vm-${name}-policy.json" ''
-      {
-        "network": { "direct": { "allow": [], "deny": [] } },
-        "sudo": ${sudo},
-        "filesystem": ${filesystem},
-        "resources": ${resources},
-        "dbus": ${dbus}
-      }
-    '';
-
-  dynamicPolicy = mkPolicy "dynamic" {
-    filesystem = ''
-      {
-        "allow": [
-          { "path": "/var/lib/agent-sandbox-test/dynamic-read", "access": "read" },
-          { "path": "/var/lib/agent-sandbox-test/dynamic-write", "access": "all" },
-          { "path": "/var/lib/agent-sandbox-test/dynamic-denied", "access": "all" },
-          { "path": "/var/lib/agent-sandbox-test/dynamic-mutations", "access": "all" }
-        ],
-        "deny": [
-          { "path": "/var/lib/agent-sandbox-test/dynamic-denied", "access": "all" },
-          { "path": "/var/lib/agent-sandbox-test/dynamic-mutations/denied", "access": "all" }
-        ]
-      }
-    '';
-  };
-
-  resourcePolicy = mkPolicy "resource" {
-    resources = ''
-      {
-        "allow": [
-          { "kind": "unix_socket", "path": "/run/agent-sandbox-test/echo.sock", "access": "connect" },
-          { "kind": "unix_socket", "path": "/run/agent-sandbox-test/echo.sock", "access": "send" },
-          { "kind": "device", "path": "/dev/agent-sandbox-test-device", "access": "open_read" }
-        ],
-        "deny": []
-      }
-    '';
-  };
-
-  dbusPolicy = mkPolicy "dbus" {
-    dbus = ''
-      {
-        "allow": [
-          {
-            "target": {
-              "bus": "session",
-              "destination": "*",
-              "object_path": "**",
-              "interface": "org.freedesktop.DBus.Introspectable",
-              "member": "Introspect",
-              "message_kind": "method_call",
-              "signature": "",
-              "fd_metadata": []
-            },
-            "comment": "global"
-          },
-          {
-            "target": {
-              "bus": "session",
-              "destination": ":*",
-              "object_path": "/org/freedesktop/DBus",
-              "interface": "org.freedesktop.DBus",
-              "member": "NameAcquired",
-              "message_kind": "signal",
-              "signature": "s",
-              "fd_metadata": []
-            },
-            "comment": "global"
-          }
-        ],
-        "deny": []
-      }
-    '';
-
-    resources = ''
-      {
-        "allow": [
-          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
-          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
-        ],
-        "deny": []
-      }
-    '';
-  };
-
-  sudoPolicy = mkPolicy "sudo" {
-    sudo = ''
-      {
-        "allow": [ { "argv": [ "id" ], "comment": "VM elevation contract" } ],
-        "deny": []
-      }
-    '';
-  };
-
-  testUser = {
-    extraGroups = [ "dialout" ];
-    group = "users";
-    home = "/home/user";
-    isNormalUser = true;
-    linger = true;
-    uid = 1000;
-  };
-
   baseNode = {
     boot.kernelParams = [ "audit=0" ];
     environment.etc."agent-sandbox-test/hidden-file".text = "hidden file marker\n";
@@ -339,26 +54,133 @@ let
       memorySize = 2048;
     };
   };
+  commonExtraPkgs = with pkgs; [
+    coreutils
+    dbus
+    socat
+    sudo
+    util-linux
+  ];
+  dbusPolicy = mkPolicy "dbus" {
+    dbus = ''
+      {
+        "allow": [
+          {
+            "target": {
+              "bus": "session",
+              "destination": "*",
+              "object_path": "**",
+              "interface": "org.freedesktop.DBus.Introspectable",
+              "member": "Introspect",
+              "message_kind": "method_call",
+              "signature": "",
+              "fd_metadata": []
+            },
+            "comment": "global"
+          },
+          {
+            "target": {
+              "bus": "session",
+              "destination": ":*",
+              "object_path": "/org/freedesktop/DBus",
+              "interface": "org.freedesktop.DBus",
+              "member": "NameAcquired",
+              "message_kind": "signal",
+              "signature": "s",
+              "fd_metadata": []
+            },
+            "comment": "global"
+          }
+        ],
+        "deny": []
+      }
+    '';
 
-  installPolicy = policy: {
-    environment.etc."agent-sandbox-vm-policy.json".source = policy;
-
-    systemd.services.agent-sandbox-vm-policy = {
-      before = [ "agent-sandbox-policy.service" ];
-      wantedBy = [ "multi-user.target" ];
-
-      serviceConfig = {
-        RemainAfterExit = true;
-        Type = "oneshot";
-      };
-
-      script = ''
-        install -d -o sandbox -g users /home/user/.config/agent-sandbox
-        install -o sandbox -g users ${policy} /home/user/.config/agent-sandbox/policy.json
-      '';
-    };
+    resources = ''
+      {
+        "allow": [
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "connect" },
+          { "kind": "unix_socket", "path": "/var/lib/agent-sandbox-test/dbus-runtime", "access": "send" }
+        ],
+        "deny": []
+      }
+    '';
   };
+  directNetworkPackages = [
+    (mkCurl "sandbox-direct-curl" {
+      extraPkgs = commonExtraPkgs;
+    })
 
+    (mkBash "sandbox-direct-bash" {
+      extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
+    })
+  ];
+  dynamicPackages = [
+    (mkBash "sandbox-dynamic-bash" {
+      extraPkgs = commonExtraPkgs ++ [ pkgs.python3 ];
+
+      hiddenPaths = [
+        "/etc/agent-sandbox-test/hidden-file"
+        "/var/lib/agent-sandbox-test/hidden-file"
+        "~/sandbox-hidden-dir"
+      ];
+    })
+
+    (mkCurl "sandbox-dynamic-curl" {
+      extraPkgs = commonExtraPkgs;
+      hiddenPaths = [ "/var/lib/agent-sandbox-test/hidden-file" ];
+    })
+  ];
+  dynamicPolicy = mkPolicy "dynamic" {
+    filesystem = ''
+      {
+        "allow": [
+          { "path": "/var/lib/agent-sandbox-test/dynamic-read", "access": "read" },
+          { "path": "/var/lib/agent-sandbox-test/dynamic-write", "access": "all" },
+          { "path": "/var/lib/agent-sandbox-test/dynamic-denied", "access": "all" },
+          { "path": "/var/lib/agent-sandbox-test/dynamic-mutations", "access": "all" }
+        ],
+        "deny": [
+          { "path": "/var/lib/agent-sandbox-test/dynamic-denied", "access": "all" },
+          { "path": "/var/lib/agent-sandbox-test/dynamic-mutations/denied", "access": "all" }
+        ]
+      }
+    '';
+  };
+  emptyPolicySection = ''{ "allow": [], "deny": [] }'';
+  httpServer =
+    {
+      port,
+      address ? null,
+      certificate ? null,
+      privateKey ? null,
+      serviceName ? "http",
+    }:
+    {
+      name = "agent-sandbox-vm-${serviceName}-${toString port}";
+
+      value = {
+        serviceConfig = {
+          ExecStart = lib.escapeShellArgs (
+            [
+              "${pkgs.python3}/bin/python"
+              httpServerScript
+              (toString port)
+            ]
+            ++ lib.optional (address != null) address
+            ++ lib.optionals (certificate != null) [
+              certificate
+              privateKey
+            ]
+          );
+
+          Restart = "on-failure";
+          User = "sandbox";
+        };
+
+        wantedBy = [ "multi-user.target" ];
+      };
+    };
   httpServerScript = pkgs.writeText "agent-sandbox-vm-http.py" ''
     import sys
     import socket
@@ -417,44 +239,74 @@ let
         server.socket = context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
   '';
-
-  httpServer =
-    {
-      port,
-      address ? null,
-      certificate ? null,
-      privateKey ? null,
-      serviceName ? "http",
-    }:
-    {
-      name = "agent-sandbox-vm-${serviceName}-${toString port}";
-
-      value = {
-        serviceConfig = {
-          ExecStart = lib.escapeShellArgs (
-            [
-              "${pkgs.python3}/bin/python"
-              httpServerScript
-              (toString port)
-            ]
-            ++ lib.optional (address != null) address
-            ++ lib.optionals (certificate != null) [
-              certificate
-              privateKey
-            ]
-          );
-
-          Restart = "on-failure";
-          User = "sandbox";
-        };
-
-        wantedBy = [ "multi-user.target" ];
-      };
-    };
-
   httpServers = specs: {
     systemd.services = lib.listToAttrs (map httpServer specs);
   };
+  installPolicy = policy: {
+    environment.etc."agent-sandbox-vm-policy.json".source = policy;
+
+    systemd.services.agent-sandbox-vm-policy = {
+      before = [ "agent-sandbox-policy.service" ];
+      wantedBy = [ "multi-user.target" ];
+
+      serviceConfig = {
+        RemainAfterExit = true;
+        Type = "oneshot";
+      };
+
+      script = ''
+        install -d -o sandbox -g users /home/user/.config/agent-sandbox
+        install -o sandbox -g users ${policy} /home/user/.config/agent-sandbox/policy.json
+      '';
+    };
+  };
+  mkBash =
+    name: options:
+    options
+    // {
+      package = pkgs.writeShellScriptBin name ''
+        exec ${lib.getExe pkgs.bashInteractive} "$@"
+      '';
+
+      binary = name;
+    };
+  mkCurl =
+    name: options:
+    options
+    // {
+      package = pkgs.writeShellScriptBin name ''
+        exec ${lib.getExe pkgs.curl} "$@"
+      '';
+
+      binary = name;
+    };
+  mkPolicy =
+    name:
+    {
+      dbus ? emptyPolicySection,
+      filesystem ? emptyPolicySection,
+      resources ? emptyPolicySection,
+      sudo ? emptyPolicySection,
+    }:
+    pkgs.writeText "agent-sandbox-vm-${name}-policy.json" ''
+      {
+        "network": { "direct": { "allow": [], "deny": [] } },
+        "sudo": ${sudo},
+        "filesystem": ${filesystem},
+        "resources": ${resources},
+        "dbus": ${dbus}
+      }
+    '';
+  module = ../../modules/nixos/agent-sandbox;
+  proxyNetworkPackages = [
+    (mkCurl "sandbox-proxy-curl" {
+      extraPkgs = commonExtraPkgs;
+    })
+
+    (mkBash "sandbox-proxy-bash" {
+      extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
+    })
+  ];
   proxyNode =
     baseNode
     // (httpServers [
@@ -533,7 +385,125 @@ let
         8443
       ];
     };
+  resourcePackages = [
+    (mkBash "sandbox-resource-bash" {
+      extraPkgs = commonExtraPkgs;
+    })
+  ];
+  resourcePolicy = mkPolicy "resource" {
+    resources = ''
+      {
+        "allow": [
+          { "kind": "unix_socket", "path": "/run/agent-sandbox-test/echo.sock", "access": "connect" },
+          { "kind": "unix_socket", "path": "/run/agent-sandbox-test/echo.sock", "access": "send" },
+          { "kind": "device", "path": "/dev/agent-sandbox-test-device", "access": "open_read" }
+        ],
+        "deny": []
+      }
+    '';
+  };
+  staticPackages = [
+    (mkBash "sandbox-static-bash" {
+      devicePaths = [ "/dev/agent-sandbox-test-device" ];
+      exposeWorkingDirectory = true;
+      extraPkgs = commonExtraPkgs;
+      readonlyDirs = [ "/var/lib/agent-sandbox-test/readonly-dir" ];
 
+      readonlyFiles = [
+        "/var/lib/agent-sandbox-test/readonly-file"
+        "~/sandbox-home-readonly"
+      ];
+
+      readwriteDirs = [ "~/sandbox-readwrite" ];
+      readwriteFiles = [ "/var/lib/agent-sandbox-test/readwrite-file" ];
+    })
+
+    (mkBash "sandbox-static-options-bash" {
+      blockEnvVars = [ "CUSTOM_SECRET" ];
+
+      extraBwrapArgs = [
+        "--setenv"
+        "AGENT_SANDBOX_EXTRA_BWRAP"
+        "covered"
+      ];
+
+      extraPkgs = commonExtraPkgs;
+      runtimeReadonlyDirs = [ "/run/agent-sandbox-test-runtime" ];
+    })
+
+    (mkBash "sandbox-static-no-cwd-bash" {
+      exposeWorkingDirectory = false;
+      extraPkgs = commonExtraPkgs;
+      runtimeReadonlyDirs = [ ];
+    })
+
+    (mkCurl "sandbox-static-curl" {
+      extraPkgs = commonExtraPkgs;
+    })
+
+    {
+      package = pkgs.writeShellScriptBin "sandbox-inferred-binary" ''
+        printf 'inferred-binary\n'
+      '';
+
+      extraPkgs = commonExtraPkgs;
+    }
+  ];
+  sudoApprovePackages = [
+    (mkBash "sandbox-sudo-approve-bash" {
+      extraPkgs = commonExtraPkgs;
+      readonlyDirs = [ "~/.config/agent-sandbox" ];
+    })
+  ];
+  sudoDenyPackages = [
+    (mkBash "sandbox-sudo-deny-bash" {
+      extraPkgs = commonExtraPkgs;
+    })
+  ];
+  sudoPolicy = mkPolicy "sudo" {
+    sudo = ''
+      {
+        "allow": [ { "argv": [ "id" ], "comment": "VM elevation contract" } ],
+        "deny": []
+      }
+    '';
+  };
+  testUser = {
+    extraGroups = [ "dialout" ];
+    group = "users";
+    home = "/home/user";
+    isNormalUser = true;
+    linger = true;
+    uid = 1000;
+  };
+  tlsFixture =
+    pkgs.runCommand "agent-sandbox-vm-tls-fixture" { nativeBuildInputs = [ pkgs.openssl ]; }
+      ''
+        mkdir -p "$out"
+
+        openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+          -subj '/CN=agent-sandbox VM test CA' \
+          -addext 'basicConstraints=critical,CA:true,pathlen:1' \
+          -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+          -keyout "$out/ca-key.pem" -out "$out/ca-cert.pem" >/dev/null 2>&1
+
+        openssl req -new -newkey rsa:2048 -sha256 -nodes \
+          -subj '/CN=169.254.100.1' \
+          -keyout "$out/server-key.pem" -out "$out/server.csr" >/dev/null 2>&1
+
+        cat > server.ext <<'EOF'
+        basicConstraints=critical,CA:false
+        keyUsage=critical,digitalSignature,keyEncipherment
+        extendedKeyUsage=serverAuth
+        subjectAltName=IP:169.254.100.1
+        EOF
+
+        openssl x509 -req -sha256 -days 3650 \
+          -in "$out/server.csr" \
+          -CA "$out/ca-cert.pem" -CAkey "$out/ca-key.pem" -CAcreateserial \
+          -extfile server.ext -out "$out/server-cert.pem" >/dev/null 2>&1
+        rm "$out/server.csr" "$out/ca-cert.srl"
+      '';
   vmTest = pkgs.testers.runNixOSTest (_: {
     name = "agent-sandbox-e2e";
     node.specialArgs = { inherit inputs; };
@@ -831,7 +801,7 @@ let
           };
         };
 
-      "sudo-approve" =
+      sudo-approve =
         _:
         lib.recursiveUpdate baseNode (
           lib.recursiveUpdate (installPolicy sudoPolicy) {
@@ -851,7 +821,7 @@ let
           }
         );
 
-      "sudo-deny" =
+      sudo-deny =
         _:
         baseNode
         // {
@@ -1154,5 +1124,10 @@ let
       sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo -u nobody id", expect_success=False)
     '';
   });
+  wrappingPackages = [
+    (mkBash "sandbox-wrapping-bash" {
+      extraPkgs = commonExtraPkgs;
+    })
+  ];
 in
 vmTest

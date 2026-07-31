@@ -15,243 +15,6 @@ let
     inherit lib;
     inherit (inputs) jail-nix;
   };
-
-  networkModuleSource = builtins.toFile "agent-sandbox-network.nix" (
-    builtins.readFile ../../modules/nixos/agent-sandbox/network.nix
-  );
-  proxyFirewallSource = builtins.toFile "agent-sandbox-proxy-firewall.sh" (
-    builtins.readFile ../../modules/nixos/agent-sandbox/proxy-firewall.sh
-  );
-  proxyTproxyRouteSource = builtins.toFile "agent-sandbox-proxy-tproxy-route.sh" (
-    builtins.readFile ../../modules/nixos/agent-sandbox/proxy-tproxy-route.sh
-  );
-  proxyInitSource = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-init.sh;
-  runtime = proxy: {
-    hostIp = "169.254.100.1";
-    httpProxy.enable = proxy;
-    network = { };
-    policyContext = false;
-  };
-
-  mkWrapper =
-    {
-      dynamic,
-      proxy,
-    }:
-    agentSandboxLib.mkWrapPackage pkgs {
-      package = pkgs.hello;
-      binary = "hello";
-      fsArmPkg = if dynamic then pkgs.hello else null;
-      runtime = runtime proxy;
-      syscallArmPkg = pkgs.hello;
-    };
-
-  staticDirect = mkWrapper {
-    dynamic = false;
-    proxy = false;
-  };
-  staticProxy = mkWrapper {
-    dynamic = false;
-    proxy = true;
-  };
-  dynamicDirect = mkWrapper {
-    dynamic = true;
-    proxy = false;
-  };
-  dynamicProxy = mkWrapper {
-    dynamic = true;
-    proxy = true;
-  };
-  proxyGroupLookupCheck = pkgs.writeShellApplication {
-    name = "proxy-group-lookup-regression";
-
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.getent
-      pkgs.glibc.bin
-    ];
-
-    text = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-group-gid.sh;
-  };
-  mkNixosSystem =
-    extraModule:
-    inputs.nixpkgs.lib.nixosSystem {
-      modules = [
-        ../../modules/nixos/agent-sandbox
-        {
-          agent-sandbox = {
-            enable = true;
-            network.enable = true;
-          };
-
-          nixpkgs.pkgs = pkgs;
-          system.stateVersion = "26.11";
-        }
-        extraModule
-      ];
-
-      specialArgs = { inherit inputs; };
-      system = pkgs.stdenv.hostPlatform.system;
-    };
-
-  validPolicySystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          comment = "API access";
-          url = "https://api.example.com/v1";
-        }
-      ];
-
-      declarativeDeny = [
-        {
-          methods = [ "POST" ];
-          url = "https://api.example.com/v1/private";
-        }
-      ];
-    };
-  };
-  validPolicyJson =
-    builtins.fromJSON
-      validPolicySystem.config.environment.etc."agent-sandbox/declarative.json".text;
-  validPortSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://api.example.com:65535/v1";
-        }
-      ];
-    };
-  };
-  validPortJson =
-    builtins.fromJSON
-      validPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
-
-  echStateOrdering =
-    let
-      dnsService = validPortSystem.config.systemd.services."agent-sandbox-dns";
-      initService = validPortSystem.config.systemd.services."agent-sandbox-proxy-init";
-    in
-    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.after;
-    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.requires;
-    assert lib.hasInfix "--init-ech-state-only" proxyInitSource;
-    assert lib.hasInfix "agent-sandbox-proxy" (toString initService.serviceConfig.ExecStart);
-    true;
-
-  invalidProxySystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy.declarativeAllow = [
-      {
-        allMethods = true;
-        url = "https://api.example.com/v1";
-      }
-    ];
-  };
-  invalidModeSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          methods = [ ];
-          url = "https://api.example.com/v1";
-        }
-      ];
-    };
-  };
-  invalidMethodSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          methods = [ (builtins.concatStringsSep "" (builtins.genList (_: "A") 65)) ];
-          url = "https://api.example.com/v1";
-        }
-      ];
-    };
-  };
-  invalidFragmentSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://api.example.com/v1#private";
-        }
-      ];
-    };
-  };
-  invalidPortSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://api.example.com:99999/v1";
-        }
-      ];
-    };
-  };
-  validPaddedPortSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://api.example.com:080/v1";
-        }
-      ];
-    };
-  };
-  validPaddedPortJson =
-    builtins.fromJSON
-      validPaddedPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
-  validIpv6System = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://[::1]/v1";
-        }
-      ];
-    };
-  };
-  validFullGlobSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://[ab].example.com/{one,two}/file?.txt";
-        }
-      ];
-    };
-  };
-  invalidZeroPortSystem = mkNixosSystem {
-    agent-sandbox.network.httpProxy = {
-      enable = true;
-
-      declarativeAllow = [
-        {
-          allMethods = true;
-          url = "https://api.example.com:0/v1";
-        }
-      ];
-    };
-  };
-
   declarativeHttpContract =
     assert
       validPolicyJson.network.direct == {
@@ -313,7 +76,151 @@ let
         invalidZeroPortSystem.config.environment.etc."agent-sandbox/declarative.json".text
       ).success;
     true;
+  dynamicDirect = mkWrapper {
+    dynamic = true;
+    proxy = false;
+  };
+  dynamicProxy = mkWrapper {
+    dynamic = true;
+    proxy = true;
+  };
+  echStateOrdering =
+    let
+      dnsService = validPortSystem.config.systemd.services."agent-sandbox-dns";
+      initService = validPortSystem.config.systemd.services."agent-sandbox-proxy-init";
+    in
+    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.after;
+    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.requires;
+    assert lib.hasInfix "--init-ech-state-only" proxyInitSource;
+    assert lib.hasInfix "agent-sandbox-proxy" (toString initService.serviceConfig.ExecStart);
+    true;
+  invalidFragmentSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
 
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://api.example.com/v1#private";
+        }
+      ];
+    };
+  };
+  invalidMethodSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          methods = [ (builtins.concatStringsSep "" (builtins.genList (_: "A") 65)) ];
+          url = "https://api.example.com/v1";
+        }
+      ];
+    };
+  };
+  invalidModeSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          methods = [ ];
+          url = "https://api.example.com/v1";
+        }
+      ];
+    };
+  };
+  invalidPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://api.example.com:99999/v1";
+        }
+      ];
+    };
+  };
+  invalidProxySystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy.declarativeAllow = [
+      {
+        allMethods = true;
+        url = "https://api.example.com/v1";
+      }
+    ];
+  };
+  invalidZeroPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://api.example.com:0/v1";
+        }
+      ];
+    };
+  };
+  mkNixosSystem =
+    extraModule:
+    inputs.nixpkgs.lib.nixosSystem {
+      modules = [
+        ../../modules/nixos/agent-sandbox
+        {
+          agent-sandbox = {
+            enable = true;
+            network.enable = true;
+          };
+
+          nixpkgs.pkgs = pkgs;
+          system.stateVersion = "26.11";
+        }
+        extraModule
+      ];
+
+      specialArgs = { inherit inputs; };
+      system = pkgs.stdenv.hostPlatform.system;
+    };
+  mkWrapper =
+    {
+      dynamic,
+      proxy,
+    }:
+    agentSandboxLib.mkWrapPackage pkgs {
+      package = pkgs.hello;
+      binary = "hello";
+      fsArmPkg = if dynamic then pkgs.hello else null;
+      runtime = runtime proxy;
+      syscallArmPkg = pkgs.hello;
+    };
+  networkModuleSource = builtins.toFile "agent-sandbox-network.nix" (
+    builtins.readFile ../../modules/nixos/agent-sandbox/network.nix
+  );
+  proxyFirewallSource = builtins.toFile "agent-sandbox-proxy-firewall.sh" (
+    builtins.readFile ../../modules/nixos/agent-sandbox/proxy-firewall.sh
+  );
+  proxyGroupLookupCheck = pkgs.writeShellApplication {
+    name = "proxy-group-lookup-regression";
+
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.getent
+      pkgs.glibc.bin
+    ];
+
+    text = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-group-gid.sh;
+  };
+  proxyInitSource = builtins.readFile ../../modules/nixos/agent-sandbox/proxy-init.sh;
+  proxyTproxyRouteSource = builtins.toFile "agent-sandbox-proxy-tproxy-route.sh" (
+    builtins.readFile ../../modules/nixos/agent-sandbox/proxy-tproxy-route.sh
+  );
+  runtime = proxy: {
+    hostIp = "169.254.100.1";
+    httpProxy.enable = proxy;
+    network = { };
+    policyContext = false;
+  };
   script = wrapper: ''
     $(
       _script=$(readlink -f ${wrapper}/bin/hello)
@@ -323,6 +230,91 @@ let
       printf '%s' "$_script"
     )
   '';
+  staticDirect = mkWrapper {
+    dynamic = false;
+    proxy = false;
+  };
+  staticProxy = mkWrapper {
+    dynamic = false;
+    proxy = true;
+  };
+  validFullGlobSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://[ab].example.com/{one,two}/file?.txt";
+        }
+      ];
+    };
+  };
+  validIpv6System = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://[::1]/v1";
+        }
+      ];
+    };
+  };
+  validPaddedPortJson =
+    builtins.fromJSON
+      validPaddedPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+  validPaddedPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://api.example.com:080/v1";
+        }
+      ];
+    };
+  };
+  validPolicyJson =
+    builtins.fromJSON
+      validPolicySystem.config.environment.etc."agent-sandbox/declarative.json".text;
+  validPolicySystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          comment = "API access";
+          url = "https://api.example.com/v1";
+        }
+      ];
+
+      declarativeDeny = [
+        {
+          methods = [ "POST" ];
+          url = "https://api.example.com/v1/private";
+        }
+      ];
+    };
+  };
+  validPortJson =
+    builtins.fromJSON
+      validPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+  validPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://api.example.com:65535/v1";
+        }
+      ];
+    };
+  };
 in
 pkgs.runCommand "network-mode-wrapper-regression" { } ''
   fail() { echo "FAIL: $*" >&2; exit 1; }

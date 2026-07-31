@@ -19,7 +19,15 @@ let
     inherit lib;
     inherit (inputs) jail-nix;
   };
-
+  nonResourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
+    package = pkgs.hello;
+    binary = "hello";
+    devicePaths = [ "/dev/agent-sandbox-regression-device" ];
+    fsArmPkg = pkgs.hello;
+    policyContext = true;
+    policySocket = "/tmp/resource-gate-regression.sock";
+    sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
+  };
   resourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
     package = pkgs.hello;
     binary = "hello";
@@ -30,16 +38,6 @@ let
     resourceGate = true;
     sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
     syscallArmPkg = pkgs.hello;
-  };
-
-  nonResourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
-    package = pkgs.hello;
-    binary = "hello";
-    devicePaths = [ "/dev/agent-sandbox-regression-device" ];
-    fsArmPkg = pkgs.hello;
-    policyContext = true;
-    policySocket = "/tmp/resource-gate-regression.sock";
-    sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
   };
 in
 pkgs.runCommand "resource-gate-wrapper-regression" { } ''

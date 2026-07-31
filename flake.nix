@@ -39,10 +39,13 @@
                   blank-lines-mode = "multiline";
                   flatten = true;
                   merge = true;
+                  name-style = "identifier";
                 };
 
                 formatter = "nixfmt";
                 inherit-placement = "front";
+                inherits.name-style = "identifier";
+                lets.name-style = "identifier";
                 lists.sort = false;
               };
             };

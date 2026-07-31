@@ -6,140 +6,15 @@
   ...
 }:
 let
-  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
-
   agentSandboxLib = import ./lib.nix {
     inherit lib;
     inherit (flake) jail-nix;
   };
-
-  policyPkg = flake.package "agent-sandbox";
-
-  # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
-  fsArmPkg = policyPkg;
-
-  # The Rust workspace package also installs agent-sandbox-syscall-arm and
-  # agent-sandbox-syscall-broker. We expose both as `syscallArmPkg` so the
-  # sandbox entry chain can prepend the arm helper that installs the seccomp
-  # user-notification filter; the broker is spawned by policyd (see the
-  # `agent-sandbox-nfq` / `agent-sandbox-policyd` systemd units).
-  syscallArmPkg = policyPkg;
-
-  isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
-
-  mountPathType = lib.types.addCheck lib.types.str (
+  cfg = config.agent-sandbox;
+  cidrValid = value: builtins.match "^.+/.+$" value != null;
+  credentialPathValid =
     path:
-    lib.assertMsg (isValidMountPath path) ''
-      agent-sandbox mount path must start with ~/ or / (for example "~/.agents" or "/run/user/1000"), got: ${path}
-    ''
-  );
-
-  mountPathDescription = ''
-    Each entry must be an absolute path: `~/…` under the invoking user's `$HOME`
-    (for example `"~/.agents"`), or `/…` on the host (for example `"/run/user/1000"`).
-  '';
-
-  mountOptions = {
-    readonlyDirs = lib.mkOption {
-      type = lib.types.listOf mountPathType;
-      default = [ ];
-      description = "Directories mounted read-only. ${mountPathDescription}";
-    };
-
-    readonlyFiles = lib.mkOption {
-      type = lib.types.listOf mountPathType;
-      default = [ ];
-      description = "Files mounted read-only. ${mountPathDescription}";
-    };
-
-    readwriteDirs = lib.mkOption {
-      type = lib.types.listOf mountPathType;
-      default = [ ];
-      description = "Directories mounted read-write. ${mountPathDescription}";
-    };
-
-    readwriteFiles = lib.mkOption {
-      type = lib.types.listOf mountPathType;
-      default = [ ];
-      description = "Files mounted read-write. ${mountPathDescription}";
-    };
-  };
-
-  hiddenPathType = mountPathType;
-
-  hiddenPathDescription = ''
-    Paths masked inside dynamic-FS sandboxes (``gates.filesystem.enable``).
-    The wrapper bind-mounts the host root, then overlays these entries so
-    the sandbox cannot see their contents: directories become empty tmpfs
-    mounts, files become ``/dev/null``. Use ``~/…`` for paths under the
-    invoking user's ``$HOME``, or ``/…`` for absolute host paths.
-  '';
-
-  httpUrlType = lib.types.addCheck lib.types.str (
-    url:
-    let
-      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" url;
-      port = if match == null then null else builtins.elemAt match 1;
-      portDigits =
-        if port == null then null else builtins.substring 1 (builtins.stringLength port - 1) port;
-      normalizedPort =
-        if portDigits == null then
-          null
-        else
-          let
-            normalized = builtins.match "0*([1-9][0-9]*|0)" portDigits;
-          in
-          if normalized == null then null else builtins.elemAt normalized 0;
-      portValue =
-        if normalizedPort == null then null else builtins.tryEval (builtins.fromJSON normalizedPort);
-    in
-    lib.assertMsg
-      (
-        match != null
-        && (port == null || (portValue.success && portValue.value >= 1 && portValue.value <= 65535))
-      )
-      "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with valid glob syntax and no fragment, got: ${url}"
-  );
-
-  httpMethodType = lib.types.addCheck lib.types.str (
-    method:
-    lib.assertMsg (
-      builtins.stringLength method <= 64 && builtins.match "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" method != null
-    ) "agent-sandbox HTTP rule methods must contain valid HTTP method tokens, got: ${method}"
-  );
-
-  httpRuleType = lib.types.submodule {
-    options = {
-      allMethods = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Match every HTTP method at this URL.";
-      };
-
-      comment = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Optional operator comment for this rule.";
-      };
-
-      methods = lib.mkOption {
-        type = lib.types.nullOr (lib.types.listOf httpMethodType);
-        default = null;
-        description = "HTTP method token list to match; empty means all methods only with allMethods = true.";
-      };
-
-      url = lib.mkOption {
-        type = httpUrlType;
-        description = "Absolute HTTP(S) URL to match.";
-      };
-    };
-  };
-
-  httpRules = {
-    type = lib.types.listOf httpRuleType;
-    default = [ ];
-  };
-
+    path == null || (lib.hasPrefix "/" path && !(lib.hasInfix "\n" path) && !(lib.hasInfix "\r" path));
   dbusFdMetadataType = lib.types.submodule {
     options = {
       kind = lib.mkOption {
@@ -153,7 +28,16 @@ let
       };
     };
   };
+  dbusRuleType = lib.types.submodule {
+    options = {
+      comment = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+      };
 
+      target = lib.mkOption { type = dbusTargetType; };
+    };
+  };
   dbusTargetType = lib.types.submodule {
     options = {
       bus = lib.mkOption {
@@ -190,25 +74,124 @@ let
       signature = lib.mkOption { type = lib.types.str; };
     };
   };
-
-  dbusRuleType = lib.types.submodule {
+  flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
+  # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
+  fsArmPkg = policyPkg;
+  hiddenPathDescription = ''
+    Paths masked inside dynamic-FS sandboxes (``gates.filesystem.enable``).
+    The wrapper bind-mounts the host root, then overlays these entries so
+    the sandbox cannot see their contents: directories become empty tmpfs
+    mounts, files become ``/dev/null``. Use ``~/…`` for paths under the
+    invoking user's ``$HOME``, or ``/…`` for absolute host paths.
+  '';
+  hiddenPathType = mountPathType;
+  httpMethodType = lib.types.addCheck lib.types.str (
+    method:
+    lib.assertMsg (
+      builtins.stringLength method <= 64 && builtins.match "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" method != null
+    ) "agent-sandbox HTTP rule methods must contain valid HTTP method tokens, got: ${method}"
+  );
+  httpRuleType = lib.types.submodule {
     options = {
+      allMethods = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Match every HTTP method at this URL.";
+      };
+
       comment = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
+        description = "Optional operator comment for this rule.";
       };
 
-      target = lib.mkOption { type = dbusTargetType; };
+      methods = lib.mkOption {
+        type = lib.types.nullOr (lib.types.listOf httpMethodType);
+        default = null;
+        description = "HTTP method token list to match; empty means all methods only with allMethods = true.";
+      };
+
+      url = lib.mkOption {
+        type = httpUrlType;
+        description = "Absolute HTTP(S) URL to match.";
+      };
     };
   };
+  httpRules = {
+    type = lib.types.listOf httpRuleType;
+    default = [ ];
+  };
+  httpUrlType = lib.types.addCheck lib.types.str (
+    url:
+    let
+      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" url;
+      normalizedPort =
+        if portDigits == null then
+          null
+        else
+          let
+            normalized = builtins.match "0*([1-9][0-9]*|0)" portDigits;
+          in
+          if normalized == null then null else builtins.elemAt normalized 0;
+      port = if match == null then null else builtins.elemAt match 1;
+      portDigits =
+        if port == null then null else builtins.substring 1 (builtins.stringLength port - 1) port;
+      portValue =
+        if normalizedPort == null then null else builtins.tryEval (builtins.fromJSON normalizedPort);
+    in
+    lib.assertMsg
+      (
+        match != null
+        && (port == null || (portValue.success && portValue.value >= 1 && portValue.value <= 65535))
+      )
+      "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with valid glob syntax and no fragment, got: ${url}"
+  );
+  isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
+  mergePackageMounts =
+    pkgCfg:
+    pkgCfg
+    // {
+      hiddenPaths = lib.unique (cfg.hiddenPaths ++ pkgCfg.hiddenPaths);
+      readonlyDirs = lib.unique (cfg.readonlyDirs ++ sharedRuntimeReadonly ++ pkgCfg.readonlyDirs);
+      readonlyFiles = lib.unique (cfg.readonlyFiles ++ pkgCfg.readonlyFiles);
+      readwriteDirs = lib.unique (cfg.readwriteDirs ++ pkgCfg.readwriteDirs);
+      readwriteFiles = lib.unique (cfg.readwriteFiles ++ pkgCfg.readwriteFiles);
+    };
+  mountOptions = {
+    readonlyDirs = lib.mkOption {
+      type = lib.types.listOf mountPathType;
+      default = [ ];
+      description = "Directories mounted read-only. ${mountPathDescription}";
+    };
 
-  ruleType = lib.types.submodule {
-    options = {
-      host = lib.mkOption { type = lib.types.str; };
-      port = lib.mkOption { type = lib.types.port; };
+    readonlyFiles = lib.mkOption {
+      type = lib.types.listOf mountPathType;
+      default = [ ];
+      description = "Files mounted read-only. ${mountPathDescription}";
+    };
+
+    readwriteDirs = lib.mkOption {
+      type = lib.types.listOf mountPathType;
+      default = [ ];
+      description = "Directories mounted read-write. ${mountPathDescription}";
+    };
+
+    readwriteFiles = lib.mkOption {
+      type = lib.types.listOf mountPathType;
+      default = [ ];
+      description = "Files mounted read-write. ${mountPathDescription}";
     };
   };
-
+  mountPathDescription = ''
+    Each entry must be an absolute path: `~/…` under the invoking user's `$HOME`
+    (for example `"~/.agents"`), or `/…` on the host (for example `"/run/user/1000"`).
+  '';
+  mountPathType = lib.types.addCheck lib.types.str (
+    path:
+    lib.assertMsg (isValidMountPath path) ''
+      agent-sandbox mount path must start with ~/ or / (for example "~/.agents" or "/run/user/1000"), got: ${path}
+    ''
+  );
   packageOptions = mountOptions // {
     package = lib.mkOption {
       type = lib.types.package;
@@ -266,35 +249,30 @@ let
       default = agentSandboxLib.defaultRuntimeReadonlyDirs;
     };
   };
-
-  cfg = config.agent-sandbox;
-
   policyContextEnabled =
     cfg.network.enable || cfg.gates.filesystem.enable || cfg.sudoPolicy == "approve";
-
-  sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
-
+  policyPkg = flake.package "agent-sandbox";
+  ruleType = lib.types.submodule {
+    options = {
+      host = lib.mkOption { type = lib.types.str; };
+      port = lib.mkOption { type = lib.types.port; };
+    };
+  };
   runtime = agentSandboxLib.mkRuntime {
     netnsEnter = "${config.security.wrapperDir}/agent-sandbox-enter";
     rootCfg = cfg;
   };
-
-  mergePackageMounts =
-    pkgCfg:
-    pkgCfg
-    // {
-      hiddenPaths = lib.unique (cfg.hiddenPaths ++ pkgCfg.hiddenPaths);
-      readonlyDirs = lib.unique (cfg.readonlyDirs ++ sharedRuntimeReadonly ++ pkgCfg.readonlyDirs);
-      readonlyFiles = lib.unique (cfg.readonlyFiles ++ pkgCfg.readonlyFiles);
-      readwriteDirs = lib.unique (cfg.readwriteDirs ++ pkgCfg.readwriteDirs);
-      readwriteFiles = lib.unique (cfg.readwriteFiles ++ pkgCfg.readwriteFiles);
-    };
-
+  sharedRuntimeReadonly = lib.optional cfg.network.enable "/run/netns";
   sudoGuardPkg = import ./sudo-guard.nix {
     inherit pkgs policyPkg;
     policy = cfg.sudoPolicy;
   };
-
+  # The Rust workspace package also installs agent-sandbox-syscall-arm and
+  # agent-sandbox-syscall-broker. We expose both as `syscallArmPkg` so the
+  # sandbox entry chain can prepend the arm helper that installs the seccomp
+  # user-notification filter; the broker is spawned by policyd (see the
+  # `agent-sandbox-nfq` / `agent-sandbox-policyd` systemd units).
+  syscallArmPkg = policyPkg;
   wrapOne =
     value:
     agentSandboxLib.mkWrapPackage pkgs (
@@ -304,11 +282,11 @@ let
         inherit runtime;
 
         inherit (runtime)
+          dbus
+          network
+          policyContext
           policySocket
           sandboxPolicySocket
-          policyContext
-          network
-          dbus
           ;
 
         dbusProxyPkg = policyPkg;
@@ -331,12 +309,6 @@ let
         resourceGate = true;
       }
     );
-
-  credentialPathValid =
-    path:
-    path == null || (lib.hasPrefix "/" path && !(lib.hasInfix "\n" path) && !(lib.hasInfix "\r" path));
-
-  cidrValid = value: builtins.match "^.+/.+$" value != null;
 
 in
 {
@@ -709,8 +681,8 @@ in
         message =
           let
             proxy = cfg.network.httpProxy;
-            urls = map (rule: rule.url) (proxy.declarativeAllow ++ proxy.declarativeDeny);
             suffix = lib.optionalString (urls != [ ]) " (configured URLs: ${lib.concatStringsSep ", " urls})";
+            urls = map (rule: rule.url) (proxy.declarativeAllow ++ proxy.declarativeDeny);
           in
           "agent-sandbox.network.httpProxy.declarativeAllow/declarativeDeny require httpProxy.enable${suffix}";
       }
@@ -755,11 +727,11 @@ in
       (final: _: {
         agentSandbox = {
           inherit (agentSandboxLib)
-            mkWrapPackage
-            defaultCommonPkgs
             defaultBlockEnvVars
-            defaultRuntimeReadonlyDirs
+            defaultCommonPkgs
             defaultDevicePaths
+            defaultRuntimeReadonlyDirs
+            mkWrapPackage
             ;
 
           inherit policyPkg;
