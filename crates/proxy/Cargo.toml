@@ -19,6 +19,7 @@ rama-core.workspace = true
 rama-dns.workspace = true
 rama-http.workspace = true
 rama-http-backend.workspace = true
+rama-http-core.workspace = true
 rama-net.workspace = true
 rama-tcp.workspace = true
 rama-tls.workspace = true

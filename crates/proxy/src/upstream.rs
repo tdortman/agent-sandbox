@@ -1,6 +1,6 @@
 use crate::{
     FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
-    is_protocol_negotiation_failure, request_head_clone,
+    is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
 };
 use agent_sandbox_core::HttpRequest;
 use agent_sandbox_proxy::semantic::SemanticRequest;
@@ -19,7 +19,7 @@ use rama_http::{
 use rama_http_backend::client::{HttpConnector, HttpPooledConnectorConfig};
 use rama_net::client::EstablishedClientConnection;
 use rama_tcp::client::service::TcpConnector;
-use rama_tls::client::TlsClientConfig;
+use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
 use std::{
     pin::Pin,
@@ -32,14 +32,23 @@ use std::{
 
 #[async_trait]
 trait UpstreamConnection: Send {
+    fn h2_without_alpn(&self) -> bool;
+
     async fn send(self: Box<Self>) -> Result<Response, BoxError>;
 }
 
 #[async_trait]
 impl<C> UpstreamConnection for EstablishedClientConnection<C, Request>
 where
-    C: Service<Request, Output = Response, Error: Into<BoxError>> + Send + 'static,
+    C: Service<Request, Output = Response, Error: Into<BoxError>> + ExtensionsRef + Send + 'static,
 {
+    fn h2_without_alpn(&self) -> bool {
+        self.conn
+            .extensions()
+            .get_ref::<NegotiatedTlsParameters>()
+            .is_some_and(|params| params.application_layer_protocol.is_none())
+    }
+
     async fn send(self: Box<Self>) -> Result<Response, BoxError> {
         let connection = *self;
 
@@ -61,7 +70,7 @@ impl<S, C> UpstreamClient for Arc<S>
 where
     S: Service<Request, Output = EstablishedClientConnection<C, Request>> + Send + Sync + 'static,
     S::Error: Into<BoxError>,
-    C: Service<Request, Output = Response, Error: Into<BoxError>> + Send + 'static,
+    C: Service<Request, Output = Response, Error: Into<BoxError>> + ExtensionsRef + Send + 'static,
 {
     async fn connect(&self, request: Request) -> Result<Box<dyn UpstreamConnection>, BoxError> {
         self.serve(request)
@@ -208,6 +217,23 @@ fn build_upstream_client() -> Result<Arc<dyn UpstreamClient>, BoxError> {
     Ok(Arc::new(client))
 }
 
+fn is_no_alpn_h2_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<rama_http_core::Error>()
+            .is_some_and(rama_http_core::Error::is_canceled)
+        {
+            return true;
+        }
+
+        source = error.source();
+    }
+
+    false
+}
+
 pub async fn send_upstream_request(
     mut request: Request,
     state: &FlowState,
@@ -282,7 +308,7 @@ pub async fn send_upstream_request(
         started: AtomicBool::new(false),
     });
 
-    let retry_request = (selected_version == Version::HTTP_2).then(|| {
+    let mut retry_request = (selected_version == Version::HTTP_2).then(|| {
         request_head_clone(
             &request,
             Version::HTTP_11,
@@ -292,18 +318,31 @@ pub async fn send_upstream_request(
 
     request = request.map(|_| Body::new(ReplayBody::new(replay_state.clone())));
     let client = state.upstream_clients.for_version(selected_version);
-
-    let first_result = match client.connect(request).await {
-        Ok(connection) => connection.send().await,
-        Err(error) => Err(error),
-    };
-
-    let response = match first_result {
-        Ok(response) => response,
+    let connection = match client.connect(request).await {
+        Ok(connection) => connection,
         Err(error)
             if retry_request.is_some()
                 && !replay_state.started.load(Ordering::Acquire)
                 && is_protocol_negotiation_failure(&error) =>
+        {
+            let retry_request = retry_request.take().expect("retry request was checked");
+            state
+                .upstream_clients
+                .for_version(Version::HTTP_11)
+                .connect(retry_request)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
+    let h2_without_alpn = connection.h2_without_alpn();
+
+    let response = match connection.send().await {
+        Ok(response) => response,
+        Err(error)
+            if retry_request.is_some()
+                && !replay_state.started.load(Ordering::Acquire)
+                && (is_h2_protocol_negotiation_failure(error.as_ref(), h2_without_alpn)
+                    || (h2_without_alpn && is_no_alpn_h2_cancellation(error.as_ref()))) =>
         {
             let retry_request = retry_request.expect("retry request was checked");
             let connection = state
@@ -322,8 +361,8 @@ pub async fn send_upstream_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplayBody, ReplayBodyState, StreamingBody, is_protocol_negotiation_failure,
-        select_upstream_version,
+        ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
+        is_protocol_negotiation_failure, select_upstream_version,
     };
     use rama_http::{Body, Version};
     use std::{
@@ -390,6 +429,27 @@ mod tests {
     fn only_protocol_negotiation_errors_trigger_retry() {
         assert!(is_protocol_negotiation_failure(&"h2 handshake failed"));
         assert!(is_protocol_negotiation_failure(&"NoApplicationProtocol"));
+        assert!(!is_protocol_negotiation_failure(&"http2 error"));
         assert!(!is_protocol_negotiation_failure(&"upstream policy denied"));
+
+        let protocol_error: rama_http_core::h2::Error =
+            rama_http_core::h2::Reason::PROTOCOL_ERROR.into();
+        assert!(is_h2_protocol_negotiation_failure(&protocol_error, true));
+        assert!(!is_h2_protocol_negotiation_failure(&protocol_error, false));
+
+        let frame_size_error: rama_http_core::h2::Error =
+            rama_http_core::h2::Reason::FRAME_SIZE_ERROR.into();
+        assert!(is_h2_protocol_negotiation_failure(&frame_size_error, true));
+        assert!(!is_h2_protocol_negotiation_failure(
+            &frame_size_error,
+            false
+        ));
+
+        let http11_required: rama_http_core::h2::Error =
+            rama_http_core::h2::Reason::HTTP_1_1_REQUIRED.into();
+        assert!(!is_h2_protocol_negotiation_failure(&http11_required, true));
+
+        let cancel_error: rama_http_core::h2::Error = rama_http_core::h2::Reason::CANCEL.into();
+        assert!(!is_h2_protocol_negotiation_failure(&cancel_error, true));
     }
 }

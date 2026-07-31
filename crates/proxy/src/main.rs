@@ -1005,6 +1005,32 @@ fn is_protocol_negotiation_failure(error: &dyn Display) -> bool {
     .any(|marker| error.contains(marker))
 }
 
+fn is_h2_protocol_negotiation_failure(
+    error: &(dyn Error + 'static),
+    h2_without_alpn: bool,
+) -> bool {
+    let mut source = Some(error);
+
+    while let Some(error) = source {
+        if let Some(h2_error) = error.downcast_ref::<rama_http_core::h2::Error>() {
+            return match h2_error.reason() {
+                Some(
+                    rama_http_core::h2::Reason::PROTOCOL_ERROR
+                    | rama_http_core::h2::Reason::FRAME_SIZE_ERROR,
+                ) => h2_without_alpn && !h2_error.is_remote(),
+                Some(rama_http_core::h2::Reason::HTTP_1_1_REQUIRED) => {
+                    !h2_error.is_library() && h2_error.is_remote()
+                }
+                _ => false,
+            };
+        }
+
+        source = error.source();
+    }
+
+    false
+}
+
 fn adapt_http10_response(mut response: Response) -> Response {
     response.headers_mut().remove("content-length");
     response.headers_mut().remove("transfer-encoding");

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.29.1"
+version = "0.30.0"
 edition = "2024"
 license = "MIT"
 
@@ -22,6 +22,7 @@ libc = "0.2.189"
 nfq-updated = "0.2.6"
 nix = "0.31.3"
 rama-dns = { version = "0.3.0", default-features = false }
+rama-http-core = { version = "0.3.0", default-features = false }
 rama-http = { version = "0.3.0", default-features = false }
 rama-net = { version = "0.3.0", default-features = false, features = ["std"] }
 rama-tcp = "0.3.0"
