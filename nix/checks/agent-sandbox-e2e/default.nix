@@ -308,131 +308,134 @@ let
     })
   ];
   proxyNode =
-    baseNode
-    // (httpServers [
-      { port = 8008; }
-      { port = 8080; }
+    lib.recursiveUpdate
+      (
+        baseNode
+        // (httpServers [
+          { port = 8008; }
+          { port = 8080; }
+          {
+            certificate = "${tlsFixture}/server-cert.pem";
+            port = 8443;
+            privateKey = "${tlsFixture}/server-key.pem";
+            serviceName = "https";
+          }
+        ])
+      )
       {
-        certificate = "${tlsFixture}/server-cert.pem";
-        port = 8443;
-        privateKey = "${tlsFixture}/server-key.pem";
-        serviceName = "https";
-      }
-    ])
-    // {
-      imports = [ module ];
+        imports = [ module ];
 
-      agent-sandbox = {
-        enable = true;
-        gates.syscalls.enable = true;
-
-        network = {
+        agent-sandbox = {
           enable = true;
+          gates.syscalls.enable = true;
 
-          httpProxy = {
+          network = {
             enable = true;
-            caCertificateFile = "${tlsFixture}/ca-cert.pem";
-            caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
 
-            declarativeAllow = [
-              {
-                methods = [ "GET" ];
-                url = "http://169.254.100.1:8008/allowed";
-              }
-              {
-                methods = [ "GET" ];
-                url = "http://169.254.100.1:8080/allowed";
-              }
-              {
-                methods = [ "GET" ];
-                url = "http://169.254.100.1:8008/stream";
-              }
-              {
-                methods = [ "GET" ];
-                url = "https://169.254.100.1:8443/allowed";
-              }
-              {
-                methods = [ "GET" ];
-                url = "https://169.254.100.1:443/allowed";
-              }
-              {
-                methods = [ "GET" ];
-                url = "https://[fd00:dead:beef::1]:443/allowed";
-              }
-            ];
+            httpProxy = {
+              enable = true;
+              caCertificateFile = "${tlsFixture}/ca-cert.pem";
+              caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
 
-            declarativeDeny = [
-              {
-                allMethods = true;
-                url = "http://169.254.100.1:8008/denied";
-              }
-              {
-                allMethods = true;
-                url = "https://169.254.100.1:8443/denied";
-              }
-              {
-                allMethods = true;
-                url = "https://169.254.100.1:443/denied";
-              }
-            ];
+              declarativeAllow = [
+                {
+                  methods = [ "GET" ];
+                  url = "http://169.254.100.1:8008/allowed";
+                }
+                {
+                  methods = [ "GET" ];
+                  url = "http://169.254.100.1:8080/allowed";
+                }
+                {
+                  methods = [ "GET" ];
+                  url = "http://169.254.100.1:8008/stream";
+                }
+                {
+                  methods = [ "GET" ];
+                  url = "https://169.254.100.1:8443/allowed";
+                }
+                {
+                  methods = [ "GET" ];
+                  url = "https://169.254.100.1:443/allowed";
+                }
+                {
+                  methods = [ "GET" ];
+                  url = "https://[fd00:dead:beef::1]:443/allowed";
+                }
+              ];
 
-            http3.enable = true;
+              declarativeDeny = [
+                {
+                  allMethods = true;
+                  url = "http://169.254.100.1:8008/denied";
+                }
+                {
+                  allMethods = true;
+                  url = "https://169.254.100.1:8443/denied";
+                }
+                {
+                  allMethods = true;
+                  url = "https://169.254.100.1:443/denied";
+                }
+              ];
 
-            upstreamAllowCidrs = [
-              "169.254.100.1/32"
-              "fd00:dead:beef::1/128"
-            ];
+              http3.enable = true;
+
+              upstreamAllowCidrs = [
+                "169.254.100.1/32"
+                "fd00:dead:beef::1/128"
+              ];
+            };
+
+            vethHost = "asbx-test-host";
+            vethNetns = "asbx-test-ns";
           };
 
-          vethHost = "asbx-test-host";
-          vethNetns = "asbx-test-ns";
+          packages = proxyNetworkPackages;
+
+          policy = {
+            interactiveApproval = false;
+            uiBackend = "none";
+          };
         };
 
-        packages = proxyNetworkPackages;
-
-        policy = {
-          interactiveApproval = false;
-          uiBackend = "none";
-        };
-      };
-
-      networking.firewall.interfaces.asbx-test-host = {
-        allowedTCPPorts = [
-          8008
-          8080
-          8443
-        ];
-
-        allowedUDPPorts = [ 443 ];
-      };
-
-      systemd.services.agent-sandbox-vm-h3-http = {
-        description = "HTTP/3 origin for the sandbox e2e check";
-        after = [ "network.target" ];
-        wantedBy = [ "multi-user.target" ];
-
-        serviceConfig = {
-          AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
-          CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
-
-          ExecStart = lib.escapeShellArgs [
-            "${sandboxPkg}/bin/h3-origin"
-            "--address"
-            "::"
-            "--port"
-            "443"
-            "--certificate"
-            "${tlsFixture}/server-cert.pem"
-            "--private-key"
-            "${tlsFixture}/server-key.pem"
-            "--log"
-            "/var/log/h3-origin.log"
+        networking.firewall.interfaces.asbx-test-host = {
+          allowedTCPPorts = [
+            8008
+            8080
+            8443
           ];
 
-          Restart = "on-failure";
+          allowedUDPPorts = [ 443 ];
+        };
+
+        systemd.services.agent-sandbox-vm-h3-http = {
+          description = "HTTP/3 origin for the sandbox e2e check";
+          after = [ "network.target" ];
+          wantedBy = [ "multi-user.target" ];
+
+          serviceConfig = {
+            AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+            CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+
+            ExecStart = lib.escapeShellArgs [
+              "${sandboxPkg}/bin/h3-origin"
+              "--address"
+              "::"
+              "--port"
+              "443"
+              "--certificate"
+              "${tlsFixture}/server-cert.pem"
+              "--private-key"
+              "${tlsFixture}/server-key.pem"
+              "--log"
+              "/var/log/h3-origin.log"
+            ];
+
+            Restart = "on-failure";
+          };
         };
       };
-    };
   resourcePackages = [
     (mkBash "sandbox-resource-bash" {
       extraPkgs = commonExtraPkgs;
