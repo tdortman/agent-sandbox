@@ -1,4 +1,5 @@
 pub mod cert;
+pub mod http3;
 pub mod policy;
 pub mod semantic;
 use rama_http::{HeaderName, Response};

@@ -1,6 +1,6 @@
 //! Protocol-independent HTTP values shared by proxy backends.
 //!
-//! This module deliberately does not depend on Rama, quiche, or socket types.
+//! This module deliberately does not depend on Rama, quinn, or socket types.
 
 use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
@@ -8,6 +8,27 @@ use agent_sandbox_core::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 use std::{collections::VecDeque, fmt};
+
+/// Whether a header must not be forwarded end to end.
+///
+/// The header is either a hop-by-hop field or a field named by the
+/// connection header tokens of the message.
+#[must_use]
+pub fn is_hop_by_hop_header(name: &str, connection_tokens: &[String]) -> bool {
+    let name = name.to_ascii_lowercase();
+
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || connection_tokens.iter().any(|token| token == &name)
+}
 
 /// HTTP versions supported by the semantic proxy contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

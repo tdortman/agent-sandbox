@@ -34,6 +34,12 @@ pub struct IssuedCertificate {
     pub private_key: Arc<PrivateKeyDer<'static>>,
 }
 
+impl std::fmt::Debug for CertificateIssuer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CertificateIssuer")
+    }
+}
+
 impl CertificateIssuer {
     /// Load an interception CA certificate and private key from PEM.
     ///

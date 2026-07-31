@@ -3,10 +3,15 @@ pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
     cert::CertificateIssuer,
-    policy::{FlowClaim, PolicySession, authority_for_policy, flow_key, normalize_authority},
+    http3::{self, Http3Config},
+    policy::{
+        FlowClaim, PendingPolicyCheck, PolicySession, authority_for_policy, flow_key,
+        normalize_authority,
+    },
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
         ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, TerminalError,
+        is_hop_by_hop_header,
     },
     strip_alt_svc,
 };
@@ -151,6 +156,12 @@ struct Args {
 
     #[arg(long, env = "AGENT_SANDBOX_PROXY_CA_KEY")]
     ca_private_key: Option<PathBuf>,
+
+    #[arg(long, env = "AGENT_SANDBOX_PROXY_HTTP3")]
+    http3: bool,
+
+    #[arg(long, default_value_t = 443)]
+    http3_listen_port: u16,
 
     #[arg(long)]
     init_ech_state_only: bool,
@@ -346,23 +357,6 @@ async fn main() -> Result<(), BoxError> {
 
     let args = Args::parse();
 
-    let websocket_http11_urls = args
-        .websocket_http11_urls
-        .iter()
-        .map(|pattern| {
-            HttpUrl::parse_pattern(pattern).map_err(|error| {
-                BoxError::from(format!(
-                    "invalid WebSocket HTTP/1.1 URL pattern {pattern:?}: {error}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let websocket_http11_urls = Arc::new(websocket_http11_urls);
-
-    let http10_upstream_origins =
-        Arc::new(canonical_http10_origins(&args.http10_upstream_origins)?);
-
     if args.init_ech_state_only {
         let state_dir = args
             .ech_state_dir
@@ -373,31 +367,7 @@ async fn main() -> Result<(), BoxError> {
         return Ok(());
     }
 
-    let ech_state = args
-        .ech_state_dir
-        .as_deref()
-        .map(ech_state::load_or_generate)
-        .transpose()?;
-
-    let ech_config_list =
-        select_ech_config_list(args.ech_config_list.as_deref(), ech_state.as_ref())?;
-
-    let ech_private_key = ech_state.map(|state| state.private_key);
-
-    let ca_certificate = args
-        .ca_certificate
-        .as_deref()
-        .ok_or_else(|| BoxError::from_static_str("CA certificate is required"))?;
-
-    let ca_certificate = std::fs::read_to_string(ca_certificate)?;
-
-    let ca_private_key = args
-        .ca_private_key
-        .as_deref()
-        .ok_or_else(|| BoxError::from_static_str("CA private key is required"))?;
-
-    let ca_private_key = std::fs::read_to_string(ca_private_key)?;
-    let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
+    let (issuer, listener_config) = load_listener_config(&args)?;
 
     let policy = Arc::new(
         PolicySession::open(
@@ -411,30 +381,12 @@ async fn main() -> Result<(), BoxError> {
     let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
     let executor = Executor::default();
 
-    let listener_config = ListenerConfig {
-        issuer,
-        ech_config_list,
-        ech_private_key,
-        websocket_http11_urls,
-        http10_upstream_origins,
-        #[cfg(debug_assertions)]
-        destination_resolver: args
-            .test_destination
-            .map_or_else(|| Arc::new(destination_for_stream), destination_override),
-        #[cfg(not(debug_assertions))]
-        destination_resolver: Arc::new(destination_for_stream),
-        #[cfg(debug_assertions)]
-        test_tls: args.test_tls,
-        #[cfg(not(debug_assertions))]
-        test_tls: false,
-    };
-
     let service = build_listener_service(
         executor.clone(),
         policy.clone(),
         listener_config,
         shutdown.clone(),
-        active_checks,
+        active_checks.clone(),
         args.listen_port,
     );
 
@@ -443,6 +395,23 @@ async fn main() -> Result<(), BoxError> {
 
     #[cfg(not(debug_assertions))]
     let transparent = true;
+
+    if args.http3 {
+        let http3 = Http3Config {
+            policy: policy.clone(),
+            issuer: issuer.clone(),
+            shutdown: shutdown.clone(),
+            active_checks: active_checks.clone(),
+            listen_port: args.http3_listen_port,
+            #[cfg(debug_assertions)]
+            test_destination: args.test_destination,
+            #[cfg(not(debug_assertions))]
+            test_destination: None,
+        };
+
+        let backend = http3::prepare(http3)?;
+        tokio::spawn(http3::run(backend));
+    }
 
     run_listeners(
         service,
@@ -646,6 +615,71 @@ fn build_listener_service(
     })
 }
 
+fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenerConfig), BoxError> {
+    let websocket_http11_urls = args
+        .websocket_http11_urls
+        .iter()
+        .map(|pattern| {
+            HttpUrl::parse_pattern(pattern).map_err(|error| {
+                BoxError::from(format!(
+                    "invalid WebSocket HTTP/1.1 URL pattern {pattern:?}: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let websocket_http11_urls = Arc::new(websocket_http11_urls);
+
+    let http10_upstream_origins =
+        Arc::new(canonical_http10_origins(&args.http10_upstream_origins)?);
+
+    let ech_state = args
+        .ech_state_dir
+        .as_deref()
+        .map(ech_state::load_or_generate)
+        .transpose()?;
+
+    let ech_config_list =
+        select_ech_config_list(args.ech_config_list.as_deref(), ech_state.as_ref())?;
+
+    let ech_private_key = ech_state.map(|state| state.private_key);
+
+    let ca_certificate = args
+        .ca_certificate
+        .as_deref()
+        .ok_or_else(|| BoxError::from_static_str("CA certificate is required"))?;
+
+    let ca_certificate = std::fs::read_to_string(ca_certificate)?;
+
+    let ca_private_key = args
+        .ca_private_key
+        .as_deref()
+        .ok_or_else(|| BoxError::from_static_str("CA private key is required"))?;
+
+    let ca_private_key = std::fs::read_to_string(ca_private_key)?;
+    let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
+
+    let listener_config = ListenerConfig {
+        issuer: issuer.clone(),
+        ech_config_list,
+        ech_private_key,
+        websocket_http11_urls,
+        http10_upstream_origins,
+        #[cfg(debug_assertions)]
+        destination_resolver: args
+            .test_destination
+            .map_or_else(|| Arc::new(destination_for_stream), destination_override),
+        #[cfg(not(debug_assertions))]
+        destination_resolver: Arc::new(destination_for_stream),
+        #[cfg(debug_assertions)]
+        test_tls: args.test_tls,
+        #[cfg(not(debug_assertions))]
+        test_tls: false,
+    };
+
+    Ok((issuer, listener_config))
+}
+
 fn destination_for_stream(stream: &TcpStream, listen_port: u16) -> Result<SocketAddr, BoxError> {
     let local: SocketAddr = stream.local_addr()?.into();
 
@@ -676,41 +710,6 @@ fn original_destination(stream: &TcpStream) -> Option<SocketAddr> {
                 0,
             ))
         })
-}
-
-struct PendingPolicyCheck {
-    policy: Arc<PolicySession>,
-    request_id: ProxyRequestId,
-    armed: bool,
-}
-
-impl PendingPolicyCheck {
-    const fn new(policy: Arc<PolicySession>, request_id: ProxyRequestId) -> Self {
-        Self {
-            policy,
-            request_id,
-            armed: true,
-        }
-    }
-
-    const fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingPolicyCheck {
-    fn drop(&mut self) {
-        if self.armed {
-            let policy = self.policy.clone();
-            let request_id = self.request_id;
-
-            tokio::spawn(async move {
-                if let Err(error) = policy.cancel(request_id).await {
-                    error!(%error, "failed to cancel dropped HTTP policy check");
-                }
-            });
-        }
-    }
 }
 
 fn is_doh_request(request: &Request) -> bool {
@@ -1481,22 +1480,6 @@ fn semantic_request_headers(request: &Request) -> Result<SemanticHeaders, BoxErr
     }
 
     Ok(headers)
-}
-
-fn is_hop_by_hop_header(name: &str, connection_tokens: &[String]) -> bool {
-    let name = name.to_ascii_lowercase();
-
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    ) || connection_tokens.iter().any(|token| token == &name)
 }
 
 fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, BoxError> {

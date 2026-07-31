@@ -6,10 +6,11 @@ use agent_sandbox_core::{
 use std::{
     env, fs,
     io::ErrorKind,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     num::NonZeroU16,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -28,6 +29,46 @@ pub struct PolicySession {
     token: ProxySessionToken,
     timeout: Duration,
     ready_path: Option<PathBuf>,
+}
+
+/// Cancels a pending HTTP approval when dropped before a reply arrives.
+///
+/// The drop path runs in a spawned task so the cancellation RPC can be
+/// awaited without blocking the dropping frame.
+pub struct PendingPolicyCheck {
+    policy: Arc<PolicySession>,
+    request_id: ProxyRequestId,
+    armed: bool,
+}
+
+impl PendingPolicyCheck {
+    #[must_use]
+    pub const fn new(policy: Arc<PolicySession>, request_id: ProxyRequestId) -> Self {
+        Self {
+            policy,
+            request_id,
+            armed: true,
+        }
+    }
+
+    pub const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingPolicyCheck {
+    fn drop(&mut self) {
+        if self.armed {
+            let policy = self.policy.clone();
+            let request_id = self.request_id;
+
+            tokio::spawn(async move {
+                if let Err(error) = policy.cancel(request_id).await {
+                    tracing::error!(%error, "failed to cancel dropped HTTP policy check");
+                }
+            });
+        }
+    }
 }
 
 impl PolicySession {
@@ -338,8 +379,8 @@ pub enum PolicyError {
 ///
 /// Returns an error when either socket endpoint has a zero port.
 pub fn flow_key(
-    source: std::net::SocketAddr,
-    destination: std::net::SocketAddr,
+    source: SocketAddr,
+    destination: SocketAddr,
 ) -> Result<NetworkFlowKey, PolicyError> {
     let source_port = NonZeroU16::new(source.port())
         .ok_or_else(|| PolicyError::Rpc("source port must be non-zero".to_owned()))?;
@@ -349,6 +390,30 @@ pub fn flow_key(
 
     Ok(NetworkFlowKey::new(
         FlowProtocol::Tcp,
+        source.ip(),
+        source_port,
+        destination.ip(),
+        destination_port,
+    ))
+}
+
+/// Build the typed flow key used to claim an intercepted UDP association.
+///
+/// # Errors
+///
+/// Returns an error when either socket endpoint has a zero port.
+pub fn udp_flow_key(
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> Result<NetworkFlowKey, PolicyError> {
+    let source_port = NonZeroU16::new(source.port())
+        .ok_or_else(|| PolicyError::Rpc("source port must be non-zero".to_owned()))?;
+
+    let destination_port = NonZeroU16::new(destination.port())
+        .ok_or_else(|| PolicyError::Rpc("destination port must be non-zero".to_owned()))?;
+
+    Ok(NetworkFlowKey::new(
+        FlowProtocol::Udp,
         source.ip(),
         source_port,
         destination.ip(),
