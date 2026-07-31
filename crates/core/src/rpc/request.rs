@@ -7,13 +7,11 @@ use super::{
     },
     scope::ApprovalScope,
 };
-
 use crate::{
     ProcessIds, ResolvedRequestContext, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
-
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
@@ -168,6 +166,13 @@ pub enum RpcRequest {
         connection_id: ProxyConnectionId,
     },
 
+    RebindNetworkFlow {
+        proxy_session: ProxySessionToken,
+        attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
+        flow: NetworkFlowKey,
+    },
+
     CheckHttp {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
@@ -189,6 +194,7 @@ pub enum RpcRequest {
     ReleaseNetworkFlow {
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
     },
 
     Check {
@@ -347,6 +353,13 @@ enum RpcRequestWire {
         connection_id: ProxyConnectionId,
     },
 
+    RebindNetworkFlow {
+        proxy_session: ProxySessionToken,
+        attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
+        flow: NetworkFlowKey,
+    },
+
     CheckHttp {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
@@ -368,6 +381,7 @@ enum RpcRequestWire {
     ReleaseNetworkFlow {
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
     },
 
     Check {
@@ -530,6 +544,13 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
         "open_proxy_session" => &["op"][..],
         "register_network_flow" => &["op", "registration"][..],
         "claim_network_flow" => &["op", "proxy_session", "flow", "connection_id"][..],
+        "rebind_network_flow" => &[
+            "op",
+            "proxy_session",
+            "attribution_token",
+            "connection_id",
+            "flow",
+        ][..],
         "check_http" => &[
             "op",
             "proxy_session",
@@ -539,7 +560,9 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
         ][..],
         "check_network_flow" => &["op", "proxy_session", "request_id", "attribution_token"][..],
         "cancel_check" => &["op", "proxy_session", "request_id"][..],
-        "release_network_flow" => &["op", "proxy_session", "attribution_token"][..],
+        "release_network_flow" => {
+            &["op", "proxy_session", "attribution_token", "connection_id"][..]
+        }
         _ => return Ok(()),
     };
 
@@ -567,6 +590,20 @@ impl RpcRequest {
             proxy_session,
             flow,
             connection_id,
+        }
+    }
+
+    const fn rebind_network_flow(
+        proxy_session: ProxySessionToken,
+        attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
+        flow: NetworkFlowKey,
+    ) -> Self {
+        Self::RebindNetworkFlow {
+            proxy_session,
+            attribution_token,
+            connection_id,
+            flow,
         }
     }
 
@@ -606,10 +643,12 @@ impl RpcRequest {
     const fn release_network_flow(
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
     ) -> Self {
         Self::ReleaseNetworkFlow {
             proxy_session,
             attribution_token,
+            connection_id,
         }
     }
 
@@ -736,6 +775,13 @@ impl From<RpcRequestWire> for RpcRequest {
                 connection_id,
             } => Self::claim_network_flow(proxy_session, flow, connection_id),
 
+            RpcRequestWire::RebindNetworkFlow {
+                proxy_session,
+                attribution_token,
+                connection_id,
+                flow,
+            } => Self::rebind_network_flow(proxy_session, attribution_token, connection_id, flow),
+
             RpcRequestWire::CheckHttp {
                 proxy_session,
                 request_id,
@@ -757,7 +803,8 @@ impl From<RpcRequestWire> for RpcRequest {
             RpcRequestWire::ReleaseNetworkFlow {
                 proxy_session,
                 attribution_token,
-            } => Self::release_network_flow(proxy_session, attribution_token),
+                connection_id,
+            } => Self::release_network_flow(proxy_session, attribution_token, connection_id),
 
             RpcRequestWire::Check {
                 host,
@@ -848,6 +895,7 @@ impl RpcRequest {
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
             | Self::ClaimNetworkFlow { .. }
+            | Self::RebindNetworkFlow { .. }
             | Self::CheckHttp { .. }
             | Self::CheckNetworkFlow { .. }
             | Self::CancelCheck { .. }
@@ -875,6 +923,7 @@ impl RpcRequest {
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
             | Self::ClaimNetworkFlow { .. }
+            | Self::RebindNetworkFlow { .. }
             | Self::CheckHttp { .. }
             | Self::CheckNetworkFlow { .. }
             | Self::CancelCheck { .. }
@@ -969,6 +1018,70 @@ mod tests {
             serde_json::from_str::<RpcRequest>(r#"{"op":"open_proxy_session","unexpected":true}"#)
                 .expect_err("proxy wire must reject unknown fields");
 
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rebind_network_flow_round_trips_and_rejects_unknown_fields() {
+        use crate::{
+            AttributionToken, FlowProtocol, NetworkFlowKey, ProxyConnectionId, ProxySessionToken,
+        };
+
+        let flow = NetworkFlowKey::try_new(
+            FlowProtocol::Udp,
+            "127.0.0.1".parse().expect("valid source"),
+            4242,
+            "1.1.1.1".parse().expect("valid destination"),
+            443,
+        )
+        .expect("valid flow");
+
+        let request = RpcRequest::RebindNetworkFlow {
+            proxy_session: ProxySessionToken::from_bytes([1; 32]),
+            attribution_token: AttributionToken::from_bytes([2; 32]),
+            connection_id: ProxyConnectionId::new(),
+            flow,
+        };
+
+        let wire = serde_json::to_value(&request).expect("serialize rebind");
+        assert_eq!(wire["op"], "rebind_network_flow");
+        let decoded =
+            serde_json::from_value::<RpcRequest>(wire.clone()).expect("deserialize rebind");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("reserialize rebind"),
+            wire
+        );
+
+        let mut unknown = wire;
+        unknown["unexpected"] = serde_json::json!(true);
+        let error = serde_json::from_value::<RpcRequest>(unknown)
+            .expect_err("rebind wire must reject unknown fields");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn release_network_flow_requires_connection_identifier() {
+        use crate::{AttributionToken, ProxyConnectionId, ProxySessionToken};
+
+        let request = RpcRequest::ReleaseNetworkFlow {
+            proxy_session: ProxySessionToken::from_bytes([1; 32]),
+            attribution_token: AttributionToken::from_bytes([2; 32]),
+            connection_id: ProxyConnectionId::new(),
+        };
+
+        let wire = serde_json::to_value(&request).expect("serialize release");
+        assert_eq!(wire["op"], "release_network_flow");
+        let decoded =
+            serde_json::from_value::<RpcRequest>(wire.clone()).expect("deserialize release");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("reserialize release"),
+            wire
+        );
+
+        let mut unknown = wire;
+        unknown["unexpected"] = serde_json::json!(true);
+        let error = serde_json::from_value::<RpcRequest>(unknown)
+            .expect_err("release wire must reject unknown fields");
         assert!(error.to_string().contains("unknown field"));
     }
 
