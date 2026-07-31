@@ -17,7 +17,7 @@ use rama_core::{
     Service,
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
-    extensions::{ExtensionsRef, Ingress},
+    extensions::ExtensionsRef,
     io::Io,
     matcher::{match_fn, service::MatcherServicePair},
     rt::Executor,
@@ -322,11 +322,18 @@ where
         });
 
         let stream = rama_tls_boring::core::tokio::accept(&acceptor.build(), stream).await?;
+        let stream = TlsStream::new(stream);
 
-        self.inner
-            .serve(TlsStream::new(stream))
-            .await
-            .map_err(Into::into)
+        // Record the negotiated SNI on the connection extensions. The HTTP
+        // server clones those extensions into each request's `Ingress`,
+        // giving policy the verified TLS identity for authority resolution.
+        if let Some(server_name) = stream.ssl_ref().servername(NameType::HOST_NAME) {
+            stream
+                .extensions()
+                .insert(TlsServerName(server_name.to_owned()));
+        }
+
+        self.inner.serve(stream).await.map_err(Into::into)
     }
 }
 
@@ -580,9 +587,9 @@ fn build_listener_service(
                 async move {
                     let tls_server_name = request
                         .extensions()
-                        .get_ref::<Ingress<TlsStream<TcpStream>>>()
-                        .and_then(|ingress| ingress.ssl_ref().servername(NameType::HOST_NAME))
-                        .map(str::to_owned);
+                        .ingress()
+                        .and_then(|ingress| ingress.get_ref::<TlsServerName>())
+                        .map(|name| name.0.clone());
 
                     if let Some(server_name) = tls_server_name {
                         request.extensions().insert(TlsServerName(server_name));
