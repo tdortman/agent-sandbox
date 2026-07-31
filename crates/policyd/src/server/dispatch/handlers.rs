@@ -12,12 +12,10 @@ use crate::{
     store::{PolicyStore, UiClientHandle},
     wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire},
 };
-
 use agent_sandbox_core::{
     ApprovalScope, RegisterUiReply, ResolvedRequestContext, RpcReply, SimpleOkReply,
     split_check_aliases,
 };
-
 use std::{path::PathBuf, sync::Arc};
 
 pub async fn handle(
@@ -39,6 +37,7 @@ const fn is_proxy_request(req: &ResolvedRpcRequest) -> bool {
         ResolvedRpcRequest::OpenProxySession
             | ResolvedRpcRequest::RegisterNetworkFlow { .. }
             | ResolvedRpcRequest::ClaimNetworkFlow { .. }
+            | ResolvedRpcRequest::RebindNetworkFlow { .. }
             | ResolvedRpcRequest::CheckHttp { .. }
             | ResolvedRpcRequest::CheckNetworkFlow { .. }
             | ResolvedRpcRequest::CancelCheck { .. }
@@ -70,6 +69,18 @@ async fn handle_proxy_request(
                 .claim_network_flow(proxy_session, flow, connection_id)
                 .await?,
         )),
+
+        ResolvedRpcRequest::RebindNetworkFlow {
+            proxy_session,
+            attribution_token,
+            connection_id,
+            flow,
+        } => {
+            store
+                .rebind_network_flow(proxy_session, attribution_token, connection_id, flow)
+                .await?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
 
         ResolvedRpcRequest::CheckHttp {
             proxy_session,
@@ -103,9 +114,10 @@ async fn handle_proxy_request(
         ResolvedRpcRequest::ReleaseNetworkFlow {
             proxy_session,
             attribution_token,
+            connection_id,
         } => {
             store
-                .release_network_flow(proxy_session, attribution_token)
+                .release_network_flow(proxy_session, attribution_token, connection_id)
                 .await?;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
@@ -410,12 +422,10 @@ async fn handle_approve_host(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         error::PolicydError,
         store::{PolicyStore, TrustedPeer},
     };
-
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
     use std::{sync::Arc, time::Duration};
     use tokio::{net::UnixStream, sync::Mutex};

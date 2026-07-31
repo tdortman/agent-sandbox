@@ -4,14 +4,12 @@ use crate::{
     server::{dispatch::SocketRole, peer::ClientPeer},
     store::{PolicyStore, TrustedPeer},
 };
-
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, AttributionToken, FileAccess, FilesystemRule, FlowRegistration,
     HttpRequest, HttpRuleTarget, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
     ProxySessionToken, RequestContext, ResolvedRequestContext, ResourceAccess, ResourceKind,
     RpcRequest,
 };
-
 use std::{path::PathBuf, sync::Arc};
 
 pub(super) enum ResolvedRpcRequest {
@@ -30,6 +28,13 @@ pub(super) enum ResolvedRpcRequest {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
         connection_id: ProxyConnectionId,
+    },
+
+    RebindNetworkFlow {
+        proxy_session: ProxySessionToken,
+        attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
+        flow: NetworkFlowKey,
     },
 
     CheckHttp {
@@ -53,6 +58,7 @@ pub(super) enum ResolvedRpcRequest {
     ReleaseNetworkFlow {
         proxy_session: ProxySessionToken,
         attribution_token: AttributionToken,
+        connection_id: ProxyConnectionId,
     },
 
     Check {
@@ -184,6 +190,18 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
             connection_id,
         }),
 
+        RpcRequest::RebindNetworkFlow {
+            proxy_session,
+            attribution_token,
+            connection_id,
+            flow,
+        } => Ok(ResolvedRpcRequest::RebindNetworkFlow {
+            proxy_session,
+            attribution_token,
+            connection_id,
+            flow,
+        }),
+
         RpcRequest::CheckHttp {
             proxy_session,
             request_id,
@@ -217,9 +235,11 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
         RpcRequest::ReleaseNetworkFlow {
             proxy_session,
             attribution_token,
+            connection_id,
         } => Ok(ResolvedRpcRequest::ReleaseNetworkFlow {
             proxy_session,
             attribution_token,
+            connection_id,
         }),
 
         req => Err(Box::new(req)),
@@ -404,16 +424,13 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::{ResolvedRpcRequest, plan};
-
     use crate::{
         server::{dispatch::SocketRole, peer::ClientPeer},
         store::PolicyStore,
     };
-
     use agent_sandbox_core::{
         FileAccess, ProcessIds, RequestContext, ResolvedRequestContext, RpcRequest, home_from_uid,
     };
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
