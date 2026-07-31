@@ -16,6 +16,8 @@ use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_boring::client::TlsConnector;
 use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
+
+use bytes::Buf;
 use support::{IpVersion, TransparentHarness, loopback};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -53,7 +55,10 @@ async fn wait_for_release(harness: &TransparentHarness) {
         sleep(Duration::from_millis(10)).await;
     }
 
-    panic!("proxy did not release flow ownership");
+    panic!(
+        "proxy did not release flow ownership\nproxy log:\n{}",
+        std::fs::read_to_string(&harness.proxy_log).unwrap_or_default()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -568,4 +573,248 @@ async fn harness_udp_origin_covers_ipv6_datagrams() {
         harness.udp_origin.received.lock().expect("UDP origin lock")[0],
         b"datagram"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harness_h3_client_reaches_standalone_origin() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
+    let ca_cert = root.path().join("ca.pem");
+    let ca_key = root.path().join("ca-key.pem");
+    std::fs::write(&ca_cert, ca.cert.pem()).expect("write CA certificate");
+    std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
+
+    let origin = support::Http3Origin::start(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        0,
+        &ca_cert,
+        &ca_key,
+        root.path(),
+        None,
+    )
+    .await;
+
+    let client = support::Http3Client::new(&ca_cert);
+    let response = client
+        .request(origin.address, "localhost", "/allow")
+        .await
+        .expect("standalone origin request");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+    assert_eq!(origin.attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_upstream_pool_reaches_standalone_origin() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
+    let ca_cert = root.path().join("ca.pem");
+    let ca_key = root.path().join("ca-key.pem");
+    std::fs::write(&ca_cert, ca.cert.pem()).expect("write CA certificate");
+    std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
+
+    let origin = support::Http3Origin::start(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        0,
+        &ca_cert,
+        &ca_key,
+        root.path(),
+        None,
+    )
+    .await;
+
+    let pool = std::sync::Arc::new(
+        agent_sandbox_proxy::http3::upstream::UpstreamPool::new(&ca_cert).expect("upstream pool"),
+    );
+
+    let authority = format!("localhost:{}", origin.address.port());
+    let connection = pool
+        .connect("https", &authority)
+        .await
+        .expect("upstream connect");
+
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{authority}/allow"))
+        .body(())
+        .expect("upstream request");
+
+    let mut stream = connection
+        .send_request(request)
+        .await
+        .expect("send upstream request");
+
+    let response = stream.recv_response().await.expect("upstream response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut body = Vec::new();
+
+    while let Some(mut chunk) = stream.recv_data().await.expect("upstream body") {
+        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+
+    assert_eq!(body, b"origin-response\n");
+    assert_eq!(origin.attempts(), 1);
+}
+
+async fn wait_for_h3_condition(mut condition: impl FnMut() -> bool, timeout_seconds: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds);
+
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("HTTP/3 harness condition was not met in time");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_allow_records_policy_and_upstream() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let response = match harness.http3_request("/allow?raw=query").await {
+        Ok(response) => response,
+        Err(error) => {
+            panic!(
+                "HTTP/3 request failed: {error}\nproxy log:\n{}\norigin log:\n{}",
+                std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+                std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+            );
+        }
+    };
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+
+    assert_eq!(events.claims.len(), 1);
+    assert_eq!(
+        events.claims[0].flow.protocol(),
+        agent_sandbox_core::FlowProtocol::Udp
+    );
+    assert_eq!(events.checks.len(), 1);
+
+    assert_eq!(
+        events.checks[0].url.to_string(),
+        format!(
+            "https://localhost:{}/allow",
+            harness.h3_origin().address.port()
+        )
+    );
+
+    assert!(!events.checks[0].url.to_string().contains("raw=query"));
+    assert_release_matches_claim(&events);
+    drop(events);
+
+    assert_eq!(harness.h3_origin().attempts(), 1);
+    assert_eq!(harness.h3_origin().request_heads()[0], "GET /allow");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_reuses_and_releases_upstream_associations() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    for path in ["/allow", "/allow-again"] {
+        let response = harness.http3_request(path).await.expect("HTTP/3 request");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body().await, b"origin-response\n");
+    }
+
+    wait_for_release(&harness).await;
+
+    assert_eq!(harness.h3_origin().attempts(), 2);
+
+    // Both exchanges reuse one upstream association, which the proxy then
+    // releases once it idles out.
+    assert_eq!(harness.h3_origin().connections_opened(), 1);
+
+    wait_for_h3_condition(|| harness.h3_origin().connections_closed() >= 1, 25).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_denied_no_upstream() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let result = harness.http3_request("/deny").await;
+    assert!(
+        result.is_err(),
+        "denied request must be reset, not answered"
+    );
+
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.claims.len(), 1);
+    assert_eq!(events.checks.len(), 1);
+    assert!(events.checks[0].url.to_string().ends_with("/deny"));
+    assert_release_matches_claim(&events);
+    drop(events);
+
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_streaming_is_bounded_and_ordered() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let mut response = harness
+        .http3_request("/stream")
+        .await
+        .expect("HTTP/3 request");
+    assert_eq!(response.status(), 200);
+
+    let first = timeout(Duration::from_secs(10), response.next_chunk())
+        .await
+        .expect("first chunk timeout")
+        .expect("first chunk");
+    assert_eq!(first, b"first-chunk");
+
+    std::fs::write(harness.h3_stream_gate(), b"open").expect("open streaming gate");
+
+    let rest = timeout(Duration::from_secs(5), response.body())
+        .await
+        .expect("remaining body timeout");
+    assert_eq!(
+        rest,
+        b"second-chunk",
+        "proxy log:\n{}\norigin log:\n{}",
+        std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+        std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+    );
+
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_ipv6_allow() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V6)).await;
+
+    let response = harness
+        .http3_request("/allow")
+        .await
+        .expect("IPv6 HTTP/3 request");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.claims.len(), 1);
+    assert_eq!(
+        events.claims[0].flow.protocol(),
+        agent_sandbox_core::FlowProtocol::Udp
+    );
+    assert_release_matches_claim(&events);
+    drop(events);
+
+    assert_eq!(harness.h3_origin().attempts(), 1);
 }

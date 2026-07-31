@@ -2,11 +2,13 @@ use agent_sandbox_core::{
     AttributionToken, ErrorReply, FlowClaimReply, HttpCheckReply, HttpRequest, ProxyConnectionId,
     ProxySessionReply, ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
+use bytes::Buf;
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
 };
 use rcgen::generate_simple_self_signed;
+use rustls::pki_types::pem::PemObject;
 use std::{
     io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -475,6 +477,76 @@ impl Drop for TcpOrigin {
     }
 }
 
+/// Origin selection for one harness.
+struct OriginOptions {
+    ip: IpAddr,
+    origin_port: u16,
+    tls: bool,
+    keep_alive: bool,
+    http3: bool,
+    certificate: PathBuf,
+    private_key: PathBuf,
+    root: PathBuf,
+}
+
+/// The origins a harness can start; only the modes the harness asked for
+/// are populated.
+struct HarnessOrigins {
+    tcp: TcpOrigin,
+    tls: Option<TlsOrigin>,
+    h3: Option<Http3Origin>,
+}
+
+async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
+    if options.http3 {
+        let gate = options.root.join("gate");
+        let origin = Http3Origin::start(
+            options.ip,
+            0,
+            &options.certificate,
+            &options.private_key,
+            &options.root,
+            Some(&gate),
+        )
+        .await;
+
+        return HarnessOrigins {
+            tcp: TcpOrigin::start(options.ip, free_port(options.ip), b"unused").await,
+            tls: None,
+            h3: Some(origin),
+        };
+    }
+
+    if options.tls {
+        let origin_address = SocketAddr::new(options.ip, options.origin_port);
+        let (origin, tls_origin) = start_tls_origin(
+            options.ip,
+            origin_address,
+            &options.certificate,
+            &options.private_key,
+        )
+        .await;
+
+        return HarnessOrigins {
+            tcp: origin,
+            tls: Some(tls_origin),
+            h3: None,
+        };
+    }
+
+    let origin = if options.keep_alive {
+        TcpOrigin::start_keep_alive(options.ip, options.origin_port, b"origin-response").await
+    } else {
+        TcpOrigin::start(options.ip, options.origin_port, b"origin-response").await
+    };
+
+    HarnessOrigins {
+        tcp: origin,
+        tls: None,
+        h3: None,
+    }
+}
+
 async fn start_tls_origin(
     ip: IpAddr,
     address: SocketAddr,
@@ -594,11 +666,266 @@ impl Drop for TlsOrigin {
     }
 }
 
+/// HTTP/3 origin used by the transparent harness.
+///
+/// The origin is a separate process (`h3-origin`) that records request and
+/// connection events to a log file, so tests can observe upstream attempts
+/// and association release without instrumenting the proxy.
+pub struct Http3Origin {
+    pub address: SocketAddr,
+    log: PathBuf,
+    child: Child,
+}
+
+impl Http3Origin {
+    pub async fn start(
+        ip: IpAddr,
+        port: u16,
+        certificate: &Path,
+        private_key: &Path,
+        root: &Path,
+        gate: Option<&Path>,
+    ) -> Self {
+        let address = SocketAddr::new(ip, if port == 0 { free_port(ip) } else { port });
+        let log = root.join("origin.log");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_h3-origin"));
+        command.args([
+            "--port",
+            &address.port().to_string(),
+            "--address",
+            &ip.to_string(),
+            "--certificate",
+            certificate.to_str().expect("certificate path"),
+            "--private-key",
+            private_key.to_str().expect("private key path"),
+            "--log",
+            log.to_str().expect("log path"),
+        ]);
+
+        if let Some(gate) = gate {
+            command.args(["--gate", gate.to_str().expect("gate path")]);
+        }
+
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start HTTP/3 origin");
+
+        let origin = Self {
+            address,
+            log,
+            child,
+        };
+
+        for _ in 0..200 {
+            if std::fs::read_to_string(&origin.log).is_ok_and(|log| log.contains("listening")) {
+                return origin;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("HTTP/3 origin did not start listening");
+    }
+
+    /// Path of the origin log file.
+    #[must_use]
+    pub fn log_path(&self) -> &Path {
+        &self.log
+    }
+
+    /// Number of requests the origin has received.
+    #[must_use]
+    pub fn attempts(&self) -> usize {
+        self.request_lines().len()
+    }
+
+    /// Request heads in the form `METHOD PATH`.
+    #[must_use]
+    pub fn request_heads(&self) -> Vec<String> {
+        self.request_lines()
+    }
+
+    /// Number of upstream associations the origin has accepted.
+    #[must_use]
+    pub fn connections_opened(&self) -> usize {
+        self.log_lines()
+            .iter()
+            .filter(|line| line.as_str() == "conn-opened")
+            .count()
+    }
+
+    /// Number of upstream associations the origin has seen close.
+    #[must_use]
+    pub fn connections_closed(&self) -> usize {
+        self.log_lines()
+            .iter()
+            .filter(|line| line.as_str() == "conn-closed")
+            .count()
+    }
+
+    fn request_lines(&self) -> Vec<String> {
+        self.log_lines()
+            .into_iter()
+            .filter_map(|line| line.strip_prefix("request ").map(str::to_owned))
+            .collect()
+    }
+
+    fn log_lines(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Drop for Http3Origin {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One HTTP/3 response with an incremental body reader.
+///
+/// The request sender is retained because dropping the last handle closes
+/// the client's HTTP/3 connection, which the proxy must treat as a critical
+/// stream failure.
+pub struct Http3Response {
+    status: u16,
+    stream: Option<H3RequestStream>,
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    _connection: h3::client::Connection<h3_quinn::Connection, bytes::Bytes>,
+}
+
+impl Http3Response {
+    /// The response status code.
+    #[must_use]
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Read the next response body chunk.
+    pub async fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        let stream = self.stream.as_mut()?;
+
+        if let Ok(Some(mut chunk)) = stream.recv_data().await {
+            return Some(chunk.copy_to_bytes(chunk.remaining()).to_vec());
+        }
+
+        self.stream = None;
+        None
+    }
+
+    /// Read the complete response body.
+    pub async fn body(mut self) -> Vec<u8> {
+        let mut body = Vec::new();
+
+        while let Some(chunk) = self.next_chunk().await {
+            body.extend_from_slice(&chunk);
+        }
+
+        body
+    }
+}
+
+type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+
+/// HTTP/3 client used by the transparent harness to reach the proxy.
+pub struct Http3Client {
+    endpoint: quinn::Endpoint,
+}
+
+impl Http3Client {
+    /// Build a client that trusts the harness CA.
+    #[must_use]
+    pub fn new(ca_file: &Path) -> Self {
+        let pem = std::fs::read(ca_file).expect("read harness CA");
+        let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse harness CA");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(certificates);
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+
+        let client_config =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config");
+        let client_config = quinn::ClientConfig::new(Arc::new(client_config));
+
+        let mut endpoint = quinn::Endpoint::client("[::]:0".parse().expect("client address"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(client_config);
+
+        Self { endpoint }
+    }
+
+    /// Send one GET request and return the response.
+    pub async fn request(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Http3Response, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+
+        let connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
+        let h3 = h3_quinn::Connection::new(connection);
+        let (connection, mut send_request) = h3::client::new(h3)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("client request");
+
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("response failed: {error}"))?;
+
+        Ok(Http3Response {
+            status: response.status().as_u16(),
+            stream: Some(stream),
+            _send_request: send_request,
+            _connection: connection,
+        })
+    }
+}
+
 pub struct TransparentHarness {
     pub proxy_address: SocketAddr,
     pub origin: TcpOrigin,
     pub udp_origin: UdpOrigin,
     pub policy: FakePolicy,
+    pub h3_origin: Option<Http3Origin>,
+    pub proxy_log: PathBuf,
     tls_origin: Option<TlsOrigin>,
     root: TempDir,
     proxy: Child,
@@ -606,25 +933,30 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false, false).await
+        Self::start_inner(ip, origin_port, false, false, false, false, false).await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, true, false, false).await
+        Self::start_inner(ip, origin_port, false, true, false, false, false).await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), true, false, false, false).await
+        Self::start_inner(ip, free_port(ip), true, false, false, false, false).await
     }
 
     /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
     pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, true, false).await
+        Self::start_inner(ip, origin_port, false, false, true, false, false).await
     }
 
     /// Start a harness whose policy service rejects every flow claim.
     pub async fn start_claim_error(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false, true).await
+        Self::start_inner(ip, origin_port, false, false, false, true, false).await
+    }
+
+    /// Start a harness with the HTTP/3 backend enabled and an HTTP/3 origin.
+    pub async fn start_http3(ip: IpAddr) -> Self {
+        Self::start_inner(ip, 0, false, false, false, false, true).await
     }
 
     #[expect(
@@ -638,6 +970,7 @@ impl TransparentHarness {
         keep_alive: bool,
         http10_origin: bool,
         claim_errors: bool,
+        http3: bool,
     ) -> Self {
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = if claim_errors {
@@ -652,28 +985,31 @@ impl TransparentHarness {
         std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
         let origin_cert = ca_cert.clone();
         let origin_key = ca_key.clone();
-        let origin_address = SocketAddr::new(ip, origin_port);
 
-        let (origin, tls_origin) = if tls {
-            let (origin, tls_origin) =
-                start_tls_origin(ip, origin_address, &origin_cert, &origin_key).await;
-            (origin, Some(tls_origin))
-        } else {
-            (
-                if keep_alive {
-                    TcpOrigin::start_keep_alive(ip, origin_port, b"origin-response").await
-                } else {
-                    TcpOrigin::start(ip, origin_port, b"origin-response").await
-                },
-                None,
-            )
-        };
+        let origins = start_harness_origin(OriginOptions {
+            ip,
+            origin_port,
+            tls,
+            keep_alive,
+            http3,
+            certificate: origin_cert.clone(),
+            private_key: origin_key.clone(),
+            root: root.path().to_owned(),
+        })
+        .await;
+
+        let origin = origins.tcp;
+        let tls_origin = origins.tls;
+        let h3_origin = origins.h3;
 
         let udp_origin = UdpOrigin::start(ip).await;
         let ready = root.path().join("ready");
         let state = root.path().join("ech");
         let proxy_port = free_port(ip);
         let proxy_address = SocketAddr::new(ip, proxy_port);
+        let destination = h3_origin
+            .as_ref()
+            .map_or(origin.address, |origin| origin.address);
         let mut proxy_command = Command::new(env!("CARGO_BIN_EXE_agent-sandbox-proxy"));
 
         proxy_command.args([
@@ -688,7 +1024,7 @@ impl TransparentHarness {
             "--listen-port",
             &proxy_port.to_string(),
             "--test-destination",
-            &origin.address.to_string(),
+            &destination.to_string(),
         ]);
 
         if tls {
@@ -706,11 +1042,22 @@ impl TransparentHarness {
             proxy_command.env("SSL_CERT_FILE", &origin_cert);
         }
 
+        if http3 {
+            proxy_command.args(["--http3", "--http3-listen-port", &proxy_port.to_string()]);
+            proxy_command.env("SSL_CERT_FILE", &origin_cert);
+        }
+
+        let proxy_log = root.path().join("proxy.log");
+
         let proxy = proxy_command
             .env("AGENT_SANDBOX_PROXY_SESSION_READY", &ready)
             .env("INVOCATION_ID", "0123456789abcdef0123456789abcdef")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(
+                std::fs::File::create(&proxy_log).expect("create proxy log"),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(&proxy_log).expect("create proxy log"),
+            ))
             .spawn()
             .expect("start proxy");
 
@@ -721,6 +1068,8 @@ impl TransparentHarness {
             origin,
             udp_origin,
             policy,
+            h3_origin,
+            proxy_log,
             tls_origin,
             root,
             proxy,
@@ -989,6 +1338,24 @@ impl TransparentHarness {
 
     pub fn policy_events(&self) -> Arc<Mutex<PolicyEvents>> {
         self.policy.events.clone()
+    }
+
+    /// Send one HTTP/3 GET request through the proxy.
+    pub async fn http3_request(&self, path: &str) -> Result<Http3Response, String> {
+        let client = Http3Client::new(&self.root.path().join("ca.pem"));
+        client.request(self.proxy_address, "localhost", path).await
+    }
+
+    /// The HTTP/3 origin started with this harness.
+    #[must_use]
+    pub const fn h3_origin(&self) -> &Http3Origin {
+        self.h3_origin.as_ref().expect("HTTP/3 origin")
+    }
+
+    /// Path of the streaming gate file for the HTTP/3 origin.
+    #[must_use]
+    pub fn h3_stream_gate(&self) -> PathBuf {
+        self.root.path().join("gate")
     }
 }
 
