@@ -250,8 +250,8 @@ let
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
-        RemainAfterExit = true;
         Type = "oneshot";
+        RemainAfterExit = true;
       };
 
       script = ''
@@ -351,6 +351,14 @@ let
                 methods = [ "GET" ];
                 url = "https://169.254.100.1:8443/allowed";
               }
+              {
+                methods = [ "GET" ];
+                url = "https://169.254.100.1:443/allowed";
+              }
+              {
+                methods = [ "GET" ];
+                url = "https://[fd00:dead:beef::1]:443/allowed";
+              }
             ];
 
             declarativeDeny = [
@@ -362,9 +370,18 @@ let
                 allMethods = true;
                 url = "https://169.254.100.1:8443/denied";
               }
+              {
+                allMethods = true;
+                url = "https://169.254.100.1:443/denied";
+              }
             ];
 
-            upstreamAllowCidrs = [ "169.254.100.1/32" ];
+            http3.enable = true;
+
+            upstreamAllowCidrs = [
+              "169.254.100.1/32"
+              "fd00:dead:beef::1/128"
+            ];
           };
 
           vethHost = "asbx-test-host";
@@ -379,11 +396,42 @@ let
         };
       };
 
-      networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [
-        8008
-        8080
-        8443
-      ];
+      networking.firewall.interfaces.asbx-test-host = {
+        allowedTCPPorts = [
+          8008
+          8080
+          8443
+        ];
+
+        allowedUDPPorts = [ 443 ];
+      };
+
+      systemd.services.agent-sandbox-vm-h3-http = {
+        description = "HTTP/3 origin for the sandbox e2e check";
+        after = [ "network.target" ];
+        wantedBy = [ "multi-user.target" ];
+
+        serviceConfig = {
+          AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+          CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+
+          ExecStart = lib.escapeShellArgs [
+            "${sandboxPkg}/bin/h3-origin"
+            "--address"
+            "::"
+            "--port"
+            "443"
+            "--certificate"
+            "${tlsFixture}/server-cert.pem"
+            "--private-key"
+            "${tlsFixture}/server-key.pem"
+            "--log"
+            "/var/log/h3-origin.log"
+          ];
+
+          Restart = "on-failure";
+        };
+      };
     };
   resourcePackages = [
     (mkBash "sandbox-resource-bash" {
@@ -402,6 +450,7 @@ let
       }
     '';
   };
+  sandboxPkg = inputs.self.packages.${pkgs.system}.agent-sandbox;
   staticPackages = [
     (mkBash "sandbox-static-bash" {
       devicePaths = [ "/dev/agent-sandbox-test-device" ];
@@ -1106,10 +1155,35 @@ let
       )
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "https://169.254.100.1:8443/allowed", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/unlisted", wrapper=session_wrapper, expect_success=False)
+      # Raw UDP to the intercepted port is routed to the proxy and dropped:
+      # it is not QUIC, so the backend never answers it.
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
           "printf blocked | timeout 3 socat - UDP4:169.254.100.1:443 | grep -q blocked",
+          wrapper=session_wrapper,
+          expect_success=False,
+      )
+
+      # HTTP/3 through transparent UDP interception: allow over IPv4 and
+      # IPv6, and deny without an upstream reach.
+      proxy.wait_for_unit("agent-sandbox-vm-h3-http.service", timeout=120)
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 https://169.254.100.1:443/allowed | grep -q allowed-get",
+          wrapper=session_wrapper,
+      )
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 'https://[fd00:dead:beef::1]:443/allowed' | grep -q allowed-get",
+          wrapper=session_wrapper,
+      )
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 https://169.254.100.1:443/denied",
           wrapper=session_wrapper,
           expect_success=False,
       )

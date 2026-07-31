@@ -214,7 +214,10 @@ let
         ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
         # Encrypted DNS transports have no policy-controlled resolver path.
         tcp dport 853 reject with tcp reset
-        udp dport { 443, 853 } reject
+        ${lib.optionalString (
+          cfg.httpProxy.enable && cfg.httpProxy.http3.enable
+        ) "udp dport 853 reject\n"}
+        ${lib.optionalString (!cfg.httpProxy.http3.enable) "udp dport { 443, 853 } reject\n"}
         ${lib.optionalString (!cfg.httpProxy.enable)
           "    ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    ip protocol udp queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto udp queue num ${toString runtime.queueNumber}\n"
         }
@@ -295,6 +298,11 @@ let
             "--websocket-http11-url"
             url
           ]) runtime.httpProxy.websocketHttp11Urls
+          ++ lib.optionals runtime.httpProxy.http3.enable [
+            "--http3"
+            "--http3-listen-port"
+            (toString runtime.httpProxy.http3.udpPort)
+          ]
         )
       }
     '';
@@ -410,6 +418,8 @@ lib.mkIf policyEnabled (
         wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
+          Type = "simple";
+
           ExecStart = lib.escapeShellArgs (
             [
               (
@@ -466,7 +476,6 @@ lib.mkIf policyEnabled (
           RuntimeDirectory = "agent-sandbox";
           RuntimeDirectoryPreserve = "yes";
           StateDirectory = "agent-sandbox";
-          Type = "simple";
         };
 
         environment = {
@@ -552,6 +561,8 @@ lib.mkIf policyEnabled (
           wantedBy = [ "multi-user.target" ];
 
           serviceConfig = networkDaemonHardening // {
+            Type = "simple";
+
             ExecStart = lib.escapeShellArgs (
               [
                 "${sandboxPkg}/bin/agent-sandbox-dns-forwarder"
@@ -579,7 +590,6 @@ lib.mkIf policyEnabled (
             Restart = "on-failure";
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryPreserve = "yes";
-            Type = "simple";
           };
 
           bindsTo = [ "agent-sandbox-netns.service" ];
@@ -596,10 +606,10 @@ lib.mkIf policyEnabled (
           wantedBy = [ "multi-user.target" ];
 
           serviceConfig = networkNamespaceSetupHardening // {
+            Type = "oneshot";
             ExecStart = "${netnsUpPkg}/bin/agent-sandbox-netns-up";
             ExecStop = "${netnsDownPkg}/bin/agent-sandbox-netns-down";
             RemainAfterExit = true;
-            Type = "oneshot";
           };
         };
 
@@ -621,6 +631,8 @@ lib.mkIf policyEnabled (
           wantedBy = [ "multi-user.target" ];
 
           serviceConfig = networkDaemonHardening // {
+            Type = "simple";
+
             ExecStart = lib.escapeShellArgs (
               [
                 "${sandboxPkg}/bin/agent-sandbox-nfq"
@@ -655,7 +667,6 @@ lib.mkIf policyEnabled (
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryPreserve = "yes";
-            Type = "simple";
           };
 
           environment.AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
@@ -687,9 +698,20 @@ lib.mkIf policyEnabled (
           wantedBy = [ "multi-user.target" ];
 
           serviceConfig = networkDaemonHardening // {
-            AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+            Type = "simple";
+
+            AmbientCapabilities = [
+              "CAP_NET_ADMIN"
+            ]
+            ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
+
             BindReadOnlyPaths = [ "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf" ];
-            CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+
+            CapabilityBoundingSet = [
+              "CAP_NET_ADMIN"
+            ]
+            ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
+
             ExecStart = "${proxyLaunchPkg}/bin/agent-sandbox-proxy-launch";
 
             ExecStartPre = [
@@ -714,7 +736,6 @@ lib.mkIf policyEnabled (
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryMode = "0755";
             RuntimeDirectoryPreserve = "yes";
-            Type = "simple";
             User = proxyUser;
           };
 
@@ -743,34 +764,40 @@ lib.mkIf policyEnabled (
           ];
 
           wantedBy = [ "multi-user.target" ];
+          partOf = [ "agent-sandbox-proxy.service" ];
 
           serviceConfig = networkSetupHardening // {
-            ExecStart = lib.escapeShellArgs [
-              "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-              proxyUser
-              proxyGroup
-              runtime.hostIp
-              proxyCidrsPath
-              "agent_sandbox_proxy"
-              "apply"
-            ];
+            Type = "oneshot";
 
-            ExecStopPost = lib.escapeShellArgs [
-              "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-              proxyUser
-              proxyGroup
-              runtime.hostIp
-              proxyCidrsPath
-              "agent_sandbox_proxy"
-              "cleanup"
-            ];
+            ExecStart = lib.escapeShellArgs (
+              [
+                "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+                proxyUser
+                proxyGroup
+                runtime.hostIp
+                proxyCidrsPath
+                "agent_sandbox_proxy"
+              ]
+              ++ [ (toString (if runtime.httpProxy.http3.enable then runtime.httpProxy.http3.udpPort else 0)) ]
+              ++ [ "apply" ]
+            );
+
+            ExecStopPost = lib.escapeShellArgs (
+              [
+                "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+                proxyUser
+                proxyGroup
+                runtime.hostIp
+                proxyCidrsPath
+                "agent_sandbox_proxy"
+              ]
+              ++ [ (toString (if runtime.httpProxy.http3.enable then runtime.httpProxy.http3.udpPort else 0)) ]
+              ++ [ "cleanup" ]
+            );
 
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             RemainAfterExit = true;
-            Type = "oneshot";
           };
-
-          partOf = [ "agent-sandbox-proxy.service" ];
         };
 
         agent-sandbox-proxy-init = {
@@ -790,6 +817,8 @@ lib.mkIf policyEnabled (
           wantedBy = [ "multi-user.target" ];
 
           serviceConfig = networkSetupHardening // {
+            Type = "oneshot";
+
             ExecStart = lib.escapeShellArgs [
               "${proxyInitPkg}/bin/agent-sandbox-proxy-init"
               proxyStateDir
@@ -813,7 +842,6 @@ lib.mkIf policyEnabled (
             RuntimeDirectoryPreserve = "yes";
             StateDirectory = "agent-sandbox/proxy";
             StateDirectoryMode = "0700";
-            Type = "oneshot";
           };
         };
 
@@ -831,47 +859,60 @@ lib.mkIf policyEnabled (
           ];
 
           wantedBy = [ "multi-user.target" ];
+          partOf = [ "agent-sandbox-proxy.service" ];
 
           serviceConfig = networkSetupHardening // {
-            ExecStart = lib.escapeShellArgs [
-              "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
-              "18080"
-              "51820"
-              "51820"
-              "agent_sandbox_proxy_tproxy"
-              (toString runtime.queueNumber)
-              proxyUser
-              "agent-sandbox-proxy.service"
-              "agent-sandbox-nfq.service"
-              proxyReadyPath
-              nfqReadyPath
-            ];
+            Type = "oneshot";
 
-            ExecStopPost = lib.escapeShellArgs [
-              "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
-              "18080"
-              "51820"
-              "51820"
-              "agent_sandbox_proxy_tproxy"
-              (toString runtime.queueNumber)
-              proxyUser
-              "agent-sandbox-proxy.service"
-              "agent-sandbox-nfq.service"
-              proxyReadyPath
-              nfqReadyPath
-              "cleanup"
-            ];
+            ExecStart = lib.escapeShellArgs (
+              [
+                "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
+                "18080"
+                "51820"
+                "51820"
+                "agent_sandbox_proxy_tproxy"
+                (toString runtime.queueNumber)
+                proxyUser
+                "agent-sandbox-proxy.service"
+                "agent-sandbox-nfq.service"
+                proxyReadyPath
+                nfqReadyPath
+              ]
+              ++ lib.optionals runtime.httpProxy.http3.enable [
+                (toString runtime.httpProxy.http3.udpPort)
+              ]
+            );
+
+            ExecStopPost = lib.escapeShellArgs (
+              [
+                "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
+                "18080"
+                "51820"
+                "51820"
+                "agent_sandbox_proxy_tproxy"
+                (toString runtime.queueNumber)
+                proxyUser
+                "agent-sandbox-proxy.service"
+                "agent-sandbox-nfq.service"
+                proxyReadyPath
+                nfqReadyPath
+              ]
+              ++ lib.optionals runtime.httpProxy.http3.enable [
+                (toString runtime.httpProxy.http3.udpPort)
+              ]
+              ++ [
+                "cleanup"
+              ]
+            );
 
             NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
             RemainAfterExit = true;
             Restart = "on-failure";
             RestartSec = 1;
             SuccessExitStatus = [ "143" ];
-            Type = "oneshot";
           };
 
           bindsTo = [ "agent-sandbox-proxy.service" ];
-          partOf = [ "agent-sandbox-proxy.service" ];
         };
       };
 

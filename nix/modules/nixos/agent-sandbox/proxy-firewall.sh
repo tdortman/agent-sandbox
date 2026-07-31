@@ -6,7 +6,8 @@ proxy_group="$2"
 dns_server_ip="$3"
 cidrs_file="$4"
 table_name="$5"
-action="${6:-apply}"
+udp_allow_port="${6:-0}"
+action="${7:-apply}"
 
 proxy_uid="$(id -u "$proxy_user")"
 proxy_gid="$(id -g "$proxy_group")"
@@ -57,7 +58,11 @@ trap 'rm -f "$rules_file" "$apply_file"' EXIT
   printf '  ip daddr %s udp dport 53 accept\n' "$dns_server_ip"
   printf '  ip daddr %s tcp dport 53 accept\n' "$dns_server_ip"
   printf '  tcp dport 853 reject with tcp reset\n'
-  printf '  udp dport { 443, 853 } reject\n'
+  if [[ "$udp_allow_port" != 0 ]]; then
+    printf '  udp dport 853 reject\n'
+  else
+    printf '  udp dport { 443, 853 } reject\n'
+  fi
 
   while IFS= read -r cidr; do
     [[ -n "$cidr" ]] || continue

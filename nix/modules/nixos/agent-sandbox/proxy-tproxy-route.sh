@@ -11,7 +11,8 @@ proxy_unit="$7"
 nfq_unit="$8"
 proxy_ready="$9"
 nfq_ready="${10}"
-action="${11:-up}"
+udp_port="${11:-0}"
+action="${12:-up}"
 
 ports='80,443,8008,8080,8443'
 
@@ -90,14 +91,36 @@ nft -f - <<EOF
      # Queue before local TPROXY routing so the policy daemon sees the
      # original sandbox socket tuple.
      tcp dport 853 reject with tcp reset
-     udp dport { 443, 853 } reject
+     ${
+       if [[ "$udp_port" != 0 ]]; then
+         echo "udp dport 853 reject"
+       else
+         echo "udp dport { 443, 853 } reject"
+       fi
+     }
      tcp dport { $ports } counter meta mark set $mark queue num $queue_number
+     ${
+       if [[ "$udp_port" != 0 ]]; then
+         echo "udp dport $udp_port counter meta mark set $mark queue num $queue_number"
+       fi
+     }
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
      tcp dport 853 reject with tcp reset
-     udp dport { 443, 853 } reject
+     ${
+       if [[ "$udp_port" != 0 ]]; then
+         echo "udp dport 853 reject"
+       else
+         echo "udp dport { 443, 853 } reject"
+       fi
+     }
      tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark
+     ${
+       if [[ "$udp_port" != 0 ]]; then
+         echo "udp dport $udp_port counter tproxy to :$udp_port meta mark set $mark"
+       fi
+     }
    }
    chain output_redirect {
      type nat hook output priority 5; policy accept;

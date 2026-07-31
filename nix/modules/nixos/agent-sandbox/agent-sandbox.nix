@@ -438,6 +438,16 @@ in
           description = "Optional explicit group ID allowed to connect to the trusted proxy socket; null uses the dedicated proxy group.";
         };
 
+        http3 = {
+          enable = lib.mkEnableOption "transparent HTTP/3 interception through UDP port 443";
+
+          udpPort = lib.mkOption {
+            type = lib.types.port;
+            default = 443;
+            description = "UDP port whose intercepted QUIC traffic terminates at the proxy.";
+          };
+        };
+
         socketPath = lib.mkOption {
           type = lib.types.str;
           default = "/run/agent-sandbox/proxy-policy.sock";
@@ -456,7 +466,6 @@ in
           default = [ ];
           description = "Absolute HTTP(S) URL glob patterns whose WebSocket upstreams must use HTTP/1.1.";
         };
-
       };
 
       netnsIp = lib.mkOption {
@@ -710,6 +719,10 @@ in
       {
         assertion = cfg.network.httpProxy.gid == null || cfg.network.httpProxy.gid > 0;
         message = "agent-sandbox.network.httpProxy.gid must be nonzero when explicitly configured";
+      }
+      {
+        assertion = !cfg.network.httpProxy.http3.enable || cfg.network.httpProxy.enable;
+        message = "agent-sandbox.network.httpProxy.http3.enable requires httpProxy.enable";
       }
     ];
 

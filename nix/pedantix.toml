@@ -49,6 +49,8 @@ attrs.first = [
   "wants",
   "requires",
   "wantedBy",
+  "partOf",
+  "Type",
   "serviceConfig",
   "unitConfig",
   "script",
