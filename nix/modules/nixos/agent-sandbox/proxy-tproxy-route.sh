@@ -101,7 +101,12 @@ nft -f - <<EOF
      tcp dport { $ports } counter meta mark set $mark queue num $queue_number
      ${
        if [[ "$udp_port" != 0 ]]; then
-         echo "udp dport $udp_port counter meta mark set $mark queue num $queue_number"
+         # Queue only the first packet of each UDP flow. QUIC sends many
+         # datagrams per flow (handshake, data, ACKs); checking every packet
+         # against policyd serialises the NFQUEUE at tens of milliseconds per
+         # packet. Established flows keep the kernel path and reach the proxy
+         # directly, so the policy check runs once per destination.
+         echo "udp dport $udp_port ct state new,untracked counter meta mark set $mark queue num $queue_number"
        fi
      }
    }

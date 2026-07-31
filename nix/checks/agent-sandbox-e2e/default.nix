@@ -275,7 +275,7 @@ let
     options
     // {
       package = pkgs.writeShellScriptBin name ''
-        exec ${lib.getExe pkgs.curl} "$@"
+        exec ${lib.getExe (pkgs.curl.override { http3Support = true; })} "$@"
       '';
 
       binary = name;
@@ -331,6 +331,26 @@ let
 
           network = {
             enable = true;
+
+            declarativeAllow = [
+              {
+                host = "169.254.100.1";
+                port = 443;
+              }
+              {
+                host = "fd00:dead:beef::1";
+                port = 443;
+              }
+            ];
+
+            declarativeDeny = [
+              {
+                host = "denied.test";
+                port = 443;
+              }
+            ];
+
+            dnsForwardTarget = "169.254.100.1:5353";
 
             httpProxy = {
               enable = true;
@@ -409,30 +429,55 @@ let
           allowedUDPPorts = [ 443 ];
         };
 
-        systemd.services.agent-sandbox-vm-h3-http = {
-          description = "HTTP/3 origin for the sandbox e2e check";
-          after = [ "network.target" ];
-          wantedBy = [ "multi-user.target" ];
+        systemd.services = {
+          agent-sandbox-vm-dns = {
+            after = [ "agent-sandbox-netns.service" ];
+            requires = [ "agent-sandbox-netns.service" ];
+            wantedBy = [ "multi-user.target" ];
 
-          serviceConfig = {
-            AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
-            CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+            serviceConfig = {
+              ExecStart = lib.escapeShellArgs [
+                "${pkgs.dnsmasq}/bin/dnsmasq"
+                "--keep-in-foreground"
+                "--no-resolv"
+                "--no-hosts"
+                "--bind-interfaces"
+                "--listen-address=169.254.100.1"
+                "--port=5353"
+                "--user=sandbox"
+                "--address=/allowed.test/169.254.100.1"
+                "--address=/denied.test/169.254.100.1"
+              ];
 
-            ExecStart = lib.escapeShellArgs [
-              "${sandboxPkg}/bin/h3-origin"
-              "--address"
-              "::"
-              "--port"
-              "443"
-              "--certificate"
-              "${tlsFixture}/server-cert.pem"
-              "--private-key"
-              "${tlsFixture}/server-key.pem"
-              "--log"
-              "/var/log/h3-origin.log"
-            ];
+              Restart = "on-failure";
+            };
+          };
 
-            Restart = "on-failure";
+          agent-sandbox-vm-h3-http = {
+            description = "HTTP/3 origin for the sandbox e2e check";
+            after = [ "network.target" ];
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+              CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+
+              ExecStart = lib.escapeShellArgs [
+                "${sandboxPkg}/bin/h3-origin"
+                "--address"
+                "::"
+                "--port"
+                "443"
+                "--certificate"
+                "${tlsFixture}/server-cert.pem"
+                "--private-key"
+                "${tlsFixture}/server-key.pem"
+                "--log"
+                "/var/log/h3-origin.log"
+              ];
+
+              Restart = "on-failure";
+            };
           };
         };
       };
@@ -453,7 +498,7 @@ let
       }
     '';
   };
-  sandboxPkg = inputs.self.packages.${pkgs.system}.agent-sandbox;
+  sandboxPkg = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.agent-sandbox;
   staticPackages = [
     (mkBash "sandbox-static-bash" {
       devicePaths = [ "/dev/agent-sandbox-test-device" ];
@@ -547,7 +592,7 @@ let
         basicConstraints=critical,CA:false
         keyUsage=critical,digitalSignature,keyEncipherment
         extendedKeyUsage=serverAuth
-        subjectAltName=IP:169.254.100.1
+        subjectAltName=IP:169.254.100.1,IP:fd00:dead:beef::1
         EOF
 
         openssl x509 -req -sha256 -days 3650 \
@@ -1158,8 +1203,9 @@ let
       )
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "https://169.254.100.1:8443/allowed", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/unlisted", wrapper=session_wrapper, expect_success=False)
-      # Raw UDP to the intercepted port is routed to the proxy and dropped:
-      # it is not QUIC, so the backend never answers it.
+      # Raw UDP to the intercepted port passes the transport check and
+      # egresses directly; the HTTP/3 origin ignores non-QUIC datagrams, so
+      # the client never gets a reply.
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
@@ -1168,8 +1214,10 @@ let
           expect_success=False,
       )
 
-      # HTTP/3 through transparent UDP interception: allow over IPv4 and
-      # IPv6, and deny without an upstream reach.
+      # HTTP/3: the kernel cannot redirect locally generated UDP output to the
+      # proxy (tproxy only runs in prerouting), so the first packet of each
+      # UDP flow is checked against transport policy and approved flows egress
+      # directly. Allow over IPv4 and IPv6, deny by host.
       proxy.wait_for_unit("agent-sandbox-vm-h3-http.service", timeout=120)
       sandbox_shell(
           proxy,
@@ -1186,7 +1234,7 @@ let
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
-          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 https://169.254.100.1:443/denied",
+          "sandbox-proxy-curl --http3-only --fail --silent --show-error --max-time 15 https://denied.test:443/denied",
           wrapper=session_wrapper,
           expect_success=False,
       )

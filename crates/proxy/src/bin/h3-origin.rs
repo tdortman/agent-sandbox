@@ -134,7 +134,11 @@ async fn serve_connection(
             stream.finish().await?;
             continue;
         } else {
-            b"origin-response\n".as_slice()
+            match path.as_str() {
+                "/allowed" => b"allowed-get\n".as_slice(),
+                "/denied" => b"denied-get\n".as_slice(),
+                _ => b"origin-response\n".as_slice(),
+            }
         };
 
         let response = http::Response::builder()
