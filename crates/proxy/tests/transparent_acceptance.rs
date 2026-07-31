@@ -1,6 +1,10 @@
 #![cfg(debug_assertions)]
 
 mod support;
+use nix::{
+    libc,
+    sys::socket::{setsockopt, sockopt::Linger},
+};
 use rama_core::{Service, extensions::ExtensionsRef, rt::Executor};
 use rama_http::{Body, Request, StatusCode, Version, body::util::BodyExt, conn::TargetHttpVersion};
 use rama_http_backend::client::HttpConnector;
@@ -11,13 +15,27 @@ use rama_net::{
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_boring::client::TlsConnector;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
 use support::{IpVersion, TransparentHarness, loopback};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     time::{sleep, timeout},
 };
+
+/// Assert the single observed release matches the claimed connection
+/// identity and the fixed fake-policy token.
+fn assert_release_matches_claim(events: &support::PolicyEvents) {
+    assert_eq!(events.releases.len(), 1);
+    assert_eq!(
+        events.releases[0].token,
+        agent_sandbox_core::AttributionToken::from_bytes([2; 32])
+    );
+    assert_eq!(
+        events.releases[0].connection_id,
+        events.claims[0].connection_id
+    );
+}
 
 async fn wait_for_release(harness: &TransparentHarness) {
     for _ in 0..100 {
@@ -52,9 +70,7 @@ async fn transparent_http_allow_records_policy_and_upstream() {
     assert_eq!(events.checks.len(), 1);
     assert_eq!(events.decisions, [true]);
 
-    assert_eq!(events.releases, [
-        agent_sandbox_core::AttributionToken::from_bytes([2; 32])
-    ]);
+    assert_release_matches_claim(&events);
 
     assert_eq!(
         events.checks[0].url.to_string(),
@@ -198,9 +214,7 @@ async fn transparent_http_deny_does_not_open_upstream() {
     assert_eq!(events.checks.len(), 1);
     assert_eq!(events.decisions, [false]);
 
-    assert_eq!(events.releases, [
-        agent_sandbox_core::AttributionToken::from_bytes([2; 32])
-    ]);
+    assert_release_matches_claim(&events);
 
     drop(events);
 }
@@ -224,9 +238,7 @@ fn transparent_https_deny_does_not_open_upstream() {
         let events = harness.policy_events();
         let events = events.lock().expect("policy events lock");
         assert_eq!(events.decisions, [false]);
-        assert_eq!(events.releases, [
-            agent_sandbox_core::AttributionToken::from_bytes([2; 32])
-        ]);
+        assert_release_matches_claim(&events);
         drop(events);
     });
 }
@@ -258,9 +270,7 @@ fn transparent_https_allow_reaches_tls_origin() {
         assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(events.checks.len(), 1);
         assert_eq!(events.decisions, [true]);
-        assert_eq!(events.releases, [
-            agent_sandbox_core::AttributionToken::from_bytes([2; 32])
-        ]);
+        assert_release_matches_claim(&events);
         drop(events);
     });
 }
@@ -381,9 +391,7 @@ async fn transparent_http2_downstream_falls_back_to_http11_upstream() {
     let events = events.lock().expect("policy events lock");
     assert_eq!(events.checks.len(), 1);
     assert_eq!(events.decisions, [true]);
-    assert_eq!(events.releases, [
-        agent_sandbox_core::AttributionToken::from_bytes([2; 32])
-    ]);
+    assert_release_matches_claim(&events);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -419,6 +427,118 @@ async fn transparent_http_cancellation_resets_upstream_stream() {
     })
     .await
     .expect("origin did not observe reset");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_cancellation_releases_pending_check_and_claim() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+    let request = format!(
+        "GET /cancel HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write client request");
+
+    timeout(Duration::from_secs(2), async {
+        while harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .checks
+            .is_empty()
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("policy check never reached the fake policy");
+
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    setsockopt(&stream.as_fd(), Linger, &linger).expect("set reset linger");
+    drop(stream);
+
+    timeout(Duration::from_secs(2), async {
+        while harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .cancellations
+            .is_empty()
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("proxy never cancelled the dropped policy check");
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 1);
+    assert_eq!(events.cancellations.len(), 1);
+    assert_release_matches_claim(&events);
+    drop(events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_policy_error_fails_closed_without_upstream() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let response = harness.request("/policy-error").await;
+    wait_for_release(&harness).await;
+
+    assert!(
+        response.starts_with(b"HTTP/1.1 502"),
+        "unexpected response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 1);
+    assert_release_matches_claim(&events);
+    drop(events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http_claim_error_closes_connection_without_upstream() {
+    let harness = TransparentHarness::start_claim_error(loopback(IpVersion::V4), 0).await;
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+    let request = format!(
+        "GET /allow HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write client request");
+
+    let mut buffer = [0; 64];
+    let read = timeout(Duration::from_secs(2), stream.read(&mut buffer)).await;
+
+    assert!(
+        matches!(read, Ok(Ok(0) | Err(_))),
+        "connection must close after a failed claim, got {read:?}"
+    );
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.claims.len(), 1);
+    assert!(
+        events.releases.is_empty(),
+        "a failed claim must not be released"
+    );
+    drop(events);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

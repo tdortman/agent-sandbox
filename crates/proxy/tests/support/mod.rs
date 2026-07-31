@@ -1,6 +1,6 @@
 use agent_sandbox_core::{
-    AttributionToken, FlowClaimReply, HttpCheckReply, HttpRequest, ProxySessionReply,
-    ProxySessionToken, RpcReply, Verdict, VerdictSource,
+    AttributionToken, ErrorReply, FlowClaimReply, HttpCheckReply, HttpRequest, ProxyConnectionId,
+    ProxySessionReply, ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
 use nix::{
     libc,
@@ -28,12 +28,29 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+/// One observed flow claim with the connection identity that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimEvent {
+    pub flow: agent_sandbox_core::NetworkFlowKey,
+    pub connection_id: ProxyConnectionId,
+}
+
+/// One observed ownership release. The connection identifier must match the
+/// identifier recorded when the flow was claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowRelease {
+    pub token: AttributionToken,
+    pub connection_id: ProxyConnectionId,
+}
+
 #[derive(Debug, Default)]
 pub struct PolicyEvents {
-    pub claims: Vec<agent_sandbox_core::NetworkFlowKey>,
+    pub claims: Vec<ClaimEvent>,
     pub checks: Vec<HttpRequest>,
     pub decisions: Vec<bool>,
-    pub releases: Vec<AttributionToken>,
+    pub cancellations: Vec<agent_sandbox_core::ProxyRequestId>,
+    pub rebinds: Vec<agent_sandbox_core::NetworkFlowKey>,
+    pub releases: Vec<FlowRelease>,
 }
 
 pub struct FakePolicy {
@@ -44,10 +61,21 @@ pub struct FakePolicy {
 
 impl FakePolicy {
     pub fn start(root: &Path) -> Self {
+        Self::start_with_behavior(root, false)
+    }
+
+    /// Start a policy service that rejects every flow claim, so the proxy's
+    /// connection-level failure path can be observed.
+    pub fn start_claim_error(root: &Path) -> Self {
+        Self::start_with_behavior(root, true)
+    }
+
+    fn start_with_behavior(root: &Path, claim_errors: bool) -> Self {
         let socket = root.join("policy.sock");
         let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
         let events = Arc::new(Mutex::new(PolicyEvents::default()));
         let task_events = events.clone();
+        let cancel_gate = Arc::new(Notify::new());
 
         let task = tokio::spawn(async move {
             loop {
@@ -55,86 +83,13 @@ impl FakePolicy {
                     break;
                 };
                 let events = task_events.clone();
-                tokio::spawn(async move {
-                    let (reader, mut writer) = stream.into_split();
-                    let mut reader = BufReader::new(reader);
-                    let mut line = String::new();
-                    while reader.read_line(&mut line).await.is_ok() && !line.is_empty() {
-                        let value: serde_json::Value = match serde_json::from_str(line.trim()) {
-                            Ok(value) => value,
-                            Err(_) => break,
-                        };
-                        let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
-                            break;
-                        };
-                        let reply = match op {
-                            "open_proxy_session" => RpcReply::ProxySession(ProxySessionReply {
-                                ok: true,
-                                proxy_session: ProxySessionToken::from_bytes([1; 32]),
-                            }),
-                            "claim_network_flow" => {
-                                let flow = serde_json::from_value(
-                                    value.get("flow").cloned().expect("flow"),
-                                )
-                                .expect("flow value");
-                                events.lock().expect("policy events lock").claims.push(flow);
-                                RpcReply::FlowClaim(FlowClaimReply {
-                                    ok: true,
-                                    attribution_token: AttributionToken::from_bytes([2; 32]),
-                                })
-                            }
-                            "check_http" => {
-                                let request: HttpRequest = serde_json::from_value(
-                                    value.get("request").cloned().expect("request"),
-                                )
-                                .expect("HTTP request value");
-                                let allowed = !request.url.to_string().contains("/deny");
-                                let mut events = events.lock().expect("policy events lock");
-                                events.checks.push(request.clone());
-                                events.decisions.push(allowed);
-                                drop(events);
-                                RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
-                                    serde_json::from_value(
-                                        value.get("request_id").cloned().expect("request id"),
-                                    )
-                                    .expect("request id"),
-                                    RpcReply::HttpCheck(HttpCheckReply::from_verdict(
-                                        request,
-                                        if allowed {
-                                            Verdict::allowed(VerdictSource::policy())
-                                        } else {
-                                            Verdict::denied(VerdictSource::policy())
-                                        },
-                                    )),
-                                ))
-                            }
-                            "release_network_flow" => {
-                                let token = serde_json::from_value(
-                                    value.get("attribution_token").cloned().expect("token"),
-                                )
-                                .expect("attribution token");
-                                events
-                                    .lock()
-                                    .expect("policy events lock")
-                                    .releases
-                                    .push(token);
-                                RpcReply::Simple(agent_sandbox_core::SimpleOkReply::OK)
-                            }
-                            "cancel_check" => {
-                                RpcReply::Simple(agent_sandbox_core::SimpleOkReply::OK)
-                            }
-                            _ => break,
-                        };
-                        let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
-                        if writer.write_all(&encoded).await.is_err()
-                            || writer.write_all(b"\n").await.is_err()
-                            || writer.flush().await.is_err()
-                        {
-                            break;
-                        }
-                        line.clear();
-                    }
-                });
+                let cancel_gate = cancel_gate.clone();
+                tokio::spawn(serve_policy_connection(
+                    stream,
+                    events,
+                    cancel_gate,
+                    claim_errors,
+                ));
             }
         });
 
@@ -143,6 +98,159 @@ impl FakePolicy {
             events,
             task,
         }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fake policy RPC table mirrors the full proxy wire contract"
+)]
+async fn serve_policy_connection(
+    stream: tokio::net::UnixStream,
+    events: Arc<Mutex<PolicyEvents>>,
+    cancel_gate: Arc<Notify>,
+    claim_errors: bool,
+) {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    while reader.read_line(&mut line).await.is_ok() && !line.is_empty() {
+        let value: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
+            break;
+        };
+        let reply = match op {
+            "open_proxy_session" => RpcReply::ProxySession(ProxySessionReply {
+                ok: true,
+                proxy_session: ProxySessionToken::from_bytes([1; 32]),
+            }),
+            "claim_network_flow" => {
+                let flow = serde_json::from_value(value.get("flow").cloned().expect("flow"))
+                    .expect("flow value");
+                let connection_id = serde_json::from_value(
+                    value.get("connection_id").cloned().expect("connection id"),
+                )
+                .expect("connection id value");
+                let mut events = events.lock().expect("policy events lock");
+                events.claims.push(ClaimEvent {
+                    flow,
+                    connection_id,
+                });
+                drop(events);
+
+                if claim_errors {
+                    RpcReply::Error(ErrorReply::new("unknown connection identifier"))
+                } else {
+                    RpcReply::FlowClaim(FlowClaimReply {
+                        ok: true,
+                        attribution_token: AttributionToken::from_bytes([2; 32]),
+                    })
+                }
+            }
+            "rebind_network_flow" => {
+                let flow = serde_json::from_value(value.get("flow").cloned().expect("flow"))
+                    .expect("flow value");
+                events
+                    .lock()
+                    .expect("policy events lock")
+                    .rebinds
+                    .push(flow);
+                RpcReply::Simple(SimpleOkReply::OK)
+            }
+            "check_http" => {
+                let request: HttpRequest =
+                    serde_json::from_value(value.get("request").cloned().expect("request"))
+                        .expect("HTTP request value");
+                let url = request.url.to_string();
+                events
+                    .lock()
+                    .expect("policy events lock")
+                    .checks
+                    .push(request.clone());
+
+                if url.contains("/policy-error") {
+                    RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+                        serde_json::from_value(
+                            value.get("request_id").cloned().expect("request id"),
+                        )
+                        .expect("request id"),
+                        RpcReply::Error(ErrorReply::new("socket owner changed")),
+                    ))
+                } else if url.contains("/cancel") {
+                    cancel_gate.notified().await;
+                    RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+                        serde_json::from_value(
+                            value.get("request_id").cloned().expect("request id"),
+                        )
+                        .expect("request id"),
+                        RpcReply::HttpCheck(HttpCheckReply::blocked(
+                            "agent-sandbox: HTTP check cancelled",
+                        )),
+                    ))
+                } else {
+                    let allowed = !url.contains("/deny");
+                    let mut events = events.lock().expect("policy events lock");
+                    events.decisions.push(allowed);
+                    drop(events);
+                    RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+                        serde_json::from_value(
+                            value.get("request_id").cloned().expect("request id"),
+                        )
+                        .expect("request id"),
+                        RpcReply::HttpCheck(HttpCheckReply::from_verdict(
+                            request,
+                            if allowed {
+                                Verdict::allowed(VerdictSource::policy())
+                            } else {
+                                Verdict::denied(VerdictSource::policy())
+                            },
+                        )),
+                    ))
+                }
+            }
+            "release_network_flow" => {
+                let token =
+                    serde_json::from_value(value.get("attribution_token").cloned().expect("token"))
+                        .expect("attribution token");
+                let connection_id = serde_json::from_value(
+                    value.get("connection_id").cloned().expect("connection id"),
+                )
+                .expect("connection id value");
+                events
+                    .lock()
+                    .expect("policy events lock")
+                    .releases
+                    .push(FlowRelease {
+                        token,
+                        connection_id,
+                    });
+                RpcReply::Simple(SimpleOkReply::OK)
+            }
+            "cancel_check" => {
+                let request_id =
+                    serde_json::from_value(value.get("request_id").cloned().expect("request id"))
+                        .expect("request id");
+                events
+                    .lock()
+                    .expect("policy events lock")
+                    .cancellations
+                    .push(request_id);
+                cancel_gate.notify_waiters();
+                RpcReply::Simple(SimpleOkReply::OK)
+            }
+            _ => break,
+        };
+        let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
+        if writer.write_all(&encoded).await.is_err()
+            || writer.write_all(b"\n").await.is_err()
+            || writer.flush().await.is_err()
+        {
+            break;
+        }
+        line.clear();
     }
 }
 
@@ -498,31 +606,45 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false).await
+        Self::start_inner(ip, origin_port, false, false, false, false).await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, true, false).await
+        Self::start_inner(ip, origin_port, false, true, false, false).await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), true, false, false).await
+        Self::start_inner(ip, free_port(ip), true, false, false, false).await
     }
 
     /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
     pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, true).await
+        Self::start_inner(ip, origin_port, false, false, true, false).await
     }
 
+    /// Start a harness whose policy service rejects every flow claim.
+    pub async fn start_claim_error(ip: IpAddr, origin_port: u16) -> Self {
+        Self::start_inner(ip, origin_port, false, false, false, true).await
+    }
+
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "harness constructor flags map directly to proxy options"
+    )]
     async fn start_inner(
         ip: IpAddr,
         origin_port: u16,
         tls: bool,
         keep_alive: bool,
         http10_origin: bool,
+        claim_errors: bool,
     ) -> Self {
         let root = tempfile::tempdir().expect("temporary harness directory");
-        let policy = FakePolicy::start(root.path());
+        let policy = if claim_errors {
+            FakePolicy::start_claim_error(root.path())
+        } else {
+            FakePolicy::start(root.path())
+        };
         let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
         let ca_cert = root.path().join("ca.pem");
         let ca_key = root.path().join("ca-key.pem");
