@@ -217,13 +217,39 @@ let
                 "/denied": b"denied-get\n",
                 "/unlisted": b"unlisted-get\n",
             }
+            if path == "/doh-ech":
+                self.doh(False)
+                return
+            if path == "/doh-dnssec":
+                self.doh(True)
+                return
             if path not in bodies:
                 self.send_error(404)
                 return
             self.respond(bodies[path])
 
         def do_POST(self):
-            self.respond(b"post-ok\n")
+            path = self.path.split("?", 1)[0]
+            if path == "/doh-ech":
+                self.doh(False)
+            elif path == "/doh-dnssec":
+                self.doh(True)
+            else:
+                self.respond(b"post-ok\n")
+
+        def doh(self, dnssec):
+            import struct
+            flags = 0x8180 | (0x20 if dnssec else 0)
+            question = b"\x07example\x04test\x00" + struct.pack(">HH", 65, 1)
+            svcparams = struct.pack(">HH", 5, 6) + b"\x00\x04\x01\x02\x03\x04"
+            rdata = struct.pack(">H", 1) + b"\x00" + svcparams
+            answer = b"\xc0\x0c" + struct.pack(">HHIH", 65, 1, 300, len(rdata)) + rdata
+            packet = struct.pack(">HHHHHH", 0x1234, flags, 1, 1, 0, 0) + question + answer
+            self.send_response(200)
+            self.send_header("Content-Type", "application/dns-message")
+            self.send_header("Content-Length", str(len(packet)))
+            self.end_headers()
+            self.wfile.write(packet)
 
     class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
         address_family = socket.AF_INET6
@@ -304,7 +330,10 @@ let
     })
 
     (mkBash "sandbox-proxy-bash" {
-      extraPkgs = commonExtraPkgs ++ [ (pkgs.curl.override { http3Support = true; }) ];
+      extraPkgs = commonExtraPkgs ++ [
+        (pkgs.curl.override { http3Support = true; })
+        pkgs.python3
+      ];
     })
   ];
   proxyNode =
@@ -382,6 +411,18 @@ let
                   methods = [ "GET" ];
                   url = "https://[fd00:dead:beef::1]:443/allowed";
                 }
+                {
+                  allMethods = true;
+                  url = "http://169.254.100.1:8008/doh-ech";
+                }
+                {
+                  allMethods = true;
+                  url = "http://169.254.100.1:8008/doh-dnssec";
+                }
+                {
+                  methods = [ "GET" ];
+                  url = "https://allowed.test:8443/allowed";
+                }
               ];
 
               declarativeDeny = [
@@ -400,6 +441,7 @@ let
               ];
 
               http3.enable = true;
+              http3.altUdpPorts = [ 4444 ];
 
               upstreamAllowCidrs = [
                 "169.254.100.1/32"
@@ -426,7 +468,10 @@ let
             8443
           ];
 
-          allowedUDPPorts = [ 443 ];
+          allowedUDPPorts = [
+            443
+            4444
+          ];
         };
 
         systemd.services = {
@@ -472,6 +517,8 @@ let
                 "${tlsFixture}/server-cert.pem"
                 "--private-key"
                 "${tlsFixture}/server-key.pem"
+                "--alt-svc"
+                "h3=\":4444\"; persist=1"
                 "--log"
                 "/var/log/h3-origin.log"
               ];
@@ -1237,6 +1284,33 @@ let
           "curl --http3-only --fail --silent --show-error --max-time 15 https://denied.test:443/denied",
           wrapper=session_wrapper,
           expect_success=False,
+      )
+
+      # DoH: the proxy rewrites the advertised ECH configuration with its
+      # own, and rejects DNSSEC-bearing responses instead of rewriting them.
+      ech_config = proxy.succeed("base64 -w0 /var/lib/agent-sandbox/proxy/ech-config-list").strip()
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "curl --silent --show-error --fail --max-time 15 -X POST -H 'Content-Type: application/dns-message' --data-binary \"\" -o /tmp/doh-ech.bin http://169.254.100.1:8008/doh-ech && python3 -c 'import base64,sys; expected=base64.b64decode(\"%s\"); data=open(\"/tmp/doh-ech.bin\",\"rb\").read(); sys.exit(0 if expected in data else 1)'" % ech_config,
+          wrapper=session_wrapper,
+      )
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "status=$(curl --silent --show-error --max-time 15 --write-out '%{http_code}' --output /tmp/doh-dnssec.bin -X POST -H 'Content-Type: application/dns-message' --data-binary \"\" http://169.254.100.1:8008/doh-dnssec); test \"$status\" = 403 && grep -F -q 'blocked by agent-sandbox policy' /tmp/doh-dnssec.bin",
+          wrapper=session_wrapper,
+      )
+
+      # TLS identity: the SNI must match the origin certificate. The policy
+      # target is allowed, but the certificate carries only IP SANs, so the
+      # upstream handshake must fail closed.
+      sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://allowed.test:8443/allowed", wrapper=session_wrapper, expect_success=False)
+      sandbox_shell(
+          proxy,
+          "sandbox-proxy-bash",
+          "curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}' https://allowed.test:8443/allowed | grep -q 502",
+          wrapper=session_wrapper,
       )
 
       # Sudo deny is an immediate guard failure; approve mode executes the
