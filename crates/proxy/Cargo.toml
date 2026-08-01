@@ -17,6 +17,7 @@ bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
 h3.workspace = true
 h3-quinn.workspace = true
+hickory-proto.workspace = true
 http.workspace = true
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 quinn.workspace = true
@@ -31,6 +32,7 @@ rama-tls.workspace = true
 rama-tls-boring.workspace = true
 rama-tls-rustls.workspace = true
 rcgen.workspace = true
+ring.workspace = true
 rustls = { workspace = true, features = ["ring", "std"] }
 serde.workspace = true
 thiserror.workspace = true

@@ -10,15 +10,12 @@ use agent_sandbox_core::{
     DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, EchRewrite, mappings_from_response,
     rewrite_ech_config,
 };
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
-
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
     rr::{RData, rdata::svcb::SvcParamKey},
 };
-
 use std::{
     net::{IpAddr, SocketAddr},
     os::unix::net::UnixDatagram,
@@ -26,12 +23,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
 };
-
 use tracing::{debug, info, warn};
 
 /// Build a DNS `SERVFAIL` response for a parseable query packet.
@@ -528,12 +523,10 @@ impl DnsForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query, ResponseCode},
         rr::{Name, RData, Record, RecordType, rdata::TXT},
     };
-
     use std::{
         net::{Ipv4Addr, SocketAddr},
         os::unix::net::UnixDatagram,
@@ -624,6 +617,19 @@ mod tests {
             .expect_err("DNSSEC-authenticated metadata must not be stripped");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_ech_config_path_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
+        forwarder.ech_config_path = Some(PathBuf::from("/nonexistent/ech-config-list"));
+
+        let error = forwarder
+            .sanitize_response(upstream_txt_response())
+            .expect_err("unavailable downstream ECH configuration must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         Ok(())
     }
 

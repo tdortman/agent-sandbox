@@ -4,14 +4,19 @@
 //! proxy terminates. They are pooled by origin authority and closed when the
 //! peer goes away or the idle timeout expires, so ownership of an upstream
 //! association is released after the exchange that used it completes.
+//!
+//! Each origin's TLS configuration carries the verified upstream ECH
+//! configuration when its DNS zone advertises one; origins without ECH keep
+//! ordinary TLS, where the SNI and certificate identity still bind to the
+//! policy target. An unverifiable advertised configuration fails closed.
 
+use super::{BoxError, ech::UpstreamEch};
 use bytes::Bytes;
 use h3::client::SendRequest;
-use super::BoxError;
 use rustls::pki_types::pem::PemObject;
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::Path,
     sync::{Arc, Weak},
     time::Duration,
@@ -21,6 +26,15 @@ use std::{
 pub struct UpstreamPool {
     endpoint: quinn::Endpoint,
     connections: Arc<std::sync::Mutex<HashMap<String, Weak<UpstreamConnection>>>>,
+    tls: UpstreamTls,
+    ech: UpstreamEch,
+}
+
+/// Shared upstream TLS material: the crypto provider and the verified roots.
+/// The per-origin ECH configuration cache lives in [`UpstreamEch`].
+struct UpstreamTls {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    roots: Arc<rustls::RootCertStore>,
 }
 
 impl UpstreamPool {
@@ -30,7 +44,7 @@ impl UpstreamPool {
     ///
     /// Returns an error when the client endpoint or its TLS configuration
     /// cannot be built.
-    pub fn new(ca_file: &Path) -> Result<Self, BoxError> {
+    pub fn new(ca_file: &Path, test_ech_dns: Option<SocketAddr>) -> Result<Self, BoxError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
 
         let pem = std::fs::read(ca_file)?;
@@ -46,23 +60,7 @@ impl UpstreamPool {
         let mut roots = rustls::RootCertStore::empty();
         roots.add_parsable_certificates(certificates);
 
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-
-        let client_config =
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(BoxError::from)?;
-
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
-
-        let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
-        client_config.transport_config(Arc::new(transport));
-
-        let mut endpoint = quinn::Endpoint::new(
+        let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             None,
             std::net::UdpSocket::bind((IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0]), 0))?,
@@ -71,11 +69,14 @@ impl UpstreamPool {
         )
         .map_err(BoxError::from)?;
 
-        endpoint.set_default_client_config(client_config);
-
         Ok(Self {
             endpoint,
             connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tls: UpstreamTls {
+                provider,
+                roots: Arc::new(roots),
+            },
+            ech: UpstreamEch::new(test_ech_dns),
         })
     }
 
@@ -84,8 +85,9 @@ impl UpstreamPool {
     ///
     /// # Errors
     ///
-    /// Returns an error when the origin cannot be resolved or the QUIC and
-    /// HTTP/3 handshakes fail.
+    /// Returns an error when the origin cannot be resolved, its advertised
+    /// ECH configuration is unverifiable, or the QUIC and HTTP/3 handshakes
+    /// fail.
     ///
     /// # Panics
     ///
@@ -105,16 +107,7 @@ impl UpstreamPool {
             }
         }
 
-        let host = authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host)
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-
-        let port = authority
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .ok_or_else(|| BoxError::from(format!("origin authority has no port: {authority}")))?;
+        let (host, port) = split_authority(authority)?;
 
         let addresses = tokio::net::lookup_host((host, port)).await?;
 
@@ -143,11 +136,13 @@ impl UpstreamPool {
         &self,
         host: &str,
         authority: &str,
-        address: std::net::SocketAddr,
+        address: SocketAddr,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
+        let client_config = self.client_config(host).await?;
+
         let connecting = self
             .endpoint
-            .connect(address, host)
+            .connect_with(client_config, address, host)
             .map_err(BoxError::from)?;
 
         let connection = tokio::time::timeout(Duration::from_secs(2), connecting)
@@ -190,6 +185,63 @@ impl UpstreamPool {
 
         Ok(connection)
     }
+
+    /// Build the per-origin QUIC client configuration.
+    ///
+    /// A verified ECH configuration enables ECH for the handshake; a missing
+    /// or unadvertised configuration keeps ordinary TLS. An unverifiable
+    /// advertised configuration is an error, so the connection fails closed.
+    async fn client_config(&self, host: &str) -> Result<quinn::ClientConfig, BoxError> {
+        let ech = self.ech.config_for(host).await?;
+
+        // `with_ech` fixes TLS 1.3 as the only protocol version; the plain
+        // path keeps the safe defaults instead.
+        let builder = rustls::ClientConfig::builder_with_provider(self.tls.provider.clone());
+
+        let builder = match ech {
+            Some(config) => builder
+                .with_ech(rustls::client::EchMode::Enable((*config).clone()))
+                .map_err(BoxError::from)?,
+            None => builder.with_safe_default_protocol_versions()?,
+        };
+
+        let mut tls = builder
+            .with_root_certificates(self.tls.roots.clone())
+            .with_no_client_auth();
+
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+
+        let client_config =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(BoxError::from)?;
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
+
+        let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
+        client_config.transport_config(Arc::new(transport));
+
+        Ok(client_config)
+    }
+}
+
+/// Split one origin authority into its host and port.
+///
+/// # Errors
+///
+/// Returns an error when the authority has no parseable port.
+fn split_authority(authority: &str) -> Result<(&str, u16), BoxError> {
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+
+    let port = authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .ok_or_else(|| BoxError::from(format!("origin authority has no port: {authority}")))?;
+
+    Ok((host, port))
 }
 
 /// One live upstream HTTP/3 association.
@@ -217,5 +269,3 @@ impl UpstreamConnection {
             .map_err(|error| BoxError::from(format!("upstream request failed: {error}")))
     }
 }
-
-

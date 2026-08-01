@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.33.0"
+version = "0.34.0"
 edition = "2024"
 license = "MIT"
 
@@ -49,6 +49,9 @@ zvariant = "5.13"
 version = "0.11.11"
 default-features = false
 features = ["futures-io", "runtime-tokio", "rustls-ring"]
+
+[workspace.dependencies.ring]
+version = "0.17.14"
 
 [workspace.dependencies.rama-core]
 version = "0.3.0"
