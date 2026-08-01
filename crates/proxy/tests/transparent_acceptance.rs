@@ -1,6 +1,7 @@
 #![cfg(debug_assertions)]
 
 mod support;
+use bytes::Buf;
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
@@ -16,9 +17,7 @@ use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_boring::client::TlsConnector;
 use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
-
-use bytes::Buf;
-use support::{IpVersion, TransparentHarness, loopback};
+use support::{Http3Client, IpVersion, TransparentHarness, loopback};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -625,7 +624,8 @@ async fn proxy_upstream_pool_reaches_standalone_origin() {
     .await;
 
     let pool = std::sync::Arc::new(
-        agent_sandbox_proxy::http3::upstream::UpstreamPool::new(&ca_cert).expect("upstream pool"),
+        agent_sandbox_proxy::http3::upstream::UpstreamPool::new(&ca_cert, None)
+            .expect("upstream pool"),
     );
 
     let authority = format!("localhost:{}", origin.address.port());
@@ -817,4 +817,364 @@ async fn transparent_http3_ipv6_allow() {
     drop(events);
 
     assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_doh_ech_config_is_rewritten() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+    let expected = std::fs::read(harness.ech_state_dir().join("ech-config-list"))
+        .expect("proxy ECH configuration");
+
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+
+    let request = format!(
+        "POST /doh-ech HTTP/1.1\r\nHost: localhost:{}\r\nContent-Type: \
+         application/dns-message\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write DoH request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read DoH response");
+    wait_for_release(&harness).await;
+
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK"),
+        "unexpected DoH response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        response
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "rewritten DoH response must carry the proxy ECH configuration"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_doh_dnssec_response_is_rejected() {
+    let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
+
+    let mut stream = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect proxy");
+
+    let request = format!(
+        "POST /doh-dnssec HTTP/1.1\r\nHost: localhost:{}\r\nContent-Type: \
+         application/dns-message\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write DoH request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read DoH response");
+    wait_for_release(&harness).await;
+
+    assert!(
+        response.starts_with(b"HTTP/1.1 403 Forbidden"),
+        "unexpected DoH response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        response
+            .windows(b"blocked by agent-sandbox policy".len())
+            .any(|window| window == b"blocked by agent-sandbox policy")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_alt_svc_preserved_and_attributed() {
+    let harness = TransparentHarness::start_http3_with_alt(loopback(IpVersion::V4)).await;
+    let alt_address = harness.h3_alt_address.expect("alternative endpoint");
+    let origin_port = harness.h3_origin().address.port();
+
+    // The origin advertises the alternative; the proxy preserves it because
+    // transparent UDP interception covers its port.
+    let response = harness
+        .http3_request("/allow")
+        .await
+        .expect("main endpoint request");
+    assert_eq!(response.status(), 200);
+    let alt_svc = response
+        .headers()
+        .get("alt-svc")
+        .expect("preserved alt-svc header")
+        .to_str()
+        .expect("alt-svc value");
+    assert!(
+        alt_svc.contains(&format!("h3=\":{}\"", alt_address.port())),
+        "unexpected alt-svc: {alt_svc}"
+    );
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    // A later QUIC association at the alternative endpoint is attributed to
+    // the original origin: the policy check and the upstream both use the
+    // origin, not the alternative transport.
+    let response = harness
+        .http3_request_to(alt_address, "/allow")
+        .await
+        .expect("alternative endpoint request");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 2);
+    assert_eq!(
+        events.checks[1].url.to_string(),
+        format!("https://localhost:{origin_port}/allow"),
+        "alternative endpoint must keep the original origin identity"
+    );
+    assert_release_matches_claim(&events);
+    drop(events);
+
+    assert_eq!(harness.h3_origin().attempts(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_alt_endpoint_without_mapping_is_refused() {
+    let harness = TransparentHarness::start_http3_with_alt(loopback(IpVersion::V4)).await;
+    let alt_address = harness.h3_alt_address.expect("alternative endpoint");
+
+    let result = harness.http3_request_to(alt_address, "/allow").await;
+    assert!(
+        result.is_err(),
+        "an alternative endpoint without a recorded mapping must be refused"
+    );
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert!(
+        events.claims.is_empty(),
+        "refused alternative endpoint must not be claimed"
+    );
+    assert!(events.releases.is_empty());
+    assert!(events.checks.is_empty());
+    drop(events);
+
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_unvalidated_alt_svc_is_filtered() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let response = harness
+        .http3_request("/alt-svc-filtered")
+        .await
+        .expect("filtered alt-svc request");
+    assert_eq!(response.status(), 200);
+
+    assert!(
+        !response.headers().contains_key("alt-svc"),
+        "an alternative on an unintercepted port must be filtered"
+    );
+    assert_eq!(response.body().await, b"origin-response\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_alt_svc_clear_removes_mapping() {
+    let harness = TransparentHarness::start_http3_with_alt(loopback(IpVersion::V4)).await;
+    let alt_address = harness.h3_alt_address.expect("alternative endpoint");
+
+    harness
+        .http3_request("/allow")
+        .await
+        .expect("main endpoint request");
+    assert!(
+        harness.http3_request_to(alt_address, "/allow").await.is_ok(),
+        "mapped alternative endpoint must be served"
+    );
+
+    let response = harness
+        .http3_request("/alt-svc-clear")
+        .await
+        .expect("clear request");
+    assert_eq!(
+        response
+            .headers()
+            .get("alt-svc")
+            .and_then(|value| value.to_str().ok()),
+        Some("clear"),
+        "clear must pass through to the client"
+    );
+
+    assert!(
+        harness.http3_request_to(alt_address, "/allow").await.is_err(),
+        "cleared mappings must not serve later alternative associations"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_downstream_alpn_mismatch_fails_closed() {
+    // The proxy advertises only h3; a client offering a different ALPN must
+    // fail the handshake instead of falling back to an unadvertised
+    // protocol.
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::with_alpn(&harness.ca_file(), b"http/1.1");
+
+    let result = client
+        .request(harness.proxy_address, "localhost", "/allow")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an ALPN mismatch must fail the QUIC handshake closed"
+    );
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_ordinary_tls_fallback_when_no_ech() {
+    // The injected DNS serves no HTTPS record for the origin, so the proxy
+    // uses ordinary TLS and the identity checks still pass.
+    let dns = start_empty_dns().await;
+
+    let harness =
+        TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
+
+    let response = harness.http3_request("/allow").await.expect("HTTP/3 request");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_upstream_ech_fails_closed() {
+    // The origin has no ECH support; an advertised ECH configuration must
+    // make the handshake fail closed instead of downgrading to ordinary TLS.
+    let root = tempfile::tempdir().expect("temporary directory");
+    let state = root.path().join("ech");
+
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_agent-sandbox-proxy"))
+        .args(["--init-ech-state-only", "--ech-state-dir"])
+        .arg(&state)
+        .status()
+        .expect("run ECH state init");
+    assert!(init.success());
+
+    let config = std::fs::read(state.join("ech-config-list")).expect("ECH configuration");
+    let dns = start_ech_dns(config).await;
+
+    let harness =
+        TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
+
+    let result = harness.http3_request("/allow").await;
+    assert!(
+        result.is_err(),
+        "ECH offered to a non-ECH origin must fail closed"
+    );
+
+    wait_for_release(&harness).await;
+
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+/// Serve an empty NOERROR answer for every query, so the proxy's upstream
+/// ECH discovery concludes the origin does not advertise ECH.
+async fn start_empty_dns() -> std::net::SocketAddr {
+    let socket = UdpSocket::bind((loopback(IpVersion::V4), 0))
+        .await
+        .expect("bind empty DNS server");
+    let address = socket.local_addr().expect("empty DNS address");
+
+    tokio::spawn(async move {
+        let packet = empty_dns_answer();
+        let mut buffer = [0_u8; 2_048];
+
+        loop {
+            let Ok((size, peer)) = socket.recv_from(&mut buffer).await else {
+                break;
+            };
+
+            let _ = socket.send_to(&packet, peer).await;
+            let _ = size;
+        }
+    });
+
+    address
+}
+
+fn empty_dns_answer() -> Vec<u8> {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RecordType},
+    };
+
+    let name = Name::from_ascii("localhost.").expect("valid name");
+
+    let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(name, RecordType::HTTPS));
+    message.to_vec().expect("encode DNS answer")
+}
+
+/// Serve one canned HTTPS answer with the given ECH configuration for every
+/// query, so the proxy's upstream ECH discovery finds it.
+async fn start_ech_dns(config: Vec<u8>) -> std::net::SocketAddr {
+    let socket = UdpSocket::bind((loopback(IpVersion::V4), 0))
+        .await
+        .expect("bind ECH DNS server");
+    let address = socket.local_addr().expect("ECH DNS address");
+
+    tokio::spawn(async move {
+        let packet = https_answer_with_ech(&config);
+        let mut buffer = [0_u8; 2_048];
+
+        loop {
+            let Ok((size, peer)) = socket.recv_from(&mut buffer).await else {
+                break;
+            };
+
+            let _ = socket.send_to(&packet, peer).await;
+            let _ = size;
+        }
+    });
+
+    address
+}
+
+fn https_answer_with_ech(config: &[u8]) -> Vec<u8> {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{
+            Name, RData, Record, RecordType,
+            rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
+            rdata::HTTPS,
+        },
+    };
+
+    let name = Name::from_ascii("localhost.").expect("valid name");
+    let params = vec![(
+        SvcParamKey::EchConfigList,
+        SvcParamValue::EchConfigList(EchConfigList(config.to_vec())),
+    )];
+
+    let https = RData::HTTPS(HTTPS(SVCB::new(1, name.clone(), params)));
+
+    let mut message = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(name.clone(), RecordType::HTTPS));
+    message.add_answer(Record::from_rdata(name, 300, https));
+    message.to_vec().expect("encode DNS answer")
 }

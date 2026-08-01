@@ -302,6 +302,10 @@ pub struct TcpOrigin {
     task: Option<JoinHandle<()>>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the plain-text origin serves every harness response shape"
+)]
 async fn serve_tcp_origin_connection(
     mut stream: TcpStream,
     body: &'static [u8],
@@ -334,6 +338,31 @@ async fn serve_tcp_origin_connection(
             .lock()
             .expect("request heads lock")
             .push(String::from_utf8_lossy(&request).into_owned());
+
+        let doh_packet = if request
+            .windows(b"/doh-ech".len())
+            .any(|window| window == b"/doh-ech")
+        {
+            Some(doh_dns_message(false))
+        } else if request
+            .windows(b"/doh-dnssec".len())
+            .any(|window| window == b"/doh-dnssec")
+        {
+            Some(doh_dns_message(true))
+        } else {
+            None
+        };
+
+        if let Some(packet) = doh_packet {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n",
+                packet.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&packet).await;
+            break;
+        }
 
         let websocket = request
             .windows(b"upgrade: websocket".len())
@@ -410,6 +439,36 @@ async fn serve_tcp_origin_connection(
     }
 }
 
+/// One canned `application/dns-message` response with an HTTPS record whose
+/// ECH configuration the proxy must rewrite (or reject when DNSSEC-bearing).
+fn doh_dns_message(dnssec: bool) -> Vec<u8> {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{
+            Name, RData, Record, RecordType,
+            rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
+            rdata::HTTPS,
+        },
+    };
+
+    let name = Name::from_ascii("example.test.").expect("valid name");
+    let params = vec![
+        (SvcParamKey::Port, SvcParamValue::Port(443)),
+        (
+            SvcParamKey::EchConfigList,
+            SvcParamValue::EchConfigList(EchConfigList(vec![1, 2, 3, 4])),
+        ),
+    ];
+
+    let https = RData::HTTPS(HTTPS(SVCB::new(1, name.clone(), params)));
+
+    let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+    message.metadata.authentic_data = dnssec;
+    message.add_query(Query::query(name.clone(), RecordType::HTTPS));
+    message.add_answer(Record::from_rdata(name, 300, https));
+    message.to_vec().expect("encode DNS response")
+}
+
 impl TcpOrigin {
     pub async fn start(ip: IpAddr, port: u16, body: &'static [u8]) -> Self {
         Self::start_with_keep_alive(ip, port, body, false).await
@@ -484,6 +543,7 @@ struct OriginOptions {
     tls: bool,
     keep_alive: bool,
     http3: bool,
+    alt_port: Option<u16>,
     certificate: PathBuf,
     private_key: PathBuf,
     root: PathBuf,
@@ -500,13 +560,17 @@ struct HarnessOrigins {
 async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
     if options.http3 {
         let gate = options.root.join("gate");
-        let origin = Http3Origin::start(
+        let alt_svc = options
+            .alt_port
+            .map(|port| format!("h3=\":{port}\"; persist=1"));
+        let origin = Http3Origin::start_with_alt_svc(
             options.ip,
             0,
             &options.certificate,
             &options.private_key,
             &options.root,
             Some(&gate),
+            alt_svc.as_deref(),
         )
         .await;
 
@@ -686,6 +750,20 @@ impl Http3Origin {
         root: &Path,
         gate: Option<&Path>,
     ) -> Self {
+        Self::start_with_alt_svc(ip, port, certificate, private_key, root, gate, None).await
+    }
+
+    /// Start an origin that advertises one `Alt-Svc` value on every
+    /// non-stream response.
+    pub async fn start_with_alt_svc(
+        ip: IpAddr,
+        port: u16,
+        certificate: &Path,
+        private_key: &Path,
+        root: &Path,
+        gate: Option<&Path>,
+        alt_svc: Option<&str>,
+    ) -> Self {
         let address = SocketAddr::new(ip, if port == 0 { free_port(ip) } else { port });
         let log = root.join("origin.log");
 
@@ -705,6 +783,10 @@ impl Http3Origin {
 
         if let Some(gate) = gate {
             command.args(["--gate", gate.to_str().expect("gate path")]);
+        }
+
+        if let Some(alt_svc) = alt_svc {
+            command.args(["--alt-svc", alt_svc]);
         }
 
         let child = command
@@ -796,6 +878,7 @@ impl Drop for Http3Origin {
 /// stream failure.
 pub struct Http3Response {
     status: u16,
+    headers: http::HeaderMap,
     stream: Option<H3RequestStream>,
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
     _connection: h3::client::Connection<h3_quinn::Connection, bytes::Bytes>,
@@ -806,6 +889,12 @@ impl Http3Response {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
+    }
+
+    /// The response headers.
+    #[must_use]
+    pub const fn headers(&self) -> &http::HeaderMap {
+        &self.headers
     }
 
     /// Read the next response body chunk.
@@ -843,6 +932,12 @@ impl Http3Client {
     /// Build a client that trusts the harness CA.
     #[must_use]
     pub fn new(ca_file: &Path) -> Self {
+        Self::with_alpn(ca_file, b"h3")
+    }
+
+    /// Build a client that offers one explicit ALPN protocol.
+    #[must_use]
+    pub fn with_alpn(ca_file: &Path, alpn: &[u8]) -> Self {
         let pem = std::fs::read(ca_file).expect("read harness CA");
         let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
@@ -859,7 +954,7 @@ impl Http3Client {
             .with_root_certificates(roots)
             .with_no_client_auth();
 
-        tls.alpn_protocols = vec![b"h3".to_vec()];
+        tls.alpn_protocols = vec![alpn.to_vec()];
 
         let client_config =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config");
@@ -912,11 +1007,19 @@ impl Http3Client {
 
         Ok(Http3Response {
             status: response.status().as_u16(),
+            headers: response.headers().clone(),
             stream: Some(stream),
             _send_request: send_request,
             _connection: connection,
         })
     }
+}
+
+/// Extra HTTP/3 options for one harness.
+#[derive(Default)]
+struct Http3Options {
+    alt_port: Option<u16>,
+    test_ech_dns: Option<SocketAddr>,
 }
 
 pub struct TransparentHarness {
@@ -925,6 +1028,9 @@ pub struct TransparentHarness {
     pub udp_origin: UdpOrigin,
     pub policy: FakePolicy,
     pub h3_origin: Option<Http3Origin>,
+    /// Address of the alternative endpoint the proxy intercepts, when the
+    /// harness started one.
+    pub h3_alt_address: Option<SocketAddr>,
     pub proxy_log: PathBuf,
     tls_origin: Option<TlsOrigin>,
     root: TempDir,
@@ -933,34 +1039,65 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false, false, false).await
+        Self::start_inner(ip, origin_port, false, false, false, false, false, Http3Options::default()).await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, true, false, false, false).await
+        Self::start_inner(ip, origin_port, false, true, false, false, false, Http3Options::default()).await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), true, false, false, false, false).await
+        Self::start_inner(ip, free_port(ip), true, false, false, false, false, Http3Options::default()).await
     }
 
     /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
     pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, true, false, false).await
+        Self::start_inner(ip, origin_port, false, false, true, false, false, Http3Options::default()).await
     }
 
     /// Start a harness whose policy service rejects every flow claim.
     pub async fn start_claim_error(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false, true, false).await
+        Self::start_inner(ip, origin_port, false, false, false, true, false, Http3Options::default()).await
     }
 
     /// Start a harness with the HTTP/3 backend enabled and an HTTP/3 origin.
     pub async fn start_http3(ip: IpAddr) -> Self {
-        Self::start_inner(ip, 0, false, false, false, false, true).await
+        Self::start_inner(
+            ip,
+            0,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Http3Options::default(),
+        )
+        .await
+    }
+
+    /// Start an HTTP/3 harness whose origin advertises one alternative
+    /// endpoint, which the proxy also intercepts.
+    pub async fn start_http3_with_alt(ip: IpAddr) -> Self {
+        let options = Http3Options {
+            alt_port: Some(free_port(ip)),
+            ..Http3Options::default()
+        };
+        Self::start_inner(ip, 0, false, false, false, false, true, options).await
+    }
+
+    /// Start an HTTP/3 harness whose upstream ECH lookups use `dns`.
+    pub async fn start_http3_with_ech_dns(ip: IpAddr, dns: SocketAddr) -> Self {
+        let options = Http3Options {
+            test_ech_dns: Some(dns),
+            ..Http3Options::default()
+        };
+        Self::start_inner(ip, 0, false, false, false, false, true, options).await
     }
 
     #[expect(
         clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "harness constructor flags map directly to proxy options"
     )]
     async fn start_inner(
@@ -971,6 +1108,7 @@ impl TransparentHarness {
         http10_origin: bool,
         claim_errors: bool,
         http3: bool,
+        http3_options: Http3Options,
     ) -> Self {
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = if claim_errors {
@@ -992,6 +1130,7 @@ impl TransparentHarness {
             tls,
             keep_alive,
             http3,
+            alt_port: http3_options.alt_port,
             certificate: origin_cert.clone(),
             private_key: origin_key.clone(),
             root: root.path().to_owned(),
@@ -1044,6 +1183,15 @@ impl TransparentHarness {
 
         if http3 {
             proxy_command.args(["--http3", "--http3-listen-port", &proxy_port.to_string()]);
+
+            if let Some(alt_port) = http3_options.alt_port {
+                proxy_command.args(["--http3-alt-port", &alt_port.to_string()]);
+            }
+
+            if let Some(dns) = http3_options.test_ech_dns {
+                proxy_command.args(["--test-ech-dns", &dns.to_string()]);
+            }
+
             proxy_command.env("SSL_CERT_FILE", &origin_cert);
         }
 
@@ -1063,12 +1211,15 @@ impl TransparentHarness {
 
         wait_for_path(&ready).await;
 
+        let h3_alt_address = http3_options.alt_port.map(|port| SocketAddr::new(ip, port));
+
         Self {
             proxy_address,
             origin,
             udp_origin,
             policy,
             h3_origin,
+            h3_alt_address,
             proxy_log,
             tls_origin,
             root,
@@ -1342,8 +1493,29 @@ impl TransparentHarness {
 
     /// Send one HTTP/3 GET request through the proxy.
     pub async fn http3_request(&self, path: &str) -> Result<Http3Response, String> {
+        self.http3_request_to(self.proxy_address, path).await
+    }
+
+    /// Send one HTTP/3 GET request to an explicit proxy endpoint.
+    pub async fn http3_request_to(
+        &self,
+        address: SocketAddr,
+        path: &str,
+    ) -> Result<Http3Response, String> {
         let client = Http3Client::new(&self.root.path().join("ca.pem"));
-        client.request(self.proxy_address, "localhost", path).await
+        client.request(address, "localhost", path).await
+    }
+
+    /// Directory holding the proxy's ECH key material and configuration.
+    #[must_use]
+    pub fn ech_state_dir(&self) -> PathBuf {
+        self.root.path().join("ech")
+    }
+
+    /// Path of the harness CA certificate.
+    #[must_use]
+    pub fn ca_file(&self) -> PathBuf {
+        self.root.path().join("ca.pem")
     }
 
     /// The HTTP/3 origin started with this harness.
