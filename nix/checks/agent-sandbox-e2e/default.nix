@@ -440,8 +440,10 @@ let
                 }
               ];
 
-              http3.enable = true;
-              http3.altUdpPorts = [ 4444 ];
+              http3 = {
+                enable = true;
+                altUdpPorts = [ 4444 ];
+              };
 
               upstreamAllowCidrs = [
                 "169.254.100.1/32"
