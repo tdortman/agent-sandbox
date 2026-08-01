@@ -122,6 +122,11 @@ struct Cli {
     #[arg(long)]
     proxy_mode: bool,
 
+    /// UDP ports whose flows are registered for the transparent HTTP/3
+    /// proxy instead of being transport-checked. Comma-separated.
+    #[arg(long, value_name = "PORTS", default_value = "443")]
+    udp_proxy_ports: String,
+
     /// Readiness marker written only after NFQUEUE bind succeeds. The marker
     /// contains the systemd `INVOCATION_ID` so stale daemon state cannot be
     /// mistaken for the current queue owner.
@@ -143,6 +148,7 @@ struct NfqState {
     dns_server_ip: IpAddr,
     nft_binary: String,
     proxy_mode: bool,
+    udp_proxy_ports: Vec<u16>,
 }
 
 impl NfqState {
@@ -172,6 +178,11 @@ impl NfqState {
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
             proxy_mode: cli.proxy_mode,
+            udp_proxy_ports: cli
+                .udp_proxy_ports
+                .split(',')
+                .filter_map(|port| port.trim().parse::<u16>().ok())
+                .collect(),
         }
     }
 
@@ -603,8 +614,16 @@ const fn proxy_flow_port(protocol: packet::TransportProtocol, port: u16) -> bool
         (
             packet::TransportProtocol::Tcp,
             80 | 443 | 8008 | 8080 | 8443
-        ) | (packet::TransportProtocol::Udp, 443)
+        )
     )
+}
+
+impl NfqState {
+    /// Whether this UDP port's flows are registered for the transparent
+    /// HTTP/3 proxy.
+    fn udp_proxy_port(&self, port: u16) -> bool {
+        self.udp_proxy_ports.contains(&port)
+    }
 }
 
 /// Whether this flow was registered recently and can skip the verdict RPCs.
@@ -826,7 +845,7 @@ where
     let udp_proxy_flow = state.proxy_mode
         && !meta.dst_ip.is_loopback()
         && meta.protocol == packet::TransportProtocol::Udp
-        && proxy_flow_port(meta.protocol, meta.dst_port);
+        && state.udp_proxy_port(meta.dst_port);
 
     // QUIC sends its opening burst of datagrams before the first packet's
     // verdict can confirm the flow, so already-registered flows skip the
@@ -1081,6 +1100,7 @@ mod tests {
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
             proxy_mode: false,
+            udp_proxy_ports: vec![443],
         }
     }
 
@@ -1090,10 +1110,21 @@ mod tests {
             assert!(proxy_flow_port(packet::TransportProtocol::Tcp, port));
         }
 
-        assert!(proxy_flow_port(packet::TransportProtocol::Udp, 443));
-        assert!(!proxy_flow_port(packet::TransportProtocol::Udp, 80));
-        assert!(!proxy_flow_port(packet::TransportProtocol::Udp, 8080));
         assert!(!proxy_flow_port(packet::TransportProtocol::Tcp, 853));
+    }
+
+    #[test]
+    fn udp_proxy_ports_are_configurable() {
+        let state = NfqState::new(&Cli::parse_from([
+            "nfq",
+            "--proxy-mode",
+            "--udp-proxy-ports",
+            "443,4444",
+        ]));
+        assert!(state.udp_proxy_port(443));
+        assert!(state.udp_proxy_port(4444));
+        assert!(!state.udp_proxy_port(8443));
+        assert!(!state.udp_proxy_port(80));
     }
 
     #[test]
