@@ -303,6 +303,10 @@ let
             "--http3-listen-port"
             (toString runtime.httpProxy.http3.udpPort)
           ]
+          ++ lib.concatMap (port: [
+            "--http3-alt-port"
+            (toString port)
+          ]) runtime.httpProxy.http3.altUdpPorts
         )
       }
     '';
@@ -654,6 +658,12 @@ lib.mkIf policyEnabled (
                 "--ready-file"
                 nfqReadyPath
               ]
+              ++ lib.optionals (cfg.httpProxy.enable && cfg.httpProxy.http3.enable) [
+                "--udp-proxy-ports"
+                (lib.concatStringsSep "," (
+                  [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
+                ))
+              ]
             );
 
             ExecStartPre = lib.optionals cfg.httpProxy.enable [
@@ -879,7 +889,9 @@ lib.mkIf policyEnabled (
                 nfqReadyPath
               ]
               ++ lib.optionals runtime.httpProxy.http3.enable [
-                (toString runtime.httpProxy.http3.udpPort)
+                (lib.concatStringsSep " " (
+                  [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
+                ))
               ]
             );
 
@@ -898,7 +910,9 @@ lib.mkIf policyEnabled (
                 nfqReadyPath
               ]
               ++ lib.optionals runtime.httpProxy.http3.enable [
-                (toString runtime.httpProxy.http3.udpPort)
+                (lib.concatStringsSep " " (
+                  [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
+                ))
               ]
               ++ [
                 "cleanup"

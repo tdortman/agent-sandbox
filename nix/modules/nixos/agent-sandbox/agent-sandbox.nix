@@ -446,6 +446,15 @@ in
             default = 443;
             description = "UDP port whose intercepted QUIC traffic terminates at the proxy.";
           };
+
+          altUdpPorts = lib.mkOption {
+            type = lib.types.listOf lib.types.port;
+            default = [ ];
+            description = ''
+              Additional UDP ports whose intercepted QUIC traffic terminates at
+              the proxy, for validated `Alt-Svc` alternative endpoints.
+            '';
+          };
         };
 
         socketPath = lib.mkOption {

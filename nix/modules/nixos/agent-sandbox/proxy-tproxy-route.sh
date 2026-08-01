@@ -11,10 +11,49 @@ proxy_unit="$7"
 nfq_unit="$8"
 proxy_ready="$9"
 nfq_ready="${10}"
-udp_port="${11:-0}"
+udp_ports="${11:-}"
 action="${12:-up}"
 
 ports='80,443,8008,8080,8443'
+
+# Space-separated list of intercepted UDP ports; empty means HTTP/3 is off.
+read -r -a udp_port_array <<< "$udp_ports"
+
+udp_set() {
+  local elements=()
+  local port
+  for port in "${udp_port_array[@]}"; do
+    elements+=("$port")
+  done
+  [[ ${#elements[@]} -gt 0 ]] || return 1
+  printf '{ %s }' "$(IFS=','; echo "${elements[*]}")"
+}
+
+reject_rule() {
+  if [[ -n "$udp_ports" ]]; then
+    echo "udp dport 853 reject"
+  else
+    echo "udp dport { 443, 853 } reject"
+  fi
+}
+
+queue_rule() {
+  [[ -n "$udp_ports" ]] || return 0
+  # Queue only the first packet of each UDP flow. QUIC sends many datagrams
+  # per flow (handshake, data, ACKs); checking every packet against policyd
+  # serialises the NFQUEUE at tens of milliseconds per packet. Established
+  # flows keep the kernel path and reach the proxy directly, so the policy
+  # check runs once per destination.
+  echo "udp dport $(udp_set) ct state new,untracked counter meta mark set $mark queue num $queue_number"
+}
+
+tproxy_rules() {
+  [[ -n "$udp_ports" ]] || return 0
+  local port
+  for port in "${udp_port_array[@]}"; do
+    echo "udp dport $port counter tproxy to :$port meta mark set $mark"
+  done
+}
 
 systemctl_ready() {
   local unit="$1"
@@ -37,6 +76,11 @@ remove_rules() {
 fail_closed() {
   remove_rules
 
+  local udp_reject="udp dport { 443, 853 } reject"
+  if [[ -n "$udp_ports" ]]; then
+    udp_reject="udp dport { 853, $(udp_set) } reject"
+  fi
+
   nft -f - <<EOF
  table inet $nft_table {
    chain output {
@@ -44,13 +88,13 @@ fail_closed() {
      meta skuid $proxy_uid return
      tcp dport { $ports } reject with tcp reset
      tcp dport 853 reject with tcp reset
-     udp dport { 443, 853 } reject
+     $udp_reject
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
      tcp dport { $ports } reject with tcp reset
      tcp dport 853 reject with tcp reset
-     udp dport { 443, 853 } reject
+     $udp_reject
    }
  }
 EOF
@@ -91,41 +135,16 @@ nft -f - <<EOF
      # Queue before local TPROXY routing so the policy daemon sees the
      # original sandbox socket tuple.
      tcp dport 853 reject with tcp reset
-     ${
-       if [[ "$udp_port" != 0 ]]; then
-         echo "udp dport 853 reject"
-       else
-         echo "udp dport { 443, 853 } reject"
-       fi
-     }
+     $(reject_rule)
      tcp dport { $ports } counter meta mark set $mark queue num $queue_number
-     ${
-       if [[ "$udp_port" != 0 ]]; then
-         # Queue only the first packet of each UDP flow. QUIC sends many
-         # datagrams per flow (handshake, data, ACKs); checking every packet
-         # against policyd serialises the NFQUEUE at tens of milliseconds per
-         # packet. Established flows keep the kernel path and reach the proxy
-         # directly, so the policy check runs once per destination.
-         echo "udp dport $udp_port ct state new,untracked counter meta mark set $mark queue num $queue_number"
-       fi
-     }
+     $(queue_rule)
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
      tcp dport 853 reject with tcp reset
-     ${
-       if [[ "$udp_port" != 0 ]]; then
-         echo "udp dport 853 reject"
-       else
-         echo "udp dport { 443, 853 } reject"
-       fi
-     }
+     $(reject_rule)
      tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark
-     ${
-       if [[ "$udp_port" != 0 ]]; then
-         echo "udp dport $udp_port counter tproxy to :$udp_port meta mark set $mark"
-       fi
-     }
+     $(tproxy_rules)
    }
    chain output_redirect {
      type nat hook output priority 5; policy accept;
