@@ -2,6 +2,7 @@ mod ech_state;
 pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
+    alt_svc::AltSvcStore,
     cert::CertificateIssuer,
     http3::{self, Http3Config},
     policy::{
@@ -13,7 +14,6 @@ use agent_sandbox_proxy::{
         ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, TerminalError,
         is_hop_by_hop_header,
     },
-    strip_alt_svc,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
@@ -163,6 +163,11 @@ struct Args {
     #[arg(long, default_value_t = 443)]
     http3_listen_port: u16,
 
+    /// Additional UDP ports whose intercepted QUIC traffic terminates at
+    /// the proxy, for validated `Alt-Svc` alternative endpoints.
+    #[arg(long = "http3-alt-port", value_name = "PORT")]
+    http3_alt_ports: Vec<u16>,
+
     #[arg(long)]
     init_ech_state_only: bool,
 
@@ -172,6 +177,10 @@ struct Args {
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     test_destination: Option<SocketAddr>,
+
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    test_ech_dns: Option<SocketAddr>,
 
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
@@ -240,9 +249,22 @@ struct FlowState {
     policy: Arc<PolicySession>,
     claim: FlowClaim,
     ech_config_list: Option<Arc<Vec<u8>>>,
+    alt_svc: Arc<AltSvcStore>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
     http10_upstream_origins: Arc<Vec<String>>,
     upstream_clients: Arc<UpstreamClients>,
+}
+
+impl FlowState {
+    /// The fallback port for port-less authorities: the destination port,
+    /// or the recorded origin port when the destination is a validated
+    /// `Alt-Svc` alternative endpoint.
+    #[must_use]
+    fn authority_fallback_port(&self) -> u16 {
+        self.alt_svc
+            .origin_port_for(self.destination.ip(), self.destination.port())
+            .unwrap_or_else(|| self.destination.port())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +402,7 @@ async fn main() -> Result<(), BoxError> {
     let shutdown = Arc::new(Notify::new());
     let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
     let executor = Executor::default();
+    let alt_svc = listener_config.alt_svc.clone();
 
     let service = build_listener_service(
         executor.clone(),
@@ -403,10 +426,16 @@ async fn main() -> Result<(), BoxError> {
             shutdown: shutdown.clone(),
             active_checks: active_checks.clone(),
             listen_port: args.http3_listen_port,
+            alt_ports: args.http3_alt_ports.clone(),
+            alt_svc,
             #[cfg(debug_assertions)]
             test_destination: args.test_destination,
             #[cfg(not(debug_assertions))]
             test_destination: None,
+            #[cfg(debug_assertions)]
+            test_ech_dns: args.test_ech_dns,
+            #[cfg(not(debug_assertions))]
+            test_ech_dns: None,
         };
 
         let backend = http3::prepare(http3)?;
@@ -501,6 +530,7 @@ struct ListenerConfig {
     issuer: CertificateIssuer,
     ech_config_list: Option<Arc<Vec<u8>>>,
     ech_private_key: Option<[u8; 32]>,
+    alt_svc: Arc<AltSvcStore>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
     http10_upstream_origins: Arc<Vec<String>>,
     destination_resolver: DestinationResolver,
@@ -521,6 +551,7 @@ fn build_listener_service(
         let issuer = listener_config.issuer.clone();
         let ech_config_list = listener_config.ech_config_list.clone();
         let ech_private_key = listener_config.ech_private_key;
+        let alt_svc = listener_config.alt_svc.clone();
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
         let shutdown = shutdown.clone();
@@ -544,6 +575,7 @@ fn build_listener_service(
                 policy: policy.clone(),
                 claim: claim.clone(),
                 ech_config_list: ech_config_list.clone(),
+                alt_svc: alt_svc.clone(),
                 websocket_http11_urls: websocket_http11_urls.clone(),
                 http10_upstream_origins,
                 upstream_clients,
@@ -659,10 +691,19 @@ fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenerConfi
     let ca_private_key = std::fs::read_to_string(ca_private_key)?;
     let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
 
+    let intercepted_udp_ports = if args.http3 {
+        std::iter::once(args.http3_listen_port)
+            .chain(args.http3_alt_ports.iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let listener_config = ListenerConfig {
         issuer: issuer.clone(),
         ech_config_list,
         ech_private_key,
+        alt_svc: Arc::new(AltSvcStore::new(intercepted_udp_ports)),
         websocket_http11_urls,
         http10_upstream_origins,
         #[cfg(debug_assertions)]
@@ -796,6 +837,41 @@ async fn rewrite_doh_response(
     Ok(response)
 }
 
+/// Rewrite the `Alt-Svc` headers of one approved response.
+///
+/// Validated alternatives are preserved for HTTP/3 discovery, filtered
+/// alternatives are removed, and the special `clear` value passes through.
+/// The header is removed entirely when no alternative survives validation.
+async fn preserve_alt_svc(
+    response: &mut Response,
+    store: &AltSvcStore,
+    origin: &str,
+) -> Result<(), BoxError> {
+    let values = response
+        .headers()
+        .get_all("alt-svc")
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    let borrowed = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let rewritten = store.record(origin, &borrowed).await;
+
+    response.headers_mut().remove("alt-svc");
+
+    if let Some(value) = rewritten
+        && let Ok(value) = HeaderValue::from_bytes(&value)
+    {
+        response.headers_mut().insert("alt-svc", value);
+    }
+
+    Ok(())
+}
+
 async fn check_http_policy(
     request: &Request,
     state: &FlowState,
@@ -810,8 +886,8 @@ async fn check_http_policy(
     let uri_host = request.uri().authority().map(|value| value.to_string());
 
     if let (Some(header_host), Some(uri_host)) = (&header_host, &uri_host) {
-        let header_authority = normalize_authority(header_host, state.destination.port())?;
-        let uri_authority = normalize_authority(uri_host, state.destination.port())?;
+        let header_authority = normalize_authority(header_host, state.authority_fallback_port())?;
+        let uri_authority = normalize_authority(uri_host, state.authority_fallback_port())?;
 
         if header_authority != uri_authority {
             return Err(BoxError::from_static_str(
@@ -828,8 +904,8 @@ async fn check_http_policy(
     if let Some(tls_host) = tls_host.as_deref()
         && let Some(request_host) = header_host.as_deref().or(uri_host.as_deref())
     {
-        let tls_authority = normalize_authority(tls_host, state.destination.port())?;
-        let request_authority = normalize_authority(request_host, state.destination.port())?;
+        let tls_authority = normalize_authority(tls_host, state.authority_fallback_port())?;
+        let request_authority = normalize_authority(request_host, state.authority_fallback_port())?;
 
         if tls_authority != request_authority {
             return Err(BoxError::from_static_str(
@@ -852,7 +928,7 @@ async fn check_http_policy(
         .ok_or_else(|| BoxError::from_static_str("HTTP request has no authority"))?;
 
     let scheme = if state.tls { "https" } else { "http" };
-    let authority = normalize_authority(&host, state.destination.port())?;
+    let authority = normalize_authority(&host, state.authority_fallback_port())?;
     let target = request_target(request);
 
     let path = target
@@ -960,7 +1036,7 @@ async fn proxy_request(
         response = adapt_http10_response(response);
     }
 
-    strip_alt_svc(&mut response);
+    preserve_alt_svc(&mut response, &state.alt_svc, &authority).await?;
 
     if doh {
         response = rewrite_doh_response(
