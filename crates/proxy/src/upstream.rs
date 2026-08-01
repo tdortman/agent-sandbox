@@ -205,30 +205,32 @@ fn select_upstream_version(
     }
 }
 
-/// Offer `http/1.1` over TLS ALPN for an HTTP/1.0 upstream target.
+/// Adjust TLS ALPN and the request version for upstream targets.
 ///
 /// ALPN has no `http/1.0` token, but the TLS connector derives the offered
 /// ALPN from `TargetHttpVersion` and would offer the invalid `http/1.0`
 /// value. Shadow the target with `HTTP/1.1` during the handshake so the
 /// connector offers `http/1.1`, then restore `HTTP/1.0` afterwards so the
-/// version adapter still sends HTTP/1.0. The newest extension value wins.
+/// version adapter still sends HTTP/1.0. TLS can also succeed without ALPN.
+/// In that case, return a protocol negotiation error before the HTTP connector
+/// starts its HTTP/2 handshake, so the caller can retry with HTTP/1.1.
 #[derive(Clone, Debug)]
-struct Http10AlpnConnector<S> {
+struct TlsAlpnConnector<S> {
     inner: S,
 }
 
-impl<S> Http10AlpnConnector<S> {
+impl<S> TlsAlpnConnector<S> {
     const fn new(inner: S) -> Self {
         Self { inner }
     }
 }
 
-impl<S, C> Service<Request> for Http10AlpnConnector<S>
+impl<S, C> Service<Request> for TlsAlpnConnector<S>
 where
     S: Service<Request, Output = EstablishedClientConnection<C, Request>, Error: Into<BoxError>>,
     C: ExtensionsRef + Send + 'static,
 {
-    type Error = S::Error;
+    type Error = BoxError;
     type Output = EstablishedClientConnection<C, Request>;
 
     async fn serve(&self, request: Request) -> Result<Self::Output, Self::Error> {
@@ -237,13 +239,29 @@ where
             .get_ref::<TargetHttpVersion>()
             .is_some_and(|target| target.0 == Version::HTTP_10);
 
+        let http2_target = request
+            .extensions()
+            .get_ref::<TargetHttpVersion>()
+            .is_some_and(|target| target.0 == Version::HTTP_2);
+
         if http10_target {
             request
                 .extensions()
                 .insert(TargetHttpVersion(Version::HTTP_11));
         }
 
-        let established = self.inner.serve(request).await?;
+        let established = self.inner.serve(request).await.map_err(Into::into)?;
+
+        let no_alpn_http2 = http2_target
+            && established
+                .conn
+                .extensions()
+                .get_ref::<NegotiatedTlsParameters>()
+                .is_some_and(|params| params.application_layer_protocol.is_none());
+
+        if no_alpn_http2 {
+            return Err(BoxError::from_static_str("HTTP/2 handshake requires ALPN"));
+        }
 
         if http10_target {
             established
@@ -259,7 +277,7 @@ where
 fn build_upstream_client() -> Result<Arc<dyn UpstreamClient>, BoxError> {
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
-    let connector = Http10AlpnConnector::new(connector);
+    let connector = TlsAlpnConnector::new(connector);
 
     let connector = rama_http::layer::version_adapter::RequestVersionAdapter::new(connector)
         .with_default_version(Version::HTTP_11);
@@ -397,6 +415,7 @@ pub async fn send_upstream_request(
 
     let response = match connection.send().await {
         Ok(response) => response,
+
         Err(error)
             if retry_request.is_some()
                 && !replay_state.started.load(Ordering::Acquire)
@@ -411,6 +430,7 @@ pub async fn send_upstream_request(
                 .await?;
             connection.send().await?
         }
+
         Err(error) => return Err(error),
     };
 

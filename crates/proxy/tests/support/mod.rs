@@ -446,8 +446,10 @@ fn doh_dns_message(dnssec: bool) -> Vec<u8> {
         op::{Message, MessageType, OpCode, Query},
         rr::{
             Name, RData, Record, RecordType,
-            rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
-            rdata::HTTPS,
+            rdata::{
+                HTTPS,
+                svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
+            },
         },
     };
 
@@ -536,11 +538,18 @@ impl Drop for TcpOrigin {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TlsAlpn {
+    Http11,
+    None,
+}
+
 /// Origin selection for one harness.
 struct OriginOptions {
     ip: IpAddr,
     origin_port: u16,
     tls: bool,
+    tls_alpn: TlsAlpn,
     keep_alive: bool,
     http3: bool,
     alt_port: Option<u16>,
@@ -588,6 +597,7 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
             origin_address,
             &options.certificate,
             &options.private_key,
+            options.tls_alpn,
         )
         .await;
 
@@ -616,24 +626,29 @@ async fn start_tls_origin(
     address: SocketAddr,
     certificate: &Path,
     key: &Path,
+    tls_alpn: TlsAlpn,
 ) -> (TcpOrigin, TlsOrigin) {
     let listener = TcpListener::bind(address).await.expect("bind TLS origin");
     let inner_port = free_port(ip);
 
-    let child = Command::new("openssl")
-        .args([
-            "s_server",
-            "-quiet",
-            "-www",
-            "-alpn",
-            "http/1.1",
-            "-accept",
-            &inner_port.to_string(),
-            "-cert",
-            certificate.to_str().expect("origin certificate path"),
-            "-key",
-            key.to_str().expect("origin key path"),
-        ])
+    let mut command = Command::new("openssl");
+    command.args([
+        "s_server",
+        "-quiet",
+        "-www",
+        "-accept",
+        &inner_port.to_string(),
+        "-cert",
+        certificate.to_str().expect("origin certificate path"),
+        "-key",
+        key.to_str().expect("origin key path"),
+    ]);
+
+    if matches!(tls_alpn, TlsAlpn::Http11) {
+        command.args(["-alpn", "http/1.1"]);
+    }
+
+    let child = command
         .stdout(Stdio::null())
         .spawn()
         .expect("start TLS origin");
@@ -1039,25 +1054,96 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false, false, false, Http3Options::default()).await
+        Self::start_inner(
+            ip,
+            origin_port,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Http3Options::default(),
+        )
+        .await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, true, false, false, false, Http3Options::default()).await
+        Self::start_inner(
+            ip,
+            origin_port,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            Http3Options::default(),
+        )
+        .await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), true, false, false, false, false, Http3Options::default()).await
+        Self::start_inner(
+            ip,
+            free_port(ip),
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            Http3Options::default(),
+        )
+        .await
+    }
+
+    /// Start a TLS harness whose origin does not advertise ALPN.
+    pub async fn start_tls_without_alpn(ip: IpAddr) -> Self {
+        Self::start_inner(
+            ip,
+            free_port(ip),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Http3Options::default(),
+        )
+        .await
     }
 
     /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
     pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, true, false, false, Http3Options::default()).await
+        Self::start_inner(
+            ip,
+            origin_port,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            Http3Options::default(),
+        )
+        .await
     }
 
     /// Start a harness whose policy service rejects every flow claim.
     pub async fn start_claim_error(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(ip, origin_port, false, false, false, true, false, Http3Options::default()).await
+        Self::start_inner(
+            ip,
+            origin_port,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            Http3Options::default(),
+        )
+        .await
     }
 
     /// Start a harness with the HTTP/3 backend enabled and an HTTP/3 origin.
@@ -1065,6 +1151,7 @@ impl TransparentHarness {
         Self::start_inner(
             ip,
             0,
+            false,
             false,
             false,
             false,
@@ -1082,7 +1169,7 @@ impl TransparentHarness {
             alt_port: Some(free_port(ip)),
             ..Http3Options::default()
         };
-        Self::start_inner(ip, 0, false, false, false, false, true, options).await
+        Self::start_inner(ip, 0, false, false, false, false, false, true, options).await
     }
 
     /// Start an HTTP/3 harness whose upstream ECH lookups use `dns`.
@@ -1091,7 +1178,7 @@ impl TransparentHarness {
             test_ech_dns: Some(dns),
             ..Http3Options::default()
         };
-        Self::start_inner(ip, 0, false, false, false, false, true, options).await
+        Self::start_inner(ip, 0, false, false, false, false, false, true, options).await
     }
 
     #[expect(
@@ -1104,6 +1191,7 @@ impl TransparentHarness {
         ip: IpAddr,
         origin_port: u16,
         tls: bool,
+        advertise_http11_alpn: bool,
         keep_alive: bool,
         http10_origin: bool,
         claim_errors: bool,
@@ -1128,6 +1216,11 @@ impl TransparentHarness {
             ip,
             origin_port,
             tls,
+            tls_alpn: if advertise_http11_alpn {
+                TlsAlpn::Http11
+            } else {
+                TlsAlpn::None
+            },
             keep_alive,
             http3,
             alt_port: http3_options.alt_port,

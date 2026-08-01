@@ -335,8 +335,8 @@ fn transparent_https_conflicting_sni_and_host_are_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transparent_http2_downstream_falls_back_to_http11_upstream() {
-    let harness = TransparentHarness::start_tls(loopback(IpVersion::V4)).await;
+async fn transparent_http2_downstream_falls_back_to_http11_without_alpn() {
+    let harness = TransparentHarness::start_tls_without_alpn(loopback(IpVersion::V4)).await;
     let origin = format!("https://localhost:{}/allow", harness.origin.address.port());
     let proxy_target = ConnectorTarget(HostWithPort::new(
         Host::from(harness.proxy_address.ip()),
@@ -998,7 +998,10 @@ async fn transparent_http3_alt_svc_clear_removes_mapping() {
         .await
         .expect("main endpoint request");
     assert!(
-        harness.http3_request_to(alt_address, "/allow").await.is_ok(),
+        harness
+            .http3_request_to(alt_address, "/allow")
+            .await
+            .is_ok(),
         "mapped alternative endpoint must be served"
     );
 
@@ -1016,7 +1019,10 @@ async fn transparent_http3_alt_svc_clear_removes_mapping() {
     );
 
     assert!(
-        harness.http3_request_to(alt_address, "/allow").await.is_err(),
+        harness
+            .http3_request_to(alt_address, "/allow")
+            .await
+            .is_err(),
         "cleared mappings must not serve later alternative associations"
     );
 }
@@ -1048,10 +1054,12 @@ async fn transparent_http3_ordinary_tls_fallback_when_no_ech() {
     // uses ordinary TLS and the identity checks still pass.
     let dns = start_empty_dns().await;
 
-    let harness =
-        TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
+    let harness = TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
 
-    let response = harness.http3_request("/allow").await.expect("HTTP/3 request");
+    let response = harness
+        .http3_request("/allow")
+        .await
+        .expect("HTTP/3 request");
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
 
@@ -1076,8 +1084,7 @@ async fn transparent_http3_upstream_ech_fails_closed() {
     let config = std::fs::read(state.join("ech-config-list")).expect("ECH configuration");
     let dns = start_ech_dns(config).await;
 
-    let harness =
-        TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
+    let harness = TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
 
     let result = harness.http3_request("/allow").await;
     assert!(
@@ -1159,8 +1166,10 @@ fn https_answer_with_ech(config: &[u8]) -> Vec<u8> {
         op::{Message, MessageType, OpCode, Query},
         rr::{
             Name, RData, Record, RecordType,
-            rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
-            rdata::HTTPS,
+            rdata::{
+                HTTPS,
+                svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
+            },
         },
     };
 
