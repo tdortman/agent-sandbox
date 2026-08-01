@@ -11,10 +11,12 @@
 //! port to the proxy before any HTTP/3 traffic can arrive.
 
 mod association;
+mod ech;
+mod hpke;
 mod socket;
 pub mod upstream;
 
-use crate::{cert::CertificateIssuer, policy::PolicySession};
+use crate::{alt_svc::AltSvcStore, cert::CertificateIssuer, policy::PolicySession};
 use socket::TransparentUdpSocket;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -32,6 +34,7 @@ pub struct Http3State {
     pub active_checks: Arc<Semaphore>,
     pub upstream: Arc<upstream::UpstreamPool>,
     pub destination_port: u16,
+    pub alt_svc: Arc<AltSvcStore>,
 }
 
 /// Configuration for the HTTP/3 backend.
@@ -41,7 +44,10 @@ pub struct Http3Config {
     pub shutdown: Arc<Notify>,
     pub active_checks: Arc<Semaphore>,
     pub listen_port: u16,
+    pub alt_ports: Vec<u16>,
+    pub alt_svc: Arc<AltSvcStore>,
     pub test_destination: Option<SocketAddr>,
+    pub test_ech_dns: Option<SocketAddr>,
 }
 
 /// Prepare the HTTP/3 backend so every fallible setup step runs before
@@ -56,7 +62,7 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         .map(PathBuf::from)
         .ok_or_else(|| boxed("SSL_CERT_FILE is required to verify upstream HTTP/3 certificates"))?;
 
-    let upstream = Arc::new(upstream::UpstreamPool::new(&ca_file)?);
+    let upstream = Arc::new(upstream::UpstreamPool::new(&ca_file, config.test_ech_dns)?);
 
     let transparent = config.test_destination.is_none();
 
@@ -71,6 +77,7 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         active_checks: config.active_checks,
         upstream,
         destination_port,
+        alt_svc: config.alt_svc.clone(),
     });
 
     let v4 = bind_endpoint(
@@ -87,14 +94,42 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         &state,
     )?;
 
-    let destination =
-        association::DestinationResolver::new(config.listen_port, config.test_destination);
+    let main_destination =
+        association::DestinationResolver::new(config.listen_port, config.test_destination, false);
+
+    let mut alternatives = Vec::with_capacity(config.alt_ports.len());
+
+    for port in config.alt_ports {
+        let v4 = bind_endpoint(
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port,
+            transparent,
+            &state,
+        )?;
+
+        let v6 = bind_endpoint(
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            port,
+            transparent,
+            &state,
+        )?;
+
+        let destination =
+            association::DestinationResolver::new(port, config.test_destination, true);
+
+        alternatives.push(AltEndpoint {
+            v4,
+            v6,
+            destination,
+        });
+    }
 
     Ok(Http3Backend {
         v4,
         v6,
         state,
-        destination,
+        destination: main_destination,
+        alternatives,
     })
 }
 
@@ -103,6 +138,14 @@ pub struct Http3Backend {
     v4: quinn::Endpoint,
     v6: quinn::Endpoint,
     state: Arc<Http3State>,
+    destination: association::DestinationResolver,
+    alternatives: Vec<AltEndpoint>,
+}
+
+/// One alternative UDP listener for validated `Alt-Svc` endpoints.
+struct AltEndpoint {
+    v4: quinn::Endpoint,
+    v6: quinn::Endpoint,
     destination: association::DestinationResolver,
 }
 
@@ -113,6 +156,7 @@ pub async fn run(backend: Http3Backend) {
         v6,
         state,
         destination,
+        alternatives,
     } = backend;
 
     let v4_loop = tokio::spawn(association::accept_loop(
@@ -121,6 +165,19 @@ pub async fn run(backend: Http3Backend) {
         destination.clone(),
     ));
     let v6_loop = tokio::spawn(association::accept_loop(v6, state.clone(), destination));
+
+    for alternative in alternatives {
+        tokio::spawn(association::accept_loop(
+            alternative.v4,
+            state.clone(),
+            alternative.destination.clone(),
+        ));
+        tokio::spawn(association::accept_loop(
+            alternative.v6,
+            state.clone(),
+            alternative.destination,
+        ));
+    }
 
     tracing::info!("HTTP/3 backend listening");
 

@@ -5,8 +5,16 @@
 //! policy before any upstream connection is used. Denied or cancelled
 //! streams are reset without closing other approved streams, and the
 //! association claim is released when the connection completes.
+//!
+//! Associations that arrive at an `Alt-Svc` alternative endpoint are
+//! attributed to the recorded origin before the flow is claimed. The
+//! alternative host and port stay transport details: `:authority`, SNI,
+//! certificate identity, policy identity, and the upstream pool keep using
+//! the original origin. An association at an alternative endpoint whose
+//! mapping is missing or expired is refused before any claim is made.
 
 use crate::{
+    alt_svc::AltSvcStore,
     http3::{BoxError, Http3State},
     policy::{FlowClaim, PendingPolicyCheck, PolicySession, normalize_authority},
     semantic::{
@@ -27,22 +35,34 @@ use tracing::{info, warn};
 pub struct DestinationResolver {
     port: u16,
     test_destination: Option<SocketAddr>,
+    alternative: bool,
 }
 
 impl DestinationResolver {
     /// Build a resolver for one listener.
     #[must_use]
-    pub const fn new(port: u16, test_destination: Option<SocketAddr>) -> Self {
+    pub const fn new(port: u16, test_destination: Option<SocketAddr>, alternative: bool) -> Self {
         Self {
             port,
             test_destination,
+            alternative,
         }
+    }
+
+    /// Whether this listener serves an alternative (non-primary) endpoint.
+    #[must_use]
+    pub const fn is_alternative(&self) -> bool {
+        self.alternative
     }
 
     /// Resolve the original destination for one incoming association.
     #[must_use]
     pub fn resolve(&self, incoming: &quinn::Incoming) -> SocketAddr {
         if let Some(destination) = self.test_destination {
+            if self.alternative {
+                return SocketAddr::new(destination.ip(), self.port);
+            }
+
             return destination;
         }
 
@@ -79,8 +99,38 @@ async fn serve_incoming(
     destination: DestinationResolver,
 ) -> Result<(), BoxError> {
     let source = incoming.remote_address();
-    let destination = destination.resolve(&incoming);
-    let flow = crate::policy::udp_flow_key(source, destination)?;
+    let destination_address = destination.resolve(&incoming);
+
+    // An alternative endpoint carries no origin identity of its own. Resolve
+    // the recorded origin before claiming the flow so an unmapped or expired
+    // alternative fails closed without touching policy state.
+    let origin_port = if destination.is_alternative() {
+        let Some(origin_port) = state
+            .alt_svc
+            .origin_port_for(destination_address.ip(), destination_address.port())
+        else {
+            warn!(
+                %source,
+                %destination_address,
+                "refusing QUIC association at unmapped alternative endpoint"
+            );
+            incoming.refuse();
+            return Ok(());
+        };
+
+        info!(
+            %source,
+            %destination_address,
+            origin_port,
+            "attributed alternative QUIC endpoint to its origin"
+        );
+
+        Some(origin_port)
+    } else {
+        None
+    };
+
+    let flow = crate::policy::udp_flow_key(source, destination_address)?;
 
     let claim = match state.policy.claim(flow).await {
         Ok(claim) => claim,
@@ -90,7 +140,11 @@ async fn serve_incoming(
         }
     };
 
-    info!(%source, %destination, "claimed downstream QUIC association");
+    info!(
+        %source,
+        destination = %destination_address,
+        "claimed downstream QUIC association"
+    );
 
     let connecting = match incoming.accept() {
         Ok(connecting) => connecting,
@@ -131,7 +185,7 @@ async fn serve_incoming(
                 let claim = claim.clone();
 
                 tokio::spawn(async move {
-                    if let Err(error) = serve_request(resolver, state, claim).await {
+                    if let Err(error) = serve_request(resolver, state, claim, origin_port).await {
                         warn!(%error, "downstream HTTP/3 stream failed");
                     }
                 });
@@ -159,10 +213,11 @@ async fn serve_request(
     resolver: RequestResolver<h3_quinn::Connection, Bytes>,
     state: Arc<Http3State>,
     claim: FlowClaim,
+    origin_port: Option<u16>,
 ) -> Result<(), BoxError> {
     let (request, stream) = resolver.resolve_request().await?;
 
-    let semantic = match semantic_request(&request, &state) {
+    let semantic = match semantic_request(&request, &state, origin_port) {
         Ok(semantic) => semantic,
         Err(error) => {
             let mut stream = stream;
@@ -222,6 +277,7 @@ async fn serve_request(
 fn semantic_request(
     request: &http::Request<()>,
     state: &Http3State,
+    origin_port: Option<u16>,
 ) -> Result<SemanticRequest, BoxError> {
     let uri = request.uri();
 
@@ -229,7 +285,11 @@ fn semantic_request(
         .authority()
         .ok_or_else(|| boxed("HTTP/3 request has no :authority"))?;
 
-    let authority = normalize_authority(authority.as_str(), state.destination_port)?;
+    // An alternative endpoint changes only the transport; the fallback port
+    // for a port-less authority stays the origin's port.
+    let fallback_port = origin_port.unwrap_or(state.destination_port);
+
+    let authority = normalize_authority(authority.as_str(), fallback_port)?;
 
     let scheme = uri
         .scheme_str()
@@ -307,6 +367,9 @@ async fn relay_request(
 
     *request.headers_mut() = upstream_headers(semantic.headers())?;
 
+    let origin = semantic.authority().to_owned();
+    let alt_svc = state.alt_svc.clone();
+
     let request_stream = upstream.send_request(request).await?;
     let (mut send_stream, mut recv_response) = request_stream.split();
 
@@ -315,7 +378,7 @@ async fn relay_request(
     let body_task =
         tokio::spawn(async move { relay_request_body(&mut recv_half, &mut send_stream).await });
 
-    let relay_result = relay_response(&mut send_half, &mut recv_response).await;
+    let relay_result = relay_response(&mut send_half, &mut recv_response, &alt_svc, &origin).await;
 
     body_task.abort();
 
@@ -357,13 +420,17 @@ async fn relay_request_body(
 async fn relay_response(
     stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     recv_response: &mut h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
+    alt_svc: &AltSvcStore,
+    origin: &str,
 ) -> Result<(), BoxError> {
-    let response = match recv_response.recv_response().await {
+    let mut response = match recv_response.recv_response().await {
         Ok(response) => response,
         Err(error) => {
             return Err(BoxError::from(format!("upstream response failed: {error}")));
         }
     };
+
+    crate::alt_svc::preserve_response_alt_svc(&mut response, alt_svc, origin).await;
 
     stream.send_response(response).await?;
 

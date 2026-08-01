@@ -36,6 +36,10 @@ struct Args {
     #[arg(long)]
     log: PathBuf,
 
+    /// `Alt-Svc` header value added to every non-stream response.
+    #[arg(long)]
+    alt_svc: Option<String>,
+
     #[arg(long)]
     gate: Option<PathBuf>,
 }
@@ -75,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while let Some(incoming) = endpoint.accept().await {
         let log = log.clone();
         let gate = args.gate.clone();
+        let alt_svc = args.alt_svc.clone();
 
         log_line(
             &log,
@@ -84,7 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::spawn(async move {
             log_line(&log, "conn-opened");
 
-            if let Err(error) = serve_connection(incoming, log.clone(), gate).await {
+            if let Err(error) =
+                serve_connection(incoming, log.clone(), gate, alt_svc.as_deref()).await
+            {
                 log_line(&log, &format!("conn-error {error}"));
             }
 
@@ -99,6 +106,7 @@ async fn serve_connection(
     incoming: quinn::Incoming,
     log: Arc<std::sync::Mutex<std::fs::File>>,
     gate: Option<PathBuf>,
+    alt_svc: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connecting = incoming.accept()?;
     let connection = connecting.await?;
@@ -112,19 +120,29 @@ async fn serve_connection(
 
         log_line(&log, &format!("request {method} {path}"));
 
+        let alt_svc = match path.as_str() {
+            "/alt-svc-clear" => Some("clear"),
+            "/alt-svc-filtered" => Some("h3=\":59999\""),
+            _ => alt_svc,
+        };
+
         let body = if path == "/stream" {
-            let response = http::Response::builder()
+            let mut builder = http::Response::builder()
                 .status(200)
-                .header("content-type", "application/octet-stream")
-                .body(())
-                .expect("response head");
+                .header("content-type", "application/octet-stream");
+
+            if let Some(alt_svc) = alt_svc {
+                builder = builder.header("alt-svc", alt_svc);
+            }
+
+            let response = builder.body(()).expect("response head");
 
             stream.send_response(response).await?;
             stream
                 .send_data(bytes::Bytes::from_static(b"first-chunk"))
                 .await?;
 
-            if let Some(ref gate) = gate {
+            if let Some(gate) = &gate {
                 wait_for_gate(gate).await;
             }
 
@@ -141,11 +159,15 @@ async fn serve_connection(
             }
         };
 
-        let response = http::Response::builder()
+        let mut builder = http::Response::builder()
             .status(200)
-            .header("content-length", body.len().to_string())
-            .body(())
-            .expect("response head");
+            .header("content-length", body.len().to_string());
+
+        if let Some(alt_svc) = alt_svc {
+            builder = builder.header("alt-svc", alt_svc);
+        }
+
+        let response = builder.body(()).expect("response head");
 
         stream.send_response(response).await?;
         stream.send_data(bytes::Bytes::from_static(body)).await?;
