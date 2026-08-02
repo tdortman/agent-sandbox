@@ -358,14 +358,10 @@ mod tests {
         message.add_answer(Record::from_rdata(
             name.clone(),
             300,
-            RData::HTTPS(hickory_proto::rr::rdata::HTTPS(SVCB::new(
-                2,
-                name,
-                vec![(
-                    SvcParamKey::EchConfigList,
-                    SvcParamValue::EchConfigList(EchConfigList(vec![9, 9])),
-                )],
-            ))),
+            RData::HTTPS(hickory_proto::rr::rdata::HTTPS(SVCB::new(2, name, vec![(
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(EchConfigList(vec![9, 9])),
+            )]))),
         ));
 
         let parsed = parse_https_answer(&message).expect("ech record found");

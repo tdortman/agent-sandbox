@@ -7,13 +7,10 @@ use super::{
     },
     ui_route::{UiRoute, paths_match},
 };
-
 use crate::wire::UiSpawnContext;
-
 use agent_sandbox_core::{
     ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
 };
-
 use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
 use uuid::Uuid;
@@ -463,14 +460,11 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
-
     use crate::store::{
         Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
-
     use agent_sandbox_core::FileAccess;
     use std::{sync::Arc, time::Duration};
-
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,

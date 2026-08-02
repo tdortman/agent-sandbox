@@ -1,9 +1,7 @@
 //! Shared IP→hostname cache populated by the DNS forwarder.
 
 use crate::hosts::normalize_host;
-
 use serde::{Deserialize, Serialize};
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

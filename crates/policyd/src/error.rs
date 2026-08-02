@@ -1,7 +1,6 @@
 //! Policy daemon errors (RPC-facing and startup).
 
 use agent_sandbox_core::{ErrorReply, ProjectPolicyError, RpcReply, ScopeResolveError};
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]

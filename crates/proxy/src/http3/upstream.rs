@@ -10,17 +10,34 @@
 //! ordinary TLS, where the SNI and certificate identity still bind to the
 //! policy target. An unverifiable advertised configuration fails closed.
 
-use super::{BoxError, ech::UpstreamEch};
+use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
 use bytes::Bytes;
-use h3::client::SendRequest;
+use h3::{
+    ConnectionState,
+    client::SendRequest,
+    error::Code,
+    quic::{OpenStreams as _, RecvStream as _, SendStream as _},
+};
 use rustls::pki_types::pem::PemObject;
 use std::{
     collections::HashMap,
+    future::poll_fn,
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::{Arc, Weak},
+    task::{Context, Poll},
     time::Duration,
 };
+
+pub(crate) enum IncomingWebTransportStream {
+    Bidi(Box<h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>>),
+    Uni(h3_webtransport::stream::RecvStream<h3_quinn::RecvStream, Bytes>),
+}
+
+pub(crate) type IncomingWebTransportReceiver =
+    tokio::sync::mpsc::Receiver<IncomingWebTransportStream>;
+
+type IncomingWebTransportSender = tokio::sync::mpsc::Sender<IncomingWebTransportStream>;
 
 /// Pool of upstream HTTP/3 connections keyed by origin authority.
 pub struct UpstreamPool {
@@ -108,9 +125,7 @@ impl UpstreamPool {
         }
 
         let (host, port) = split_authority(authority)?;
-
         let addresses = tokio::net::lookup_host((host, port)).await?;
-
         let mut last_error = None;
 
         for address in addresses {
@@ -123,6 +138,33 @@ impl UpstreamPool {
 
                     return Ok(connection);
                 }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            BoxError::from(format!("origin {authority} resolved to no addresses"))
+        }))
+    }
+
+    /// Establish a separate upstream HTTP/3 association for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the origin cannot be resolved or the HTTP/3
+    /// handshake fails.
+    pub async fn connect_dedicated(
+        self: &Arc<Self>,
+        _scheme: &str,
+        authority: &str,
+    ) -> Result<Arc<UpstreamConnection>, BoxError> {
+        let (host, port) = split_authority(authority)?;
+        let addresses = tokio::net::lookup_host((host, port)).await?;
+        let mut last_error = None;
+
+        for address in addresses {
+            match self.establish(host, authority, address).await {
+                Ok(connection) => return Ok(connection),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -157,27 +199,37 @@ impl UpstreamPool {
             })?;
 
         let h3 = h3_quinn::Connection::new(connection.clone());
-        let (mut h3_connection, send_request) = h3::client::new(h3).await.map_err(|error| {
+        let mut builder = h3::client::builder();
+        builder
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .enable_webtransport(true);
+
+        let (h3_connection, send_request) = builder.build(h3).await.map_err(|error| {
             BoxError::from(format!(
                 "upstream HTTP/3 handshake failed for {authority}: {error}"
             ))
         })?;
 
+        let incoming_sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let connection = Arc::new(UpstreamConnection {
             authority: authority.to_owned(),
             connection,
             send_request: tokio::sync::Mutex::new(send_request),
+            incoming_sessions,
         });
 
         let watcher = connection.clone();
         let pool = Arc::clone(&self.connections);
+        let driver_sessions = watcher.incoming_sessions.clone();
 
         tokio::spawn(async move {
             tokio::select! {
                 _ = watcher.connection.closed() => {}
-                _ = h3_connection.wait_idle() => {}
+                () = drive_upstream(h3_connection, driver_sessions.clone()) => {}
             }
 
+            driver_sessions.lock().await.clear();
             pool.lock()
                 .expect("upstream pool lock")
                 .retain(|key, entry| key != &watcher.authority || entry.strong_count() > 0);
@@ -244,11 +296,135 @@ fn split_authority(authority: &str) -> Result<(&str, u16), BoxError> {
     Ok((host, port))
 }
 
+enum UpstreamEvent {
+    Bidi(h3_quinn::BidiStream<Bytes>),
+    Uni(
+        h3::webtransport::SessionId,
+        h3_webtransport::stream::RecvStream<h3_quinn::RecvStream, Bytes>,
+    ),
+}
+
+fn poll_upstream_event(
+    connection: &mut h3::client::Connection<h3_quinn::Connection, Bytes>,
+    context: &mut Context<'_>,
+) -> Poll<Result<UpstreamEvent, h3::error::ConnectionError>> {
+    if let Some((session_id, stream)) = connection.inner.accepted_streams_mut().wt_uni_streams.pop()
+    {
+        return Poll::Ready(Ok(UpstreamEvent::Uni(
+            session_id,
+            h3_webtransport::stream::RecvStream::new(stream),
+        )));
+    }
+
+    match connection.poll_accept_bi(context) {
+        Poll::Ready(Ok(stream)) => return Poll::Ready(Ok(UpstreamEvent::Bidi(stream))),
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+        Poll::Pending => {}
+    }
+
+    match connection.poll_close(context) {
+        Poll::Ready(error) => Poll::Ready(Err(error)),
+        Poll::Pending => {
+            if let Some((session_id, stream)) =
+                connection.inner.accepted_streams_mut().wt_uni_streams.pop()
+            {
+                return Poll::Ready(Ok(UpstreamEvent::Uni(
+                    session_id,
+                    h3_webtransport::stream::RecvStream::new(stream),
+                )));
+            }
+
+            Poll::Pending
+        }
+    }
+}
+
+async fn drive_upstream(
+    mut connection: h3::client::Connection<h3_quinn::Connection, Bytes>,
+    sessions: Arc<
+        tokio::sync::Mutex<HashMap<h3::webtransport::SessionId, IncomingWebTransportSender>>,
+    >,
+) {
+    loop {
+        let event = poll_fn(|context| poll_upstream_event(&mut connection, context)).await;
+
+        match event {
+            Ok(UpstreamEvent::Bidi(stream)) => {
+                let sessions = Arc::clone(&sessions);
+                tokio::spawn(async move {
+                    match h3_webtransport::stream::accept_bidi(stream).await {
+                        Ok((session_id, stream)) => {
+                            dispatch_incoming(
+                                session_id,
+                                IncomingWebTransportStream::Bidi(Box::new(stream)),
+                                sessions,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!("upstream WebTransport stream rejected: {error}");
+                        }
+                    }
+                });
+            }
+            Ok(UpstreamEvent::Uni(session_id, stream)) => {
+                dispatch_incoming(
+                    session_id,
+                    IncomingWebTransportStream::Uni(stream),
+                    Arc::clone(&sessions),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::debug!("upstream HTTP/3 driver closed: {error}");
+                return;
+            }
+        }
+    }
+}
+
+async fn dispatch_incoming(
+    session_id: h3::webtransport::SessionId,
+    stream: IncomingWebTransportStream,
+    sessions: Arc<
+        tokio::sync::Mutex<HashMap<h3::webtransport::SessionId, IncomingWebTransportSender>>,
+    >,
+) {
+    let sender = sessions.lock().await.get(&session_id).cloned();
+
+    if let Some(sender) = sender {
+        match sender.send(stream).await {
+            Ok(()) => return,
+            Err(error) => {
+                sessions.lock().await.remove(&session_id);
+                reject_incoming(error.0);
+                return;
+            }
+        }
+    }
+
+    reject_incoming(stream);
+}
+
+fn reject_incoming(stream: IncomingWebTransportStream) {
+    match stream {
+        IncomingWebTransportStream::Bidi(mut stream) => {
+            stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
+            stream.reset(Code::H3_REQUEST_REJECTED.value());
+        }
+        IncomingWebTransportStream::Uni(mut stream) => {
+            stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
+        }
+    }
+}
+
 /// One live upstream HTTP/3 association.
 pub struct UpstreamConnection {
     authority: String,
     connection: quinn::Connection,
     send_request: tokio::sync::Mutex<SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    incoming_sessions:
+        Arc<tokio::sync::Mutex<HashMap<h3::webtransport::SessionId, IncomingWebTransportSender>>>,
 }
 
 impl UpstreamConnection {
@@ -267,5 +443,159 @@ impl UpstreamConnection {
             .send_request(request)
             .await
             .map_err(|error| BoxError::from(format!("upstream request failed: {error}")))
+    }
+
+    /// Require the peer settings for one approved session protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the peer does not advertise the required
+    /// settings before the session timeout.
+    pub async fn require_session_settings(
+        &self,
+        protocol: SessionProtocol,
+    ) -> Result<(), BoxError> {
+        for _ in 0..200 {
+            let settings = {
+                let send_request = self.send_request.lock().await;
+                *send_request.settings()
+            };
+            let supported = settings.enable_extended_connect()
+                && (!protocol.needs_datagrams() || settings.enable_datagram())
+                && (!matches!(protocol, SessionProtocol::WebTransport)
+                    || settings.enable_webtransport());
+
+            if supported {
+                return Ok(());
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Err(BoxError::from(format!(
+            "upstream HTTP/3 peer refused {} settings",
+            protocol.name()
+        )))
+    }
+
+    pub(crate) async fn register_webtransport_session(
+        &self,
+        session_id: h3::webtransport::SessionId,
+    ) -> IncomingWebTransportReceiver {
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        self.incoming_sessions
+            .lock()
+            .await
+            .insert(session_id, sender);
+        receiver
+    }
+
+    pub(crate) async fn unregister_webtransport_session(
+        &self,
+        session_id: h3::webtransport::SessionId,
+    ) {
+        self.incoming_sessions.lock().await.remove(&session_id);
+    }
+
+    /// Open one upstream WebTransport bidirectional stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream association cannot open or
+    /// initialise the stream.
+    pub(crate) async fn open_webtransport_stream(
+        &self,
+        session_id: h3::webtransport::SessionId,
+    ) -> Result<h3_quinn::BidiStream<Bytes>, BoxError> {
+        let h3 = h3_quinn::Connection::new(self.connection.clone());
+        let mut opener = <h3_quinn::Connection as h3::quic::Connection<Bytes>>::opener(&h3);
+        let mut stream = poll_fn(|context| opener.poll_open_bidi(context))
+            .await
+            .map_err(|error| {
+                BoxError::from(format!("upstream WebTransport stream failed: {error}"))
+            })?;
+
+        stream
+            .send_data(h3::stream::BidiStreamHeader::WebTransportBidi(session_id))
+            .map_err(|error| {
+                BoxError::from(format!("upstream WebTransport header failed: {error}"))
+            })?;
+        poll_fn(|context| stream.poll_ready(context))
+            .await
+            .map_err(|error| {
+                BoxError::from(format!("upstream WebTransport header failed: {error}"))
+            })?;
+
+        Ok(stream)
+    }
+
+    /// Open one upstream WebTransport unidirectional stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream association cannot open or
+    /// initialise the stream.
+    pub async fn open_webtransport_uni_stream(
+        &self,
+        session_id: h3::webtransport::SessionId,
+    ) -> Result<h3_quinn::SendStream<Bytes>, BoxError> {
+        let h3 = h3_quinn::Connection::new(self.connection.clone());
+        let mut opener = <h3_quinn::Connection as h3::quic::Connection<Bytes>>::opener(&h3);
+        let mut stream = poll_fn(|context| opener.poll_open_send(context))
+            .await
+            .map_err(|error| {
+                BoxError::from(format!("upstream WebTransport uni stream failed: {error}"))
+            })?;
+
+        stream
+            .send_data(h3::stream::UniStreamHeader::WebTransportUni(session_id))
+            .map_err(|error| {
+                BoxError::from(format!("upstream WebTransport uni header failed: {error}"))
+            })?;
+        poll_fn(|context| stream.poll_ready(context))
+            .await
+            .map_err(|error| {
+                BoxError::from(format!("upstream WebTransport uni header failed: {error}"))
+            })?;
+
+        Ok(stream)
+    }
+
+    /// Send one raw QUIC datagram through this HTTP/3 association.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when QUIC rejects the datagram.
+    pub fn send_datagram(&self, datagram: Bytes) -> Result<(), BoxError> {
+        self.connection
+            .send_datagram(datagram)
+            .map_err(|error| BoxError::from(format!("upstream HTTP Datagram failed: {error}")))
+    }
+
+    /// Receive one raw QUIC datagram from this HTTP/3 association.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the association closes.
+    pub async fn recv_datagram(&self) -> Result<Bytes, BoxError> {
+        self.connection
+            .read_datagram()
+            .await
+            .map_err(|error| BoxError::from(format!("upstream HTTP Datagram failed: {error}")))
+    }
+
+    /// Return the maximum datagram payload accepted by the peer.
+    #[must_use]
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn client_builder_supports_webtransport_settings() {
+        let mut builder = h3::client::builder();
+        builder.enable_webtransport(true);
     }
 }

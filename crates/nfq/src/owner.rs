@@ -1,11 +1,9 @@
 //! NFQ compatibility wrapper for shared procfs socket-owner resolution.
 
 use crate::packet::TransportProtocol;
-
 use agent_sandbox_core::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };
-
 use std::net::IpAddr;
 
 /// Find the checked process/socket snapshot for the socket bound to

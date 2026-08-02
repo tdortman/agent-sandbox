@@ -6,7 +6,6 @@ use crate::{
     proc_context::{ProcContext, context_from_pid, home_from_uid},
     session_context::{SessionContext, read_session_context, write_session_context},
 };
-
 use std::path::{Path, PathBuf};
 
 fn non_empty_path(path: &Path) -> Option<&Path> {

@@ -4,13 +4,11 @@ use super::{
     ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
     StatusReply, UiPush, Verdict, VerdictSource,
 };
-
 use crate::{
     ResourceKind,
     http::HttpRequest,
     policy::{DeviceAccess, FileAccess, Policy, ResourceAccess},
 };
-
 use std::path::{Path, PathBuf};
 
 #[test]

@@ -4,10 +4,8 @@ use crate::{
     store::{PolicyStore, PolicydArgs, evict_oldest},
     wire::UiSpawnContext,
 };
-
 use agent_sandbox_core::graphical_env::{graphical_session_env, tool_path};
 use nix::unistd::User;
-
 use std::{
     collections::HashMap,
     hash::BuildHasher,

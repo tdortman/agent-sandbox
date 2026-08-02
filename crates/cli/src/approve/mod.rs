@@ -1,14 +1,11 @@
 //! Host CLI for pending policy approvals.
 
 use crate::ui::{bus_name, message_kind_name, signature_display};
-
 use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
     RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
-
 use clap::{Args, Parser, Subcommand};
-
 use std::{
     path::{Path, PathBuf},
     time::Duration,

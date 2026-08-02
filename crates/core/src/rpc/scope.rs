@@ -1,7 +1,6 @@
 //! Approval scope for network and sudo rules.
 
 use crate::error::InvalidScopeError;
-
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

@@ -8,7 +8,6 @@ use crate::{
     hosts::{NetworkRuleKey, build_glob},
     http::HttpRule,
 };
-
 use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -1301,7 +1300,6 @@ mod tests {
         SocketAccess, SudoRule, contract_home_path, contract_project_path, expand_home_path,
         filesystem_approval_paths, open_flags_to_file_access,
     };
-
     use std::path::{Path, PathBuf};
 
     #[test]

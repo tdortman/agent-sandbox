@@ -1,7 +1,6 @@
 //! Read sandbox context from a client process via /proc (host pid namespace).
 
 use crate::merge_policy::ProjectPolicyContext;
-
 use std::path::{Path, PathBuf};
 
 #[must_use]

@@ -718,6 +718,323 @@ async fn transparent_http3_allow_records_policy_and_upstream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_websocket_reaches_upstream() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let body = match client
+        .websocket_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+    {
+        Ok(body) => body,
+        Err(error) => panic!(
+            "{error}\nproxy log:\n{}\norigin log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+        ),
+    };
+    assert_eq!(body, b"websocket-response\n");
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+    assert_eq!(harness.h3_origin().request_heads()[0], "CONNECT /allow");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_retries_approved_session_without_rechecking_policy() {
+    let harness =
+        TransparentHarness::start_http3_reconnecting_sessions(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let body = match client
+        .websocket_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+    {
+        Ok(body) => body,
+        Err(error) => panic!(
+            "{error}\nproxy log:\n{}\norigin log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+        ),
+    };
+
+    assert_eq!(body, b"websocket-response\n");
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 2);
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_reports_upstream_session_refusal() {
+    let harness = TransparentHarness::start_http3_refusing_sessions(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    client
+        .websocket_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect_err("upstream session refusal must fail the session");
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_webtransport_child_reaches_upstream() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let body = client
+        .webtransport_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect("WebTransport child stream");
+
+    assert_eq!(body, b"webtransport-response\n");
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+    assert_eq!(harness.h3_origin().request_heads()[0], "CONNECT /allow");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_retries_webtransport_session_without_rechecking_policy() {
+    let harness =
+        TransparentHarness::start_http3_reconnecting_sessions(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let body = client
+        .webtransport_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect("WebTransport session retry");
+
+    assert_eq!(body, b"webtransport-response\n");
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 2);
+    let events = harness.policy_events();
+    assert_eq!(events.lock().expect("policy events lock").checks.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_rejects_unapproved_webtransport_session() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    client
+        .webtransport_invalid_session_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect_err("unapproved WebTransport session must reset");
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_missing_datagram_setting_fails_closed() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let result = client
+        .webtransport_probe_without_datagram(harness.proxy_address, "localhost", "/allow")
+        .await;
+
+    assert!(result.is_err());
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_upstream_missing_session_settings_fails_closed() {
+    let harness = TransparentHarness::start_http3_rejecting_sessions(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let result = client
+        .webtransport_probe(harness.proxy_address, "localhost", "/allow")
+        .await;
+
+    assert!(result.is_err());
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_websocket_upstream_missing_settings_fails_closed() {
+    let harness = TransparentHarness::start_http3_rejecting_sessions(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let result = client
+        .websocket_probe(harness.proxy_address, "localhost", "/allow")
+        .await;
+
+    assert!(result.is_err());
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_connect_udp_relays_datagrams() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let body = match client
+        .connect_udp_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+    {
+        Ok(body) => body,
+        Err(error) => panic!(
+            "{error}\nproxy log:\n{}\norigin log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+        ),
+    };
+
+    assert_eq!(body, b"connect-udp-probe");
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+    assert_eq!(harness.h3_origin().request_heads()[0], "CONNECT /allow");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_relays_connect_udp_capsules() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let capsules = match client
+        .connect_udp_capsule_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+    {
+        Ok(capsules) => capsules,
+        Err(error) => panic!(
+            "{error}\nproxy log:\n{}\norigin log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+        ),
+    };
+
+    assert_eq!(capsules, vec![
+        (0, b"\0capsule-probe".to_vec()),
+        (0x21, b"unknown-capsule".to_vec()),
+    ]);
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_rejects_connect_udp_capsules_without_protocol() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    client
+        .connect_udp_capsule_probe_without_protocol(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect_err("missing Capsule-Protocol must reset the session");
+
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_reuses_query_insensitive_approval() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let bodies = client
+        .connect_udp_two_streams_probe(
+            harness.proxy_address,
+            "localhost",
+            "/allow",
+            "/allow?raw=query",
+        )
+        .await
+        .expect("CONNECT-UDP approval reuse");
+
+    assert_eq!(bodies, [b"route-0".to_vec(), b"route-1".to_vec()]);
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    assert_eq!(events.lock().expect("policy events lock").checks.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_rejects_malformed_connect_udp_capsule() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    client
+        .connect_udp_malformed_capsule_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect("malformed CONNECT-UDP Capsule Protocol message must reset");
+
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_does_not_reuse_connect_udp_approval_for_another_target() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let result = client
+        .connect_udp_two_streams_probe(harness.proxy_address, "localhost", "/allow", "/deny")
+        .await;
+
+    assert!(result.is_err(), "a different target needs a new approval");
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 2);
+    assert!(
+        events
+            .checks
+            .iter()
+            .any(|request| { request.url.to_string().ends_with("/allow") })
+    );
+    assert!(
+        events
+            .checks
+            .iter()
+            .any(|request| { request.url.to_string().ends_with("/deny") })
+    );
+    drop(events);
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_retries_connect_udp_without_rechecking_policy() {
+    let harness =
+        TransparentHarness::start_http3_reconnecting_sessions(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let body = client
+        .connect_udp_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect("CONNECT-UDP session retry");
+
+    assert_eq!(body, b"connect-udp-probe");
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 2);
+    let events = harness.policy_events();
+    assert_eq!(events.lock().expect("policy events lock").checks.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_routes_concurrent_connect_udp_streams() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    let bodies = match client
+        .connect_udp_two_streams_probe(harness.proxy_address, "localhost", "/allow", "/allow-again")
+        .await
+    {
+        Ok(bodies) => bodies,
+        Err(error) => panic!(
+            "{error}\nproxy log:\n{}\norigin log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+        ),
+    };
+
+    assert_eq!(bodies, [b"route-0".to_vec(), b"route-1".to_vec()]);
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_rejects_invalid_connect_udp_context() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+    client
+        .connect_udp_invalid_context_probe(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect("invalid CONNECT-UDP context must reset the session");
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_reuses_and_releases_upstream_associations() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
 

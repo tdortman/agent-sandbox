@@ -9,7 +9,9 @@
 //! keeps the packet loop project-owned while the endpoint handles QUIC
 //! connections, routing, and timers.
 
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, recvmsg, sendmsg, setsockopt, sockopt};
+use nix::sys::socket::{
+    ControlMessage, ControlMessageOwned, recvmsg, sendmsg, setsockopt, sockopt,
+};
 use rama_net::socket::core::{Domain, Protocol, Socket as Socket2, Type};
 use std::{
     io,

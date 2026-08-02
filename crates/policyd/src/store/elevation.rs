@@ -1,20 +1,16 @@
 //! Policy store: elevation.
 
 use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore};
-
 use crate::{
     error::PolicydError,
     wire::{ElevationRequest, UiSpawnContext},
 };
-
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
-
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
-
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
@@ -407,7 +403,6 @@ mod tests {
     use super::ELEVATION_PATH;
     use crate::{store::types::PolicyStore, wire::ElevationRequest};
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,

@@ -5,19 +5,16 @@ use agent_sandbox_core::{
     rpc::{RequestContext, RpcReply, RpcRequest},
     rpc_client::PersistentRpcClient,
 };
-
 use futures_util::StreamExt;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, time::Duration};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
-
 use zbus::{
     Connection, Guid, MessageStream,
     connection::Builder,
     message::{Builder as MessageBuilder, Flags, Message, Type},
 };
-
 use zvariant::Fd;
 
 const DBUS_PATH: &str = "/org/freedesktop/DBus";

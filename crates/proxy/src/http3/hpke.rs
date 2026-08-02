@@ -386,7 +386,9 @@ impl ring::hkdf::KeyType for HkdfLength {
 }
 
 fn unspecified_err(_: ring::error::Unspecified) -> Error {
-    Error::Other(OtherError(Arc::new(IoError::other("HPKE operation failed"))))
+    Error::Other(OtherError(Arc::new(IoError::other(
+        "HPKE operation failed",
+    ))))
 }
 
 fn client_only() -> Error {

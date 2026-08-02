@@ -1,10 +1,8 @@
 use super::PolicyStore;
 use crate::wire::DbusCheckRequest;
-
 use agent_sandbox_core::{
     ApprovalScope, DbusCheckReply, ResourceAccess, ResourceKind, Verdict, VerdictSource,
 };
-
 use std::path::PathBuf;
 
 impl PolicyStore {

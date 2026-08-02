@@ -1,7 +1,6 @@
 use agent_sandbox_syscall::{build_filter, default_syscalls};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
-
 use nix::{
     fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     sys::{
@@ -10,7 +9,6 @@ use nix::{
     },
     unistd::{ForkResult, Pid, execvp, pipe2},
 };
-
 use std::{
     env,
     ffi::{CStr, CString, OsString},

@@ -8,7 +8,6 @@ use crate::{
         SudoRule, contract_home_path, expand_policy_path,
     },
 };
-
 use std::path::{Path, PathBuf};
 
 /// Maximum on-disk policy JSON size policyd/core will load.
@@ -544,7 +543,6 @@ fn push_spaced_json(out: &mut String, compact: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::policy::{
         DbusMessageKind, DbusRule, DbusTarget, FileAccess, FilesystemRule, NetworkRule, Policy,
     };

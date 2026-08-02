@@ -2,7 +2,6 @@ use agent_sandbox_core::{
     ApprovalScope, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody, ProxyRequestId,
     RequestContext, RpcMessage, RpcReply, RpcRequest, Verdict, VerdictSource,
 };
-
 use std::path::PathBuf;
 
 #[test]

@@ -24,7 +24,6 @@ pub mod nr {
         SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE, SYS_write as WRITE,
         SYS_writev as WRITEV,
     };
-
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for
     /// the target.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

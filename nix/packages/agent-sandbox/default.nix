@@ -35,15 +35,13 @@ rust.rustPlatform.buildRustPackage {
     rust.rustPlatform.bindgenHook
   ];
 
-  # seccompiler is a git dep (pinned to the commit that adds
-  # SECCOMP_RET_USER_NOTIF). Nix's cargoLock importer cannot infer the
-  # hash for git-sourced crates, so we supply it explicitly. To refresh
-  # after bumping the seccompiler rev, run `nix flake prefetch
-  # git+https://github.com/rust-vmm/seccompiler.git?rev=<NEW_REV>` and
-  # paste the SRI hash below.
   cargoLock = {
     lockFile = "${src}/Cargo.lock";
-    outputHashes."seccompiler-0.5.0" = "sha256-k1TNr0GA8GeJYo1RvB/cfuvVg+tN4G7yypkVkhSq+h8=";
+
+    outputHashes = {
+      "h3-quinn-0.0.10" = "sha256-9s9/OxQm3TTWpcNYK+BUKahro9acdbAqYRBZdnEp1O4=";
+      "seccompiler-0.5.0" = "sha256-k1TNr0GA8GeJYo1RvB/cfuvVg+tN4G7yypkVkhSq+h8=";
+    };
   };
 
   preBuild = ''

@@ -1,6 +1,5 @@
 use super::options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator};
 use agent_sandbox_core::{graphical_session_env, tool_path};
-
 use std::{
     collections::HashMap,
     io::{BufRead, Write},
@@ -8,7 +7,6 @@ use std::{
     process::{Command, Stdio},
     sync::LazyLock,
 };
-
 use tracing::info;
 
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
@@ -455,7 +453,6 @@ mod tests {
         ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
         parse_review_result, qt_dialog_review,
     };
-
     use crate::ui::options::{ApprovalFormContext, ReviewValidator};
     use agent_sandbox_core::ApprovalScope;
     use std::{collections::HashMap, io::Write as _, os::unix::fs::PermissionsExt};

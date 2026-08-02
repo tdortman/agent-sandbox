@@ -1,7 +1,6 @@
 //! Shared session context for policyd and enforcement daemons.
 
 use serde::{Deserialize, Serialize};
-
 use std::{env, path::PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/h3"]
 
 [workspace.package]
-version = "0.34.2"
+version = "0.38.0"
 edition = "2024"
 license = "MIT"
 
@@ -17,8 +18,6 @@ dns-lookup = "3.0.1"
 futures-util = "0.3.33"
 getrandom = "0.4.3"
 globset = "0.4.19"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
 hickory-proto = "0.26.1"
 http = "1.5.0"
 idna = "1.1.0"
@@ -33,6 +32,8 @@ rama-net = { version = "0.3.0", default-features = false, features = ["std"] }
 rama-tcp = "0.3.0"
 rama-tls = { version = "0.3.0", default-features = false }
 rcgen = { version = "0.14.8", features = ["pem", "ring", "x509-parser"] }
+ring = "0.17.14"
+rustls = { version = "0.23.42", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
@@ -45,13 +46,27 @@ uuid = { version = "1.24.0", features = ["v4", "v7"] }
 which = "8.0.5"
 zvariant = "5.13"
 
+[workspace.dependencies.h3]
+git = "https://github.com/hyperium/h3.git"
+rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3"
+
+[workspace.dependencies.h3-datagram]
+git = "https://github.com/hyperium/h3.git"
+rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3"
+
+[workspace.dependencies.h3-quinn]
+git = "https://github.com/hyperium/h3.git"
+rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3"
+features = ["datagram"]
+
+[workspace.dependencies.h3-webtransport]
+git = "https://github.com/hyperium/h3.git"
+rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3"
+
 [workspace.dependencies.quinn]
 version = "0.11.11"
 default-features = false
 features = ["futures-io", "runtime-tokio", "rustls-ring"]
-
-[workspace.dependencies.ring]
-version = "0.17.14"
 
 [workspace.dependencies.rama-core]
 version = "0.3.0"
@@ -72,10 +87,6 @@ version = "0.3.0"
 default-features = false
 features = ["http", "ring"]
 
-[workspace.dependencies.rustls]
-version = "0.23.42"
-default-features = false
-
 [workspace.dependencies.seccompiler]
 git = "https://github.com/rust-vmm/seccompiler.git"
 rev = "08587106340b8e3cb361c7561411510039436857"
@@ -92,3 +103,8 @@ pedantic = { level = "warn", priority = -1 }
 [workspace.lints.rust]
 unsafe_code = "deny"
 warnings = "deny"
+
+[patch."https://github.com/hyperium/h3.git"]
+h3 = { path = "vendor/h3" }
+h3-datagram = { path = "vendor/h3-datagram" }
+h3-webtransport = { path = "vendor/h3-webtransport" }

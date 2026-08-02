@@ -4,7 +4,6 @@ use crate::{
     http::{HttpRequest, PendingHttpId},
     policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind},
 };
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

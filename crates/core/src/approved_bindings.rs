@@ -7,9 +7,7 @@ use crate::{
     dns_cache::{evict_oldest, unix_now, write_json_atomic},
     hosts::normalize_host,
 };
-
 use serde::{Deserialize, Serialize};
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

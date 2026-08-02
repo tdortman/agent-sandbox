@@ -4,7 +4,6 @@ use super::super::types::{
     Pending, PendingContext, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
     PendingResource, PolicyStore,
 };
-
 use crate::wire::{PendingDecision, ScopeWire};
 use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 

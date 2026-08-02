@@ -6,14 +6,11 @@
 //! for bubblewrap).
 
 use caps::CapSet;
-
 use clap::Parser as _;
-
 use nix::{
     sched::{CloneFlags, setns},
     unistd::execvp,
 };
-
 use std::{
     ffi::CString,
     fs::OpenOptions,

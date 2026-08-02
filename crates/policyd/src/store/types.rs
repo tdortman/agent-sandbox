@@ -7,14 +7,12 @@ use agent_sandbox_core::{
     ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
 };
-
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, RwLock, atomic::AtomicU64},
     time::{Duration, Instant},
 };
-
 use tokio::{
     net::unix::OwnedWriteHalf,
     sync::{Mutex, oneshot},

@@ -221,20 +221,23 @@ impl AltSvcStore {
     ///
     /// Panics when the entry lock is poisoned by a panicking task.
     #[must_use]
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the entry lock must stay held while reading and removing the entry"
-    )]
     pub fn origin_for(&self, ip: IpAddr, port: u16) -> Option<String> {
-        let mut entries = self.entries.lock().expect("alt-svc entries lock");
-        let entry = entries.get(&(ip, port))?;
+        let origin = {
+            let mut entries = self.entries.lock().expect("alt-svc entries lock");
+            let entry = entries.get(&(ip, port))?;
 
-        if entry.expiry <= Instant::now() {
-            entries.remove(&(ip, port));
-            return None;
-        }
+            if entry.expiry <= Instant::now() {
+                entries.remove(&(ip, port));
+                drop(entries);
+                return None;
+            }
 
-        Some(entry.origin.clone())
+            let origin = entry.origin.clone();
+            drop(entries);
+            origin
+        };
+
+        Some(origin)
     }
 
     /// Resolve the origin port for one transport endpoint.
@@ -355,7 +358,10 @@ fn parse_authority(authority: &str) -> Option<ParsedAuthority<'_>> {
 
     // Bracketed IPv6 literals split at the closing bracket; everything else
     // splits at the last colon. A malformed port filters the alternative.
-    let (host, port) = match authority.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+    let (host, port) = match authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
         Some((host, suffix)) => parse_bracketed(host, suffix)?,
         None => split_host_port(authority)?,
     };

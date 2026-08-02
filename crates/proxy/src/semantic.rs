@@ -416,44 +416,43 @@ pub struct SemanticRequest {
     body: BoundedRequestBody,
 }
 
+/// Input values for one semantic HTTP request.
+pub struct SemanticRequestParts<'a> {
+    pub method: &'a str,
+    pub scheme: &'a str,
+    pub authority: &'a str,
+    pub path: &'a str,
+    pub raw_query: Option<&'a str>,
+    pub headers: SemanticHeaders,
+    pub source_version: HttpVersion,
+    pub target_version: HttpVersion,
+    pub session: Option<SessionMetadata>,
+    pub body: BoundedRequestBody,
+}
+
 impl SemanticRequest {
     /// # Errors
     /// Returns [`SemanticRequestError`] when any request value is invalid.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "semantic request fields map directly to the wire contract"
-    )]
-    pub fn from_parts(
-        method: &str,
-        scheme: &str,
-        authority: &str,
-        path: &str,
-        raw_query: Option<&str>,
-        headers: SemanticHeaders,
-        source_version: HttpVersion,
-        target_version: HttpVersion,
-        session: Option<SessionMetadata>,
-        body: BoundedRequestBody,
-    ) -> Result<Self, SemanticRequestError> {
-        let method = HttpMethod::parse(method)?;
-        let scheme = HttpScheme::parse(scheme)?;
-        let authority_value = HttpAuthority::parse(scheme, authority)?;
+    pub fn from_parts(parts: SemanticRequestParts<'_>) -> Result<Self, SemanticRequestError> {
+        let method = HttpMethod::parse(parts.method)?;
+        let scheme = HttpScheme::parse(parts.scheme)?;
+        let authority_value = HttpAuthority::parse(scheme, parts.authority)?;
         let authority = canonical_authority(scheme, &authority_value).into_boxed_str();
-        let semantic_path = SemanticPath::parse(path, method.as_str())?;
-        let raw_query = raw_query.map(RawQuery::parse).transpose()?;
+        let semantic_path = SemanticPath::parse(parts.path, method.as_str())?;
+        let raw_query = parts.raw_query.map(RawQuery::parse).transpose()?;
 
         Ok(Self {
             method,
             scheme,
             authority,
             path: semantic_path,
-            raw_path: path.into(),
+            raw_path: parts.path.into(),
             raw_query,
-            headers,
-            source_version,
-            target_version,
-            session,
-            body,
+            headers: parts.headers,
+            source_version: parts.source_version,
+            target_version: parts.target_version,
+            session: parts.session,
+            body: parts.body,
         })
     }
 
@@ -572,20 +571,21 @@ impl TryFrom<SemanticRequestWire> for SemanticRequest {
     fn try_from(wire: SemanticRequestWire) -> Result<Self, Self::Error> {
         let expected_path = wire.path;
 
-        let request = Self::from_parts(
-            wire.method.as_str(),
-            wire.scheme.as_str(),
-            &wire.authority,
-            wire.raw_path
+        let request = Self::from_parts(SemanticRequestParts {
+            method: wire.method.as_str(),
+            scheme: wire.scheme.as_str(),
+            authority: &wire.authority,
+            path: wire
+                .raw_path
                 .as_deref()
                 .unwrap_or_else(|| expected_path.as_str()),
-            wire.raw_query.as_ref().map(RawQuery::as_str),
-            wire.headers,
-            wire.source_version,
-            wire.target_version,
-            wire.session,
-            wire.body,
-        )?;
+            raw_query: wire.raw_query.as_ref().map(RawQuery::as_str),
+            headers: wire.headers,
+            source_version: wire.source_version,
+            target_version: wire.target_version,
+            session: wire.session,
+            body: wire.body,
+        })?;
 
         if request.path != expected_path {
             return Err(SemanticRequestError::PathMismatch);
@@ -1083,18 +1083,18 @@ mod tests {
 
     #[test]
     fn request_wire_preserves_raw_query_and_policy_ignores_it() {
-        let request = SemanticRequest::from_parts(
-            "GET",
-            "https",
-            "Example.COM:443",
-            "/a/../b",
-            Some("x=1&x=2"),
-            SemanticHeaders::new(),
-            HttpVersion::Http11,
-            HttpVersion::Http11,
-            None,
-            BoundedRequestBody::empty(),
-        )
+        let request = SemanticRequest::from_parts(SemanticRequestParts {
+            method: "GET",
+            scheme: "https",
+            authority: "Example.COM:443",
+            path: "/a/../b",
+            raw_query: Some("x=1&x=2"),
+            headers: SemanticHeaders::new(),
+            source_version: HttpVersion::Http11,
+            target_version: HttpVersion::Http11,
+            session: None,
+            body: BoundedRequestBody::empty(),
+        })
         .expect("valid request");
 
         assert_eq!(
@@ -1187,18 +1187,18 @@ mod tests {
         assert!(RawQuery::parse("x=1#fragment").is_err());
 
         assert!(
-            SemanticRequest::from_parts(
-                "GET",
-                "https",
-                "example.com",
-                "*",
-                None,
-                SemanticHeaders::new(),
-                HttpVersion::Http11,
-                HttpVersion::Http11,
-                None,
-                BoundedRequestBody::empty()
-            )
+            SemanticRequest::from_parts(SemanticRequestParts {
+                method: "GET",
+                scheme: "https",
+                authority: "example.com",
+                path: "*",
+                raw_query: None,
+                headers: SemanticHeaders::new(),
+                source_version: HttpVersion::Http11,
+                target_version: HttpVersion::Http11,
+                session: None,
+                body: BoundedRequestBody::empty(),
+            })
             .is_err()
         );
 
@@ -1321,18 +1321,18 @@ mod tests {
         headers.try_push("X-Test", "one").expect("header");
         headers.try_push("x-test", "two").expect("header");
 
-        let request = SemanticRequest::from_parts(
-            "GET",
-            "http",
-            "example.com",
-            "/",
-            Some("a=1&b=2"),
+        let request = SemanticRequest::from_parts(SemanticRequestParts {
+            method: "GET",
+            scheme: "http",
+            authority: "example.com",
+            path: "/",
+            raw_query: Some("a=1&b=2"),
             headers,
-            HttpVersion::Http11,
-            HttpVersion::Http11,
-            None,
-            BoundedRequestBody::empty(),
-        )
+            source_version: HttpVersion::Http11,
+            target_version: HttpVersion::Http11,
+            session: None,
+            body: BoundedRequestBody::empty(),
+        })
         .expect("request");
 
         let wire = serde_json::to_string(&request).expect("wire");

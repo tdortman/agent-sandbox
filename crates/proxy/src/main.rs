@@ -11,8 +11,8 @@ use agent_sandbox_proxy::{
     },
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
-        ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, TerminalError,
-        is_hop_by_hop_header,
+        ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, SemanticRequestParts,
+        TerminalError, is_hop_by_hop_header,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -939,18 +939,18 @@ async fn check_http_policy(
     let raw_query = request.uri().query().map(|query| query.to_string());
     let semantic_version = semantic_http_version(request.version())?;
 
-    let semantic_request = SemanticRequest::from_parts(
-        request.method().as_str(),
+    let semantic_request = SemanticRequest::from_parts(SemanticRequestParts {
+        method: request.method().as_str(),
         scheme,
-        &authority,
-        &path,
-        raw_query.as_deref(),
-        semantic_request_headers(request)?,
-        semantic_version,
-        semantic_version,
-        None,
-        BoundedRequestBody::empty(),
-    )?;
+        authority: &authority,
+        path: &path,
+        raw_query: raw_query.as_deref(),
+        headers: semantic_request_headers(request)?,
+        source_version: semantic_version,
+        target_version: semantic_version,
+        session: None,
+        body: BoundedRequestBody::empty(),
+    })?;
 
     let request_id = ProxyRequestId::new();
 

@@ -5,12 +5,10 @@ use super::{
     decisions::DecisionAction,
     types::{PolicyDecisionState, PolicyStore},
 };
-
 use crate::{
     error::PolicydError,
     wire::{ScopeWire, SudoScopeOp},
 };
-
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 use std::path::PathBuf;
 

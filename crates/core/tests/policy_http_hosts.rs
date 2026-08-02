@@ -2,7 +2,6 @@ use agent_sandbox_core::{
     FileAccess, FilesystemRule, HttpRequest, HttpRule, NetworkRule, SudoRule, normalize_dns_name,
     policy_host_for_connect,
 };
-
 use std::path::Path;
 
 #[test]

@@ -6,7 +6,6 @@
 //! inode, the process start-time ticks, and the descriptor's socket target.
 
 use crate::{FlowProtocol, ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
-
 use std::{
     collections::HashMap,
     fmt::Write as _,

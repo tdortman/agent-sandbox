@@ -103,10 +103,6 @@ impl FakePolicy {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the fake policy RPC table mirrors the full proxy wire contract"
-)]
 async fn serve_policy_connection(
     stream: tokio::net::UnixStream,
     events: Arc<Mutex<PolicyEvents>>,
@@ -124,126 +120,10 @@ async fn serve_policy_connection(
         let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
             break;
         };
-        let reply = match op {
-            "open_proxy_session" => RpcReply::ProxySession(ProxySessionReply {
-                ok: true,
-                proxy_session: ProxySessionToken::from_bytes([1; 32]),
-            }),
-            "claim_network_flow" => {
-                let flow = serde_json::from_value(value.get("flow").cloned().expect("flow"))
-                    .expect("flow value");
-                let connection_id = serde_json::from_value(
-                    value.get("connection_id").cloned().expect("connection id"),
-                )
-                .expect("connection id value");
-                let mut events = events.lock().expect("policy events lock");
-                events.claims.push(ClaimEvent {
-                    flow,
-                    connection_id,
-                });
-                drop(events);
-
-                if claim_errors {
-                    RpcReply::Error(ErrorReply::new("unknown connection identifier"))
-                } else {
-                    RpcReply::FlowClaim(FlowClaimReply {
-                        ok: true,
-                        attribution_token: AttributionToken::from_bytes([2; 32]),
-                    })
-                }
-            }
-            "rebind_network_flow" => {
-                let flow = serde_json::from_value(value.get("flow").cloned().expect("flow"))
-                    .expect("flow value");
-                events
-                    .lock()
-                    .expect("policy events lock")
-                    .rebinds
-                    .push(flow);
-                RpcReply::Simple(SimpleOkReply::OK)
-            }
-            "check_http" => {
-                let request: HttpRequest =
-                    serde_json::from_value(value.get("request").cloned().expect("request"))
-                        .expect("HTTP request value");
-                let url = request.url.to_string();
-                events
-                    .lock()
-                    .expect("policy events lock")
-                    .checks
-                    .push(request.clone());
-
-                if url.contains("/policy-error") {
-                    RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
-                        serde_json::from_value(
-                            value.get("request_id").cloned().expect("request id"),
-                        )
-                        .expect("request id"),
-                        RpcReply::Error(ErrorReply::new("socket owner changed")),
-                    ))
-                } else if url.contains("/cancel") {
-                    cancel_gate.notified().await;
-                    RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
-                        serde_json::from_value(
-                            value.get("request_id").cloned().expect("request id"),
-                        )
-                        .expect("request id"),
-                        RpcReply::HttpCheck(HttpCheckReply::blocked(
-                            "agent-sandbox: HTTP check cancelled",
-                        )),
-                    ))
-                } else {
-                    let allowed = !url.contains("/deny");
-                    let mut events = events.lock().expect("policy events lock");
-                    events.decisions.push(allowed);
-                    drop(events);
-                    RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
-                        serde_json::from_value(
-                            value.get("request_id").cloned().expect("request id"),
-                        )
-                        .expect("request id"),
-                        RpcReply::HttpCheck(HttpCheckReply::from_verdict(
-                            request,
-                            if allowed {
-                                Verdict::allowed(VerdictSource::policy())
-                            } else {
-                                Verdict::denied(VerdictSource::policy())
-                            },
-                        )),
-                    ))
-                }
-            }
-            "release_network_flow" => {
-                let token =
-                    serde_json::from_value(value.get("attribution_token").cloned().expect("token"))
-                        .expect("attribution token");
-                let connection_id = serde_json::from_value(
-                    value.get("connection_id").cloned().expect("connection id"),
-                )
-                .expect("connection id value");
-                events
-                    .lock()
-                    .expect("policy events lock")
-                    .releases
-                    .push(FlowRelease {
-                        token,
-                        connection_id,
-                    });
-                RpcReply::Simple(SimpleOkReply::OK)
-            }
-            "cancel_check" => {
-                let request_id =
-                    serde_json::from_value(value.get("request_id").cloned().expect("request id"))
-                        .expect("request id");
-                events
-                    .lock()
-                    .expect("policy events lock")
-                    .cancellations
-                    .push(request_id);
-                cancel_gate.notify_waiters();
-                RpcReply::Simple(SimpleOkReply::OK)
-            }
-            _ => break,
+        let Some(reply) =
+            handle_policy_operation(op, &value, &events, &cancel_gate, claim_errors).await
+        else {
+            break;
         };
         let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
         if writer.write_all(&encoded).await.is_err()
@@ -254,6 +134,143 @@ async fn serve_policy_connection(
         }
         line.clear();
     }
+}
+
+async fn handle_policy_operation(
+    op: &str,
+    value: &serde_json::Value,
+    events: &Arc<Mutex<PolicyEvents>>,
+    cancel_gate: &Notify,
+    claim_errors: bool,
+) -> Option<RpcReply> {
+    match op {
+        "open_proxy_session" => Some(RpcReply::ProxySession(ProxySessionReply {
+            ok: true,
+            proxy_session: ProxySessionToken::from_bytes([1; 32]),
+        })),
+        "claim_network_flow" => Some(handle_claim(value, events, claim_errors)),
+        "rebind_network_flow" => Some(handle_rebind(value, events)),
+        "check_http" => Some(handle_check(value, events, cancel_gate).await),
+        "release_network_flow" => Some(handle_release(value, events)),
+        "cancel_check" => Some(handle_cancel(value, events, cancel_gate)),
+        _ => None,
+    }
+}
+
+fn parse_policy_field<T: serde::de::DeserializeOwned>(value: &serde_json::Value, name: &str) -> T {
+    serde_json::from_value(value.get(name).cloned().expect(name)).expect(name)
+}
+
+fn handle_claim(
+    value: &serde_json::Value,
+    events: &Arc<Mutex<PolicyEvents>>,
+    claim_errors: bool,
+) -> RpcReply {
+    let flow = parse_policy_field(value, "flow");
+    let connection_id = parse_policy_field(value, "connection_id");
+    events
+        .lock()
+        .expect("policy events lock")
+        .claims
+        .push(ClaimEvent {
+            flow,
+            connection_id,
+        });
+    if claim_errors {
+        RpcReply::Error(ErrorReply::new("unknown connection identifier"))
+    } else {
+        RpcReply::FlowClaim(FlowClaimReply {
+            ok: true,
+            attribution_token: AttributionToken::from_bytes([2; 32]),
+        })
+    }
+}
+
+fn handle_rebind(value: &serde_json::Value, events: &Arc<Mutex<PolicyEvents>>) -> RpcReply {
+    let flow = parse_policy_field(value, "flow");
+    events
+        .lock()
+        .expect("policy events lock")
+        .rebinds
+        .push(flow);
+    RpcReply::Simple(SimpleOkReply::OK)
+}
+
+async fn handle_check(
+    value: &serde_json::Value,
+    events: &Arc<Mutex<PolicyEvents>>,
+    cancel_gate: &Notify,
+) -> RpcReply {
+    let request: HttpRequest = parse_policy_field(value, "request");
+    let url = request.url.to_string();
+    events
+        .lock()
+        .expect("policy events lock")
+        .checks
+        .push(request.clone());
+    let request_id = || parse_policy_field(value, "request_id");
+
+    if url.contains("/policy-error") {
+        RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+            request_id(),
+            RpcReply::Error(ErrorReply::new("socket owner changed")),
+        ))
+    } else if url.contains("/cancel") {
+        cancel_gate.notified().await;
+        RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+            request_id(),
+            RpcReply::HttpCheck(HttpCheckReply::blocked(
+                "agent-sandbox: HTTP check cancelled",
+            )),
+        ))
+    } else {
+        let allowed = !url.contains("/deny");
+        events
+            .lock()
+            .expect("policy events lock")
+            .decisions
+            .push(allowed);
+        RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
+            request_id(),
+            RpcReply::HttpCheck(HttpCheckReply::from_verdict(
+                request,
+                if allowed {
+                    Verdict::allowed(VerdictSource::policy())
+                } else {
+                    Verdict::denied(VerdictSource::policy())
+                },
+            )),
+        ))
+    }
+}
+
+fn handle_release(value: &serde_json::Value, events: &Arc<Mutex<PolicyEvents>>) -> RpcReply {
+    let token = parse_policy_field(value, "attribution_token");
+    let connection_id = parse_policy_field(value, "connection_id");
+    events
+        .lock()
+        .expect("policy events lock")
+        .releases
+        .push(FlowRelease {
+            token,
+            connection_id,
+        });
+    RpcReply::Simple(SimpleOkReply::OK)
+}
+
+fn handle_cancel(
+    value: &serde_json::Value,
+    events: &Arc<Mutex<PolicyEvents>>,
+    cancel_gate: &Notify,
+) -> RpcReply {
+    let request_id = parse_policy_field(value, "request_id");
+    events
+        .lock()
+        .expect("policy events lock")
+        .cancellations
+        .push(request_id);
+    cancel_gate.notify_waiters();
+    RpcReply::Simple(SimpleOkReply::OK)
 }
 
 impl Drop for FakePolicy {
@@ -302,10 +319,6 @@ pub struct TcpOrigin {
     task: Option<JoinHandle<()>>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the plain-text origin serves every harness response shape"
-)]
 async fn serve_tcp_origin_connection(
     mut stream: TcpStream,
     body: &'static [u8],
@@ -338,7 +351,6 @@ async fn serve_tcp_origin_connection(
             .lock()
             .expect("request heads lock")
             .push(String::from_utf8_lossy(&request).into_owned());
-
         let doh_packet = if request
             .windows(b"/doh-ech".len())
             .any(|window| window == b"/doh-ech")
@@ -354,87 +366,113 @@ async fn serve_tcp_origin_connection(
         };
 
         if let Some(packet) = doh_packet {
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: \
-                 {}\r\nConnection: close\r\n\r\n",
-                packet.len()
-            );
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(&packet).await;
+            serve_doh_response(&mut stream, &packet).await;
             break;
         }
-
         let websocket = request
             .windows(b"upgrade: websocket".len())
             .any(|window| window.eq_ignore_ascii_case(b"upgrade: websocket"));
 
         if websocket {
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 101 Switching Protocols\r\n\
-                      Connection: Upgrade\r\n\
-                      Upgrade: websocket\r\n\
-                      Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
-                )
-                .await;
-            let mut payload = [0; 4];
-            if stream.read_exact(&mut payload).await.is_ok() {
-                let _ = stream.write_all(&payload).await;
-            }
+            serve_websocket_response(&mut stream).await;
             break;
         }
 
         let abort_probe = request
             .windows(b"/stream-abort".len())
             .any(|window| window == b"/stream-abort");
-        let declared_length = body.len() + usize::from(abort_probe) * 4 * 1024 * 1024;
-        let connection = if keep_alive { "keep-alive" } else { "close" };
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: \
-             {connection}\r\n\r\n"
-        );
-        let _ = stream.write_all(header.as_bytes()).await;
-        let split = body.len() / 2;
-        let _ = stream.write_all(&body[..split]).await;
-        if request
-            .windows(b"/stream".len())
-            .any(|window| window == b"/stream")
-        {
-            stream_gate.notified().await;
-        }
 
-        if let Err(error) = stream.write_all(&body[split..]).await {
-            if matches!(
-                error.kind(),
-                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
-            ) {
-                stream_resets.fetch_add(1, Ordering::SeqCst);
-            }
-        } else if abort_probe {
-            let probe = vec![0_u8; 65_536];
-            let probe_error = timeout(Duration::from_secs(2), async {
-                for _ in 0..64 {
-                    if let Err(error) = stream.write_all(&probe).await {
-                        return Some(error.kind());
-                    }
-                }
-                None
-            })
-            .await;
-            if matches!(
-                probe_error,
-                Ok(Some(
-                    ErrorKind::ConnectionReset
-                        | ErrorKind::BrokenPipe
-                        | ErrorKind::ConnectionAborted,
-                ))
-            ) {
-                stream_resets.fetch_add(1, Ordering::SeqCst);
-            }
-        }
+        serve_origin_body(
+            &mut stream,
+            body,
+            &request,
+            keep_alive,
+            &stream_gate,
+            &stream_resets,
+            abort_probe,
+        )
+        .await;
 
         if !keep_alive {
             break;
+        }
+    }
+}
+
+async fn serve_doh_response(stream: &mut TcpStream, packet: &[u8]) {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: \
+         {}\r\nConnection: close\r\n\r\n",
+        packet.len()
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let _ = stream.write_all(packet).await;
+}
+
+async fn serve_websocket_response(stream: &mut TcpStream) {
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+              Connection: Upgrade\r\n\
+              Upgrade: websocket\r\n\
+              Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+        )
+        .await;
+    let mut payload = [0; 4];
+    if stream.read_exact(&mut payload).await.is_ok() {
+        let _ = stream.write_all(&payload).await;
+    }
+}
+
+async fn serve_origin_body(
+    stream: &mut TcpStream,
+    body: &[u8],
+    request: &[u8],
+    keep_alive: bool,
+    stream_gate: &Notify,
+    stream_resets: &AtomicUsize,
+    abort_probe: bool,
+) {
+    let declared_length = body.len() + usize::from(abort_probe) * 4 * 1024 * 1024;
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: {connection}\r\n\r\n"
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let split = body.len() / 2;
+    let _ = stream.write_all(&body[..split]).await;
+    if request
+        .windows(b"/stream".len())
+        .any(|window| window == b"/stream")
+    {
+        stream_gate.notified().await;
+    }
+
+    if let Err(error) = stream.write_all(&body[split..]).await {
+        if matches!(
+            error.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
+        ) {
+            stream_resets.fetch_add(1, Ordering::SeqCst);
+        }
+    } else if abort_probe {
+        let probe = vec![0_u8; 65_536];
+        let probe_error = timeout(Duration::from_secs(2), async {
+            for _ in 0..64 {
+                if let Err(error) = stream.write_all(&probe).await {
+                    return Some(error.kind());
+                }
+            }
+            None
+        })
+        .await;
+        if matches!(
+            probe_error,
+            Ok(Some(
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted,
+            ))
+        ) {
+            stream_resets.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -544,6 +582,20 @@ enum TlsAlpn {
     None,
 }
 
+const fn harness_tls_alpn(advertise_http11_alpn: bool) -> TlsAlpn {
+    if advertise_http11_alpn {
+        TlsAlpn::Http11
+    } else {
+        TlsAlpn::None
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Http3SessionSettings {
+    Enabled,
+    Rejected,
+}
+
 /// Origin selection for one harness.
 struct OriginOptions {
     ip: IpAddr,
@@ -551,11 +603,17 @@ struct OriginOptions {
     tls: bool,
     tls_alpn: TlsAlpn,
     keep_alive: bool,
-    http3: bool,
-    alt_port: Option<u16>,
+    http3: Option<Http3OriginOptions>,
     certificate: PathBuf,
     private_key: PathBuf,
     root: PathBuf,
+}
+
+struct Http3OriginOptions {
+    alt_port: Option<u16>,
+    session_settings: Http3SessionSettings,
+    refuse_sessions: bool,
+    drop_first_session: bool,
 }
 
 /// The origins a harness can start; only the modes the harness asked for
@@ -567,19 +625,24 @@ struct HarnessOrigins {
 }
 
 async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
-    if options.http3 {
+    if let Some(http3) = options.http3.as_ref() {
         let gate = options.root.join("gate");
-        let alt_svc = options
+        let alt_svc = http3
             .alt_port
             .map(|port| format!("h3=\":{port}\"; persist=1"));
-        let origin = Http3Origin::start_with_alt_svc(
+        let origin = Http3Origin::start_with_settings(
             options.ip,
             0,
             &options.certificate,
             &options.private_key,
             &options.root,
-            Some(&gate),
-            alt_svc.as_deref(),
+            Http3OriginSettings {
+                gate: Some(&gate),
+                alt_svc: alt_svc.as_deref(),
+                reject_sessions: matches!(http3.session_settings, Http3SessionSettings::Rejected),
+                refuse_sessions: http3.refuse_sessions,
+                drop_first_session: http3.drop_first_session,
+            },
         )
         .await;
 
@@ -756,6 +819,14 @@ pub struct Http3Origin {
     child: Child,
 }
 
+struct Http3OriginSettings<'a> {
+    gate: Option<&'a Path>,
+    alt_svc: Option<&'a str>,
+    reject_sessions: bool,
+    refuse_sessions: bool,
+    drop_first_session: bool,
+}
+
 impl Http3Origin {
     pub async fn start(
         ip: IpAddr,
@@ -765,19 +836,30 @@ impl Http3Origin {
         root: &Path,
         gate: Option<&Path>,
     ) -> Self {
-        Self::start_with_alt_svc(ip, port, certificate, private_key, root, gate, None).await
+        Self::start_with_settings(
+            ip,
+            port,
+            certificate,
+            private_key,
+            root,
+            Http3OriginSettings {
+                gate,
+                alt_svc: None,
+                reject_sessions: false,
+                refuse_sessions: false,
+                drop_first_session: false,
+            },
+        )
+        .await
     }
 
-    /// Start an origin that advertises one `Alt-Svc` value on every
-    /// non-stream response.
-    pub async fn start_with_alt_svc(
+    async fn start_with_settings(
         ip: IpAddr,
         port: u16,
         certificate: &Path,
         private_key: &Path,
         root: &Path,
-        gate: Option<&Path>,
-        alt_svc: Option<&str>,
+        settings: Http3OriginSettings<'_>,
     ) -> Self {
         let address = SocketAddr::new(ip, if port == 0 { free_port(ip) } else { port });
         let log = root.join("origin.log");
@@ -796,12 +878,24 @@ impl Http3Origin {
             log.to_str().expect("log path"),
         ]);
 
-        if let Some(gate) = gate {
+        if let Some(gate) = settings.gate {
             command.args(["--gate", gate.to_str().expect("gate path")]);
         }
 
-        if let Some(alt_svc) = alt_svc {
+        if let Some(alt_svc) = settings.alt_svc {
             command.args(["--alt-svc", alt_svc]);
+        }
+
+        if settings.reject_sessions {
+            command.arg("--reject-sessions");
+        }
+
+        if settings.refuse_sessions {
+            command.arg("--refuse-sessions");
+        }
+
+        if settings.drop_first_session {
+            command.arg("--drop-first-session");
         }
 
         let child = command
@@ -1028,6 +1122,610 @@ impl Http3Client {
             _connection: connection,
         })
     }
+
+    pub async fn websocket_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let h3_quic = h3_quinn::Connection::new(quinn_connection);
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true);
+        let (h3_connection, mut send_request) = builder
+            .build::<_, _, bytes::Bytes>(h3_quic)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let mut request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("WebSocket request");
+        request
+            .extensions_mut()
+            .insert(h3::ext::Protocol::WEBSOCKET);
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("WebSocket request failed: {error}"))?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("WebSocket response failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("WebSocket response was {}", response.status()));
+        }
+
+        stream
+            .send_data(bytes::Bytes::from_static(b"websocket-probe"))
+            .await
+            .map_err(|error| format!("WebSocket request body failed: {error}"))?;
+        stream
+            .finish()
+            .await
+            .map_err(|error| format!("WebSocket request close failed: {error}"))?;
+
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|error| format!("WebSocket response body failed: {error}"))?
+        {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+
+        drop(stream);
+        drop(send_request);
+        drop(h3_connection);
+        Ok(body)
+    }
+
+    /// Open one WebTransport child stream and read the origin response.
+    pub async fn webtransport_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.webtransport_probe_with_settings(server, server_name, path, true, false)
+            .await
+    }
+
+    /// Open one WebTransport child stream without HTTP Datagram support.
+    pub async fn webtransport_probe_without_datagram(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.webtransport_probe_with_settings(server, server_name, path, false, false)
+            .await
+    }
+
+    /// Open a child stream with an unapproved WebTransport session ID.
+    pub async fn webtransport_invalid_session_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        self.webtransport_probe_with_settings(server, server_name, path, true, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn webtransport_probe_with_settings(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+        enable_datagram: bool,
+        invalid_session: bool,
+    ) -> Result<Vec<u8>, String> {
+        use h3::quic::{RecvStream as _, SendStream as _};
+        use h3_datagram::datagram_handler::HandleDatagramsExt;
+
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let h3_quic = h3_quinn::Connection::new(quinn_connection.clone());
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true);
+
+        if enable_datagram {
+            builder.enable_datagram(true);
+        }
+
+        builder.enable_webtransport(true);
+        let (h3_connection, mut send_request) = builder
+            .build::<_, _, bytes::Bytes>(h3_quic)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let mut request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("WebTransport request");
+        request
+            .extensions_mut()
+            .insert(h3::ext::Protocol::WEB_TRANSPORT);
+        let mut connect_stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("WebTransport request failed: {error}"))?;
+        let session_id = h3::webtransport::SessionId::from(connect_stream.id());
+        let child_session_id = if invalid_session {
+            h3::webtransport::SessionId::try_from(4).expect("invalid session id")
+        } else {
+            session_id
+        };
+        let response = connect_stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("WebTransport response failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("WebTransport response was {}", response.status()));
+        }
+
+        if enable_datagram && !invalid_session {
+            let stream_id = connect_stream.id();
+            let mut datagram_sender = h3_connection.get_datagram_sender(stream_id);
+            let mut datagram_reader = h3_connection.get_datagram_reader();
+            datagram_sender
+                .send_datagram(bytes::Bytes::from_static(b"\0webtransport-datagram"))
+                .map_err(|error| format!("WebTransport datagram send failed: {error}"))?;
+            let datagram =
+                tokio::time::timeout(Duration::from_secs(5), datagram_reader.read_datagram())
+                    .await
+                    .map_err(|_| "WebTransport datagram receive timed out".to_owned())?
+                    .map_err(|error| format!("WebTransport datagram receive failed: {error}"))?;
+            if datagram.stream_id() != stream_id {
+                return Err("WebTransport datagram stream context changed".to_owned());
+            }
+            if datagram.into_payload() != bytes::Bytes::from_static(b"\0webtransport-datagram") {
+                return Err("WebTransport datagram payload changed".to_owned());
+            }
+        }
+
+        let child_quic = h3_quinn::Connection::new(quinn_connection);
+        let mut opener =
+            <h3_quinn::Connection as h3::quic::Connection<bytes::Bytes>>::opener(&child_quic);
+        let mut child = std::future::poll_fn(|context| {
+            <h3_quinn::OpenStreams as h3::quic::OpenStreams<bytes::Bytes>>::poll_open_bidi(
+                &mut opener,
+                context,
+            )
+        })
+        .await
+        .map_err(|error| format!("WebTransport child stream failed: {error}"))?;
+        child
+            .send_data(h3::stream::BidiStreamHeader::WebTransportBidi(
+                child_session_id,
+            ))
+            .map_err(|error| format!("WebTransport child header failed: {error}"))?;
+        std::future::poll_fn(|context| child.poll_ready(context))
+            .await
+            .map_err(|error| format!("WebTransport child header failed: {error}"))?;
+        std::future::poll_fn(|context| child.poll_finish(context))
+            .await
+            .map_err(|error| format!("WebTransport child close failed: {error}"))?;
+
+        let mut body = Vec::new();
+        while let Some(mut chunk) = std::future::poll_fn(|context| child.poll_data(context))
+            .await
+            .map_err(|error| format!("WebTransport child response failed: {error}"))?
+        {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+
+        drop(connect_stream);
+        drop(send_request);
+        drop(h3_connection);
+        Ok(body)
+    }
+
+    pub async fn connect_udp_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.connect_udp_probe_with_context(server, server_name, path, false)
+            .await
+    }
+
+    pub async fn connect_udp_capsule_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.connect_udp_capsule_probe_with_settings(server, server_name, path, false, true)
+            .await
+    }
+
+    pub async fn connect_udp_capsule_probe_without_protocol(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        self.connect_udp_capsule_probe_with_settings(server, server_name, path, false, false)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn connect_udp_malformed_capsule_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        self.connect_udp_capsule_probe_with_settings(server, server_name, path, true, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn connect_udp_capsule_probe_with_settings(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+        malformed: bool,
+        capsule_protocol: bool,
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let h3_quic = h3_quinn::Connection::new(quinn_connection);
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true).enable_datagram(true);
+        let (h3_connection, mut send_request) = builder
+            .build::<_, _, bytes::Bytes>(h3_quic)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let mut request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("CONNECT-UDP request");
+        request
+            .extensions_mut()
+            .insert(h3::ext::Protocol::CONNECT_UDP);
+        if capsule_protocol {
+            request
+                .headers_mut()
+                .insert("capsule-protocol", http::HeaderValue::from_static("?1"));
+        }
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("CONNECT-UDP request failed: {error}"))?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("CONNECT-UDP response failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("CONNECT-UDP response was {}", response.status()));
+        }
+
+        let body = if malformed {
+            vec![0, 5, 1, 2]
+        } else {
+            [
+                encode_test_capsule(0, b"\0capsule-probe"),
+                encode_test_capsule(0x21, b"unknown-capsule"),
+            ]
+            .concat()
+        };
+        if let Err(error) = stream.send_data(bytes::Bytes::from(body)).await {
+            return malformed
+                .then_some(Vec::new())
+                .ok_or_else(|| format!("CONNECT-UDP Capsule Protocol body failed: {error}"));
+        }
+        if let Err(error) = stream.finish().await {
+            return malformed
+                .then_some(Vec::new())
+                .ok_or_else(|| format!("CONNECT-UDP Capsule Protocol close failed: {error}"));
+        }
+
+        if malformed {
+            return match tokio::time::timeout(Duration::from_secs(5), stream.recv_data()).await {
+                Ok(Err(_)) => Ok(Vec::new()),
+                Ok(Ok(_)) => Err("malformed CONNECT-UDP capsule was accepted".to_owned()),
+                Err(_) => Err("malformed CONNECT-UDP capsule was not reset".to_owned()),
+            };
+        }
+
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|error| format!("CONNECT-UDP capsule response failed: {error}"))?
+        {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+
+        drop(stream);
+        drop(send_request);
+        drop(h3_connection);
+        decode_test_capsules(&body)
+    }
+
+    pub async fn connect_udp_invalid_context_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        self.connect_udp_probe_with_context(server, server_name, path, true)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn connect_udp_two_streams_probe(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        first_path: &str,
+        second_path: &str,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        use h3_datagram::datagram_handler::HandleDatagramsExt;
+
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let h3_quic = h3_quinn::Connection::new(quinn_connection);
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true).enable_datagram(true);
+        let (h3_connection, mut send_request) = builder
+            .build::<_, _, bytes::Bytes>(h3_quic)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let mut streams = Vec::new();
+        for path in [first_path, second_path] {
+            let mut request = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri(format!("https://{server_name}{path}"))
+                .body(())
+                .expect("CONNECT-UDP request");
+            request
+                .extensions_mut()
+                .insert(h3::ext::Protocol::CONNECT_UDP);
+            let mut stream = send_request
+                .send_request(request)
+                .await
+                .map_err(|error| format!("CONNECT-UDP request failed: {error}"))?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|error| format!("CONNECT-UDP response failed: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!("CONNECT-UDP response was {}", response.status()));
+            }
+            streams.push(stream);
+        }
+
+        let stream_ids = [streams[0].id(), streams[1].id()];
+        if stream_ids[0] == stream_ids[1] {
+            return Err("CONNECT-UDP request streams reused one ID".to_owned());
+        }
+        let mut senders = [
+            h3_connection.get_datagram_sender(stream_ids[0]),
+            h3_connection.get_datagram_sender(stream_ids[1]),
+        ];
+        for (index, sender) in senders.iter_mut().enumerate() {
+            sender
+                .send_datagram(bytes::Bytes::from(format!("\0route-{index}")))
+                .map_err(|error| format!("CONNECT-UDP datagram send failed: {error}"))?;
+        }
+
+        let mut datagram_reader = h3_connection.get_datagram_reader();
+        let mut bodies = [None, None];
+        for _ in 0..2 {
+            let datagram = datagram_reader
+                .read_datagram()
+                .await
+                .map_err(|error| format!("CONNECT-UDP datagram receive failed: {error}"))?;
+            let index = stream_ids
+                .iter()
+                .position(|stream_id| *stream_id == datagram.stream_id())
+                .ok_or_else(|| "CONNECT-UDP datagram context changed".to_owned())?;
+            let payload = datagram.into_payload();
+            if payload.first() != Some(&0) {
+                return Err("CONNECT-UDP inner context changed".to_owned());
+            }
+            bodies[index] = Some(payload.slice(1..).to_vec());
+        }
+
+        for stream in &mut streams {
+            stream
+                .finish()
+                .await
+                .map_err(|error| format!("CONNECT-UDP session close failed: {error}"))?;
+        }
+
+        Ok(bodies
+            .into_iter()
+            .map(|body| body.expect("two CONNECT-UDP responses"))
+            .collect())
+    }
+
+    async fn connect_udp_probe_with_context(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+        invalid_context: bool,
+    ) -> Result<Vec<u8>, String> {
+        use h3_datagram::datagram_handler::HandleDatagramsExt;
+
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let h3_quic = h3_quinn::Connection::new(quinn_connection);
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true).enable_datagram(true);
+        let (h3_connection, mut send_request) = builder
+            .build::<_, _, bytes::Bytes>(h3_quic)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let mut request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("CONNECT-UDP request");
+        request
+            .extensions_mut()
+            .insert(h3::ext::Protocol::CONNECT_UDP);
+        let mut connect_stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("CONNECT-UDP request failed: {error}"))?;
+        let stream_id = connect_stream.id();
+        let response = connect_stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("CONNECT-UDP response failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("CONNECT-UDP response was {}", response.status()));
+        }
+
+        let datagram_context = stream_id;
+        let mut datagram_sender = h3_connection.get_datagram_sender(datagram_context);
+        let mut datagram_reader = h3_connection.get_datagram_reader();
+        let payload = if invalid_context {
+            bytes::Bytes::from_static(b"\x01connect-udp-probe")
+        } else {
+            bytes::Bytes::from_static(b"\0connect-udp-probe")
+        };
+        datagram_sender
+            .send_datagram(payload)
+            .map_err(|error| format!("CONNECT-UDP datagram send failed: {error}"))?;
+        if invalid_context {
+            return match connect_stream.recv_data().await {
+                Err(_error) => Ok(Vec::new()),
+                Ok(_) => Err("invalid CONNECT-UDP context was accepted".to_owned()),
+            };
+        }
+        let datagram = datagram_reader
+            .read_datagram()
+            .await
+            .map_err(|error| format!("CONNECT-UDP datagram receive failed: {error}"))?;
+        if datagram.stream_id() != stream_id {
+            return Err("CONNECT-UDP datagram context changed".to_owned());
+        }
+
+        connect_stream
+            .finish()
+            .await
+            .map_err(|error| format!("CONNECT-UDP session close failed: {error}"))?;
+        let payload = datagram.into_payload();
+        if payload.first() != Some(&0) {
+            return Err("CONNECT-UDP inner context changed".to_owned());
+        }
+
+        Ok(payload.slice(1..).to_vec())
+    }
+}
+
+fn encode_test_capsule(kind: u64, payload: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encode_test_varint(kind, &mut encoded);
+    encode_test_varint(
+        u64::try_from(payload.len()).expect("capsule payload length fits"),
+        &mut encoded,
+    );
+    encoded.extend_from_slice(payload);
+    encoded
+}
+
+fn decode_test_capsules(mut encoded: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    let mut capsules = Vec::new();
+    while !encoded.is_empty() {
+        let Some((kind, kind_len)) = decode_test_varint(encoded) else {
+            return Err("truncated Capsule Protocol type".to_owned());
+        };
+        let Some((length, length_len)) = decode_test_varint(&encoded[kind_len..]) else {
+            return Err("truncated Capsule Protocol length".to_owned());
+        };
+        let length = usize::try_from(length).map_err(|_| "Capsule Protocol length is too large")?;
+        let start = kind_len + length_len;
+        let end = start
+            .checked_add(length)
+            .ok_or("Capsule Protocol length overflows")?;
+        if end > encoded.len() {
+            return Err("truncated Capsule Protocol payload".to_owned());
+        }
+        capsules.push((kind, encoded[start..end].to_vec()));
+        encoded = &encoded[end..];
+    }
+    Ok(capsules)
+}
+
+fn encode_test_varint(value: u64, output: &mut Vec<u8>) {
+    match value {
+        0..=63 => output.push(u8::try_from(value).expect("bounded test varint")),
+        64..=16_383 => {
+            let value = u16::try_from(value | 0x4000).expect("bounded test varint");
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        16_384..=1_073_741_823 => {
+            let value = u32::try_from(value | 0x8000_0000).expect("bounded test varint");
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        _ => {
+            let value = value | 0xC000_0000_0000_0000;
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
+    let first = encoded.first().copied()?;
+    let length = 1usize << (first >> 6);
+    if encoded.len() < length {
+        return None;
+    }
+
+    let mut value = u64::from(first & 0x3F);
+    for byte in &encoded[1..length] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Some((value, length))
 }
 
 /// Extra HTTP/3 options for one harness.
@@ -1035,6 +1733,64 @@ impl Http3Client {
 struct Http3Options {
     alt_port: Option<u16>,
     test_ech_dns: Option<SocketAddr>,
+    reject_sessions: bool,
+    refuse_sessions: bool,
+    drop_first_session: bool,
+}
+
+impl Http3Options {
+    const fn session_settings(&self) -> Http3SessionSettings {
+        if self.reject_sessions {
+            Http3SessionSettings::Rejected
+        } else {
+            Http3SessionSettings::Enabled
+        }
+    }
+}
+
+#[derive(Default)]
+enum HarnessMode {
+    #[default]
+    Plain,
+    Http10Origin,
+    ClaimErrors,
+    Http3(Http3Options),
+}
+
+#[derive(Default)]
+struct HarnessOptions {
+    tls: bool,
+    advertise_http11_alpn: bool,
+    keep_alive: bool,
+    mode: HarnessMode,
+}
+fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> Child {
+    command
+        .env("AGENT_SANDBOX_PROXY_SESSION_READY", ready)
+        .env("INVOCATION_ID", "0123456789abcdef0123456789abcdef")
+        .stdout(Stdio::from(
+            std::fs::File::create(proxy_log).expect("create proxy log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(proxy_log).expect("create proxy log"),
+        ))
+        .spawn()
+        .expect("start proxy")
+}
+fn write_harness_ca(root: &TempDir) -> (PathBuf, PathBuf) {
+    let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
+    let ca_cert = root.path().join("ca.pem");
+    let ca_key = root.path().join("ca-key.pem");
+    std::fs::write(&ca_cert, ca.cert.pem()).expect("write CA certificate");
+    std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
+    (ca_cert, ca_key)
+}
+fn start_harness_policy(root: &TempDir, claim_errors: bool) -> FakePolicy {
+    if claim_errors {
+        FakePolicy::start_claim_error(root.path())
+    } else {
+        FakePolicy::start(root.path())
+    }
 }
 
 pub struct TransparentHarness {
@@ -1043,9 +1799,11 @@ pub struct TransparentHarness {
     pub udp_origin: UdpOrigin,
     pub policy: FakePolicy,
     pub h3_origin: Option<Http3Origin>,
+
     /// Address of the alternative endpoint the proxy intercepts, when the
     /// harness started one.
     pub h3_alt_address: Option<SocketAddr>,
+
     pub proxy_log: PathBuf,
     tls_origin: Option<TlsOrigin>,
     root: TempDir,
@@ -1054,178 +1812,159 @@ pub struct TransparentHarness {
 
 impl TransparentHarness {
     pub async fn start(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(
-            ip,
-            origin_port,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            Http3Options::default(),
-        )
-        .await
+        Self::start_inner(ip, origin_port, HarnessOptions::default()).await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(
-            ip,
-            origin_port,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            Http3Options::default(),
-        )
+        Self::start_inner(ip, origin_port, HarnessOptions {
+            keep_alive: true,
+            ..HarnessOptions::default()
+        })
         .await
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(
-            ip,
-            free_port(ip),
-            true,
-            true,
-            false,
-            false,
-            false,
-            false,
-            Http3Options::default(),
-        )
+        Self::start_inner(ip, free_port(ip), HarnessOptions {
+            tls: true,
+            advertise_http11_alpn: true,
+            ..HarnessOptions::default()
+        })
         .await
     }
 
     /// Start a TLS harness whose origin does not advertise ALPN.
     pub async fn start_tls_without_alpn(ip: IpAddr) -> Self {
-        Self::start_inner(
-            ip,
-            free_port(ip),
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            Http3Options::default(),
-        )
+        Self::start_inner(ip, free_port(ip), HarnessOptions {
+            tls: true,
+            ..HarnessOptions::default()
+        })
         .await
     }
 
     /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
     pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(
-            ip,
-            origin_port,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            Http3Options::default(),
-        )
+        Self::start_inner(ip, origin_port, HarnessOptions {
+            mode: HarnessMode::Http10Origin,
+            ..HarnessOptions::default()
+        })
         .await
     }
 
     /// Start a harness whose policy service rejects every flow claim.
     pub async fn start_claim_error(ip: IpAddr, origin_port: u16) -> Self {
-        Self::start_inner(
-            ip,
-            origin_port,
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            Http3Options::default(),
-        )
+        Self::start_inner(ip, origin_port, HarnessOptions {
+            mode: HarnessMode::ClaimErrors,
+            ..HarnessOptions::default()
+        })
         .await
     }
 
     /// Start a harness with the HTTP/3 backend enabled and an HTTP/3 origin.
     pub async fn start_http3(ip: IpAddr) -> Self {
-        Self::start_inner(
-            ip,
-            0,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            Http3Options::default(),
-        )
+        Self::start_inner(ip, 0, HarnessOptions {
+            mode: HarnessMode::Http3(Http3Options::default()),
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
+    /// Start an HTTP/3 harness whose origin omits session settings.
+    pub async fn start_http3_rejecting_sessions(ip: IpAddr) -> Self {
+        let http3_options = Http3Options {
+            reject_sessions: true,
+            ..Http3Options::default()
+        };
+        Self::start_inner(ip, 0, HarnessOptions {
+            mode: HarnessMode::Http3(http3_options),
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
+    /// Start an HTTP/3 harness whose origin refuses approved sessions.
+    pub async fn start_http3_refusing_sessions(ip: IpAddr) -> Self {
+        let http3_options = Http3Options {
+            refuse_sessions: true,
+            ..Http3Options::default()
+        };
+        Self::start_inner(ip, 0, HarnessOptions {
+            mode: HarnessMode::Http3(http3_options),
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
+    /// Start an HTTP/3 harness whose first approved session closes early.
+    pub async fn start_http3_reconnecting_sessions(ip: IpAddr) -> Self {
+        let http3_options = Http3Options {
+            drop_first_session: true,
+            ..Http3Options::default()
+        };
+        Self::start_inner(ip, 0, HarnessOptions {
+            mode: HarnessMode::Http3(http3_options),
+            ..HarnessOptions::default()
+        })
         .await
     }
 
     /// Start an HTTP/3 harness whose origin advertises one alternative
     /// endpoint, which the proxy also intercepts.
     pub async fn start_http3_with_alt(ip: IpAddr) -> Self {
-        let options = Http3Options {
+        let http3_options = Http3Options {
             alt_port: Some(free_port(ip)),
             ..Http3Options::default()
         };
-        Self::start_inner(ip, 0, false, false, false, false, false, true, options).await
+        Self::start_inner(ip, 0, HarnessOptions {
+            mode: HarnessMode::Http3(http3_options),
+            ..HarnessOptions::default()
+        })
+        .await
     }
 
     /// Start an HTTP/3 harness whose upstream ECH lookups use `dns`.
     pub async fn start_http3_with_ech_dns(ip: IpAddr, dns: SocketAddr) -> Self {
-        let options = Http3Options {
+        let http3_options = Http3Options {
             test_ech_dns: Some(dns),
             ..Http3Options::default()
         };
-        Self::start_inner(ip, 0, false, false, false, false, false, true, options).await
+        Self::start_inner(ip, 0, HarnessOptions {
+            mode: HarnessMode::Http3(http3_options),
+            ..HarnessOptions::default()
+        })
+        .await
     }
 
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "harness constructor flags map directly to proxy options"
-    )]
-    async fn start_inner(
-        ip: IpAddr,
-        origin_port: u16,
-        tls: bool,
-        advertise_http11_alpn: bool,
-        keep_alive: bool,
-        http10_origin: bool,
-        claim_errors: bool,
-        http3: bool,
-        http3_options: Http3Options,
-    ) -> Self {
-        let root = tempfile::tempdir().expect("temporary harness directory");
-        let policy = if claim_errors {
-            FakePolicy::start_claim_error(root.path())
-        } else {
-            FakePolicy::start(root.path())
+    async fn start_inner(ip: IpAddr, origin_port: u16, options: HarnessOptions) -> Self {
+        let HarnessOptions {
+            tls,
+            advertise_http11_alpn,
+            keep_alive,
+            mode,
+        } = options;
+        let (http10_origin, claim_errors, http3, http3_options) = match mode {
+            HarnessMode::Plain => (false, false, false, Http3Options::default()),
+            HarnessMode::Http10Origin => (true, false, false, Http3Options::default()),
+            HarnessMode::ClaimErrors => (false, true, false, Http3Options::default()),
+            HarnessMode::Http3(options) => (false, false, true, options),
         };
-        let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
-        let ca_cert = root.path().join("ca.pem");
-        let ca_key = root.path().join("ca-key.pem");
-        std::fs::write(&ca_cert, ca.cert.pem()).expect("write CA certificate");
-        std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
-        let origin_cert = ca_cert.clone();
-        let origin_key = ca_key.clone();
+        let root = tempfile::tempdir().expect("temporary harness directory");
+        let policy = start_harness_policy(&root, claim_errors);
+        let (ca_cert, ca_key) = write_harness_ca(&root);
 
         let origins = start_harness_origin(OriginOptions {
             ip,
             origin_port,
             tls,
-            tls_alpn: if advertise_http11_alpn {
-                TlsAlpn::Http11
-            } else {
-                TlsAlpn::None
-            },
+            tls_alpn: harness_tls_alpn(advertise_http11_alpn),
             keep_alive,
-            http3,
-            alt_port: http3_options.alt_port,
-            certificate: origin_cert.clone(),
-            private_key: origin_key.clone(),
+            http3: http3.then_some(Http3OriginOptions {
+                alt_port: http3_options.alt_port,
+                session_settings: http3_options.session_settings(),
+                refuse_sessions: http3_options.refuse_sessions,
+                drop_first_session: http3_options.drop_first_session,
+            }),
+            certificate: ca_cert.clone(),
+            private_key: ca_key.clone(),
             root: root.path().to_owned(),
         })
         .await;
@@ -1271,7 +2010,7 @@ impl TransparentHarness {
         }
 
         if tls_origin.is_some() {
-            proxy_command.env("SSL_CERT_FILE", &origin_cert);
+            proxy_command.env("SSL_CERT_FILE", &ca_cert);
         }
 
         if http3 {
@@ -1285,22 +2024,12 @@ impl TransparentHarness {
                 proxy_command.args(["--test-ech-dns", &dns.to_string()]);
             }
 
-            proxy_command.env("SSL_CERT_FILE", &origin_cert);
+            proxy_command.env("SSL_CERT_FILE", &ca_cert);
         }
 
         let proxy_log = root.path().join("proxy.log");
 
-        let proxy = proxy_command
-            .env("AGENT_SANDBOX_PROXY_SESSION_READY", &ready)
-            .env("INVOCATION_ID", "0123456789abcdef0123456789abcdef")
-            .stdout(Stdio::from(
-                std::fs::File::create(&proxy_log).expect("create proxy log"),
-            ))
-            .stderr(Stdio::from(
-                std::fs::File::create(&proxy_log).expect("create proxy log"),
-            ))
-            .spawn()
-            .expect("start proxy");
+        let proxy = spawn_harness_proxy(proxy_command, &proxy_log, &ready);
 
         wait_for_path(&ready).await;
 

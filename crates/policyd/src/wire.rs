@@ -4,7 +4,6 @@ use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusTarget, FileAccess, FilesystemRule, ProcessIds,
     RequestContext, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
 };
-
 use std::path::{Path, PathBuf};
 
 /// Attacker-controlled request context as received on the wire.

@@ -2,12 +2,10 @@ use super::{
     PolicyStore,
     access::{filesystem_rules_match_allow, is_sandbox_infrastructure_path},
 };
-
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, ResolvedRequestContext, ResourceAccess, ResourceKind,
     Verdict, VerdictSource, normalize_directory_traverse_access, normalize_host,
 };
-
 use std::path::Path;
 
 impl PolicyStore {
@@ -190,12 +188,10 @@ mod tests {
         super::types::{UiClient, UiSessionContext},
         *,
     };
-
     use agent_sandbox_core::{
         DbusMessageKind, DbusRule, DbusTarget, DeviceAccess, NetworkRule, NetworkRuleKey, Policy,
         ProcessIds, ResourceRule, ResourceRuleKey, SandboxPaths, atomic_write_policy,
     };
-
     use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
     use tokio::{net::UnixStream, sync::Mutex};
 

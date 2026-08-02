@@ -13,6 +13,7 @@
 mod association;
 mod ech;
 mod hpke;
+mod session;
 mod socket;
 pub mod upstream;
 

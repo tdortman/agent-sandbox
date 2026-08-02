@@ -7,7 +7,6 @@
 use crate::{
     error::ScopeResolveError, merge_policy::trusted_project_policy_path, rpc::ApprovalScope,
 };
-
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
