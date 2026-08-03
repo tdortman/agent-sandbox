@@ -146,6 +146,16 @@ let
       )
       "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with valid glob syntax and no fragment, got: ${url}"
   );
+
+  http10OriginType = lib.types.addCheck httpUrlType (
+    origin:
+    let
+      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" origin;
+      path = if match == null then null else builtins.elemAt match 2;
+    in
+    lib.assertMsg (builtins.match ".*[*?].*" origin == null && (path == null || path == "/"))
+      "agent-sandbox HTTP/1.0 upstream origins must be exact HTTP(S) origins without globs or paths, got: ${origin}"
+  );
   isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
   mergePackageMounts =
     pkgCfg:
@@ -476,6 +486,16 @@ in
           default = [ ];
           description = "Absolute HTTP(S) URL glob patterns whose WebSocket upstreams must use HTTP/1.1.";
         };
+
+        http10UpstreamOrigins = lib.mkOption {
+          type = lib.types.listOf http10OriginType;
+          default = [ ];
+
+          description = ''
+            Exact HTTP(S) origins that may use HTTP/1.0 upstream framing.
+            The proxy validates each origin before startup.
+          '';
+        };
       };
 
       netnsIp = lib.mkOption {
@@ -733,6 +753,10 @@ in
       {
         assertion = !cfg.network.httpProxy.http3.enable || cfg.network.httpProxy.enable;
         message = "agent-sandbox.network.httpProxy.http3.enable requires httpProxy.enable";
+      }
+      {
+        assertion = cfg.network.httpProxy.http3.enable || cfg.network.httpProxy.http3.altUdpPorts == [ ];
+        message = "agent-sandbox.network.httpProxy.http3.altUdpPorts requires http3.enable";
       }
     ];
 

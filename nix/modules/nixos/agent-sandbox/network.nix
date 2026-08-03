@@ -298,6 +298,10 @@ let
             "--websocket-http11-url"
             url
           ]) runtime.httpProxy.websocketHttp11Urls
+          ++ lib.concatMap (origin: [
+            "--http10-upstream-origin"
+            origin
+          ]) runtime.httpProxy.http10UpstreamOrigins
           ++ lib.optionals runtime.httpProxy.http3.enable [
             "--http3"
             "--http3-listen-port"

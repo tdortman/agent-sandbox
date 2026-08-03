@@ -13,6 +13,7 @@ let
     proxyCredentialsMessage
     upstreamCidrMessage
     proxyGidMessage
+    proxyAltPortsMessage
   ];
   contract =
     assert expectFailure socketPathMessage {
@@ -37,6 +38,48 @@ let
     assert expectFailure proxyNetworkMessage {
       agent-sandbox.network.httpProxy.enable = true;
     };
+
+    assert expectFailure proxyAltPortsMessage {
+      agent-sandbox.network = {
+        enable = true;
+
+        httpProxy.http3.altUdpPorts = [ 4444 ];
+      };
+    };
+
+    assert
+      !(builtins.tryEval (
+        let
+          system = mkNixosSystem {
+            agent-sandbox.network = {
+              enable = true;
+
+              httpProxy = {
+                enable = true;
+                http10UpstreamOrigins = [ "http://example.com/path" ];
+              };
+            };
+          };
+        in
+        builtins.deepSeq system.config.agent-sandbox.network.httpProxy.http10UpstreamOrigins true
+      )).success;
+
+    assert
+      !(builtins.tryEval (
+        let
+          system = mkNixosSystem {
+            agent-sandbox.network = {
+              enable = true;
+
+              httpProxy = {
+                enable = true;
+                http10UpstreamOrigins = [ "http://*.example.com" ];
+              };
+            };
+          };
+        in
+        builtins.deepSeq system.config.agent-sandbox.network.httpProxy.http10UpstreamOrigins true
+      )).success;
 
     assert expectFailure proxyRulesMessage {
       agent-sandbox.network = {
@@ -70,6 +113,7 @@ let
       agent-sandbox.network.httpProxy.gid = 0;
     };
 
+    assert validSystem.config.agent-sandbox.network.httpProxy.http3.enable == false;
     assert failedModuleMessages validSystem == [ ];
     true;
   dbusGateMessage = "agent-sandbox.policy.dbus.enable requires gates.resources.enable";
@@ -99,6 +143,7 @@ let
   proxyCredentialsMessage = "agent-sandbox HTTP proxy CA certificate and key must be supplied together and use absolute paths";
   proxyGidMessage = "agent-sandbox.network.httpProxy.gid must be nonzero when explicitly configured";
   proxyNetworkMessage = "agent-sandbox.network.httpProxy.enable requires network.enable";
+  proxyAltPortsMessage = "agent-sandbox.network.httpProxy.http3.altUdpPorts requires http3.enable";
   proxyRulesMessage = "agent-sandbox.network.httpProxy.declarativeAllow/declarativeDeny require httpProxy.enable (configured URLs: https://api.example.com/v1)";
   resourceGateMessage = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
   socketPathMessage = "agent-sandbox.policy.socketPath and sandboxSocketPath must differ when policy is enabled";
