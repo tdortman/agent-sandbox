@@ -231,19 +231,21 @@ impl quinn::AsyncUdpSocket for TransparentUdpSocket {
 
             match self.recv_one(buffer) {
                 Ok(Some((length, source, original_destination))) => {
-                    let fallback = || {
-                        if self.bound.is_ipv4() {
-                            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-                        } else {
-                            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-                        }
+                    let destination = if self.transparent {
+                        original_destination.ok_or_else(|| {
+                            io::Error::other(
+                                "transparent UDP datagram arrived without original destination",
+                            )
+                        })?
+                    } else {
+                        original_destination.unwrap_or_else(|| {
+                            if self.bound.is_ipv4() {
+                                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                            } else {
+                                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                            }
+                        })
                     };
-
-                    let destination = self
-                        .transparent
-                        .then_some(original_destination)
-                        .flatten()
-                        .unwrap_or_else(fallback);
 
                     meta.addr = source.ok_or_else(|| {
                         io::Error::other("UDP datagram arrived without a source address")

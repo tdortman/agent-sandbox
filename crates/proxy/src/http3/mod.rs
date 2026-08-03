@@ -218,6 +218,7 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
         }));
 
     tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.max_early_data_size = 0;
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
@@ -226,10 +227,8 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls));
     server_config.transport_config(Arc::new(transport));
 
-    // Client path changes must not relay on an unapproved UDP tuple until
-    // the migration rebind contract is implemented; quinn then rejects
-    // active migration and keeps the association on the claimed path.
-    server_config.migration(false);
+    // Path migration stays subject to the policy-owned tuple rebind check.
+    server_config.migration(true);
 
     Ok(server_config)
 }

@@ -1605,15 +1605,16 @@ fn blocked_http_request(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Body, BoundedRequestBody, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx,
-        SemanticRequestBody, StatusCode, TargetHttpVersion, Version, adapt_http10_response,
-        adapt_response_version, blocked_http_request, bridge_response_body,
+        Args, Body, BoundedRequestBody, HttpUrl, POLICY_DENIED_BODY, Request,
+        ResponseVersionAdaptCtx, SemanticRequestBody, StatusCode, TargetHttpVersion, Version,
+        adapt_http10_response, adapt_response_version, blocked_http_request, bridge_response_body,
         canonical_http10_origin, force_websocket_http11, is_doh_request,
         is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
         request_head_clone, select_ech_config_list, semantic_request_headers,
         semantic_response_headers,
     };
     use crate::ech_state::EchState;
+    use clap::Parser;
     use rama_core::{
         Service,
         bytes::Bytes,
@@ -1707,6 +1708,31 @@ mod tests {
 
         assert!(canonical_http10_origin("http://example.com *").is_err());
         assert!(canonical_http10_origin("http://example.com/path").is_err());
+    }
+
+    #[test]
+    fn args_disable_http3_by_default() {
+        let args = Args::try_parse_from(["agent-sandbox-proxy"]).expect("proxy arguments");
+
+        assert!(!args.http3);
+    }
+
+    #[test]
+    fn args_parse_http10_upstream_origins() {
+        let args = Args::try_parse_from([
+            "agent-sandbox-proxy",
+            "--http10-upstream-origin",
+            "http://example.com",
+            "--http10-upstream-origin",
+            "https://example.org:8443/",
+        ])
+        .expect("proxy arguments");
+
+        assert!(!args.http3);
+        assert_eq!(args.http10_upstream_origins, [
+            "http://example.com",
+            "https://example.org:8443/"
+        ]);
     }
 
     #[test]

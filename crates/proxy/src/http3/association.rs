@@ -68,22 +68,21 @@ impl DestinationResolver {
     }
 
     /// Resolve the original destination for one incoming association.
-    #[must_use]
-    pub fn resolve(&self, incoming: &quinn::Incoming) -> SocketAddr {
+    pub fn resolve(&self, incoming: &quinn::Incoming) -> Result<SocketAddr, BoxError> {
         if let Some(destination) = self.test_destination {
             if self.alternative {
-                return SocketAddr::new(destination.ip(), self.port);
+                return Ok(SocketAddr::new(destination.ip(), self.port));
             }
 
-            return destination;
+            return Ok(destination);
         }
 
-        let ip = incoming.local_ip().unwrap_or_else(|| {
+        let ip = incoming.local_ip().ok_or_else(|| {
             warn!("intercepted QUIC association has no original destination");
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        });
+            boxed("intercepted QUIC association has no original destination")
+        })?;
 
-        SocketAddr::new(ip, self.port)
+        Ok(SocketAddr::new(ip, self.port))
     }
 }
 
@@ -353,7 +352,13 @@ async fn serve_incoming(
     destination: DestinationResolver,
 ) -> Result<(), BoxError> {
     let source = incoming.remote_address();
-    let destination_address = destination.resolve(&incoming);
+    let destination_address = match destination.resolve(&incoming) {
+        Ok(destination) => destination,
+        Err(error) => {
+            incoming.refuse();
+            return Err(error);
+        }
+    };
 
     // An alternative endpoint carries no origin identity of its own. Resolve
     // the recorded origin before claiming the flow so an unmapped or expired
@@ -424,6 +429,8 @@ async fn serve_incoming(
         connection,
         state.clone(),
         claim.clone(),
+        source,
+        destination_address,
         origin_port,
         origin_authority,
     ))
@@ -457,6 +464,12 @@ impl H3RequestContext {
         stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
     ) {
+        if stream.is_0rtt() {
+            let mut stream = stream;
+            stream.stop_stream(Code::H3_REQUEST_REJECTED);
+            return;
+        }
+
         let downstream_stream_id = stream.id();
         let downstream_datagrams = if request
             .extensions()
@@ -557,10 +570,14 @@ async fn serve_h3_connection(
     connection: quinn::Connection,
     state: Arc<Http3State>,
     claim: FlowClaim,
+    source: SocketAddr,
+    destination: SocketAddr,
     origin_port: Option<u16>,
     origin_authority: Option<String>,
 ) -> Result<(), BoxError> {
     let mut h3 = build_h3_server(&connection).await?;
+
+    let mut bound_source = source;
     let sessions = Arc::new(SessionRegistry::default());
     let mut request_context = H3RequestContext {
         state,
@@ -575,10 +592,20 @@ async fn serve_h3_connection(
     let (webtransport_tx, mut webtransport_rx) =
         mpsc::unbounded_channel::<WebTransportPreparation>();
     let mut webtransport_pending = false;
-
+    let mut migration_tick = tokio::time::interval(Duration::from_millis(10));
     loop {
+        rebind_migrated_path(
+            &connection,
+            &request_context.state.policy,
+            &request_context.claim,
+            destination,
+            &mut bound_source,
+        )
+        .await?;
+
         tokio::select! {
             () = request_context.state.shutdown.notified() => break,
+            _ = migration_tick.tick() => {}
             accepted = h3.accept() => match accepted {
                 Ok(Some(resolver)) => {
                     request_context.tasks.push(spawn_h3_request_resolution(
@@ -675,6 +702,28 @@ fn spawn_h3_request_resolution(
     tokio::spawn(async move {
         let _ = resolved_tx.send(resolver.resolve_request().await);
     })
+}
+
+async fn rebind_migrated_path(
+    connection: &quinn::Connection,
+    policy: &PolicySession,
+    claim: &FlowClaim,
+    destination: SocketAddr,
+    bound_source: &mut SocketAddr,
+) -> Result<(), BoxError> {
+    let source = connection.remote_address();
+    if source == *bound_source {
+        return Ok(());
+    }
+
+    let flow = crate::policy::udp_flow_key(source, destination)?;
+    if let Err(error) = policy.rebind(claim, flow).await {
+        connection.close(varint(Code::H3_INTERNAL_ERROR), b"QUIC path rebind failed");
+        return Err(error.into());
+    }
+
+    *bound_source = source;
+    Ok(())
 }
 
 async fn finish_h3_request(

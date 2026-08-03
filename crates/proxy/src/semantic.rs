@@ -1229,6 +1229,40 @@ mod tests {
     }
 
     #[test]
+    fn response_sequence_rejects_late_headers_and_tracks_reset_after_trailers() {
+        let mut sequence = ResponseSequence::new();
+        sequence
+            .push(ResponseEvent::Final(
+                ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
+            ))
+            .expect("final");
+
+        assert_eq!(
+            sequence.push(ResponseEvent::Informational(
+                ResponseHead::informational(103, SemanticHeaders::new()).expect("1xx"),
+            )),
+            Err(EventError::InvalidOrdering)
+        );
+
+        sequence
+            .push(ResponseEvent::BodyChunk(vec![1]))
+            .expect("body");
+        sequence
+            .push(ResponseEvent::Trailers(SemanticHeaders::new()))
+            .expect("trailers");
+        assert_eq!(
+            sequence.push(ResponseEvent::BodyChunk(vec![2])),
+            Err(EventError::InvalidOrdering)
+        );
+
+        sequence.push(ResponseEvent::Reset(7)).expect("reset");
+        assert_eq!(
+            sequence.push(ResponseEvent::Complete),
+            Err(EventError::AfterTerminal)
+        );
+    }
+
+    #[test]
     fn terminal_errors_are_typed_and_serializable() {
         let error = TerminalError::PolicyDenied("approval required".into());
         let event = ResponseEvent::Error(error.clone());

@@ -129,7 +129,7 @@ impl UpstreamPool {
         let mut last_error = None;
 
         for address in addresses {
-            match self.establish(host, authority, address).await {
+            match self.establish(host, authority, address, Some(&key)).await {
                 Ok(connection) => {
                     self.connections
                         .lock()
@@ -163,7 +163,7 @@ impl UpstreamPool {
         let mut last_error = None;
 
         for address in addresses {
-            match self.establish(host, authority, address).await {
+            match self.establish(host, authority, address, None).await {
                 Ok(connection) => return Ok(connection),
                 Err(error) => last_error = Some(error),
             }
@@ -179,6 +179,7 @@ impl UpstreamPool {
         host: &str,
         authority: &str,
         address: SocketAddr,
+        pool_key: Option<&str>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
         let client_config = self.client_config(host).await?;
 
@@ -213,7 +214,6 @@ impl UpstreamPool {
 
         let incoming_sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let connection = Arc::new(UpstreamConnection {
-            authority: authority.to_owned(),
             connection,
             send_request: tokio::sync::Mutex::new(send_request),
             incoming_sessions,
@@ -221,6 +221,7 @@ impl UpstreamPool {
 
         let watcher = connection.clone();
         let pool = Arc::clone(&self.connections);
+        let pool_key = pool_key.map(str::to_owned);
         let driver_sessions = watcher.incoming_sessions.clone();
 
         tokio::spawn(async move {
@@ -230,9 +231,17 @@ impl UpstreamPool {
             }
 
             driver_sessions.lock().await.clear();
-            pool.lock()
-                .expect("upstream pool lock")
-                .retain(|key, entry| key != &watcher.authority || entry.strong_count() > 0);
+
+            if let Some(pool_key) = pool_key {
+                pool.lock()
+                    .expect("upstream pool lock")
+                    .retain(|key, entry| {
+                        key != &pool_key
+                            || entry
+                                .upgrade()
+                                .is_some_and(|entry| !Arc::ptr_eq(&entry, &watcher))
+                    });
+            }
         });
 
         Ok(connection)
@@ -261,6 +270,7 @@ impl UpstreamPool {
             .with_root_certificates(self.tls.roots.clone())
             .with_no_client_auth();
 
+        tls.enable_early_data = false;
         tls.alpn_protocols = vec![b"h3".to_vec()];
 
         let client_config =
@@ -420,7 +430,6 @@ fn reject_incoming(stream: IncomingWebTransportStream) {
 
 /// One live upstream HTTP/3 association.
 pub struct UpstreamConnection {
-    authority: String,
     connection: quinn::Connection,
     send_request: tokio::sync::Mutex<SendRequest<h3_quinn::OpenStreams, Bytes>>,
     incoming_sessions:
