@@ -1047,6 +1047,16 @@ impl Http3Client {
     /// Build a client that offers one explicit ALPN protocol.
     #[must_use]
     pub fn with_alpn(ca_file: &Path, alpn: &[u8]) -> Self {
+        Self::with_alpn_and_ip(ca_file, alpn, IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+    }
+
+    /// Build an HTTP/3 client bound to one local address family.
+    #[must_use]
+    pub fn with_local_ip(ca_file: &Path, local_ip: IpAddr) -> Self {
+        Self::with_alpn_and_ip(ca_file, b"h3", local_ip)
+    }
+
+    fn with_alpn_and_ip(ca_file: &Path, alpn: &[u8], local_ip: IpAddr) -> Self {
         let pem = std::fs::read(ca_file).expect("read harness CA");
         let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
@@ -1069,8 +1079,8 @@ impl Http3Client {
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config");
         let client_config = quinn::ClientConfig::new(Arc::new(client_config));
 
-        let mut endpoint = quinn::Endpoint::client("[::]:0".parse().expect("client address"))
-            .expect("client endpoint");
+        let mut endpoint =
+            quinn::Endpoint::client(SocketAddr::new(local_ip, 0)).expect("client endpoint");
         endpoint.set_default_client_config(client_config);
 
         Self { endpoint }
@@ -1121,6 +1131,87 @@ impl Http3Client {
             _send_request: send_request,
             _connection: connection,
         })
+    }
+
+    /// Rebind one live HTTP/3 request to a new local UDP address.
+    pub async fn request_with_rebind(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+        local_ip: IpAddr,
+        release_gate: Option<&Path>,
+    ) -> Result<Vec<u8>, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let h3 = h3_quinn::Connection::new(quinn_connection.clone());
+        let (connection, mut send_request) = h3::client::new(h3)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://{server_name}{path}"))
+            .body(())
+            .expect("client request");
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("response failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("unexpected response status {}", response.status()));
+        }
+
+        let mut body = Vec::new();
+
+        if let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|error| format!("response body failed: {error}"))?
+        {
+            body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+        }
+
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(local_ip, 0))
+            .map_err(|error| format!("bind migration socket failed: {error}"))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| format!("set migration socket nonblocking failed: {error}"))?;
+        self.endpoint
+            .rebind(socket)
+            .map_err(|error| format!("rebind QUIC endpoint failed: {error}"))?;
+
+        stream
+            .finish()
+            .await
+            .map_err(|error| format!("finish migration request failed: {error}"))?;
+
+        if let Some(gate) = release_gate {
+            std::fs::write(gate, b"open")
+                .map_err(|error| format!("open migration stream gate failed: {error}"))?;
+        }
+
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|error| format!("response body failed: {error}"))?
+        {
+            body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+        }
+
+        quinn_connection.close(quinn::VarInt::from_u32(0), b"migration complete");
+        drop(send_request);
+        drop(connection);
+        Ok(body)
     }
 
     pub async fn websocket_probe(

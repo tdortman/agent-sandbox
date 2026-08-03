@@ -699,6 +699,16 @@ async fn transparent_http3_allow_records_policy_and_upstream() {
         events.claims[0].flow.protocol(),
         agent_sandbox_core::FlowProtocol::Udp
     );
+
+    assert_eq!(events.claims[0].flow.source_ip(), loopback(IpVersion::V4));
+    assert_eq!(
+        events.claims[0].flow.destination_ip(),
+        harness.h3_origin().address.ip()
+    );
+    assert_eq!(
+        events.claims[0].flow.destination_port().get(),
+        harness.h3_origin().address.port()
+    );
     assert_eq!(events.checks.len(), 1);
 
     assert_eq!(
@@ -1111,6 +1121,40 @@ async fn transparent_http3_streaming_is_bounded_and_ordered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_migration_rebinds_policy_flow() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::with_local_ip(&harness.ca_file(), loopback(IpVersion::V4));
+    let gate = harness.h3_stream_gate();
+    let body = client
+        .request_with_rebind(
+            harness.proxy_address,
+            "localhost",
+            "/stream",
+            loopback(IpVersion::V4),
+            Some(&gate),
+        )
+        .await
+        .expect("HTTP/3 migration request");
+    assert_eq!(body, b"first-chunksecond-chunk");
+
+    wait_for_release(&harness).await;
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.rebinds.len(), 1);
+    assert_eq!(events.rebinds[0].source_ip(), loopback(IpVersion::V4));
+    assert_eq!(
+        events.rebinds[0].destination_ip(),
+        harness.h3_origin().address.ip()
+    );
+    assert_eq!(
+        events.rebinds[0].destination_port().get(),
+        harness.h3_origin().address.port()
+    );
+    drop(events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_ipv6_allow() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V6)).await;
 
@@ -1129,6 +1173,16 @@ async fn transparent_http3_ipv6_allow() {
     assert_eq!(
         events.claims[0].flow.protocol(),
         agent_sandbox_core::FlowProtocol::Udp
+    );
+
+    assert_eq!(events.claims[0].flow.source_ip(), loopback(IpVersion::V6));
+    assert_eq!(
+        events.claims[0].flow.destination_ip(),
+        harness.h3_origin().address.ip()
+    );
+    assert_eq!(
+        events.claims[0].flow.destination_port().get(),
+        harness.h3_origin().address.port()
     );
     assert_release_matches_claim(&events);
     drop(events);
