@@ -630,7 +630,11 @@ async fn proxy_upstream_pool_reaches_standalone_origin() {
 
     let authority = format!("localhost:{}", origin.address.port());
     let connection = pool
-        .connect("https", &authority)
+        .connect(
+            "https",
+            &authority,
+            agent_sandbox_core::AttributionToken::from_bytes([0; 32]),
+        )
         .await
         .expect("upstream connect");
 
@@ -725,6 +729,127 @@ async fn transparent_http3_allow_records_policy_and_upstream() {
 
     assert_eq!(harness.h3_origin().attempts(), 1);
     assert_eq!(harness.h3_origin().request_heads()[0], "GET /allow");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_disables_0rtt() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::with_early_data(&harness.ca_file());
+    let response = client
+        .request(harness.proxy_address, "localhost", "/allow")
+        .await
+        .expect("initial HTTP/3 request");
+
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    let zero_rtt = client
+        .zero_rtt_is_accepted(harness.proxy_address, "localhost")
+        .await
+        .expect("0-RTT probe");
+
+    assert!(!zero_rtt);
+
+    wait_for_release(&harness).await;
+    assert_eq!(harness.h3_origin().attempts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_forwards_informational_responses() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    let (informational, response) = client
+        .request_with_informational(harness.proxy_address, "localhost", "/informational")
+        .await
+        .unwrap_or_else(|error| panic!("HTTP/3 informational request failed: {error}"));
+
+    assert_eq!(informational.len(), 1);
+    assert_eq!(informational[0].status().as_u16(), 103);
+    assert_eq!(
+        informational[0]
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok()),
+        Some("</style.css>; rel=preload")
+    );
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_rejects_excessive_informational_responses() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    let result = client
+        .request_with_informational(
+            harness.proxy_address,
+            "localhost",
+            "/informational-overflow",
+        )
+        .await;
+
+    assert!(result.is_err());
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_gates_request_body_on_continue() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    let response = client
+        .request_with_expect(harness.proxy_address, "localhost", "/expect")
+        .await
+        .unwrap_or_else(|error| panic!("HTTP/3 Expect request failed: {error}"));
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"request-body-ok\n");
+
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_forwards_request_trailers() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let client = Http3Client::new(&harness.ca_file());
+
+    let response = client
+        .request_with_trailers(harness.proxy_address, "localhost", "/request-trailers")
+        .await
+        .unwrap_or_else(|error| panic!("HTTP/3 request trailers failed: {error}"));
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"request-body-ok\n");
+
+    wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_forwards_response_trailers() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let response = harness
+        .http3_request("/trailers")
+        .await
+        .expect("HTTP/3 request");
+
+    assert_eq!(response.status(), 200);
+    let (body, trailers) = response.body_with_trailers().await;
+
+    assert_eq!(body, b"origin-response\n");
+
+    assert_eq!(
+        trailers
+            .get("x-origin-trailer")
+            .and_then(|value| value.to_str().ok()),
+        Some("present")
+    );
+
+    wait_for_release(&harness).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1118,6 +1243,30 @@ async fn transparent_http3_streaming_is_bounded_and_ordered() {
     );
 
     wait_for_release(&harness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_cancellation_closes_upstream_stream() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+    let mut response = harness
+        .http3_request("/stream")
+        .await
+        .expect("HTTP/3 request");
+
+    assert_eq!(response.status(), 200);
+
+    let first = timeout(Duration::from_secs(10), response.next_chunk())
+        .await
+        .expect("first chunk timeout")
+        .expect("first chunk");
+
+    assert_eq!(first, b"first-chunk");
+
+    drop(response);
+    std::fs::write(harness.h3_stream_gate(), b"open").expect("open streaming gate");
+
+    wait_for_release(&harness).await;
+    wait_for_h3_condition(|| harness.h3_origin().connections_closed() >= 1, 5).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

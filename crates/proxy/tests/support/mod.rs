@@ -2,7 +2,7 @@ use agent_sandbox_core::{
     AttributionToken, ErrorReply, FlowClaimReply, HttpCheckReply, HttpRequest, ProxyConnectionId,
     ProxySessionReply, ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -29,6 +29,91 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
+
+fn harness_startup_mutex() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+        LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+    LOCK.clone()
+}
+
+struct HarnessStartupLock {
+    path: PathBuf,
+    _local_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl HarnessStartupLock {
+    async fn acquire() -> Self {
+        let local_guard = harness_startup_mutex().lock_owned().await;
+        let path = std::env::temp_dir().join("agent-sandbox-proxy-harness-startup.lock");
+
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id()).expect("write harness lock owner");
+                    return Self {
+                        path,
+                        _local_guard: local_guard,
+                    };
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if !harness_lock_owner_is_alive(&path)
+                        && let Err(error) = std::fs::remove_file(&path)
+                        && error.kind() != ErrorKind::NotFound
+                    {
+                        panic!("remove stale harness startup lock: {error}");
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("create harness startup lock: {error}"),
+            }
+        }
+    }
+}
+
+impl Drop for HarnessStartupLock {
+    fn drop(&mut self) {
+        let owner = std::process::id().to_string();
+
+        if std::fs::read_to_string(&self.path).is_ok_and(|contents| contents.trim() == owner)
+            && let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != ErrorKind::NotFound
+        {
+            panic!("remove harness startup lock: {error}");
+        }
+    }
+}
+
+fn harness_lock_owner_is_alive(path: &Path) -> bool {
+    let Ok(owner) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = owner.trim().parse::<u32>() else {
+        return false;
+    };
+
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+struct PortReservation(std::net::TcpListener);
+
+impl PortReservation {
+    fn new(ip: IpAddr) -> Self {
+        Self(std::net::TcpListener::bind(SocketAddr::new(ip, 0)).expect("reserve harness port"))
+    }
+
+    fn port(&self) -> u16 {
+        self.0.local_addr().expect("reserved port address").port()
+    }
+}
+
+fn free_port(ip: IpAddr) -> u16 {
+    PortReservation::new(ip).port()
+}
 
 /// One observed flow claim with the connection identity that owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -861,7 +946,7 @@ impl Http3Origin {
         root: &Path,
         settings: Http3OriginSettings<'_>,
     ) -> Self {
-        let address = SocketAddr::new(ip, if port == 0 { free_port(ip) } else { port });
+        let address = SocketAddr::new(ip, port);
         let log = root.join("origin.log");
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_h3-origin"));
@@ -904,14 +989,20 @@ impl Http3Origin {
             .spawn()
             .expect("start HTTP/3 origin");
 
-        let origin = Self {
+        let mut origin = Self {
             address,
             log,
             child,
         };
 
         for _ in 0..200 {
-            if std::fs::read_to_string(&origin.log).is_ok_and(|log| log.contains("listening")) {
+            let listening_address = std::fs::read_to_string(&origin.log).ok().and_then(|log| {
+                log.lines()
+                    .find_map(|line| line.strip_prefix("listening ")?.parse().ok())
+            });
+
+            if let Some(listening_address) = listening_address {
+                origin.address = listening_address;
                 return origin;
             }
 
@@ -1010,27 +1101,63 @@ impl Http3Response {
     pub async fn next_chunk(&mut self) -> Option<Vec<u8>> {
         let stream = self.stream.as_mut()?;
 
-        if let Ok(Some(mut chunk)) = stream.recv_data().await {
-            return Some(chunk.copy_to_bytes(chunk.remaining()).to_vec());
+        match stream.recv_data().await {
+            Ok(Some(mut chunk)) => Some(chunk.copy_to_bytes(chunk.remaining()).to_vec()),
+            Ok(None) => {
+                self.stream = None;
+                None
+            }
+            Err(error) => panic!("response body failed: {error}"),
         }
-
-        self.stream = None;
-        None
     }
 
     /// Read the complete response body.
-    pub async fn body(mut self) -> Vec<u8> {
+    pub async fn body(self) -> Vec<u8> {
+        self.body_with_trailers().await.0
+    }
+
+    /// Read the complete response body and trailers.
+    pub async fn body_with_trailers(mut self) -> (Vec<u8>, http::HeaderMap) {
         let mut body = Vec::new();
 
-        while let Some(chunk) = self.next_chunk().await {
-            body.extend_from_slice(&chunk);
+        let Some(mut stream) = self.stream.take() else {
+            return (body, http::HeaderMap::new());
+        };
+
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .unwrap_or_else(|error| panic!("response body failed: {error}"))
+        {
+            body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
         }
 
-        body
+        let trailers = stream
+            .recv_trailers()
+            .await
+            .unwrap_or_else(|error| panic!("response trailers failed: {error}"))
+            .unwrap_or_default();
+
+        (body, trailers)
     }
 }
 
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+
+const MAX_INFORMATIONAL_RESPONSES: usize = 16;
+
+fn assert_webtransport_response(response: &http::Response<()>) -> Result<(), String> {
+    if !response.status().is_success() {
+        return Err(format!("WebTransport response was {}", response.status()));
+    }
+
+    if response.headers().get("x-origin-webtransport")
+        != Some(&http::HeaderValue::from_static("preserved"))
+    {
+        return Err("WebTransport response header was not preserved".to_owned());
+    }
+    Ok(())
+}
 
 /// HTTP/3 client used by the transparent harness to reach the proxy.
 pub struct Http3Client {
@@ -1056,7 +1183,27 @@ impl Http3Client {
         Self::with_alpn_and_ip(ca_file, b"h3", local_ip)
     }
 
+    /// Build an HTTP/3 client that offers QUIC 0-RTT data.
+    #[must_use]
+    pub fn with_early_data(ca_file: &Path) -> Self {
+        Self::with_alpn_and_ip_and_early_data(
+            ca_file,
+            b"h3",
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            true,
+        )
+    }
+
     fn with_alpn_and_ip(ca_file: &Path, alpn: &[u8], local_ip: IpAddr) -> Self {
+        Self::with_alpn_and_ip_and_early_data(ca_file, alpn, local_ip, false)
+    }
+
+    fn with_alpn_and_ip_and_early_data(
+        ca_file: &Path,
+        alpn: &[u8],
+        local_ip: IpAddr,
+        enable_early_data: bool,
+    ) -> Self {
         let pem = std::fs::read(ca_file).expect("read harness CA");
         let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
@@ -1075,6 +1222,10 @@ impl Http3Client {
 
         tls.alpn_protocols = vec![alpn.to_vec()];
 
+        if enable_early_data {
+            tls.enable_early_data = true;
+        }
+
         let client_config =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config");
         let client_config = quinn::ClientConfig::new(Arc::new(client_config));
@@ -1086,6 +1237,36 @@ impl Http3Client {
         Self { endpoint }
     }
 
+    /// Report whether a resumed connection accepts QUIC 0-RTT data.
+    pub async fn zero_rtt_is_accepted(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+    ) -> Result<bool, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+
+        match connecting.into_0rtt() {
+            Ok((connection, accepted)) => {
+                let accepted = timeout(Duration::from_secs(5), accepted)
+                    .await
+                    .map_err(|_| "0-RTT acceptance timed out".to_owned())?;
+                connection.close(quinn::VarInt::from_u32(0), b"0-RTT probe");
+                Ok(accepted)
+            }
+            Err(connecting) => {
+                let connection = timeout(Duration::from_secs(5), connecting)
+                    .await
+                    .map_err(|_| "QUIC handshake timed out".to_owned())?
+                    .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+                connection.close(quinn::VarInt::from_u32(0), b"0-RTT unavailable");
+                Ok(false)
+            }
+        }
+    }
+
     /// Send one GET request and return the response.
     pub async fn request(
         &self,
@@ -1093,6 +1274,19 @@ impl Http3Client {
         server_name: &str,
         path: &str,
     ) -> Result<Http3Response, String> {
+        let (_, response) = self
+            .request_with_informational(server, server_name, path)
+            .await?;
+        Ok(response)
+    }
+
+    /// Send one GET request and retain informational responses.
+    pub async fn request_with_informational(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<(Vec<http::Response<()>>, Http3Response), String> {
         let connecting = self
             .endpoint
             .connect(server, server_name)
@@ -1119,8 +1313,141 @@ impl Http3Client {
             .await
             .map_err(|error| format!("request failed: {error}"))?;
 
-        let response = stream
-            .recv_response()
+        let (informational, response) = stream
+            .recv_response_with_informational()
+            .await
+            .map_err(|error| format!("response failed: {error}"))?;
+
+        Ok((informational, Http3Response {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            stream: Some(stream),
+            _send_request: send_request,
+            _connection: connection,
+        }))
+    }
+
+    /// Send a POST request that waits for `100 Continue` before its body.
+    pub async fn request_with_expect(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Http3Response, String> {
+        self.request_with_body(server, server_name, path, true, false)
+            .await
+    }
+
+    /// Send a POST request with request trailers.
+    pub async fn request_with_trailers(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+    ) -> Result<Http3Response, String> {
+        self.request_with_body(server, server_name, path, false, true)
+            .await
+    }
+
+    async fn request_with_body(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+        path: &str,
+        expect_continue: bool,
+        send_trailers: bool,
+    ) -> Result<Http3Response, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+        let connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
+        let h3 = h3_quinn::Connection::new(connection);
+        let (connection, mut send_request) = h3::client::new(h3)
+            .await
+            .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://{server_name}{path}"));
+
+        if expect_continue {
+            request = request.header("expect", "100-continue");
+        }
+        if send_trailers {
+            request = request.header("trailer", "x-request-trailer");
+        }
+        let request = request.body(()).expect("client request");
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+
+        let early_response = if expect_continue {
+            let mut informational_count = 0;
+            loop {
+                let response = stream
+                    .recv_response_head()
+                    .await
+                    .map_err(|error| format!("response failed: {error}"))?;
+
+                if response.status() == http::StatusCode::CONTINUE {
+                    break None;
+                }
+
+                if response.status().is_informational() {
+                    if informational_count == MAX_INFORMATIONAL_RESPONSES {
+                        return Err("too many informational responses".to_owned());
+                    }
+                    informational_count += 1;
+                    continue;
+                }
+
+                break Some(response);
+            }
+        } else {
+            None
+        };
+
+        if let Some(response) = early_response {
+            return Ok(Http3Response {
+                status: response.status().as_u16(),
+                headers: response.headers().clone(),
+                stream: Some(stream),
+                _send_request: send_request,
+                _connection: connection,
+            });
+        }
+
+        stream
+            .send_data(Bytes::from_static(b"request-body"))
+            .await
+            .map_err(|error| format!("request body failed: {error}"))?;
+
+        if send_trailers {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert(
+                "x-request-trailer",
+                http::HeaderValue::from_static("present"),
+            );
+
+            stream
+                .send_trailers(trailers)
+                .await
+                .map_err(|error| format!("request trailers failed: {error}"))?;
+        }
+
+        stream
+            .finish()
+            .await
+            .map_err(|error| format!("request finish failed: {error}"))?;
+
+        let (_, response) = stream
+            .recv_response_with_informational()
             .await
             .map_err(|error| format!("response failed: {error}"))?;
 
@@ -1369,10 +1696,7 @@ impl Http3Client {
             .recv_response()
             .await
             .map_err(|error| format!("WebTransport response failed: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("WebTransport response was {}", response.status()));
-        }
-
+        assert_webtransport_response(&response)?;
         if enable_datagram && !invalid_session {
             let stream_id = connect_stream.id();
             let mut datagram_sender = h3_connection.get_datagram_sender(stream_id);
@@ -1821,8 +2145,26 @@ fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
 
 /// Extra HTTP/3 options for one harness.
 #[derive(Default)]
+enum Http3AltPort {
+    #[default]
+    None,
+    Allocate,
+    Fixed(u16),
+}
+
+impl Http3AltPort {
+    const fn value(&self) -> Option<u16> {
+        match self {
+            Self::Fixed(port) => Some(*port),
+            Self::None | Self::Allocate => None,
+        }
+    }
+}
+
+/// Extra HTTP/3 options for one harness.
+#[derive(Default)]
 struct Http3Options {
-    alt_port: Option<u16>,
+    alt_port: Http3AltPort,
     test_ech_dns: Option<SocketAddr>,
     reject_sessions: bool,
     refuse_sessions: bool,
@@ -1830,6 +2172,12 @@ struct Http3Options {
 }
 
 impl Http3Options {
+    fn resolve_alt_port(&mut self, enabled: bool, ip: IpAddr) {
+        if enabled && matches!(&self.alt_port, Http3AltPort::Allocate) {
+            self.alt_port = Http3AltPort::Fixed(free_port(ip));
+        }
+    }
+
     const fn session_settings(&self) -> Http3SessionSettings {
         if self.reject_sessions {
             Http3SessionSettings::Rejected
@@ -1855,6 +2203,16 @@ struct HarnessOptions {
     keep_alive: bool,
     mode: HarnessMode,
 }
+
+fn harness_mode_options(mode: HarnessMode) -> (bool, bool, bool, Http3Options) {
+    match mode {
+        HarnessMode::Plain => (false, false, false, Http3Options::default()),
+        HarnessMode::Http10Origin => (true, false, false, Http3Options::default()),
+        HarnessMode::ClaimErrors => (false, true, false, Http3Options::default()),
+        HarnessMode::Http3(options) => (false, false, true, options),
+    }
+}
+
 fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> Child {
     command
         .env("AGENT_SANDBOX_PROXY_SESSION_READY", ready)
@@ -2002,7 +2360,7 @@ impl TransparentHarness {
     /// endpoint, which the proxy also intercepts.
     pub async fn start_http3_with_alt(ip: IpAddr) -> Self {
         let http3_options = Http3Options {
-            alt_port: Some(free_port(ip)),
+            alt_port: Http3AltPort::Allocate,
             ..Http3Options::default()
         };
         Self::start_inner(ip, 0, HarnessOptions {
@@ -2032,12 +2390,12 @@ impl TransparentHarness {
             keep_alive,
             mode,
         } = options;
-        let (http10_origin, claim_errors, http3, http3_options) = match mode {
-            HarnessMode::Plain => (false, false, false, Http3Options::default()),
-            HarnessMode::Http10Origin => (true, false, false, Http3Options::default()),
-            HarnessMode::ClaimErrors => (false, true, false, Http3Options::default()),
-            HarnessMode::Http3(options) => (false, false, true, options),
-        };
+
+        let _startup_lock = HarnessStartupLock::acquire().await;
+
+        let (http10_origin, claim_errors, http3, mut http3_options) = harness_mode_options(mode);
+
+        http3_options.resolve_alt_port(http3, ip);
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = start_harness_policy(&root, claim_errors);
         let (ca_cert, ca_key) = write_harness_ca(&root);
@@ -2049,7 +2407,7 @@ impl TransparentHarness {
             tls_alpn: harness_tls_alpn(advertise_http11_alpn),
             keep_alive,
             http3: http3.then_some(Http3OriginOptions {
-                alt_port: http3_options.alt_port,
+                alt_port: http3_options.alt_port.value(),
                 session_settings: http3_options.session_settings(),
                 refuse_sessions: http3_options.refuse_sessions,
                 drop_first_session: http3_options.drop_first_session,
@@ -2105,9 +2463,11 @@ impl TransparentHarness {
         }
 
         if http3 {
-            proxy_command.args(["--http3", "--http3-listen-port", &proxy_port.to_string()]);
+            proxy_command
+                .args(["--enable-http3-backend", "--http3-listen-port"])
+                .arg(proxy_port.to_string());
 
-            if let Some(alt_port) = http3_options.alt_port {
+            if let Some(alt_port) = http3_options.alt_port.value() {
                 proxy_command.args(["--http3-alt-port", &alt_port.to_string()]);
             }
 
@@ -2124,7 +2484,10 @@ impl TransparentHarness {
 
         wait_for_path(&ready).await;
 
-        let h3_alt_address = http3_options.alt_port.map(|port| SocketAddr::new(ip, port));
+        let h3_alt_address = http3_options
+            .alt_port
+            .value()
+            .map(|port| SocketAddr::new(ip, port));
 
         Self {
             proxy_address,
@@ -2450,14 +2813,6 @@ impl Drop for TransparentHarness {
         let _ = self.proxy.wait();
         let _ = self.tls_origin.take();
     }
-}
-
-fn free_port(ip: IpAddr) -> u16 {
-    std::net::TcpListener::bind(SocketAddr::new(ip, 0))
-        .expect("reserve proxy port")
-        .local_addr()
-        .expect("reserved port")
-        .port()
 }
 
 async fn wait_for_path(path: &Path) {

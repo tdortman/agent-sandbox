@@ -88,9 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(server_config));
 
-    let address = SocketAddr::new(args.address, args.port);
-    let endpoint = quinn::Endpoint::server(server_config, address)?;
+    let bind_address = SocketAddr::new(args.address, args.port);
 
+    let endpoint = quinn::Endpoint::server(server_config, bind_address)?;
+    let address = endpoint.local_addr()?;
     log_line(&log, &format!("listening {address}"));
 
     let drop_first_session = Arc::new(AtomicBool::new(args.drop_first_session));
@@ -251,7 +252,14 @@ async fn serve_webtransport(
     h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
     drop_session: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let session = h3_webtransport::server::WebTransportSession::accept(request, stream, h3).await?;
+    let response = http::Response::builder()
+        .status(200)
+        .header("x-origin-webtransport", "preserved")
+        .body(())?;
+    let session = h3_webtransport::server::WebTransportSession::accept_with_response(
+        request, stream, h3, response,
+    )
+    .await?;
 
     if drop_session {
         return Ok(());
@@ -358,46 +366,105 @@ async fn serve_connection(
             }
         }
 
-        let alt_svc = match path.as_str() {
-            "/alt-svc-clear" => Some("clear"),
-            "/alt-svc-filtered" => Some("h3=\":59999\""),
-            _ => alt_svc,
-        };
+        serve_request(&path, &mut stream, gate.as_deref(), alt_svc).await?;
+    }
 
-        let body = if path == "/stream" {
-            let mut builder = http::Response::builder()
-                .status(200)
-                .header("content-type", "application/octet-stream");
+    Ok(())
+}
 
-            if let Some(alt_svc) = alt_svc {
-                builder = builder.header("alt-svc", alt_svc);
-            }
+const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
-            let response = builder.body(()).expect("response head");
+type OriginRequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
-            stream.send_response(response).await?;
-            stream.send_data(Bytes::from_static(b"first-chunk")).await?;
+async fn send_informational_response(
+    stream: &mut OriginRequestStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stream
+        .send_response(
+            http::Response::builder()
+                .status(103)
+                .header("link", "</style.css>; rel=preload")
+                .body(())?,
+        )
+        .await?;
+    Ok(())
+}
 
-            if let Some(gate) = &gate {
-                wait_for_gate(gate).await;
-            }
+async fn send_excessive_informational_responses(
+    stream: &mut OriginRequestStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for _ in 0..=MAX_INFORMATIONAL_RESPONSES {
+        stream
+            .send_response(http::Response::builder().status(103).body(())?)
+            .await?;
+    }
+    Ok(())
+}
 
-            stream
-                .send_data(Bytes::from_static(b"second-chunk"))
-                .await?;
-            stream.finish().await?;
-            continue;
+async fn serve_request(
+    path: &str,
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    gate: Option<&std::path::Path>,
+    default_alt_svc: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if path == "/informational" {
+        send_informational_response(stream).await?;
+    }
+
+    if path == "/informational-overflow" {
+        send_excessive_informational_responses(stream).await?;
+    }
+
+    let alt_svc = match path {
+        "/alt-svc-clear" => Some("clear"),
+        "/alt-svc-filtered" => Some("h3=\":59999\""),
+        _ => default_alt_svc,
+    };
+
+    if matches!(path, "/expect" | "/request-trailers") {
+        let early_body = if path == "/expect" {
+            matches!(
+                tokio::time::timeout(Duration::from_millis(250), stream.recv_data()).await,
+                Ok(Ok(Some(_)))
+            )
         } else {
-            match path.as_str() {
-                "/allowed" => b"allowed-get\n".as_slice(),
-                "/denied" => b"denied-get\n".as_slice(),
-                _ => b"origin-response\n".as_slice(),
-            }
+            false
         };
 
+        if path == "/expect" {
+            stream
+                .send_response(http::Response::builder().status(100).body(())?)
+                .await?;
+        }
+
+        let (request_body, request_trailers) = read_request_body(stream).await?;
+        let valid = !early_body
+            && request_body == b"request-body"
+            && (path == "/expect"
+                || request_trailers
+                    .get("x-request-trailer")
+                    .is_some_and(|value| value == "present"));
+        let status = if valid { 200 } else { 400 };
+        let body = if valid {
+            b"request-body-ok\n".as_slice()
+        } else {
+            b"request-body-invalid\n".as_slice()
+        };
+        let response = http::Response::builder()
+            .status(status)
+            .header("content-length", body.len().to_string())
+            .body(())?;
+
+        stream.send_response(response).await?;
+        stream.send_data(Bytes::from_static(body)).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
+
+    if path == "/stream" {
         let mut builder = http::Response::builder()
             .status(200)
-            .header("content-length", body.len().to_string());
+            .header("content-type", "application/octet-stream");
 
         if let Some(alt_svc) = alt_svc {
             builder = builder.header("alt-svc", alt_svc);
@@ -406,11 +473,65 @@ async fn serve_connection(
         let response = builder.body(()).expect("response head");
 
         stream.send_response(response).await?;
-        stream.send_data(Bytes::from_static(body)).await?;
+        stream.send_data(Bytes::from_static(b"first-chunk")).await?;
+
+        if let Some(gate) = gate {
+            wait_for_gate(gate).await;
+        }
+
+        stream
+            .send_data(Bytes::from_static(b"second-chunk"))
+            .await?;
         stream.finish().await?;
+        return Ok(());
     }
 
+    let body = match path {
+        "/allowed" => b"allowed-get\n".as_slice(),
+        "/denied" => b"denied-get\n".as_slice(),
+        _ => b"origin-response\n".as_slice(),
+    };
+    let mut builder = http::Response::builder()
+        .status(200)
+        .header("content-length", body.len().to_string());
+
+    if let Some(alt_svc) = alt_svc {
+        builder = builder.header("alt-svc", alt_svc);
+    }
+
+    let response = builder.body(()).expect("response head");
+    if path == "/trailers" {
+        stream.send_response(response).await?;
+        stream.send_data(Bytes::from_static(body)).await?;
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert(
+            "x-origin-trailer",
+            http::HeaderValue::from_static("present"),
+        );
+
+        stream.send_trailers(trailers).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
+
+    stream.send_response(response).await?;
+    stream.send_data(Bytes::from_static(body)).await?;
+    stream.finish().await?;
     Ok(())
+}
+
+async fn read_request_body(
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<(Vec<u8>, http::HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+    let mut body = Vec::new();
+
+    while let Some(mut chunk) = stream.recv_data().await? {
+        body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+    }
+
+    let trailers = stream.recv_trailers().await?.unwrap_or_default();
+    Ok((body, trailers))
 }
 
 async fn wait_for_gate(gate: &std::path::Path) {
