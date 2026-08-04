@@ -303,7 +303,7 @@ let
             origin
           ]) runtime.httpProxy.http10UpstreamOrigins
           ++ lib.optionals runtime.httpProxy.http3.enable [
-            "--http3"
+            "--enable-http3-backend"
             "--http3-listen-port"
             (toString runtime.httpProxy.http3.udpPort)
           ]

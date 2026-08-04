@@ -34,12 +34,33 @@ agent-sandbox.network.httpProxy.websocketHttp11Urls = [
 ];
 ```
 
+HTTP/3 interception stays disabled unless you enable it explicitly:
+
+```nix
+agent-sandbox.network.httpProxy.http3 = {
+  enable = true;
+  altUdpPorts = [ 4444 ];
+};
+```
+
+To let the proxy select HTTP/1.0 for an upstream origin, add its validated canonical origin:
+
+```nix
+agent-sandbox.network.httpProxy.http10UpstreamOrigins = [
+  "https://legacy.example.com"
+];
+```
+
+The HTTP/3 backend remains opt-in. Quinn 0.11 does not expose active or retired
+QUIC connection identifiers to the application, and rustls 0.23 has no server
+ECH configuration API, so those rollout gates are not deployment defaults.
+
 ## What it gates
 
 | Gate       | Behavior                                                                                                                                        |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Network    | Per-sandbox network namespace and outbound TCP/UDP checks.                                                                                      |
-| HTTP proxy | Optional HTTP/1.1 and HTTP/2 inspection, including WebSocket upgrade relay, through the transparent proxy.                                      |
+| HTTP proxy | Optional HTTP/1.0, HTTP/1.1, HTTP/2 and HTTP/3 inspection, including WebSocket upgrade relay and WebTransport, through the transparent proxy.   |
 | Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
 | Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
 | Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |

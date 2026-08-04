@@ -157,7 +157,10 @@ struct Args {
     #[arg(long, env = "AGENT_SANDBOX_PROXY_CA_KEY")]
     ca_private_key: Option<PathBuf>,
 
-    #[arg(long, env = "AGENT_SANDBOX_PROXY_HTTP3")]
+    #[arg(
+        long = "enable-http3-backend",
+        env = "AGENT_SANDBOX_PROXY_ENABLE_HTTP3"
+    )]
     http3: bool,
 
     #[arg(long, default_value_t = 443)]
@@ -207,6 +210,26 @@ struct Args {
 }
 
 fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
+    let parsed = url::Url::parse(value)?;
+    let raw_path = value
+        .find("://")
+        .and_then(|scheme_end| {
+            let authority_start = scheme_end + 3;
+            value[authority_start..].find('/').map(|path_start| {
+                value[authority_start + path_start..]
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or_default()
+            })
+        })
+        .unwrap_or_default();
+
+    if !matches!(raw_path, "" | "/") {
+        return Err(BoxError::from(format!(
+            "HTTP/1.0 upstream origin must not include a path: {value:?}"
+        )));
+    }
+
     let origin = HttpUrl::parse(value)
         .map_err(|error| BoxError::from(format!("invalid HTTP/1.0 upstream origin: {error}")))?;
 
@@ -216,11 +239,27 @@ fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
         )));
     }
 
-    let parsed = url::Url::parse(value)?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(BoxError::from(format!(
+            "HTTP/1.0 upstream origin must not include userinfo: {value:?}"
+        )));
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(BoxError::from(format!(
+            "HTTP/1.0 upstream origin must not include a query or fragment: {value:?}"
+        )));
+    }
 
     let host = parsed
         .host_str()
         .ok_or_else(|| BoxError::from_static_str("HTTP/1.0 upstream origin has no host"))?;
+
+    if host.ends_with('.') {
+        return Err(BoxError::from(format!(
+            "HTTP/1.0 upstream origin must not use a trailing dot: {value:?}"
+        )));
+    }
 
     let port = parsed
         .port_or_known_default()
@@ -1708,6 +1747,11 @@ mod tests {
 
         assert!(canonical_http10_origin("http://example.com *").is_err());
         assert!(canonical_http10_origin("http://example.com/path").is_err());
+        assert!(canonical_http10_origin("http://example.com/foo/..").is_err());
+        assert!(canonical_http10_origin("http://example.com.").is_err());
+        assert!(canonical_http10_origin("http://example.com/?query").is_err());
+        assert!(canonical_http10_origin("http://example.com/#fragment").is_err());
+        assert!(canonical_http10_origin("http://user:pass@example.com").is_err());
     }
 
     #[test]
@@ -1715,6 +1759,14 @@ mod tests {
         let args = Args::try_parse_from(["agent-sandbox-proxy"]).expect("proxy arguments");
 
         assert!(!args.http3);
+    }
+
+    #[test]
+    fn args_enable_http3_with_explicit_flag() {
+        let args = Args::try_parse_from(["agent-sandbox-proxy", "--enable-http3-backend"])
+            .expect("proxy arguments");
+
+        assert!(args.http3);
     }
 
     #[test]
