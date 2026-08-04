@@ -1,10 +1,3 @@
-use bytes::Buf;
-use futures_util::future;
-use http::{HeaderMap, Response};
-use quic::StreamId;
-#[cfg(feature = "tracing")]
-use tracing::instrument;
-
 use crate::{
     connection::{self},
     error::{
