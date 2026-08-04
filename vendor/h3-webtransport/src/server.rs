@@ -21,7 +21,7 @@ use h3_datagram::{
     datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
     quic_traits,
 };
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode};
 use pin_project_lite::pin_project;
 use std::{
     pin::Pin,
@@ -76,8 +76,19 @@ where
     /// request?
     pub async fn accept(
         request: Request<()>,
+        stream: RequestStream<C::BidiStream, B>,
+        conn: Connection<C, B>,
+    ) -> Result<Self, StreamError> {
+        let response = default_webtransport_response(&request);
+        Self::accept_with_response(request, stream, conn, response).await
+    }
+
+    /// Accepts a *CONNECT* request with a caller-provided response.
+    pub async fn accept_with_response(
+        request: Request<()>,
         mut stream: RequestStream<C::BidiStream, B>,
         mut conn: Connection<C, B>,
+        response: Response<()>,
     ) -> Result<Self, StreamError> {
         let shared = conn.inner.shared.clone();
 
@@ -120,22 +131,12 @@ where
             tracing::warn!("Server does not support CONNECT");
         }
 
-        // Respond to the CONNECT request.
-
-        //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.3
-        let response = if validate_wt_connect(&request) {
-            Response::builder()
-                // This is the only header that chrome cares about.
-                .header("sec-webtransport-http3-draft", "draft02")
-                .status(StatusCode::OK)
-                .body(())
-                .unwrap()
+        let mut response = if validate_wt_connect(&request) {
+            response
         } else {
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(())
-                .unwrap()
+            default_webtransport_response(&request)
         };
+        ensure_draft_header(&mut response);
         stream.send_response(response).await?;
 
         let session_id = stream.send_id().into();
@@ -188,20 +189,27 @@ where
     pub async fn accept_request(
         &self,
         request: Request<()>,
-        mut stream: RequestStream<C::BidiStream, B>,
+        stream: RequestStream<C::BidiStream, B>,
     ) -> Result<(SessionId, RequestStream<C::BidiStream, B>), StreamError> {
-        let response = if validate_wt_connect(&request) {
-            Response::builder()
-                .header("sec-webtransport-http3-draft", "draft02")
-                .status(StatusCode::OK)
-                .body(())
-                .expect("valid WebTransport response")
+        let response = default_webtransport_response(&request);
+        self.accept_request_with_response(request, stream, response)
+            .await
+    }
+
+    /// Accepts another WebTransport CONNECT request with a caller-provided
+    /// response.
+    pub async fn accept_request_with_response(
+        &self,
+        request: Request<()>,
+        mut stream: RequestStream<C::BidiStream, B>,
+        response: Response<()>,
+    ) -> Result<(SessionId, RequestStream<C::BidiStream, B>), StreamError> {
+        let mut response = if validate_wt_connect(&request) {
+            response
         } else {
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(())
-                .expect("valid WebTransport response")
+            default_webtransport_response(&request)
         };
+        ensure_draft_header(&mut response);
         stream.send_response(response).await?;
         let session_id = stream.send_id().into();
         Ok((session_id, stream))
@@ -444,6 +452,34 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+fn ensure_draft_header(response: &mut Response<()>) {
+    if response.status().is_success()
+        && !response
+            .headers()
+            .contains_key("sec-webtransport-http3-draft")
+    {
+        response.headers_mut().insert(
+            "sec-webtransport-http3-draft",
+            HeaderValue::from_static("draft02"),
+        );
+    }
+}
+
+fn default_webtransport_response(request: &Request<()>) -> Response<()> {
+    if validate_wt_connect(request) {
+        Response::builder()
+            .header("sec-webtransport-http3-draft", "draft02")
+            .status(StatusCode::OK)
+            .body(())
+            .expect("valid WebTransport response")
+    } else {
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(())
+            .expect("valid WebTransport response")
     }
 }
 

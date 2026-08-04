@@ -26,7 +26,7 @@ use crate::{
         is_hop_by_hop_header,
     },
 };
-use agent_sandbox_core::{HttpCheckReply, HttpRequest, ProxyRequestId};
+use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, ProxyRequestId};
 use bytes::{Buf, Bytes};
 use h3::{
     ConnectionState,
@@ -37,10 +37,12 @@ use h3::{
 use h3_datagram::datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt};
 use h3_quinn::datagram::{RecvDatagramHandler, SendDatagramHandler};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 const MAX_WEBTRANSPORT_SESSIONS: usize = 64;
+
+const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
 /// Resolve the original destination for intercepted UDP associations.
 #[derive(Clone)]
@@ -98,19 +100,30 @@ type UpstreamRequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Byte
 struct SessionOpen {
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,
     stream: UpstreamRequestStream,
+    informational_responses: Vec<http::Response<()>>,
     response: http::Response<()>,
     upstream_incoming: Option<IncomingWebTransportReceiver>,
+}
+
+struct SessionOpenContext<'a> {
+    state: &'a Http3State,
+    scheme: &'a str,
+    authority: &'a str,
+    sessions: &'a SessionRegistry,
+    pending_webtransport: &'a PendingWebTransportSessions,
 }
 
 struct RelayRequestOpen {
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,
     stream: UpstreamRequestStream,
+    preflight_informational: Vec<http::Response<()>>,
     preflight_response: Option<http::Response<()>>,
     key: Option<SessionKey>,
     protocol: Option<SessionProtocol>,
 }
 
 struct ResponseRelayContext {
+    preflight_informational: Vec<http::Response<()>>,
     preflight_response: Option<http::Response<()>>,
     alt_svc: Arc<AltSvcStore>,
     origin: String,
@@ -119,6 +132,12 @@ struct ResponseRelayContext {
     binding: Option<SessionBinding>,
     normalized: Option<HttpRequest>,
     sessions: Arc<SessionRegistry>,
+}
+
+struct RequestRelayResults {
+    relay_result: Result<(), BoxError>,
+    body_result: Result<(), BoxError>,
+    body_failed_first: bool,
 }
 
 struct WebTransportRoute {
@@ -134,6 +153,22 @@ struct WebTransportRoute {
 struct WebTransportSetup {
     semantic: SemanticRequest,
     normalized: agent_sandbox_core::HttpRequest,
+    downstream_stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    informational_responses: Vec<http::Response<()>>,
+    response: http::Response<()>,
+
+    upstream: Arc<crate::http3::upstream::UpstreamConnection>,
+    upstream_session_id: h3::webtransport::SessionId,
+    upstream_incoming: IncomingWebTransportReceiver,
+    upstream_stream_id: StreamId,
+    upstream_stream: UpstreamRequestStream,
+}
+
+struct AcceptedWebTransportRequest {
+    semantic: SemanticRequest,
+    normalized: agent_sandbox_core::HttpRequest,
+    session_id: h3::webtransport::SessionId,
+    downstream_stream_id: StreamId,
     downstream_stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,
     upstream_session_id: h3::webtransport::SessionId,
@@ -154,10 +189,13 @@ struct DatagramRouter {
     routes: Arc<Mutex<HashMap<StreamId, mpsc::Sender<RoutedDatagram>>>>,
 }
 
+struct DatagramRouterState {
+    router: DatagramRouter,
+    task: tokio::task::JoinHandle<()>,
+}
+
 impl DatagramRouter {
-    fn start(
-        mut reader: DatagramReader<RecvDatagramHandler>,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    fn start(mut reader: DatagramReader<RecvDatagramHandler>) -> DatagramRouterState {
         let routes: Arc<Mutex<HashMap<StreamId, mpsc::Sender<RoutedDatagram>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let task_routes = routes.clone();
@@ -190,7 +228,10 @@ impl DatagramRouter {
             }
         });
 
-        (Self { routes }, task)
+        DatagramRouterState {
+            router: Self { routes },
+            task,
+        }
     }
 
     async fn register(&self, stream_id: StreamId) -> mpsc::Receiver<RoutedDatagram> {
@@ -204,15 +245,82 @@ impl DatagramRouter {
     }
 }
 
-type ResolvedRequest = Result<
-    (
-        http::Request<()>,
-        RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    ),
-    StreamError,
->;
+type ResolvedRequestValue = (
+    http::Request<()>,
+    RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+);
 
-type WebTransportPreparation = (http::Request<()>, Result<WebTransportSetup, BoxError>);
+type ResolvedRequest = Result<ResolvedRequestValue, StreamError>;
+
+struct WebTransportPrep {
+    request: http::Request<()>,
+    setup: Result<WebTransportSetup, BoxError>,
+}
+
+#[derive(Clone, Default)]
+struct PendingWebTransportSessions {
+    sessions: Arc<std::sync::Mutex<Vec<PendingWebTransportSession>>>,
+}
+
+struct PendingWebTransportSession {
+    upstream: Arc<crate::http3::upstream::UpstreamConnection>,
+    session_id: h3::webtransport::SessionId,
+}
+
+impl PendingWebTransportSessions {
+    fn insert(
+        &self,
+        upstream: Arc<crate::http3::upstream::UpstreamConnection>,
+        session_id: h3::webtransport::SessionId,
+    ) {
+        self.sessions
+            .lock()
+            .expect("pending WebTransport sessions lock")
+            .push(PendingWebTransportSession {
+                upstream,
+                session_id,
+            });
+    }
+
+    fn remove(
+        &self,
+        upstream: &Arc<crate::http3::upstream::UpstreamConnection>,
+        session_id: h3::webtransport::SessionId,
+    ) {
+        self.sessions
+            .lock()
+            .expect("pending WebTransport sessions lock")
+            .retain(|pending| {
+                pending.session_id != session_id || !Arc::ptr_eq(&pending.upstream, upstream)
+            });
+    }
+
+    async fn remove_and_unregister(
+        &self,
+        upstream: &Arc<crate::http3::upstream::UpstreamConnection>,
+        session_id: h3::webtransport::SessionId,
+    ) {
+        self.remove(upstream, session_id);
+        upstream.unregister_webtransport_session(session_id).await;
+    }
+
+    async fn cleanup(&self) {
+        let pending = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("pending WebTransport sessions lock");
+            std::mem::take(&mut *sessions)
+        };
+
+        for pending in pending {
+            pending
+                .upstream
+                .unregister_webtransport_session(pending.session_id)
+                .await;
+        }
+    }
+}
 
 struct ApprovedSession {
     normalized: HttpRequest,
@@ -445,28 +553,47 @@ struct H3RequestContext {
     origin_port: Option<u16>,
     origin_authority: Option<String>,
     sessions: Arc<SessionRegistry>,
-    datagram_router: Option<(DatagramRouter, tokio::task::JoinHandle<()>)>,
+    pending_webtransport: PendingWebTransportSessions,
+    datagram_router: Option<DatagramRouterState>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+fn new_h3_request_context(
+    state: Arc<Http3State>,
+    claim: FlowClaim,
+    origin_port: Option<u16>,
+    origin_authority: Option<String>,
+) -> H3RequestContext {
+    H3RequestContext {
+        state,
+        claim,
+        origin_port,
+        origin_authority,
+        sessions: Arc::new(SessionRegistry::default()),
+        pending_webtransport: PendingWebTransportSessions::default(),
+        datagram_router: None,
+        tasks: Vec::new(),
+    }
+}
+
+#[derive(Clone)]
 struct Http3RequestContext {
     state: Arc<Http3State>,
     claim: FlowClaim,
     origin_port: Option<u16>,
     origin_authority: Option<String>,
     sessions: Arc<SessionRegistry>,
+    pending_webtransport: PendingWebTransportSessions,
 }
 
 impl H3RequestContext {
     async fn serve(
         &mut self,
         request: http::Request<()>,
-        stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
     ) {
-        if stream.is_0rtt() {
-            let mut stream = stream;
-            stream.stop_stream(Code::H3_REQUEST_REJECTED);
+        if reject_0rtt_stream(&mut stream) {
             return;
         }
 
@@ -477,10 +604,14 @@ impl H3RequestContext {
             .is_some_and(|protocol| protocol.as_str() == "connect-udp")
         {
             if self.datagram_router.is_none() {
-                let (router, task) = DatagramRouter::start(h3.get_datagram_reader());
-                self.datagram_router = Some((router, task));
+                let datagram_state = DatagramRouter::start(h3.get_datagram_reader());
+                self.datagram_router = Some(datagram_state);
             }
-            let (router, _) = self.datagram_router.as_ref().expect("router initialised");
+            let router = &self
+                .datagram_router
+                .as_ref()
+                .expect("router initialised")
+                .router;
             Some(DatagramRelay {
                 reader: router.register(downstream_stream_id).await,
                 sender: h3.get_datagram_sender(downstream_stream_id),
@@ -492,13 +623,14 @@ impl H3RequestContext {
         let datagram_router = self
             .datagram_router
             .as_ref()
-            .map(|(router, _)| router.clone());
+            .map(|state| state.router.clone());
         let request_context = Http3RequestContext {
             state: self.state.clone(),
             claim: self.claim.clone(),
             origin_port: self.origin_port,
             origin_authority: self.origin_authority.clone(),
             sessions: self.sessions.clone(),
+            pending_webtransport: self.pending_webtransport.clone(),
         };
         let task = tokio::spawn(async move {
             let result =
@@ -507,6 +639,44 @@ impl H3RequestContext {
         });
         self.tasks.push(task);
     }
+
+    const fn take_datagram_router(&mut self) -> DatagramRouterState {
+        self.datagram_router
+            .take()
+            .expect("WebTransport datagram router")
+    }
+}
+
+fn reject_0rtt_stream(stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) -> bool {
+    if !stream.is_0rtt() {
+        return false;
+    }
+    stream.stop_stream(Code::H3_REQUEST_REJECTED);
+    true
+}
+
+async fn reject_webtransport_request(
+    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<(), BoxError> {
+    stream
+        .send_response(
+            http::Response::builder()
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(())?,
+        )
+        .await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+async fn send_informational_responses(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    responses: impl IntoIterator<Item = http::Response<()>>,
+) -> Result<(), BoxError> {
+    for response in responses {
+        stream.send_response(response).await?;
+    }
+    Ok(())
 }
 
 fn queue_webtransport_preparation(
@@ -514,32 +684,25 @@ fn queue_webtransport_preparation(
     h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
     request: http::Request<()>,
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    prepare_tx: &mpsc::UnboundedSender<WebTransportPreparation>,
+    prepare_tx: &mpsc::UnboundedSender<WebTransportPrep>,
 ) -> tokio::task::JoinHandle<()> {
-    let datagram_router = request_context.datagram_router.take().unwrap_or_else(|| {
-        let (router, task) = DatagramRouter::start(h3.get_datagram_reader());
-        (router, task)
-    });
+    let datagram_router = request_context
+        .datagram_router
+        .take()
+        .unwrap_or_else(|| DatagramRouter::start(h3.get_datagram_reader()));
     request_context.datagram_router = Some(datagram_router);
-
     let prepare_tx = prepare_tx.clone();
-    let state = request_context.state.clone();
-    let claim = request_context.claim.clone();
-    let origin_port = request_context.origin_port;
-    let origin_authority = request_context.origin_authority.clone();
-    let sessions = request_context.sessions.clone();
+    let request_context = Http3RequestContext {
+        state: request_context.state.clone(),
+        claim: request_context.claim.clone(),
+        origin_port: request_context.origin_port,
+        origin_authority: request_context.origin_authority.clone(),
+        sessions: request_context.sessions.clone(),
+        pending_webtransport: request_context.pending_webtransport.clone(),
+    };
     tokio::spawn(async move {
-        let setup = prepare_webtransport(
-            &request,
-            stream,
-            &state,
-            &claim,
-            origin_port,
-            origin_authority.as_deref(),
-            &sessions,
-        )
-        .await;
-        let _ = prepare_tx.send((request, setup));
+        let setup = prepare_webtransport(&request, stream, request_context).await;
+        let _ = prepare_tx.send(WebTransportPrep { request, setup });
     })
 }
 
@@ -566,6 +729,13 @@ async fn build_h3_server(
     }
 }
 
+fn is_webtransport_request(request: &http::Request<()>) -> bool {
+    request
+        .extensions()
+        .get::<h3::ext::Protocol>()
+        .is_some_and(|protocol| protocol.as_str() == "webtransport")
+}
+
 async fn serve_h3_connection(
     connection: quinn::Connection,
     state: Arc<Http3State>,
@@ -578,33 +748,27 @@ async fn serve_h3_connection(
     let mut h3 = build_h3_server(&connection).await?;
 
     let mut bound_source = source;
-    let sessions = Arc::new(SessionRegistry::default());
-    let mut request_context = H3RequestContext {
-        state,
-        claim,
-        origin_port,
-        origin_authority,
-        tasks: Vec::new(),
-        sessions,
-        datagram_router: None,
-    };
+    let mut request_context = new_h3_request_context(state, claim, origin_port, origin_authority);
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedRequest>();
-    let (webtransport_tx, mut webtransport_rx) =
-        mpsc::unbounded_channel::<WebTransportPreparation>();
+    let (webtransport_tx, mut webtransport_rx) = mpsc::unbounded_channel::<WebTransportPrep>();
     let mut webtransport_pending = false;
     let mut migration_tick = tokio::time::interval(Duration::from_millis(10));
-    loop {
-        rebind_migrated_path(
+
+    let result = loop {
+        if let Err(error) = rebind_migrated_path(
             &connection,
             &request_context.state.policy,
             &request_context.claim,
             destination,
             &mut bound_source,
         )
-        .await?;
+        .await
+        {
+            break Err(error);
+        }
 
         tokio::select! {
-            () = request_context.state.shutdown.notified() => break,
+            () = request_context.state.shutdown.notified() => break Ok(()),
             _ = migration_tick.tick() => {}
             accepted = h3.accept() => match accepted {
                 Ok(Some(resolver)) => {
@@ -613,29 +777,36 @@ async fn serve_h3_connection(
                         resolved_tx.clone(),
                     ));
                 }
-                Ok(None) => break,
+                Ok(None) => break Ok(()),
                 Err(error) => {
                     info!(%error, "downstream HTTP/3 connection closed");
-                    break;
+                    break Ok(());
                 }
             },
-            Some((request, setup)) = webtransport_rx.recv(), if webtransport_pending => {
+            Some(WebTransportPrep { request, setup }) = webtransport_rx.recv(),
+                if webtransport_pending => {
                 webtransport_pending = false;
-                let datagram_router = request_context
-                    .datagram_router
-                    .take()
-                    .expect("WebTransport datagram router");
+                let datagram_router = request_context.take_datagram_router();
                 match setup {
                     Ok(setup) => {
-                        return Box::pin(serve_webtransport(
+                        request_context
+                            .pending_webtransport
+                            .remove(&setup.upstream, setup.upstream_session_id);
+                        let input = WebTransportServeInput {
                             request,
                             h3,
-                            request_context,
+                            connection: connection.clone(),
+                            destination,
+                            bound_source,
+                            context: request_context,
                             datagram_router,
                             resolved_rx,
                             setup,
-                        ))
-                        .await;
+                        };
+
+                        let result = Box::pin(serve_webtransport(input)).await;
+                        connection.close(varint(Code::H3_NO_ERROR), b"proxy shutdown");
+                        return result;
                     }
                     Err(error) => {
                         warn!(%error, "downstream WebTransport request rejected");
@@ -644,19 +815,22 @@ async fn serve_h3_connection(
                 }
             },
             Some(resolved) = resolved_rx.recv(), if !webtransport_pending => {
-                let (request, stream) = match resolved {
-                    Ok(request) => request,
-                    Err(error) => {
-                        warn!(%error, "downstream HTTP/3 request resolution failed");
-                        continue;
-                    }
+                let Some((request, mut stream)) = resolved_request(resolved) else {
+                    continue;
                 };
 
-                if request
-                    .extensions()
-                    .get::<h3::ext::Protocol>()
-                    .is_some_and(|protocol| protocol.as_str() == "webtransport")
-                {
+                if reject_0rtt_stream(&mut stream) {
+                    continue;
+                }
+
+                if is_webtransport_request(&request) {
+                    if request.method() != http::Method::CONNECT {
+                        if let Err(error) = reject_webtransport_request(stream).await {
+                            warn!(%error, "malformed WebTransport request rejected");
+                        }
+                        continue;
+                    }
+
                     let task = queue_webtransport_preparation(
                         &mut request_context,
                         &h3,
@@ -672,20 +846,21 @@ async fn serve_h3_connection(
                 request_context.serve(request, stream, &h3).await;
             }
         }
-    }
+    };
 
     finish_h3_connection(&mut request_context).await;
 
     connection.close(varint(Code::H3_NO_ERROR), b"proxy shutdown");
-    Ok(())
+    result
 }
 
 async fn finish_h3_connection(request_context: &mut H3RequestContext) {
     stop_h3_tasks(std::mem::take(&mut request_context.tasks)).await;
-    if let Some((_, datagram_task)) = request_context.datagram_router.take() {
-        datagram_task.abort();
-        let _ = datagram_task.await;
+    if let Some(datagram_state) = request_context.datagram_router.take() {
+        datagram_state.task.abort();
+        let _ = datagram_state.task.await;
     }
+    request_context.pending_webtransport.cleanup().await;
 }
 
 async fn stop_h3_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
@@ -702,6 +877,16 @@ fn spawn_h3_request_resolution(
     tokio::spawn(async move {
         let _ = resolved_tx.send(resolver.resolve_request().await);
     })
+}
+
+fn resolved_request(resolved: ResolvedRequest) -> Option<ResolvedRequestValue> {
+    match resolved {
+        Ok(request) => Some(request),
+        Err(error) => {
+            warn!(%error, "downstream HTTP/3 request resolution failed");
+            None
+        }
+    }
 }
 
 async fn rebind_migrated_path(
@@ -741,65 +926,96 @@ async fn finish_h3_request(
     }
 }
 
+struct WebTransportServeInput {
+    request: http::Request<()>,
+    h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
+    connection: quinn::Connection,
+    destination: SocketAddr,
+    bound_source: SocketAddr,
+    context: H3RequestContext,
+    datagram_router: DatagramRouterState,
+    resolved_rx: mpsc::UnboundedReceiver<ResolvedRequest>,
+    setup: WebTransportSetup,
+}
+
+struct WebTransportRegistration {
+    downstream_stream_id: StreamId,
+    upstream: Arc<crate::http3::upstream::UpstreamConnection>,
+    datagram_task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
 async fn release_claim(policy: &PolicySession, claim: &FlowClaim) {
     if let Err(error) = policy.release(claim).await {
         tracing::error!(%error, "failed to release downstream QUIC association claim");
     }
 }
 
-async fn serve_webtransport(
-    request: http::Request<()>,
-    h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
-    context: H3RequestContext,
-    datagram_router: (DatagramRouter, tokio::task::JoinHandle<()>),
-    resolved_rx: mpsc::UnboundedReceiver<ResolvedRequest>,
-    setup: WebTransportSetup,
-) -> Result<(), BoxError> {
+async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxError> {
+    let WebTransportServeInput {
+        request,
+        h3,
+        connection,
+        destination,
+        bound_source,
+        context,
+        datagram_router,
+        resolved_rx,
+        setup,
+    } = input;
     let H3RequestContext {
         state,
         claim,
         origin_port,
         origin_authority,
         sessions,
+        pending_webtransport,
         tasks,
         ..
     } = context;
-    let (datagram_router, datagram_task) = datagram_router;
-    let downstream_stream_id = setup.downstream_stream.id();
-    let setup_upstream = setup.upstream.clone();
-    let setup_upstream_session_id = setup.upstream_session_id;
-    let (binding, datagram_task, tasks) = register_webtransport_binding(
-        &sessions,
-        &setup,
-        &claim,
+    let DatagramRouterState {
+        router: datagram_router,
+        task: datagram_task,
+    } = datagram_router;
+
+    let WebTransportRegistration {
         downstream_stream_id,
+        upstream,
         datagram_task,
         tasks,
-    )
-    .await?;
-    let (session, downstream_connect, tasks, datagram_task) = match accept_webtransport_session(
+    } = register_webtransport_session(&sessions, &setup, &claim, datagram_task, tasks).await?;
+
+    let AcceptedWebTransport {
+        session,
+        downstream_connect,
+        tasks,
+        datagram_task,
+    } = accept_webtransport_for_binding(
         request,
         setup.downstream_stream,
         h3,
-        setup_upstream.clone(),
-        setup_upstream_session_id,
-        datagram_task,
-        tasks,
+        setup.informational_responses,
+        WebTransportAcceptCleanup {
+            upstream: upstream.clone(),
+            upstream_session_id: setup.upstream_session_id,
+            datagram_task,
+            tasks,
+            response: setup.response,
+        },
+        downstream_stream_id,
+        &sessions,
     )
-    .await
-    {
-        Ok(accepted) => accepted,
-        Err(error) => {
-            sessions.remove(binding.downstream_stream_id).await;
-            return Err(error);
-        }
-    };
-    let binding_id = binding.downstream_stream_id;
+    .await?;
+
     let cleanup_sessions = sessions.clone();
-    let association = match Box::pin(WebTransportAssociation::new(
+    let binding_id = downstream_stream_id;
+    let StartedWebTransportAssociation {
+        association,
+        datagram_task,
+    } = start_webtransport_association(
         session,
         WebTransportRoute {
-            upstream: setup.upstream,
+            upstream: upstream.clone(),
             upstream_session_id: setup.upstream_session_id,
             downstream_stream_id,
             upstream_stream_id: setup.upstream_stream_id,
@@ -814,28 +1030,86 @@ async fn serve_webtransport(
             claim,
             origin_port,
             sessions,
+            pending_webtransport,
             datagram_router,
             downstream_connect,
             upstream_connect: setup.upstream_stream,
             tasks,
             resolved_rx,
+            connection,
+            destination,
+            bound_source,
         },
-    ))
-    .await
-    {
-        Ok(association) => association,
-        Err(error) => {
-            setup_upstream
-                .unregister_webtransport_session(setup_upstream_session_id)
-                .await;
-            cleanup_sessions.remove(binding_id).await;
-            stop_datagram_task(datagram_task).await;
-            return Err(error);
-        }
-    };
+        WebTransportAssociationCleanup {
+            upstream,
+            upstream_session_id: setup.upstream_session_id,
+            sessions: cleanup_sessions,
+            binding_id,
+            datagram_task,
+        },
+    )
+    .await?;
+
     let result = Box::pin(association.run()).await;
     stop_datagram_task(datagram_task).await;
     result
+}
+
+async fn register_webtransport_session(
+    sessions: &SessionRegistry,
+    setup: &WebTransportSetup,
+    claim: &FlowClaim,
+    datagram_task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<WebTransportRegistration, BoxError> {
+    let downstream_stream_id = setup.downstream_stream.id();
+    let upstream = setup.upstream.clone();
+    let (_, datagram_task, tasks) = register_webtransport_binding(
+        sessions,
+        setup,
+        claim,
+        downstream_stream_id,
+        datagram_task,
+        tasks,
+    )
+    .await?;
+    Ok(WebTransportRegistration {
+        downstream_stream_id,
+        upstream,
+        datagram_task,
+        tasks,
+    })
+}
+
+async fn start_webtransport_association(
+    session: h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>,
+    first_route: WebTransportRoute,
+    first_incoming: IncomingWebTransportReceiver,
+    config: WebTransportAssociationConfig,
+    cleanup: WebTransportAssociationCleanup,
+) -> Result<StartedWebTransportAssociation, BoxError> {
+    match Box::pin(WebTransportAssociation::new(
+        session,
+        first_route,
+        first_incoming,
+        config,
+    ))
+    .await
+    {
+        Ok(association) => Ok(StartedWebTransportAssociation {
+            association,
+            datagram_task: cleanup.datagram_task,
+        }),
+        Err(error) => {
+            cleanup
+                .upstream
+                .unregister_webtransport_session(cleanup.upstream_session_id)
+                .await;
+            cleanup.sessions.remove(cleanup.binding_id).await;
+            stop_datagram_task(cleanup.datagram_task).await;
+            Err(error)
+        }
+    }
 }
 
 async fn register_webtransport_binding(
@@ -863,7 +1137,9 @@ async fn register_webtransport_binding(
         downstream_stream_id,
         upstream_stream_id: setup.upstream_stream_id,
     };
+
     if let Err(error) = sessions.set(&binding, &setup.normalized).await {
+        sessions.remove(downstream_stream_id).await;
         setup
             .upstream
             .unregister_webtransport_session(setup.upstream_session_id)
@@ -875,35 +1151,63 @@ async fn register_webtransport_binding(
     Ok((binding, datagram_task, tasks))
 }
 
-async fn accept_webtransport_session(
-    request: http::Request<()>,
-    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
+struct WebTransportAcceptCleanup {
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,
     upstream_session_id: h3::webtransport::SessionId,
     datagram_task: tokio::task::JoinHandle<()>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-) -> Result<
-    (
-        h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>,
-        RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-        Vec<tokio::task::JoinHandle<()>>,
-        tokio::task::JoinHandle<()>,
-    ),
-    BoxError,
-> {
-    let mut session =
-        match h3_webtransport::server::WebTransportSession::accept(request, stream, h3).await {
-            Ok(session) => session,
-            Err(error) => {
-                upstream
-                    .unregister_webtransport_session(upstream_session_id)
-                    .await;
-                stop_datagram_task(datagram_task).await;
-                stop_h3_tasks(tasks).await;
-                return Err(error.into());
-            }
-        };
+    response: http::Response<()>,
+}
+
+struct AcceptedWebTransport {
+    session: h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>,
+    downstream_connect: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    datagram_task: tokio::task::JoinHandle<()>,
+}
+
+async fn accept_webtransport_session(
+    request: http::Request<()>,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
+    informational_responses: Vec<http::Response<()>>,
+    cleanup: WebTransportAcceptCleanup,
+) -> Result<AcceptedWebTransport, BoxError> {
+    let mut stream = stream;
+    let WebTransportAcceptCleanup {
+        upstream,
+        upstream_session_id,
+        datagram_task,
+        tasks,
+        response,
+    } = cleanup;
+    for response in informational_responses {
+        if let Err(error) = stream.send_response(response).await {
+            upstream
+                .unregister_webtransport_session(upstream_session_id)
+                .await;
+            stop_datagram_task(datagram_task).await;
+            stop_h3_tasks(tasks).await;
+            return Err(error.into());
+        }
+    }
+
+    let mut session = match h3_webtransport::server::WebTransportSession::accept_with_response(
+        request, stream, h3, response,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            upstream
+                .unregister_webtransport_session(upstream_session_id)
+                .await;
+            stop_datagram_task(datagram_task).await;
+            stop_h3_tasks(tasks).await;
+            return Err(error.into());
+        }
+    };
+
     let Some(downstream_connect) = session.take_connect_stream() else {
         upstream
             .unregister_webtransport_session(upstream_session_id)
@@ -912,35 +1216,66 @@ async fn accept_webtransport_session(
         stop_h3_tasks(tasks).await;
         return Err(boxed("WebTransport CONNECT stream already consumed"));
     };
-    Ok((session, downstream_connect, tasks, datagram_task))
+    Ok(AcceptedWebTransport {
+        session,
+        downstream_connect,
+        tasks,
+        datagram_task,
+    })
+}
+
+async fn accept_webtransport_for_binding(
+    request: http::Request<()>,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
+    informational_responses: Vec<http::Response<()>>,
+    cleanup: WebTransportAcceptCleanup,
+    binding_id: StreamId,
+    sessions: &SessionRegistry,
+) -> Result<AcceptedWebTransport, BoxError> {
+    match accept_webtransport_session(request, stream, h3, informational_responses, cleanup).await {
+        Ok(accepted) => Ok(accepted),
+        Err(error) => {
+            sessions.remove(binding_id).await;
+            Err(error)
+        }
+    }
 }
 
 async fn prepare_webtransport(
     request: &http::Request<()>,
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    state: &Http3State,
-    claim: &FlowClaim,
-    origin_port: Option<u16>,
-    origin_authority: Option<&str>,
-    sessions: &SessionRegistry,
+    context: Http3RequestContext,
 ) -> Result<WebTransportSetup, BoxError> {
-    let (semantic, normalized, downstream_stream) = approve_webtransport_request(
-        request,
-        stream,
+    let Http3RequestContext {
         state,
         claim,
         origin_port,
         origin_authority,
         sessions,
+        pending_webtransport,
+    } = context;
+
+    let (semantic, normalized, downstream_stream) = approve_webtransport_request(
+        request,
+        stream,
+        &state,
+        &claim,
+        origin_port,
+        origin_authority.as_deref(),
+        &sessions,
     )
     .await?;
+
     let upstream_url = url::Url::parse(&normalized.url.to_string())?;
     let upstream_host = upstream_url
         .host_str()
         .ok_or_else(|| boxed("normalized policy target has no host"))?;
+
     let upstream_port = upstream_url
         .port_or_known_default()
         .ok_or_else(|| boxed("normalized policy target has no port"))?;
+
     let upstream_authority = crate::policy::authority_for_policy(upstream_host, upstream_port);
     let key = session_key(
         &semantic,
@@ -949,27 +1284,33 @@ async fn prepare_webtransport(
         claim.attribution_token.clone(),
     );
     let downstream_stream_id = downstream_stream.id();
-    sessions.reserve(downstream_stream_id, &key).await?;
     let upstream_request = build_upstream_request(
         &semantic,
         &upstream_url,
         &upstream_authority,
         Some(key.protocol),
     )?;
+
+    sessions.reserve(downstream_stream_id, &key).await?;
     let session_open = open_session_request(
-        state,
-        upstream_url.scheme(),
-        &upstream_authority,
+        SessionOpenContext {
+            state: &state,
+            scheme: upstream_url.scheme(),
+            authority: &upstream_authority,
+            sessions: &sessions,
+            pending_webtransport: &pending_webtransport,
+        },
         &key,
         upstream_request,
-        sessions,
         downstream_stream_id,
     )
     .await;
+
     let SessionOpen {
         upstream,
         stream: upstream_stream,
-        response: _,
+        mut informational_responses,
+        mut response,
         upstream_incoming,
     } = match session_open {
         Ok(session_open) => session_open,
@@ -978,16 +1319,31 @@ async fn prepare_webtransport(
             return Err(error);
         }
     };
+
+    for informational_response in &mut informational_responses {
+        crate::alt_svc::preserve_response_alt_svc(
+            informational_response,
+            &state.alt_svc,
+            semantic.authority(),
+        )
+        .await;
+    }
+    crate::alt_svc::preserve_response_alt_svc(&mut response, &state.alt_svc, semantic.authority())
+        .await;
+
     let Some(upstream_incoming) = upstream_incoming else {
         sessions.remove(downstream_stream_id).await;
         return Err(boxed("WebTransport session has no incoming stream route"));
     };
     let upstream_stream_id = upstream_stream.id();
     let upstream_session_id = h3::webtransport::SessionId::from(upstream_stream_id);
+
     Ok(WebTransportSetup {
         semantic,
         normalized,
         downstream_stream,
+        informational_responses,
+        response,
         upstream,
         upstream_session_id,
         upstream_incoming,
@@ -1079,20 +1435,41 @@ struct WebTransportAssociationConfig {
     origin_port: Option<u16>,
     origin_authority: Option<String>,
     sessions: Arc<SessionRegistry>,
+    pending_webtransport: PendingWebTransportSessions,
     datagram_router: DatagramRouter,
     downstream_connect: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     upstream_connect: UpstreamRequestStream,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     resolved_rx: mpsc::UnboundedReceiver<ResolvedRequest>,
+    connection: quinn::Connection,
+    destination: SocketAddr,
+    bound_source: SocketAddr,
+}
+
+struct WebTransportAssociationCleanup {
+    upstream: Arc<crate::http3::upstream::UpstreamConnection>,
+    upstream_session_id: h3::webtransport::SessionId,
+    sessions: Arc<SessionRegistry>,
+    binding_id: StreamId,
+    datagram_task: tokio::task::JoinHandle<()>,
+}
+
+struct StartedWebTransportAssociation {
+    association: WebTransportAssociation,
+    datagram_task: tokio::task::JoinHandle<()>,
 }
 
 struct WebTransportAssociation {
     session: h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>,
+    connection: quinn::Connection,
+    destination: SocketAddr,
+    bound_source: SocketAddr,
     state: Arc<Http3State>,
     claim: FlowClaim,
     origin_port: Option<u16>,
     origin_authority: Option<String>,
     sessions: Arc<SessionRegistry>,
+    pending_webtransport: PendingWebTransportSessions,
     datagram_router: DatagramRouter,
     resolved_rx: mpsc::UnboundedReceiver<ResolvedRequest>,
     route_error_rx: mpsc::UnboundedReceiver<(h3::webtransport::SessionId, String)>,
@@ -1117,11 +1494,15 @@ impl WebTransportAssociation {
             origin_port,
             origin_authority,
             sessions,
+            pending_webtransport,
             datagram_router,
             downstream_connect,
             upstream_connect,
             mut tasks,
             resolved_rx,
+            connection,
+            destination,
+            bound_source,
         } = config;
         let (route_error_tx, route_error_rx) = mpsc::unbounded_channel();
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
@@ -1138,11 +1519,15 @@ impl WebTransportAssociation {
         ));
         let mut association = Self {
             session,
+            connection,
+            destination,
+            bound_source,
             state,
             claim,
             origin_authority,
             origin_port,
             sessions,
+            pending_webtransport,
             datagram_router,
             resolved_rx,
             route_error_rx,
@@ -1164,8 +1549,23 @@ impl WebTransportAssociation {
     }
 
     async fn run(mut self) -> Result<(), BoxError> {
+        let mut migration_tick = tokio::time::interval(Duration::from_millis(10));
         let result = loop {
             tokio::select! {
+                _ = migration_tick.tick() => {
+                    if let Err(error) = rebind_migrated_path(
+                        &self.connection,
+                        &self.state.policy,
+                        &self.claim,
+                        self.destination,
+                        &mut self.bound_source,
+                    )
+                    .await
+                    {
+                        break Err(error);
+                    }
+                }
+
                 incoming = self.incoming_rx.recv() => {
                     let Some((binding_id, stream)) = incoming else {
                         break Err(boxed("upstream WebTransport session closed"));
@@ -1176,12 +1576,17 @@ impl WebTransportAssociation {
                 }
                 () = self.state.shutdown.notified() => break Ok(()),
                 accepted = self.session.accept_bi() => {
-                    let accepted = accepted
-                        .map_err(|error| BoxError::from(format!("WebTransport bidirectional stream failed: {error}")))?;
+                    let accepted = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(BoxError::from(format!(
+                            "WebTransport bidirectional stream failed: {error}"
+                        ))),
+                    };
+
                     let Some(accepted) = accepted else {
                         break Ok(());
                     };
-                    if let Err(error) = self.handle_bi(accepted).await {
+                    if let Err(error) = Box::pin(self.handle_bi(accepted)).await {
                         warn!(%error, "WebTransport bidirectional stream rejected");
                     }
                 }
@@ -1189,8 +1594,13 @@ impl WebTransportAssociation {
                     self.fail_route(session_id, error).await;
                 }
                 accepted = self.session.accept_uni() => {
-                    let accepted = accepted
-                        .map_err(|error| BoxError::from(format!("WebTransport unidirectional stream failed: {error}")))?;
+                    let accepted = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(BoxError::from(format!(
+                            "WebTransport unidirectional stream failed: {error}"
+                        ))),
+                    };
+
                     let Some((session_id, stream)) = accepted else {
                         break Ok(());
                     };
@@ -1349,13 +1759,13 @@ impl WebTransportAssociation {
     async fn handle_request(
         &mut self,
         request: http::Request<()>,
-        stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ) -> Result<(), BoxError> {
-        let is_webtransport = request
-            .extensions()
-            .get::<h3::ext::Protocol>()
-            .is_some_and(|protocol| protocol.as_str() == "webtransport");
-        if is_webtransport {
+        if reject_0rtt_stream(&mut stream) {
+            return Ok(());
+        }
+
+        if is_webtransport_request(&request) {
             return self.handle_webtransport_request(request, stream).await;
         }
 
@@ -1380,6 +1790,7 @@ impl WebTransportAssociation {
             origin_port: self.origin_port,
             origin_authority: self.origin_authority.clone(),
             sessions: self.sessions.clone(),
+            pending_webtransport: self.pending_webtransport.clone(),
         };
         let task = tokio::spawn(async move {
             let result =
@@ -1390,11 +1801,97 @@ impl WebTransportAssociation {
         Ok(())
     }
 
+    async fn cleanup_webtransport_setup(
+        &self,
+        downstream_stream_id: StreamId,
+        upstream: &Arc<crate::http3::upstream::UpstreamConnection>,
+        upstream_session_id: h3::webtransport::SessionId,
+    ) {
+        self.sessions.remove(downstream_stream_id).await;
+        self.pending_webtransport
+            .remove_and_unregister(upstream, upstream_session_id)
+            .await;
+    }
+
+    async fn accept_prepared_webtransport_request(
+        &self,
+        request: http::Request<()>,
+        stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ) -> Result<AcceptedWebTransportRequest, BoxError> {
+        let WebTransportSetup {
+            semantic,
+            normalized,
+            downstream_stream,
+            informational_responses,
+            response,
+            upstream,
+            upstream_session_id,
+            upstream_incoming,
+            upstream_stream_id,
+            upstream_stream,
+        } = prepare_webtransport(&request, stream, Http3RequestContext {
+            state: self.state.clone(),
+            claim: self.claim.clone(),
+            origin_port: self.origin_port,
+            origin_authority: self.origin_authority.clone(),
+            sessions: self.sessions.clone(),
+            pending_webtransport: self.pending_webtransport.clone(),
+        })
+        .await?;
+        let downstream_stream_id = downstream_stream.id();
+        let cleanup_upstream = upstream.clone();
+        let mut downstream_stream = downstream_stream;
+        if let Err(error) =
+            send_informational_responses(&mut downstream_stream, informational_responses).await
+        {
+            self.cleanup_webtransport_setup(
+                downstream_stream_id,
+                &cleanup_upstream,
+                upstream_session_id,
+            )
+            .await;
+            return Err(error);
+        }
+        let (session_id, downstream_stream) = match self
+            .session
+            .accept_request_with_response(request, downstream_stream, response)
+            .await
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                self.cleanup_webtransport_setup(
+                    downstream_stream_id,
+                    &cleanup_upstream,
+                    upstream_session_id,
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
+        Ok(AcceptedWebTransportRequest {
+            semantic,
+            normalized,
+            session_id,
+            downstream_stream_id,
+            downstream_stream,
+            upstream,
+            upstream_session_id,
+            upstream_incoming,
+            upstream_stream_id,
+            upstream_stream,
+        })
+    }
+
     async fn handle_webtransport_request(
         &mut self,
         request: http::Request<()>,
         stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ) -> Result<(), BoxError> {
+        if request.method() != http::Method::CONNECT {
+            reject_webtransport_request(stream).await?;
+            return Ok(());
+        }
+
         if self.routes.len() >= MAX_WEBTRANSPORT_SESSIONS {
             let mut stream = stream;
             stream.stop_sending(Code::H3_REQUEST_REJECTED);
@@ -1402,78 +1899,70 @@ impl WebTransportAssociation {
             return Ok(());
         }
 
-        let setup = prepare_webtransport(
-            &request,
-            stream,
-            &self.state,
-            &self.claim,
-            self.origin_port,
-            self.origin_authority.as_deref(),
-            &self.sessions,
-        )
-        .await?;
-        let downstream_stream_id = setup.downstream_stream.id();
-        let setup_upstream = setup.upstream.clone();
-        let setup_upstream_session_id = setup.upstream_session_id;
-        let (session_id, downstream_stream) = match self
-            .session
-            .accept_request(request, setup.downstream_stream)
-            .await
-        {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                setup_upstream
-                    .unregister_webtransport_session(setup_upstream_session_id)
-                    .await;
-                self.sessions.remove(downstream_stream_id).await;
-                return Err(error.into());
-            }
-        };
+        let AcceptedWebTransportRequest {
+            semantic,
+            normalized,
+            session_id,
+            downstream_stream_id,
+            downstream_stream,
+            upstream,
+            upstream_session_id,
+            upstream_incoming,
+            upstream_stream_id,
+            upstream_stream,
+        } = self
+            .accept_prepared_webtransport_request(request, stream)
+            .await?;
+        let cleanup_upstream = upstream.clone();
         let binding = SessionBinding {
             key: session_key(
-                &setup.semantic,
-                &setup.normalized,
+                &semantic,
+                &normalized,
                 SessionProtocol::WebTransport,
                 self.claim.attribution_token.clone(),
             ),
             downstream_stream_id,
-            upstream_stream_id: setup.upstream_stream_id,
+            upstream_stream_id,
         };
-        let binding_id = binding.downstream_stream_id;
-        if let Err(error) = self.sessions.set(&binding, &setup.normalized).await {
-            setup_upstream
-                .unregister_webtransport_session(setup_upstream_session_id)
-                .await;
+        if let Err(error) = self.sessions.set(&binding, &normalized).await {
+            self.cleanup_webtransport_setup(
+                downstream_stream_id,
+                &cleanup_upstream,
+                upstream_session_id,
+            )
+            .await;
             return Err(error);
         }
-        let upstream = setup.upstream.clone();
-        let upstream_session_id = setup.upstream_session_id;
         let (cancel_tx, cancel_rx) = watch::channel(false);
         if let Err(error) = self
             .register_route(
                 session_id,
                 WebTransportRoute {
-                    upstream: setup.upstream,
+                    upstream,
                     upstream_session_id,
                     downstream_stream_id,
-                    upstream_stream_id: setup.upstream_stream_id,
-                    binding_id,
+                    upstream_stream_id,
+                    binding_id: downstream_stream_id,
                     cancel: Some(cancel_tx),
                     incoming_task: None,
                 },
-                setup.upstream_incoming,
+                upstream_incoming,
             )
             .await
         {
-            upstream
-                .unregister_webtransport_session(upstream_session_id)
-                .await;
-            self.sessions.remove(binding_id).await;
+            self.cleanup_webtransport_setup(
+                downstream_stream_id,
+                &cleanup_upstream,
+                upstream_session_id,
+            )
+            .await;
             return Err(error);
         }
+        self.pending_webtransport
+            .remove(&cleanup_upstream, upstream_session_id);
         self.tasks.push(spawn_webtransport_connect_relay(
             downstream_stream,
-            setup.upstream_stream,
+            upstream_stream,
             cancel_rx,
             self.route_error_tx.clone(),
             session_id,
@@ -1507,6 +1996,7 @@ impl WebTransportAssociation {
         let mut datagram_cancel = cancel.subscribe();
         let error_tx = self.route_error_tx.clone();
         let datagram_upstream = upstream.clone();
+
         let datagram_task = tokio::spawn(async move {
             let result = tokio::select! {
                 result = relay_webtransport_datagrams(
@@ -1522,6 +2012,7 @@ impl WebTransportAssociation {
             }
             result
         });
+
         self.datagram_tasks.push(datagram_task);
         let incoming_tx = self.incoming_tx.clone();
         let incoming_error_tx = self.route_error_tx.clone();
@@ -1536,6 +2027,7 @@ impl WebTransportAssociation {
                 "upstream WebTransport session closed".to_owned(),
             ));
         });
+
         self.routes.insert(session_id, WebTransportRoute {
             upstream,
             upstream_session_id,
@@ -1545,6 +2037,7 @@ impl WebTransportAssociation {
             cancel: Some(cancel),
             incoming_task: Some(incoming_task),
         });
+
         Ok(())
     }
 
@@ -1588,6 +2081,7 @@ impl WebTransportAssociation {
                 .await;
             self.sessions.remove(route.binding_id).await;
         }
+        self.pending_webtransport.cleanup().await;
     }
 }
 
@@ -1651,6 +2145,42 @@ async fn select_datagram_relay(
         result = &mut *datagram_task => match result {
             Ok(result) => result,
             Err(error) => Err(BoxError::from(format!("HTTP Datagram relay failed: {error}"))),
+        }
+    }
+}
+
+async fn await_request_relays(
+    body_task: &mut tokio::task::JoinHandle<Result<(), BoxError>>,
+    relay_response: impl Future<Output = Result<(), BoxError>>,
+    datagram_task: &mut Option<tokio::task::JoinHandle<Result<(), BoxError>>>,
+) -> RequestRelayResults {
+    let mut relay_task = Box::pin(select_datagram_relay(relay_response, datagram_task));
+    tokio::select! {
+        biased;
+        body_result = &mut *body_task => {
+            let body_result = body_task_result(body_result);
+            if body_result.is_err() {
+                RequestRelayResults {
+                    relay_result: Ok(()),
+                    body_result,
+                    body_failed_first: true,
+                }
+            } else {
+                RequestRelayResults {
+                    relay_result: relay_task.await,
+                    body_result,
+                    body_failed_first: false,
+                }
+            }
+        }
+        relay_result = &mut relay_task => {
+            body_task.abort();
+            let body_result = await_body_task(body_task).await;
+            RequestRelayResults {
+                relay_result,
+                body_result,
+                body_failed_first: false,
+            }
         }
     }
 }
@@ -1831,6 +2361,7 @@ async fn serve_request(
         origin_port,
         origin_authority,
         sessions,
+        pending_webtransport,
     } = context;
     let semantic =
         match semantic_request(&request, &state, origin_port, origin_authority.as_deref()) {
@@ -1918,10 +2449,15 @@ async fn serve_request(
     } else {
         None
     };
-    relay_request(
-        stream, state, semantic, normalized, claim, sessions, datagrams,
-    )
-    .await
+    let relay_context = Http3RequestContext {
+        state,
+        claim,
+        origin_port,
+        origin_authority,
+        sessions,
+        pending_webtransport,
+    };
+    relay_request(stream, semantic, normalized, relay_context, datagrams).await
 }
 
 fn semantic_request(
@@ -1972,6 +2508,18 @@ fn semantic_request(
         .map(|protocol| session::metadata(protocol, &authority))
         .transpose()?;
     let headers = semantic_request_headers(request.headers())?;
+
+    for header in headers
+        .as_slice()
+        .iter()
+        .filter(|header| header.name() == "host")
+    {
+        let host = std::str::from_utf8(header.value())
+            .map_err(|_| boxed("HTTP/3 Host header is not valid UTF-8"))?;
+        if normalize_authority(host, fallback_port)? != authority {
+            return Err(boxed("HTTP/3 Host header does not match :authority"));
+        }
+    }
 
     Ok(SemanticRequest::from_parts(SemanticRequestParts {
         method: request.method().as_str(),
@@ -2033,17 +2581,23 @@ fn semantic_request_headers(headers: &http::HeaderMap) -> Result<SemanticHeaders
 
 async fn relay_request(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    state: Arc<Http3State>,
     semantic: SemanticRequest,
     normalized: agent_sandbox_core::HttpRequest,
-    claim: FlowClaim,
-    sessions: Arc<SessionRegistry>,
+    context: Http3RequestContext,
     datagrams: Option<DatagramRelay>,
 ) -> Result<(), BoxError> {
+    let Http3RequestContext {
+        state,
+        claim,
+        sessions,
+        pending_webtransport,
+        ..
+    } = context;
     let downstream_stream_id = stream.id();
     let RelayRequestOpen {
         upstream,
         stream: request_stream,
+        preflight_informational,
         preflight_response,
         key,
         protocol,
@@ -2054,6 +2608,7 @@ async fn relay_request(
         &claim,
         &sessions,
         downstream_stream_id,
+        &pending_webtransport,
     )
     .await?;
 
@@ -2071,6 +2626,13 @@ async fn relay_request(
     let (mut send_half, mut recv_half) = stream.split();
     let body_protocol = protocol;
     let capsule_protocol = has_capsule_protocol(&semantic);
+    let expects_continue = protocol.is_none()
+        && semantic.headers().as_slice().iter().any(|header| {
+            header.name().eq_ignore_ascii_case("expect")
+                && header.value().eq_ignore_ascii_case(b"100-continue")
+        });
+
+    let (continue_tx, continue_rx) = oneshot::channel();
 
     let mut body_task = tokio::spawn(async move {
         relay_request_body(
@@ -2078,41 +2640,34 @@ async fn relay_request(
             &mut send_stream,
             body_protocol,
             capsule_protocol,
+            expects_continue.then_some(continue_rx),
         )
         .await
     });
+
     let mut datagram_task = spawn_datagram_relay(datagrams, upstream.clone(), upstream_stream_id);
+    let relay_response = relay_response(
+        &mut send_half,
+        &mut recv_response,
+        ResponseRelayContext {
+            preflight_informational,
+            preflight_response,
+            alt_svc,
+            origin,
+            protocol,
+            binding,
+            capsule_protocol,
+            normalized: protocol.map(|_| normalized.clone()),
+            sessions,
+        },
+        expects_continue.then_some(continue_tx),
+    );
 
-    let relay_response = relay_response(&mut send_half, &mut recv_response, ResponseRelayContext {
-        preflight_response,
-        alt_svc,
-        origin,
-        protocol,
-        binding,
-        capsule_protocol,
-
-        normalized: protocol.map(|_| normalized.clone()),
-        sessions,
-    });
-    let (relay_result, body_result, body_failed_first) = {
-        let mut relay_task = Box::pin(select_datagram_relay(relay_response, &mut datagram_task));
-        tokio::select! {
-            biased;
-            body_result = &mut body_task => {
-                let body_result = body_task_result(body_result);
-                if body_result.is_err() {
-                    (Ok(()), body_result, true)
-                } else {
-                    (relay_task.await, body_result, false)
-                }
-            }
-            relay_result = &mut relay_task => {
-                body_task.abort();
-                let body_result = await_body_task(&mut body_task).await;
-                (relay_result, body_result, false)
-            }
-        }
-    };
+    let RequestRelayResults {
+        relay_result,
+        body_result,
+        body_failed_first,
+    } = await_request_relays(&mut body_task, relay_response, &mut datagram_task).await;
 
     if body_failed_first {
         if let Some(datagram_task) = datagram_task.as_mut() {
@@ -2139,14 +2694,17 @@ async fn open_relay_request(
     claim: &FlowClaim,
     sessions: &SessionRegistry,
     downstream_stream_id: StreamId,
+    pending_webtransport: &PendingWebTransportSessions,
 ) -> Result<RelayRequestOpen, BoxError> {
     let upstream_url = url::Url::parse(&normalized.url.to_string())?;
     let upstream_host = upstream_url
         .host_str()
         .ok_or_else(|| boxed("normalized policy target has no host"))?;
+
     let upstream_port = upstream_url
         .port_or_known_default()
         .ok_or_else(|| boxed("normalized policy target has no port"))?;
+
     let upstream_authority = crate::policy::authority_for_policy(upstream_host, upstream_port);
     let protocol = semantic
         .session()
@@ -2157,6 +2715,7 @@ async fn open_relay_request(
             _ => Err(BoxError::from("invalid HTTP/3 session protocol")),
         })
         .transpose()?;
+
     let key = protocol.map(|protocol| {
         session_key(
             semantic,
@@ -2165,16 +2724,20 @@ async fn open_relay_request(
             claim.attribution_token.clone(),
         )
     });
+
     let request = build_upstream_request(semantic, &upstream_url, &upstream_authority, protocol)?;
     let session_open = if let Some(key) = key.as_ref() {
         sessions.reserve(downstream_stream_id, key).await?;
         match open_session_request(
-            state,
-            upstream_url.scheme(),
-            &upstream_authority,
+            SessionOpenContext {
+                state,
+                scheme: upstream_url.scheme(),
+                authority: &upstream_authority,
+                sessions,
+                pending_webtransport,
+            },
             key,
             request.clone(),
-            sessions,
             downstream_stream_id,
         )
         .await
@@ -2188,19 +2751,32 @@ async fn open_relay_request(
     } else {
         None
     };
-    let (upstream, stream, preflight_response) = if let Some(opened) = session_open {
-        (opened.upstream, opened.stream, Some(opened.response))
-    } else {
-        let upstream =
-            connect_upstream_for_request(state, upstream_url.scheme(), &upstream_authority, None)
-                .await?;
-        let stream = upstream.send_request(request).await?;
-        (upstream, stream, None)
-    };
+
+    let (upstream, stream, preflight_informational, preflight_response) =
+        if let Some(opened) = session_open {
+            (
+                opened.upstream,
+                opened.stream,
+                opened.informational_responses,
+                Some(opened.response),
+            )
+        } else {
+            let upstream = connect_upstream_for_request(
+                state,
+                upstream_url.scheme(),
+                &upstream_authority,
+                None,
+                claim.attribution_token.clone(),
+            )
+            .await?;
+            let stream = upstream.send_request(request).await?;
+            (upstream, stream, Vec::new(), None)
+        };
 
     Ok(RelayRequestOpen {
         upstream,
         stream,
+        preflight_informational,
         preflight_response,
         key,
         protocol,
@@ -2212,11 +2788,15 @@ async fn connect_upstream_for_request(
     scheme: &str,
     authority: &str,
     protocol: Option<SessionProtocol>,
+    security_context: AttributionToken,
 ) -> Result<Arc<crate::http3::upstream::UpstreamConnection>, BoxError> {
     let upstream = if protocol.is_some() {
         state.upstream.connect_dedicated(scheme, authority).await?
     } else {
-        state.upstream.connect(scheme, authority).await?
+        state
+            .upstream
+            .connect(scheme, authority, security_context)
+            .await?
     };
 
     if let Some(protocol) = protocol {
@@ -2227,14 +2807,16 @@ async fn connect_upstream_for_request(
 }
 
 async fn open_session_request(
-    state: &Http3State,
-    scheme: &str,
-    authority: &str,
+    context: SessionOpenContext<'_>,
     key: &SessionKey,
     request: http::Request<()>,
-    sessions: &SessionRegistry,
     downstream_stream_id: StreamId,
 ) -> Result<SessionOpen, BoxError> {
+    let state = context.state;
+    let scheme = context.scheme;
+    let authority = context.authority;
+    let sessions = context.sessions;
+    let pending_webtransport = context.pending_webtransport;
     let mut last_error = None;
 
     for _attempt in 0..2 {
@@ -2245,6 +2827,7 @@ async fn open_session_request(
             scheme,
             authority,
             Some(key.protocol),
+            key.attribution.clone(),
         )
         .await
         {
@@ -2266,21 +2849,22 @@ async fn open_session_request(
         };
         let upstream_session_id = h3::webtransport::SessionId::from(stream.id());
         let upstream_incoming = if key.protocol == SessionProtocol::WebTransport {
-            Some(
-                upstream
-                    .register_webtransport_session(upstream_session_id)
-                    .await,
-            )
+            let incoming = upstream
+                .register_webtransport_session(upstream_session_id)
+                .await;
+
+            pending_webtransport.insert(upstream.clone(), upstream_session_id);
+            Some(incoming)
         } else {
             None
         };
 
-        match stream.recv_response().await {
-            Ok(response) if response.status().is_success() => {
+        match stream.recv_response_with_informational().await {
+            Ok((informational_responses, response)) if response.status().is_success() => {
                 if let Err(error) = sessions.validate(downstream_stream_id, key).await {
                     if upstream_incoming.is_some() {
-                        upstream
-                            .unregister_webtransport_session(upstream_session_id)
+                        pending_webtransport
+                            .remove_and_unregister(&upstream, upstream_session_id)
                             .await;
                     }
                     return Err(error);
@@ -2288,14 +2872,15 @@ async fn open_session_request(
                 return Ok(SessionOpen {
                     upstream,
                     stream,
+                    informational_responses,
                     response,
                     upstream_incoming,
                 });
             }
-            Ok(response) => {
+            Ok((_informational_responses, response)) => {
                 if upstream_incoming.is_some() {
-                    upstream
-                        .unregister_webtransport_session(upstream_session_id)
+                    pending_webtransport
+                        .remove_and_unregister(&upstream, upstream_session_id)
                         .await;
                 }
                 return Err(format!(
@@ -2306,8 +2891,8 @@ async fn open_session_request(
             }
             Err(error) => {
                 if upstream_incoming.is_some() {
-                    upstream
-                        .unregister_webtransport_session(upstream_session_id)
+                    pending_webtransport
+                        .remove_and_unregister(&upstream, upstream_session_id)
                         .await;
                 }
                 if is_session_refusal(&error) {
@@ -2325,12 +2910,16 @@ async fn open_session_request(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
+    Err(session_open_error(last_error, key))
+}
+
+fn session_open_error(last_error: Option<BoxError>, key: &SessionKey) -> BoxError {
+    last_error.unwrap_or_else(|| {
         BoxError::from(format!(
             "upstream {} session could not be established",
             key.protocol.name()
         ))
-    }))
+    })
 }
 
 fn build_upstream_request(
@@ -2360,7 +2949,14 @@ async fn relay_request_body(
     send_stream: &mut h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     protocol: Option<SessionProtocol>,
     capsule_protocol: bool,
+    continue_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
+    if let Some(continue_rx) = continue_rx {
+        continue_rx
+            .await
+            .map_err(|_| boxed("upstream closed before 100 Continue"))?;
+    }
+
     let mut capsules = session::CapsuleDecoder::default();
 
     loop {
@@ -2421,6 +3017,7 @@ async fn relay_webtransport_connect(
             &mut upstream_send,
             Some(SessionProtocol::WebTransport),
             false,
+            None,
         ),
         relay_webtransport_response_body(&mut upstream_recv, &mut downstream_send),
     )?;
@@ -2525,12 +3122,69 @@ async fn relay_webtransport_response_capsules(
     Ok(())
 }
 
+async fn relay_informational_response(
+    stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut response: http::Response<()>,
+    alt_svc: &AltSvcStore,
+    origin: &str,
+    continue_tx: &mut Option<oneshot::Sender<()>>,
+) -> Result<(), BoxError> {
+    let is_continue = response.status().as_u16() == 100;
+    crate::alt_svc::preserve_response_alt_svc(&mut response, alt_svc, origin).await;
+    stream.send_response(response).await?;
+    if is_continue && let Some(sender) = continue_tx.take() {
+        let _ = sender.send(());
+    }
+    Ok(())
+}
+
+async fn set_session_binding(
+    sessions: &SessionRegistry,
+    binding: Option<&SessionBinding>,
+    normalized: Option<&HttpRequest>,
+) -> Result<(), BoxError> {
+    if let (Some(binding), Some(normalized)) = (binding, normalized)
+        && let Err(error) = sessions.set(binding, normalized).await
+    {
+        sessions.remove(binding.downstream_stream_id).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn relay_response_heads(
+    stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    recv_response: &mut h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
+    alt_svc: &AltSvcStore,
+    origin: &str,
+    continue_tx: &mut Option<oneshot::Sender<()>>,
+) -> Result<http::Response<()>, BoxError> {
+    let mut informational_count = 0;
+    loop {
+        let response = recv_response
+            .recv_response_head()
+            .await
+            .map_err(|error| BoxError::from(format!("upstream response failed: {error}")))?;
+        if !response.status().is_informational() {
+            return Ok(response);
+        }
+        if informational_count == MAX_INFORMATIONAL_RESPONSES {
+            recv_response.stop_sending(Code::H3_EXCESSIVE_LOAD);
+            return Err(boxed("too many informational responses"));
+        }
+        informational_count += 1;
+        relay_informational_response(stream, response, alt_svc, origin, continue_tx).await?;
+    }
+}
+
 async fn relay_response(
     stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     recv_response: &mut h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
     context: ResponseRelayContext,
+    continue_tx: Option<oneshot::Sender<()>>,
 ) -> Result<(), BoxError> {
     let ResponseRelayContext {
+        preflight_informational,
         preflight_response,
         alt_svc,
         origin,
@@ -2540,14 +3194,21 @@ async fn relay_response(
         normalized,
         sessions,
     } = context;
-    let mut response = match preflight_response {
-        Some(response) => response,
-        None => match recv_response.recv_response().await {
-            Ok(response) => response,
-            Err(error) => {
-                return Err(BoxError::from(format!("upstream response failed: {error}")));
-            }
-        },
+    let mut continue_tx = continue_tx;
+    let mut response = if let Some(response) = preflight_response {
+        for informational_response in preflight_informational {
+            relay_informational_response(
+                stream,
+                informational_response,
+                &alt_svc,
+                &origin,
+                &mut continue_tx,
+            )
+            .await?;
+        }
+        response
+    } else {
+        relay_response_heads(stream, recv_response, &alt_svc, &origin, &mut continue_tx).await?
     };
 
     if binding.is_some() && !response.status().is_success() {
@@ -2559,12 +3220,10 @@ async fn relay_response(
     }
 
     let binding_id = binding.as_ref().map(|binding| binding.downstream_stream_id);
-    if let (Some(binding), Some(normalized)) = (binding.as_ref(), normalized.as_ref()) {
-        sessions.set(binding, normalized).await?;
-    }
+    set_session_binding(&sessions, binding.as_ref(), normalized.as_ref()).await?;
+
     let relay_result: Result<(), BoxError> = async {
         crate::alt_svc::preserve_response_alt_svc(&mut response, &alt_svc, &origin).await;
-
         stream.send_response(response).await?;
 
         let mut capsules = session::CapsuleDecoder::default();
@@ -2620,6 +3279,7 @@ async fn relay_response(
     if let Some(binding_id) = binding_id {
         sessions.remove(binding_id).await;
     }
+
     relay_result
 }
 
@@ -2636,6 +3296,7 @@ fn upstream_headers(headers: &SemanticHeaders) -> Result<http::HeaderMap, BoxErr
         map.append(name, value);
     }
 
+    map.remove("host");
     Ok(map)
 }
 

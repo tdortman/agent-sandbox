@@ -1,9 +1,10 @@
 //! Upstream HTTP/3 client connections for the proxy's QUIC backend.
 //!
 //! Upstream associations are separate from the downstream associations the
-//! proxy terminates. They are pooled by origin authority and closed when the
-//! peer goes away or the idle timeout expires, so ownership of an upstream
-//! association is released after the exchange that used it completes.
+//! proxy terminates. They are pooled by origin authority and policy context,
+//! then closed when the peer goes away or the idle timeout expires, so
+//! ownership of an upstream association is released after its exchange
+//! completes.
 //!
 //! Each origin's TLS configuration carries the verified upstream ECH
 //! configuration when its DNS zone advertises one; origins without ECH keep
@@ -11,6 +12,7 @@
 //! policy target. An unverifiable advertised configuration fails closed.
 
 use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
+use agent_sandbox_core::AttributionToken;
 use bytes::Bytes;
 use h3::{
     ConnectionState,
@@ -38,11 +40,12 @@ pub(crate) type IncomingWebTransportReceiver =
     tokio::sync::mpsc::Receiver<IncomingWebTransportStream>;
 
 type IncomingWebTransportSender = tokio::sync::mpsc::Sender<IncomingWebTransportStream>;
+type UpstreamPoolKey = (String, String, AttributionToken);
 
-/// Pool of upstream HTTP/3 connections keyed by origin authority.
+/// Pool of upstream HTTP/3 connections keyed by origin and policy context.
 pub struct UpstreamPool {
     endpoint: quinn::Endpoint,
-    connections: Arc<std::sync::Mutex<HashMap<String, Weak<UpstreamConnection>>>>,
+    connections: Arc<std::sync::Mutex<HashMap<UpstreamPoolKey, Weak<UpstreamConnection>>>>,
     tls: UpstreamTls,
     ech: UpstreamEch,
 }
@@ -113,8 +116,9 @@ impl UpstreamPool {
         self: &Arc<Self>,
         scheme: &str,
         authority: &str,
+        security_context: AttributionToken,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let key = format!("{scheme}://{authority}");
+        let key = (scheme.to_owned(), authority.to_owned(), security_context);
 
         {
             let pool = self.connections.lock().expect("upstream pool lock");
@@ -179,7 +183,7 @@ impl UpstreamPool {
         host: &str,
         authority: &str,
         address: SocketAddr,
-        pool_key: Option<&str>,
+        pool_key: Option<&UpstreamPoolKey>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
         let client_config = self.client_config(host).await?;
 
@@ -221,7 +225,7 @@ impl UpstreamPool {
 
         let watcher = connection.clone();
         let pool = Arc::clone(&self.connections);
-        let pool_key = pool_key.map(str::to_owned);
+        let pool_key = pool_key.cloned();
         let driver_sessions = watcher.incoming_sessions.clone();
 
         tokio::spawn(async move {

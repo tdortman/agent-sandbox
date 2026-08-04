@@ -17,27 +17,41 @@ use crate::{
     quic::{self},
     shared_state::{ConnectionState, SharedState},
 };
+use bytes::Buf;
+use futures_util::future;
+use http::{HeaderMap, Response};
+use quic::StreamId;
 use std::{
     convert::TryFrom,
     task::{Context, Poll},
 };
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
+const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
 /// Manage request bodies transfer, response and trailers.
 ///
-/// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can be awaited by calling
-/// [`RequestStream::recv_response()`]. A body for this request can be sent with [`RequestStream::send_data()`], then the request
-/// shall be completed by either sending trailers with  [`RequestStream::finish()`].
+/// Once a request has been sent via
+/// [`crate::client::SendRequest::send_request()`], a response can be awaited by
+/// calling [`RequestStream::recv_response()`]. A body for this request can be
+/// sent with [`RequestStream::send_data()`], then the request
+/// shall be completed by either sending trailers with
+/// [`RequestStream::finish()`].
 ///
-/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`] until it returns
-/// `None`. Then the trailers will eventually be available via [`RequestStream::recv_trailers()`].
+/// After receiving the response's headers, it's body can be read by
+/// [`RequestStream::recv_data()`] until it returns `None`. Then the trailers
+/// will eventually be available via [`RequestStream::recv_trailers()`].
 ///
-/// TODO: If data is polled before the response has been received, an error will be thrown.
+/// TODO: If data is polled before the response has been received, an error will
+/// be thrown.
 ///
-/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error will be
-/// thrown
+/// TODO: If trailers are polled but the body hasn't been fully received, an
+/// UNEXPECT_FRAME error will be thrown
 ///
-/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`], which will
-/// put an end to any transfer concerning it.
+/// Whenever the client wants to cancel this request, it can call
+/// [`RequestStream::stop_sending()`], which will put an end to any transfer
+/// concerning it.
 ///
 /// # Examples
 ///
@@ -90,13 +104,57 @@ impl<S, B> RequestStream<S, B>
 where
     S: quic::RecvStream,
 {
-    /// Receive the HTTP/3 response
+    /// Receive the final HTTP/3 response.
     ///
-    /// This should be called before trying to receive any data with [`recv_data()`].
+    /// Informational responses are consumed and discarded. Use
+    /// [`RequestStream::recv_response_with_informational`] when those
+    /// responses must be retained.
+    ///
+    /// This should be called before trying to receive any data with
+    /// [`recv_data()`].
     ///
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
+        let (_, response) = self.recv_response_with_informational().await?;
+        Ok(response)
+    }
+
+    /// Receive informational responses and the final HTTP/3 response.
+    ///
+    /// HTTP/3 permits one or more informational responses before the final
+    /// response. The returned vector preserves their order.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_response_with_informational(
+        &mut self,
+    ) -> Result<(Vec<Response<()>>, Response<()>), StreamError> {
+        let mut informational = Vec::new();
+
+        loop {
+            let response = self.recv_response_head().await?;
+
+            if response.status().is_informational() {
+                if informational.len() == MAX_INFORMATIONAL_RESPONSES {
+                    self.inner.stream.stop_sending(Code::H3_EXCESSIVE_LOAD);
+                    return Err(StreamError::StreamError {
+                        code: Code::H3_EXCESSIVE_LOAD,
+                        reason: "too many informational responses".to_owned(),
+                    });
+                }
+
+                informational.push(response);
+            } else {
+                return Ok((informational, response));
+            }
+        }
+    }
+
+    /// Receive one HTTP/3 response head.
+    ///
+    /// The caller must process informational heads before receiving the final
+    /// response, then call [`RequestStream::recv_data()`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_response_head(&mut self) -> Result<Response<()>, StreamError> {
         let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
             .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
@@ -120,10 +178,10 @@ where
         //= type=TODO
         //# If a client
         //# receives a push ID that has already been promised and detects a
-        //# mismatch, it MUST respond with a connection error of type
+        //# mismatch, it MUST respond with a connection error of
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = if let Frame::Headers(ref mut encoded) = frame {
+        let decoded = if let Frame::Headers(encoded) = &mut frame {
             match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
@@ -186,7 +244,8 @@ where
 
     /// Receive some of the response body.
     ///
-    /// This returns a chunk of the response body, or `None` if the response body is finished.
+    /// This returns a chunk of the response body, or `None` if the response
+    /// body is finished.
     // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf>, StreamError> {
@@ -195,7 +254,8 @@ where
 
     /// Receive some of the response body.
     ///
-    /// This returns a chunk of the response body, or `None` if the response body is finished.
+    /// This returns a chunk of the response body, or `None` if the response
+    /// body is finished.
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
