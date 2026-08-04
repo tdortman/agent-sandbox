@@ -387,6 +387,7 @@ async fn send_informational_response(
                 .body(())?,
         )
         .await?;
+
     Ok(())
 }
 
@@ -398,6 +399,7 @@ async fn send_excessive_informational_responses(
             .send_response(http::Response::builder().status(103).body(())?)
             .await?;
     }
+
     Ok(())
 }
 

@@ -85,6 +85,15 @@ let
     invoking user's ``$HOME``, or ``/…`` for absolute host paths.
   '';
   hiddenPathType = mountPathType;
+  http10OriginType = lib.types.addCheck httpUrlType (
+    origin:
+    let
+      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" origin;
+      path = if match == null then null else builtins.elemAt match 2;
+    in
+    lib.assertMsg (builtins.match ".*[*?].*" origin == null && (path == null || path == "/"))
+      "agent-sandbox HTTP/1.0 upstream origins must be exact HTTP(S) origins without globs or paths, got: ${origin}"
+  );
   httpMethodType = lib.types.addCheck lib.types.str (
     method:
     lib.assertMsg (
@@ -145,16 +154,6 @@ let
         && (port == null || (portValue.success && portValue.value >= 1 && portValue.value <= 65535))
       )
       "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with valid glob syntax and no fragment, got: ${url}"
-  );
-
-  http10OriginType = lib.types.addCheck httpUrlType (
-    origin:
-    let
-      match = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" origin;
-      path = if match == null then null else builtins.elemAt match 2;
-    in
-    lib.assertMsg (builtins.match ".*[*?].*" origin == null && (path == null || path == "/"))
-      "agent-sandbox HTTP/1.0 upstream origins must be exact HTTP(S) origins without globs or paths, got: ${origin}"
   );
   isValidMountPath = path: path == "~" || lib.hasPrefix "~/" path || lib.hasPrefix "/" path;
   mergePackageMounts =
@@ -448,6 +447,16 @@ in
           description = "Optional explicit group ID allowed to connect to the trusted proxy socket; null uses the dedicated proxy group.";
         };
 
+        http10UpstreamOrigins = lib.mkOption {
+          type = lib.types.listOf http10OriginType;
+          default = [ ];
+
+          description = ''
+            Exact HTTP(S) origins that may use HTTP/1.0 upstream framing.
+            The proxy validates each origin before startup.
+          '';
+        };
+
         http3 = {
           enable = lib.mkEnableOption "transparent HTTP/3 interception through UDP port 443";
 
@@ -485,16 +494,6 @@ in
           type = lib.types.listOf httpUrlType;
           default = [ ];
           description = "Absolute HTTP(S) URL glob patterns whose WebSocket upstreams must use HTTP/1.1.";
-        };
-
-        http10UpstreamOrigins = lib.mkOption {
-          type = lib.types.listOf http10OriginType;
-          default = [ ];
-
-          description = ''
-            Exact HTTP(S) origins that may use HTTP/1.0 upstream framing.
-            The proxy validates each origin before startup.
-          '';
         };
       };
 

@@ -42,7 +42,6 @@ let
     assert expectFailure proxyAltPortsMessage {
       agent-sandbox.network = {
         enable = true;
-
         httpProxy.http3.altUdpPorts = [ 4444 ];
       };
     };
@@ -140,10 +139,10 @@ let
       specialArgs = { inherit inputs; };
       system = pkgs.stdenv.hostPlatform.system;
     };
+  proxyAltPortsMessage = "agent-sandbox.network.httpProxy.http3.altUdpPorts requires http3.enable";
   proxyCredentialsMessage = "agent-sandbox HTTP proxy CA certificate and key must be supplied together and use absolute paths";
   proxyGidMessage = "agent-sandbox.network.httpProxy.gid must be nonzero when explicitly configured";
   proxyNetworkMessage = "agent-sandbox.network.httpProxy.enable requires network.enable";
-  proxyAltPortsMessage = "agent-sandbox.network.httpProxy.http3.altUdpPorts requires http3.enable";
   proxyRulesMessage = "agent-sandbox.network.httpProxy.declarativeAllow/declarativeDeny require httpProxy.enable (configured URLs: https://api.example.com/v1)";
   resourceGateMessage = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
   socketPathMessage = "agent-sandbox.policy.socketPath and sandboxSocketPath must differ when policy is enabled";

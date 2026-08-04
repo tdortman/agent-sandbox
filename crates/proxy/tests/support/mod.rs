@@ -1238,11 +1238,13 @@ impl Http3Client {
     }
 
     /// Report whether a resumed connection accepts QUIC 0-RTT data.
+    ///
+    /// Returns `None` when the server does not issue a resumption ticket.
     pub async fn zero_rtt_is_accepted(
         &self,
         server: SocketAddr,
         server_name: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<bool>, String> {
         let connecting = self
             .endpoint
             .connect(server, server_name)
@@ -1254,15 +1256,16 @@ impl Http3Client {
                     .await
                     .map_err(|_| "0-RTT acceptance timed out".to_owned())?;
                 connection.close(quinn::VarInt::from_u32(0), b"0-RTT probe");
-                Ok(accepted)
+                Ok(Some(accepted))
             }
+
             Err(connecting) => {
                 let connection = timeout(Duration::from_secs(5), connecting)
                     .await
                     .map_err(|_| "QUIC handshake timed out".to_owned())?
                     .map_err(|error| format!("QUIC handshake failed: {error}"))?;
                 connection.close(quinn::VarInt::from_u32(0), b"0-RTT unavailable");
-                Ok(false)
+                Ok(None)
             }
         }
     }

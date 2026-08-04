@@ -963,6 +963,7 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
         resolved_rx,
         setup,
     } = input;
+
     let H3RequestContext {
         state,
         claim,
@@ -973,6 +974,7 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
         tasks,
         ..
     } = context;
+
     let DatagramRouterState {
         router: datagram_router,
         task: datagram_task,
@@ -1009,6 +1011,7 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
 
     let cleanup_sessions = sessions.clone();
     let binding_id = downstream_stream_id;
+
     let StartedWebTransportAssociation {
         association,
         datagram_task,
@@ -1171,6 +1174,7 @@ async fn accept_webtransport_session(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
     informational_responses: Vec<http::Response<()>>,
+
     cleanup: WebTransportAcceptCleanup,
 ) -> Result<AcceptedWebTransport, BoxError> {
     let mut stream = stream;
@@ -1181,6 +1185,7 @@ async fn accept_webtransport_session(
         tasks,
         response,
     } = cleanup;
+
     for response in informational_responses {
         if let Err(error) = stream.send_response(response).await {
             upstream
@@ -1216,6 +1221,7 @@ async fn accept_webtransport_session(
         stop_h3_tasks(tasks).await;
         return Err(boxed("WebTransport CONNECT stream already consumed"));
     };
+
     Ok(AcceptedWebTransport {
         session,
         downstream_connect,

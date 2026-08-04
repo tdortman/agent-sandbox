@@ -136,6 +136,7 @@ where
         } else {
             default_webtransport_response(&request)
         };
+
         ensure_draft_header(&mut response);
         stream.send_response(response).await?;
 

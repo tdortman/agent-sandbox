@@ -747,7 +747,10 @@ async fn transparent_http3_disables_0rtt() {
         .await
         .expect("0-RTT probe");
 
-    assert!(!zero_rtt);
+    assert!(
+        zero_rtt.is_none(),
+        "proxy must not issue a 0-RTT-capable session ticket"
+    );
 
     wait_for_release(&harness).await;
     assert_eq!(harness.h3_origin().attempts(), 1);
