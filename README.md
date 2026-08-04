@@ -51,7 +51,7 @@ agent-sandbox.network.httpProxy.http10UpstreamOrigins = [
 ];
 ```
 
-The HTTP/3 backend remains opt-in. Quinn 0.11 does not expose active or retired QUIC connection identifiers to the application, and rustls 0.23 has no server ECH configuration API, so those rollout gates are not deployment defaults.
+The HTTP/3 backend stays disabled by default. Quinn does not let the proxy track QUIC connection IDs, and rustls cannot configure server-side ECH yet.
 
 ## What it gates
 
