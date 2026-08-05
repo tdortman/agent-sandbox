@@ -2,8 +2,8 @@
 
 use super::{
     proxy::{
-        AttributionToken, FlowRegistration, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
-        ProxySessionToken,
+        AttributionToken, FlowRegistration, NetworkFlowKey, NetworkFlowSelector, ProxyConnectionId,
+        ProxyRequestId, ProxySessionToken,
     },
     scope::ApprovalScope,
 };
@@ -163,6 +163,12 @@ pub enum RpcRequest {
     ClaimNetworkFlow {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
+        connection_id: ProxyConnectionId,
+    },
+
+    ClaimNetworkFlowBySource {
+        proxy_session: ProxySessionToken,
+        selector: NetworkFlowSelector,
         connection_id: ProxyConnectionId,
     },
 
@@ -350,6 +356,12 @@ enum RpcRequestWire {
     ClaimNetworkFlow {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
+        connection_id: ProxyConnectionId,
+    },
+
+    ClaimNetworkFlowBySource {
+        proxy_session: ProxySessionToken,
+        selector: NetworkFlowSelector,
         connection_id: ProxyConnectionId,
     },
 
@@ -544,6 +556,7 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
         "open_proxy_session" => &["op"][..],
         "register_network_flow" => &["op", "registration"][..],
         "claim_network_flow" => &["op", "proxy_session", "flow", "connection_id"][..],
+        "claim_network_flow_by_source" => &["op", "proxy_session", "selector", "connection_id"][..],
         "rebind_network_flow" => &[
             "op",
             "proxy_session",
@@ -589,6 +602,18 @@ impl RpcRequest {
         Self::ClaimNetworkFlow {
             proxy_session,
             flow,
+            connection_id,
+        }
+    }
+
+    const fn claim_network_flow_by_source(
+        proxy_session: ProxySessionToken,
+        selector: NetworkFlowSelector,
+        connection_id: ProxyConnectionId,
+    ) -> Self {
+        Self::ClaimNetworkFlowBySource {
+            proxy_session,
+            selector,
             connection_id,
         }
     }
@@ -775,6 +800,12 @@ impl From<RpcRequestWire> for RpcRequest {
                 connection_id,
             } => Self::claim_network_flow(proxy_session, flow, connection_id),
 
+            RpcRequestWire::ClaimNetworkFlowBySource {
+                proxy_session,
+                selector,
+                connection_id,
+            } => Self::claim_network_flow_by_source(proxy_session, selector, connection_id),
+
             RpcRequestWire::RebindNetworkFlow {
                 proxy_session,
                 attribution_token,
@@ -895,6 +926,7 @@ impl RpcRequest {
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
             | Self::ClaimNetworkFlow { .. }
+            | Self::ClaimNetworkFlowBySource { .. }
             | Self::RebindNetworkFlow { .. }
             | Self::CheckHttp { .. }
             | Self::CheckNetworkFlow { .. }
@@ -923,6 +955,7 @@ impl RpcRequest {
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
             | Self::ClaimNetworkFlow { .. }
+            | Self::ClaimNetworkFlowBySource { .. }
             | Self::RebindNetworkFlow { .. }
             | Self::CheckHttp { .. }
             | Self::CheckNetworkFlow { .. }

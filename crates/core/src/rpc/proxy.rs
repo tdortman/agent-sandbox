@@ -570,6 +570,53 @@ impl NetworkFlowKey {
     }
 }
 
+/// Local flow identity used to claim a redirected UDP association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkFlowSelector {
+    pub protocol: FlowProtocol,
+    pub source_ip: IpAddr,
+    pub source_port: NonZeroU16,
+    pub destination_port: NonZeroU16,
+}
+
+impl NetworkFlowSelector {
+    #[must_use]
+    pub const fn new(
+        protocol: FlowProtocol,
+        source_ip: IpAddr,
+        source_port: NonZeroU16,
+        destination_port: NonZeroU16,
+    ) -> Self {
+        Self {
+            protocol,
+            source_ip,
+            source_port,
+            destination_port,
+        }
+    }
+
+    #[must_use]
+    pub const fn protocol(&self) -> FlowProtocol {
+        self.protocol
+    }
+
+    #[must_use]
+    pub const fn source_ip(&self) -> IpAddr {
+        self.source_ip
+    }
+
+    #[must_use]
+    pub const fn source_port(&self) -> NonZeroU16 {
+        self.source_port
+    }
+
+    #[must_use]
+    pub const fn destination_port(&self) -> NonZeroU16 {
+        self.destination_port
+    }
+}
+
 /// Normalized policy host (DNS name or canonical IP literal).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NormalizedPolicyHost(NormalizedPolicyHostValue);

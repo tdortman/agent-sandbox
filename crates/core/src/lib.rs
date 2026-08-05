@@ -61,12 +61,12 @@ pub use rpc::{
     DbusScopeActionReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
     FilesystemScopeActionReply, FlowClaimReply, FlowContext, FlowProtocol, FlowRegistration,
     HttpApprovalRequest, HttpCheckReply, HttpCheckRequest, HttpScopeActionReply,
-    NetworkFlowCheckReply, NetworkFlowKey, NormalizedPolicyHost, PendingSummary, ProcessIdentity,
-    ProcessStartTimeTicks, ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId,
-    ProxySessionReply, ProxySessionToken, RegisterUiReply, RequestContext, ResourceCheckReply,
-    ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
-    SocketIdentity, SocketInode, StatusReply, UiPush, Verdict, VerdictSource, attach_check_aliases,
-    split_check_aliases,
+    NetworkFlowCheckReply, NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost,
+    PendingSummary, ProcessIdentity, ProcessStartTimeTicks, ProxyConnectionId, ProxyReply,
+    ProxyReplyBody, ProxyRequestId, ProxySessionReply, ProxySessionToken, RegisterUiReply,
+    RequestContext, ResourceCheckReply, ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest,
+    ScopeActionReply, SimpleOkReply, SocketIdentity, SocketInode, StatusReply, UiPush, Verdict,
+    VerdictSource, attach_check_aliases, split_check_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

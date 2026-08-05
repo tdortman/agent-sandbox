@@ -37,6 +37,7 @@ const fn is_proxy_request(req: &ResolvedRpcRequest) -> bool {
         ResolvedRpcRequest::OpenProxySession
             | ResolvedRpcRequest::RegisterNetworkFlow { .. }
             | ResolvedRpcRequest::ClaimNetworkFlow { .. }
+            | ResolvedRpcRequest::ClaimNetworkFlowBySource { .. }
             | ResolvedRpcRequest::RebindNetworkFlow { .. }
             | ResolvedRpcRequest::CheckHttp { .. }
             | ResolvedRpcRequest::CheckNetworkFlow { .. }
@@ -67,6 +68,16 @@ async fn handle_proxy_request(
         } => Ok(RpcReply::FlowClaim(
             store
                 .claim_network_flow(proxy_session, flow, connection_id)
+                .await?,
+        )),
+
+        ResolvedRpcRequest::ClaimNetworkFlowBySource {
+            proxy_session,
+            selector,
+            connection_id,
+        } => Ok(RpcReply::FlowClaim(
+            store
+                .claim_network_flow_by_source(proxy_session, selector, connection_id)
                 .await?,
         )),
 

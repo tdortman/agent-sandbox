@@ -6,9 +6,9 @@ use crate::{
 };
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, AttributionToken, FileAccess, FilesystemRule, FlowRegistration,
-    HttpRequest, HttpRuleTarget, NetworkFlowKey, ProxyConnectionId, ProxyRequestId,
-    ProxySessionToken, RequestContext, ResolvedRequestContext, ResourceAccess, ResourceKind,
-    RpcRequest,
+    HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkFlowSelector, ProxyConnectionId,
+    ProxyRequestId, ProxySessionToken, RequestContext, ResolvedRequestContext, ResourceAccess,
+    ResourceKind, RpcRequest,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -27,6 +27,12 @@ pub(super) enum ResolvedRpcRequest {
     ClaimNetworkFlow {
         proxy_session: ProxySessionToken,
         flow: NetworkFlowKey,
+        connection_id: ProxyConnectionId,
+    },
+
+    ClaimNetworkFlowBySource {
+        proxy_session: ProxySessionToken,
+        selector: NetworkFlowSelector,
         connection_id: ProxyConnectionId,
     },
 
@@ -187,6 +193,16 @@ fn plan_simple(req: RpcRequest) -> Result<ResolvedRpcRequest, Box<RpcRequest>> {
         } => Ok(ResolvedRpcRequest::ClaimNetworkFlow {
             proxy_session,
             flow,
+            connection_id,
+        }),
+
+        RpcRequest::ClaimNetworkFlowBySource {
+            proxy_session,
+            selector,
+            connection_id,
+        } => Ok(ResolvedRpcRequest::ClaimNetworkFlowBySource {
+            proxy_session,
+            selector,
             connection_id,
         }),
 

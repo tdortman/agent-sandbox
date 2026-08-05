@@ -15,8 +15,9 @@ mod tests;
 pub use message::RpcMessage;
 pub use proxy::{
     AttributionToken, FlowContext, FlowProtocol, FlowRegistration, HttpApprovalRequest,
-    HttpCheckRequest, NetworkFlowKey, NormalizedPolicyHost, ProcessIdentity, ProcessStartTimeTicks,
-    ProxyConnectionId, ProxyRequestId, ProxySessionToken, SocketIdentity, SocketInode,
+    HttpCheckRequest, NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, ProcessIdentity,
+    ProcessStartTimeTicks, ProxyConnectionId, ProxyRequestId, ProxySessionToken, SocketIdentity,
+    SocketInode,
 };
 pub use push::{PendingSummary, UiPush};
 pub use reply::{

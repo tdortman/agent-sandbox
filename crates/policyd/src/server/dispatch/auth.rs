@@ -46,6 +46,7 @@ pub const fn is_proxy_request(req: &RpcRequest) -> bool {
         req,
         RpcRequest::OpenProxySession
             | RpcRequest::ClaimNetworkFlow { .. }
+            | RpcRequest::ClaimNetworkFlowBySource { .. }
             | RpcRequest::RebindNetworkFlow { .. }
             | RpcRequest::CheckHttp { .. }
             | RpcRequest::CheckNetworkFlow { .. }

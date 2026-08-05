@@ -6,12 +6,9 @@ use super::types::{
 use crate::{error::PolicydError, wire::NetworkCheckRequest};
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
-    NetworkFlowKey, ProcessIds, ProxyConnectionId, ProxyRequestId, ProxySessionReply,
-    ProxySessionToken, ResolvedRequestContext, SocketIdentity,
-    socket_owner::{
-        OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot,
-        validate_socket_identity,
-    },
+    NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
+    ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity,
+    socket_owner::validate_socket_identity,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -23,62 +20,58 @@ fn proxy_error(message: impl Into<String>) -> PolicydError {
     PolicydError::Proxy(message.into())
 }
 
-/// Resolve and revalidate the owner of a migrated UDP tuple.
+/// Validate the owner identity attached to an NFQ flow registration.
 ///
-/// The tuple must resolve to a unique live socket owned by the same process
-/// identity as the claim. The resolved identity is revalidated after
-/// resolution, so a socket that closed and whose tuple was reused during the
-/// lookup fails closed instead of being committed.
+/// The check uses process identity only. It does not resolve the UDP tuple,
+/// because policyd runs outside the sandbox network namespace.
 ///
 /// # Errors
 ///
-/// Returns [`PolicydError`] when the tuple has no unique live owner, the
-/// owner's process identity differs, or the resolved identity is no longer
-/// live.
-async fn resolve_rebind_owner(
-    flow: &NetworkFlowKey,
-    expected: SocketIdentity,
+/// Returns [`PolicydError`] when owner validation times out or fails.
+async fn validate_registered_owner(
+    owner: SocketIdentity,
     approval_timeout: Duration,
 ) -> Result<SocketIdentity, PolicydError> {
-    let resolve_flow = flow.clone();
-    let new_owner = tokio::time::timeout(
-        approval_timeout,
-        tokio::task::spawn_blocking(move || {
-            resolve_owner_snapshot(
-                SocketProtocol::Udp,
-                SocketTuple::from_local(resolve_flow.source_ip(), resolve_flow.source_port().get()),
-            )
-        }),
-    )
-    .await
-    .map_err(|_| proxy_error("rebind owner revalidation timed out"))?
-    .map_err(|_| proxy_error("rebind owner revalidation failed"))?;
-
-    let OwnerResolution::Unique(snapshot) = new_owner else {
-        return Err(proxy_error("socket owner changed"));
-    };
-
-    if snapshot.identity().pid() != expected.pid()
-        || snapshot.identity().uid() != expected.uid()
-        || snapshot.identity().process_start_time_ticks() != expected.process_start_time_ticks()
-    {
-        return Err(proxy_error("socket owner changed"));
-    }
-
-    let rebind_identity = snapshot.identity();
     let identity_valid = tokio::time::timeout(
         approval_timeout,
-        tokio::task::spawn_blocking(move || validate_socket_identity(rebind_identity)),
+        tokio::task::spawn_blocking(move || validate_socket_identity(owner)),
     )
     .await
-    .map_err(|_| proxy_error("rebind identity revalidation timed out"))?
-    .map_err(|_| proxy_error("rebind identity revalidation failed"))?;
+    .map_err(|_| proxy_error("socket owner validation timed out"))?
+    .map_err(|_| proxy_error("socket owner validation failed"))?;
 
     if !identity_valid {
         return Err(proxy_error("socket owner changed"));
     }
 
-    Ok(snapshot.identity())
+    Ok(owner)
+}
+
+fn same_socket_owner(first: SocketIdentity, second: SocketIdentity) -> bool {
+    first.pid() == second.pid()
+        && first.uid() == second.uid()
+        && first.process_start_time_ticks() == second.process_start_time_ticks()
+}
+
+fn validate_rebind_candidate(
+    claimed: &ProxyFlowState,
+    pending: &ProxyFlowState,
+) -> Result<(), PolicydError> {
+    if pending.attribution_token.is_some() {
+        return Err(proxy_error("rebind conflicts with an existing flow"));
+    }
+
+    if !same_socket_owner(claimed.registration.owner(), pending.registration.owner()) {
+        return Err(proxy_error("socket owner changed"));
+    }
+
+    if pending.registration.policy_host() != claimed.registration.policy_host()
+        || pending.registration.context() != claimed.registration.context()
+    {
+        return Err(proxy_error("rebind conflicts with an existing flow"));
+    }
+
+    Ok(())
 }
 
 const fn transport_scheme(protocol: FlowProtocol, port: u16) -> &'static str {
@@ -218,11 +211,108 @@ impl PolicyStore {
         state.connection_id = Some(connection_id);
         state.claimed_at = Some(now);
         state.last_check = now;
+
+        let policy_host = state.registration.policy_host().clone();
         drop(inner);
 
         Ok(agent_sandbox_core::FlowClaimReply {
             ok: true,
             attribution_token,
+            flow,
+            policy_host,
+        })
+    }
+
+    /// Claim one registered UDP flow after OUTPUT NAT hid its destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicydError`] when the selector is invalid, ambiguous, or
+    /// does not identify exactly one registered flow.
+    pub async fn claim_network_flow_by_source(
+        &self,
+        proxy_session: ProxySessionToken,
+        selector: NetworkFlowSelector,
+        connection_id: ProxyConnectionId,
+    ) -> Result<agent_sandbox_core::FlowClaimReply, PolicydError> {
+        if selector.protocol() != FlowProtocol::Udp {
+            return Err(proxy_error("redirected flow selector requires UDP"));
+        }
+
+        let (candidate, expected_registration) = {
+            let mut inner = self.inner.lock().await;
+            prune_flows(&mut inner.proxy_flows, Instant::now());
+            validate_session(&inner, &proxy_session)?;
+
+            let mut matches = inner
+                .proxy_flows
+                .iter()
+                .filter(|(flow, _state)| {
+                    flow.protocol() == selector.protocol()
+                        && flow.source_ip() == selector.source_ip()
+                        && flow.source_port() == selector.source_port()
+                        && flow.destination_port() == selector.destination_port()
+                })
+                .map(|(flow, state)| {
+                    (
+                        flow.clone(),
+                        state.attribution_token.is_some(),
+                        state.registration.clone(),
+                    )
+                });
+
+            let (candidate, claimed, registration) = matches
+                .next()
+                .ok_or_else(|| proxy_error("redirected flow is not registered"))?;
+
+            if matches.next().is_some() {
+                return Err(proxy_error("redirected flow selector is ambiguous"));
+            }
+
+            if claimed {
+                return Err(proxy_error("redirected flow is already claimed"));
+            }
+
+            drop(matches);
+            drop(inner);
+            (candidate, registration)
+        };
+
+        validate_registered_owner(expected_registration.owner(), self.args.approval_timeout)
+            .await?;
+
+        let mut inner = self.inner.lock().await;
+        prune_flows(&mut inner.proxy_flows, Instant::now());
+        validate_session(&inner, &proxy_session)?;
+
+        let state = inner
+            .proxy_flows
+            .get_mut(&candidate)
+            .ok_or_else(|| proxy_error("redirected flow is no longer registered"))?;
+
+        if state.registration != expected_registration {
+            return Err(proxy_error("redirected flow changed during claim"));
+        }
+
+        if state.attribution_token.is_some() {
+            return Err(proxy_error("redirected flow is already claimed"));
+        }
+
+        let attribution_token = AttributionToken::try_new().map_err(proxy_error)?;
+        let now = Instant::now();
+        state.attribution_token = Some(attribution_token.clone());
+        state.connection_id = Some(connection_id);
+        state.claimed_at = Some(now);
+        state.last_check = now;
+
+        let policy_host = state.registration.policy_host().clone();
+        drop(inner);
+
+        Ok(agent_sandbox_core::FlowClaimReply {
+            ok: true,
+            attribution_token,
+            flow: candidate,
+            policy_host,
         })
     }
 
@@ -410,8 +500,8 @@ impl PolicyStore {
     /// original-destination, session, and attribution validation.
     ///
     /// A QUIC migration changes the client UDP path without changing the
-    /// association. The new tuple must resolve to a socket owned by the same
-    /// process identity, must keep the original destination, and must belong
+    /// association. The new tuple must have an unclaimed NFQ registration
+    /// with a live owner identity, keep the original destination, and belong
     /// to the same claimed association.
     ///
     /// # Errors
@@ -430,7 +520,7 @@ impl PolicyStore {
         connection_id: ProxyConnectionId,
         flow: NetworkFlowKey,
     ) -> Result<(), PolicydError> {
-        let (old_key, registration) = {
+        let (old_key, registration, pending_registration) = {
             let mut inner = self.inner.lock().await;
             prune_flows(&mut inner.proxy_flows, Instant::now());
             validate_session(&inner, &proxy_session)?;
@@ -461,31 +551,55 @@ impl PolicyStore {
                 return Err(proxy_error("rebind requires a new flow tuple"));
             }
 
-            let snapshot = (old_key.clone(), state.registration.clone());
+            let pending = inner
+                .proxy_flows
+                .get(&flow)
+                .ok_or_else(|| proxy_error("rebind flow is not registered"))?;
+
+            validate_rebind_candidate(state, pending)?;
+
+            let old_key = old_key.clone();
+            let registrations = (state.registration.clone(), pending.registration.clone());
             drop(inner);
-            snapshot
+            (old_key, registrations.0, registrations.1)
         };
 
-        let expected = registration.owner();
-        let new_owner = resolve_rebind_owner(&flow, expected, self.args.approval_timeout).await?;
+        let new_owner =
+            validate_registered_owner(pending_registration.owner(), self.args.approval_timeout)
+                .await?;
 
         let mut inner = self.inner.lock().await;
         validate_session(&inner, &proxy_session)?;
 
         let state = inner
             .proxy_flows
-            .get_mut(&old_key)
+            .get(&old_key)
             .ok_or_else(|| proxy_error("flow registration expired"))?;
 
-        if state.connection_id != Some(connection_id)
+        if state.registration != registration
+            || state.connection_id != Some(connection_id)
             || state.attribution_token.as_ref() != Some(&attribution_token)
         {
             return Err(proxy_error("flow claim changed during rebind"));
         }
 
-        if inner.proxy_flows.contains_key(&flow) {
-            return Err(proxy_error("rebind conflicts with an existing flow"));
+        let pending = inner
+            .proxy_flows
+            .get(&flow)
+            .ok_or_else(|| proxy_error("rebind flow is no longer registered"))?;
+
+        let old_owner = registration.owner();
+        let pending_owner = pending.registration.owner();
+
+        if !same_socket_owner(old_owner, pending_owner) {
+            return Err(proxy_error("socket owner changed"));
         }
+
+        if pending.attribution_token.is_some() || pending.registration != pending_registration {
+            return Err(proxy_error("rebind flow changed during validation"));
+        }
+
+        inner.proxy_flows.remove(&flow);
 
         let now = Instant::now();
         let state = inner
@@ -772,6 +886,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirected_flow_claim_returns_registered_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&dir);
+        let session = store
+            .open_proxy_session(1)
+            .await
+            .expect("open session")
+            .proxy_session;
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+        let source = socket.local_addr().expect("socket address");
+        let owner = test_udp_owner(source).await;
+        let flow = NetworkFlowKey::try_new(
+            FlowProtocol::Udp,
+            source.ip(),
+            source.port(),
+            "1.1.1.1".parse().expect("valid destination"),
+            443,
+        )
+        .expect("valid flow");
+        let registration = FlowRegistration::new(
+            flow.clone(),
+            owner,
+            NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+            FlowContext::default(),
+        );
+
+        store
+            .register_network_flow(registration)
+            .await
+            .expect("register flow");
+
+        let claim = store
+            .claim_network_flow_by_source(
+                session,
+                NetworkFlowSelector::new(
+                    FlowProtocol::Udp,
+                    source.ip(),
+                    source.port().try_into().expect("non-zero source port"),
+                    443.try_into().expect("non-zero destination port"),
+                ),
+                ProxyConnectionId::new(),
+            )
+            .await
+            .expect("claim redirected flow");
+
+        assert_eq!(claim.flow, flow);
+    }
+
+    #[tokio::test]
     async fn check_network_flow_requests_deferred_transport_approval_and_honors_cancellation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
@@ -785,13 +949,7 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
 
-        let owner = match resolve_owner_snapshot(
-            SocketProtocol::Udp,
-            SocketTuple::from_local(source.ip(), source.port()),
-        ) {
-            OwnerResolution::Unique(snapshot) => snapshot.identity(),
-            other => panic!("expected unique UDP owner, got {other:?}"),
-        };
+        let owner = test_udp_owner(source).await;
 
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
@@ -891,6 +1049,23 @@ mod tests {
         assert!(!canceled.allowed, "canceled check must be blocked");
     }
 
+    async fn test_udp_owner(source: std::net::SocketAddr) -> SocketIdentity {
+        for _ in 0..100 {
+            match resolve_owner_snapshot(
+                SocketProtocol::Udp,
+                SocketTuple::from_local(source.ip(), source.port()),
+            ) {
+                OwnerResolution::Unique(snapshot) => return snapshot.identity(),
+                OwnerResolution::Missing => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                OwnerResolution::Ambiguous => panic!("expected unique UDP owner"),
+            }
+        }
+
+        panic!("UDP owner did not become visible in procfs");
+    }
+
     /// Register and claim one real UDP association owned by this test process.
     async fn test_udp_association(
         store: &Arc<PolicyStore>,
@@ -904,13 +1079,7 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
 
-        let owner = match resolve_owner_snapshot(
-            SocketProtocol::Udp,
-            SocketTuple::from_local(source.ip(), source.port()),
-        ) {
-            OwnerResolution::Unique(snapshot) => snapshot.identity(),
-            other => panic!("expected unique UDP owner, got {other:?}"),
-        };
+        let owner = test_udp_owner(source).await;
 
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
@@ -1062,6 +1231,18 @@ mod tests {
         )
         .expect("valid migrated flow");
 
+        let migrated_owner = test_udp_owner(migrated_source).await;
+
+        store
+            .register_network_flow(FlowRegistration::new(
+                migrated_flow.clone(),
+                migrated_owner,
+                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                FlowContext::default(),
+            ))
+            .await
+            .expect("register migrated flow");
+
         store
             .rebind_network_flow(
                 session.clone(),
@@ -1193,6 +1374,16 @@ mod tests {
             443,
         )
         .expect("valid flow");
+
+        store
+            .register_network_flow(FlowRegistration::new(
+                vanished_flow.clone(),
+                test_owner(),
+                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                FlowContext::default(),
+            ))
+            .await
+            .expect("register vanished flow");
 
         let error = store
             .rebind_network_flow(session.clone(), token.clone(), connection_id, vanished_flow)
@@ -1360,13 +1551,7 @@ mod tests {
 
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
-        let owner = match resolve_owner_snapshot(
-            SocketProtocol::Udp,
-            SocketTuple::from_local(source.ip(), source.port()),
-        ) {
-            OwnerResolution::Unique(snapshot) => snapshot.identity(),
-            other => panic!("expected unique UDP owner, got {other:?}"),
-        };
+        let owner = test_udp_owner(source).await;
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             source.ip(),

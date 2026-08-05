@@ -1,7 +1,8 @@
 use agent_sandbox_core::{
     AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
-    ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
-    ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest, policy_rpc,
+    NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxyReply, ProxyReplyBody,
+    ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
+    RpcRequest, policy_rpc,
 };
 use std::{
     env, fs,
@@ -21,6 +22,8 @@ use std::{
 pub struct FlowClaim {
     pub attribution_token: AttributionToken,
     pub connection_id: ProxyConnectionId,
+    pub flow: NetworkFlowKey,
+    pub policy_host: NormalizedPolicyHost,
 }
 
 pub struct PolicySession {
@@ -164,15 +167,74 @@ impl PolicySession {
         if let RpcReply::FlowClaim(FlowClaimReply {
             ok: true,
             attribution_token,
+            flow,
+            policy_host,
         }) = reply
         {
             Ok(FlowClaim {
                 attribution_token,
                 connection_id,
+                flow,
+                policy_host,
             })
         } else {
             self.clear_session_ready();
             Err(PolicyError::UnexpectedReply("claim_network_flow"))
+        }
+    }
+
+    /// Claim one output-redirected UDP flow by its visible socket tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when policyd rejects or cannot uniquely identify the
+    /// registered flow.
+    pub async fn claim_udp_redirected(
+        &self,
+        source: SocketAddr,
+        destination_port: u16,
+    ) -> Result<FlowClaim, PolicyError> {
+        let source_port = NonZeroU16::new(source.port())
+            .ok_or_else(|| PolicyError::Rpc("source port must be non-zero".to_owned()))?;
+        let destination_port = NonZeroU16::new(destination_port)
+            .ok_or_else(|| PolicyError::Rpc("destination port must be non-zero".to_owned()))?;
+        let connection_id = ProxyConnectionId::new();
+        let reply = policy_rpc(
+            &self.socket,
+            RpcRequest::ClaimNetworkFlowBySource {
+                proxy_session: self.token.clone(),
+                selector: NetworkFlowSelector::new(
+                    FlowProtocol::Udp,
+                    source.ip(),
+                    source_port,
+                    destination_port,
+                ),
+                connection_id,
+            },
+            self.timeout,
+        )
+        .await
+        .map_err(|error| {
+            self.clear_session_ready();
+            PolicyError::Rpc(error.to_string())
+        })?;
+
+        if let RpcReply::FlowClaim(FlowClaimReply {
+            ok: true,
+            attribution_token,
+            flow,
+            policy_host,
+        }) = reply
+        {
+            Ok(FlowClaim {
+                attribution_token,
+                connection_id,
+                flow,
+                policy_host,
+            })
+        } else {
+            self.clear_session_ready();
+            Err(PolicyError::UnexpectedReply("claim_network_flow_by_source"))
         }
     }
 

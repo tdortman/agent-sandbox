@@ -1,6 +1,8 @@
 use super::{
     message::RpcMessage,
-    proxy::{AttributionToken, ProxyRequestId, ProxySessionToken},
+    proxy::{
+        AttributionToken, NetworkFlowKey, NormalizedPolicyHost, ProxyRequestId, ProxySessionToken,
+    },
     scope::ApprovalScope,
 };
 use crate::{
@@ -516,6 +518,8 @@ pub struct ProxySessionReply {
 pub struct FlowClaimReply {
     pub ok: bool,
     pub attribution_token: AttributionToken,
+    pub flow: NetworkFlowKey,
+    pub policy_host: NormalizedPolicyHost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,7 @@
 use agent_sandbox_core::{
-    AttributionToken, ErrorReply, FlowClaimReply, HttpCheckReply, HttpRequest, ProxyConnectionId,
-    ProxySessionReply, ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
+    AttributionToken, ErrorReply, FlowClaimReply, HttpCheckReply, HttpRequest, NetworkFlowKey,
+    NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxySessionReply,
+    ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
 use bytes::{Buf, Bytes};
 use nix::{
@@ -234,6 +235,7 @@ async fn handle_policy_operation(
             proxy_session: ProxySessionToken::from_bytes([1; 32]),
         })),
         "claim_network_flow" => Some(handle_claim(value, events, claim_errors)),
+        "claim_network_flow_by_source" => Some(handle_claim_by_source(value, events, claim_errors)),
         "rebind_network_flow" => Some(handle_rebind(value, events)),
         "check_http" => Some(handle_check(value, events, cancel_gate).await),
         "release_network_flow" => Some(handle_release(value, events)),
@@ -252,13 +254,38 @@ fn handle_claim(
     claim_errors: bool,
 ) -> RpcReply {
     let flow = parse_policy_field(value, "flow");
+    handle_claim_flow(value, flow, events, claim_errors)
+}
+
+fn handle_claim_by_source(
+    value: &serde_json::Value,
+    events: &Arc<Mutex<PolicyEvents>>,
+    claim_errors: bool,
+) -> RpcReply {
+    let selector: NetworkFlowSelector = parse_policy_field(value, "selector");
+    let flow = NetworkFlowKey::new(
+        selector.protocol(),
+        selector.source_ip(),
+        selector.source_port(),
+        selector.source_ip(),
+        selector.destination_port(),
+    );
+    handle_claim_flow(value, flow, events, claim_errors)
+}
+
+fn handle_claim_flow(
+    value: &serde_json::Value,
+    flow: NetworkFlowKey,
+    events: &Arc<Mutex<PolicyEvents>>,
+    claim_errors: bool,
+) -> RpcReply {
     let connection_id = parse_policy_field(value, "connection_id");
     events
         .lock()
         .expect("policy events lock")
         .claims
         .push(ClaimEvent {
-            flow,
+            flow: flow.clone(),
             connection_id,
         });
     if claim_errors {
@@ -267,6 +294,8 @@ fn handle_claim(
         RpcReply::FlowClaim(FlowClaimReply {
             ok: true,
             attribution_token: AttributionToken::from_bytes([2; 32]),
+            flow,
+            policy_host: NormalizedPolicyHost::parse("localhost").expect("valid policy host"),
         })
     }
 }
