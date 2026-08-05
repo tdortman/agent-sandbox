@@ -16,17 +16,17 @@ action="${12:-up}"
 
 ports='80,443,8008,8080,8443'
 
-# Space-separated list of intercepted UDP ports; empty means HTTP/3 is off.
+# Space- or comma-separated intercepted UDP ports; empty means HTTP/3 is off.
+udp_ports="${udp_ports//,/ }"
 read -r -a udp_port_array <<< "$udp_ports"
 
+udp_elements() {
+  [[ ${#udp_port_array[@]} -gt 0 ]] || return 1
+  printf '%s' "$(IFS=','; echo "${udp_port_array[*]}")"
+}
+
 udp_set() {
-  local elements=()
-  local port
-  for port in "${udp_port_array[@]}"; do
-    elements+=("$port")
-  done
-  [[ ${#elements[@]} -gt 0 ]] || return 1
-  printf '{ %s }' "$(IFS=','; echo "${elements[*]}")"
+  printf '{ %s }' "$(udp_elements)"
 }
 
 reject_rule() {
@@ -37,14 +37,22 @@ reject_rule() {
   fi
 }
 
+udp_mark_rule() {
+  [[ -n "$udp_ports" ]] || return 0
+  echo "udp dport $(udp_set) meta mark set $mark"
+}
+
 queue_rule() {
   [[ -n "$udp_ports" ]] || return 0
+
   # Queue only the first packet of each UDP flow. QUIC sends many datagrams
   # per flow (handshake, data, ACKs); checking every packet against policyd
-  # serialises the NFQUEUE at tens of milliseconds per packet. Established
-  # flows keep the kernel path and reach the proxy directly, so the policy
-  # check runs once per destination.
-  echo "udp dport $(udp_set) ct state new,untracked counter meta mark set $mark queue num $queue_number"
+  # serialises the NFQUEUE at tens of milliseconds per packet. After
+  # registration, marked UDP datagrams use the local route table instead of
+  # output NAT, preserving the original destination metadata for the proxy.
+
+  echo "udp dport $(udp_set) ct state new,untracked counter queue num $queue_number"
+
 }
 
 tproxy_rules() {
@@ -52,6 +60,17 @@ tproxy_rules() {
   local port
   for port in "${udp_port_array[@]}"; do
     echo "udp dport $port counter tproxy to :$port meta mark set $mark"
+  done
+}
+
+output_redirect_rules() {
+  [[ -n "$udp_ports" ]] || return 0
+  local port
+  for port in "${udp_port_array[@]}"; do
+    # Marked datagrams were accepted by NFQUEUE and already use the local
+    # route table; redirecting them would hide the original destination
+    # from the proxy. Only unmarked UDP falls back to the local redirect.
+    echo "udp dport $port meta mark != $mark counter redirect to :$port"
   done
 }
 
@@ -78,7 +97,7 @@ fail_closed() {
 
   local udp_reject="udp dport { 443, 853 } reject"
   if [[ -n "$udp_ports" ]]; then
-    udp_reject="udp dport { 853, $(udp_set) } reject"
+    udp_reject="udp dport { 853, $(udp_elements) } reject"
   fi
 
   nft -f - <<EOF
@@ -132,12 +151,11 @@ nft -f - <<EOF
    chain output {
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
-     # Queue before local TPROXY routing so the policy daemon sees the
-     # original sandbox socket tuple.
-     tcp dport 853 reject with tcp reset
-     $(reject_rule)
-     tcp dport { $ports } counter meta mark set $mark queue num $queue_number
-     $(queue_rule)
+    tcp dport 853 reject with tcp reset
+    $(reject_rule)
+    tcp dport { $ports } counter meta mark set $mark queue num $queue_number
+    $(queue_rule)
+    $(udp_mark_rule)
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
@@ -146,11 +164,13 @@ nft -f - <<EOF
      tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark
      $(tproxy_rules)
    }
-   chain output_redirect {
-     type nat hook output priority 5; policy accept;
-     meta skuid $proxy_uid return
-     tcp dport { $ports } redirect to :$listen_port
-   }
+
+  chain output_redirect {
+    type nat hook output priority 5; policy accept;
+    meta skuid $proxy_uid return
+    tcp dport { $ports } counter redirect to :$listen_port
+    $(output_redirect_rules)
+  }
  }
 EOF
 

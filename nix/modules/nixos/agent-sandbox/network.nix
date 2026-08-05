@@ -792,8 +792,16 @@ lib.mkIf policyEnabled (
                 proxyCidrsPath
                 "agent_sandbox_proxy"
               ]
-              ++ [ (toString (if runtime.httpProxy.http3.enable then runtime.httpProxy.http3.udpPort else 0)) ]
-              ++ [ "apply" ]
+              ++ [
+                (
+                  if runtime.httpProxy.http3.enable then
+                    lib.concatStringsSep "," (
+                      [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
+                    )
+                  else
+                    "0"
+                )
+              ]
             );
 
             ExecStopPost = lib.escapeShellArgs (
@@ -805,7 +813,16 @@ lib.mkIf policyEnabled (
                 proxyCidrsPath
                 "agent_sandbox_proxy"
               ]
-              ++ [ (toString (if runtime.httpProxy.http3.enable then runtime.httpProxy.http3.udpPort else 0)) ]
+              ++ [
+                (
+                  if runtime.httpProxy.http3.enable then
+                    lib.concatStringsSep "," (
+                      [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
+                    )
+                  else
+                    "0"
+                )
+              ]
               ++ [ "cleanup" ]
             );
 
@@ -913,12 +930,12 @@ lib.mkIf policyEnabled (
                 proxyReadyPath
                 nfqReadyPath
               ]
-              ++ lib.optionals runtime.httpProxy.http3.enable [
-                (lib.concatStringsSep " " (
-                  [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
-                ))
-              ]
               ++ [
+                (lib.optionalString runtime.httpProxy.http3.enable (
+                  lib.concatStringsSep " " (
+                    [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
+                  )
+                ))
                 "cleanup"
               ]
             );
