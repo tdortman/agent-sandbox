@@ -258,6 +258,7 @@ in
       exposeWorkingDirectory ? true,
       extraBwrapArgs ? [ ],
       extraPkgs ? [ ],
+      filesystemGate ? false,
       fsArmPkg ? null,
       hiddenPaths ? [ ],
       network ? null,
@@ -813,7 +814,17 @@ in
         inherit path;
         access = "read_write";
       }));
-      syscallArmPrefix = if syscallGate then "${syscallArmPkg}/bin/agent-sandbox-syscall-arm --" else "";
+      syscallArmPrefix =
+        if syscallGate then
+          lib.concatStringsSep " " (
+            [
+              "${syscallArmPkg}/bin/agent-sandbox-syscall-arm"
+            ]
+            ++ lib.optional filesystemGate "--filesystem"
+            ++ [ "--" ]
+          )
+        else
+          "";
       # Syscall gate: when wired, prepend `agent-sandbox-syscall-arm --` to
       # the entry chain. The arm helper installs a seccomp filter inside the
       # sandbox, then execs its argv tail. The chain is composable with the

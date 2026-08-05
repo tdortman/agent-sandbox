@@ -82,6 +82,20 @@ pub const AUDIT_ARCH_I686: u32 = 0x4000_0003;
 /// path. `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
 #[must_use]
 pub fn default_syscalls() -> BTreeSet<i64> {
+    syscalls(true)
+}
+
+/// Return the syscall set without filesystem mutation traps.
+///
+/// Filesystem mutations remain unmediated when the filesystem gate is
+/// disabled. The syscall gate must not route them to an empty filesystem
+/// policy in that configuration.
+#[must_use]
+pub fn syscalls_without_filesystem() -> BTreeSet<i64> {
+    syscalls(false)
+}
+
+fn syscalls(include_filesystem: bool) -> BTreeSet<i64> {
     let mut syscalls = BTreeSet::from([
         nr::CONNECT,
         nr::SENDTO,
@@ -96,11 +110,13 @@ pub fn default_syscalls() -> BTreeSet<i64> {
         nr::IO_URING_REGISTER,
     ]);
 
-    push_filesystem_mutation_syscalls(&mut syscalls);
+    if include_filesystem {
+        push_filesystem_mutation_syscalls(&mut syscalls);
+    }
+
     syscalls
 }
 
-/// Extend `syscalls` with filesystem mutation traps when `libc` exposes them.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn push_filesystem_mutation_syscalls(syscalls: &mut BTreeSet<i64>) {
     use nr::{
@@ -121,7 +137,7 @@ fn push_filesystem_mutation_syscalls(_syscalls: &mut BTreeSet<i64>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{default_syscalls, nr};
+    use super::{default_syscalls, nr, syscalls_without_filesystem};
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -151,7 +167,6 @@ mod tests {
 
         // Filesystem mutation set (broker policy-gates via CheckFilesystem).
         assert!(syscalls.contains(&nr::RENAME));
-
         assert!(syscalls.contains(&nr::RENAMEAT));
         assert!(syscalls.contains(&nr::RENAMEAT2));
         assert!(syscalls.contains(&nr::LINK));
@@ -209,6 +224,31 @@ mod tests {
         assert!(!syscalls.contains(&libc::SYS_socketpair));
         assert!(!syscalls.contains(&libc::SYS_clone3));
         assert!(!syscalls.contains(&libc::SYS_unshare));
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn syscalls_without_filesystem_excludes_mutation_syscalls() {
+        let syscalls = syscalls_without_filesystem();
+
+        for nr in [
+            nr::RENAME,
+            nr::RENAMEAT,
+            nr::RENAMEAT2,
+            nr::LINK,
+            nr::LINKAT,
+            nr::SYMLINK,
+            nr::SYMLINKAT,
+            nr::UNLINK,
+            nr::UNLINKAT,
+            nr::TRUNCATE,
+            nr::FTRUNCATE,
+        ] {
+            assert!(
+                !syscalls.contains(&nr),
+                "filesystem mutation syscall {nr} must not be trapped"
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

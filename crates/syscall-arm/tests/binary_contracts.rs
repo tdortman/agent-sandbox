@@ -12,7 +12,8 @@ fn help_describes_forwarded_command_without_installing_filter() {
     let output = run(&["--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage: agent-sandbox-syscall-arm [COMMAND]..."));
+    assert!(stdout.contains("Usage: agent-sandbox-syscall-arm [OPTIONS] [COMMAND]..."));
+    assert!(stdout.contains("--filesystem"));
     assert!(stdout.contains("Everything after the flags is forwarded verbatim"));
     assert!(stdout.contains("AGENT_SANDBOX_POLICY_SOCKET"));
 }

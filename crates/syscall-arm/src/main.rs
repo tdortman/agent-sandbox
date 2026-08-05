@@ -1,4 +1,4 @@
-use agent_sandbox_syscall::{build_filter, default_syscalls};
+use agent_sandbox_syscall::{build_filter, default_syscalls, syscalls_without_filesystem};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
 use nix::{
@@ -38,12 +38,17 @@ fn cstring(bytes: &[u8]) -> CString {
     })
 }
 
-fn install_filter() -> OwnedFd {
+fn install_filter(include_filesystem: bool) -> OwnedFd {
     set_no_new_privs()
         .map_err(|_| ())
         .unwrap_or_else(|()| die("prctl PR_SET_NO_NEW_PRIVS failed"));
 
-    let filter = build_filter(&default_syscalls());
+    let syscalls = if include_filesystem {
+        default_syscalls()
+    } else {
+        syscalls_without_filesystem()
+    };
+    let filter = build_filter(&syscalls);
 
     // `seccompiler::BpfProgram` is `Vec<seccompiler::sock_filter>`. The
     // seccomp syscall takes a `*mut libc::sock_filter`, both struct types
@@ -172,6 +177,10 @@ agent-sandbox-syscall-arm /usr/bin/python3 -i
 agent-sandbox-syscall-arm /home/user/bin/my-agent --flag"
 )]
 struct Cli {
+    /// Trap filesystem mutation syscalls for the filesystem policy gate.
+    #[arg(long)]
+    filesystem: bool,
+
     /// The command to exec after the seccomp filter is installed. Everything
     /// after the flags is forwarded verbatim to execvp, including values that
     /// look like flags. A `--` separator is accepted but not required.
@@ -185,6 +194,7 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+    let include_filesystem = cli.filesystem;
     let command = cli.command;
 
     if command.is_empty() {
@@ -206,7 +216,7 @@ fn main() {
             // SIGSTOP so the parent can re-acquire the listener fd via
             // pidfd_getfd before the command execs, then exec.
             drop(read_end);
-            let listener_fd = install_filter();
+            let listener_fd = install_filter(include_filesystem);
             write_listener_fd(write_end, listener_fd.as_raw_fd());
             raise(Signal::SIGSTOP)
                 .map_err(|_| ())

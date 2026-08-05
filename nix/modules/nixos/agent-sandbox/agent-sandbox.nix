@@ -299,6 +299,7 @@ let
           ;
 
         dbusProxyPkg = policyPkg;
+        filesystemGate = cfg.gates.filesystem.enable;
         sudoGuard = sudoGuardPkg;
       }
       // lib.optionalAttrs cfg.gates.filesystem.enable {
