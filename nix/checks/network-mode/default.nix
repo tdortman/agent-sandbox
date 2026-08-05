@@ -333,6 +333,16 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "TPROXY route must queue TCP service ports for policy attribution"
   grep -F -q -- 'tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark' ${proxyTproxyRouteSource} \
     || fail "TPROXY route must redirect transparent TCP flows"
+  grep -F -q -- 'echo "udp dport $(udp_set) meta mark set $mark"' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must mark configured UDP flows"
+  grep -F -q -- 'udp_reject="udp dport { 853, $(udp_elements) } reject"' ${proxyTproxyRouteSource} \
+    || fail "TPROXY fail-closed UDP reject must flatten configured proxy ports"
+  grep -F -q -- '++ [ "cleanup" ]' ${networkModuleSource} \
+    || fail "proxy firewall service must remove its rules on stop"
+  grep -F -q -- 'meta skuid $proxy_uid return' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must exclude proxy-owned output"
+  grep -F -q -- 'ip route replace local 0.0.0.0/0 dev lo table "$route_table"' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must preserve the UDP local route table"
   if grep -F -q -- 'oifname "lo" accept' ${proxyFirewallSource}; then
     fail "proxy firewall must not allow unrestricted loopback egress"
   fi

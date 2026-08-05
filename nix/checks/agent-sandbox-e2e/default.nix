@@ -360,25 +360,6 @@ let
 
           network = {
             enable = true;
-
-            declarativeAllow = [
-              {
-                host = "169.254.100.1";
-                port = 443;
-              }
-              {
-                host = "fd00:dead:beef::1";
-                port = 443;
-              }
-            ];
-
-            declarativeDeny = [
-              {
-                host = "denied.test";
-                port = 443;
-              }
-            ];
-
             dnsForwardTarget = "169.254.100.1:5353";
 
             httpProxy = {
@@ -405,11 +386,11 @@ let
                 }
                 {
                   methods = [ "GET" ];
-                  url = "https://169.254.100.1:443/allowed";
+                  url = "https://h3-allowed.test:443/allowed";
                 }
                 {
                   methods = [ "GET" ];
-                  url = "https://[fd00:dead:beef::1]:443/allowed";
+                  url = "https://h3-allowed-v6.test:443/allowed";
                 }
                 {
                   allMethods = true;
@@ -436,7 +417,7 @@ let
                 }
                 {
                   allMethods = true;
-                  url = "https://169.254.100.1:443/denied";
+                  url = "https://h3-denied.test:443/denied";
                 }
               ];
 
@@ -494,6 +475,9 @@ let
                 "--user=sandbox"
                 "--address=/allowed.test/169.254.100.1"
                 "--address=/denied.test/169.254.100.1"
+                "--address=/h3-allowed.test/169.254.100.1"
+                "--address=/h3-allowed-v6.test/fd00:dead:beef::1"
+                "--address=/h3-denied.test/169.254.100.1"
               ];
 
               Restart = "on-failure";
@@ -520,7 +504,7 @@ let
                 "--private-key"
                 "${tlsFixture}/server-key.pem"
                 "--alt-svc"
-                "h3=\":4444\"; persist=1"
+                "h3=\"169.254.100.1:4444\"; persist=1"
                 "--log"
                 "/var/log/h3-origin.log"
               ];
@@ -641,7 +625,7 @@ let
         basicConstraints=critical,CA:false
         keyUsage=critical,digitalSignature,keyEncipherment
         extendedKeyUsage=serverAuth
-        subjectAltName=IP:169.254.100.1,IP:fd00:dead:beef::1
+        subjectAltName=IP:169.254.100.1,IP:fd00:dead:beef::1,DNS:h3-allowed.test,DNS:h3-allowed-v6.test,DNS:h3-denied.test
         EOF
 
         openssl x509 -req -sha256 -days 3650 \
@@ -1252,41 +1236,40 @@ let
       )
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "-X", "POST", "https://169.254.100.1:8443/allowed", wrapper=session_wrapper, expect_success=False)
       sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "https://169.254.100.1:8443/unlisted", wrapper=session_wrapper, expect_success=False)
-      # Raw UDP to the intercepted port passes the transport check and
-      # egresses directly; the HTTP/3 origin ignores non-QUIC datagrams, so
-      # the client never gets a reply.
-      sandbox_shell(
-          proxy,
-          "sandbox-proxy-bash",
-          "printf blocked | timeout 3 socat - UDP4:169.254.100.1:443 | grep -q blocked",
-          wrapper=session_wrapper,
-          expect_success=False,
-      )
 
-      # HTTP/3: the kernel cannot redirect locally generated UDP output to the
-      # proxy (tproxy only runs in prerouting), so the first packet of each
-      # UDP flow is checked against transport policy and approved flows egress
-      # directly. Allow over IPv4 and IPv6, deny by host.
+      # HTTP/3 policy is enforced per decoded request over IPv4 and IPv6.
       proxy.wait_for_unit("agent-sandbox-vm-h3-http.service", timeout=120)
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
-          "curl --http3-only --fail --silent --show-error --max-time 15 https://169.254.100.1:443/allowed | grep -q allowed-get",
+          "python3 -c 'import socket; assert socket.getaddrinfo(\"h3-allowed.test\", 443); assert socket.getaddrinfo(\"h3-allowed-v6.test\", 443)'",
           wrapper=session_wrapper,
       )
+      proxy.succeed("set +e; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} reset counters table inet agent_sandbox_proxy_tproxy; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get' >/tmp/h3-allowed.log 2>&1; status=$?; cat /tmp/h3-allowed.log; ip netns exec agent-sandbox ip route get 169.254.100.1 mark 51820; ip netns exec agent-sandbox cat /proc/net/udp /proc/net/udp6; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy; test $status -eq 0")
       sandbox_shell(
           proxy,
           "sandbox-proxy-bash",
-          "curl --http3-only --fail --silent --show-error --max-time 15 'https://[fd00:dead:beef::1]:443/allowed' | grep -q allowed-get",
+          "curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed-v6.test:443/allowed | grep -q allowed-get",
           wrapper=session_wrapper,
       )
-      sandbox_shell(
-          proxy,
-          "sandbox-proxy-bash",
-          "curl --http3-only --fail --silent --show-error --max-time 15 https://denied.test:443/denied",
-          wrapper=session_wrapper,
-          expect_success=False,
+      # Raw or invalid UDP on intercepted HTTP/3 ports is rejected by the
+      # proxy instead of egressing directly to the origin.
+      proxy.succeed("before=$(grep -c '^datagram ' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'printf blocked | timeout 3 socat - UDP4:169.254.100.1:443 | grep -q blocked' >/tmp/h3-raw-udp.log 2>&1; status=$?; set -e; cat /tmp/h3-raw-udp.log; sleep 1; after=$(grep -c '^datagram ' /var/log/h3-origin.log || true); test $status -ne 0; test \"$before\" = \"$after\"")
+
+      proxy.succeed("before=$(grep -c '^datagram ' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'printf blocked | timeout 3 socat - UDP4:169.254.100.1:4444 | grep -q blocked' >/tmp/h3-raw-alt-udp.log 2>&1; status=$?; set -e; cat /tmp/h3-raw-alt-udp.log; sleep 1; after=$(grep -c '^datagram ' /var/log/h3-origin.log || true); test $status -ne 0; test \"$before\" = \"$after\"")
+
+      print(
+          sandbox_shell(
+              proxy,
+              "sandbox-proxy-bash",
+              "alt_svc=/tmp/h3-alt-svc-$$.cache; curl --http3-only --alt-svc \"$alt_svc\" --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get && cat \"$alt_svc\" && test -s \"$alt_svc\" && curl --http3 --alt-svc \"$alt_svc\" --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get",
+              wrapper=session_wrapper,
+          )
       )
+      proxy.succeed("journalctl --no-pager -b -u agent-sandbox-proxy.service | grep -F -q 'attributed alternative QUIC endpoint'")
+
+      proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -ne 0; test \"$before\" = \"$after\"")
+
 
       # DoH: the proxy rewrites the advertised ECH configuration with its
       # own, and rejects DNSSEC-bearing responses instead of rewriting them.
