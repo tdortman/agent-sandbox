@@ -109,6 +109,7 @@ struct SessionOpenContext<'a> {
     state: &'a Http3State,
     scheme: &'a str,
     authority: &'a str,
+    destination: Option<SocketAddr>,
     sessions: &'a SessionRegistry,
     pending_webtransport: &'a PendingWebTransportSessions,
 }
@@ -501,15 +502,22 @@ async fn serve_incoming(
         (None, None)
     };
 
-    let flow = crate::policy::udp_flow_key(source, destination_address)?;
-
-    let claim = match state.policy.claim(flow).await {
+    let claim = match state
+        .policy
+        .claim_udp_redirected(source, destination_address.port())
+        .await
+    {
         Ok(claim) => claim,
         Err(error) => {
             incoming.refuse();
             return Err(error.into());
         }
     };
+
+    let destination_address = SocketAddr::new(
+        claim.flow.destination_ip(),
+        claim.flow.destination_port().get(),
+    );
 
     info!(
         %source,
@@ -550,6 +558,7 @@ async fn serve_incoming(
 struct H3RequestContext {
     state: Arc<Http3State>,
     claim: FlowClaim,
+    destination: SocketAddr,
     origin_port: Option<u16>,
     origin_authority: Option<String>,
     sessions: Arc<SessionRegistry>,
@@ -561,12 +570,14 @@ struct H3RequestContext {
 fn new_h3_request_context(
     state: Arc<Http3State>,
     claim: FlowClaim,
+    destination: SocketAddr,
     origin_port: Option<u16>,
     origin_authority: Option<String>,
 ) -> H3RequestContext {
     H3RequestContext {
         state,
         claim,
+        destination,
         origin_port,
         origin_authority,
         sessions: Arc::new(SessionRegistry::default()),
@@ -580,10 +591,28 @@ fn new_h3_request_context(
 struct Http3RequestContext {
     state: Arc<Http3State>,
     claim: FlowClaim,
+    destination: SocketAddr,
+    upstream_destination: Option<SocketAddr>,
     origin_port: Option<u16>,
     origin_authority: Option<String>,
     sessions: Arc<SessionRegistry>,
     pending_webtransport: PendingWebTransportSessions,
+}
+
+/// Resolve the transport address for the upstream connection.
+///
+/// Primary flows route to the claimed destination. Alternative flows route
+/// to the alternative's address (the origin's own address) with the recorded
+/// origin port; the origin authority still supplies the TLS identity.
+fn upstream_destination_for(
+    origin_authority: Option<&str>,
+    origin_port: Option<u16>,
+    destination: SocketAddr,
+) -> Option<SocketAddr> {
+    match origin_authority {
+        Some(_) => origin_port.map(|port| SocketAddr::new(destination.ip(), port)),
+        None => Some(destination),
+    }
 }
 
 impl H3RequestContext {
@@ -627,6 +656,12 @@ impl H3RequestContext {
         let request_context = Http3RequestContext {
             state: self.state.clone(),
             claim: self.claim.clone(),
+            destination: self.destination,
+            upstream_destination: upstream_destination_for(
+                self.origin_authority.as_deref(),
+                self.origin_port,
+                self.destination,
+            ),
             origin_port: self.origin_port,
             origin_authority: self.origin_authority.clone(),
             sessions: self.sessions.clone(),
@@ -695,6 +730,12 @@ fn queue_webtransport_preparation(
     let request_context = Http3RequestContext {
         state: request_context.state.clone(),
         claim: request_context.claim.clone(),
+        destination: request_context.destination,
+        upstream_destination: upstream_destination_for(
+            request_context.origin_authority.as_deref(),
+            request_context.origin_port,
+            request_context.destination,
+        ),
         origin_port: request_context.origin_port,
         origin_authority: request_context.origin_authority.clone(),
         sessions: request_context.sessions.clone(),
@@ -748,7 +789,8 @@ async fn serve_h3_connection(
     let mut h3 = build_h3_server(&connection).await?;
 
     let mut bound_source = source;
-    let mut request_context = new_h3_request_context(state, claim, origin_port, origin_authority);
+    let mut request_context =
+        new_h3_request_context(state, claim, destination, origin_port, origin_authority);
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedRequest>();
     let (webtransport_tx, mut webtransport_rx) = mpsc::unbounded_channel::<WebTransportPrep>();
     let mut webtransport_pending = false;
@@ -1258,10 +1300,11 @@ async fn prepare_webtransport(
         claim,
         origin_port,
         origin_authority,
+        upstream_destination,
         sessions,
         pending_webtransport,
+        ..
     } = context;
-
     let (semantic, normalized, downstream_stream) = approve_webtransport_request(
         request,
         stream,
@@ -1303,6 +1346,7 @@ async fn prepare_webtransport(
             state: &state,
             scheme: upstream_url.scheme(),
             authority: &upstream_authority,
+            destination: upstream_destination,
             sessions: &sessions,
             pending_webtransport: &pending_webtransport,
         },
@@ -1616,7 +1660,9 @@ impl WebTransportAssociation {
                 }
                 Some(resolved) = self.resolved_rx.recv() => match resolved {
                     Ok((request, stream)) => {
-                        if let Err(error) = self.handle_request(request, stream).await {
+                        if let Err(error) =
+                            Box::pin(self.handle_request(request, stream)).await
+                        {
                             warn!(%error, "WebTransport request rejected");
                         }
                     }
@@ -1720,7 +1766,7 @@ impl WebTransportAssociation {
                 self.tasks.push(task);
             }
             h3_webtransport::server::AcceptedBi::Request(request, stream) => {
-                if let Err(error) = self.handle_request(request, stream).await {
+                if let Err(error) = Box::pin(self.handle_request(request, stream)).await {
                     warn!(%error, "WebTransport request rejected");
                 }
             }
@@ -1793,6 +1839,12 @@ impl WebTransportAssociation {
         let request_context = Http3RequestContext {
             state: self.state.clone(),
             claim: self.claim.clone(),
+            destination: self.destination,
+            upstream_destination: upstream_destination_for(
+                self.origin_authority.as_deref(),
+                self.origin_port,
+                self.destination,
+            ),
             origin_port: self.origin_port,
             origin_authority: self.origin_authority.clone(),
             sessions: self.sessions.clone(),
@@ -1838,6 +1890,12 @@ impl WebTransportAssociation {
         } = prepare_webtransport(&request, stream, Http3RequestContext {
             state: self.state.clone(),
             claim: self.claim.clone(),
+            destination: self.destination,
+            upstream_destination: upstream_destination_for(
+                self.origin_authority.as_deref(),
+                self.origin_port,
+                self.destination,
+            ),
             origin_port: self.origin_port,
             origin_authority: self.origin_authority.clone(),
             sessions: self.sessions.clone(),
@@ -2364,6 +2422,8 @@ async fn serve_request(
     let Http3RequestContext {
         state,
         claim,
+        destination,
+        upstream_destination,
         origin_port,
         origin_authority,
         sessions,
@@ -2396,16 +2456,55 @@ async fn serve_request(
         return Err(error);
     }
 
+    let normalized = authorize_request(
+        &request,
+        &semantic,
+        &state,
+        &claim,
+        &sessions,
+        requested_protocol,
+    )
+    .await?;
+    let Some(normalized) = normalized else {
+        let mut stream = stream;
+        stream.stop_sending(Code::H3_REQUEST_REJECTED);
+        stream.stop_stream(Code::H3_REQUEST_REJECTED);
+        return Ok(());
+    };
+    let datagrams = if requested_protocol == Some(SessionProtocol::ConnectUdp) {
+        datagrams
+    } else {
+        None
+    };
+    let relay_context = Http3RequestContext {
+        state,
+        claim,
+        destination,
+        upstream_destination,
+        origin_port,
+        origin_authority,
+        sessions,
+        pending_webtransport,
+    };
+    relay_request(stream, semantic, normalized, relay_context, datagrams).await
+}
+
+async fn authorize_request(
+    request: &http::Request<()>,
+    semantic: &SemanticRequest,
+    state: &Http3State,
+    claim: &FlowClaim,
+    sessions: &SessionRegistry,
+    requested_protocol: Option<SessionProtocol>,
+) -> Result<Option<agent_sandbox_core::HttpRequest>, BoxError> {
     let reused = if let Some(protocol) = requested_protocol {
         sessions
-            .approved(&semantic, protocol, claim.attribution_token.clone())
+            .approved(semantic, protocol, claim.attribution_token.clone())
             .await
     } else {
         None
     };
-    let normalized = if let Some(normalized) = reused {
-        normalized
-    } else {
+    let Some(reused) = reused else {
         let request_id = ProxyRequestId::new();
         let _permit = state
             .active_checks
@@ -2414,7 +2513,6 @@ async fn serve_request(
             .map_err(|_| boxed("too many active policy checks"))?;
 
         let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
-
         let check = tokio::select! {
             result = state.policy.check_http(
                 request_id,
@@ -2427,7 +2525,6 @@ async fn serve_request(
                 return Err(boxed("proxy shutting down"));
             }
         };
-
         pending.disarm();
 
         let HttpCheckReply {
@@ -2442,28 +2539,12 @@ async fn serve_request(
                 url = %semantic.forwarding_target(),
                 "downstream HTTP/3 request denied by policy"
             );
-
-            let mut stream = stream;
-            stream.stop_sending(Code::H3_REQUEST_REJECTED);
-            stream.stop_stream(Code::H3_REQUEST_REJECTED);
-            return Ok(());
+            return Ok(None);
         };
-        normalized
+        return Ok(Some(normalized));
     };
-    let datagrams = if requested_protocol == Some(SessionProtocol::ConnectUdp) {
-        datagrams
-    } else {
-        None
-    };
-    let relay_context = Http3RequestContext {
-        state,
-        claim,
-        origin_port,
-        origin_authority,
-        sessions,
-        pending_webtransport,
-    };
-    relay_request(stream, semantic, normalized, relay_context, datagrams).await
+
+    Ok(Some(reused))
 }
 
 fn semantic_request(
@@ -2592,13 +2673,6 @@ async fn relay_request(
     context: Http3RequestContext,
     datagrams: Option<DatagramRelay>,
 ) -> Result<(), BoxError> {
-    let Http3RequestContext {
-        state,
-        claim,
-        sessions,
-        pending_webtransport,
-        ..
-    } = context;
     let downstream_stream_id = stream.id();
     let RelayRequestOpen {
         upstream,
@@ -2608,16 +2682,17 @@ async fn relay_request(
         key,
         protocol,
     } = open_relay_request(
-        &state,
+        &context.state,
         &semantic,
         &normalized,
-        &claim,
-        &sessions,
+        &context,
         downstream_stream_id,
-        &pending_webtransport,
     )
     .await?;
 
+    let Http3RequestContext {
+        state, sessions, ..
+    } = context;
     let alt_svc = state.alt_svc.clone();
     let origin = semantic.authority().to_owned();
     let upstream_stream_id = request_stream.id();
@@ -2697,11 +2772,13 @@ async fn open_relay_request(
     state: &Http3State,
     semantic: &SemanticRequest,
     normalized: &agent_sandbox_core::HttpRequest,
-    claim: &FlowClaim,
-    sessions: &SessionRegistry,
+    context: &Http3RequestContext,
     downstream_stream_id: StreamId,
-    pending_webtransport: &PendingWebTransportSessions,
 ) -> Result<RelayRequestOpen, BoxError> {
+    let claim = &context.claim;
+    let destination = context.upstream_destination;
+    let sessions = &context.sessions;
+    let pending_webtransport = &context.pending_webtransport;
     let upstream_url = url::Url::parse(&normalized.url.to_string())?;
     let upstream_host = upstream_url
         .host_str()
@@ -2739,6 +2816,7 @@ async fn open_relay_request(
                 state,
                 scheme: upstream_url.scheme(),
                 authority: &upstream_authority,
+                destination,
                 sessions,
                 pending_webtransport,
             },
@@ -2771,6 +2849,7 @@ async fn open_relay_request(
                 state,
                 upstream_url.scheme(),
                 &upstream_authority,
+                destination,
                 None,
                 claim.attribution_token.clone(),
             )
@@ -2793,16 +2872,30 @@ async fn connect_upstream_for_request(
     state: &Http3State,
     scheme: &str,
     authority: &str,
+    destination: Option<SocketAddr>,
     protocol: Option<SessionProtocol>,
     security_context: AttributionToken,
 ) -> Result<Arc<crate::http3::upstream::UpstreamConnection>, BoxError> {
-    let upstream = if protocol.is_some() {
-        state.upstream.connect_dedicated(scheme, authority).await?
-    } else {
-        state
-            .upstream
-            .connect(scheme, authority, security_context)
-            .await?
+    let upstream = match (protocol.is_some(), destination) {
+        (true, Some(destination)) => {
+            state
+                .upstream
+                .connect_dedicated_to(scheme, authority, destination)
+                .await?
+        }
+        (true, None) => state.upstream.connect_dedicated(scheme, authority).await?,
+        (false, Some(destination)) => {
+            state
+                .upstream
+                .connect_to(scheme, authority, destination, security_context)
+                .await?
+        }
+        (false, None) => {
+            state
+                .upstream
+                .connect(scheme, authority, security_context)
+                .await?
+        }
     };
 
     if let Some(protocol) = protocol {
@@ -2821,6 +2914,7 @@ async fn open_session_request(
     let state = context.state;
     let scheme = context.scheme;
     let authority = context.authority;
+    let destination = context.destination;
     let sessions = context.sessions;
     let pending_webtransport = context.pending_webtransport;
     let mut last_error = None;
@@ -2832,6 +2926,7 @@ async fn open_session_request(
             state,
             scheme,
             authority,
+            destination,
             Some(key.protocol),
             key.attribution.clone(),
         )

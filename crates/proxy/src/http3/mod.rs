@@ -255,10 +255,22 @@ impl rustls::server::ResolvesServerCert for SandboxCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let server_name = client_hello.server_name().unwrap_or(&self.fallback_name);
 
-        let issued = self.issuer.issue(server_name).ok()?;
+        let issued = match self.issuer.issue(server_name) {
+            Ok(issued) => issued,
+            Err(error) => {
+                tracing::warn!(server_name, %error, "HTTP/3 downstream certificate issue failed");
+                return None;
+            }
+        };
 
-        let signing_key =
-            rustls::crypto::ring::sign::any_supported_type(&issued.private_key).ok()?;
+        let signing_key = match rustls::crypto::ring::sign::any_supported_type(&issued.private_key)
+        {
+            Ok(signing_key) => signing_key,
+            Err(error) => {
+                tracing::warn!(server_name, ?error, "HTTP/3 downstream signing key failed");
+                return None;
+            }
+        };
 
         let key = rustls::sign::CertifiedKey::new(issued.certificate_chain.clone(), signing_key);
 

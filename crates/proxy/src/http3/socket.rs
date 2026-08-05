@@ -59,9 +59,11 @@ impl TransparentUdpSocket {
         if address.is_ipv6() {
             socket.set_ip_transparent_v6(transparent)?;
             socket.set_only_v6(true)?;
+            setsockopt(&socket, sockopt::Ipv6RecvPacketInfo, &transparent)?;
             setsockopt(&socket, sockopt::Ipv6OrigDstAddr, &transparent)?;
         } else {
             socket.set_ip_transparent_v4(transparent)?;
+            setsockopt(&socket, sockopt::Ipv4PacketInfo, &transparent)?;
             setsockopt(&socket, sockopt::Ipv4OrigDstAddr, &transparent)?;
         }
 
@@ -103,17 +105,36 @@ impl TransparentUdpSocket {
                 .or_else(|| address.as_sockaddr_in6().copied().map(SocketAddr::from))
         });
 
-        let original_destination = message.cmsgs().ok().and_then(|mut cmsgs| {
-            cmsgs.find_map(|cmsg| match cmsg {
-                ControlMessageOwned::Ipv4OrigDstAddr(address) => Some(IpAddr::V4(Ipv4Addr::from(
-                    u32::from_be(address.sin_addr.s_addr),
-                ))),
-                ControlMessageOwned::Ipv6OrigDstAddr(address) => {
-                    Some(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)))
+        let mut original_destination = None;
+        let mut packet_destination = None;
+
+        if let Ok(cmsgs) = message.cmsgs() {
+            for cmsg in cmsgs {
+                match cmsg {
+                    ControlMessageOwned::Ipv4OrigDstAddr(address) => {
+                        original_destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            address.sin_addr.s_addr,
+                        ))));
+                    }
+                    ControlMessageOwned::Ipv6OrigDstAddr(address) => {
+                        original_destination =
+                            Some(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)));
+                    }
+                    ControlMessageOwned::Ipv4PacketInfo(info) => {
+                        packet_destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            info.ipi_addr.s_addr,
+                        ))));
+                    }
+                    ControlMessageOwned::Ipv6PacketInfo(info) => {
+                        packet_destination =
+                            Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
+                    }
+                    _ => {}
                 }
-                _ => None,
-            })
-        });
+            }
+        }
+
+        let original_destination = original_destination.or(packet_destination);
 
         Ok(Some((message.bytes, source, original_destination)))
     }

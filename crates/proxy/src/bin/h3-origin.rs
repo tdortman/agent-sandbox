@@ -1,9 +1,8 @@
 //! Controllable HTTP/3 origin for the transparent proxy harness.
 //!
-//! The origin speaks HTTP/3 over QUIC and records one line per request and
-//! connection event to a log file, so harness tests can observe upstream
-//! attempts, request heads, and upstream association release without
-//! instrumenting the proxy.
+//! The origin speaks HTTP/3 over QUIC and records one line per request,
+//! connection event, and received UDP datagram to a log file. Harness tests
+//! can observe upstream attempts without instrumenting the proxy.
 //!
 //! The `/stream` path sends one chunk, then waits until the gate file
 //! exists before sending the rest. This gives deterministic streaming
@@ -15,14 +14,132 @@ use h3::quic::{SendStream as _, SendStreamUnframed as _};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use rustls::pki_types::pem::PemObject;
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
+use tokio::io::unix::AsyncFd;
+
+#[derive(Debug)]
+struct LoggedUdpSocket {
+    inner: Arc<AsyncFd<std::net::UdpSocket>>,
+    bound: SocketAddr,
+    log: Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+impl LoggedUdpSocket {
+    fn new(
+        socket: std::net::UdpSocket,
+        bound: SocketAddr,
+        log: Arc<std::sync::Mutex<std::fs::File>>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(AsyncFd::new(socket)?),
+            bound,
+            log,
+        })
+    }
+
+    fn recv_one(&self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        match self.inner.get_ref().recv_from(buffer) {
+            Ok((length, source)) => {
+                log_line(&self.log, &format!("datagram {length}"));
+                Ok(Some((length, source)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoggedUdpPoller {
+    inner: Arc<AsyncFd<std::net::UdpSocket>>,
+}
+
+impl quinn::UdpPoller for LoggedUdpPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner
+            .poll_write_ready(cx)
+            .map(|result| result.map(|_| ()))
+    }
+}
+
+impl quinn::AsyncUdpSocket for LoggedUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Box::pin(LoggedUdpPoller {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        self.inner
+            .get_ref()
+            .send_to(transmit.contents, transmit.destination)
+            .map(|_| ())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        metas: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let Some(buffer) = bufs.first_mut() else {
+            return Poll::Ready(Ok(0));
+        };
+
+        let Some(meta) = metas.first_mut() else {
+            return Poll::Ready(Err(io::Error::other(
+                "quinn supplied no receive metadata slot",
+            )));
+        };
+
+        loop {
+            let mut guard = match self.inner.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            };
+
+            match self.recv_one(buffer) {
+                Ok(Some((length, source))) => {
+                    meta.addr = source;
+                    meta.len = length;
+                    meta.stride = length;
+                    meta.ecn = None;
+                    meta.dst_ip = None;
+                    return Poll::Ready(Ok(1));
+                }
+                Ok(None) => guard.clear_ready(),
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.bound)
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "h3-origin")]
@@ -90,7 +207,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let bind_address = SocketAddr::new(args.address, args.port);
 
-    let endpoint = quinn::Endpoint::server(server_config, bind_address)?;
+    let socket = std::net::UdpSocket::bind(bind_address)?;
+    socket.set_nonblocking(true)?;
+    let bound = socket.local_addr()?;
+    let socket = Arc::new(LoggedUdpSocket::new(socket, bound, log.clone())?);
+
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     let address = endpoint.local_addr()?;
     log_line(&log, &format!("listening {address}"));
 

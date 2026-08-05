@@ -1,10 +1,10 @@
 //! Upstream HTTP/3 client connections for the proxy's QUIC backend.
 //!
 //! Upstream associations are separate from the downstream associations the
-//! proxy terminates. They are pooled by origin authority and policy context,
-//! then closed when the peer goes away or the idle timeout expires, so
-//! ownership of an upstream association is released after its exchange
-//! completes.
+//! proxy terminates. They are pooled by origin authority, transport address,
+//! and policy context, then closed when the peer goes away or the idle timeout
+//! expires, so ownership of an upstream association is released after its
+//! exchange completes.
 //!
 //! Each origin's TLS configuration carries the verified upstream ECH
 //! configuration when its DNS zone advertises one; origins without ECH keep
@@ -40,7 +40,7 @@ pub(crate) type IncomingWebTransportReceiver =
     tokio::sync::mpsc::Receiver<IncomingWebTransportStream>;
 
 type IncomingWebTransportSender = tokio::sync::mpsc::Sender<IncomingWebTransportStream>;
-type UpstreamPoolKey = (String, String, AttributionToken);
+type UpstreamPoolKey = (String, String, AttributionToken, SocketAddr);
 
 /// Pool of upstream HTTP/3 connections keyed by origin and policy context.
 pub struct UpstreamPool {
@@ -118,30 +118,16 @@ impl UpstreamPool {
         authority: &str,
         security_context: AttributionToken,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let key = (scheme.to_owned(), authority.to_owned(), security_context);
-
-        {
-            let pool = self.connections.lock().expect("upstream pool lock");
-
-            if let Some(connection) = pool.get(&key).and_then(Weak::upgrade) {
-                return Ok(connection);
-            }
-        }
-
         let (host, port) = split_authority(authority)?;
         let addresses = tokio::net::lookup_host((host, port)).await?;
         let mut last_error = None;
 
         for address in addresses {
-            match self.establish(host, authority, address, Some(&key)).await {
-                Ok(connection) => {
-                    self.connections
-                        .lock()
-                        .expect("upstream pool lock")
-                        .insert(key.clone(), Arc::downgrade(&connection));
-
-                    return Ok(connection);
-                }
+            match self
+                .connect_address(scheme, authority, host, address, Some(&security_context))
+                .await
+            {
+                Ok(connection) => return Ok(connection),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -149,6 +135,34 @@ impl UpstreamPool {
         Err(last_error.unwrap_or_else(|| {
             BoxError::from(format!("origin {authority} resolved to no addresses"))
         }))
+    }
+
+    /// Get a live upstream connection for an origin authority at a known
+    /// transport address, or establish one.
+    ///
+    /// The address supplies routing only. The authority still supplies the
+    /// TLS server name and HTTP origin identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the advertised ECH configuration is unverifiable
+    /// or the QUIC and HTTP/3 handshakes fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pool lock is poisoned by a panicking task.
+    pub async fn connect_to(
+        self: &Arc<Self>,
+        scheme: &str,
+        authority: &str,
+        address: SocketAddr,
+        security_context: AttributionToken,
+    ) -> Result<Arc<UpstreamConnection>, BoxError> {
+        let (host, port) = split_authority(authority)?;
+        let address = SocketAddr::new(address.ip(), port);
+
+        self.connect_address(scheme, authority, host, address, Some(&security_context))
+            .await
     }
 
     /// Establish a separate upstream HTTP/3 association for one session.
@@ -159,7 +173,7 @@ impl UpstreamPool {
     /// handshake fails.
     pub async fn connect_dedicated(
         self: &Arc<Self>,
-        _scheme: &str,
+        scheme: &str,
         authority: &str,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
         let (host, port) = split_authority(authority)?;
@@ -167,7 +181,10 @@ impl UpstreamPool {
         let mut last_error = None;
 
         for address in addresses {
-            match self.establish(host, authority, address, None).await {
+            match self
+                .connect_address(scheme, authority, host, address, None)
+                .await
+            {
                 Ok(connection) => return Ok(connection),
                 Err(error) => last_error = Some(error),
             }
@@ -176,6 +193,70 @@ impl UpstreamPool {
         Err(last_error.unwrap_or_else(|| {
             BoxError::from(format!("origin {authority} resolved to no addresses"))
         }))
+    }
+
+    /// Establish a separate upstream HTTP/3 association at a known address.
+    ///
+    /// The address supplies routing only. The authority still supplies the
+    /// TLS server name and HTTP origin identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the advertised ECH configuration is unverifiable
+    /// or the HTTP/3 handshake fails.
+    pub async fn connect_dedicated_to(
+        self: &Arc<Self>,
+        scheme: &str,
+        authority: &str,
+        address: SocketAddr,
+    ) -> Result<Arc<UpstreamConnection>, BoxError> {
+        let (host, port) = split_authority(authority)?;
+        let address = SocketAddr::new(address.ip(), port);
+
+        self.connect_address(scheme, authority, host, address, None)
+            .await
+    }
+
+    async fn connect_address(
+        &self,
+        scheme: &str,
+        authority: &str,
+        host: &str,
+        address: SocketAddr,
+        security_context: Option<&AttributionToken>,
+    ) -> Result<Arc<UpstreamConnection>, BoxError> {
+        let pool_key = security_context.map(|security_context| {
+            (
+                scheme.to_owned(),
+                authority.to_owned(),
+                security_context.clone(),
+                address,
+            )
+        });
+
+        if let Some(pool_key) = pool_key.as_ref()
+            && let Some(connection) = self
+                .connections
+                .lock()
+                .expect("upstream pool lock")
+                .get(pool_key)
+                .and_then(Weak::upgrade)
+        {
+            return Ok(connection);
+        }
+
+        let connection = self
+            .establish(host, authority, address, pool_key.as_ref())
+            .await?;
+
+        if let Some(pool_key) = pool_key {
+            self.connections
+                .lock()
+                .expect("upstream pool lock")
+                .insert(pool_key, Arc::downgrade(&connection));
+        }
+
+        Ok(connection)
     }
 
     async fn establish(
