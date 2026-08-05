@@ -5,8 +5,10 @@ mod client;
 mod dispatch;
 pub(crate) mod peer;
 use crate::store::PolicyStore;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
 use std::{path::Path, sync::Arc};
 use tokio::net::UnixListener;
 
@@ -169,9 +171,11 @@ impl PolicyServer {
 mod tests {
     use super::*;
     use crate::store::PolicydArgs;
+
     use agent_sandbox_core::{
         ApprovalScope, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, UiPush,
     };
+
     use std::time::Duration;
 
     fn test_args(dir: &tempfile::TempDir) -> PolicydArgs {

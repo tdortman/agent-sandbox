@@ -1,6 +1,7 @@
 mod ech_state;
 pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
+
 use agent_sandbox_proxy::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
@@ -15,9 +16,11 @@ use agent_sandbox_proxy::{
         TerminalError, is_hop_by_hop_header,
     },
 };
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use nix::sys::socket::{getsockopt, sockopt};
+
 use rama_core::{
     Service,
     bytes::Bytes,
@@ -28,6 +31,7 @@ use rama_core::{
     rt::Executor,
     service::service_fn,
 };
+
 use rama_http::{
     Body, HeaderMap, HeaderValue, Request, Response, StatusCode, Version,
     body::{Frame, StreamingBody, util::BodyExt},
@@ -38,7 +42,9 @@ use rama_http::{
         version_adapter::{ResponseVersionAdaptCtx, adapt_response_version},
     },
 };
+
 use rama_http_backend::server::HttpServer;
+
 use rama_net::{
     address::SocketAddress,
     http::server::HttpPeekRouter,
@@ -46,8 +52,10 @@ use rama_net::{
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
+
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
+
 use rama_tls_boring::{
     TlsStream,
     core::{
@@ -56,6 +64,7 @@ use rama_tls_boring::{
         x509::X509,
     },
 };
+
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
@@ -66,6 +75,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 use upstream::UpstreamClients;
@@ -211,10 +221,12 @@ struct Args {
 
 fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
     let parsed = url::Url::parse(value)?;
+
     let raw_path = value
         .find("://")
         .and_then(|scheme_end| {
             let authority_start = scheme_end + 3;
+
             value[authority_start..].find('/').map(|path_start| {
                 value[authority_start + path_start..]
                     .split(['?', '#'])
@@ -899,7 +911,6 @@ async fn preserve_alt_svc(
 
     let borrowed = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let rewritten = store.record(origin, &borrowed).await;
-
     response.headers_mut().remove("alt-svc");
 
     if let Some(value) = rewritten
@@ -1652,8 +1663,10 @@ mod tests {
         request_head_clone, select_ech_config_list, semantic_request_headers,
         semantic_response_headers,
     };
+
     use crate::ech_state::EchState;
     use clap::Parser;
+
     use rama_core::{
         Service,
         bytes::Bytes,
@@ -1662,18 +1675,22 @@ mod tests {
         rt::Executor,
         service::service_fn,
     };
+
     use rama_http::{
         HeaderMap, HeaderValue, Response,
         body::util::BodyExt,
         io::upgrade::{Upgraded, pending},
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
+
     use rama_net::proxy::IoForwardService;
+
     use std::{
         convert::Infallible,
         pin::Pin,
         task::{Context, Poll},
     };
+
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         time::{Duration, timeout},
@@ -1757,7 +1774,6 @@ mod tests {
     #[test]
     fn args_disable_http3_by_default() {
         let args = Args::try_parse_from(["agent-sandbox-proxy"]).expect("proxy arguments");
-
         assert!(!args.http3);
     }
 
@@ -1781,6 +1797,7 @@ mod tests {
         .expect("proxy arguments");
 
         assert!(!args.http3);
+
         assert_eq!(args.http10_upstream_origins, [
             "http://example.com",
             "https://example.org:8443/"
@@ -1873,6 +1890,7 @@ mod tests {
                 .map(rama_http::proto::h2::ext::Protocol::as_str),
             Some("websocket")
         );
+
         assert_eq!(
             clone
                 .extensions()
@@ -2182,10 +2200,10 @@ mod tests {
             .expect("response");
 
         let mut response = adapt_http10_response(response);
-
         assert!(response.headers().get("content-length").is_none());
         assert!(response.headers().get("transfer-encoding").is_none());
         assert!(response.headers().get("trailer").is_none());
+
         assert_eq!(
             response
                 .headers()

@@ -1,4 +1,5 @@
 use super::{io::policy_json, *};
+
 use crate::{
     HttpRule,
     policy::{
@@ -6,6 +7,7 @@ use crate::{
         NetworkRule, NetworkSection, Policy, SudoRule, SudoSection,
     },
 };
+
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 fn empty_policy() -> Policy {

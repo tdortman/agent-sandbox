@@ -4,6 +4,7 @@ use agent_sandbox_core::{
     ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
     RpcRequest, policy_rpc,
 };
+
 use std::{
     env, fs,
     io::ErrorKind,
@@ -149,6 +150,7 @@ impl PolicySession {
     /// Returns an error when policyd rejects or cannot identify the flow.
     pub async fn claim(&self, flow: NetworkFlowKey) -> Result<FlowClaim, PolicyError> {
         let connection_id = ProxyConnectionId::new();
+
         let reply = policy_rpc(
             &self.socket,
             RpcRequest::ClaimNetworkFlow {
@@ -196,9 +198,12 @@ impl PolicySession {
     ) -> Result<FlowClaim, PolicyError> {
         let source_port = NonZeroU16::new(source.port())
             .ok_or_else(|| PolicyError::Rpc("source port must be non-zero".to_owned()))?;
+
         let destination_port = NonZeroU16::new(destination_port)
             .ok_or_else(|| PolicyError::Rpc("destination port must be non-zero".to_owned()))?;
+
         let connection_id = ProxyConnectionId::new();
+
         let reply = policy_rpc(
             &self.socket,
             RpcRequest::ClaimNetworkFlowBySource {
@@ -514,6 +519,7 @@ pub fn normalize_authority(value: &str, fallback_port: u16) -> Result<String, Po
 #[cfg(test)]
 mod tests {
     use super::{PolicyError, decode_http_check_reply, normalize_authority};
+
     use agent_sandbox_core::{
         ErrorReply, HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RpcReply,
     };

@@ -4,8 +4,10 @@
 //! before the command is accepted but not required.
 
 use agent_sandbox_core::{FilesystemRule, RequestContext};
+
 use agent_sandbox_fsmon::rpc_client;
 use clap::Parser as _;
+
 use std::{
     ffi::{CStr, CString, OsString},
     os::unix::ffi::OsStrExt,

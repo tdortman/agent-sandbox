@@ -1,6 +1,7 @@
 use agent_sandbox_syscall::{build_filter, default_syscalls, syscalls_without_filesystem};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
 use clap::Parser as _;
+
 use nix::{
     fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     sys::{
@@ -9,6 +10,7 @@ use nix::{
     },
     unistd::{ForkResult, Pid, execvp, pipe2},
 };
+
 use std::{
     env,
     ffi::{CStr, CString, OsString},
@@ -48,6 +50,7 @@ fn install_filter(include_filesystem: bool) -> OwnedFd {
     } else {
         syscalls_without_filesystem()
     };
+
     let filter = build_filter(&syscalls);
 
     // `seccompiler::BpfProgram` is `Vec<seccompiler::sock_filter>`. The

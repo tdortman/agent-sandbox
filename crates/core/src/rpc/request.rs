@@ -7,11 +7,13 @@ use super::{
     },
     scope::ApprovalScope,
 };
+
 use crate::{
     ProcessIds, ResolvedRequestContext, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
+
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
@@ -1078,8 +1080,10 @@ mod tests {
 
         let wire = serde_json::to_value(&request).expect("serialize rebind");
         assert_eq!(wire["op"], "rebind_network_flow");
+
         let decoded =
             serde_json::from_value::<RpcRequest>(wire.clone()).expect("deserialize rebind");
+
         assert_eq!(
             serde_json::to_value(&decoded).expect("reserialize rebind"),
             wire
@@ -1087,8 +1091,10 @@ mod tests {
 
         let mut unknown = wire;
         unknown["unexpected"] = serde_json::json!(true);
+
         let error = serde_json::from_value::<RpcRequest>(unknown)
             .expect_err("rebind wire must reject unknown fields");
+
         assert!(error.to_string().contains("unknown field"));
     }
 
@@ -1104,8 +1110,10 @@ mod tests {
 
         let wire = serde_json::to_value(&request).expect("serialize release");
         assert_eq!(wire["op"], "release_network_flow");
+
         let decoded =
             serde_json::from_value::<RpcRequest>(wire.clone()).expect("deserialize release");
+
         assert_eq!(
             serde_json::to_value(&decoded).expect("reserialize release"),
             wire
@@ -1113,8 +1121,10 @@ mod tests {
 
         let mut unknown = wire;
         unknown["unexpected"] = serde_json::json!(true);
+
         let error = serde_json::from_value::<RpcRequest>(unknown)
             .expect_err("release wire must reject unknown fields");
+
         assert!(error.to_string().contains("unknown field"));
     }
 

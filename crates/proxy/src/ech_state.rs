@@ -1,6 +1,7 @@
 //! Persistent ECH key material and DNS configuration for the transparent proxy.
 
 use rama_tls_boring::core::x25519::X25519PrivateKey;
+
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},

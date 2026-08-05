@@ -4,15 +4,19 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
     VerdictEntry, enforce_verdict_cache_limit,
 };
+
 use crate::wire::{ResourceCheckRequest, UiSpawnContext};
+
 use agent_sandbox_core::{
     DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
     ResourceRuleKey, UiPush, VerdictSource,
 };
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
@@ -408,19 +412,23 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
+
     use crate::{
         store::{UiSessionContext, types::UiClient},
         wire::ResourceCheckRequest,
     };
+
     use agent_sandbox_core::{
         ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess, VerdictSource,
     };
+
     use std::{
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
+
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {

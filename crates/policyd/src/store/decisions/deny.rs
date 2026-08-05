@@ -1,6 +1,7 @@
 //! Deny a pending network or elevation request.
 
 use super::{super::types::PolicyStore, DecisionAction};
+
 use crate::wire::PendingDecision;
 use agent_sandbox_core::RpcReply;
 

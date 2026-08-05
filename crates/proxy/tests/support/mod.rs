@@ -3,13 +3,17 @@ use agent_sandbox_core::{
     NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxySessionReply,
     ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
+
 use bytes::{Buf, Bytes};
+
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
 };
+
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::pem::PemObject;
+
 use std::{
     io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -22,7 +26,9 @@ use std::{
     },
     time::Duration,
 };
+
 use tempfile::TempDir;
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, UdpSocket, UnixListener},
@@ -61,6 +67,7 @@ impl HarnessStartupLock {
                         _local_guard: local_guard,
                     };
                 }
+
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     if !harness_lock_owner_is_alive(&path)
                         && let Err(error) = std::fs::remove_file(&path)
@@ -70,6 +77,7 @@ impl HarnessStartupLock {
                     }
                     sleep(Duration::from_millis(10)).await;
                 }
+
                 Err(error) => panic!("create harness startup lock: {error}"),
             }
         }
@@ -93,6 +101,7 @@ fn harness_lock_owner_is_alive(path: &Path) -> bool {
     let Ok(owner) = std::fs::read_to_string(path) else {
         return false;
     };
+
     let Ok(pid) = owner.trim().parse::<u32>() else {
         return false;
     };
@@ -198,26 +207,32 @@ async fn serve_policy_connection(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+
     while reader.read_line(&mut line).await.is_ok() && !line.is_empty() {
         let value: serde_json::Value = match serde_json::from_str(line.trim()) {
             Ok(value) => value,
             Err(_) => break,
         };
+
         let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
             break;
         };
+
         let Some(reply) =
             handle_policy_operation(op, &value, &events, &cancel_gate, claim_errors).await
         else {
             break;
         };
+
         let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
+
         if writer.write_all(&encoded).await.is_err()
             || writer.write_all(b"\n").await.is_err()
             || writer.flush().await.is_err()
         {
             break;
         }
+
         line.clear();
     }
 }
@@ -234,6 +249,7 @@ async fn handle_policy_operation(
             ok: true,
             proxy_session: ProxySessionToken::from_bytes([1; 32]),
         })),
+
         "claim_network_flow" => Some(handle_claim(value, events, claim_errors)),
         "claim_network_flow_by_source" => Some(handle_claim_by_source(value, events, claim_errors)),
         "rebind_network_flow" => Some(handle_rebind(value, events)),
@@ -263,6 +279,7 @@ fn handle_claim_by_source(
     claim_errors: bool,
 ) -> RpcReply {
     let selector: NetworkFlowSelector = parse_policy_field(value, "selector");
+
     let flow = NetworkFlowKey::new(
         selector.protocol(),
         selector.source_ip(),
@@ -270,6 +287,7 @@ fn handle_claim_by_source(
         selector.source_ip(),
         selector.destination_port(),
     );
+
     handle_claim_flow(value, flow, events, claim_errors)
 }
 
@@ -280,6 +298,7 @@ fn handle_claim_flow(
     claim_errors: bool,
 ) -> RpcReply {
     let connection_id = parse_policy_field(value, "connection_id");
+
     events
         .lock()
         .expect("policy events lock")
@@ -288,6 +307,7 @@ fn handle_claim_flow(
             flow: flow.clone(),
             connection_id,
         });
+
     if claim_errors {
         RpcReply::Error(ErrorReply::new("unknown connection identifier"))
     } else {
@@ -302,11 +322,13 @@ fn handle_claim_flow(
 
 fn handle_rebind(value: &serde_json::Value, events: &Arc<Mutex<PolicyEvents>>) -> RpcReply {
     let flow = parse_policy_field(value, "flow");
+
     events
         .lock()
         .expect("policy events lock")
         .rebinds
         .push(flow);
+
     RpcReply::Simple(SimpleOkReply::OK)
 }
 
@@ -317,11 +339,13 @@ async fn handle_check(
 ) -> RpcReply {
     let request: HttpRequest = parse_policy_field(value, "request");
     let url = request.url.to_string();
+
     events
         .lock()
         .expect("policy events lock")
         .checks
         .push(request.clone());
+
     let request_id = || parse_policy_field(value, "request_id");
 
     if url.contains("/policy-error") {
@@ -331,6 +355,7 @@ async fn handle_check(
         ))
     } else if url.contains("/cancel") {
         cancel_gate.notified().await;
+
         RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
             request_id(),
             RpcReply::HttpCheck(HttpCheckReply::blocked(
@@ -339,11 +364,13 @@ async fn handle_check(
         ))
     } else {
         let allowed = !url.contains("/deny");
+
         events
             .lock()
             .expect("policy events lock")
             .decisions
             .push(allowed);
+
         RpcReply::Proxy(agent_sandbox_core::ProxyReply::from_reply(
             request_id(),
             RpcReply::HttpCheck(HttpCheckReply::from_verdict(
@@ -361,6 +388,7 @@ async fn handle_check(
 fn handle_release(value: &serde_json::Value, events: &Arc<Mutex<PolicyEvents>>) -> RpcReply {
     let token = parse_policy_field(value, "attribution_token");
     let connection_id = parse_policy_field(value, "connection_id");
+
     events
         .lock()
         .expect("policy events lock")
@@ -369,6 +397,7 @@ fn handle_release(value: &serde_json::Value, events: &Arc<Mutex<PolicyEvents>>) 
             token,
             connection_id,
         });
+
     RpcReply::Simple(SimpleOkReply::OK)
 }
 
@@ -378,11 +407,13 @@ fn handle_cancel(
     cancel_gate: &Notify,
 ) -> RpcReply {
     let request_id = parse_policy_field(value, "request_id");
+
     events
         .lock()
         .expect("policy events lock")
         .cancellations
         .push(request_id);
+
     cancel_gate.notify_waiters();
     RpcReply::Simple(SimpleOkReply::OK)
 }
@@ -398,14 +429,17 @@ async fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
 
     while !response.ends_with(b"\r\n\r\n") {
         let mut byte = [0; 1];
+
         stream
             .read_exact(&mut byte)
             .await
             .expect("read response header");
+
         response.push(byte[0]);
     }
 
     let headers = String::from_utf8_lossy(&response);
+
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -414,8 +448,10 @@ async fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
         })
         .and_then(|value| value.trim().parse::<usize>().ok())
         .expect("response content length");
+
     let body_start = response.len();
     response.resize(body_start + content_length, 0);
+
     stream
         .read_exact(&mut response[body_start..])
         .await
@@ -443,6 +479,7 @@ async fn serve_tcp_origin_connection(
 ) {
     loop {
         let mut request = Vec::new();
+
         let read_result = timeout(Duration::from_secs(2), async {
             loop {
                 let mut byte = [0; 1];
@@ -465,6 +502,7 @@ async fn serve_tcp_origin_connection(
             .lock()
             .expect("request heads lock")
             .push(String::from_utf8_lossy(&request).into_owned());
+
         let doh_packet = if request
             .windows(b"/doh-ech".len())
             .any(|window| window == b"/doh-ech")
@@ -483,6 +521,7 @@ async fn serve_tcp_origin_connection(
             serve_doh_response(&mut stream, &packet).await;
             break;
         }
+
         let websocket = request
             .windows(b"upgrade: websocket".len())
             .any(|window| window.eq_ignore_ascii_case(b"upgrade: websocket"));
@@ -519,6 +558,7 @@ async fn serve_doh_response(stream: &mut TcpStream, packet: &[u8]) {
          {}\r\nConnection: close\r\n\r\n",
         packet.len()
     );
+
     let _ = stream.write_all(header.as_bytes()).await;
     let _ = stream.write_all(packet).await;
 }
@@ -532,7 +572,9 @@ async fn serve_websocket_response(stream: &mut TcpStream) {
               Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         )
         .await;
+
     let mut payload = [0; 4];
+
     if stream.read_exact(&mut payload).await.is_ok() {
         let _ = stream.write_all(&payload).await;
     }
@@ -549,12 +591,15 @@ async fn serve_origin_body(
 ) {
     let declared_length = body.len() + usize::from(abort_probe) * 4 * 1024 * 1024;
     let connection = if keep_alive { "keep-alive" } else { "close" };
+
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: {connection}\r\n\r\n"
     );
+
     let _ = stream.write_all(header.as_bytes()).await;
     let split = body.len() / 2;
     let _ = stream.write_all(&body[..split]).await;
+
     if request
         .windows(b"/stream".len())
         .any(|window| window == b"/stream")
@@ -571,6 +616,7 @@ async fn serve_origin_body(
         }
     } else if abort_probe {
         let probe = vec![0_u8; 65_536];
+
         let probe_error = timeout(Duration::from_secs(2), async {
             for _ in 0..64 {
                 if let Err(error) = stream.write_all(&probe).await {
@@ -580,6 +626,7 @@ async fn serve_origin_body(
             None
         })
         .await;
+
         if matches!(
             probe_error,
             Ok(Some(
@@ -606,6 +653,7 @@ fn doh_dns_message(dnssec: bool) -> Vec<u8> {
     };
 
     let name = Name::from_ascii("example.test.").expect("valid name");
+
     let params = vec![
         (SvcParamKey::Port, SvcParamValue::Port(443)),
         (
@@ -615,7 +663,6 @@ fn doh_dns_message(dnssec: bool) -> Vec<u8> {
     ];
 
     let https = RData::HTTPS(HTTPS(SVCB::new(1, name.clone(), params)));
-
     let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
     message.metadata.authentic_data = dnssec;
     message.add_query(Query::query(name.clone(), RecordType::HTTPS));
@@ -641,6 +688,7 @@ impl TcpOrigin {
         let listener = TcpListener::bind(SocketAddr::new(ip, port))
             .await
             .expect("bind TCP origin");
+
         let address = listener.local_addr().expect("origin address");
         let attempts = Arc::new(AtomicUsize::new(0));
         let stream_gate = Arc::new(Notify::new());
@@ -741,9 +789,11 @@ struct HarnessOrigins {
 async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
     if let Some(http3) = options.http3.as_ref() {
         let gate = options.root.join("gate");
+
         let alt_svc = http3
             .alt_port
             .map(|port| format!("h3=\":{port}\"; persist=1"));
+
         let origin = Http3Origin::start_with_settings(
             options.ip,
             0,
@@ -769,6 +819,7 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
 
     if options.tls {
         let origin_address = SocketAddr::new(options.ip, options.origin_port);
+
         let (origin, tls_origin) = start_tls_origin(
             options.ip,
             origin_address,
@@ -807,8 +858,8 @@ async fn start_tls_origin(
 ) -> (TcpOrigin, TlsOrigin) {
     let listener = TcpListener::bind(address).await.expect("bind TLS origin");
     let inner_port = free_port(ip);
-
     let mut command = Command::new("openssl");
+
     command.args([
         "s_server",
         "-quiet",
@@ -977,8 +1028,8 @@ impl Http3Origin {
     ) -> Self {
         let address = SocketAddr::new(ip, port);
         let log = root.join("origin.log");
-
         let mut command = Command::new(env!("CARGO_BIN_EXE_h3-origin"));
+
         command.args([
             "--port",
             &address.port().to_string(),
@@ -1132,10 +1183,12 @@ impl Http3Response {
 
         match stream.recv_data().await {
             Ok(Some(mut chunk)) => Some(chunk.copy_to_bytes(chunk.remaining()).to_vec()),
+
             Ok(None) => {
                 self.stream = None;
                 None
             }
+
             Err(error) => panic!("response body failed: {error}"),
         }
     }
@@ -1172,7 +1225,6 @@ impl Http3Response {
 }
 
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
-
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
 fn assert_webtransport_response(response: &http::Response<()>) -> Result<(), String> {
@@ -1185,6 +1237,7 @@ fn assert_webtransport_response(response: &http::Response<()>) -> Result<(), Str
     {
         return Err("WebTransport response header was not preserved".to_owned());
     }
+
     Ok(())
 }
 
@@ -1234,13 +1287,13 @@ impl Http3Client {
         enable_early_data: bool,
     ) -> Self {
         let pem = std::fs::read(ca_file).expect("read harness CA");
+
         let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
             .expect("parse harness CA");
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add_parsable_certificates(certificates);
-
         let provider = Arc::new(rustls::crypto::ring::default_provider());
 
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -1257,12 +1310,13 @@ impl Http3Client {
 
         let client_config =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config");
+
         let client_config = quinn::ClientConfig::new(Arc::new(client_config));
 
         let mut endpoint =
             quinn::Endpoint::client(SocketAddr::new(local_ip, 0)).expect("client endpoint");
-        endpoint.set_default_client_config(client_config);
 
+        endpoint.set_default_client_config(client_config);
         Self { endpoint }
     }
 
@@ -1309,6 +1363,7 @@ impl Http3Client {
         let (_, response) = self
             .request_with_informational(server, server_name, path)
             .await?;
+
         Ok(response)
     }
 
@@ -1330,6 +1385,7 @@ impl Http3Client {
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
 
         let h3 = h3_quinn::Connection::new(connection);
+
         let (connection, mut send_request) = h3::client::new(h3)
             .await
             .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
@@ -1393,12 +1449,14 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
 
         let h3 = h3_quinn::Connection::new(connection);
+
         let (connection, mut send_request) = h3::client::new(h3)
             .await
             .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
@@ -1410,10 +1468,13 @@ impl Http3Client {
         if expect_continue {
             request = request.header("expect", "100-continue");
         }
+
         if send_trailers {
             request = request.header("trailer", "x-request-trailer");
         }
+
         let request = request.body(()).expect("client request");
+
         let mut stream = send_request
             .send_request(request)
             .await
@@ -1462,6 +1523,7 @@ impl Http3Client {
 
         if send_trailers {
             let mut trailers = http::HeaderMap::new();
+
             trailers.insert(
                 "x-request-trailer",
                 http::HeaderValue::from_static("present"),
@@ -1505,27 +1567,34 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
         let h3 = h3_quinn::Connection::new(quinn_connection.clone());
+
         let (connection, mut send_request) = h3::client::new(h3)
             .await
             .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
+
         let request = http::Request::builder()
             .method("GET")
             .uri(format!("https://{server_name}{path}"))
             .body(())
             .expect("client request");
+
         let mut stream = send_request
             .send_request(request)
             .await
             .map_err(|error| format!("request failed: {error}"))?;
+
         let response = stream
             .recv_response()
             .await
             .map_err(|error| format!("response failed: {error}"))?;
+
         if !response.status().is_success() {
             return Err(format!("unexpected response status {}", response.status()));
         }
@@ -1542,9 +1611,11 @@ impl Http3Client {
 
         let socket = std::net::UdpSocket::bind(SocketAddr::new(local_ip, 0))
             .map_err(|error| format!("bind migration socket failed: {error}"))?;
+
         socket
             .set_nonblocking(true)
             .map_err(|error| format!("set migration socket nonblocking failed: {error}"))?;
+
         self.endpoint
             .rebind(socket)
             .map_err(|error| format!("rebind QUIC endpoint failed: {error}"))?;
@@ -1583,13 +1654,16 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true);
+
         let (h3_connection, mut send_request) = builder
             .build::<_, _, bytes::Bytes>(h3_quic)
             .await
@@ -1600,17 +1674,21 @@ impl Http3Client {
             .uri(format!("https://{server_name}{path}"))
             .body(())
             .expect("WebSocket request");
+
         request
             .extensions_mut()
             .insert(h3::ext::Protocol::WEBSOCKET);
+
         let mut stream = send_request
             .send_request(request)
             .await
             .map_err(|error| format!("WebSocket request failed: {error}"))?;
+
         let response = stream
             .recv_response()
             .await
             .map_err(|error| format!("WebSocket response failed: {error}"))?;
+
         if !response.status().is_success() {
             return Err(format!("WebSocket response was {}", response.status()));
         }
@@ -1619,12 +1697,14 @@ impl Http3Client {
             .send_data(bytes::Bytes::from_static(b"websocket-probe"))
             .await
             .map_err(|error| format!("WebSocket request body failed: {error}"))?;
+
         stream
             .finish()
             .await
             .map_err(|error| format!("WebSocket request close failed: {error}"))?;
 
         let mut body = Vec::new();
+
         while let Some(mut chunk) = stream
             .recv_data()
             .await
@@ -1688,10 +1768,12 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
         let h3_quic = h3_quinn::Connection::new(quinn_connection.clone());
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true);
@@ -1701,6 +1783,7 @@ impl Http3Client {
         }
 
         builder.enable_webtransport(true);
+
         let (h3_connection, mut send_request) = builder
             .build::<_, _, bytes::Bytes>(h3_quic)
             .await
@@ -1711,47 +1794,60 @@ impl Http3Client {
             .uri(format!("https://{server_name}{path}"))
             .body(())
             .expect("WebTransport request");
+
         request
             .extensions_mut()
             .insert(h3::ext::Protocol::WEB_TRANSPORT);
+
         let mut connect_stream = send_request
             .send_request(request)
             .await
             .map_err(|error| format!("WebTransport request failed: {error}"))?;
+
         let session_id = h3::webtransport::SessionId::from(connect_stream.id());
+
         let child_session_id = if invalid_session {
             h3::webtransport::SessionId::try_from(4).expect("invalid session id")
         } else {
             session_id
         };
+
         let response = connect_stream
             .recv_response()
             .await
             .map_err(|error| format!("WebTransport response failed: {error}"))?;
+
         assert_webtransport_response(&response)?;
+
         if enable_datagram && !invalid_session {
             let stream_id = connect_stream.id();
             let mut datagram_sender = h3_connection.get_datagram_sender(stream_id);
             let mut datagram_reader = h3_connection.get_datagram_reader();
+
             datagram_sender
                 .send_datagram(bytes::Bytes::from_static(b"\0webtransport-datagram"))
                 .map_err(|error| format!("WebTransport datagram send failed: {error}"))?;
+
             let datagram =
                 tokio::time::timeout(Duration::from_secs(5), datagram_reader.read_datagram())
                     .await
                     .map_err(|_| "WebTransport datagram receive timed out".to_owned())?
                     .map_err(|error| format!("WebTransport datagram receive failed: {error}"))?;
+
             if datagram.stream_id() != stream_id {
                 return Err("WebTransport datagram stream context changed".to_owned());
             }
+
             if datagram.into_payload() != bytes::Bytes::from_static(b"\0webtransport-datagram") {
                 return Err("WebTransport datagram payload changed".to_owned());
             }
         }
 
         let child_quic = h3_quinn::Connection::new(quinn_connection);
+
         let mut opener =
             <h3_quinn::Connection as h3::quic::Connection<bytes::Bytes>>::opener(&child_quic);
+
         let mut child = std::future::poll_fn(|context| {
             <h3_quinn::OpenStreams as h3::quic::OpenStreams<bytes::Bytes>>::poll_open_bidi(
                 &mut opener,
@@ -1760,19 +1856,23 @@ impl Http3Client {
         })
         .await
         .map_err(|error| format!("WebTransport child stream failed: {error}"))?;
+
         child
             .send_data(h3::stream::BidiStreamHeader::WebTransportBidi(
                 child_session_id,
             ))
             .map_err(|error| format!("WebTransport child header failed: {error}"))?;
+
         std::future::poll_fn(|context| child.poll_ready(context))
             .await
             .map_err(|error| format!("WebTransport child header failed: {error}"))?;
+
         std::future::poll_fn(|context| child.poll_finish(context))
             .await
             .map_err(|error| format!("WebTransport child close failed: {error}"))?;
 
         let mut body = Vec::new();
+
         while let Some(mut chunk) = std::future::poll_fn(|context| child.poll_data(context))
             .await
             .map_err(|error| format!("WebTransport child response failed: {error}"))?
@@ -1840,13 +1940,16 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);
+
         let (h3_connection, mut send_request) = builder
             .build::<_, _, bytes::Bytes>(h3_quic)
             .await
@@ -1857,22 +1960,27 @@ impl Http3Client {
             .uri(format!("https://{server_name}{path}"))
             .body(())
             .expect("CONNECT-UDP request");
+
         request
             .extensions_mut()
             .insert(h3::ext::Protocol::CONNECT_UDP);
+
         if capsule_protocol {
             request
                 .headers_mut()
                 .insert("capsule-protocol", http::HeaderValue::from_static("?1"));
         }
+
         let mut stream = send_request
             .send_request(request)
             .await
             .map_err(|error| format!("CONNECT-UDP request failed: {error}"))?;
+
         let response = stream
             .recv_response()
             .await
             .map_err(|error| format!("CONNECT-UDP response failed: {error}"))?;
+
         if !response.status().is_success() {
             return Err(format!("CONNECT-UDP response was {}", response.status()));
         }
@@ -1886,11 +1994,13 @@ impl Http3Client {
             ]
             .concat()
         };
+
         if let Err(error) = stream.send_data(bytes::Bytes::from(body)).await {
             return malformed
                 .then_some(Vec::new())
                 .ok_or_else(|| format!("CONNECT-UDP Capsule Protocol body failed: {error}"));
         }
+
         if let Err(error) = stream.finish().await {
             return malformed
                 .then_some(Vec::new())
@@ -1906,6 +2016,7 @@ impl Http3Client {
         }
 
         let mut body = Vec::new();
+
         while let Some(mut chunk) = stream
             .recv_data()
             .await
@@ -1944,50 +2055,62 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);
+
         let (h3_connection, mut send_request) = builder
             .build::<_, _, bytes::Bytes>(h3_quic)
             .await
             .map_err(|error| format!("HTTP/3 setup failed: {error}"))?;
 
         let mut streams = Vec::new();
+
         for path in [first_path, second_path] {
             let mut request = http::Request::builder()
                 .method(http::Method::CONNECT)
                 .uri(format!("https://{server_name}{path}"))
                 .body(())
                 .expect("CONNECT-UDP request");
+
             request
                 .extensions_mut()
                 .insert(h3::ext::Protocol::CONNECT_UDP);
+
             let mut stream = send_request
                 .send_request(request)
                 .await
                 .map_err(|error| format!("CONNECT-UDP request failed: {error}"))?;
+
             let response = stream
                 .recv_response()
                 .await
                 .map_err(|error| format!("CONNECT-UDP response failed: {error}"))?;
+
             if !response.status().is_success() {
                 return Err(format!("CONNECT-UDP response was {}", response.status()));
             }
+
             streams.push(stream);
         }
 
         let stream_ids = [streams[0].id(), streams[1].id()];
+
         if stream_ids[0] == stream_ids[1] {
             return Err("CONNECT-UDP request streams reused one ID".to_owned());
         }
+
         let mut senders = [
             h3_connection.get_datagram_sender(stream_ids[0]),
             h3_connection.get_datagram_sender(stream_ids[1]),
         ];
+
         for (index, sender) in senders.iter_mut().enumerate() {
             sender
                 .send_datagram(bytes::Bytes::from(format!("\0route-{index}")))
@@ -1996,19 +2119,24 @@ impl Http3Client {
 
         let mut datagram_reader = h3_connection.get_datagram_reader();
         let mut bodies = [None, None];
+
         for _ in 0..2 {
             let datagram = datagram_reader
                 .read_datagram()
                 .await
                 .map_err(|error| format!("CONNECT-UDP datagram receive failed: {error}"))?;
+
             let index = stream_ids
                 .iter()
                 .position(|stream_id| *stream_id == datagram.stream_id())
                 .ok_or_else(|| "CONNECT-UDP datagram context changed".to_owned())?;
+
             let payload = datagram.into_payload();
+
             if payload.first() != Some(&0) {
                 return Err("CONNECT-UDP inner context changed".to_owned());
             }
+
             bodies[index] = Some(payload.slice(1..).to_vec());
         }
 
@@ -2038,13 +2166,16 @@ impl Http3Client {
             .endpoint
             .connect(server, server_name)
             .map_err(|error| error.to_string())?;
+
         let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .map_err(|_| "QUIC handshake timed out".to_owned())?
             .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);
+
         let (h3_connection, mut send_request) = builder
             .build::<_, _, bytes::Bytes>(h3_quic)
             .await
@@ -2055,18 +2186,23 @@ impl Http3Client {
             .uri(format!("https://{server_name}{path}"))
             .body(())
             .expect("CONNECT-UDP request");
+
         request
             .extensions_mut()
             .insert(h3::ext::Protocol::CONNECT_UDP);
+
         let mut connect_stream = send_request
             .send_request(request)
             .await
             .map_err(|error| format!("CONNECT-UDP request failed: {error}"))?;
+
         let stream_id = connect_stream.id();
+
         let response = connect_stream
             .recv_response()
             .await
             .map_err(|error| format!("CONNECT-UDP response failed: {error}"))?;
+
         if !response.status().is_success() {
             return Err(format!("CONNECT-UDP response was {}", response.status()));
         }
@@ -2074,24 +2210,29 @@ impl Http3Client {
         let datagram_context = stream_id;
         let mut datagram_sender = h3_connection.get_datagram_sender(datagram_context);
         let mut datagram_reader = h3_connection.get_datagram_reader();
+
         let payload = if invalid_context {
             bytes::Bytes::from_static(b"\x01connect-udp-probe")
         } else {
             bytes::Bytes::from_static(b"\0connect-udp-probe")
         };
+
         datagram_sender
             .send_datagram(payload)
             .map_err(|error| format!("CONNECT-UDP datagram send failed: {error}"))?;
+
         if invalid_context {
             return match connect_stream.recv_data().await {
                 Err(_error) => Ok(Vec::new()),
                 Ok(_) => Err("invalid CONNECT-UDP context was accepted".to_owned()),
             };
         }
+
         let datagram = datagram_reader
             .read_datagram()
             .await
             .map_err(|error| format!("CONNECT-UDP datagram receive failed: {error}"))?;
+
         if datagram.stream_id() != stream_id {
             return Err("CONNECT-UDP datagram context changed".to_owned());
         }
@@ -2100,7 +2241,9 @@ impl Http3Client {
             .finish()
             .await
             .map_err(|error| format!("CONNECT-UDP session close failed: {error}"))?;
+
         let payload = datagram.into_payload();
+
         if payload.first() != Some(&0) {
             return Err("CONNECT-UDP inner context changed".to_owned());
         }
@@ -2112,48 +2255,60 @@ impl Http3Client {
 fn encode_test_capsule(kind: u64, payload: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::new();
     encode_test_varint(kind, &mut encoded);
+
     encode_test_varint(
         u64::try_from(payload.len()).expect("capsule payload length fits"),
         &mut encoded,
     );
+
     encoded.extend_from_slice(payload);
     encoded
 }
 
 fn decode_test_capsules(mut encoded: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let mut capsules = Vec::new();
+
     while !encoded.is_empty() {
         let Some((kind, kind_len)) = decode_test_varint(encoded) else {
             return Err("truncated Capsule Protocol type".to_owned());
         };
+
         let Some((length, length_len)) = decode_test_varint(&encoded[kind_len..]) else {
             return Err("truncated Capsule Protocol length".to_owned());
         };
+
         let length = usize::try_from(length).map_err(|_| "Capsule Protocol length is too large")?;
         let start = kind_len + length_len;
+
         let end = start
             .checked_add(length)
             .ok_or("Capsule Protocol length overflows")?;
+
         if end > encoded.len() {
             return Err("truncated Capsule Protocol payload".to_owned());
         }
+
         capsules.push((kind, encoded[start..end].to_vec()));
         encoded = &encoded[end..];
     }
+
     Ok(capsules)
 }
 
 fn encode_test_varint(value: u64, output: &mut Vec<u8>) {
     match value {
         0..=63 => output.push(u8::try_from(value).expect("bounded test varint")),
+
         64..=16_383 => {
             let value = u16::try_from(value | 0x4000).expect("bounded test varint");
             output.extend_from_slice(&value.to_be_bytes());
         }
+
         16_384..=1_073_741_823 => {
             let value = u32::try_from(value | 0x8000_0000).expect("bounded test varint");
             output.extend_from_slice(&value.to_be_bytes());
         }
+
         _ => {
             let value = value | 0xC000_0000_0000_0000;
             output.extend_from_slice(&value.to_be_bytes());
@@ -2164,14 +2319,17 @@ fn encode_test_varint(value: u64, output: &mut Vec<u8>) {
 fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
     let first = encoded.first().copied()?;
     let length = 1usize << (first >> 6);
+
     if encoded.len() < length {
         return None;
     }
 
     let mut value = u64::from(first & 0x3F);
+
     for byte in &encoded[1..length] {
         value = (value << 8) | u64::from(*byte);
     }
+
     Some((value, length))
 }
 
@@ -2180,6 +2338,7 @@ fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
 enum Http3AltPort {
     #[default]
     None,
+
     Allocate,
     Fixed(u16),
 }
@@ -2223,6 +2382,7 @@ impl Http3Options {
 enum HarnessMode {
     #[default]
     Plain,
+
     Http10Origin,
     ClaimErrors,
     Http3(Http3Options),
@@ -2258,6 +2418,7 @@ fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> 
         .spawn()
         .expect("start proxy")
 }
+
 fn write_harness_ca(root: &TempDir) -> (PathBuf, PathBuf) {
     let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
     let ca_cert = root.path().join("ca.pem");
@@ -2266,6 +2427,7 @@ fn write_harness_ca(root: &TempDir) -> (PathBuf, PathBuf) {
     std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
     (ca_cert, ca_key)
 }
+
 fn start_harness_policy(root: &TempDir, claim_errors: bool) -> FakePolicy {
     if claim_errors {
         FakePolicy::start_claim_error(root.path())
@@ -2355,6 +2517,7 @@ impl TransparentHarness {
             reject_sessions: true,
             ..Http3Options::default()
         };
+
         Self::start_inner(ip, 0, HarnessOptions {
             mode: HarnessMode::Http3(http3_options),
             ..HarnessOptions::default()
@@ -2368,6 +2531,7 @@ impl TransparentHarness {
             refuse_sessions: true,
             ..Http3Options::default()
         };
+
         Self::start_inner(ip, 0, HarnessOptions {
             mode: HarnessMode::Http3(http3_options),
             ..HarnessOptions::default()
@@ -2381,6 +2545,7 @@ impl TransparentHarness {
             drop_first_session: true,
             ..Http3Options::default()
         };
+
         Self::start_inner(ip, 0, HarnessOptions {
             mode: HarnessMode::Http3(http3_options),
             ..HarnessOptions::default()
@@ -2395,6 +2560,7 @@ impl TransparentHarness {
             alt_port: Http3AltPort::Allocate,
             ..Http3Options::default()
         };
+
         Self::start_inner(ip, 0, HarnessOptions {
             mode: HarnessMode::Http3(http3_options),
             ..HarnessOptions::default()
@@ -2408,6 +2574,7 @@ impl TransparentHarness {
             test_ech_dns: Some(dns),
             ..Http3Options::default()
         };
+
         Self::start_inner(ip, 0, HarnessOptions {
             mode: HarnessMode::Http3(http3_options),
             ..HarnessOptions::default()
@@ -2424,9 +2591,7 @@ impl TransparentHarness {
         } = options;
 
         let _startup_lock = HarnessStartupLock::acquire().await;
-
         let (http10_origin, claim_errors, http3, mut http3_options) = harness_mode_options(mode);
-
         http3_options.resolve_alt_port(http3, ip);
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = start_harness_policy(&root, claim_errors);
@@ -2453,15 +2618,16 @@ impl TransparentHarness {
         let origin = origins.tcp;
         let tls_origin = origins.tls;
         let h3_origin = origins.h3;
-
         let udp_origin = UdpOrigin::start(ip).await;
         let ready = root.path().join("ready");
         let state = root.path().join("ech");
         let proxy_port = free_port(ip);
         let proxy_address = SocketAddr::new(ip, proxy_port);
+
         let destination = h3_origin
             .as_ref()
             .map_or(origin.address, |origin| origin.address);
+
         let mut proxy_command = Command::new(env!("CARGO_BIN_EXE_agent-sandbox-proxy"));
 
         proxy_command.args([
@@ -2511,9 +2677,7 @@ impl TransparentHarness {
         }
 
         let proxy_log = root.path().join("proxy.log");
-
         let proxy = spawn_harness_proxy(proxy_command, &proxy_log, &ready);
-
         wait_for_path(&ready).await;
 
         let h3_alt_address = http3_options
@@ -2564,22 +2728,24 @@ impl TransparentHarness {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
-        let host = format!("localhost:{}", self.origin.address.port());
 
+        let host = format!("localhost:{}", self.origin.address.port());
         let first_request = format!("GET /pool-first HTTP/1.1\r\nHost: {host}\r\n\r\n");
+
         stream
             .write_all(first_request.as_bytes())
             .await
             .expect("write first pooled request");
-        let first_response = read_http_response(&mut stream).await;
 
+        let first_response = read_http_response(&mut stream).await;
         let second_request = format!("GET /pool-second HTTP/1.1\r\nHost: {host}\r\n\r\n");
+
         stream
             .write_all(second_request.as_bytes())
             .await
             .expect("write second pooled request");
-        let second_response = read_http_response(&mut stream).await;
 
+        let second_response = read_http_response(&mut stream).await;
         (first_response, second_response)
     }
 
@@ -2587,24 +2753,29 @@ impl TransparentHarness {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
+
         let request = format!(
             "GET /websocket HTTP/1.1\r\nHost: localhost:{}\r\nUpgrade: websocket\r\nConnection: \
              Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
              13\r\n\r\n",
             self.origin.address.port()
         );
+
         stream
             .write_all(request.as_bytes())
             .await
             .expect("write websocket request");
 
         let mut response = Vec::new();
+
         while !response.ends_with(b"\r\n\r\n") {
             let mut byte = [0; 1];
+
             stream
                 .read_exact(&mut byte)
                 .await
                 .expect("read websocket response");
+
             response.push(byte[0]);
         }
 
@@ -2612,11 +2783,14 @@ impl TransparentHarness {
             .write_all(b"ping")
             .await
             .expect("write websocket payload");
+
         let mut payload = [0; 4];
+
         stream
             .read_exact(&mut payload)
             .await
             .expect("read websocket payload");
+
         response.extend_from_slice(&payload);
         response
     }
@@ -2749,6 +2923,7 @@ impl TransparentHarness {
         };
 
         let mut command = Command::new("openssl");
+
         command.args([
             "s_client",
             "-quiet",
@@ -2787,6 +2962,7 @@ impl TransparentHarness {
             "GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
             self.origin.address.port()
         );
+
         self.tls_raw_request(&request, None)
     }
 

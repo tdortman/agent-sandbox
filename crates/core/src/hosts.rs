@@ -1,6 +1,7 @@
 //! Hostname normalization and policy host resolution.
 
 use globset::GlobBuilder;
+
 use hickory_proto::rr::Name;
 use idna::domain_to_ascii;
 use std::{net::IpAddr, path::Path};

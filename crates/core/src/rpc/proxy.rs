@@ -1,17 +1,21 @@
 //! Typed capabilities and flow-registration wire values for the proxy socket.
 
 use super::request::RequestContext;
+
 use crate::{
     HttpRequest, HttpRuleTarget, SandboxPaths,
     hosts::{normalize_dns_name, normalize_host},
 };
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
+
 use std::{
     fmt,
     net::IpAddr,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     path::PathBuf,
 };
+
 use uuid::Uuid;
 
 /// A non-zero inode number identifying a local socket.

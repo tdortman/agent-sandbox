@@ -1,6 +1,7 @@
 //! Explicit `project_root` handling and home inference for policy resolution.
 
 use crate::error::ProjectPolicyError;
+
 use std::path::{Path, PathBuf};
 
 /// Cached inputs for explicit valid `project_root` handling and home inference.

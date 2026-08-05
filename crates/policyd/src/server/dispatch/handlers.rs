@@ -12,10 +12,12 @@ use crate::{
     store::{PolicyStore, UiClientHandle},
     wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire},
 };
+
 use agent_sandbox_core::{
     ApprovalScope, RegisterUiReply, ResolvedRequestContext, RpcReply, SimpleOkReply,
     split_check_aliases,
 };
+
 use std::{path::PathBuf, sync::Arc};
 
 pub async fn handle(
@@ -433,10 +435,12 @@ async fn handle_approve_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::{
         error::PolicydError,
         store::{PolicyStore, TrustedPeer},
     };
+
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
     use std::{sync::Arc, time::Duration};
     use tokio::{net::UnixStream, sync::Mutex};

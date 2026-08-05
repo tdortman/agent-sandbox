@@ -12,15 +12,19 @@
 //! policy target. An unverifiable advertised configuration fails closed.
 
 use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
+
 use agent_sandbox_core::AttributionToken;
 use bytes::Bytes;
+
 use h3::{
     ConnectionState,
     client::SendRequest,
     error::Code,
     quic::{OpenStreams as _, RecvStream as _, SendStream as _},
 };
+
 use rustls::pki_types::pem::PemObject;
+
 use std::{
     collections::HashMap,
     future::poll_fn,
@@ -66,8 +70,8 @@ impl UpstreamPool {
     /// cannot be built.
     pub fn new(ca_file: &Path, test_ech_dns: Option<SocketAddr>) -> Result<Self, BoxError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-
         let pem = std::fs::read(ca_file)?;
+
         let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -286,6 +290,7 @@ impl UpstreamPool {
 
         let h3 = h3_quinn::Connection::new(connection.clone());
         let mut builder = h3::client::builder();
+
         builder
             .enable_extended_connect(true)
             .enable_datagram(true)
@@ -298,6 +303,7 @@ impl UpstreamPool {
         })?;
 
         let incoming_sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
         let connection = Arc::new(UpstreamConnection {
             connection,
             send_request: tokio::sync::Mutex::new(send_request),
@@ -363,10 +369,8 @@ impl UpstreamPool {
 
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
-
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
         client_config.transport_config(Arc::new(transport));
-
         Ok(client_config)
     }
 }
@@ -393,6 +397,7 @@ fn split_authority(authority: &str) -> Result<(&str, u16), BoxError> {
 
 enum UpstreamEvent {
     Bidi(h3_quinn::BidiStream<Bytes>),
+
     Uni(
         h3::webtransport::SessionId,
         h3_webtransport::stream::RecvStream<h3_quinn::RecvStream, Bytes>,
@@ -419,6 +424,7 @@ fn poll_upstream_event(
 
     match connection.poll_close(context) {
         Poll::Ready(error) => Poll::Ready(Err(error)),
+
         Poll::Pending => {
             if let Some((session_id, stream)) =
                 connection.inner.accepted_streams_mut().wt_uni_streams.pop()
@@ -462,6 +468,7 @@ async fn drive_upstream(
                     }
                 });
             }
+
             Ok(UpstreamEvent::Uni(session_id, stream)) => {
                 dispatch_incoming(
                     session_id,
@@ -470,6 +477,7 @@ async fn drive_upstream(
                 )
                 .await;
             }
+
             Err(error) => {
                 tracing::debug!("upstream HTTP/3 driver closed: {error}");
                 return;
@@ -490,6 +498,7 @@ async fn dispatch_incoming(
     if let Some(sender) = sender {
         match sender.send(stream).await {
             Ok(()) => return,
+
             Err(error) => {
                 sessions.lock().await.remove(&session_id);
                 reject_incoming(error.0);
@@ -507,6 +516,7 @@ fn reject_incoming(stream: IncomingWebTransportStream) {
             stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
             stream.reset(Code::H3_REQUEST_REJECTED.value());
         }
+
         IncomingWebTransportStream::Uni(mut stream) => {
             stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
         }
@@ -517,6 +527,7 @@ fn reject_incoming(stream: IncomingWebTransportStream) {
 pub struct UpstreamConnection {
     connection: quinn::Connection,
     send_request: tokio::sync::Mutex<SendRequest<h3_quinn::OpenStreams, Bytes>>,
+
     incoming_sessions:
         Arc<tokio::sync::Mutex<HashMap<h3::webtransport::SessionId, IncomingWebTransportSender>>>,
 }
@@ -554,6 +565,7 @@ impl UpstreamConnection {
                 let send_request = self.send_request.lock().await;
                 *send_request.settings()
             };
+
             let supported = settings.enable_extended_connect()
                 && (!protocol.needs_datagrams() || settings.enable_datagram())
                 && (!matches!(protocol, SessionProtocol::WebTransport)
@@ -577,10 +589,12 @@ impl UpstreamConnection {
         session_id: h3::webtransport::SessionId,
     ) -> IncomingWebTransportReceiver {
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
+
         self.incoming_sessions
             .lock()
             .await
             .insert(session_id, sender);
+
         receiver
     }
 
@@ -603,6 +617,7 @@ impl UpstreamConnection {
     ) -> Result<h3_quinn::BidiStream<Bytes>, BoxError> {
         let h3 = h3_quinn::Connection::new(self.connection.clone());
         let mut opener = <h3_quinn::Connection as h3::quic::Connection<Bytes>>::opener(&h3);
+
         let mut stream = poll_fn(|context| opener.poll_open_bidi(context))
             .await
             .map_err(|error| {
@@ -614,6 +629,7 @@ impl UpstreamConnection {
             .map_err(|error| {
                 BoxError::from(format!("upstream WebTransport header failed: {error}"))
             })?;
+
         poll_fn(|context| stream.poll_ready(context))
             .await
             .map_err(|error| {
@@ -635,6 +651,7 @@ impl UpstreamConnection {
     ) -> Result<h3_quinn::SendStream<Bytes>, BoxError> {
         let h3 = h3_quinn::Connection::new(self.connection.clone());
         let mut opener = <h3_quinn::Connection as h3::quic::Connection<Bytes>>::opener(&h3);
+
         let mut stream = poll_fn(|context| opener.poll_open_send(context))
             .await
             .map_err(|error| {
@@ -646,6 +663,7 @@ impl UpstreamConnection {
             .map_err(|error| {
                 BoxError::from(format!("upstream WebTransport uni header failed: {error}"))
             })?;
+
         poll_fn(|context| stream.poll_ready(context))
             .await
             .map_err(|error| {

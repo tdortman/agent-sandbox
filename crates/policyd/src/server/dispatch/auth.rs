@@ -1,6 +1,7 @@
 //! Gate sandbox vs host socket requests by RPC variant.
 
 use crate::error::PolicydError;
+
 use agent_sandbox_core::RpcRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,7 @@ pub const fn ensure_allowed(role: SocketRole, req: &RpcRequest) -> Result<(), Po
 mod tests {
     use super::{SocketRole, ensure_allowed};
     use crate::error::PolicydError;
+
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
         NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,

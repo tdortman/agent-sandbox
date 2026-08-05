@@ -4,16 +4,20 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
     PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
+
 use crate::wire::{NetworkCheckRequest, UiSpawnContext};
+
 use agent_sandbox_core::{
     CheckReply, NetworkRuleKey, ProcessIds, ProxyRequestId, ProxySessionToken,
     ResolvedRequestContext, SandboxPaths, UiPush, VerdictSource, attach_check_aliases,
     normalize_host,
 };
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
@@ -630,13 +634,16 @@ mod tests {
         store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
         wire::NetworkCheckRequest,
     };
+
     use agent_sandbox_core::{
         FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
     };
+
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
+
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {

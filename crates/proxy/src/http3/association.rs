@@ -26,14 +26,17 @@ use crate::{
         is_hop_by_hop_header,
     },
 };
+
 use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, ProxyRequestId};
 use bytes::{Buf, Bytes};
+
 use h3::{
     ConnectionState,
     error::{Code, StreamError},
     quic::{BidiStream as _, RecvStream as _, SendStream as _, StreamId},
     server::RequestStream,
 };
+
 use h3_datagram::datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt};
 use h3_quinn::datagram::{RecvDatagramHandler, SendDatagramHandler};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -41,7 +44,6 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 const MAX_WEBTRANSPORT_SESSIONS: usize = 64;
-
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
 /// Resolve the original destination for intercepted UDP associations.
@@ -157,7 +159,6 @@ struct WebTransportSetup {
     downstream_stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     informational_responses: Vec<http::Response<()>>,
     response: http::Response<()>,
-
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,
     upstream_session_id: h3::webtransport::SessionId,
     upstream_incoming: IncomingWebTransportReceiver,
@@ -199,7 +200,9 @@ impl DatagramRouter {
     fn start(mut reader: DatagramReader<RecvDatagramHandler>) -> DatagramRouterState {
         let routes: Arc<Mutex<HashMap<StreamId, mpsc::Sender<RoutedDatagram>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+
         let task_routes = routes.clone();
+
         let task = tokio::spawn(async move {
             loop {
                 let datagram = match reader.read_datagram().await {
@@ -340,6 +343,7 @@ impl SessionRegistry {
         key: &SessionKey,
     ) -> Result<(), BoxError> {
         let mut leases = self.leases.lock().await;
+
         if let Some(existing) = leases.get(&downstream_stream_id)
             && existing != key
         {
@@ -357,10 +361,12 @@ impl SessionRegistry {
         key: &SessionKey,
     ) -> Result<(), BoxError> {
         let leases = self.leases.lock().await;
+
         if leases.get(&downstream_stream_id) == Some(key) {
             drop(leases);
             return Ok(());
         }
+
         drop(leases);
         Err("HTTP/3 session identity changed during reconnect".into())
     }
@@ -372,12 +378,14 @@ impl SessionRegistry {
         attribution: agent_sandbox_core::AttributionToken,
     ) -> Option<HttpRequest> {
         let target = semantic.policy_request().ok()?.url.to_string();
+
         let key = SessionKey {
             origin: semantic.authority().to_owned(),
             target,
             protocol,
             attribution,
         };
+
         let approvals = self.approvals.lock().await;
         let normalized = approvals.get(&key)?.normalized.clone();
         drop(approvals);
@@ -391,18 +399,19 @@ impl SessionRegistry {
     ) -> Result<(), BoxError> {
         let downstream_datagram = session::encode_http_datagram(binding.downstream_stream_id, &[])?;
         session::decode_http_datagram(&downstream_datagram, binding.downstream_stream_id)?;
-
         let upstream_datagram = session::encode_http_datagram(binding.upstream_stream_id, &[])?;
         session::decode_http_datagram(&upstream_datagram, binding.upstream_stream_id)?;
 
         self.reserve(binding.downstream_stream_id, &binding.key)
             .await?;
+
         self.approvals
             .lock()
             .await
             .insert(binding.key.clone(), ApprovedSession {
                 normalized: normalized.clone(),
             });
+
         Ok(())
     }
 
@@ -461,6 +470,7 @@ async fn serve_incoming(
     destination: DestinationResolver,
 ) -> Result<(), BoxError> {
     let source = incoming.remote_address();
+
     let destination_address = match destination.resolve(&incoming) {
         Ok(destination) => destination,
         Err(error) => {
@@ -551,6 +561,7 @@ async fn serve_incoming(
         origin_authority,
     ))
     .await;
+
     release_claim(&state.policy, &claim).await;
     result
 }
@@ -627,6 +638,7 @@ impl H3RequestContext {
         }
 
         let downstream_stream_id = stream.id();
+
         let downstream_datagrams = if request
             .extensions()
             .get::<h3::ext::Protocol>()
@@ -648,11 +660,14 @@ impl H3RequestContext {
         } else {
             None
         };
+
         let has_datagrams = downstream_datagrams.is_some();
+
         let datagram_router = self
             .datagram_router
             .as_ref()
             .map(|state| state.router.clone());
+
         let request_context = Http3RequestContext {
             state: self.state.clone(),
             claim: self.claim.clone(),
@@ -667,11 +682,13 @@ impl H3RequestContext {
             sessions: self.sessions.clone(),
             pending_webtransport: self.pending_webtransport.clone(),
         };
+
         let task = tokio::spawn(async move {
             let result =
                 serve_request(request, stream, request_context, downstream_datagrams).await;
             finish_h3_request(result, has_datagrams, datagram_router, downstream_stream_id).await;
         });
+
         self.tasks.push(task);
     }
 
@@ -686,6 +703,7 @@ fn reject_0rtt_stream(stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, By
     if !stream.is_0rtt() {
         return false;
     }
+
     stream.stop_stream(Code::H3_REQUEST_REJECTED);
     true
 }
@@ -700,6 +718,7 @@ async fn reject_webtransport_request(
                 .body(())?,
         )
         .await?;
+
     stream.finish().await?;
     Ok(())
 }
@@ -711,6 +730,7 @@ async fn send_informational_responses(
     for response in responses {
         stream.send_response(response).await?;
     }
+
     Ok(())
 }
 
@@ -725,8 +745,10 @@ fn queue_webtransport_preparation(
         .datagram_router
         .take()
         .unwrap_or_else(|| DatagramRouter::start(h3.get_datagram_reader()));
+
     request_context.datagram_router = Some(datagram_router);
     let prepare_tx = prepare_tx.clone();
+
     let request_context = Http3RequestContext {
         state: request_context.state.clone(),
         claim: request_context.claim.clone(),
@@ -741,6 +763,7 @@ fn queue_webtransport_preparation(
         sessions: request_context.sessions.clone(),
         pending_webtransport: request_context.pending_webtransport.clone(),
     };
+
     tokio::spawn(async move {
         let setup = prepare_webtransport(&request, stream, request_context).await;
         let _ = prepare_tx.send(WebTransportPrep { request, setup });
@@ -752,6 +775,7 @@ async fn build_h3_server(
 ) -> Result<h3::server::Connection<h3_quinn::Connection, Bytes>, BoxError> {
     let h3 = h3_quinn::Connection::new(connection.clone());
     let mut builder = h3::server::builder();
+
     builder
         .enable_extended_connect(true)
         .enable_webtransport(true)
@@ -763,6 +787,7 @@ async fn build_h3_server(
 
     match builder.build(h3).await {
         Ok(h3) => Ok(h3),
+
         Err(error) => {
             connection.close(varint(Code::H3_INTERNAL_ERROR), b"http3 setup failed");
             Err(format!("HTTP/3 setup failed: {error}").into())
@@ -787,10 +812,11 @@ async fn serve_h3_connection(
     origin_authority: Option<String>,
 ) -> Result<(), BoxError> {
     let mut h3 = build_h3_server(&connection).await?;
-
     let mut bound_source = source;
+
     let mut request_context =
         new_h3_request_context(state, claim, destination, origin_port, origin_authority);
+
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedRequest>();
     let (webtransport_tx, mut webtransport_rx) = mpsc::unbounded_channel::<WebTransportPrep>();
     let mut webtransport_pending = false;
@@ -891,17 +917,18 @@ async fn serve_h3_connection(
     };
 
     finish_h3_connection(&mut request_context).await;
-
     connection.close(varint(Code::H3_NO_ERROR), b"proxy shutdown");
     result
 }
 
 async fn finish_h3_connection(request_context: &mut H3RequestContext) {
     stop_h3_tasks(std::mem::take(&mut request_context.tasks)).await;
+
     if let Some(datagram_state) = request_context.datagram_router.take() {
         datagram_state.task.abort();
         let _ = datagram_state.task.await;
     }
+
     request_context.pending_webtransport.cleanup().await;
 }
 
@@ -924,6 +951,7 @@ fn spawn_h3_request_resolution(
 fn resolved_request(resolved: ResolvedRequest) -> Option<ResolvedRequestValue> {
     match resolved {
         Ok(request) => Some(request),
+
         Err(error) => {
             warn!(%error, "downstream HTTP/3 request resolution failed");
             None
@@ -939,11 +967,13 @@ async fn rebind_migrated_path(
     bound_source: &mut SocketAddr,
 ) -> Result<(), BoxError> {
     let source = connection.remote_address();
+
     if source == *bound_source {
         return Ok(());
     }
 
     let flow = crate::policy::udp_flow_key(source, destination)?;
+
     if let Err(error) = policy.rebind(claim, flow).await {
         connection.close(varint(Code::H3_INTERNAL_ERROR), b"QUIC path rebind failed");
         return Err(error.into());
@@ -1109,6 +1139,7 @@ async fn register_webtransport_session(
 ) -> Result<WebTransportRegistration, BoxError> {
     let downstream_stream_id = setup.downstream_stream.id();
     let upstream = setup.upstream.clone();
+
     let (_, datagram_task, tasks) = register_webtransport_binding(
         sessions,
         setup,
@@ -1118,6 +1149,7 @@ async fn register_webtransport_session(
         tasks,
     )
     .await?;
+
     Ok(WebTransportRegistration {
         downstream_stream_id,
         upstream,
@@ -1145,6 +1177,7 @@ async fn start_webtransport_association(
             association,
             datagram_task: cleanup.datagram_task,
         }),
+
         Err(error) => {
             cleanup
                 .upstream
@@ -1185,14 +1218,17 @@ async fn register_webtransport_binding(
 
     if let Err(error) = sessions.set(&binding, &setup.normalized).await {
         sessions.remove(downstream_stream_id).await;
+
         setup
             .upstream
             .unregister_webtransport_session(setup.upstream_session_id)
             .await;
+
         stop_datagram_task(datagram_task).await;
         stop_h3_tasks(tasks).await;
         return Err(error);
     }
+
     Ok((binding, datagram_task, tasks))
 }
 
@@ -1220,6 +1256,7 @@ async fn accept_webtransport_session(
     cleanup: WebTransportAcceptCleanup,
 ) -> Result<AcceptedWebTransport, BoxError> {
     let mut stream = stream;
+
     let WebTransportAcceptCleanup {
         upstream,
         upstream_session_id,
@@ -1233,6 +1270,7 @@ async fn accept_webtransport_session(
             upstream
                 .unregister_webtransport_session(upstream_session_id)
                 .await;
+
             stop_datagram_task(datagram_task).await;
             stop_h3_tasks(tasks).await;
             return Err(error.into());
@@ -1259,6 +1297,7 @@ async fn accept_webtransport_session(
         upstream
             .unregister_webtransport_session(upstream_session_id)
             .await;
+
         stop_datagram_task(datagram_task).await;
         stop_h3_tasks(tasks).await;
         return Err(boxed("WebTransport CONNECT stream already consumed"));
@@ -1283,6 +1322,7 @@ async fn accept_webtransport_for_binding(
 ) -> Result<AcceptedWebTransport, BoxError> {
     match accept_webtransport_session(request, stream, h3, informational_responses, cleanup).await {
         Ok(accepted) => Ok(accepted),
+
         Err(error) => {
             sessions.remove(binding_id).await;
             Err(error)
@@ -1305,6 +1345,7 @@ async fn prepare_webtransport(
         pending_webtransport,
         ..
     } = context;
+
     let (semantic, normalized, downstream_stream) = approve_webtransport_request(
         request,
         stream,
@@ -1317,6 +1358,7 @@ async fn prepare_webtransport(
     .await?;
 
     let upstream_url = url::Url::parse(&normalized.url.to_string())?;
+
     let upstream_host = upstream_url
         .host_str()
         .ok_or_else(|| boxed("normalized policy target has no host"))?;
@@ -1326,13 +1368,16 @@ async fn prepare_webtransport(
         .ok_or_else(|| boxed("normalized policy target has no port"))?;
 
     let upstream_authority = crate::policy::authority_for_policy(upstream_host, upstream_port);
+
     let key = session_key(
         &semantic,
         &normalized,
         SessionProtocol::WebTransport,
         claim.attribution_token.clone(),
     );
+
     let downstream_stream_id = downstream_stream.id();
+
     let upstream_request = build_upstream_request(
         &semantic,
         &upstream_url,
@@ -1341,6 +1386,7 @@ async fn prepare_webtransport(
     )?;
 
     sessions.reserve(downstream_stream_id, &key).await?;
+
     let session_open = open_session_request(
         SessionOpenContext {
             state: &state,
@@ -1378,6 +1424,7 @@ async fn prepare_webtransport(
         )
         .await;
     }
+
     crate::alt_svc::preserve_response_alt_svc(&mut response, &state.alt_svc, semantic.authority())
         .await;
 
@@ -1385,6 +1432,7 @@ async fn prepare_webtransport(
         sessions.remove(downstream_stream_id).await;
         return Err(boxed("WebTransport session has no incoming stream route"));
     };
+
     let upstream_stream_id = upstream_stream.id();
     let upstream_session_id = h3::webtransport::SessionId::from(upstream_stream_id);
 
@@ -1426,12 +1474,13 @@ async fn approve_webtransport_request(
             return Err(error);
         }
     };
+
     if let Err(error) = wait_for_downstream_settings(&stream, SessionProtocol::WebTransport).await {
         stream.stop_sending(Code::H3_SETTINGS_ERROR);
-
         stream.stop_stream(Code::H3_SETTINGS_ERROR);
         return Err(error);
     }
+
     if let Some(normalized) = sessions
         .approved(
             &semantic,
@@ -1444,12 +1493,15 @@ async fn approve_webtransport_request(
     }
 
     let request_id = ProxyRequestId::new();
+
     let _permit = state
         .active_checks
         .clone()
         .try_acquire_owned()
         .map_err(|_| boxed("too many active policy checks"))?;
+
     let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
+
     let check = tokio::select! {
         result = state.policy.check_http(
             request_id,
@@ -1462,6 +1514,7 @@ async fn approve_webtransport_request(
             return Err(boxed("proxy shutting down"));
         }
     };
+
     pending.disarm();
 
     let HttpCheckReply {
@@ -1554,12 +1607,14 @@ impl WebTransportAssociation {
             destination,
             bound_source,
         } = config;
+
         let (route_error_tx, route_error_rx) = mpsc::unbounded_channel();
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
         let session_id = session.session_id();
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mut first_route = first_route;
         first_route.cancel = Some(cancel_tx);
+
         tasks.push(spawn_webtransport_connect_relay(
             downstream_connect,
             upstream_connect,
@@ -1567,6 +1622,7 @@ impl WebTransportAssociation {
             route_error_tx.clone(),
             session_id,
         ));
+
         let mut association = Self {
             session,
             connection,
@@ -1588,6 +1644,7 @@ impl WebTransportAssociation {
             tasks,
             datagram_tasks: Vec::new(),
         };
+
         if let Err(error) = association
             .register_route(session_id, first_route, first_incoming)
             .await
@@ -1595,11 +1652,13 @@ impl WebTransportAssociation {
             stop_h3_tasks(association.tasks).await;
             return Err(error);
         }
+
         Ok(association)
     }
 
     async fn run(mut self) -> Result<(), BoxError> {
         let mut migration_tick = tokio::time::interval(Duration::from_millis(10));
+
         let result = loop {
             tokio::select! {
                 _ = migration_tick.tick() => {
@@ -1670,6 +1729,7 @@ impl WebTransportAssociation {
                 }
             }
         };
+
         self.finish().await;
         result
     }
@@ -1708,6 +1768,7 @@ impl WebTransportAssociation {
                     }
                 }));
             }
+
             IncomingWebTransportStream::Uni(mut upstream) => {
                 let mut cancel = self
                     .routes
@@ -1765,12 +1826,14 @@ impl WebTransportAssociation {
                 });
                 self.tasks.push(task);
             }
+
             h3_webtransport::server::AcceptedBi::Request(request, stream) => {
                 if let Err(error) = Box::pin(self.handle_request(request, stream)).await {
                     warn!(%error, "WebTransport request rejected");
                 }
             }
         }
+
         Ok(())
     }
 
@@ -1781,19 +1844,24 @@ impl WebTransportAssociation {
     ) -> Result<(), BoxError> {
         let Some(route) = self.routes.get(&session_id) else {
             stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
+
             return Err(boxed(
                 "WebTransport uni stream has an invalid session identifier",
             ));
         };
+
         let mut cancel = route
             .cancel
             .as_ref()
             .expect("WebTransport route cancellation")
             .subscribe();
+
         let upstream = route.upstream.clone();
+
         let upstream_stream = upstream
             .open_webtransport_uni_stream(route.upstream_session_id)
             .await?;
+
         let task = tokio::spawn(async move {
             tokio::select! {
                 result = relay_webtransport_uni(stream, upstream_stream) => {
@@ -1804,6 +1872,7 @@ impl WebTransportAssociation {
                 _ = cancel.changed() => {}
             }
         });
+
         self.tasks.push(task);
         Ok(())
     }
@@ -1822,6 +1891,7 @@ impl WebTransportAssociation {
         }
 
         let downstream_stream_id = stream.id();
+
         let downstream_datagrams = if request
             .extensions()
             .get::<h3::ext::Protocol>()
@@ -1834,8 +1904,10 @@ impl WebTransportAssociation {
         } else {
             None
         };
+
         let has_datagrams = downstream_datagrams.is_some();
         let datagram_router = has_datagrams.then(|| self.datagram_router.clone());
+
         let request_context = Http3RequestContext {
             state: self.state.clone(),
             claim: self.claim.clone(),
@@ -1850,11 +1922,13 @@ impl WebTransportAssociation {
             sessions: self.sessions.clone(),
             pending_webtransport: self.pending_webtransport.clone(),
         };
+
         let task = tokio::spawn(async move {
             let result =
                 serve_request(request, stream, request_context, downstream_datagrams).await;
             finish_h3_request(result, has_datagrams, datagram_router, downstream_stream_id).await;
         });
+
         self.tasks.push(task);
         Ok(())
     }
@@ -1866,6 +1940,7 @@ impl WebTransportAssociation {
         upstream_session_id: h3::webtransport::SessionId,
     ) {
         self.sessions.remove(downstream_stream_id).await;
+
         self.pending_webtransport
             .remove_and_unregister(upstream, upstream_session_id)
             .await;
@@ -1902,9 +1977,11 @@ impl WebTransportAssociation {
             pending_webtransport: self.pending_webtransport.clone(),
         })
         .await?;
+
         let downstream_stream_id = downstream_stream.id();
         let cleanup_upstream = upstream.clone();
         let mut downstream_stream = downstream_stream;
+
         if let Err(error) =
             send_informational_responses(&mut downstream_stream, informational_responses).await
         {
@@ -1914,8 +1991,10 @@ impl WebTransportAssociation {
                 upstream_session_id,
             )
             .await;
+
             return Err(error);
         }
+
         let (session_id, downstream_stream) = match self
             .session
             .accept_request_with_response(request, downstream_stream, response)
@@ -1932,6 +2011,7 @@ impl WebTransportAssociation {
                 return Err(error.into());
             }
         };
+
         Ok(AcceptedWebTransportRequest {
             semantic,
             normalized,
@@ -1977,7 +2057,9 @@ impl WebTransportAssociation {
         } = self
             .accept_prepared_webtransport_request(request, stream)
             .await?;
+
         let cleanup_upstream = upstream.clone();
+
         let binding = SessionBinding {
             key: session_key(
                 &semantic,
@@ -1988,6 +2070,7 @@ impl WebTransportAssociation {
             downstream_stream_id,
             upstream_stream_id,
         };
+
         if let Err(error) = self.sessions.set(&binding, &normalized).await {
             self.cleanup_webtransport_setup(
                 downstream_stream_id,
@@ -1995,9 +2078,12 @@ impl WebTransportAssociation {
                 upstream_session_id,
             )
             .await;
+
             return Err(error);
         }
+
         let (cancel_tx, cancel_rx) = watch::channel(false);
+
         if let Err(error) = self
             .register_route(
                 session_id,
@@ -2020,10 +2106,13 @@ impl WebTransportAssociation {
                 upstream_session_id,
             )
             .await;
+
             return Err(error);
         }
+
         self.pending_webtransport
             .remove(&cleanup_upstream, upstream_session_id);
+
         self.tasks.push(spawn_webtransport_connect_relay(
             downstream_stream,
             upstream_stream,
@@ -2031,6 +2120,7 @@ impl WebTransportAssociation {
             self.route_error_tx.clone(),
             session_id,
         ));
+
         Ok(())
     }
 
@@ -2045,6 +2135,7 @@ impl WebTransportAssociation {
                 "WebTransport session identifier is already registered",
             ));
         }
+
         let WebTransportRoute {
             upstream,
             upstream_session_id,
@@ -2054,6 +2145,7 @@ impl WebTransportAssociation {
             cancel,
             incoming_task: _,
         } = route;
+
         let cancel = cancel.ok_or_else(|| boxed("WebTransport route has no cancellation"))?;
         let downstream_reader = self.datagram_router.register(downstream_stream_id).await;
         let downstream_sender = self.session.datagram_sender_for(downstream_stream_id);
@@ -2080,6 +2172,7 @@ impl WebTransportAssociation {
         self.datagram_tasks.push(datagram_task);
         let incoming_tx = self.incoming_tx.clone();
         let incoming_error_tx = self.route_error_tx.clone();
+
         let incoming_task = tokio::spawn(async move {
             while let Some(stream) = upstream_incoming.recv().await {
                 if incoming_tx.send((binding_id, stream)).await.is_err() {
@@ -2109,42 +2202,53 @@ impl WebTransportAssociation {
         let Some(mut route) = self.routes.remove(&session_id) else {
             return;
         };
+
         warn!(%error, ?session_id, "WebTransport session failed");
         let _ = route.cancel.as_ref().map(|cancel| cancel.send(true));
+
         if let Some(task) = route.incoming_task.take() {
             task.abort();
             let _ = task.await;
         }
+
         self.datagram_router
             .unregister(route.downstream_stream_id)
             .await;
+
         route
             .upstream
             .unregister_webtransport_session(route.upstream_session_id)
             .await;
+
         self.sessions.remove(route.binding_id).await;
     }
 
     async fn finish(mut self) {
         stop_h3_tasks(self.tasks).await;
+
         for task in self.datagram_tasks {
             task.abort();
             let _ = task.await;
         }
+
         for (_, mut route) in self.routes.drain() {
             if let Some(task) = route.incoming_task.take() {
                 task.abort();
                 let _ = task.await;
             }
+
             self.datagram_router
                 .unregister(route.downstream_stream_id)
                 .await;
+
             route
                 .upstream
                 .unregister_webtransport_session(route.upstream_session_id)
                 .await;
+
             self.sessions.remove(route.binding_id).await;
         }
+
         self.pending_webtransport.cleanup().await;
     }
 }
@@ -2177,6 +2281,7 @@ fn spawn_datagram_relay(
     upstream_stream_id: StreamId,
 ) -> Option<tokio::task::JoinHandle<Result<(), BoxError>>> {
     let datagrams = datagrams?;
+
     Some(tokio::spawn(async move {
         relay_connect_udp_datagrams(
             datagrams.reader,
@@ -2219,6 +2324,7 @@ async fn await_request_relays(
     datagram_task: &mut Option<tokio::task::JoinHandle<Result<(), BoxError>>>,
 ) -> RequestRelayResults {
     let mut relay_task = Box::pin(select_datagram_relay(relay_response, datagram_task));
+
     tokio::select! {
         biased;
         body_result = &mut *body_task => {
@@ -2255,6 +2361,7 @@ fn body_task_result(
     match result {
         Ok(result) => result,
         Err(error) if error.is_cancelled() => Ok(()),
+
         Err(error) => Err(BoxError::from(format!(
             "HTTP request body relay failed: {error}"
         ))),
@@ -2353,6 +2460,7 @@ fn reject_webtransport_stream(stream: IncomingWebTransportStream) {
             stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
             stream.reset(Code::H3_REQUEST_REJECTED.value());
         }
+
         IncomingWebTransportStream::Uni(mut stream) => {
             stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
         }
@@ -2373,6 +2481,7 @@ where
 {
     loop {
         let data = std::future::poll_fn(|context| recv.poll_data(context)).await?;
+
         let Some(mut data) = data else {
             std::future::poll_fn(|context| output.poll_finish(context)).await?;
             return Ok(());
@@ -2381,6 +2490,7 @@ where
         while data.has_remaining() {
             let written =
                 std::future::poll_fn(|context| output.poll_send(context, &mut data)).await?;
+
             if written == 0 {
                 return Err(boxed("WebTransport stream made no send progress"));
             }
@@ -2394,6 +2504,7 @@ async fn wait_for_downstream_settings(
 ) -> Result<(), BoxError> {
     for _ in 0..200 {
         let settings = stream.settings();
+
         let supported = settings.enable_extended_connect()
             && (!protocol.needs_datagrams() || settings.enable_datagram())
             && (!matches!(protocol, SessionProtocol::WebTransport)
@@ -2429,6 +2540,7 @@ async fn serve_request(
         sessions,
         pending_webtransport,
     } = context;
+
     let semantic =
         match semantic_request(&request, &state, origin_port, origin_authority.as_deref()) {
             Ok(semantic) => semantic,
@@ -2465,17 +2577,20 @@ async fn serve_request(
         requested_protocol,
     )
     .await?;
+
     let Some(normalized) = normalized else {
         let mut stream = stream;
         stream.stop_sending(Code::H3_REQUEST_REJECTED);
         stream.stop_stream(Code::H3_REQUEST_REJECTED);
         return Ok(());
     };
+
     let datagrams = if requested_protocol == Some(SessionProtocol::ConnectUdp) {
         datagrams
     } else {
         None
     };
+
     let relay_context = Http3RequestContext {
         state,
         claim,
@@ -2486,6 +2601,7 @@ async fn serve_request(
         sessions,
         pending_webtransport,
     };
+
     relay_request(stream, semantic, normalized, relay_context, datagrams).await
 }
 
@@ -2504,8 +2620,10 @@ async fn authorize_request(
     } else {
         None
     };
+
     let Some(reused) = reused else {
         let request_id = ProxyRequestId::new();
+
         let _permit = state
             .active_checks
             .clone()
@@ -2513,6 +2631,7 @@ async fn authorize_request(
             .map_err(|_| boxed("too many active policy checks"))?;
 
         let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
+
         let check = tokio::select! {
             result = state.policy.check_http(
                 request_id,
@@ -2525,6 +2644,7 @@ async fn authorize_request(
                 return Err(boxed("proxy shutting down"));
             }
         };
+
         pending.disarm();
 
         let HttpCheckReply {
@@ -2539,8 +2659,10 @@ async fn authorize_request(
                 url = %semantic.forwarding_target(),
                 "downstream HTTP/3 request denied by policy"
             );
+
             return Ok(None);
         };
+
         return Ok(Some(normalized));
     };
 
@@ -2562,7 +2684,9 @@ fn semantic_request(
     // An alternative endpoint changes only the transport; the fallback port
     // for a port-less authority stays the origin's port.
     let fallback_port = origin_port.unwrap_or(state.destination_port);
+
     let request_authority = normalize_authority(authority.as_str(), fallback_port)?;
+
     let authority = if let Some(origin_authority) = origin_authority {
         let origin_authority = normalize_authority(origin_authority, fallback_port)?;
         if request_authority != origin_authority {
@@ -2576,6 +2700,7 @@ fn semantic_request(
     let scheme = uri
         .scheme_str()
         .ok_or_else(|| boxed("HTTP/3 request has no :scheme"))?;
+
     let protocol = request
         .extensions()
         .get::<h3::ext::Protocol>()
@@ -2594,6 +2719,7 @@ fn semantic_request(
     let session = protocol
         .map(|protocol| session::metadata(protocol, &authority))
         .transpose()?;
+
     let headers = semantic_request_headers(request.headers())?;
 
     for header in headers
@@ -2603,6 +2729,7 @@ fn semantic_request(
     {
         let host = std::str::from_utf8(header.value())
             .map_err(|_| boxed("HTTP/3 Host header is not valid UTF-8"))?;
+
         if normalize_authority(host, fallback_port)? != authority {
             return Err(boxed("HTTP/3 Host header does not match :authority"));
         }
@@ -2628,9 +2755,11 @@ fn has_capsule_protocol(semantic: &SemanticRequest) -> bool {
         .as_slice()
         .iter()
         .filter(|header| header.name() == "capsule-protocol");
+
     let Some(header) = values.next() else {
         return false;
     };
+
     header.value() == b"?1" && values.next().is_none()
 }
 
@@ -2674,6 +2803,7 @@ async fn relay_request(
     datagrams: Option<DatagramRelay>,
 ) -> Result<(), BoxError> {
     let downstream_stream_id = stream.id();
+
     let RelayRequestOpen {
         upstream,
         stream: request_stream,
@@ -2693,20 +2823,24 @@ async fn relay_request(
     let Http3RequestContext {
         state, sessions, ..
     } = context;
+
     let alt_svc = state.alt_svc.clone();
     let origin = semantic.authority().to_owned();
     let upstream_stream_id = request_stream.id();
+
     let binding = key.map(|key| SessionBinding {
         key,
         downstream_stream_id,
         upstream_stream_id,
     });
+
     let binding_id = binding.as_ref().map(|binding| binding.downstream_stream_id);
     let cleanup_sessions = sessions.clone();
     let (mut send_stream, mut recv_response) = request_stream.split();
     let (mut send_half, mut recv_half) = stream.split();
     let body_protocol = protocol;
     let capsule_protocol = has_capsule_protocol(&semantic);
+
     let expects_continue = protocol.is_none()
         && semantic.headers().as_slice().iter().any(|header| {
             header.name().eq_ignore_ascii_case("expect")
@@ -2727,6 +2861,7 @@ async fn relay_request(
     });
 
     let mut datagram_task = spawn_datagram_relay(datagrams, upstream.clone(), upstream_stream_id);
+
     let relay_response = relay_response(
         &mut send_half,
         &mut recv_response,
@@ -2754,10 +2889,12 @@ async fn relay_request(
         if let Some(datagram_task) = datagram_task.as_mut() {
             datagram_task.abort();
         }
+
         send_half.stop_stream(Code::H3_MESSAGE_ERROR);
     } else if relay_result.is_err() {
         send_half.stop_stream(Code::H3_MESSAGE_ERROR);
     }
+
     if (relay_result.is_err() || body_result.is_err())
         && let Some(binding_id) = binding_id
     {
@@ -2780,6 +2917,7 @@ async fn open_relay_request(
     let sessions = &context.sessions;
     let pending_webtransport = &context.pending_webtransport;
     let upstream_url = url::Url::parse(&normalized.url.to_string())?;
+
     let upstream_host = upstream_url
         .host_str()
         .ok_or_else(|| boxed("normalized policy target has no host"))?;
@@ -2789,6 +2927,7 @@ async fn open_relay_request(
         .ok_or_else(|| boxed("normalized policy target has no port"))?;
 
     let upstream_authority = crate::policy::authority_for_policy(upstream_host, upstream_port);
+
     let protocol = semantic
         .session()
         .map(|metadata| match metadata.protocol() {
@@ -2809,6 +2948,7 @@ async fn open_relay_request(
     });
 
     let request = build_upstream_request(semantic, &upstream_url, &upstream_authority, protocol)?;
+
     let session_open = if let Some(key) = key.as_ref() {
         sessions.reserve(downstream_stream_id, key).await?;
         match open_session_request(
@@ -2938,6 +3078,7 @@ async fn open_session_request(
                 continue;
             }
         };
+
         let mut stream = match upstream.send_request(request.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -2948,7 +3089,9 @@ async fn open_session_request(
                 continue;
             }
         };
+
         let upstream_session_id = h3::webtransport::SessionId::from(stream.id());
+
         let upstream_incoming = if key.protocol == SessionProtocol::WebTransport {
             let incoming = upstream
                 .register_webtransport_session(upstream_session_id)
@@ -2978,6 +3121,7 @@ async fn open_session_request(
                     upstream_incoming,
                 });
             }
+
             Ok((_informational_responses, response)) => {
                 if upstream_incoming.is_some() {
                     pending_webtransport
@@ -2990,6 +3134,7 @@ async fn open_session_request(
                 )
                 .into());
             }
+
             Err(error) => {
                 if upstream_incoming.is_some() {
                     pending_webtransport
@@ -3031,6 +3176,7 @@ fn build_upstream_request(
 ) -> Result<http::Request<()>, BoxError> {
     let target = semantic.forwarding_target();
     let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
+
     let mut request = http::Request::builder()
         .method(semantic.method().as_str())
         .uri(uri)
@@ -3080,7 +3226,9 @@ async fn relay_request_body(
                     _ => send_stream.send_data(chunk).await?,
                 }
             }
+
             Ok(None) => break,
+
             Err(error) => {
                 send_stream.stop_stream(map_stream_error(&error));
                 return Err(BoxError::from(format!(
@@ -3122,6 +3270,7 @@ async fn relay_webtransport_connect(
         ),
         relay_webtransport_response_body(&mut upstream_recv, &mut downstream_send),
     )?;
+
     Ok(())
 }
 
@@ -3191,7 +3340,9 @@ async fn relay_webtransport_response_body(
                 let chunk = chunk.copy_to_bytes(chunk.remaining());
                 relay_webtransport_response_capsules(&mut capsules, &chunk, stream).await?;
             }
+
             Ok(None) => break,
+
             Err(error) => {
                 stream.stop_stream(map_stream_error(&error));
                 return Err(BoxError::from(format!(
@@ -3202,9 +3353,11 @@ async fn relay_webtransport_response_body(
     }
 
     capsules.finish()?;
+
     if let Some(trailers) = recv_response.recv_trailers().await? {
         stream.send_trailers(trailers).await?;
     }
+
     stream.finish().await?;
     Ok(())
 }
@@ -3233,9 +3386,11 @@ async fn relay_informational_response(
     let is_continue = response.status().as_u16() == 100;
     crate::alt_svc::preserve_response_alt_svc(&mut response, alt_svc, origin).await;
     stream.send_response(response).await?;
+
     if is_continue && let Some(sender) = continue_tx.take() {
         let _ = sender.send(());
     }
+
     Ok(())
 }
 
@@ -3250,6 +3405,7 @@ async fn set_session_binding(
         sessions.remove(binding.downstream_stream_id).await;
         return Err(error);
     }
+
     Ok(())
 }
 
@@ -3261,18 +3417,22 @@ async fn relay_response_heads(
     continue_tx: &mut Option<oneshot::Sender<()>>,
 ) -> Result<http::Response<()>, BoxError> {
     let mut informational_count = 0;
+
     loop {
         let response = recv_response
             .recv_response_head()
             .await
             .map_err(|error| BoxError::from(format!("upstream response failed: {error}")))?;
+
         if !response.status().is_informational() {
             return Ok(response);
         }
+
         if informational_count == MAX_INFORMATIONAL_RESPONSES {
             recv_response.stop_sending(Code::H3_EXCESSIVE_LOAD);
             return Err(boxed("too many informational responses"));
         }
+
         informational_count += 1;
         relay_informational_response(stream, response, alt_svc, origin, continue_tx).await?;
     }
@@ -3295,7 +3455,9 @@ async fn relay_response(
         normalized,
         sessions,
     } = context;
+
     let mut continue_tx = continue_tx;
+
     let mut response = if let Some(response) = preflight_response {
         for informational_response in preflight_informational {
             relay_informational_response(

@@ -2,9 +2,11 @@ use crate::{
     FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
     is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
 };
+
 use agent_sandbox_core::HttpRequest;
 use agent_sandbox_proxy::semantic::SemanticRequest;
 use async_trait::async_trait;
+
 use rama_core::{
     Layer, Service,
     bytes::Bytes,
@@ -12,15 +14,19 @@ use rama_core::{
     extensions::ExtensionsRef,
     rt::Executor,
 };
+
 use rama_dns::client::DnsConnectorLayer;
+
 use rama_http::{
     Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
 };
+
 use rama_http_backend::client::{HttpConnector, HttpPooledConnectorConfig};
 use rama_net::client::EstablishedClientConnection;
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
+
 use std::{
     pin::Pin,
     sync::{
@@ -33,7 +39,6 @@ use std::{
 #[async_trait]
 trait UpstreamConnection: Send {
     fn h2_without_alpn(&self) -> bool;
-
     async fn send(self: Box<Self>) -> Result<Response, BoxError>;
 }
 
@@ -107,6 +112,7 @@ impl Drop for ReplayBody {
         };
 
         let mut shared = self.state.body.lock().expect("replay body lock");
+
         if shared.is_none() {
             *shared = Some(body);
         }
@@ -131,9 +137,11 @@ impl StreamingBody for ReplayBody {
         };
 
         let result = Pin::new(inner).poll_frame(cx);
+
         if matches!(&result, Poll::Ready(Some(Ok(_)))) {
             self.state.started.store(true, Ordering::Release);
         }
+
         result
     }
 
@@ -395,6 +403,7 @@ pub async fn send_upstream_request(
 
     request = request.map(|_| Body::new(ReplayBody::new(replay_state.clone())));
     let client = state.upstream_clients.for_version(selected_version);
+
     let connection = match client.connect(request).await {
         Ok(connection) => connection,
         Err(error)
@@ -411,6 +420,7 @@ pub async fn send_upstream_request(
         }
         Err(error) => return Err(error),
     };
+
     let h2_without_alpn = connection.h2_without_alpn();
 
     let response = match connection.send().await {
@@ -443,7 +453,9 @@ mod tests {
         ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
         is_protocol_negotiation_failure, select_upstream_version,
     };
+
     use rama_http::{Body, Version};
+
     use std::{
         pin::Pin,
         sync::{Arc, Mutex, atomic::AtomicBool},
@@ -456,10 +468,12 @@ mod tests {
             body: Mutex::new(None),
             started: AtomicBool::new(false),
         });
+
         let mut body = ReplayBody {
             state: state.clone(),
             inner: Some(Body::empty()),
         };
+
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -468,7 +482,6 @@ mod tests {
         ));
 
         drop(body);
-
         assert!(state.body.lock().expect("replay body lock").is_some());
     }
 
@@ -513,12 +526,15 @@ mod tests {
 
         let protocol_error: rama_http_core::h2::Error =
             rama_http_core::h2::Reason::PROTOCOL_ERROR.into();
+
         assert!(is_h2_protocol_negotiation_failure(&protocol_error, true));
         assert!(!is_h2_protocol_negotiation_failure(&protocol_error, false));
 
         let frame_size_error: rama_http_core::h2::Error =
             rama_http_core::h2::Reason::FRAME_SIZE_ERROR.into();
+
         assert!(is_h2_protocol_negotiation_failure(&frame_size_error, true));
+
         assert!(!is_h2_protocol_negotiation_failure(
             &frame_size_error,
             false
@@ -526,8 +542,8 @@ mod tests {
 
         let http11_required: rama_http_core::h2::Error =
             rama_http_core::h2::Reason::HTTP_1_1_REQUIRED.into();
-        assert!(!is_h2_protocol_negotiation_failure(&http11_required, true));
 
+        assert!(!is_h2_protocol_negotiation_failure(&http11_required, true));
         let cancel_error: rama_http_core::h2::Error = rama_http_core::h2::Reason::CANCEL.into();
         assert!(!is_h2_protocol_negotiation_failure(&cancel_error, true));
     }

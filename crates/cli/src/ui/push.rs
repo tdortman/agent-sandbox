@@ -12,16 +12,19 @@ use super::{
     },
     prompt_blocking, signature_display,
 };
+
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
     HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
     ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
     host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
 };
+
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
 };
+
 use tracing::warn;
 
 /// Default project-relative rule path shown in approval prompts.
@@ -1556,10 +1559,12 @@ mod tests {
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
+
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess,
     };
+
     use std::{collections::HashMap, path::Path};
 
     #[test]

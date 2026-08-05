@@ -18,6 +18,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+
 use tracing::debug;
 
 /// Rewrite the `Alt-Svc` headers of one approved response.
@@ -43,7 +44,6 @@ pub async fn preserve_response_alt_svc<B>(
 
     let borrowed = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let rewritten = store.record(origin, &borrowed).await;
-
     let headers = response.headers_mut();
     headers.remove("alt-svc");
 
@@ -132,6 +132,7 @@ impl AltSvcStore {
             for alternative in parse_alternatives(value) {
                 match alternative {
                     Alternative::Clear => cleared = true,
+
                     Alternative::Service(service) => {
                         let Some(entry) = self.resolved_entry(origin, &service).await else {
                             continue;
@@ -179,6 +180,7 @@ impl AltSvcStore {
                 port = service.port,
                 "filtering Alt-Svc alternative on an unintercepted port"
             );
+
             return None;
         }
 
@@ -311,7 +313,6 @@ fn parse_element(element: &str) -> Option<Alternative<'_>> {
     }
 
     let authority = authority.trim().trim_matches('"');
-
     let mut max_age = DEFAULT_MAX_AGE;
 
     for parameter in segments {
@@ -387,6 +388,7 @@ fn origin_port(origin: &str) -> Option<u16> {
 async fn resolve_host(host: &str) -> Vec<IpAddr> {
     match tokio::net::lookup_host((host, H3_DEFAULT_PORT)).await {
         Ok(addresses) => addresses.map(|address| address.ip()).collect(),
+
         Err(error) => {
             debug!(host, error = %error, "cannot resolve Alt-Svc alternative host");
             Vec::new()
@@ -421,6 +423,7 @@ mod tests {
             .into_iter()
             .filter_map(|ip| store.origin_for(ip, port))
             .collect::<Vec<_>>();
+
         origins.sort();
         origins.dedup();
         origins
@@ -429,6 +432,7 @@ mod tests {
     #[tokio::test]
     async fn preserves_intercepted_alternative_with_default_expiry() {
         let store = store();
+
         let rewritten = store
             .record("localhost:443", &[b"h3=\":8443\""])
             .await
@@ -442,7 +446,6 @@ mod tests {
     async fn filters_unintercepted_ports() {
         let store = store();
         let rewritten = store.record("localhost:443", &[b"h3=\":9999\""]).await;
-
         assert_eq!(rewritten, None);
         assert_eq!(recorded_origins(&store, 9999).await, Vec::<String>::new());
     }
@@ -450,16 +453,19 @@ mod tests {
     #[tokio::test]
     async fn filters_non_h3_protocols_and_malformed_values() {
         let store = store();
+
         assert_eq!(
             store.record("localhost:443", &[b"h2=\":8443\""]).await,
             None
         );
+
         assert_eq!(store.record("localhost:443", &[b"garbage"]).await, None);
     }
 
     #[tokio::test]
     async fn clear_removes_recorded_mappings_and_passes_through() {
         let store = store();
+
         store
             .record("localhost:443", &[b"h3=\":8443\""])
             .await
@@ -477,6 +483,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_drops_alternatives_no_longer_advertised() {
         let store = store();
+
         store
             .record("localhost:443", &[b"h3=\":8443\""])
             .await
@@ -494,19 +501,20 @@ mod tests {
     #[tokio::test]
     async fn expired_entries_are_not_resolved() {
         let store = store();
+
         store
             .record("localhost:443", &[b"h3=\":8443\"; ma=1"])
             .await
             .expect("short-lived alternative");
 
         sleep(Duration::from_millis(1_100)).await;
-
         assert_eq!(recorded_origins(&store, 8443).await, Vec::<String>::new());
     }
 
     #[tokio::test]
     async fn origin_port_comes_from_the_recorded_origin() {
         let store = store();
+
         store
             .record("localhost:443", &[b"h3=\":8443\""])
             .await
@@ -523,6 +531,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_valid_alternatives_are_all_preserved() {
         let store = store();
+
         let rewritten = store
             .record("localhost:443", &[b"h3=\":8443\", h3=\":443\""])
             .await
@@ -537,11 +546,9 @@ mod tests {
         let parsed = parse_authority(":8443").expect("valid authority");
         assert_eq!(parsed.host, None);
         assert_eq!(parsed.port, 8443);
-
         let parsed = parse_authority("alt.test:8443").expect("valid authority");
         assert_eq!(parsed.host, Some("alt.test"));
         assert_eq!(parsed.port, 8443);
-
         let parsed = parse_authority("").expect("valid authority");
         assert_eq!(parsed.host, None);
         assert_eq!(parsed.port, 443);

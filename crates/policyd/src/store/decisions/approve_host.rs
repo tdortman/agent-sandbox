@@ -1,10 +1,12 @@
 //! Approve a host directly (without a pending id).
 
 use super::{super::types::PolicyStore, DecisionAction};
+
 use crate::{
     error::PolicydError,
     wire::{HostApproveRequest, NetworkScopeOp, ScopeWire},
 };
+
 use agent_sandbox_core::{RpcReply, normalize_host};
 
 impl PolicyStore {

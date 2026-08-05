@@ -10,6 +10,7 @@ use crate::{
         ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
     },
 };
+
 use std::collections::BTreeMap;
 
 #[must_use]
@@ -250,6 +251,7 @@ fn merge_resources(layers: &[Policy]) -> ResourceSection {
 #[cfg(test)]
 mod tests {
     use super::merge_layers;
+
     use crate::policy::{
         DeviceAccess, FileAccess, FilesystemRule, FilesystemSection, Policy, ResourceAccess,
         ResourceKind, ResourceRule, ResourceSection,

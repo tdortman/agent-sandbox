@@ -1,6 +1,7 @@
 //! Shared error types for policy paths and I/O.
 
 use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

@@ -10,12 +10,15 @@ use agent_sandbox_core::{
     DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, EchRewrite, mappings_from_response,
     rewrite_ech_config,
 };
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
+
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
     rr::{RData, rdata::svcb::SvcParamKey},
 };
+
 use std::{
     net::{IpAddr, SocketAddr},
     os::unix::net::UnixDatagram,
@@ -23,10 +26,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
 };
+
 use tracing::{debug, info, warn};
 
 /// Build a DNS `SERVFAIL` response for a parseable query packet.
@@ -523,10 +528,12 @@ impl DnsForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query, ResponseCode},
         rr::{Name, RData, Record, RecordType, rdata::TXT},
     };
+
     use std::{
         net::{Ipv4Addr, SocketAddr},
         os::unix::net::UnixDatagram,

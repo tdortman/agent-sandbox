@@ -1,8 +1,10 @@
 use crate::{NetworkTarget, ResourceTarget};
+
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
     ResourceCheckReply, RpcReply, RpcRequest, SandboxPaths,
 };
+
 use std::{
     io,
     path::{Path, PathBuf},
@@ -146,10 +148,13 @@ impl PersistentPolicyClient {
 #[cfg(test)]
 mod tests {
     use super::PersistentPolicyClient;
+
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
+
     use std::{path::Path, time::Duration};
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,

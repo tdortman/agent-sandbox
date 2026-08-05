@@ -22,11 +22,14 @@
 //! ECH fails closed rather than negotiating with its real configuration.
 
 use super::{BoxError, hpke::ECH_SUPPORTED_SUITES};
+
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{Name, RData, RecordType, rdata::svcb::SvcParamKey},
 };
+
 use rustls::{client::EchConfig, pki_types::EchConfigListBytes};
+
 use std::{
     collections::HashMap,
     io::ErrorKind,
@@ -35,6 +38,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
 use tracing::warn;
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -46,6 +50,7 @@ const DEFAULT_TTL_SECONDS: u32 = 3_600;
 pub struct UpstreamEch {
     /// Resolver override for tests; `None` reads `/etc/resolv.conf`.
     dns: Option<SocketAddr>,
+
     cache: Mutex<HashMap<String, CachedEch>>,
 }
 
@@ -108,6 +113,7 @@ impl UpstreamEch {
 
                 Ok(Some(config))
             }
+
             Ok(None) => {
                 let ttl = DEFAULT_TTL_SECONDS.clamp(MIN_TTL_SECONDS, MAX_TTL_SECONDS);
 
@@ -121,6 +127,7 @@ impl UpstreamEch {
 
                 Ok(None)
             }
+
             Err(error) => {
                 // A discovery failure is not a verdict on the origin's ECH
                 // support: do not cache it, so the next connection retries
@@ -260,6 +267,7 @@ fn parse_resolv_conf(path: &Path) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::{parse_https_answer, parse_resolv_conf, verify_config};
+
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{
@@ -270,6 +278,7 @@ mod tests {
             },
         },
     };
+
     use std::{net::Ipv4Addr, path::Path};
 
     fn https_answer(ech: Option<&[u8]>) -> Message {
@@ -284,7 +293,6 @@ mod tests {
         }
 
         let https = RData::HTTPS(HTTPS(SVCB::new(1, name.clone(), params)));
-
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.add_query(Query::query(name.clone(), RecordType::HTTPS));
         message.add_answer(Record::from_rdata(name, 300, https));
@@ -294,7 +302,6 @@ mod tests {
     #[test]
     fn extracts_ech_config_from_https_answer() {
         let answer = https_answer(Some(&[1, 2, 3, 4]));
-
         let parsed = parse_https_answer(&answer).expect("parsed answer");
         assert_eq!(parsed.config, vec![1, 2, 3, 4]);
         assert_eq!(parsed.ttl, 300);
@@ -311,6 +318,7 @@ mod tests {
         let name = Name::from_ascii("example.test.").expect("valid name");
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.add_query(Query::query(name.clone(), RecordType::HTTPS));
+
         message.add_answer(Record::from_rdata(
             name,
             300,
@@ -324,7 +332,6 @@ mod tests {
     fn servfail_answers_are_ignored() {
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.metadata.response_code = hickory_proto::op::ResponseCode::ServFail;
-
         assert!(parse_https_answer(&message).is_none());
     }
 
@@ -334,7 +341,6 @@ mod tests {
 
         let name = Name::from_ascii("example.test.").expect("valid name");
         let other = Name::from_ascii("other.test.").expect("valid name");
-
         let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
         message.add_query(Query::query(name.clone(), RecordType::HTTPS));
 
@@ -346,6 +352,7 @@ mod tests {
             300,
             RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::LOCALHOST)),
         ));
+
         message.add_answer(Record::from_rdata(
             name.clone(),
             300,
@@ -355,6 +362,7 @@ mod tests {
                 Vec::new(),
             ))),
         ));
+
         message.add_answer(Record::from_rdata(
             name.clone(),
             300,
@@ -377,6 +385,7 @@ mod tests {
     fn reads_first_nameserver_from_resolv_conf() {
         let root = tempfile::tempdir().expect("temporary directory");
         let path = root.path().join("resolv.conf");
+
         std::fs::write(
             &path,
             "# comment\nnameserver 10.0.0.53\nnameserver 10.0.0.54\n",
@@ -401,6 +410,7 @@ mod tests {
     fn ignores_malformed_nameserver_lines() {
         let root = tempfile::tempdir().expect("temporary directory");
         let path = root.path().join("resolv.conf");
+
         std::fs::write(&path, "nameserver not-an-ip\nnameserver 192.0.2.1\n")
             .expect("write resolv.conf");
 

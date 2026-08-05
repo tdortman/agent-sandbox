@@ -6,6 +6,7 @@ use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
     HttpSessionMetadata as CoreHttpSessionMetadata,
 };
+
 use serde::{Deserialize, Serialize, Serializer};
 use std::{collections::VecDeque, fmt};
 
@@ -1231,6 +1232,7 @@ mod tests {
     #[test]
     fn response_sequence_rejects_late_headers_and_tracks_reset_after_trailers() {
         let mut sequence = ResponseSequence::new();
+
         sequence
             .push(ResponseEvent::Final(
                 ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
@@ -1247,15 +1249,18 @@ mod tests {
         sequence
             .push(ResponseEvent::BodyChunk(vec![1]))
             .expect("body");
+
         sequence
             .push(ResponseEvent::Trailers(SemanticHeaders::new()))
             .expect("trailers");
+
         assert_eq!(
             sequence.push(ResponseEvent::BodyChunk(vec![2])),
             Err(EventError::InvalidOrdering)
         );
 
         sequence.push(ResponseEvent::Reset(7)).expect("reset");
+
         assert_eq!(
             sequence.push(ResponseEvent::Complete),
             Err(EventError::AfterTerminal)

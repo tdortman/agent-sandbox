@@ -5,14 +5,17 @@ use super::{
     decisions::DecisionAction,
     types::{PolicyDecisionState, PolicyStore},
 };
+
 use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, ScopeWire},
 };
+
 use agent_sandbox_core::{
     ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,
     ScopeTarget,
 };
+
 use std::path::{Path, PathBuf};
 
 fn session_network_entries(host: &str, port: u16) -> Vec<NetworkRuleKey> {

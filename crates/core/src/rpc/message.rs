@@ -1,6 +1,7 @@
 //! Wire envelope for replies and UI pushes.
 
 use super::{push::UiPush, reply::RpcReply};
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

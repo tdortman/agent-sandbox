@@ -1,10 +1,12 @@
 //! Policy RPC client for NFQUEUE, calls policyd's `Check` endpoint.
 
 use crate::packet::TransportProtocol;
+
 use agent_sandbox_core::{
     FlowRegistration, ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths,
     attach_check_aliases, policy_rpc,
 };
+
 use std::time::Duration;
 
 struct PolicyContext {

@@ -3,13 +3,16 @@
 use super::types::{
     MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState,
 };
+
 use crate::{error::PolicydError, wire::NetworkCheckRequest};
+
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
     ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity,
     socket_owner::validate_socket_identity,
 };
+
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -211,7 +214,6 @@ impl PolicyStore {
         state.connection_id = Some(connection_id);
         state.claimed_at = Some(now);
         state.last_check = now;
-
         let policy_host = state.registration.policy_host().clone();
         drop(inner);
 
@@ -304,7 +306,6 @@ impl PolicyStore {
         state.connection_id = Some(connection_id);
         state.claimed_at = Some(now);
         state.last_check = now;
-
         let policy_host = state.registration.policy_host().clone();
         drop(inner);
 
@@ -600,12 +601,13 @@ impl PolicyStore {
         }
 
         inner.proxy_flows.remove(&flow);
-
         let now = Instant::now();
+
         let state = inner
             .proxy_flows
             .remove(&old_key)
             .expect("claimed flow exists");
+
         let rebind = ProxyFlowState {
             registration: FlowRegistration::new(
                 flow.clone(),
@@ -620,6 +622,7 @@ impl PolicyStore {
             claimed_at: state.claimed_at,
             last_check: now,
         };
+
         inner.proxy_flows.insert(flow, rebind);
         drop(inner);
         Ok(())
@@ -810,11 +813,13 @@ fn prune_flows(
 mod tests {
     use super::*;
     use crate::store::types::{Pending, PolicyStore};
+
     use agent_sandbox_core::{
         FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
         SocketIdentity, SocketInode, VerdictSource,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
+
     use std::{sync::Arc, time::Duration};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
@@ -889,6 +894,7 @@ mod tests {
     async fn redirected_flow_claim_returns_registered_destination() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(&dir);
+
         let session = store
             .open_proxy_session(1)
             .await
@@ -898,6 +904,7 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
         let owner = test_udp_owner(source).await;
+
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             source.ip(),
@@ -906,6 +913,7 @@ mod tests {
             443,
         )
         .expect("valid flow");
+
         let registration = FlowRegistration::new(
             flow.clone(),
             owner,
@@ -948,7 +956,6 @@ mod tests {
 
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
-
         let owner = test_udp_owner(source).await;
 
         let flow = NetworkFlowKey::try_new(
@@ -1056,9 +1063,11 @@ mod tests {
                 SocketTuple::from_local(source.ip(), source.port()),
             ) {
                 OwnerResolution::Unique(snapshot) => return snapshot.identity(),
+
                 OwnerResolution::Missing => {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
+
                 OwnerResolution::Ambiguous => panic!("expected unique UDP owner"),
             }
         }
@@ -1078,7 +1087,6 @@ mod tests {
     ) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
-
         let owner = test_udp_owner(source).await;
 
         let flow = NetworkFlowKey::try_new(
@@ -1101,6 +1109,7 @@ mod tests {
             .expect("register flow");
 
         let connection_id = ProxyConnectionId::new();
+
         let claim = store
             .claim_network_flow(session.clone(), flow.clone(), connection_id)
             .await
@@ -1117,6 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn denied_stream_does_not_close_association() {
         let dir = tempfile::tempdir().expect("tempdir");
+
         std::fs::write(
             dir.path().join("declarative.json"),
             r#"{
@@ -1131,11 +1141,13 @@ mod tests {
         .expect("declarative policy");
 
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
 
         let denied = store
@@ -1147,6 +1159,7 @@ mod tests {
             )
             .await
             .expect("denied check should reply");
+
         assert!(!denied.allowed, "deny rule must apply");
 
         let allowed = store
@@ -1158,6 +1171,7 @@ mod tests {
             )
             .await
             .expect("allowed check should reply");
+
         assert!(
             allowed.allowed,
             "allow rule must still apply on the same claim"
@@ -1173,14 +1187,16 @@ mod tests {
     async fn canceled_check_blocks_without_releasing_claim() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
 
+        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
         let request_id = ProxyRequestId::new();
+
         store
             .cancel_check(session.clone(), request_id)
             .await
@@ -1197,6 +1213,7 @@ mod tests {
             .expect("canceled check should reply");
 
         assert!(!reply.allowed, "canceled check must be blocked");
+
         assert_eq!(
             reply.error.as_deref(),
             Some("agent-sandbox: HTTP check cancelled")
@@ -1212,16 +1229,19 @@ mod tests {
     async fn rebind_preserves_ownership_after_valid_migration() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (_old_socket, old_flow, connection_id, token) =
             test_udp_association(&store, &session).await;
 
         let migrated = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let migrated_source = migrated.local_addr().expect("socket address");
+
         let migrated_flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             migrated_source.ip(),
@@ -1280,15 +1300,17 @@ mod tests {
     async fn rebind_rejects_unknown_connection_identifier() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
 
+        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
         let migrated = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let migrated_source = migrated.local_addr().expect("socket address");
+
         let migrated_flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             migrated_source.ip(),
@@ -1309,6 +1331,7 @@ mod tests {
             .expect_err("unknown identifier must be rejected");
 
         assert!(error.to_string().contains("unknown connection identifier"));
+
         store
             .release_network_flow(session, token, connection_id)
             .await
@@ -1319,16 +1342,19 @@ mod tests {
     async fn rebind_rejects_changed_destination() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (_socket, old_flow, connection_id, token) =
             test_udp_association(&store, &session).await;
 
         let migrated = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let migrated_source = migrated.local_addr().expect("socket address");
+
         let migrated_flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             migrated_source.ip(),
@@ -1348,6 +1374,7 @@ mod tests {
                 .to_string()
                 .contains("rebind cannot change the flow destination")
         );
+
         assert!(store.inner.lock().await.proxy_flows.contains_key(&old_flow));
     }
 
@@ -1355,17 +1382,20 @@ mod tests {
     async fn rebind_rejects_unowned_path_and_non_udp_flows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (_socket, _old_flow, connection_id, token) =
             test_udp_association(&store, &session).await;
 
         let vanished = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let vanished_source = vanished.local_addr().expect("socket address");
         drop(vanished);
+
         let vanished_flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             vanished_source.ip(),
@@ -1389,6 +1419,7 @@ mod tests {
             .rebind_network_flow(session.clone(), token.clone(), connection_id, vanished_flow)
             .await
             .expect_err("unowned path must be rejected");
+
         assert!(error.to_string().contains("socket owner changed"));
 
         let tcp_flow = NetworkFlowKey::try_new(
@@ -1404,6 +1435,7 @@ mod tests {
             .rebind_network_flow(session.clone(), token.clone(), connection_id, tcp_flow)
             .await
             .expect_err("non-UDP rebind must be rejected");
+
         assert!(error.to_string().contains("rebind requires a UDP flow"));
 
         store
@@ -1416,17 +1448,20 @@ mod tests {
     async fn release_rejects_unknown_connection_identifier() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
 
         let error = store
             .release_network_flow(session.clone(), token.clone(), ProxyConnectionId::new())
             .await
             .expect_err("release with an unknown identifier must be rejected");
+
         assert!(error.to_string().contains("unknown connection identifier"));
 
         store
@@ -1439,11 +1474,13 @@ mod tests {
     async fn ownership_loss_fails_checks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (socket, _flow, _connection_id, token) = test_udp_association(&store, &session).await;
         drop(socket);
 
@@ -1464,13 +1501,14 @@ mod tests {
     async fn close_proxy_session_releases_all_claims() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
 
+        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
         store.close_proxy_session(1).await;
 
         let error = store
@@ -1482,6 +1520,7 @@ mod tests {
             )
             .await
             .expect_err("session close must invalidate claims");
+
         assert!(
             error.to_string().contains("proxy session token is invalid"),
             "unexpected error: {error}"
@@ -1491,6 +1530,7 @@ mod tests {
             .release_network_flow(session, token, connection_id)
             .await
             .expect_err("release after session close must reject the stale session");
+
         assert!(error.to_string().contains("proxy session token is invalid"));
     }
 
@@ -1499,6 +1539,7 @@ mod tests {
         // Intercepted associations can stay idle for arbitrarily long periods,
         // so a claimed flow must never be pruned by an idle TTL.
         let dir = tempfile::tempdir().expect("tempdir");
+
         std::fs::write(
             dir.path().join("declarative.json"),
             r#"{"network":{"http":{"allow":[{"methods":["GET"],"url":"https://example.com/ok"}]}}}"#,
@@ -1506,11 +1547,13 @@ mod tests {
         .expect("declarative policy");
 
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let (_socket, flow, connection_id, token) = test_udp_association(&store, &session).await;
 
         {
@@ -1531,6 +1574,7 @@ mod tests {
             )
             .await
             .expect("claim must survive long idle");
+
         assert!(reply.allowed, "long-idle claim must still reach policy");
 
         store
@@ -1543,6 +1587,7 @@ mod tests {
     async fn unclaimed_registrations_still_prune_after_ttl() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
+
         let session = store
             .open_proxy_session(1)
             .await
@@ -1552,6 +1597,7 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
         let owner = test_udp_owner(source).await;
+
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Udp,
             source.ip(),
@@ -1587,6 +1633,7 @@ mod tests {
             .claim_network_flow(session, flow, ProxyConnectionId::new())
             .await
             .expect_err("unclaimed registration must prune after its TTL");
+
         assert!(error.to_string().contains("flow is not registered"));
     }
 }

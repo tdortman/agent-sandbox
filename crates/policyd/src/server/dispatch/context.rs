@@ -4,12 +4,14 @@ use crate::{
     server::{dispatch::SocketRole, peer::ClientPeer},
     store::{PolicyStore, TrustedPeer},
 };
+
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, AttributionToken, FileAccess, FilesystemRule, FlowRegistration,
     HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkFlowSelector, ProxyConnectionId,
     ProxyRequestId, ProxySessionToken, RequestContext, ResolvedRequestContext, ResourceAccess,
     ResourceKind, RpcRequest,
 };
+
 use std::{path::PathBuf, sync::Arc};
 
 pub(super) enum ResolvedRpcRequest {
@@ -440,13 +442,16 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::{ResolvedRpcRequest, plan};
+
     use crate::{
         server::{dispatch::SocketRole, peer::ClientPeer},
         store::PolicyStore,
     };
+
     use agent_sandbox_core::{
         FileAccess, ProcessIds, RequestContext, ResolvedRequestContext, RpcRequest, home_from_uid,
     };
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,

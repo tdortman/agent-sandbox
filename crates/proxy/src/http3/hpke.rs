@@ -14,6 +14,7 @@ use ring::{
     hmac,
     rand::SystemRandom,
 };
+
 use rustls::{
     Error, OtherError,
     crypto::hpke::{
@@ -24,6 +25,7 @@ use rustls::{
         handshake::HpkeSymmetricCipherSuite,
     },
 };
+
 use std::{
     fmt,
     io::{Error as IoError, ErrorKind},
@@ -80,16 +82,15 @@ impl RingHpke {
 
         // Base mode: no PSK and an empty PSK ID.
         let psk_id_hash = labeled_extract(&suite_id, &[], Label::PskIdHash, &[]);
-        let info_hash = labeled_extract(&suite_id, &[], Label::InfoHash, info);
 
+        let info_hash = labeled_extract(&suite_id, &[], Label::InfoHash, info);
         let mut key_schedule_context = Vec::with_capacity(1 + psk_id_hash.len() + info_hash.len());
         key_schedule_context.push(0x00); // mode_base
         key_schedule_context.extend_from_slice(&psk_id_hash);
         key_schedule_context.extend_from_slice(&info_hash);
-
         let secret = labeled_extract_prk(&suite_id, shared_secret, Label::Secret, &[]);
-
         let mut key = vec![0_u8; self.key_len];
+
         labeled_expand_into(
             &suite_id,
             &secret,
@@ -99,6 +100,7 @@ impl RingHpke {
         );
 
         let mut base_nonce = [0_u8; NONCE_LEN];
+
         labeled_expand_into(
             &suite_id,
             &secret,
@@ -135,7 +137,6 @@ impl Hpke for RingHpke {
     ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer + 'static>), Error> {
         let (shared_secret, enc) = encap(pub_key)?;
         let key_schedule = self.key_schedule(&shared_secret, info);
-
         Ok((enc, Box::new(Sealer::new(key_schedule))))
     }
 
@@ -210,11 +211,10 @@ impl KeySchedule {
     fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         let nonce = self.compute_nonce();
         self.increment_seq_num();
-
         let key = ring::aead::UnboundKey::new(self.aead, &self.key).map_err(unspecified_err)?;
         let key = ring::aead::LessSafeKey::new(key);
-
         let mut in_out = plaintext.to_vec();
+
         key.seal_in_place_append_tag(
             ring::aead::Nonce::assume_unique_for_key(nonce),
             ring::aead::Aad::from(aad),
@@ -248,8 +248,8 @@ fn encap(
 ) -> Result<([u8; SHA256_OUTPUT_LEN], EncapsulatedSecret), Error> {
     let sk_e =
         EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).map_err(unspecified_err)?;
-    let enc = sk_e.compute_public_key().map_err(unspecified_err)?;
 
+    let enc = sk_e.compute_public_key().map_err(unspecified_err)?;
     let pk_r = UnparsedPublicKey::new(&X25519, &recipient.0);
     let kem_context = [enc.as_ref(), pk_r.as_ref()].concat();
 
@@ -262,10 +262,9 @@ fn encap(
 /// `ExtractAndExpand` for the KEM context (RFC 9180 4.1).
 fn extract_and_expand(dh: &[u8], kem_context: &[u8]) -> [u8; SHA256_OUTPUT_LEN] {
     let suite_id = LabeledSuiteId::Kem(HpkeKem::DHKEM_X25519_HKDF_SHA256);
-
     let eae_prk = labeled_extract_prk(&suite_id, &[], Label::EaePrk, dh);
-
     let mut shared_secret = [0_u8; SHA256_OUTPUT_LEN];
+
     labeled_expand_into(
         &suite_id,
         &eae_prk,
@@ -320,6 +319,7 @@ impl LabeledSuiteId {
                 &u16::from(suite.sym.aead_id).to_be_bytes(),
             ]
             .concat(),
+
             Self::Kem(kem) => [b"KEM".as_slice(), &u16::from(*kem).to_be_bytes()].concat(),
         }
     }
@@ -338,7 +338,6 @@ fn labeled_extract(
     labeled_ikm.extend_from_slice(&suite_id.encoded());
     labeled_ikm.extend_from_slice(label.as_bytes());
     labeled_ikm.extend_from_slice(ikm);
-
     let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
     let mut tag = [0_u8; SHA256_OUTPUT_LEN];
     tag.copy_from_slice(hmac::sign(&key, &labeled_ikm).as_ref());
@@ -368,11 +367,12 @@ fn labeled_expand_into(
     labeled_info.extend_from_slice(&suite_id.encoded());
     labeled_info.extend_from_slice(label.as_bytes());
     labeled_info.extend_from_slice(info);
-
     let info = [&labeled_info[..]];
+
     let okm = prk
         .expand(&info, HkdfLength(out.len()))
         .expect("HPKE label expansion");
+
     okm.fill(out).expect("HPKE label expansion output");
 }
 
@@ -401,6 +401,7 @@ fn client_only() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{DHKEM_X25519_HKDF_SHA256_AES_128, KeySchedule, labeled_extract};
+
     use rustls::{
         crypto::hpke::{Hpke, HpkePrivateKey, HpkePublicKey},
         internal::msgs::enums::HpkeKem,
@@ -411,6 +412,7 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
+
         (0..value.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&value[i..i + 2], 16).expect("hex byte"))
@@ -420,11 +422,13 @@ mod tests {
     /// RFC 9180 appendix A.1.1 base-mode vector, DHKEM(X25519, HKDF-SHA256),
     /// HKDF-SHA256, AES-128-GCM.
     const INFO: &str = "4f6465206f6e2061204772656369616e2055726e";
+
     const SHARED_SECRET: &str = "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc";
     const KEY: &str = "4531685d41d65f03dc48f6b8302c05b0";
     const BASE_NONCE: &str = "56d890e5accaaf011cff4b7d";
     const PT: &str = "4265617574792069732074727574682c20747275746820626561757479";
     const AAD: &str = "436f756e742d30";
+
     const CT: &str = "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a9\
                      6d8770ac83d07bea87e13c512a";
 
@@ -432,9 +436,7 @@ mod tests {
     fn key_schedule_matches_rfc_9180_vector() {
         let mut shared_secret = [0_u8; 32];
         shared_secret.copy_from_slice(&hex(SHARED_SECRET));
-
         let schedule = DHKEM_X25519_HKDF_SHA256_AES_128.key_schedule(&shared_secret, &hex(INFO));
-
         assert_eq!(schedule.key, hex(KEY));
         assert_eq!(&schedule.base_nonce, hex(BASE_NONCE).as_slice());
     }
@@ -446,8 +448,8 @@ mod tests {
 
         let mut schedule =
             DHKEM_X25519_HKDF_SHA256_AES_128.key_schedule(&shared_secret, &hex(INFO));
-        let ciphertext = schedule.seal(&hex(AAD), &hex(PT)).expect("seal");
 
+        let ciphertext = schedule.seal(&hex(AAD), &hex(PT)).expect("seal");
         assert_eq!(ciphertext, hex(CT));
     }
 
@@ -457,6 +459,7 @@ mod tests {
         // "HPKE" prefix would diverge from RFC 9180 and from rustls's own
         // provider.
         let suite_id = super::LabeledSuiteId::Kem(HpkeKem::DHKEM_X25519_HKDF_SHA256);
+
         let eae_prk = labeled_extract(&suite_id, &[], super::Label::EaePrk, &[1, 2, 3]);
 
         let reference = {
@@ -482,6 +485,7 @@ mod tests {
         let pk_r = HpkePublicKey(hex(
             "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
         ));
+
         let info = hex(INFO);
 
         let (enc, mut sealer) = DHKEM_X25519_HKDF_SHA256_AES_128
@@ -489,11 +493,10 @@ mod tests {
             .expect("sealer setup");
 
         assert_eq!(enc.0.len(), 32);
-
         let first = sealer.seal(b"aad", b"plaintext").expect("first seal");
         let second = sealer.seal(b"aad", b"plaintext").expect("second seal");
-
         assert_ne!(first, b"plaintext");
+
         // The sequence number feeds the nonce, so two seals differ even for
         // identical plaintext and AAD.
         assert_ne!(first, second);
@@ -504,9 +507,11 @@ mod tests {
         let pk_r = HpkePublicKey(hex(
             "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
         ));
+
         let sk_r = HpkePrivateKey::from(hex(
             "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
         ));
+
         let info = hex(INFO);
 
         let (enc, _) = DHKEM_X25519_HKDF_SHA256_AES_128
@@ -518,11 +523,13 @@ mod tests {
                 .open(&enc, &info, b"aad", b"ct", &sk_r)
                 .is_err()
         );
+
         assert!(
             DHKEM_X25519_HKDF_SHA256_AES_128
                 .setup_opener(&enc, &info, &sk_r)
                 .is_err()
         );
+
         assert!(
             DHKEM_X25519_HKDF_SHA256_AES_128
                 .generate_key_pair()
@@ -534,6 +541,7 @@ mod tests {
     fn nonce_xors_sequence_number() {
         let mut base_nonce = [0_u8; 12];
         base_nonce[..4].copy_from_slice(&[0x56, 0xD8, 0x90, 0xE5]);
+
         let schedule = KeySchedule {
             aead: &ring::aead::AES_128_GCM,
             key: vec![0; 16],

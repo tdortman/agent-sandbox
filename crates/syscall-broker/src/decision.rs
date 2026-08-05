@@ -1,8 +1,10 @@
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
+
 use agent_sandbox_syscall_broker::{
     FilesystemTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif, SyscallTarget,
     target_from_notification,
 };
+
 use std::{io, path::Path, time::Duration};
 
 /// Facts extracted from a raw seccomp notification before policy evaluation.
@@ -232,10 +234,12 @@ pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
 #[cfg(test)]
 mod tests {
     use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
+
     use agent_sandbox_core::{
         DeviceAccess, FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply,
         ResourceKind, VerdictSource,
     };
+
     use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
     use std::{io, path::Path, time::Duration};
 

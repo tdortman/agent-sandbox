@@ -1,6 +1,7 @@
 //! HTTP/3 extended-session validation and wire helpers.
 
 use agent_sandbox_core::{AttributionToken, HttpSessionMetadata};
+
 use bytes::Bytes;
 use h3::{ext::Protocol, quic::StreamId};
 use std::fmt;
@@ -14,8 +15,10 @@ pub(super) const DATAGRAM_CAPSULE_TYPE: u64 = 0;
 pub enum SessionProtocol {
     /// RFC 9220 WebSocket extended CONNECT.
     WebSocket,
+
     /// WebTransport over HTTP/3.
     WebTransport,
+
     /// RFC 9298 CONNECT-UDP.
     ConnectUdp,
 }
@@ -80,10 +83,13 @@ pub fn metadata(
 pub struct SessionKey {
     /// The policy-approved origin authority.
     pub origin: String,
+
     /// The policy-approved session target.
     pub target: String,
+
     /// The policy-approved protocol.
     pub protocol: SessionProtocol,
+
     /// The policy attribution that approved the session.
     pub attribution: AttributionToken,
 }
@@ -93,6 +99,7 @@ pub struct SessionKey {
 pub struct Capsule {
     /// Capsule type.
     pub kind: u64,
+
     /// Capsule payload without the type and length fields.
     pub payload: Bytes,
 }
@@ -122,6 +129,7 @@ impl CapsuleDecoder {
             let Some((kind, kind_len)) = decode_varint(&self.buffered[offset..])? else {
                 break;
             };
+
             let Some((length, length_len)) = decode_varint(&self.buffered[offset + kind_len..])?
             else {
                 break;
@@ -130,7 +138,9 @@ impl CapsuleDecoder {
             if length > MAX_CAPSULE_BYTES as u64 {
                 return Err(SessionError::CapsuleTooLarge);
             }
+
             let start = offset + kind_len + length_len;
+
             let end = start
                 .checked_add(usize::try_from(length).map_err(|_| SessionError::InvalidCapsule)?)
                 .ok_or(SessionError::InvalidCapsule)?;
@@ -143,6 +153,7 @@ impl CapsuleDecoder {
                 kind,
                 payload: Bytes::copy_from_slice(&self.buffered[start..end]),
             });
+
             offset = end;
         }
 
@@ -172,6 +183,7 @@ impl CapsuleDecoder {
 pub fn encode_capsule(kind: u64, payload: &[u8]) -> Bytes {
     let mut encoded =
         Vec::with_capacity(varint_len(kind) + varint_len(payload.len() as u64) + payload.len());
+
     encode_varint(kind, &mut encoded);
     encode_varint(payload.len() as u64, &mut encoded);
     encoded.extend_from_slice(payload);
@@ -213,6 +225,7 @@ pub fn decode_connect_udp_datagram(payload: &[u8]) -> Result<Bytes, SessionError
     }
 
     let payload = &payload[context_len..];
+
     if payload.len() > MAX_CONNECT_UDP_PAYLOAD_BYTES {
         return Err(SessionError::DatagramTooLarge);
     }
@@ -249,6 +262,7 @@ pub fn decode_http_datagram(datagram: &[u8], expected: StreamId) -> Result<Bytes
     let Some((quarter_id, prefix_len)) = decode_varint(datagram)? else {
         return Err(SessionError::InvalidDatagramContext);
     };
+
     let stream_id = quarter_id
         .checked_mul(4)
         .and_then(|id| StreamId::try_from(id).ok())
@@ -259,6 +273,7 @@ pub fn decode_http_datagram(datagram: &[u8], expected: StreamId) -> Result<Bytes
     }
 
     let payload = &datagram[prefix_len..];
+
     if payload.len() > MAX_CONNECT_UDP_PAYLOAD_BYTES {
         return Err(SessionError::DatagramTooLarge);
     }
@@ -271,14 +286,19 @@ pub fn decode_http_datagram(datagram: &[u8], expected: StreamId) -> Result<Bytes
 pub enum SessionError {
     /// The peer does not support the requested session protocol.
     UnsupportedProtocol,
+
     /// The policy metadata is malformed.
     InvalidMetadata,
+
     /// A capsule is malformed or truncated.
     InvalidCapsule,
+
     /// A capsule exceeds the bounded relay buffer.
     CapsuleTooLarge,
+
     /// A datagram uses a context for another session.
     InvalidDatagramContext,
+
     /// A datagram exceeds the maximum payload size.
     DatagramTooLarge,
 }
@@ -293,6 +313,7 @@ impl fmt::Display for SessionError {
             Self::InvalidDatagramContext => "invalid HTTP Datagram context",
             Self::DatagramTooLarge => "HTTP Datagram payload exceeds limit",
         };
+
         formatter.write_str(message)
     }
 }
@@ -303,6 +324,7 @@ fn decode_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, SessionError> {
     let Some(first) = bytes.first().copied() else {
         return Ok(None);
     };
+
     let length = 1usize << (first >> 6);
 
     if bytes.len() < length {
@@ -310,6 +332,7 @@ fn decode_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, SessionError> {
     }
 
     let mut value = u64::from(first & 0x3F);
+
     for byte in &bytes[1..length] {
         value = value
             .checked_shl(8)
@@ -323,14 +346,17 @@ fn decode_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, SessionError> {
 fn encode_varint(value: u64, output: &mut Vec<u8>) {
     match value {
         0..=63 => output.push(u8::try_from(value).expect("bounded QUIC varint")),
+
         64..=16_383 => {
             let value = u16::try_from(value | 0x4000).expect("bounded QUIC varint");
             output.extend_from_slice(&value.to_be_bytes());
         }
+
         16_384..=1_073_741_823 => {
             let value = u32::try_from(value | 0x8000_0000).expect("bounded QUIC varint");
             output.extend_from_slice(&value.to_be_bytes());
         }
+
         _ => {
             let value = value | 0xC000_0000_0000_0000;
             output.extend_from_slice(&value.to_be_bytes());
@@ -355,14 +381,15 @@ mod tests {
     fn capsule_decoder_handles_split_messages() {
         let encoded = encode_capsule(7, b"payload");
         let mut decoder = CapsuleDecoder::default();
-
         assert!(decoder.push(&encoded[..2]).expect("first chunk").is_empty());
+
         assert_eq!(decoder.push(&encoded[2..]).expect("second chunk"), [
             Capsule {
                 kind: 7,
                 payload: Bytes::from_static(b"payload"),
             }
         ]);
+
         decoder.finish().expect("complete capsule");
     }
 
@@ -383,10 +410,12 @@ mod tests {
         let capsule = encode_connect_udp_datagram(b"hello");
         let mut decoder = CapsuleDecoder::default();
         let capsule = decoder.push(&capsule).expect("decode capsule").remove(0);
+
         assert_eq!(
             decode_connect_udp_datagram(&capsule.payload).expect("context zero"),
             Bytes::from_static(b"hello")
         );
+
         assert_eq!(
             decode_http_datagram(
                 &encode_http_datagram(StreamId::try_from(16).expect("stream id"), b"hello")
@@ -401,16 +430,20 @@ mod tests {
     #[test]
     fn connect_udp_capsule_round_trip_preserves_payload() {
         let inbound = encode_connect_udp_datagram(b"capsule");
+
         let capsule = CapsuleDecoder::default()
             .push(&inbound)
             .expect("decode inbound capsule")
             .remove(0);
+
         let payload =
             decode_connect_udp_datagram(&capsule.payload).expect("decode CONNECT-UDP payload");
+
         let outbound = encode_capsule(
             DATAGRAM_CAPSULE_TYPE,
             &encode_connect_udp_datagram_payload(&payload),
         );
+
         let capsule = CapsuleDecoder::default()
             .push(&outbound)
             .expect("decode outbound capsule")
@@ -426,6 +459,7 @@ mod tests {
     fn webtransport_datagram_capsule_payload_is_implicit() {
         let payload = Bytes::from_static(b"webtransport-capsule");
         let encoded = encode_capsule(DATAGRAM_CAPSULE_TYPE, &payload);
+
         let capsule = CapsuleDecoder::default()
             .push(&encoded)
             .expect("decode capsule")
@@ -439,6 +473,7 @@ mod tests {
         let mut value = Vec::new();
         encode_varint(1, &mut value);
         value.extend_from_slice(b"payload");
+
         assert_eq!(
             decode_connect_udp_datagram(&value),
             Err(SessionError::InvalidDatagramContext)
@@ -449,6 +484,7 @@ mod tests {
     fn oversized_connect_udp_datagram_is_rejected() {
         let payload = vec![0; MAX_CONNECT_UDP_PAYLOAD_BYTES + 1];
         let encoded = encode_connect_udp_datagram(&payload);
+
         let capsule = CapsuleDecoder::default()
             .push(&encoded)
             .expect("decode capsule")
@@ -466,8 +502,10 @@ mod tests {
             SessionProtocol::from_extension(Protocol::WEB_TRANSPORT).expect("WebTransport"),
             SessionProtocol::WebTransport
         );
+
         assert!(SessionProtocol::WebTransport.needs_datagrams());
         assert!(!SessionProtocol::WebSocket.needs_datagrams());
+
         assert_eq!(
             SessionProtocol::from_extension(Protocol::CONNECT_UDP).expect("CONNECT-UDP"),
             SessionProtocol::ConnectUdp

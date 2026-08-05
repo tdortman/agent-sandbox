@@ -9,10 +9,12 @@
 //! tests a way to observe partial responses.
 
 use bytes::{Buf, Bytes};
+
 use clap::Parser;
 use h3::quic::{SendStream as _, SendStreamUnframed as _};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use rustls::pki_types::pem::PemObject;
+
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -25,6 +27,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
 use tokio::io::unix::AsyncFd;
 
 #[derive(Debug)]
@@ -53,6 +56,7 @@ impl LoggedUdpSocket {
                 log_line(&self.log, &format!("datagram {length}"));
                 Ok(Some((length, source)))
             }
+
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
         }
@@ -118,6 +122,7 @@ impl quinn::AsyncUdpSocket for LoggedUdpSocket {
                     meta.dst_ip = None;
                     return Poll::Ready(Ok(1));
                 }
+
                 Ok(None) => guard.clear_ready(),
                 Err(error) => return Poll::Ready(Err(error)),
             }
@@ -165,6 +170,7 @@ struct Args {
 
     #[arg(long)]
     gate: Option<PathBuf>,
+
     /// Omit extended CONNECT, WebTransport, and HTTP Datagram settings.
     #[arg(long)]
     reject_sessions: bool,
@@ -191,8 +197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let certificates = rustls::pki_types::CertificateDer::pem_file_iter(&args.certificate)?
         .collect::<Result<Vec<_>, _>>()?;
-    let private_key = rustls::pki_types::PrivateKeyDer::from_pem_file(&args.private_key)?;
 
+    let private_key = rustls::pki_types::PrivateKeyDer::from_pem_file(&args.private_key)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
@@ -201,12 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_single_cert(certificates, private_key)?;
 
     tls.alpn_protocols = vec![b"h3".to_vec()];
-
     let server_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(server_config));
-
     let bind_address = SocketAddr::new(args.address, args.port);
-
     let socket = std::net::UdpSocket::bind(bind_address)?;
     socket.set_nonblocking(true)?;
     let bound = socket.local_addr()?;
@@ -218,9 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         socket,
         Arc::new(quinn::TokioRuntime),
     )?;
+
     let address = endpoint.local_addr()?;
     log_line(&log, &format!("listening {address}"));
-
     let drop_first_session = Arc::new(AtomicBool::new(args.drop_first_session));
 
     while let Some(incoming) = endpoint.accept().await {
@@ -268,6 +271,7 @@ async fn serve_connect_udp(
     let stream_id = stream.id();
     let mut datagram_reader = h3.get_datagram_reader();
     let mut datagram_sender = h3.get_datagram_sender(stream_id);
+
     stream
         .send_response(http::Response::builder().status(200).body(())?)
         .await?;
@@ -322,34 +326,44 @@ fn validate_capsules(mut encoded: &[u8]) -> Result<(), Box<dyn std::error::Error
         let Some((_, kind_len)) = decode_origin_varint(encoded) else {
             return Err("truncated Capsule Protocol type".into());
         };
+
         let Some((length, length_len)) = decode_origin_varint(&encoded[kind_len..]) else {
             return Err("truncated Capsule Protocol length".into());
         };
+
         let length = usize::try_from(length)
             .map_err(|_| std::io::Error::other("Capsule Protocol length is too large"))?;
+
         let start = kind_len + length_len;
+
         let end = start
             .checked_add(length)
             .ok_or_else(|| std::io::Error::other("Capsule Protocol length overflows"))?;
+
         if end > encoded.len() {
             return Err("truncated Capsule Protocol payload".into());
         }
+
         encoded = &encoded[end..];
     }
+
     Ok(())
 }
 
 fn decode_origin_varint(encoded: &[u8]) -> Option<(u64, usize)> {
     let first = encoded.first().copied()?;
     let length = 1usize << (first >> 6);
+
     if encoded.len() < length {
         return None;
     }
 
     let mut value = u64::from(first & 0x3F);
+
     for byte in &encoded[1..length] {
         value = (value << 8) | u64::from(*byte);
     }
+
     Some((value, length))
 }
 
@@ -368,6 +382,7 @@ async fn serve_websocket(
     stream
         .send_data(Bytes::from_static(b"websocket-response\n"))
         .await?;
+
     while stream.recv_data().await?.is_some() {}
     stream.finish().await?;
     Ok(())
@@ -383,6 +398,7 @@ async fn serve_webtransport(
         .status(200)
         .header("x-origin-webtransport", "preserved")
         .body(())?;
+
     let session = h3_webtransport::server::WebTransportSession::accept_with_response(
         request, stream, h3, response,
     )
@@ -394,6 +410,7 @@ async fn serve_webtransport(
 
     let mut datagram_reader = session.datagram_reader();
     let mut datagram_sender = session.datagram_sender();
+
     let datagram_task = tokio::spawn(async move {
         while let Ok(datagram) = datagram_reader.read_datagram().await {
             if datagram_sender
@@ -449,11 +466,13 @@ async fn serve_connection(
     let connecting = incoming.accept()?;
     let connection = connecting.await?;
     let mut builder = h3::server::builder();
+
     if !reject_sessions {
         builder.enable_extended_connect(true);
         builder.enable_datagram(true);
         builder.enable_webtransport(true);
     }
+
     let mut h3 = builder.build(h3_quinn::Connection::new(connection)).await?;
 
     while let Some(resolver) = h3.accept().await? {
@@ -461,18 +480,20 @@ async fn serve_connection(
         let path = request.uri().path().to_owned();
         let method = request.method().as_str().to_owned();
         log_line(&log, &format!("request {method} {path}"));
-
         let session_protocol = request.extensions().get::<h3::ext::Protocol>().copied();
+
         if let Some(protocol) = session_protocol {
             if refuse_sessions {
                 stream
                     .send_response(http::Response::builder().status(403).body(())?)
                     .await?;
+
                 stream.finish().await?;
                 continue;
             }
 
             let drop_session = drop_first_session.swap(false, Ordering::SeqCst);
+
             if drop_session {
                 log_line(&log, "session-dropped");
                 return Ok(());
@@ -500,7 +521,6 @@ async fn serve_connection(
 }
 
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
-
 type OriginRequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 async fn send_informational_response(
@@ -567,18 +587,22 @@ async fn serve_request(
         }
 
         let (request_body, request_trailers) = read_request_body(stream).await?;
+
         let valid = !early_body
             && request_body == b"request-body"
             && (path == "/expect"
                 || request_trailers
                     .get("x-request-trailer")
                     .is_some_and(|value| value == "present"));
+
         let status = if valid { 200 } else { 400 };
+
         let body = if valid {
             b"request-body-ok\n".as_slice()
         } else {
             b"request-body-invalid\n".as_slice()
         };
+
         let response = http::Response::builder()
             .status(status)
             .header("content-length", body.len().to_string())
@@ -600,7 +624,6 @@ async fn serve_request(
         }
 
         let response = builder.body(()).expect("response head");
-
         stream.send_response(response).await?;
         stream.send_data(Bytes::from_static(b"first-chunk")).await?;
 
@@ -611,6 +634,7 @@ async fn serve_request(
         stream
             .send_data(Bytes::from_static(b"second-chunk"))
             .await?;
+
         stream.finish().await?;
         return Ok(());
     }
@@ -620,6 +644,7 @@ async fn serve_request(
         "/denied" => b"denied-get\n".as_slice(),
         _ => b"origin-response\n".as_slice(),
     };
+
     let mut builder = http::Response::builder()
         .status(200)
         .header("content-length", body.len().to_string());
@@ -629,11 +654,12 @@ async fn serve_request(
     }
 
     let response = builder.body(()).expect("response head");
+
     if path == "/trailers" {
         stream.send_response(response).await?;
         stream.send_data(Bytes::from_static(body)).await?;
-
         let mut trailers = http::HeaderMap::new();
+
         trailers.insert(
             "x-origin-trailer",
             http::HeaderValue::from_static("present"),

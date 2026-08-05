@@ -24,6 +24,7 @@ pub mod nr {
         SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE, SYS_write as WRITE,
         SYS_writev as WRITEV,
     };
+
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for
     /// the target.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -167,6 +168,7 @@ mod tests {
 
         // Filesystem mutation set (broker policy-gates via CheckFilesystem).
         assert!(syscalls.contains(&nr::RENAME));
+
         assert!(syscalls.contains(&nr::RENAMEAT));
         assert!(syscalls.contains(&nr::RENAMEAT2));
         assert!(syscalls.contains(&nr::LINK));

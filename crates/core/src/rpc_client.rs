@@ -1,10 +1,12 @@
 //! JSON-line policyd client helpers.
 
 use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
+
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{
@@ -193,6 +195,7 @@ mod tests {
     use crate::{RequestContext, RpcReply, RpcRequest};
     use std::time::Duration;
     use tempfile::tempdir;
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,

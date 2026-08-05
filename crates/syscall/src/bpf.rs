@@ -9,6 +9,7 @@
 //! implements.
 
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+
 use std::collections::BTreeMap;
 
 // `seccompiler::sock_filter` and `libc::sock_filter` are both `#[repr(C)]`

@@ -2,10 +2,12 @@
 //! proxies.
 
 use crate::hosts::{build_glob, normalize_dns_name};
+
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as DeError, SeqAccess, Visitor},
 };
+
 use std::{fmt, net::IpAddr, num::NonZeroU16};
 use thiserror::Error;
 use url::Url;
@@ -789,6 +791,7 @@ impl<'de> Deserialize<'de> for HttpSessionMetadata {
         }
 
         let wire = Wire::deserialize(deserializer)?;
+
         Self::new(
             wire.kind.as_deref(),
             wire.protocol.as_deref(),
@@ -1656,6 +1659,7 @@ mod tests {
             ));
 
         let wire = serde_json::to_value(&request).expect("serialize request");
+
         assert_eq!(
             wire["session"],
             serde_json::json!({
@@ -1672,11 +1676,14 @@ mod tests {
 
         let plain =
             HttpRequest::parse_absolute("GET", "https://example.com/").expect("valid request");
+
         let plain_wire = serde_json::to_value(&plain).expect("serialize plain request");
+
         assert!(
             plain_wire.get("session").is_none(),
             "absent session metadata must not be serialized"
         );
+
         assert_eq!(
             serde_json::from_value::<HttpRequest>(plain_wire).expect("deserialize plain request"),
             plain
@@ -1699,6 +1706,7 @@ mod tests {
         let invalid = serde_json::from_str::<HttpRequest>(
             r#"{"method":"CONNECT","url":"https://example.com/","session":{"kind":"","protocol":null,"target":null}}"#,
         );
+
         assert!(
             invalid.is_err(),
             "invalid session wire values must fail closed"

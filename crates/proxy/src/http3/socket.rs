@@ -12,7 +12,9 @@
 use nix::sys::socket::{
     ControlMessage, ControlMessageOwned, recvmsg, sendmsg, setsockopt, sockopt,
 };
+
 use rama_net::socket::core::{Domain, Protocol, Socket as Socket2, Type};
+
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -21,6 +23,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+
 use tokio::io::unix::AsyncFd;
 
 /// One received UDP datagram and its metadata.
@@ -69,7 +72,6 @@ impl TransparentUdpSocket {
 
         socket.bind(&address.into())?;
         socket.set_nonblocking(true)?;
-
         let socket: std::net::UdpSocket = socket.into();
         let inner = Arc::new(AsyncFd::new(socket)?);
 
@@ -116,26 +118,29 @@ impl TransparentUdpSocket {
                             address.sin_addr.s_addr,
                         ))));
                     }
+
                     ControlMessageOwned::Ipv6OrigDstAddr(address) => {
                         original_destination =
                             Some(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)));
                     }
+
                     ControlMessageOwned::Ipv4PacketInfo(info) => {
                         packet_destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
                             info.ipi_addr.s_addr,
                         ))));
                     }
+
                     ControlMessageOwned::Ipv6PacketInfo(info) => {
                         packet_destination =
                             Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
                     }
+
                     _ => {}
                 }
             }
         }
 
         let original_destination = original_destination.or(packet_destination);
-
         Ok(Some((message.bytes, source, original_destination)))
     }
 
@@ -278,12 +283,15 @@ impl quinn::AsyncUdpSocket for TransparentUdpSocket {
 
                     return Poll::Ready(Ok(1));
                 }
+
                 Ok(None) => {
                     guard.clear_ready();
                 }
+
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     guard.clear_ready();
                 }
+
                 Err(error) => return Poll::Ready(Err(error)),
             }
         }

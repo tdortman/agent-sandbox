@@ -4,16 +4,21 @@
 use agent_sandbox_core::{
     FileAccess, normalize_directory_traverse_access, open_flags_to_file_access,
 };
+
 use agent_sandbox_fsmon::rpc_client;
+
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
 };
+
 use clap::Parser;
+
 use nix::{
     dir::Dir,
     fcntl::{AtFlags, OFlag, openat, readlinkat},
     sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
 };
+
 use std::{
     ffi::CString,
     fs,

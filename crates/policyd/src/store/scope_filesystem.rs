@@ -6,14 +6,17 @@ use super::{
     persist::PersistResourceRuleArgs,
     types::{PolicyDecisionState, PolicyStore},
 };
+
 use crate::{
     error::PolicydError,
     wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire},
 };
+
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind,
     ResourceRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
 };
+
 use std::path::PathBuf;
 
 impl PolicyStore {
@@ -363,14 +366,17 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::{
         store::decisions::DecisionAction,
         wire::{FilesystemScopeOp, ScopeWire},
     };
+
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
         SandboxPaths, Verdict, VerdictSource,
     };
+
     use std::{path::PathBuf, time::Duration};
 
     #[tokio::test]

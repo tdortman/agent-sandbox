@@ -1,16 +1,19 @@
 //! Policy store: context.
 
 use super::types::PolicyStore;
+
 use crate::{
     store::types::{SandboxSessionRegistration, TrustedPeer},
     wire::MergeContext,
 };
+
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
     SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
     read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
     trusted_context_from_pid, trusted_project_policy_path,
 };
+
 use std::path::{Path, PathBuf};
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {

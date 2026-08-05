@@ -11,20 +11,22 @@
 //! port to the proxy before any HTTP/3 traffic can arrive.
 
 mod association;
+
 mod ech;
 mod hpke;
 mod session;
 mod socket;
 pub mod upstream;
-
 use crate::{alt_svc::AltSvcStore, cert::CertificateIssuer, policy::PolicySession};
 use socket::TransparentUdpSocket;
+
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
+
 use tokio::sync::{Notify, Semaphore};
 
 /// Shared state for every downstream QUIC association.
@@ -64,7 +66,6 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         .ok_or_else(|| boxed("SSL_CERT_FILE is required to verify upstream HTTP/3 certificates"))?;
 
     let upstream = Arc::new(upstream::UpstreamPool::new(&ca_file, config.test_ech_dns)?);
-
     let transparent = config.test_destination.is_none();
 
     let destination_port = config
@@ -165,6 +166,7 @@ pub async fn run(backend: Http3Backend) {
         state.clone(),
         destination.clone(),
     ));
+
     let v6_loop = tokio::spawn(association::accept_loop(v6, state.clone(), destination));
 
     for alternative in alternatives {
@@ -173,6 +175,7 @@ pub async fn run(backend: Http3Backend) {
             state.clone(),
             alternative.destination.clone(),
         ));
+
         tokio::spawn(association::accept_loop(
             alternative.v6,
             state.clone(),
@@ -181,7 +184,6 @@ pub async fn run(backend: Http3Backend) {
     }
 
     tracing::info!("HTTP/3 backend listening");
-
     let _ = tokio::join!(v4_loop, v6_loop);
 }
 
@@ -192,7 +194,6 @@ fn bind_endpoint(
     state: &Http3State,
 ) -> Result<quinn::Endpoint, BoxError> {
     let socket = TransparentUdpSocket::bind(SocketAddr::new(ip, port), transparent)?;
-
     let tls = downstream_tls_config(state)?;
 
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
@@ -219,10 +220,8 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
 
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = 0;
-
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
-
     let tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls));
     server_config.transport_config(Arc::new(transport));
@@ -248,6 +247,7 @@ impl std::fmt::Debug for SandboxCertResolver {
             .finish()
     }
 }
+
 impl rustls::server::ResolvesServerCert for SandboxCertResolver {
     fn resolve(
         &self,
@@ -273,7 +273,6 @@ impl rustls::server::ResolvesServerCert for SandboxCertResolver {
         };
 
         let key = rustls::sign::CertifiedKey::new(issued.certificate_chain.clone(), signing_key);
-
         Some(Arc::new(key))
     }
 }

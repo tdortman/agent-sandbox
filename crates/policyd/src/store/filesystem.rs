@@ -4,18 +4,22 @@ use super::types::{
     MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
     PendingFilesystem, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
 };
+
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext};
+
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
     InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
     normalize_directory_traverse_access,
 };
+
 use std::{
     io::BufRead,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
 
@@ -562,10 +566,12 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
+
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
         SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
