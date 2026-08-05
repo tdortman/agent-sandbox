@@ -614,11 +614,7 @@ async fn handle_network_push(
             port,
             scheme,
             result.url,
-            if result.aliases.is_empty() {
-                None
-            } else {
-                Some(result.aliases)
-            },
+            (!result.aliases.is_empty()).then_some(result.aliases),
         ),
         &transport,
         port,
