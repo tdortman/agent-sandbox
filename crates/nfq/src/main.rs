@@ -14,11 +14,11 @@ mod policy;
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost,
-    OwnerSnapshot, SandboxPaths, lookup_dns_cache, mappings_from_response,
+    OwnerSnapshot, SandboxPaths, SocketIdentity, lookup_dns_cache, mappings_from_response,
     sandbox_session_id_from_pid,
 };
 use clap::Parser;
-use nfq_updated::{Queue, Verdict};
+use nfq_updated::{Message, Queue, Verdict};
 use std::{
     collections::HashMap,
     net::IpAddr,
@@ -33,6 +33,9 @@ use tracing::{debug, info, warn};
 /// for hickory-proto parsing (CNAME chains and multi-answer responses
 /// routinely exceed the standard Ethernet MTU's 1500-byte segment).
 const COPY_RANGE: u16 = u16::MAX;
+
+/// Packet mark used by the transparent proxy's local routing table.
+const PROXY_MARK: u32 = 51820;
 
 /// How long a registered proxy flow stays on the verdict fast path.
 ///
@@ -116,9 +119,8 @@ struct Cli {
     )]
     push_socket: PathBuf,
 
-    /// Check transport policy before registering owner-identified flows for
-    /// the transparent proxy. Direct mode leaves proxy flow registration
-    /// disabled.
+    /// Register owner-identified TCP and configured HTTP/3 UDP flows for the
+    /// transparent proxy. Direct mode leaves proxy flow registration disabled.
     #[arg(long)]
     proxy_mode: bool,
 
@@ -139,15 +141,21 @@ struct Cli {
     push_trusted_uid: u32,
 }
 
+struct ApprovedFlow {
+    owner: SocketIdentity,
+    inserted: Instant,
+}
+
 struct NfqState {
     dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
-    approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, Instant>>>,
+    approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, ApprovedFlow>>>,
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
     nft_binary: String,
     proxy_mode: bool,
+    proxy_mark: u32,
     udp_proxy_ports: Vec<u16>,
 }
 
@@ -178,6 +186,7 @@ impl NfqState {
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
             proxy_mode: cli.proxy_mode,
+            proxy_mark: PROXY_MARK,
             udp_proxy_ports: cli
                 .udp_proxy_ports
                 .split(',')
@@ -289,11 +298,38 @@ fn main() {
         };
 
         let verdict = handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
+        mark_accepted_proxy_udp(&state, &mut message, verdict);
         message.set_verdict(verdict);
 
         if let Err(err) = queue.verdict(message) {
             warn!(error = %err, "nfqueue verdict error");
         }
+    }
+}
+
+/// Mark an accepted configured HTTP/3 datagram so NFQUEUE reinjection reroutes
+/// it locally.
+fn mark_accepted_proxy_udp(state: &NfqState, message: &mut Message, verdict: Verdict) {
+    if verdict != Verdict::Accept || !state.proxy_mode {
+        return;
+    }
+
+    let Some(meta) = packet::parse_ipv4(message.get_payload())
+        .or_else(|| packet::parse_ipv6(message.get_payload()))
+    else {
+        return;
+    };
+
+    let dns_response = meta.protocol == packet::TransportProtocol::Udp
+        && meta.src_ip == state.dns_server_ip
+        && meta.src_port == 53;
+
+    if meta.protocol == packet::TransportProtocol::Udp
+        && !meta.dst_ip.is_loopback()
+        && state.udp_proxy_port(meta.dst_port)
+        && !dns_response
+    {
+        message.set_nfmark(state.proxy_mark);
     }
 }
 
@@ -631,7 +667,15 @@ impl NfqState {
 /// The cache covers the QUIC opening burst: every datagram of a flow is a
 /// policy boundary, but only the first one needs the owner snapshot and the
 /// policyd registration round trip.
-fn is_approved_flow(state: &NfqState, meta: packet::PacketMeta) -> bool {
+fn is_approved_flow(
+    state: &NfqState,
+    meta: packet::PacketMeta,
+    owner: Option<SocketIdentity>,
+) -> bool {
+    let Some(owner) = owner else {
+        return false;
+    };
+
     let protocol = match meta.protocol {
         packet::TransportProtocol::Tcp => FlowProtocol::Tcp,
         packet::TransportProtocol::Udp => FlowProtocol::Udp,
@@ -648,37 +692,44 @@ fn is_approved_flow(state: &NfqState, meta: packet::PacketMeta) -> bool {
     };
 
     state.approved_flows.lock().is_ok_and(|flows| {
-        flows
-            .get(&flow)
-            .is_some_and(|inserted| inserted.elapsed() < APPROVED_FLOW_TTL)
+        flows.get(&flow).is_some_and(|approved| {
+            approved.owner == owner && approved.inserted.elapsed() < APPROVED_FLOW_TTL
+        })
     })
 }
 
 /// Remember a registered flow on the verdict fast path, pruning expired
 /// entries so the cache stays bounded.
-fn remember_approved_flow(state: &NfqState, key: &NetworkFlowKey) {
+fn remember_approved_flow(state: &NfqState, key: &NetworkFlowKey, owner: SocketIdentity) -> bool {
     let Ok(mut flows) = state.approved_flows.lock() else {
-        return;
+        return false;
     };
 
-    flows.retain(|_, inserted| inserted.elapsed() < APPROVED_FLOW_TTL);
+    flows.retain(|_, approved| approved.inserted.elapsed() < APPROVED_FLOW_TTL);
 
-    if flows.len() < MAX_APPROVED_FLOWS {
-        flows.insert(key.clone(), Instant::now());
+    if flows.len() >= MAX_APPROVED_FLOWS {
+        return false;
     }
+
+    flows.insert(key.clone(), ApprovedFlow {
+        owner,
+        inserted: Instant::now(),
+    });
+    true
 }
 
 fn register_proxy_flow(
     state: &NfqState,
     meta: packet::PacketMeta,
+    owner: Option<OwnerSnapshot>,
     register: &mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>,
 ) -> Verdict {
-    let Some(owner) = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port) else {
+    let Some(owner) = owner else {
         warn!(
             src = %meta.src_ip,
             port = meta.src_port,
             protocol = meta.protocol.as_str(),
-            "dropping proxy flow with no unique socket owner"
+            "proxy flow has no unique socket owner"
         );
 
         return Verdict::Drop;
@@ -710,7 +761,7 @@ fn register_proxy_flow(
             src_port = meta.src_port,
             dst = %meta.dst_ip,
             dst_port = meta.dst_port,
-            "dropping proxy flow with invalid typed tuple"
+            "proxy flow has an invalid typed tuple"
         );
 
         return Verdict::Drop;
@@ -724,7 +775,7 @@ fn register_proxy_flow(
     );
 
     match register(registration) {
-        Ok(true) => {
+        Ok(true) if remember_approved_flow(state, &flow, owner.identity()) => {
             info!(
                 protocol = meta.protocol.as_str(),
                 src = %meta.src_ip,
@@ -733,8 +784,12 @@ fn register_proxy_flow(
                 dst_port = meta.dst_port,
                 "registered proxy flow"
             );
-            remember_approved_flow(state, &flow);
             Verdict::Accept
+        }
+
+        Ok(true) => {
+            warn!("dropping proxy flow because the approval cache is full");
+            Verdict::Drop
         }
 
         Ok(false) => {
@@ -825,15 +880,13 @@ where
         return Verdict::Accept;
     }
 
-    // Loopback traffic never traverses the transparent proxy route. TCP
-    // proxy-mode flows are registered and accepted here so the proxy can
-    // decode them and enforce HTTP policy per request; UDP proxy-mode flows
-    // (HTTP/3) are checked against transport policy and then registered so
-    // the proxy can claim local-destination associations. All other
-    // destinations stay on the ordinary kernel route and are checked
-    // synchronously below.
-    let src_pid = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port)
-        .map(OwnerSnapshot::pid_value);
+    // Loopback traffic never traverses the transparent proxy route. Proxy-mode
+    // flows are registered and accepted here so the proxy can decode them and
+    // enforce HTTP policy per request. All other destinations stay on the
+    // ordinary kernel route and are checked synchronously below.
+
+    let source_owner = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port);
+    let src_pid = source_owner.map(OwnerSnapshot::pid_value);
 
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
 
@@ -850,17 +903,22 @@ where
     // QUIC sends its opening burst of datagrams before the first packet's
     // verdict can confirm the flow, so already-registered flows skip the
     // verdict RPCs entirely.
-    if (tcp_proxy_flow || udp_proxy_flow) && is_approved_flow(state, meta) {
+    if (tcp_proxy_flow || udp_proxy_flow)
+        && is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity))
+    {
         return Verdict::Accept;
     }
 
-    if tcp_proxy_flow {
+    if tcp_proxy_flow || udp_proxy_flow {
         let Some(register) = register else {
             warn!("proxy mode has no registration RPC handler");
             return Verdict::Drop;
         };
 
-        return register_proxy_flow(state, meta, register);
+        // Proxy-owned flows are classified by decoded HTTP requests. The
+        // initial HTTP/3 packet must not use network.direct, or HTTP/3 would
+        // need a second transport policy rule before reaching HTTP policy.
+        return register_proxy_flow(state, meta, source_owner, register);
     }
 
     let allowed = match transport_check(
@@ -876,21 +934,6 @@ where
         TransportCheck::Allowed(destination) => destination,
     };
 
-    // UDP proxy-mode flows (HTTP/3) cannot be redirected to the transparent
-    // proxy for external destinations: the kernel only supports tproxy in
-    // prerouting, which locally generated packets never traverse, so the
-    // transport check above is the enforcement point for HTTP/3. The flow is
-    // still registered so the proxy can claim associations whose destination
-    // is local to the sandbox.
-    if udp_proxy_flow {
-        let Some(register) = register else {
-            warn!("proxy mode has no registration RPC handler");
-            return Verdict::Drop;
-        };
-
-        return register_proxy_flow(state, meta, register);
-    }
-
     info!(
         protocol = meta.protocol.as_str(),
         host = %allowed.hostname,
@@ -902,7 +945,6 @@ where
     Verdict::Accept
 }
 
-/// One allowed destination with the hostname resolved for policy.
 struct AllowedDestination {
     hostname: String,
     dst_ip: String,
@@ -1100,6 +1142,7 @@ mod tests {
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
             proxy_mode: false,
+            proxy_mark: PROXY_MARK,
             udp_proxy_ports: vec![443],
         }
     }
@@ -1299,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_udp_flow_is_transport_checked_then_registered() {
+    fn proxy_mode_udp_flow_registers_without_transport_check() {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
 
         let client_addr = socket.local_addr().expect("socket address");
@@ -1326,23 +1369,17 @@ mod tests {
 
         packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
         let check_count = std::cell::Cell::new(0_u32);
-        let mut seen_hostname = None;
 
-        let mut check = |socket: &str,
-                         hostname: &str,
+        let mut check = |_: &str,
                          _: &str,
-                         dst_port: u16,
-                         protocol: packet::TransportProtocol,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
                          _: Option<u32>,
                          _: &[String],
                          _: Duration| {
             check_count.set(check_count.get() + 1);
-            seen_hostname = Some(hostname.to_owned());
-            assert_eq!(socket, "");
-            assert_eq!(hostname, "example.test");
-            assert_eq!(dst_port, 443);
-            assert_eq!(protocol, packet::TransportProtocol::Udp);
-            Ok(true)
+            Ok(false)
         };
 
         let registration = std::cell::RefCell::new(None);
@@ -1350,8 +1387,8 @@ mod tests {
         let mut register = |flow: FlowRegistration| {
             assert_eq!(
                 check_count.get(),
-                1,
-                "transport check must run before UDP proxy registration"
+                0,
+                "UDP proxy registration must bypass the transport check"
             );
 
             *registration.borrow_mut() = Some(flow);
@@ -1368,12 +1405,15 @@ mod tests {
         );
 
         assert_eq!(verdict, Verdict::Accept);
-        assert_eq!(check_count.get(), 1);
-        assert_eq!(seen_hostname.as_deref(), Some("example.test"));
+        assert_eq!(
+            check_count.get(),
+            0,
+            "HTTP/3 must reach decoded HTTP policy without network.direct"
+        );
 
         let registration = registration
             .into_inner()
-            .expect("UDP proxy flow must register after approval");
+            .expect("UDP proxy flow must register before HTTP policy");
 
         assert_eq!(registration.flow.protocol, FlowProtocol::Udp);
         assert_eq!(registration.flow.source_ip, client_addr.ip());
@@ -1381,6 +1421,70 @@ mod tests {
             registration.flow.destination_ip,
             "93.184.216.34".parse::<Ipv4Addr>().expect("valid IPv4")
         );
+    }
+
+    #[test]
+    fn proxy_mode_udp_flow_without_owner_drops_before_transport_check() {
+        let source_ip = Ipv4Addr::new(192, 0, 2, 1);
+        let source_port: u16 = 49152;
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+
+        state
+            .dns_cache
+            .lock()
+            .expect("lock dns cache")
+            .remember_ephemeral("93.184.216.34", "example.test", DEFAULT_MAX_TTL);
+
+        let mut packet = build_udp_data_packet(443);
+        packet[12..16].copy_from_slice(&source_ip.octets());
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+
+        assert!(
+            owner::owner_snapshot(
+                packet::TransportProtocol::Udp,
+                source_ip.into(),
+                source_port
+            )
+            .is_none(),
+            "test tuple must not have a socket owner"
+        );
+
+        let check_count = std::cell::Cell::new(0_u32);
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| {
+            check_count.set(check_count.get() + 1);
+            Ok(true)
+        };
+
+        let registration_count = std::cell::Cell::new(0_u32);
+        let mut register = |_: FlowRegistration| {
+            registration_count.set(registration_count.get() + 1);
+            Ok(true)
+        };
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(
+            check_count.get(),
+            0,
+            "unowned HTTP/3 flows must not use network.direct"
+        );
+        assert_eq!(registration_count.get(), 0);
     }
 
     #[test]
@@ -1430,7 +1534,7 @@ mod tests {
             Ok(true)
         };
 
-        // First packet of the flow: transport check plus registration.
+        // First packet of the flow: registration without a transport check.
         let first = handle_packet_payload_with_registration(
             &state,
             "",
@@ -1441,10 +1545,10 @@ mod tests {
         );
 
         assert_eq!(first, Verdict::Accept);
-        assert_eq!(check_count.get(), 1);
+        assert_eq!(check_count.get(), 0);
         assert_eq!(registration_count.get(), 1);
 
-        // QUIC opening burst: the same flow skips both RPCs on the fast path.
+        // QUIC opening burst: the same flow skips both callbacks on the fast path.
         let second = handle_packet_payload_with_registration(
             &state,
             "",
@@ -1455,12 +1559,12 @@ mod tests {
         );
 
         assert_eq!(second, Verdict::Accept);
-        assert_eq!(check_count.get(), 1);
+        assert_eq!(check_count.get(), 0);
         assert_eq!(registration_count.get(), 1);
     }
 
     #[test]
-    fn proxy_mode_udp_flow_rejects_before_registration() {
+    fn proxy_mode_udp_flow_registration_denial_drops() {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
 
         let client_addr = socket.local_addr().expect("socket address");
@@ -1503,7 +1607,7 @@ mod tests {
 
         let mut register = |_: FlowRegistration| {
             registration_count.set(registration_count.get() + 1);
-            Ok(true)
+            Ok(false)
         };
 
         let verdict = handle_packet_payload_with_registration(
@@ -1515,12 +1619,93 @@ mod tests {
             Some(&mut register),
         );
 
-        assert_eq!(verdict, Verdict::Repeat);
-        assert_eq!(check_count.get(), 1);
+        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(
+            check_count.get(),
+            0,
+            "HTTP/3 registration denial must not run network.direct"
+        );
         assert_eq!(
             registration_count.get(),
-            0,
-            "denied UDP proxy flow must not register"
+            1,
+            "denied HTTP/3 flow must be rejected by registration"
+        );
+
+        assert!(
+            state
+                .approved_flows
+                .lock()
+                .expect("lock approved flows")
+                .is_empty(),
+            "denied UDP proxy flow must not enter the approved-flow fast path"
+        );
+    }
+
+    #[test]
+    fn proxy_mode_drops_when_approval_cache_cannot_mark_flow() {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
+        let client_addr = socket.local_addr().expect("socket address");
+        let mut state = state_for_tests();
+        state.proxy_mode = true;
+
+        {
+            let mut flows = state.approved_flows.lock().expect("lock approved flows");
+            let owner = owner::owner_snapshot(
+                packet::TransportProtocol::Udp,
+                client_addr.ip(),
+                client_addr.port(),
+            )
+            .expect("test owner");
+            for port in 1..=MAX_APPROVED_FLOWS {
+                let flow = NetworkFlowKey::try_new(
+                    FlowProtocol::Udp,
+                    Ipv4Addr::new(192, 0, 2, 1).into(),
+                    port.try_into().expect("test port fits"),
+                    Ipv4Addr::new(198, 51, 100, 1).into(),
+                    443,
+                )
+                .expect("valid test flow");
+                flows.insert(flow, ApprovedFlow {
+                    owner: owner.identity(),
+                    inserted: Instant::now(),
+                });
+            }
+        }
+
+        let mut packet = build_udp_data_packet(443);
+        packet[12..16].copy_from_slice(
+            &client_addr
+                .ip()
+                .to_string()
+                .parse::<Ipv4Addr>()
+                .expect("IPv4 client")
+                .octets(),
+        );
+        packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
+
+        let mut check = |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: u16,
+                         _: packet::TransportProtocol,
+                         _: Option<u32>,
+                         _: &[String],
+                         _: Duration| Ok(true);
+        let mut register = |_: FlowRegistration| Ok(true);
+
+        let verdict = handle_packet_payload_with_registration(
+            &state,
+            "",
+            Duration::from_secs(1),
+            &packet,
+            &mut check,
+            Some(&mut register),
+        );
+
+        assert_eq!(
+            verdict,
+            Verdict::Drop,
+            "an accepted registration without a route mark must fail closed"
         );
     }
 
