@@ -4,12 +4,13 @@ use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
     SyscallTarget, notification_arch_valid, revalidate_filesystem_mutation, send_response,
 };
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
 fn should_bypass_network_policy(
     network_mode: NetworkMode,
     dns_endpoint: Option<SocketAddr>,
+    udp_proxy_ports: &[u16],
     facts: &NormalizedNotification,
 ) -> bool {
     let NormalizedNotification::Target {
@@ -31,16 +32,21 @@ fn should_bypass_network_policy(
         return false;
     }
 
-    matches!(
+    if matches!(
         (target.scheme.as_str(), target.port),
-        ("tcp", 80 | 443 | 8008 | 8080 | 8443) | ("udp", 443)
-    )
+        ("tcp", 80 | 443 | 8008 | 8080 | 8443)
+    ) {
+        return true;
+    }
+
+    target.scheme == "udp" && udp_proxy_ports.contains(&target.port)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NetworkPolicyBypass {
     pub mode: NetworkMode,
     pub dns_endpoint: Option<SocketAddr>,
+    pub udp_proxy_ports: Arc<[u16]>,
 }
 
 pub async fn dispatch_notification_with_mode(
@@ -100,8 +106,12 @@ pub async fn dispatch_notification_with_mode(
         // every other notification; routing this infrastructure connection
         // back through the resource policy would deadlock the gate.
         ResponsePlan::Continue
-    } else if should_bypass_network_policy(network_policy.mode, network_policy.dns_endpoint, &facts)
-    {
+    } else if should_bypass_network_policy(
+        network_policy.mode,
+        network_policy.dns_endpoint,
+        &network_policy.udp_proxy_ports,
+        &facts,
+    ) {
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // also delegates only its transparent service ports.
         ResponsePlan::Continue
@@ -248,12 +258,14 @@ mod tests {
         assert!(should_bypass_network_policy(
             NetworkMode::Direct,
             Some(dns_endpoint),
+            &[443],
             &target("udp", "169.254.100.1", 53)
         ));
 
         assert!(should_bypass_network_policy(
             NetworkMode::Proxy,
             Some(dns_endpoint),
+            &[443],
             &target("tcp", "169.254.100.1", 53)
         ));
     }
@@ -265,18 +277,21 @@ mod tests {
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             Some(dns_endpoint),
+            &[443],
             &target("udp", "169.254.100.2", 53)
         ));
 
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             Some(dns_endpoint),
+            &[443],
             &target("udp", "169.254.100.1", 5353)
         ));
 
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             None,
+            &[443],
             &target("udp", "169.254.100.1", 53)
         ));
     }
@@ -286,37 +301,76 @@ mod tests {
         assert!(should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
+            &[443],
             &target("tcp", "192.0.2.10", 443)
         ));
 
         assert!(should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
+            &[443],
             &target("udp", "192.0.2.10", 443)
         ));
 
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
+            &[443],
             &target("tcp", "192.0.2.10", 853)
         ));
 
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
+            &[443],
             &target("udp", "192.0.2.10", 853)
         ));
 
         assert!(!should_bypass_network_policy(
             NetworkMode::Direct,
             None,
+            &[443],
             &target("tcp", "192.0.2.10", 443)
         ));
 
         assert!(!should_bypass_network_policy(
             NetworkMode::Proxy,
             None,
+            &[443],
             &NormalizedNotification::continue_()
+        ));
+    }
+
+    #[test]
+    fn proxy_mode_bypasses_configured_http3_udp_ports() {
+        let ports = [443, 4444];
+
+        assert!(should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
+            &ports,
+            &target("udp", "192.0.2.10", 4444)
+        ));
+
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
+            &[443],
+            &target("udp", "192.0.2.10", 4444)
+        ));
+
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Direct,
+            None,
+            &ports,
+            &target("udp", "192.0.2.10", 4444)
+        ));
+
+        assert!(!should_bypass_network_policy(
+            NetworkMode::Proxy,
+            None,
+            &ports,
+            &target("udp", "192.0.2.10", 4445)
         ));
     }
 }

@@ -12,6 +12,7 @@ use std::{
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time;
@@ -56,6 +57,18 @@ struct Cli {
     /// `AGENT_SANDBOX_DNS_ENDPOINT` is consulted.
     #[arg(long, value_name = "IP:PORT", env = "AGENT_SANDBOX_DNS_ENDPOINT")]
     dns_endpoint: Option<SocketAddr>,
+
+    /// UDP ports whose flows the transparent HTTP/3 proxy owns in proxy mode.
+    /// Space- or comma-separated. Flows to these ports bypass transport policy
+    /// like the transparent TCP service ports do. If omitted,
+    /// `AGENT_SANDBOX_UDP_PROXY_PORTS` is consulted.
+    #[arg(
+        long,
+        value_name = "PORTS",
+        env = "AGENT_SANDBOX_UDP_PROXY_PORTS",
+        default_value = "443"
+    )]
+    udp_proxy_ports: String,
 
     /// Inherited seccomp user-notification file descriptor. The arm uses
     /// `SCM_RIGHTS` to pass this fd across exec. The broker sets it
@@ -107,6 +120,13 @@ async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
+
+    let udp_proxy_ports: Arc<[u16]> = cli
+        .udp_proxy_ports
+        .split([' ', ','])
+        .filter_map(|port| port.trim().parse::<u16>().ok())
+        .collect();
+
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
     let mut policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());
@@ -179,6 +199,7 @@ async fn main() -> std::io::Result<()> {
             dispatch::NetworkPolicyBypass {
                 mode: network_mode,
                 dns_endpoint,
+                udp_proxy_ports: Arc::clone(&udp_proxy_ports),
             },
         )
         .await;
@@ -781,6 +802,7 @@ mod tests {
         for (argument, environment) in [
             ("network_mode", "AGENT_SANDBOX_NETWORK_MODE"),
             ("dns_endpoint", "AGENT_SANDBOX_DNS_ENDPOINT"),
+            ("udp_proxy_ports", "AGENT_SANDBOX_UDP_PROXY_PORTS"),
             ("sandbox_session_id", "AGENT_SANDBOX_SESSION_ID"),
         ] {
             let argument = command

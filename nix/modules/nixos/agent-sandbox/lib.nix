@@ -510,6 +510,18 @@ in
           RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
         fi
       '') hiddenPaths;
+      http3UdpProxyPorts =
+        if runtime == null then
+          "443"
+        else
+          let
+            http3 =
+              runtime.httpProxy.http3 or {
+                altUdpPorts = [ ];
+                udpPort = 443;
+              };
+          in
+          lib.concatStringsSep " " ([ (toString http3.udpPort) ] ++ map toString http3.altUdpPorts);
       jailFn = jail-nix.lib.extend {
         inherit pkgs;
         additionalCombinators = _: agentCombinators;
@@ -551,6 +563,7 @@ in
       networkMode = if proxyMode then "proxy" else "direct";
       networkModeScript = lib.optionalString syscallGate ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_UDP_PROXY_PORTS ${lib.escapeShellArg http3UdpProxyPorts})
         ${lib.optionalString (dnsEndpoint != null) ''
           RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_DNS_ENDPOINT ${lib.escapeShellArg dnsEndpoint})
         ''}
@@ -589,8 +602,10 @@ in
         ++ lib.optionals syscallGate [
           (builtinCombinators.compose [
             (builtinCombinators.set-env "AGENT_SANDBOX_NETWORK_MODE" networkMode)
+            (builtinCombinators.set-env "AGENT_SANDBOX_UDP_PROXY_PORTS" http3UdpProxyPorts)
             (builtinCombinators.add-runtime ''
               RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
+              RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_UDP_PROXY_PORTS ${lib.escapeShellArg http3UdpProxyPorts})
             '')
           ])
         ]
