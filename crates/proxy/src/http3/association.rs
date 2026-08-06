@@ -16,7 +16,7 @@
 use crate::{
     alt_svc::AltSvcStore,
     http3::{
-        BoxError, Http3State,
+        BoxError, ConnectionIdOwner, Http3State,
         session::{self, SessionKey, SessionProtocol},
         upstream::{IncomingWebTransportReceiver, IncomingWebTransportStream},
     },
@@ -26,17 +26,14 @@ use crate::{
         is_hop_by_hop_header,
     },
 };
-
 use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, ProxyRequestId};
 use bytes::{Buf, Bytes};
-
 use h3::{
     ConnectionState,
     error::{Code, StreamError},
     quic::{BidiStream as _, RecvStream as _, SendStream as _, StreamId},
     server::RequestStream,
 };
-
 use h3_datagram::datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt};
 use h3_quinn::datagram::{RecvDatagramHandler, SendDatagramHandler};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -95,6 +92,133 @@ struct SessionBinding {
     key: SessionKey,
     downstream_stream_id: StreamId,
     upstream_stream_id: StreamId,
+}
+
+/// Tracks the authenticated locally-issued CID set for one policy-owned
+/// downstream association. Quinn itself rejects unknown CIDs before they can
+/// reach this layer; this registry binds every accepted CID to the stable
+/// Quinn connection handle and the policy connection identity.
+struct ConnectionIdBindings {
+    registry: Arc<crate::http3::ConnectionIdRegistry>,
+    owner: ConnectionIdOwner,
+    sequences: HashMap<u64, quinn::ConnectionId>,
+}
+
+impl ConnectionIdBindings {
+    fn new(
+        connection: &quinn::Connection,
+        claim: &FlowClaim,
+        registry: Arc<crate::http3::ConnectionIdRegistry>,
+    ) -> Self {
+        Self {
+            registry,
+            owner: ConnectionIdOwner {
+                stable_id: connection.stable_id(),
+                proxy_connection_id: claim.connection_id,
+            },
+            sequences: HashMap::new(),
+        }
+    }
+
+    fn drain(&mut self, connection: &quinn::Connection) -> Result<(), BoxError> {
+        while let Some(event) = connection.poll_connection_id_event() {
+            match event {
+                quinn::ConnectionIdEvent::Active { sequence, id } => {
+                    if let Some(existing) = self.sequences.get(&sequence)
+                        && *existing != id
+                    {
+                        return Err(boxed_owned(format!(
+                            "QUIC connection-ID sequence {sequence} changed from {existing} to \
+                             {id}"
+                        )));
+                    }
+                    if !id.is_empty() {
+                        self.registry.bind(id, self.owner).map_err(boxed_owned)?;
+                    }
+                    self.sequences.insert(sequence, id);
+                    info!(
+                        connection_id = %self.owner.proxy_connection_id,
+                        stable_id = self.owner.stable_id,
+                        sequence,
+                        %id,
+                        "QUIC connection ID bound to policy association"
+                    );
+                }
+                quinn::ConnectionIdEvent::Retired { sequence, id } => {
+                    self.retire(sequence, id)?;
+                    info!(
+                        connection_id = %self.owner.proxy_connection_id,
+                        stable_id = self.owner.stable_id,
+                        sequence,
+                        %id,
+                        "QUIC connection ID released from policy association"
+                    );
+                }
+                quinn::ConnectionIdEvent::Removed { sequence, id } => {
+                    self.remove(sequence, id);
+                    info!(
+                        connection_id = %self.owner.proxy_connection_id,
+                        stable_id = self.owner.stable_id,
+                        sequence,
+                        %id,
+                        "QUIC connection ID removed from policy association"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drain_or_close(&mut self, connection: &quinn::Connection) -> Result<(), BoxError> {
+        if let Err(error) = self.drain(connection) {
+            connection.close(varint(Code::H3_INTERNAL_ERROR), b"QUIC CID registry failed");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self, sequence: u64, id: quinn::ConnectionId) -> Result<(), BoxError> {
+        let Some(existing) = self.sequences.remove(&sequence) else {
+            return Err(boxed_owned(format!(
+                "unknown QUIC connection-ID retirement for sequence {sequence} ({id})"
+            )));
+        };
+        if existing != id {
+            return Err(boxed_owned(format!(
+                "QUIC connection-ID sequence {sequence} retired as {id}, expected {existing}"
+            )));
+        }
+
+        if !id.is_empty() {
+            self.registry.unbind(id, self.owner).map_err(boxed_owned)?;
+        }
+        Ok(())
+    }
+
+    /// Teardown events are best-effort and idempotent: the owner cleanup also
+    /// runs when the association task is dropped.
+    fn remove(&mut self, sequence: u64, id: quinn::ConnectionId) {
+        self.sequences.remove(&sequence);
+        if !id.is_empty() {
+            let _ = self.registry.unbind(id, self.owner);
+        }
+    }
+}
+
+impl Drop for ConnectionIdBindings {
+    fn drop(&mut self) {
+        for (&sequence, id) in &self.sequences {
+            info!(
+                connection_id = %self.owner.proxy_connection_id,
+                stable_id = self.owner.stable_id,
+                sequence,
+                %id,
+                "QUIC connection ID removed from policy association"
+            );
+        }
+        self.registry.remove_owner(self.owner);
+    }
 }
 
 type UpstreamRequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -812,6 +936,10 @@ async fn serve_h3_connection(
     origin_authority: Option<String>,
 ) -> Result<(), BoxError> {
     let mut h3 = build_h3_server(&connection).await?;
+    let mut connection_ids =
+        ConnectionIdBindings::new(&connection, &claim, state.connection_ids.clone());
+    connection_ids.drain_or_close(&connection)?;
+
     let mut bound_source = source;
 
     let mut request_context =
@@ -825,6 +953,7 @@ async fn serve_h3_connection(
     let result = loop {
         if let Err(error) = rebind_migrated_path(
             &connection,
+            &mut connection_ids,
             &request_context.state.policy,
             &request_context.claim,
             destination,
@@ -870,6 +999,7 @@ async fn serve_h3_connection(
                             datagram_router,
                             resolved_rx,
                             setup,
+                            connection_ids,
                         };
 
                         let result = Box::pin(serve_webtransport(input)).await;
@@ -883,38 +1013,16 @@ async fn serve_h3_connection(
                 }
             },
             Some(resolved) = resolved_rx.recv(), if !webtransport_pending => {
-                let Some((request, mut stream)) = resolved_request(resolved) else {
-                    continue;
-                };
-
-                if reject_0rtt_stream(&mut stream) {
-                    continue;
-                }
-
-                if is_webtransport_request(&request) {
-                    if request.method() != http::Method::CONNECT {
-                        if let Err(error) = reject_webtransport_request(stream).await {
-                            warn!(%error, "malformed WebTransport request rejected");
-                        }
-                        continue;
-                    }
-
-                    let task = queue_webtransport_preparation(
-                        &mut request_context,
-                        &h3,
-                        request,
-                        stream,
-                        &webtransport_tx,
-                    );
-                    request_context.tasks.push(task);
+                if handle_resolved_request(resolved, &mut request_context, &h3, &webtransport_tx)
+                    .await
+                {
                     webtransport_pending = true;
-                    continue;
                 }
-
-                request_context.serve(request, stream, &h3).await;
             }
         }
     };
+
+    connection_ids.drain_or_close(&connection)?;
 
     finish_h3_connection(&mut request_context).await;
     connection.close(varint(Code::H3_NO_ERROR), b"proxy shutdown");
@@ -959,13 +1067,51 @@ fn resolved_request(resolved: ResolvedRequest) -> Option<ResolvedRequestValue> {
     }
 }
 
+/// Dispatch one accepted downstream HTTP/3 request.
+///
+/// Returns whether a WebTransport preparation was queued, which gates further
+/// resolved-request handling until the preparation completes.
+async fn handle_resolved_request(
+    resolved: ResolvedRequest,
+    request_context: &mut H3RequestContext,
+    h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
+    webtransport_tx: &mpsc::UnboundedSender<WebTransportPrep>,
+) -> bool {
+    let Some((request, mut stream)) = resolved_request(resolved) else {
+        return false;
+    };
+
+    if reject_0rtt_stream(&mut stream) {
+        return false;
+    }
+
+    if is_webtransport_request(&request) {
+        if request.method() != http::Method::CONNECT {
+            if let Err(error) = reject_webtransport_request(stream).await {
+                warn!(%error, "malformed WebTransport request rejected");
+            }
+            return false;
+        }
+
+        let task =
+            queue_webtransport_preparation(request_context, h3, request, stream, webtransport_tx);
+        request_context.tasks.push(task);
+        return true;
+    }
+
+    request_context.serve(request, stream, h3).await;
+    false
+}
+
 async fn rebind_migrated_path(
     connection: &quinn::Connection,
+    connection_ids: &mut ConnectionIdBindings,
     policy: &PolicySession,
     claim: &FlowClaim,
     destination: SocketAddr,
     bound_source: &mut SocketAddr,
 ) -> Result<(), BoxError> {
+    connection_ids.drain_or_close(connection)?;
     let source = connection.remote_address();
 
     if source == *bound_source {
@@ -1008,6 +1154,7 @@ struct WebTransportServeInput {
     datagram_router: DatagramRouterState,
     resolved_rx: mpsc::UnboundedReceiver<ResolvedRequest>,
     setup: WebTransportSetup,
+    connection_ids: ConnectionIdBindings,
 }
 
 struct WebTransportRegistration {
@@ -1034,6 +1181,7 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
         datagram_router,
         resolved_rx,
         setup,
+        connection_ids,
     } = input;
 
     let H3RequestContext {
@@ -1084,10 +1232,7 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
     let cleanup_sessions = sessions.clone();
     let binding_id = downstream_stream_id;
 
-    let StartedWebTransportAssociation {
-        association,
-        datagram_task,
-    } = start_webtransport_association(
+    run_webtransport_association(
         session,
         WebTransportRoute {
             upstream: upstream.clone(),
@@ -1114,6 +1259,7 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
             connection,
             destination,
             bound_source,
+            connection_ids,
         },
         WebTransportAssociationCleanup {
             upstream,
@@ -1123,7 +1269,21 @@ async fn serve_webtransport(input: WebTransportServeInput) -> Result<(), BoxErro
             datagram_task,
         },
     )
-    .await?;
+    .await
+}
+
+/// Start the accepted WebTransport association and run it to completion.
+async fn run_webtransport_association(
+    session: h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>,
+    route: WebTransportRoute,
+    upstream_incoming: IncomingWebTransportReceiver,
+    config: WebTransportAssociationConfig,
+    cleanup: WebTransportAssociationCleanup,
+) -> Result<(), BoxError> {
+    let StartedWebTransportAssociation {
+        association,
+        datagram_task,
+    } = start_webtransport_association(session, route, upstream_incoming, config, cleanup).await?;
 
     let result = Box::pin(association.run()).await;
     stop_datagram_task(datagram_task).await;
@@ -1547,6 +1707,7 @@ struct WebTransportAssociationConfig {
     connection: quinn::Connection,
     destination: SocketAddr,
     bound_source: SocketAddr,
+    connection_ids: ConnectionIdBindings,
 }
 
 struct WebTransportAssociationCleanup {
@@ -1582,6 +1743,7 @@ struct WebTransportAssociation {
     routes: HashMap<h3::webtransport::SessionId, WebTransportRoute>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     datagram_tasks: Vec<tokio::task::JoinHandle<Result<(), BoxError>>>,
+    connection_ids: ConnectionIdBindings,
 }
 
 impl WebTransportAssociation {
@@ -1606,6 +1768,7 @@ impl WebTransportAssociation {
             connection,
             destination,
             bound_source,
+            connection_ids,
         } = config;
 
         let (route_error_tx, route_error_rx) = mpsc::unbounded_channel();
@@ -1643,6 +1806,7 @@ impl WebTransportAssociation {
             routes: HashMap::new(),
             tasks,
             datagram_tasks: Vec::new(),
+            connection_ids,
         };
 
         if let Err(error) = association
@@ -1660,10 +1824,15 @@ impl WebTransportAssociation {
         let mut migration_tick = tokio::time::interval(Duration::from_millis(10));
 
         let result = loop {
+            if let Err(error) = self.connection_ids.drain_or_close(&self.connection) {
+                break Err(error);
+            }
+
             tokio::select! {
                 _ = migration_tick.tick() => {
                     if let Err(error) = rebind_migrated_path(
                         &self.connection,
+                        &mut self.connection_ids,
                         &self.state.policy,
                         &self.claim,
                         self.destination,
@@ -3586,6 +3755,10 @@ const fn map_stream_error(error: &StreamError) -> Code {
 
 fn boxed(message: &'static str) -> BoxError {
     message.into()
+}
+
+fn boxed_owned(message: impl Into<String>) -> BoxError {
+    std::io::Error::other(message.into()).into()
 }
 
 fn varint(code: Code) -> quinn::VarInt {

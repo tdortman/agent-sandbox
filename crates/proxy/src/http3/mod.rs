@@ -18,16 +18,96 @@ mod session;
 mod socket;
 pub mod upstream;
 use crate::{alt_svc::AltSvcStore, cert::CertificateIssuer, policy::PolicySession};
+use agent_sandbox_core::ProxyConnectionId;
 use socket::TransparentUdpSocket;
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use tokio::sync::{Notify, Semaphore};
+
+/// Owner of one locally-issued QUIC connection-ID route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectionIdOwner {
+    pub(crate) stable_id: usize,
+    pub(crate) proxy_connection_id: ProxyConnectionId,
+}
+
+/// Registry of authenticated locally-issued QUIC connection IDs.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionIdRegistry {
+    owners: Mutex<HashMap<quinn::ConnectionId, ConnectionIdOwner>>,
+}
+
+impl ConnectionIdRegistry {
+    pub(crate) fn bind(
+        &self,
+        id: quinn::ConnectionId,
+        owner: ConnectionIdOwner,
+    ) -> Result<(), String> {
+        if id.is_empty() {
+            return Ok(());
+        }
+
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| "QUIC connection-ID registry lock poisoned".to_owned())?;
+
+        match owners.get(&id) {
+            Some(existing) if *existing == owner => Ok(()),
+            Some(existing) => Err(format!(
+                "QUIC connection ID {id} already belongs to stable connection {}",
+                existing.stable_id
+            )),
+            None => {
+                owners.insert(id, owner);
+                drop(owners);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn unbind(
+        &self,
+        id: quinn::ConnectionId,
+        owner: ConnectionIdOwner,
+    ) -> Result<(), String> {
+        if id.is_empty() {
+            return Ok(());
+        }
+
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| "QUIC connection-ID registry lock poisoned".to_owned())?;
+
+        match owners.get(&id) {
+            Some(existing) if *existing == owner => {
+                owners.remove(&id);
+                drop(owners);
+                Ok(())
+            }
+            Some(existing) => Err(format!(
+                "QUIC connection ID {id} belongs to stable connection {}, not {}",
+                existing.stable_id, owner.stable_id
+            )),
+            None => Err(format!("unknown QUIC connection ID {id}")),
+        }
+    }
+
+    pub(crate) fn remove_owner(&self, owner: ConnectionIdOwner) {
+        let Ok(mut owners) = self.owners.lock() else {
+            return;
+        };
+        owners.retain(|_, existing| *existing != owner);
+    }
+}
 
 /// Shared state for every downstream QUIC association.
 pub struct Http3State {
@@ -38,6 +118,7 @@ pub struct Http3State {
     pub upstream: Arc<upstream::UpstreamPool>,
     pub destination_port: u16,
     pub alt_svc: Arc<AltSvcStore>,
+    pub(crate) connection_ids: Arc<ConnectionIdRegistry>,
 }
 
 /// Configuration for the HTTP/3 backend.
@@ -80,6 +161,7 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         upstream,
         destination_port,
         alt_svc: config.alt_svc.clone(),
+        connection_ids: Arc::new(ConnectionIdRegistry::default()),
     });
 
     let v4 = bind_endpoint(
@@ -282,4 +364,71 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 fn boxed(message: &'static str) -> BoxError {
     message.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionIdOwner, ConnectionIdRegistry};
+    use agent_sandbox_core::ProxyConnectionId;
+
+    fn owner(stable_id: usize) -> ConnectionIdOwner {
+        ConnectionIdOwner {
+            stable_id,
+            proxy_connection_id: ProxyConnectionId::new(),
+        }
+    }
+
+    #[test]
+    fn connection_id_registry_rejects_collisions_and_wrong_owners() {
+        let registry = ConnectionIdRegistry::default();
+        let id = quinn::ConnectionId::new(&[0x42; 8]);
+        let first = owner(1);
+        let second = owner(2);
+
+        registry.bind(id, first).expect("first owner binds");
+        registry.bind(id, first).expect("same owner is idempotent");
+        assert!(registry.bind(id, second).is_err());
+        assert!(registry.unbind(id, second).is_err());
+        registry.unbind(id, first).expect("owner unbinds");
+        assert!(registry.unbind(id, first).is_err());
+    }
+
+    #[test]
+    fn connection_id_registry_removes_all_ids_for_a_torn_down_owner() {
+        let registry = ConnectionIdRegistry::default();
+        let first = owner(1);
+        let second = owner(2);
+        let first_id = quinn::ConnectionId::new(&[0x41; 8]);
+        let second_id = quinn::ConnectionId::new(&[0x42; 8]);
+
+        registry.bind(first_id, first).expect("first owner binds");
+        registry
+            .bind(second_id, first)
+            .expect("first owner binds again");
+        registry
+            .bind(second_id, second)
+            .expect_err("IDs cannot be stolen");
+        registry.remove_owner(first);
+        registry
+            .bind(first_id, second)
+            .expect("teardown releases first ID");
+        registry
+            .bind(second_id, second)
+            .expect("teardown releases second ID");
+    }
+
+    #[test]
+    fn connection_id_registry_allows_zero_length_ids_without_global_routing() {
+        let registry = ConnectionIdRegistry::default();
+        let id = quinn::ConnectionId::new(&[]);
+        let first = owner(1);
+        let second = owner(2);
+
+        registry
+            .bind(id, first)
+            .expect("zero-length CID binds locally");
+        registry
+            .bind(id, second)
+            .expect("zero-length CIDs use tuple routing");
+    }
 }

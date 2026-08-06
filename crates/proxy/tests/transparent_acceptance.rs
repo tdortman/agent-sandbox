@@ -2,27 +2,22 @@
 
 mod support;
 use bytes::Buf;
-
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
 };
-
 use rama_core::{Service, extensions::ExtensionsRef, rt::Executor};
 use rama_http::{Body, Request, StatusCode, Version, body::util::BodyExt, conn::TargetHttpVersion};
 use rama_http_backend::client::HttpConnector;
-
 use rama_net::{
     address::{Host, HostWithPort},
     client::{ConnectorService, ConnectorTarget, EstablishedClientConnection},
 };
-
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_boring::client::TlsConnector;
 use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
 use support::{Http3Client, IpVersion, TransparentHarness, loopback};
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -1356,6 +1351,67 @@ async fn transparent_http3_migration_rebinds_policy_flow() {
     );
 
     drop(events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_tracks_authenticated_connection_ids() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let response = harness
+        .http3_request("/allow")
+        .await
+        .expect("HTTP/3 request");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+
+    wait_for_release(&harness).await;
+
+    let log = std::fs::read_to_string(&harness.proxy_log).unwrap_or_default();
+    let bound: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("QUIC connection ID bound to policy association"))
+        .collect();
+    let released: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains("QUIC connection ID released from policy association")
+                || line.contains("QUIC connection ID removed from policy association")
+        })
+        .collect();
+
+    assert!(
+        !bound.is_empty(),
+        "proxy must record bound QUIC connection IDs\n{log}"
+    );
+
+    assert!(
+        !released.is_empty(),
+        "proxy must record QUIC connection-ID releases at teardown\n{log}"
+    );
+
+    let stable_ids: std::collections::BTreeSet<&str> = bound
+        .iter()
+        .chain(&released)
+        .filter_map(|line| line.split("stable_id=").nth(1)?.split_whitespace().next())
+        .collect();
+
+    assert_eq!(
+        stable_ids.len(),
+        1,
+        "every CID event must map to one stable connection\n{log}"
+    );
+
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    let claim_id = format!("{}", events.claims[0].connection_id);
+    drop(events);
+
+    for line in &bound {
+        assert!(
+            line.contains(&format!("connection_id={claim_id}")),
+            "bound CID must map to the claimed policy association: {line}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
