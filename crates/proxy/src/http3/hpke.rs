@@ -1,9 +1,10 @@
 //! HPKE (RFC 9180) base mode for rustls ECH, backed by `ring` primitives.
 //!
-//! Only the client half of the [`Hpke`] trait is implemented: setup and seal
-//! for an encrypted `ClientHello`. rustls never invokes the opener or key
-//! generation methods on the client path, so those return an explicit
-//! "not supported" error instead of pretending to work.
+//! Both the sender half (seal) and the receiver half (open) of the [`Hpke`]
+//! trait are implemented: the proxy seals encrypted client hellos when it
+//! connects upstream with ECH, and opens them when it terminates downstream
+//! ECH offers.  Key generation stays with the proxy's persistent ECH state
+//! and returns an explicit "not supported" error here.
 //!
 //! The implementation follows rustls's own `aws-lc-rs` HPKE provider line
 //! for line, with ring's agreement, HKDF, and AEAD primitives substituted.
@@ -14,7 +15,6 @@ use ring::{
     hmac,
     rand::SystemRandom,
 };
-
 use rustls::{
     Error, OtherError,
     crypto::hpke::{
@@ -25,7 +25,6 @@ use rustls::{
         handshake::HpkeSymmetricCipherSuite,
     },
 };
-
 use std::{
     fmt,
     io::{Error as IoError, ErrorKind},
@@ -142,26 +141,29 @@ impl Hpke for RingHpke {
 
     fn open(
         &self,
-        _enc: &EncapsulatedSecret,
-        _info: &[u8],
-        _aad: &[u8],
-        _ciphertext: &[u8],
-        _secret_key: &HpkePrivateKey,
+        enc: &EncapsulatedSecret,
+        info: &[u8],
+        aad: &[u8],
+        ciphertext: &[u8],
+        secret_key: &HpkePrivateKey,
     ) -> Result<Vec<u8>, Error> {
-        Err(client_only())
+        let mut opener = self.setup_opener(enc, info, secret_key)?;
+        opener.open(aad, ciphertext)
     }
 
     fn setup_opener(
         &self,
-        _enc: &EncapsulatedSecret,
-        _info: &[u8],
-        _secret_key: &HpkePrivateKey,
+        enc: &EncapsulatedSecret,
+        info: &[u8],
+        secret_key: &HpkePrivateKey,
     ) -> Result<Box<dyn HpkeOpener + 'static>, Error> {
-        Err(client_only())
+        let shared_secret = decap(&enc.0, secret_key.secret_bytes())?;
+        let key_schedule = self.key_schedule(&shared_secret, info);
+        Ok(Box::new(Opener::new(key_schedule)))
     }
 
     fn generate_key_pair(&self) -> Result<(HpkePublicKey, HpkePrivateKey), Error> {
-        Err(client_only())
+        Err(unsupported())
     }
 
     fn suite(&self) -> HpkeSuite {
@@ -198,6 +200,29 @@ impl fmt::Debug for Sealer {
     }
 }
 
+/// A stateful HPKE receiver context.
+struct Opener {
+    key_schedule: KeySchedule,
+}
+
+impl Opener {
+    const fn new(key_schedule: KeySchedule) -> Self {
+        Self { key_schedule }
+    }
+}
+
+impl HpkeOpener for Opener {
+    fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+        self.key_schedule.open(aad, ciphertext)
+    }
+}
+
+impl fmt::Debug for Opener {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Opener").finish()
+    }
+}
+
 /// The RFC 9180 sender context state.
 struct KeySchedule {
     aead: &'static ring::aead::Algorithm,
@@ -223,6 +248,25 @@ impl KeySchedule {
         .map_err(unspecified_err)?;
 
         Ok(in_out)
+    }
+
+    /// Open one message with the sequence-numbered nonce (RFC 9180 5.2).
+    fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+        let nonce = self.compute_nonce();
+        self.increment_seq_num();
+        let key = ring::aead::UnboundKey::new(self.aead, &self.key).map_err(unspecified_err)?;
+        let key = ring::aead::LessSafeKey::new(key);
+        let mut in_out = ciphertext.to_vec();
+
+        let plaintext = key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::from(aad),
+                &mut in_out,
+            )
+            .map_err(unspecified_err)?;
+
+        Ok(plaintext.to_vec())
     }
 
     /// XOR the base nonce with the sequence number (RFC 9180 5.2).
@@ -257,6 +301,36 @@ fn encap(
         .map_err(unspecified_err)?;
 
     Ok((shared_secret, EncapsulatedSecret(enc.as_ref().to_vec())))
+}
+
+/// DHKEM(X25519, HKDF-SHA256) decapsulation (RFC 9180 4.1).
+///
+/// The static receiver key is used through `rama_tls_boring`, because
+/// `ring` only exposes ephemeral key agreement.
+fn decap(enc: &[u8], sk_r: &[u8]) -> Result<[u8; SHA256_OUTPUT_LEN], Error> {
+    use rama_tls_boring::core::x25519::{X25519PrivateKey, X25519PublicKey};
+
+    let key_error = || {
+        Error::Other(OtherError(Arc::new(IoError::other(
+            "ECH key agreement failed",
+        ))))
+    };
+
+    let sk_r = X25519PrivateKey::from_private_key_bytes(sk_r.try_into().map_err(|_| key_error())?)
+        .map_err(|_| key_error())?;
+
+    let pk_e = X25519PublicKey::from_public_key_bytes(enc.try_into().map_err(|_| key_error())?)
+        .map_err(|_| key_error())?;
+
+    let dh = sk_r.derive_shared_secret(&pk_e).map_err(|_| key_error())?;
+
+    let pk_r = sk_r
+        .public_key()
+        .and_then(|public_key| public_key.public_key_bytes())
+        .map_err(|_| key_error())?;
+
+    let kem_context = [enc, pk_r.as_ref()].concat();
+    Ok(extract_and_expand(&dh, &kem_context))
 }
 
 /// `ExtractAndExpand` for the KEM context (RFC 9180 4.1).
@@ -391,17 +465,17 @@ fn unspecified_err(_: ring::error::Unspecified) -> Error {
     ))))
 }
 
-fn client_only() -> Error {
+fn unsupported() -> Error {
     Error::Other(OtherError(Arc::new(IoError::new(
         ErrorKind::Unsupported,
-        "HPKE opener and key generation are not supported by the proxy's client-only provider",
+        "HPKE key generation is not supported by the proxy's provider; keys come from the \
+         persisted ECH state",
     ))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DHKEM_X25519_HKDF_SHA256_AES_128, KeySchedule, labeled_extract};
-
     use rustls::{
         crypto::hpke::{Hpke, HpkePrivateKey, HpkePublicKey},
         internal::msgs::enums::HpkeKem,
@@ -503,7 +577,9 @@ mod tests {
     }
 
     #[test]
-    fn client_only_methods_fail_closed() {
+    fn opener_opens_sealed_messages_with_static_vector_key() {
+        // The RFC 9180 appendix A.1.1 receiver keypair: sealing to `pk_r`
+        // must be reversible with `sk_r` for the same info and AAD.
         let pk_r = HpkePublicKey(hex(
             "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
         ));
@@ -514,22 +590,27 @@ mod tests {
 
         let info = hex(INFO);
 
-        let (enc, _) = DHKEM_X25519_HKDF_SHA256_AES_128
+        let (enc, mut sealer) = DHKEM_X25519_HKDF_SHA256_AES_128
             .setup_sealer(&info, &pk_r)
             .expect("sealer setup");
 
-        assert!(
-            DHKEM_X25519_HKDF_SHA256_AES_128
-                .open(&enc, &info, b"aad", b"ct", &sk_r)
-                .is_err()
+        let ciphertext = sealer.seal(b"aad", b"plaintext").expect("seal");
+
+        let mut opener = DHKEM_X25519_HKDF_SHA256_AES_128
+            .setup_opener(&enc, &info, &sk_r)
+            .expect("opener setup");
+
+        assert_eq!(
+            opener.open(b"aad", &ciphertext).expect("open"),
+            b"plaintext"
         );
 
-        assert!(
-            DHKEM_X25519_HKDF_SHA256_AES_128
-                .setup_opener(&enc, &info, &sk_r)
-                .is_err()
-        );
+        // The opener context is stateful: the second open uses the next
+        // sequence-numbered nonce, so the first ciphertext fails closed.
+        assert!(opener.open(b"aad", &ciphertext).is_err());
 
+        // Key generation stays fail-closed; the proxy's keys come from the
+        // persisted ECH state, never from the provider.
         assert!(
             DHKEM_X25519_HKDF_SHA256_AES_128
                 .generate_key_pair()

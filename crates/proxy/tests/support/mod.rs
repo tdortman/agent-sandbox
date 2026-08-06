@@ -3,17 +3,13 @@ use agent_sandbox_core::{
     NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxySessionReply,
     ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
-
 use bytes::{Buf, Bytes};
-
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
 };
-
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::pem::PemObject;
-
 use std::{
     io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -26,9 +22,7 @@ use std::{
     },
     time::Duration,
 };
-
 use tempfile::TempDir;
-
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, UdpSocket, UnixListener},
@@ -1274,6 +1268,51 @@ impl Http3Client {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             true,
         )
+    }
+
+    /// Build an HTTP/3 client that offers the proxy's ECH configuration.
+    ///
+    /// `config_list` must be the proxy's own `ECHConfigList` (the same bytes
+    /// the sandbox DNS rewrite distributes), so the client's encrypted
+    /// `ClientHelloInner` is decryptable by the proxy.
+    #[must_use]
+    pub fn with_ech(ca_file: &Path, config_list: &[u8]) -> Self {
+        let pem = std::fs::read(ca_file).expect("read harness CA");
+
+        let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse harness CA");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(certificates);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let config = rustls::client::EchConfig::new(
+            rustls::pki_types::EchConfigListBytes::from(config_list),
+            agent_sandbox_proxy::http3::hpke::ECH_SUPPORTED_SUITES,
+        )
+        .expect("proxy ECH configuration is supported");
+
+        let tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_ech(rustls::client::EchMode::Enable(config))
+            .expect("ECH client mode")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let mut tls = tls;
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+
+        let client_config =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client config");
+
+        let client_config = quinn::ClientConfig::new(Arc::new(client_config));
+
+        let mut endpoint =
+            quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+                .expect("client endpoint");
+
+        endpoint.set_default_client_config(client_config);
+        Self { endpoint }
     }
 
     fn with_alpn_and_ip(ca_file: &Path, alpn: &[u8], local_ip: IpAddr) -> Self {
@@ -2988,6 +3027,14 @@ impl TransparentHarness {
     ) -> Result<Http3Response, String> {
         let client = Http3Client::new(&self.root.path().join("ca.pem"));
         client.request(address, "localhost", path).await
+    }
+
+    /// Send one HTTP/3 GET request whose ECH offer uses the proxy's keys.
+    pub async fn http3_ech_request(&self, path: &str) -> Result<Http3Response, String> {
+        let config_list = std::fs::read(self.ech_state_dir().join("ech-config-list"))
+            .map_err(|error| format!("read proxy ECH configuration: {error}"))?;
+        let client = Http3Client::with_ech(&self.ca_file(), &config_list);
+        client.request(self.proxy_address, "localhost", path).await
     }
 
     /// Directory holding the proxy's ECH key material and configuration.

@@ -780,6 +780,48 @@ async fn transparent_http3_allow_records_policy_and_upstream() {
     assert_eq!(harness.h3_origin().request_heads()[0], "GET /allow");
 }
 
+/// The proxy must decrypt a downstream ECH offer using its own key material
+/// (the same configuration the sandbox DNS rewrite distributes), so the
+/// HTTP/3 policy section sees the inner server name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_http3_ech_offer_is_decrypted() {
+    let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
+    let response = match harness.http3_ech_request("/allow").await {
+        Ok(response) => response,
+        Err(error) => {
+            panic!(
+                "HTTP/3 ECH request failed: {error}\nproxy log:\n{}\norigin log:\n{}",
+                std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+                std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+            );
+        }
+    };
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body().await, b"origin-response\n");
+    wait_for_release(&harness).await;
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.claims.len(), 1);
+    assert_eq!(events.checks.len(), 1);
+
+    // The policy URL carries the inner (real) server name, proving the
+    // encrypted ClientHelloInner was decrypted before routing.
+    assert_eq!(
+        events.checks[0].url.to_string(),
+        format!(
+            "https://localhost:{}/allow",
+            harness.h3_origin().address.port()
+        )
+    );
+
+    assert_release_matches_claim(&events);
+    drop(events);
+    assert_eq!(harness.h3_origin().attempts(), 1);
+    assert_eq!(harness.h3_origin().request_heads()[0], "GET /allow");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_disables_0rtt() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;

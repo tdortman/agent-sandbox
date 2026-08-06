@@ -448,6 +448,8 @@ async fn main() -> Result<(), BoxError> {
     let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
     let executor = Executor::default();
     let alt_svc = listener_config.alt_svc.clone();
+    let ech_config_list = listener_config.ech_config_list.clone();
+    let ech_private_key = listener_config.ech_private_key;
 
     let service = build_listener_service(
         executor.clone(),
@@ -481,6 +483,8 @@ async fn main() -> Result<(), BoxError> {
             test_ech_dns: args.test_ech_dns,
             #[cfg(not(debug_assertions))]
             test_ech_dns: None,
+            ech_config_list,
+            ech_private_key,
         };
 
         let backend = http3::prepare(http3)?;
@@ -1677,6 +1681,7 @@ mod tests {
     use std::{
         convert::Infallible,
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll},
     };
     use tokio::{
@@ -2308,5 +2313,164 @@ mod tests {
         );
 
         assert_eq!(POLICY_DENIED_BODY, "blocked by agent-sandbox policy\n");
+    }
+
+    /// Drive a rustls client and server handshake through an in-memory pipe.
+    fn drive_handshake(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) {
+        let mut to_server = Vec::new();
+        let mut to_client = Vec::new();
+
+        for _ in 0..64 {
+            while client.wants_write() {
+                client.write_tls(&mut to_server).expect("client writes");
+            }
+            while server.wants_write() {
+                server.write_tls(&mut to_client).expect("server writes");
+            }
+            if client.wants_read() && !to_client.is_empty() {
+                let read = client
+                    .read_tls(&mut to_client.as_slice())
+                    .expect("client reads");
+                to_client.drain(..read);
+                client.process_new_packets().expect("client processes");
+            }
+            if server.wants_read() && !to_server.is_empty() {
+                let read = server
+                    .read_tls(&mut to_server.as_slice())
+                    .expect("server reads");
+                to_server.drain(..read);
+                server.process_new_packets().expect("server processes");
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+        }
+
+        panic!("TLS handshake did not finish");
+    }
+
+    #[test]
+    fn downstream_ech_handshake_decrypts_inner_hello() {
+        // Generate the same key material the proxy persists in its ECH state.
+        let dir = tempfile::tempdir().expect("temp ECH state");
+        let state = crate::ech_state::load_or_generate(dir.path()).expect("ECH state");
+
+        // A server that terminates ECH with that state, issuing certificates
+        // for the inner (real) server name.
+        let inner_name = "ech-test.example";
+        let certified = rcgen::generate_simple_self_signed(vec![inner_name.to_owned()])
+            .expect("test certificate");
+        let certificate = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let private_key =
+            rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                .expect("test key");
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let keys = agent_sandbox_proxy::http3::hpke::ECH_SUPPORTED_SUITES
+            .iter()
+            .map(|hpke| {
+                rustls::server::ech::EchKeys::new(
+                    rustls::pki_types::EchConfigListBytes::from(state.config_list.as_slice()),
+                    &state.private_key,
+                    *hpke,
+                )
+                .expect("ECH keys")
+            })
+            .collect();
+
+        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], private_key)
+            .expect("server certificate")
+            .with_ech_keys(keys)
+            .expect("server ECH keys");
+        let mut server =
+            rustls::ServerConnection::new(Arc::new(server_config)).expect("server connection");
+
+        // A client that fetched the proxy's ECH configuration (the same bytes
+        // the sandbox DNS rewrite distributes) and connects to the inner name.
+        let config = rustls::client::EchConfig::new(
+            rustls::pki_types::EchConfigListBytes::from(state.config_list.as_slice()),
+            agent_sandbox_proxy::http3::hpke::ECH_SUPPORTED_SUITES,
+        )
+        .expect("client ECH configuration");
+
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_ech(rustls::client::EchMode::Enable(config))
+            .expect("client ECH mode")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from(inner_name).expect("server name"),
+        )
+        .expect("client connection");
+
+        drive_handshake(&mut client, &mut server);
+
+        assert_eq!(client.ech_status(), rustls::client::EchStatus::Accepted);
+        assert!(!server.is_handshaking());
+        assert_eq!(
+            server.server_name().map(ToString::to_string),
+            Some(inner_name.to_owned())
+        );
+    }
+
+    /// Accepts any server certificate; the test asserts ECH behaviour, not
+    /// certificate verification.
+    #[derive(Debug)]
+    struct AcceptAllVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAllVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            certificate: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                certificate,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            certificate: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                certificate,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
     }
 }

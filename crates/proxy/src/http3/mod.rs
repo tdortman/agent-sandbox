@@ -13,14 +13,13 @@
 mod association;
 
 mod ech;
-mod hpke;
+pub mod hpke;
 mod session;
 mod socket;
 pub mod upstream;
 use crate::{alt_svc::AltSvcStore, cert::CertificateIssuer, policy::PolicySession};
 use agent_sandbox_core::ProxyConnectionId;
 use socket::TransparentUdpSocket;
-
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -28,7 +27,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-
 use tokio::sync::{Notify, Semaphore};
 
 /// Owner of one locally-issued QUIC connection-ID route.
@@ -119,6 +117,10 @@ pub struct Http3State {
     pub destination_port: u16,
     pub alt_svc: Arc<AltSvcStore>,
     pub(crate) connection_ids: Arc<ConnectionIdRegistry>,
+    /// Downstream ECH configuration distributed to clients.
+    pub ech_config_list: Option<Arc<Vec<u8>>>,
+    /// Downstream ECH private key matching `ech_config_list`.
+    pub ech_private_key: Option<[u8; 32]>,
 }
 
 /// Configuration for the HTTP/3 backend.
@@ -132,6 +134,10 @@ pub struct Http3Config {
     pub alt_svc: Arc<AltSvcStore>,
     pub test_destination: Option<SocketAddr>,
     pub test_ech_dns: Option<SocketAddr>,
+    /// Downstream ECH configuration distributed to clients.
+    pub ech_config_list: Option<Arc<Vec<u8>>>,
+    /// Downstream ECH private key matching `ech_config_list`.
+    pub ech_private_key: Option<[u8; 32]>,
 }
 
 /// Prepare the HTTP/3 backend so every fallible setup step runs before
@@ -162,6 +168,8 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         destination_port,
         alt_svc: config.alt_svc.clone(),
         connection_ids: Arc::new(ConnectionIdRegistry::default()),
+        ech_config_list: config.ech_config_list,
+        ech_private_key: config.ech_private_key,
     });
 
     let v4 = bind_endpoint(
@@ -299,6 +307,26 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
             issuer: state.issuer.clone(),
             fallback_name: std::net::Ipv4Addr::LOCALHOST.to_string(),
         }));
+
+    // Terminate downstream ECH with the same key material the TCP listener
+    // uses, so clients that fetch their configuration through the sandbox
+    // DNS rewrite get a decryptable offer on both legs.
+    if let (Some(config_list), Some(private_key)) = (&state.ech_config_list, state.ech_private_key)
+    {
+        let keys = hpke::ECH_SUPPORTED_SUITES
+            .iter()
+            .map(|hpke| {
+                rustls::server::ech::EchKeys::new(
+                    rustls::pki_types::EchConfigListBytes::from(config_list.as_slice()),
+                    &private_key,
+                    *hpke,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BoxError::from)?;
+
+        tls = tls.with_ech_keys(keys).map_err(BoxError::from)?;
+    }
 
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = 0;
