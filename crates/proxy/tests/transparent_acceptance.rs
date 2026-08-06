@@ -1642,7 +1642,24 @@ async fn transparent_http3_alt_svc_preserved_and_attributed() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
-    wait_for_release(&harness).await;
+    // The main and alternative associations each claim and release their
+    // own flow, so wait until both releases are recorded before pairing
+    // each one with its claim.
+    for _ in 0..100 {
+        let released = harness
+            .policy_events()
+            .lock()
+            .expect("policy events lock")
+            .releases
+            .len();
+
+        if released == 2 {
+            break;
+        }
+
+        sleep(Duration::from_millis(10)).await;
+    }
+
     let events = harness.policy_events();
     let events = events.lock().expect("policy events lock");
     assert_eq!(events.checks.len(), 2);
@@ -1653,7 +1670,24 @@ async fn transparent_http3_alt_svc_preserved_and_attributed() {
         "alternative endpoint must keep the original origin identity"
     );
 
-    assert_release_matches_claim(&events);
+    assert_eq!(events.claims.len(), 2);
+    assert_eq!(events.releases.len(), 2);
+
+    for release in &events.releases {
+        assert_eq!(
+            release.token,
+            agent_sandbox_core::AttributionToken::from_bytes([2; 32])
+        );
+
+        assert!(
+            events
+                .claims
+                .iter()
+                .any(|claim| claim.connection_id == release.connection_id),
+            "each release must pair with its claim"
+        );
+    }
+
     drop(events);
     assert_eq!(harness.h3_origin().attempts(), 2);
 }
