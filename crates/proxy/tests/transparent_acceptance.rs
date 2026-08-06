@@ -16,7 +16,7 @@ use rama_net::{
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_boring::client::TlsConnector;
-use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
+use std::{collections::BTreeSet, os::fd::AsFd, sync::atomic::Ordering, time::Duration};
 use support::{Http3Client, IpVersion, TransparentHarness, loopback};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -701,6 +701,29 @@ async fn wait_for_h3_condition(mut condition: impl FnMut() -> bool, timeout_seco
     panic!("HTTP/3 harness condition was not met in time");
 }
 
+/// Strip ANSI escape sequences from captured proxy output.
+///
+/// The proxy pins its own formatter to plain text, but log parsing must not
+/// depend on the colour configuration of whatever process spawned it.
+fn strip_ansi(input: &str) -> String {
+    let mut plain = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.next() == Some('[') {
+            for ch in chars.by_ref() {
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+
+    plain
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_allow_records_policy_and_upstream() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
@@ -1366,7 +1389,7 @@ async fn transparent_http3_tracks_authenticated_connection_ids() {
 
     wait_for_release(&harness).await;
 
-    let log = std::fs::read_to_string(&harness.proxy_log).unwrap_or_default();
+    let log = strip_ansi(&std::fs::read_to_string(&harness.proxy_log).unwrap_or_default());
     let bound: Vec<&str> = log
         .lines()
         .filter(|line| line.contains("QUIC connection ID bound to policy association"))
@@ -1389,7 +1412,7 @@ async fn transparent_http3_tracks_authenticated_connection_ids() {
         "proxy must record QUIC connection-ID releases at teardown\n{log}"
     );
 
-    let stable_ids: std::collections::BTreeSet<&str> = bound
+    let stable_ids: BTreeSet<&str> = bound
         .iter()
         .chain(&released)
         .filter_map(|line| line.split("stable_id=").nth(1)?.split_whitespace().next())

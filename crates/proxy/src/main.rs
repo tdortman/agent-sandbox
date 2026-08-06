@@ -1,7 +1,6 @@
 mod ech_state;
 pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
-
 use agent_sandbox_proxy::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
@@ -16,11 +15,9 @@ use agent_sandbox_proxy::{
         TerminalError, is_hop_by_hop_header,
     },
 };
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use nix::sys::socket::{getsockopt, sockopt};
-
 use rama_core::{
     Service,
     bytes::Bytes,
@@ -31,7 +28,6 @@ use rama_core::{
     rt::Executor,
     service::service_fn,
 };
-
 use rama_http::{
     Body, HeaderMap, HeaderValue, Request, Response, StatusCode, Version,
     body::{Frame, StreamingBody, util::BodyExt},
@@ -42,9 +38,7 @@ use rama_http::{
         version_adapter::{ResponseVersionAdaptCtx, adapt_response_version},
     },
 };
-
 use rama_http_backend::server::HttpServer;
-
 use rama_net::{
     address::SocketAddress,
     http::server::HttpPeekRouter,
@@ -52,10 +46,8 @@ use rama_net::{
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
-
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
-
 use rama_tls_boring::{
     TlsStream,
     core::{
@@ -64,7 +56,6 @@ use rama_tls_boring::{
         x509::X509,
     },
 };
-
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
@@ -75,7 +66,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 use upstream::UpstreamClients;
@@ -423,7 +413,11 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // Logs are captured to files by the harness and journald; ANSI styling
+    // would corrupt structured log parsing. The default would enable colours
+    // whenever `NO_COLOR` is unset, so pin them off explicitly.
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_target(false)
         .without_time()
         .init();
@@ -1663,10 +1657,8 @@ mod tests {
         request_head_clone, select_ech_config_list, semantic_request_headers,
         semantic_response_headers,
     };
-
     use crate::ech_state::EchState;
     use clap::Parser;
-
     use rama_core::{
         Service,
         bytes::Bytes,
@@ -1675,22 +1667,18 @@ mod tests {
         rt::Executor,
         service::service_fn,
     };
-
     use rama_http::{
         HeaderMap, HeaderValue, Response,
         body::util::BodyExt,
         io::upgrade::{Upgraded, pending},
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
-
     use rama_net::proxy::IoForwardService;
-
     use std::{
         convert::Infallible,
         pin::Pin,
         task::{Context, Poll},
     };
-
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         time::{Duration, timeout},
