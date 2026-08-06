@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/h3", "vendor/quinn-0.11.11", "vendor/quinn-proto-0.11.16"]
+exclude = ["vendor/*"]
 
 [workspace.package]
 version = "0.42.0"
@@ -107,6 +107,7 @@ warnings = "deny"
 [patch.crates-io]
 quinn = { path = "vendor/quinn-0.11.11" }
 quinn-proto = { path = "vendor/quinn-proto-0.11.16" }
+rustls = { path = "vendor/rustls-0.23.43" }
 
 [patch."https://github.com/hyperium/h3.git"]
 h3 = { path = "vendor/h3" }
