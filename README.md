@@ -1,6 +1,17 @@
 # agent-sandbox
 
-Run agent CLIs inside a bubblewrap jail on NixOS. `policyd` checks network, HTTP, filesystem, Unix-socket, device, sudo, and D-Bus operations. Unknown operations wait for approval in the Qt or zenity dialog, or through `agent-sandbox-approve` on the host.
+Run agent CLIs inside a bubblewrap jail on NixOS. Unknown operations wait for approval before executing.
+
+## What it gates
+
+| Gate       | Behavior                                                                                                                                        |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Network    | Per-sandbox network namespace and outbound TCP/UDP checks.                                                                                      |
+| HTTP proxy | Optional HTTP/1.0, HTTP/1.1, HTTP/2 and HTTP/3 inspection, including WebSocket upgrade relay and WebTransport, through the transparent proxy.   |
+| Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
+| Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
+| Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |
+| D-Bus      | Filtered session-bus access through a per-sandbox relay.                                                                                        |
 
 ## Quick start
 
@@ -50,19 +61,6 @@ agent-sandbox.network.httpProxy.http10UpstreamOrigins = [
   "https://legacy.example.com"
 ];
 ```
-
-The HTTP/3 backend stays disabled by default. The local Quinn patch exposes authenticated active and retired QUIC connection-ID events, but rustls still cannot configure server-side ECH.
-
-## What it gates
-
-| Gate       | Behavior                                                                                                                                        |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Network    | Per-sandbox network namespace and outbound TCP/UDP checks.                                                                                      |
-| HTTP proxy | Optional HTTP/1.0, HTTP/1.1, HTTP/2 and HTTP/3 inspection, including WebSocket upgrade relay and WebTransport, through the transparent proxy.   |
-| Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
-| Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
-| Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |
-| D-Bus      | Filtered session-bus access through a per-sandbox relay.                                                                                        |
 
 ## Policy
 
