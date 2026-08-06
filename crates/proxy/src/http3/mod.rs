@@ -147,6 +147,10 @@ pub struct Http3Config {
 ///
 /// Returns an error when the upstream trust store is missing or the UDP
 /// listeners cannot be bound.
+///
+/// # Panics
+///
+/// Panics when the freshly built shared state is unexpectedly shared.
 pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
     let ca_file = std::env::var_os("SSL_CERT_FILE")
         .map(PathBuf::from)
@@ -155,23 +159,22 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
     let upstream = Arc::new(upstream::UpstreamPool::new(&ca_file, config.test_ech_dns)?);
     let transparent = config.test_destination.is_none();
 
-    let destination_port = config
-        .test_destination
-        .map_or(config.listen_port, |destination| destination.port());
-
-    let state = Arc::new(Http3State {
+    let mut state = Arc::new(Http3State {
         policy: config.policy,
         issuer: config.issuer,
         shutdown: config.shutdown,
         active_checks: config.active_checks,
         upstream,
-        destination_port,
+        destination_port: 0,
         alt_svc: config.alt_svc.clone(),
         connection_ids: Arc::new(ConnectionIdRegistry::default()),
         ech_config_list: config.ech_config_list,
         ech_private_key: config.ech_private_key,
     });
 
+    // A port of 0 asks the kernel for an ephemeral port; the real port is
+    // only known once bound, so every listener built after the first one
+    // reuses the bound value instead of the requested one.
     let v4 = bind_endpoint(
         IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         config.listen_port,
@@ -179,16 +182,25 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         &state,
     )?;
 
+    let main_port = v4.local_addr()?.port();
+
     let v6 = bind_endpoint(
         IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        config.listen_port,
+        main_port,
         transparent,
         &state,
     )?;
 
-    let main_destination =
-        association::DestinationResolver::new(config.listen_port, config.test_destination, false);
+    Arc::get_mut(&mut state)
+        .expect("fresh HTTP/3 state")
+        .destination_port = config
+        .test_destination
+        .map_or(main_port, |destination| destination.port());
 
+    let main_destination =
+        association::DestinationResolver::new(main_port, config.test_destination, false);
+
+    let mut ports = vec![main_port];
     let mut alternatives = Vec::with_capacity(config.alt_ports.len());
 
     for port in config.alt_ports {
@@ -199,16 +211,19 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
             &state,
         )?;
 
+        let bound_port = v4.local_addr()?.port();
+
         let v6 = bind_endpoint(
             IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            port,
+            bound_port,
             transparent,
             &state,
         )?;
 
         let destination =
-            association::DestinationResolver::new(port, config.test_destination, true);
+            association::DestinationResolver::new(bound_port, config.test_destination, true);
 
+        ports.push(bound_port);
         alternatives.push(AltEndpoint {
             v4,
             v6,
@@ -222,6 +237,7 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         state,
         destination: main_destination,
         alternatives,
+        ports,
     })
 }
 
@@ -232,6 +248,15 @@ pub struct Http3Backend {
     state: Arc<Http3State>,
     destination: association::DestinationResolver,
     alternatives: Vec<AltEndpoint>,
+    ports: Vec<u16>,
+}
+
+impl Http3Backend {
+    /// The bound UDP ports: the main listener, then each alternative.
+    #[must_use]
+    pub fn bound_ports(&self) -> &[u16] {
+        &self.ports
+    }
 }
 
 /// One alternative UDP listener for validated `Alt-Svc` endpoints.
@@ -249,6 +274,7 @@ pub async fn run(backend: Http3Backend) {
         state,
         destination,
         alternatives,
+        ..
     } = backend;
 
     let v4_loop = tokio::spawn(association::accept_loop(

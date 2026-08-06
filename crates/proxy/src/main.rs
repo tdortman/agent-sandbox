@@ -56,6 +56,8 @@ use rama_tls_boring::{
         x509::X509,
     },
 };
+#[cfg(debug_assertions)]
+use std::path::Path;
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
@@ -188,6 +190,13 @@ struct Args {
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     test_tls: bool,
+
+    /// Write the actually bound listener ports to this file, one `key port`
+    /// line per listener. The harness passes `--listen-port 0` and learns
+    /// the real ports from this file, so no port allocation is raced.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    write_bound_ports: Option<PathBuf>,
 
     #[arg(long, default_value_t = 305_000)]
     policy_timeout_ms: u64,
@@ -451,20 +460,14 @@ async fn main() -> Result<(), BoxError> {
     let ech_config_list = listener_config.ech_config_list.clone();
     let ech_private_key = listener_config.ech_private_key;
 
-    let service = build_listener_service(
-        executor.clone(),
-        policy.clone(),
-        listener_config,
-        shutdown.clone(),
-        active_checks.clone(),
-        args.listen_port,
-    );
-
     #[cfg(debug_assertions)]
     let transparent = args.test_destination.is_none();
 
     #[cfg(not(debug_assertions))]
     let transparent = true;
+
+    #[cfg(debug_assertions)]
+    let mut http3_ports = Vec::new();
 
     if args.http3 {
         let http3 = Http3Config {
@@ -474,7 +477,7 @@ async fn main() -> Result<(), BoxError> {
             active_checks: active_checks.clone(),
             listen_port: args.http3_listen_port,
             alt_ports: args.http3_alt_ports.clone(),
-            alt_svc,
+            alt_svc: alt_svc.clone(),
             #[cfg(debug_assertions)]
             test_destination: args.test_destination,
             #[cfg(not(debug_assertions))]
@@ -488,7 +491,38 @@ async fn main() -> Result<(), BoxError> {
         };
 
         let backend = http3::prepare(http3)?;
+
+        for port in backend.bound_ports() {
+            alt_svc.intercept(*port);
+        }
+
+        #[cfg(debug_assertions)]
+        http3_ports.extend(backend.bound_ports().iter().copied());
+
         tokio::spawn(http3::run(backend));
+    }
+
+    let v4 = bind_listener(
+        Domain::IPv4,
+        args.listen_port,
+        executor.clone(),
+        transparent,
+    )
+    .await?;
+    let listen_port = v4.local_addr()?.port();
+
+    let service = build_listener_service(
+        executor.clone(),
+        policy.clone(),
+        listener_config,
+        shutdown.clone(),
+        active_checks.clone(),
+        listen_port,
+    );
+
+    #[cfg(debug_assertions)]
+    if let Some(path) = &args.write_bound_ports {
+        write_bound_ports_file(path, listen_port, &http3_ports)?;
     }
 
     run_listeners(
@@ -496,10 +530,37 @@ async fn main() -> Result<(), BoxError> {
         policy,
         shutdown,
         executor,
-        args.listen_port,
+        v4,
+        listen_port,
         transparent,
     )
     .await
+}
+
+/// Write the actually bound listener ports for the harness to read back.
+#[cfg(debug_assertions)]
+fn write_bound_ports_file(
+    path: &Path,
+    listen_port: u16,
+    http3_ports: &[u16],
+) -> Result<(), BoxError> {
+    use std::fmt::Write as _;
+
+    let mut content = format!("tcp {listen_port}\n");
+
+    for port in http3_ports {
+        writeln!(content, "http3 {port}")
+            .map_err(|error| BoxError::from(format!("write bound proxy ports: {error}")))?;
+    }
+
+    std::fs::write(path, content).map_err(|error| {
+        BoxError::from(format!(
+            "write bound proxy ports to {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(())
 }
 
 async fn run_listeners(
@@ -507,10 +568,10 @@ async fn run_listeners(
     policy: Arc<PolicySession>,
     shutdown: Arc<Notify>,
     executor: Executor,
+    v4: TcpListener,
     listen_port: u16,
     transparent: bool,
 ) -> Result<(), BoxError> {
-    let v4 = bind_listener(Domain::IPv4, listen_port, executor.clone(), transparent).await?;
     let v6 = bind_listener(Domain::IPv6, listen_port, executor, transparent).await?;
     policy.mark_ready()?;
     info!(port = listen_port, "transparent HTTP proxy listening");
@@ -740,19 +801,13 @@ fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenerConfi
     let ca_private_key = std::fs::read_to_string(ca_private_key)?;
     let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
 
-    let intercepted_udp_ports = if args.http3 {
-        std::iter::once(args.http3_listen_port)
-            .chain(args.http3_alt_ports.iter().copied())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
+    // The intercepted UDP set is filled after the HTTP/3 backend binds:
+    // port-0 listeners only learn their real ports once bound.
     let listener_config = ListenerConfig {
         issuer: issuer.clone(),
         ech_config_list,
         ech_private_key,
-        alt_svc: Arc::new(AltSvcStore::new(intercepted_udp_ports)),
+        alt_svc: Arc::new(AltSvcStore::new(Vec::new())),
         websocket_http11_urls,
         http10_upstream_origins,
         #[cfg(debug_assertions)]

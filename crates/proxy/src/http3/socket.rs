@@ -12,9 +12,7 @@
 use nix::sys::socket::{
     ControlMessage, ControlMessageOwned, recvmsg, sendmsg, setsockopt, sockopt,
 };
-
 use rama_net::socket::core::{Domain, Protocol, Socket as Socket2, Type};
-
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -23,7 +21,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-
 use tokio::io::unix::AsyncFd;
 
 /// One received UDP datagram and its metadata.
@@ -73,11 +70,14 @@ impl TransparentUdpSocket {
         socket.bind(&address.into())?;
         socket.set_nonblocking(true)?;
         let socket: std::net::UdpSocket = socket.into();
+        // A port of 0 asks the kernel for an ephemeral port; report the
+        // address actually bound so `local_addr` is truthful for listeners.
+        let bound = socket.local_addr()?;
         let inner = Arc::new(AsyncFd::new(socket)?);
 
         Ok(Self {
             inner,
-            bound: address,
+            bound,
             transparent,
         })
     }

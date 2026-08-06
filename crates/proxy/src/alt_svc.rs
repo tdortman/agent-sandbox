@@ -18,7 +18,6 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-
 use tracing::debug;
 
 /// Rewrite the `Alt-Svc` headers of one approved response.
@@ -83,7 +82,7 @@ fn parse_bracketed<'a>(host: &'a str, suffix: &str) -> Option<(&'a str, u16)> {
 
 /// Mapping store shared by the TCP and HTTP/3 proxy backends.
 pub struct AltSvcStore {
-    intercepted_udp_ports: Vec<u16>,
+    intercepted_udp_ports: Mutex<Vec<u16>>,
     entries: Mutex<HashMap<(IpAddr, u16), OriginEntry>>,
 }
 
@@ -98,15 +97,41 @@ impl AltSvcStore {
     #[must_use]
     pub fn new(intercepted_udp_ports: Vec<u16>) -> Self {
         Self {
-            intercepted_udp_ports,
+            intercepted_udp_ports: Mutex::new(intercepted_udp_ports),
             entries: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Record one more intercepted UDP port.
+    ///
+    /// Port-0 listeners learn their real port only after binding, so the
+    /// intercepted set is filled in once the HTTP/3 backend is prepared.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the ports lock is poisoned by a panicking task.
+    pub fn intercept(&self, port: u16) {
+        let mut ports = self
+            .intercepted_udp_ports
+            .lock()
+            .expect("alt-svc ports lock");
+
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+
     /// Whether transparent UDP interception covers `port`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the ports lock is poisoned by a panicking task.
     #[must_use]
     pub fn is_intercepted(&self, port: u16) -> bool {
-        self.intercepted_udp_ports.contains(&port)
+        self.intercepted_udp_ports
+            .lock()
+            .expect("alt-svc ports lock")
+            .contains(&port)
     }
 
     /// Record the validated alternatives of one approved response.
