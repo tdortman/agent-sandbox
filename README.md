@@ -51,7 +51,7 @@ agent-sandbox.network.httpProxy.http10UpstreamOrigins = [
 ];
 ```
 
-The HTTP/3 backend stays disabled by default. Quinn does not let the proxy track QUIC connection IDs, and rustls cannot configure server-side ECH yet.
+The HTTP/3 backend stays disabled by default. The local Quinn patch exposes authenticated active and retired QUIC connection-ID events, but rustls still cannot configure server-side ECH.
 
 ## What it gates
 

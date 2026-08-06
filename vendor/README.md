@@ -79,3 +79,12 @@ You can see the results at (https://interop.seemann.io/).
 ## License
 
 h3 is provided under the MIT license. See [LICENSE](LICENSE).
+
+## Local Quinn patch
+
+`quinn-0.11.11/` and `quinn-proto-0.11.16/` are vendored copies with a
+small project-local patch. `quinn-proto` emits authenticated
+`ConnectionIdEvent` values for locally-issued IDs, and `quinn::Connection`
+exposes them through `poll_connection_id_event()` alongside `stable_id()`. The
+transparent HTTP/3 backend uses these events to bind active and retired IDs to
+policy ownership without parsing encrypted QUIC packets.
