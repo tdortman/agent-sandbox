@@ -9,16 +9,14 @@
 //! tests a way to observe partial responses.
 
 use bytes::{Buf, Bytes};
-
 use clap::Parser;
 use h3::quic::{SendStream as _, SendStreamUnframed as _};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use rustls::pki_types::pem::PemObject;
-
 use std::{
     io,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -27,7 +25,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-
 use tokio::io::unix::AsyncFd;
 
 #[derive(Debug)]
@@ -164,9 +161,10 @@ struct Args {
     #[arg(long)]
     log: PathBuf,
 
-    /// `Alt-Svc` header value added to every non-stream response.
+    /// File holding the advertised `Alt-Svc` port; read on every response
+    /// so the harness can advertise a port discovered after startup.
     #[arg(long)]
-    alt_svc: Option<String>,
+    alt_svc_file: Option<PathBuf>,
 
     #[arg(long)]
     gate: Option<PathBuf>,
@@ -229,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while let Some(incoming) = endpoint.accept().await {
         let log = log.clone();
         let gate = args.gate.clone();
-        let alt_svc = args.alt_svc.clone();
+        let alt_svc_file = args.alt_svc_file.clone();
         let reject_sessions = args.reject_sessions;
         let refuse_sessions = args.refuse_sessions;
         let drop_first_session = drop_first_session.clone();
@@ -246,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 incoming,
                 log.clone(),
                 gate,
-                alt_svc.as_deref(),
+                alt_svc_file.as_deref(),
                 reject_sessions,
                 refuse_sessions,
                 drop_first_session,
@@ -458,7 +456,7 @@ async fn serve_connection(
     incoming: quinn::Incoming,
     log: Arc<std::sync::Mutex<std::fs::File>>,
     gate: Option<PathBuf>,
-    alt_svc: Option<&str>,
+    alt_svc_file: Option<&Path>,
     reject_sessions: bool,
     refuse_sessions: bool,
     drop_first_session: Arc<AtomicBool>,
@@ -514,7 +512,7 @@ async fn serve_connection(
             }
         }
 
-        serve_request(&path, &mut stream, gate.as_deref(), alt_svc).await?;
+        serve_request(&path, &mut stream, gate.as_deref(), alt_svc_file).await?;
     }
 
     Ok(())
@@ -554,7 +552,7 @@ async fn serve_request(
     path: &str,
     stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     gate: Option<&std::path::Path>,
-    default_alt_svc: Option<&str>,
+    alt_svc_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if path == "/informational" {
         send_informational_response(stream).await?;
@@ -565,9 +563,9 @@ async fn serve_request(
     }
 
     let alt_svc = match path {
-        "/alt-svc-clear" => Some("clear"),
-        "/alt-svc-filtered" => Some("h3=\":59999\""),
-        _ => default_alt_svc,
+        "/alt-svc-clear" => Some("clear".to_owned()),
+        "/alt-svc-filtered" => Some("h3=\":59999\"".to_owned()),
+        _ => alt_svc_file.and_then(read_alt_svc),
     };
 
     if matches!(path, "/expect" | "/request-trailers") {
@@ -674,6 +672,13 @@ async fn serve_request(
     stream.send_data(Bytes::from_static(body)).await?;
     stream.finish().await?;
     Ok(())
+}
+
+/// Read the advertised alternative port from `path`, written by the harness
+/// once the proxy reports the port it actually bound.
+fn read_alt_svc(path: &Path) -> Option<String> {
+    let port: u16 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    Some(format!("h3=\":{port}\"; persist=1"))
 }
 
 async fn read_request_body(

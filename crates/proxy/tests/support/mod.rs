@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -25,99 +25,11 @@ use std::{
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UdpSocket, UnixListener},
+    net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
     sync::Notify,
     task::JoinHandle,
     time::{sleep, timeout},
 };
-
-fn harness_startup_mutex() -> Arc<tokio::sync::Mutex<()>> {
-    static LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
-        LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
-
-    LOCK.clone()
-}
-
-struct HarnessStartupLock {
-    path: PathBuf,
-    _local_guard: tokio::sync::OwnedMutexGuard<()>,
-}
-
-impl HarnessStartupLock {
-    async fn acquire() -> Self {
-        let local_guard = harness_startup_mutex().lock_owned().await;
-        let path = std::env::temp_dir().join("agent-sandbox-proxy-harness-startup.lock");
-
-        loop {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id()).expect("write harness lock owner");
-                    return Self {
-                        path,
-                        _local_guard: local_guard,
-                    };
-                }
-
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if !harness_lock_owner_is_alive(&path)
-                        && let Err(error) = std::fs::remove_file(&path)
-                        && error.kind() != ErrorKind::NotFound
-                    {
-                        panic!("remove stale harness startup lock: {error}");
-                    }
-                    sleep(Duration::from_millis(10)).await;
-                }
-
-                Err(error) => panic!("create harness startup lock: {error}"),
-            }
-        }
-    }
-}
-
-impl Drop for HarnessStartupLock {
-    fn drop(&mut self) {
-        let owner = std::process::id().to_string();
-
-        if std::fs::read_to_string(&self.path).is_ok_and(|contents| contents.trim() == owner)
-            && let Err(error) = std::fs::remove_file(&self.path)
-            && error.kind() != ErrorKind::NotFound
-        {
-            panic!("remove harness startup lock: {error}");
-        }
-    }
-}
-
-fn harness_lock_owner_is_alive(path: &Path) -> bool {
-    let Ok(owner) = std::fs::read_to_string(path) else {
-        return false;
-    };
-
-    let Ok(pid) = owner.trim().parse::<u32>() else {
-        return false;
-    };
-
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
-struct PortReservation(std::net::TcpListener);
-
-impl PortReservation {
-    fn new(ip: IpAddr) -> Self {
-        Self(std::net::TcpListener::bind(SocketAddr::new(ip, 0)).expect("reserve harness port"))
-    }
-
-    fn port(&self) -> u16 {
-        self.0.local_addr().expect("reserved port address").port()
-    }
-}
-
-fn free_port(ip: IpAddr) -> u16 {
-    PortReservation::new(ip).port()
-}
 
 /// One observed flow claim with the connection identity that owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -766,7 +678,7 @@ struct OriginOptions {
 }
 
 struct Http3OriginOptions {
-    alt_port: Option<u16>,
+    alt_svc: bool,
     session_settings: Http3SessionSettings,
     refuse_sessions: bool,
     drop_first_session: bool,
@@ -783,10 +695,7 @@ struct HarnessOrigins {
 async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
     if let Some(http3) = options.http3.as_ref() {
         let gate = options.root.join("gate");
-
-        let alt_svc = http3
-            .alt_port
-            .map(|port| format!("h3=\":{port}\"; persist=1"));
+        let alt_svc_file = http3.alt_svc.then(|| options.root.join("alt-svc"));
 
         let origin = Http3Origin::start_with_settings(
             options.ip,
@@ -796,7 +705,7 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
             &options.root,
             Http3OriginSettings {
                 gate: Some(&gate),
-                alt_svc: alt_svc.as_deref(),
+                alt_svc_file: alt_svc_file.as_deref(),
                 reject_sessions: matches!(http3.session_settings, Http3SessionSettings::Rejected),
                 refuse_sessions: http3.refuse_sessions,
                 drop_first_session: http3.drop_first_session,
@@ -805,7 +714,7 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
         .await;
 
         return HarnessOrigins {
-            tcp: TcpOrigin::start(options.ip, free_port(options.ip), b"unused").await,
+            tcp: TcpOrigin::start(options.ip, 0, b"unused").await,
             tls: None,
             h3: Some(origin),
         };
@@ -815,7 +724,6 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
         let origin_address = SocketAddr::new(options.ip, options.origin_port);
 
         let (origin, tls_origin) = start_tls_origin(
-            options.ip,
             origin_address,
             &options.certificate,
             &options.private_key,
@@ -844,22 +752,32 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
 }
 
 async fn start_tls_origin(
-    ip: IpAddr,
     address: SocketAddr,
     certificate: &Path,
     key: &Path,
     tls_alpn: TlsAlpn,
 ) -> (TcpOrigin, TlsOrigin) {
     let listener = TcpListener::bind(address).await.expect("bind TLS origin");
-    let inner_port = free_port(ip);
+    let address = listener.local_addr().expect("TLS origin address");
+
+    // The inner TLS terminator listens on a Unix socket instead of a TCP
+    // port, so no free port is handed to a child process and raced. The
+    // socket lives in its own short /tmp directory: openssl 3.6 fails to
+    // start when the path exceeds 31 characters (its post-bind getnameinfo
+    // call overflows on longer paths).
+    let socket_dir = tempfile::Builder::new()
+        .prefix("asot")
+        .tempdir_in("/tmp")
+        .expect("create TLS origin socket directory");
+    let inner_socket = socket_dir.path().join("s.sock");
     let mut command = Command::new("openssl");
 
     command.args([
         "s_server",
         "-quiet",
         "-www",
-        "-accept",
-        &inner_port.to_string(),
+        "-unix",
+        inner_socket.to_str().expect("TLS origin socket path"),
         "-cert",
         certificate.to_str().expect("origin certificate path"),
         "-key",
@@ -875,9 +793,10 @@ async fn start_tls_origin(
         .spawn()
         .expect("start TLS origin");
 
-    wait_for_socket(SocketAddr::new(ip, inner_port)).await;
+    wait_for_unix_socket(&inner_socket).await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = attempts.clone();
+    let forward_socket = inner_socket.clone();
 
     let task = tokio::spawn(async move {
         loop {
@@ -885,7 +804,7 @@ async fn start_tls_origin(
                 break;
             };
             task_attempts.fetch_add(1, Ordering::SeqCst);
-            let Ok(mut upstream) = TcpStream::connect(SocketAddr::new(ip, inner_port)).await else {
+            let Ok(mut upstream) = UnixStream::connect(&forward_socket).await else {
                 continue;
             };
             let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
@@ -901,7 +820,11 @@ async fn start_tls_origin(
             request_heads: Arc::new(Mutex::new(Vec::new())),
             task: None,
         },
-        TlsOrigin { child, task },
+        TlsOrigin {
+            child,
+            task,
+            _socket_dir: socket_dir,
+        },
     )
 }
 
@@ -957,6 +880,7 @@ impl Drop for UdpOrigin {
 struct TlsOrigin {
     child: Child,
     task: JoinHandle<()>,
+    _socket_dir: TempDir,
 }
 
 impl Drop for TlsOrigin {
@@ -980,7 +904,7 @@ pub struct Http3Origin {
 
 struct Http3OriginSettings<'a> {
     gate: Option<&'a Path>,
-    alt_svc: Option<&'a str>,
+    alt_svc_file: Option<&'a Path>,
     reject_sessions: bool,
     refuse_sessions: bool,
     drop_first_session: bool,
@@ -1003,7 +927,7 @@ impl Http3Origin {
             root,
             Http3OriginSettings {
                 gate,
-                alt_svc: None,
+                alt_svc_file: None,
                 reject_sessions: false,
                 refuse_sessions: false,
                 drop_first_session: false,
@@ -1041,8 +965,11 @@ impl Http3Origin {
             command.args(["--gate", gate.to_str().expect("gate path")]);
         }
 
-        if let Some(alt_svc) = settings.alt_svc {
-            command.args(["--alt-svc", alt_svc]);
+        if let Some(alt_svc_file) = settings.alt_svc_file {
+            command.args([
+                "--alt-svc-file",
+                alt_svc_file.to_str().expect("alt-svc file path"),
+            ]);
         }
 
         if settings.reject_sessions {
@@ -2372,22 +2299,20 @@ fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
     Some((value, length))
 }
 
-/// Extra HTTP/3 options for one harness.
+/// Whether one harness advertises and intercepts an alternative endpoint.
 #[derive(Default)]
 enum Http3AltPort {
     #[default]
     None,
 
+    /// Let the proxy bind an ephemeral port and report it back; the origin
+    /// then advertises the reported port.
     Allocate,
-    Fixed(u16),
 }
 
 impl Http3AltPort {
-    const fn value(&self) -> Option<u16> {
-        match self {
-            Self::Fixed(port) => Some(*port),
-            Self::None | Self::Allocate => None,
-        }
+    const fn enabled(&self) -> bool {
+        matches!(self, Self::Allocate)
     }
 }
 
@@ -2402,12 +2327,6 @@ struct Http3Options {
 }
 
 impl Http3Options {
-    fn resolve_alt_port(&mut self, enabled: bool, ip: IpAddr) {
-        if enabled && matches!(&self.alt_port, Http3AltPort::Allocate) {
-            self.alt_port = Http3AltPort::Fixed(free_port(ip));
-        }
-    }
-
     const fn session_settings(&self) -> Http3SessionSettings {
         if self.reject_sessions {
             Http3SessionSettings::Rejected
@@ -2506,7 +2425,7 @@ impl TransparentHarness {
     }
 
     pub async fn start_tls(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), HarnessOptions {
+        Self::start_inner(ip, 0, HarnessOptions {
             tls: true,
             advertise_http11_alpn: true,
             ..HarnessOptions::default()
@@ -2516,7 +2435,7 @@ impl TransparentHarness {
 
     /// Start a TLS harness whose origin does not advertise ALPN.
     pub async fn start_tls_without_alpn(ip: IpAddr) -> Self {
-        Self::start_inner(ip, free_port(ip), HarnessOptions {
+        Self::start_inner(ip, 0, HarnessOptions {
             tls: true,
             ..HarnessOptions::default()
         })
@@ -2629,9 +2548,7 @@ impl TransparentHarness {
             mode,
         } = options;
 
-        let _startup_lock = HarnessStartupLock::acquire().await;
-        let (http10_origin, claim_errors, http3, mut http3_options) = harness_mode_options(mode);
-        http3_options.resolve_alt_port(http3, ip);
+        let (http10_origin, claim_errors, http3, http3_options) = harness_mode_options(mode);
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = start_harness_policy(&root, claim_errors);
         let (ca_cert, ca_key) = write_harness_ca(&root);
@@ -2643,7 +2560,7 @@ impl TransparentHarness {
             tls_alpn: harness_tls_alpn(advertise_http11_alpn),
             keep_alive,
             http3: http3.then_some(Http3OriginOptions {
-                alt_port: http3_options.alt_port.value(),
+                alt_svc: http3_options.alt_port.enabled(),
                 session_settings: http3_options.session_settings(),
                 refuse_sessions: http3_options.refuse_sessions,
                 drop_first_session: http3_options.drop_first_session,
@@ -2660,8 +2577,7 @@ impl TransparentHarness {
         let udp_origin = UdpOrigin::start(ip).await;
         let ready = root.path().join("ready");
         let state = root.path().join("ech");
-        let proxy_port = free_port(ip);
-        let proxy_address = SocketAddr::new(ip, proxy_port);
+        let bound_ports_path = root.path().join("bound-ports");
 
         let destination = h3_origin
             .as_ref()
@@ -2669,6 +2585,9 @@ impl TransparentHarness {
 
         let mut proxy_command = Command::new(env!("CARGO_BIN_EXE_agent-sandbox-proxy"));
 
+        // The proxy binds port 0 and writes its actual ports back; handing a
+        // pre-chosen port to the child would race other tests' ephemeral
+        // binds between the reservation being released and the child binding.
         proxy_command.args([
             "--policy-socket",
             policy.socket.to_str().expect("policy socket path"),
@@ -2679,7 +2598,9 @@ impl TransparentHarness {
             "--ech-state-dir",
             state.to_str().expect("ECH state path"),
             "--listen-port",
-            &proxy_port.to_string(),
+            "0",
+            "--write-bound-ports",
+            bound_ports_path.to_str().expect("bound ports path"),
             "--test-destination",
             &destination.to_string(),
         ]);
@@ -2702,10 +2623,10 @@ impl TransparentHarness {
         if http3 {
             proxy_command
                 .args(["--enable-http3-backend", "--http3-listen-port"])
-                .arg(proxy_port.to_string());
+                .arg("0");
 
-            if let Some(alt_port) = http3_options.alt_port.value() {
-                proxy_command.args(["--http3-alt-port", &alt_port.to_string()]);
+            if http3_options.alt_port.enabled() {
+                proxy_command.args(["--http3-alt-port", "0"]);
             }
 
             if let Some(dns) = http3_options.test_ech_dns {
@@ -2719,10 +2640,8 @@ impl TransparentHarness {
         let proxy = spawn_harness_proxy(proxy_command, &proxy_log, &ready);
         wait_for_path(&ready).await;
 
-        let h3_alt_address = http3_options
-            .alt_port
-            .value()
-            .map(|port| SocketAddr::new(ip, port));
+        let (proxy_address, h3_alt_address) =
+            resolve_harness_addresses(&root, ip, &read_bound_ports(&bound_ports_path));
 
         Self {
             proxy_address,
@@ -3080,10 +2999,10 @@ async fn wait_for_path(path: &Path) {
     .expect("proxy readiness");
 }
 
-async fn wait_for_socket(address: SocketAddr) {
+async fn wait_for_unix_socket(path: &Path) {
     timeout(Duration::from_secs(5), async {
         loop {
-            if TcpStream::connect(address).await.is_ok() {
+            if UnixStream::connect(path).await.is_ok() {
                 return;
             }
             sleep(Duration::from_millis(10)).await;
@@ -3091,6 +3010,73 @@ async fn wait_for_socket(address: SocketAddr) {
     })
     .await
     .expect("TLS origin readiness");
+}
+
+/// The ports the proxy bound, reported through its `--write-bound-ports`
+/// file after every listener is up.
+struct BoundProxyPorts {
+    tcp: u16,
+    http3_main: Option<u16>,
+    http3_alts: Vec<u16>,
+}
+
+/// Derive the client-facing addresses from the proxy's reported ports and
+/// publish the alternative port to the origin's advertisement file.
+fn resolve_harness_addresses(
+    root: &TempDir,
+    ip: IpAddr,
+    bound_ports: &BoundProxyPorts,
+) -> (SocketAddr, Option<SocketAddr>) {
+    let proxy_address = SocketAddr::new(ip, bound_ports.http3_main.unwrap_or(bound_ports.tcp));
+    let h3_alt_address = bound_ports
+        .http3_alts
+        .first()
+        .copied()
+        .map(|port| SocketAddr::new(ip, port));
+
+    if let Some(alt_port) = bound_ports.http3_alts.first() {
+        std::fs::write(root.path().join("alt-svc"), alt_port.to_string())
+            .expect("write origin alt-svc port");
+    }
+
+    (proxy_address, h3_alt_address)
+}
+
+fn read_bound_ports(path: &Path) -> BoundProxyPorts {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read bound proxy ports from {}: {error}", path.display()));
+
+    let mut ports = BoundProxyPorts {
+        tcp: 0,
+        http3_main: None,
+        http3_alts: Vec::new(),
+    };
+
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            panic!("malformed bound proxy port line: {line:?}");
+        };
+
+        let port: u16 = value
+            .parse()
+            .unwrap_or_else(|error| panic!("malformed bound proxy port {value:?}: {error}"));
+
+        match key {
+            "tcp" => ports.tcp = port,
+            "http3" if ports.http3_main.is_none() => ports.http3_main = Some(port),
+            "http3" => ports.http3_alts.push(port),
+            other => panic!("unknown bound proxy port key: {other:?}"),
+        }
+    }
+
+    assert_ne!(
+        ports.tcp,
+        0,
+        "bound proxy ports file {} has no tcp entry",
+        path.display()
+    );
+
+    ports
 }
 
 pub const fn loopback(version: IpVersion) -> IpAddr {
