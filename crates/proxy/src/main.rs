@@ -377,8 +377,8 @@ fn build_tcp_tls_config(
         tls = tls.with_ech_keys(keys).map_err(BoxError::from)?;
     }
 
-    // h2 preferred, http/1.1 fallback: matches the previous BoringSSL
-    // callback's server preference order.
+    // h2 preferred, http/1.1 fallback: server preference order matching
+    // the previous accept implementation's ALPN callback.
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     // Real stateless tickets for TLS 1.2 and 1.3 resumption; the rustls
