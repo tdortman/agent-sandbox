@@ -335,9 +335,10 @@ where
 
 /// Build the shared TLS configuration for one TCP listener.
 ///
-/// The configuration is built once per listener and shared across
-/// connections so session resumption state (ticketer, session cache)
-/// survives between handshakes.
+/// The configuration is built once per listener and cloned per
+/// connection with a destination-aware certificate resolver. The clone
+/// shares the ticketer and session storage through their `Arc` fields,
+/// so resumption state survives between handshakes.
 fn build_tcp_tls_config(
     issuer: CertificateIssuer,
     ech_config_list: Option<&Arc<Vec<u8>>>,
@@ -346,6 +347,9 @@ fn build_tcp_tls_config(
 ) -> Result<rustls::ServerConfig, BoxError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
+    // The per-connection clone replaces this resolver with one that
+    // issues certificates for the destination address, so the placeholder
+    // is never used for a real handshake.
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
@@ -637,11 +641,13 @@ fn build_listener_service(
         let test_tls = listener_config.test_tls;
         let active_checks = active_checks.clone();
         let tls_config = tls_config.clone();
+        let issuer = listener_config.issuer.clone();
         let ech_config_list = listener_config.ech_config_list.clone();
 
         async move {
             let peer: SocketAddr = stream.peer_addr()?.into();
             let destination = destination_resolver(&stream, listen_port)?;
+            let destination_ip = destination.ip();
             let source = peer;
             info!(%peer, %source, %destination, "accepted transparent proxy stream");
             let flow = flow_key(source, destination)?;
@@ -710,8 +716,19 @@ fn build_listener_service(
             let http = http_server.service(request_service);
             let fallback_http = HttpPeekRouter::new_http1(http.clone());
 
+            // Clone the shared listener configuration per connection so the
+            // certificate resolver can fall back to the destination address
+            // for clients that send no SNI. The clone shares the ticketer
+            // and session storage through their `Arc` fields, so resumption
+            // state survives between connections.
+            let mut tls_config = tls_config.as_ref().clone();
+            tls_config.cert_resolver = Arc::new(http3::SandboxCertResolver {
+                issuer: issuer.clone(),
+                fallback_name: destination_ip.to_string(),
+            });
+
             let tls = RustlsTlsService {
-                config: tls_config,
+                config: Arc::new(tls_config),
                 inner: http,
             };
 
