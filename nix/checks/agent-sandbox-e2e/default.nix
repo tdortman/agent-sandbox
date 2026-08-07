@@ -489,9 +489,14 @@ let
             after = [ "network.target" ];
             wantedBy = [ "multi-user.target" ];
 
+            preStart = ''
+              echo -n 169.254.100.1:4444 > /var/lib/h3-origin/alt-svc
+            '';
+
             serviceConfig = {
               AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
               CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+              StateDirectory = "h3-origin";
 
               ExecStart = lib.escapeShellArgs [
                 "${sandboxPkg}/bin/h3-origin"
@@ -503,8 +508,8 @@ let
                 "${tlsFixture}/server-cert.pem"
                 "--private-key"
                 "${tlsFixture}/server-key.pem"
-                "--alt-svc"
-                "h3=\"169.254.100.1:4444\"; persist=1"
+                "--alt-svc-file"
+                "/var/lib/h3-origin/alt-svc"
                 "--log"
                 "/var/log/h3-origin.log"
               ];
