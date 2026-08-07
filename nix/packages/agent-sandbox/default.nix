@@ -45,7 +45,6 @@ rust.rustPlatform.buildRustPackage {
   };
 
   doCheck = true;
-  useNextest = true;
 
   postInstall = ''
     # Copy the Qt dialog helper into the package.
@@ -60,6 +59,8 @@ rust.rustPlatform.buildRustPackage {
     # Install zsh completion.
     install -Dm644 ${./_agent-sandbox-approve} $out/share/zsh/site-functions/_agent-sandbox-approve
   '';
+
+  useNextest = true;
 
   meta = with lib; {
     description = "Policy daemon, NFQUEUE enforcer, DNS cache, CLIs, netns enter helper, and Qt-wrapped UI";
