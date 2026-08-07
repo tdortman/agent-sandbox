@@ -305,32 +305,33 @@ fn encap(
 
 /// DHKEM(X25519, HKDF-SHA256) decapsulation (RFC 9180 4.1).
 ///
-/// The static receiver key is used through `rama_tls_boring`, because
-/// `ring` only exposes ephemeral key agreement.
+/// The static receiver key is used through `x25519_dalek`, because ring
+/// exposes no agreement private-key import or export.
 fn decap(enc: &[u8], sk_r: &[u8]) -> Result<[u8; SHA256_OUTPUT_LEN], Error> {
-    use rama_tls_boring::core::x25519::{X25519PrivateKey, X25519PublicKey};
-
     let key_error = || {
         Error::Other(OtherError(Arc::new(IoError::other(
             "ECH key agreement failed",
         ))))
     };
 
-    let sk_r = X25519PrivateKey::from_private_key_bytes(sk_r.try_into().map_err(|_| key_error())?)
-        .map_err(|_| key_error())?;
+    let sk_r: [u8; 32] = sk_r.try_into().map_err(|_| key_error())?;
+    let enc: [u8; 32] = enc.try_into().map_err(|_| key_error())?;
 
-    let pk_e = X25519PublicKey::from_public_key_bytes(enc.try_into().map_err(|_| key_error())?)
-        .map_err(|_| key_error())?;
+    let sk_r = x25519_dalek::StaticSecret::from(sk_r);
+    let pk_e = x25519_dalek::PublicKey::from(enc);
 
-    let dh = sk_r.derive_shared_secret(&pk_e).map_err(|_| key_error())?;
+    let shared = sk_r.diffie_hellman(&pk_e);
 
-    let pk_r = sk_r
-        .public_key()
-        .and_then(|public_key| public_key.public_key_bytes())
-        .map_err(|_| key_error())?;
+    // RFC 9180 4.1 requires decapsulation to fail on a non-contributory
+    // shared secret; the all-zero identity point must never be used.
+    if !shared.was_contributory() {
+        return Err(key_error());
+    }
 
-    let kem_context = [enc, pk_r.as_ref()].concat();
-    Ok(extract_and_expand(&dh, &kem_context))
+    let pk_r = x25519_dalek::PublicKey::from(&sk_r).to_bytes();
+
+    let kem_context = [enc, pk_r].concat();
+    Ok(extract_and_expand(shared.as_bytes(), &kem_context))
 }
 
 /// `ExtractAndExpand` for the KEM context (RFC 9180 4.1).

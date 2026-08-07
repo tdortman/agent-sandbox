@@ -53,6 +53,7 @@ tokio = {
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+x25519-dalek.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

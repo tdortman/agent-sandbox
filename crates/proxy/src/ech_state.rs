@@ -1,7 +1,6 @@
 //! Persistent ECH key material and DNS configuration for the transparent proxy.
 
-use rama_tls_boring::core::x25519::X25519PrivateKey;
-
+use ring::rand::SecureRandom as _;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -9,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
 
 /// Directory containing the proxy's persistent ECH key and configuration.
 pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";
@@ -53,13 +53,9 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
             io::Error::new(io::ErrorKind::InvalidData, "invalid ECH private key length")
         })?;
 
-        let key =
-            X25519PrivateKey::from_private_key_bytes(&private_key).map_err(io::Error::other)?;
+        let key = X25519PrivateKey::from(private_key);
 
-        let public_key = key
-            .public_key()
-            .and_then(|public_key| public_key.public_key_bytes())
-            .map_err(io::Error::other)?;
+        let public_key = X25519PublicKey::from(&key).to_bytes();
 
         let config_list = encode_config_list(&public_key);
         atomic_write(&config_path, &config_list)?;
@@ -70,13 +66,10 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
         });
     }
 
-    let key = X25519PrivateKey::generate().map_err(io::Error::other)?;
-    let private_key = key.private_key_bytes().map_err(io::Error::other)?;
+    let key = generate_x25519_private_key()?;
+    let private_key = key.to_bytes();
 
-    let public_key = key
-        .public_key()
-        .and_then(|public_key| public_key.public_key_bytes())
-        .map_err(io::Error::other)?;
+    let public_key = X25519PublicKey::from(&key).to_bytes();
 
     if let Err(error) = create_if_missing(&private_key_path, &private_key, 0o600) {
         if error.kind() == io::ErrorKind::AlreadyExists {
@@ -93,6 +86,17 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
         config_list,
         private_key,
     })
+}
+
+/// Generate a fresh X25519 private key from the operating system RNG.
+fn generate_x25519_private_key() -> io::Result<X25519PrivateKey> {
+    let mut bytes = [0_u8; 32];
+
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| io::Error::other("secure RNG failure"))?;
+
+    Ok(X25519PrivateKey::from(bytes))
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -206,15 +210,20 @@ mod tests {
         let second = load_or_generate(&directory).expect("load ECH state");
         assert_eq!(first.config_list, second.config_list);
         assert_eq!(first.private_key, second.private_key);
-        let mut keys = rama_tls_boring::core::ssl::SslEchKeys::builder().expect("ECH key builder");
 
-        keys.add_key(
-            true,
-            &first.config_list[2..],
-            rama_tls_boring::core::hpke::HpkeKey::dhkem_p256_sha256(&first.private_key)
-                .expect("HPKE key"),
-        )
-        .expect("valid ECH config");
+        let keys = crate::http3::hpke::ECH_SUPPORTED_SUITES
+            .iter()
+            .map(|hpke| {
+                rustls::server::ech::EchKeys::new(
+                    rustls::pki_types::EchConfigListBytes::from(first.config_list.as_slice()),
+                    &first.private_key,
+                    *hpke,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid ECH config");
+
+        assert!(!keys.is_empty());
 
         assert_eq!(
             usize::from(u16::from_be_bytes([
