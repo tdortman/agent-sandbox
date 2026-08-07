@@ -15,7 +15,8 @@ use rama_net::{
 };
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
-use rama_tls_boring::client::TlsConnector;
+use rama_tls_rustls::client::TlsConnector;
+use rustls::pki_types::pem::PemObject as _;
 use std::{collections::BTreeSet, os::fd::AsFd, sync::atomic::Ordering, time::Duration};
 use support::{Http3Client, IpVersion, TransparentHarness, loopback};
 use tokio::{
@@ -409,6 +410,102 @@ async fn transparent_http2_downstream_falls_back_to_http11_without_alpn() {
     assert_eq!(events.checks.len(), 1);
     assert_eq!(events.decisions, [true]);
     assert_release_matches_claim(&events);
+}
+
+/// A TLS client that offers ECH with the proxy's own configuration over TCP.
+///
+/// The proxy decrypts the offer and must route on the inner server name,
+/// proving the rustls TCP accept terminates ECH end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_https_ech_offer_is_decrypted_over_tcp() {
+    let harness = TransparentHarness::start_tls(loopback(IpVersion::V4)).await;
+
+    let config_list = std::fs::read(harness.ech_state_dir().join("ech-config-list"))
+        .expect("proxy ECH configuration");
+
+    let pem = std::fs::read(harness.ca_file()).expect("harness CA");
+
+    let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse harness CA");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(certificates);
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+    let config = rustls::client::EchConfig::new(
+        rustls::pki_types::EchConfigListBytes::from(config_list),
+        agent_sandbox_proxy::http3::hpke::ECH_SUPPORTED_SUITES,
+    )
+    .expect("proxy ECH configuration is supported");
+
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_ech(rustls::client::EchMode::Enable(config))
+        .expect("ECH client mode")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let tcp = TcpStream::connect(harness.proxy_address)
+        .await
+        .expect("connect to proxy");
+
+    let connector: rama_tls_rustls::dep::tokio_rustls::TlsConnector =
+        std::sync::Arc::new(tls).into();
+
+    let mut stream = connector
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name"),
+            tcp,
+        )
+        .await
+        .expect("TLS handshake");
+
+    let request = format!(
+        "GET /allow HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        harness.origin.address.port()
+    );
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write TLS request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+
+    // The handshake completed during the IO above; the offer must have been
+    // accepted for the inner name to reach policy.
+    assert_eq!(
+        stream.get_ref().1.ech_status(),
+        rustls::client::EchStatus::Accepted
+    );
+
+    let status = response.starts_with(b"HTTP/1.0 200") || response.starts_with(b"HTTP/1.1 200");
+    assert!(
+        status,
+        "unexpected HTTPS response: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    wait_for_release(&harness).await;
+    let events = harness.policy_events();
+    let events = events.lock().expect("policy events lock");
+    assert_eq!(events.checks.len(), 1);
+
+    // The policy URL carries the inner (real) server name, proving the
+    // encrypted ClientHelloInner was decrypted before routing.
+    assert_eq!(
+        events.checks[0].url.to_string(),
+        format!("https://localhost:{}/allow", harness.origin.address.port())
+    );
+
+    assert_release_matches_claim(&events);
+    drop(events);
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

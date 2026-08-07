@@ -78,10 +78,6 @@ version = "0.3.0"
 default-features = false
 features = ["tls"]
 
-[workspace.dependencies.rama-tls-boring]
-version = "0.3.0"
-default-features = false
-
 [workspace.dependencies.rama-tls-rustls]
 version = "0.3.0"
 default-features = false

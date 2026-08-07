@@ -48,14 +48,7 @@ use rama_net::{
 };
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
-use rama_tls_boring::{
-    TlsStream,
-    core::{
-        hpke::HpkeKey,
-        ssl::{AlpnError, NameType, SelectCertError, SslAcceptor, SslEchKeys, SslMethod, SslRef},
-        x509::X509,
-    },
-};
+use rama_tls_rustls::server::TlsStream as RustlsTlsStream;
 #[cfg(debug_assertions)]
 use std::path::Path;
 use std::{
@@ -77,34 +70,6 @@ const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
 #[derive(Debug)]
 struct PolicyDenied;
-
-fn select_alpn<'a>(_: &mut SslRef, offered: &'a [u8]) -> Result<&'a [u8], AlpnError> {
-    let mut offset = 0;
-    let mut http11 = None;
-
-    while offset < offered.len() {
-        let length = offered[offset] as usize;
-        let end = offset.saturating_add(1 + length);
-
-        if end > offered.len() {
-            return Err(AlpnError::ALERT_FATAL);
-        }
-
-        let protocol = &offered[offset + 1..end];
-
-        if protocol == b"h2" {
-            return Ok(protocol);
-        }
-
-        if protocol == b"http/1.1" {
-            http11 = Some(protocol);
-        }
-
-        offset = end;
-    }
-
-    http11.ok_or(AlpnError::NOACK)
-}
 
 impl Display for PolicyDenied {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -331,93 +296,92 @@ fn destination_override(destination: SocketAddr) -> DestinationResolver {
 }
 
 #[derive(Clone)]
-struct BoringTlsService<S> {
-    issuer: CertificateIssuer,
-    ech_config_list: Option<Arc<Vec<u8>>>,
-    ech_private_key: Option<[u8; 32]>,
-    fallback_name: String,
+struct RustlsTlsService<S> {
+    config: Arc<rustls::ServerConfig>,
     inner: S,
 }
 
-impl<S, IO> Service<IO> for BoringTlsService<S>
+impl<S, IO> Service<IO> for RustlsTlsService<S>
 where
     IO: Io + Unpin + ExtensionsRef + std::fmt::Debug + Sync + 'static,
-    S: Service<TlsStream<IO>, Error: Into<BoxError>>,
+    S: Service<RustlsTlsStream<IO>, Error: Into<BoxError>>,
 {
     type Error = BoxError;
     type Output = S::Output;
 
     async fn serve(&self, stream: IO) -> Result<Self::Output, Self::Error> {
-        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
-        acceptor.set_grease_enabled(true);
-        acceptor.set_alpn_select_callback(select_alpn);
-
-        if let (Some(config_list), Some(private_key)) =
-            (&self.ech_config_list, self.ech_private_key)
-        {
-            let mut keys = SslEchKeys::builder()?;
-
-            let config = config_list
-                .get(2..)
-                .ok_or_else(|| BoxError::from_static_str("invalid ECH config list"))?;
-
-            keys.add_key(true, config, HpkeKey::dhkem_p256_sha256(&private_key)?)?;
-            acceptor.set_ech_keys(&keys.build())?;
-        }
-
-        let issuer = self.issuer.clone();
-        let fallback_name = self.fallback_name.clone();
-
-        acceptor.set_select_certificate_callback(move |mut client_hello| {
-            let server_name = client_hello
-                .servername(NameType::HOST_NAME)
-                .unwrap_or(&fallback_name);
-
-            let issued_certificate = issuer
-                .issue(server_name)
-                .map_err(|_| SelectCertError::ERROR)?;
-
-            let ssl = client_hello.ssl_mut();
-
-            let leaf = X509::from_der(issued_certificate.certificate_chain[0].as_ref())
-                .map_err(|_| SelectCertError::ERROR)?;
-
-            ssl.set_certificate(leaf.as_ref())
-                .map_err(|_| SelectCertError::ERROR)?;
-
-            for certificate in issued_certificate.certificate_chain.iter().skip(1) {
-                let certificate =
-                    X509::from_der(certificate.as_ref()).map_err(|_| SelectCertError::ERROR)?;
-
-                ssl.add_chain_cert(certificate.as_ref())
-                    .map_err(|_| SelectCertError::ERROR)?;
-            }
-
-            let private_key = rama_tls_boring::core::pkey::PKey::private_key_from_der(
-                issued_certificate.private_key.secret_der(),
-            )
-            .map_err(|_| SelectCertError::ERROR)?;
-
-            ssl.set_private_key(private_key.as_ref())
-                .map_err(|_| SelectCertError::ERROR)?;
-
-            Ok(())
-        });
-
-        let stream = rama_tls_boring::core::tokio::accept(&acceptor.build(), stream).await?;
-        let stream = TlsStream::new(stream);
+        // `TlsAcceptor` drives the full handshake state machine on a
+        // `ServerConnection`, including ECH decryption. The
+        // `LazyConfigAcceptor` path cannot be used: its config-independent
+        // ClientHello pre-processing skips ECH entirely.
+        let acceptor = rama_tls_rustls::dep::tokio_rustls::TlsAcceptor::from(self.config.clone());
+        let stream = acceptor.accept(stream).await?;
 
         // Record the negotiated SNI on the connection extensions. The HTTP
         // server clones those extensions into each request's `Ingress`,
         // giving policy the verified TLS identity for authority resolution.
-        if let Some(server_name) = stream.ssl_ref().servername(NameType::HOST_NAME) {
-            stream
-                .extensions()
-                .insert(TlsServerName(server_name.to_owned()));
+        // With an accepted ECH offer this is the decrypted inner name.
+        let server_name = stream.get_ref().1.server_name().map(ToString::to_string);
+
+        let stream = RustlsTlsStream::new(stream);
+
+        if let Some(server_name) = server_name {
+            stream.extensions().insert(TlsServerName(server_name));
         }
 
         self.inner.serve(stream).await.map_err(Into::into)
     }
+}
+
+/// Build the shared TLS configuration for one TCP listener.
+///
+/// The configuration is built once per listener and shared across
+/// connections so session resumption state (ticketer, session cache)
+/// survives between handshakes.
+fn build_tcp_tls_config(
+    issuer: CertificateIssuer,
+    ech_config_list: Option<&Arc<Vec<u8>>>,
+    ech_private_key: Option<[u8; 32]>,
+    fallback_name: String,
+) -> Result<rustls::ServerConfig, BoxError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(http3::SandboxCertResolver {
+            issuer,
+            fallback_name,
+        }));
+
+    // Terminate downstream ECH with the same key material the HTTP/3 leg
+    // uses, so clients that fetch their configuration through the sandbox
+    // DNS rewrite get a decryptable offer on both legs.
+    if let (Some(config_list), Some(private_key)) = (&ech_config_list, ech_private_key) {
+        let keys = http3::hpke::ECH_SUPPORTED_SUITES
+            .iter()
+            .map(|hpke| {
+                rustls::server::ech::EchKeys::new(
+                    rustls::pki_types::EchConfigListBytes::from(config_list.as_slice()),
+                    &private_key,
+                    *hpke,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BoxError::from)?;
+
+        tls = tls.with_ech_keys(keys).map_err(BoxError::from)?;
+    }
+
+    // h2 preferred, http/1.1 fallback: matches the previous BoringSSL
+    // callback's server preference order.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    // Real stateless tickets for TLS 1.2 and 1.3 resumption; the rustls
+    // default ticketer never produces tickets.
+    tls.ticketer = rustls::crypto::ring::Ticketer::new()?;
+
+    Ok(tls)
 }
 
 #[tokio::main]
@@ -518,7 +482,7 @@ async fn main() -> Result<(), BoxError> {
         shutdown.clone(),
         active_checks.clone(),
         listen_port,
-    );
+    )?;
 
     #[cfg(debug_assertions)]
     if let Some(path) = &args.write_bound_ports {
@@ -654,13 +618,17 @@ fn build_listener_service(
     shutdown: Arc<Notify>,
     active_checks: Arc<Semaphore>,
     listen_port: u16,
-) -> impl Service<TcpStream, Output = (), Error = BoxError> + Clone {
-    service_fn(move |stream: TcpStream| {
+) -> Result<impl Service<TcpStream, Output = (), Error = BoxError> + Clone, BoxError> {
+    let tls_config = Arc::new(build_tcp_tls_config(
+        listener_config.issuer.clone(),
+        listener_config.ech_config_list.as_ref(),
+        listener_config.ech_private_key,
+        Ipv4Addr::LOCALHOST.to_string(),
+    )?);
+
+    Ok(service_fn(move |stream: TcpStream| {
         let executor = executor.clone();
         let policy = policy.clone();
-        let issuer = listener_config.issuer.clone();
-        let ech_config_list = listener_config.ech_config_list.clone();
-        let ech_private_key = listener_config.ech_private_key;
         let alt_svc = listener_config.alt_svc.clone();
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
@@ -668,6 +636,8 @@ fn build_listener_service(
         let destination_resolver = listener_config.destination_resolver.clone();
         let test_tls = listener_config.test_tls;
         let active_checks = active_checks.clone();
+        let tls_config = tls_config.clone();
+        let ech_config_list = listener_config.ech_config_list.clone();
 
         async move {
             let peer: SocketAddr = stream.peer_addr()?.into();
@@ -740,11 +710,8 @@ fn build_listener_service(
             let http = http_server.service(request_service);
             let fallback_http = HttpPeekRouter::new_http1(http.clone());
 
-            let tls = BoringTlsService {
-                issuer,
-                ech_config_list: ech_config_list.clone(),
-                ech_private_key,
-                fallback_name: destination.ip().to_string(),
+            let tls = RustlsTlsService {
+                config: tls_config,
                 inner: http,
             };
 
@@ -754,7 +721,7 @@ fn build_listener_service(
             release_result?;
             result
         }
-    })
+    }))
 }
 
 fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenerConfig), BoxError> {

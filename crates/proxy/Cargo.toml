@@ -31,7 +31,6 @@ rama-http-core.workspace = true
 rama-net.workspace = true
 rama-tcp.workspace = true
 rama-tls.workspace = true
-rama-tls-boring.workspace = true
 rama-tls-rustls.workspace = true
 rcgen.workspace = true
 ring.workspace = true

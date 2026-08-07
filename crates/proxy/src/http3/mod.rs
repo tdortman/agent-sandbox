@@ -369,9 +369,9 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
 }
 
 /// Issues a leaf certificate from the sandbox CA for each client's SNI.
-struct SandboxCertResolver {
-    issuer: CertificateIssuer,
-    fallback_name: String,
+pub struct SandboxCertResolver {
+    pub issuer: CertificateIssuer,
+    pub fallback_name: String,
 }
 
 impl std::fmt::Debug for SandboxCertResolver {
