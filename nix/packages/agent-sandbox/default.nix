@@ -44,20 +44,8 @@ rust.rustPlatform.buildRustPackage {
     };
   };
 
-  preBuild = ''
-    # rama-boring-sys 0.6.4 treats GCC 15's upstream false positives as errors.
-    export CXXFLAGS="''${CXXFLAGS:-} -Wno-error=array-bounds -Wno-error=stringop-overflow"
-  '';
-
   doCheck = true;
-
-  # The target-qualified nextest hook cannot link rama-boring's generated
-  # native symbols for proxy tests; run the workspace tests for the host.
-  checkPhase = ''
-    runHook preCheck
-    cargo test --release --workspace --offline
-    runHook postCheck
-  '';
+  useNextest = true;
 
   postInstall = ''
     # Copy the Qt dialog helper into the package.

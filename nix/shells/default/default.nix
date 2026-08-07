@@ -20,9 +20,4 @@ pkgs.mkShell {
     rust.rustPlatform.bindgenHook
     rust.toolchain
   ];
-
-  shellHook = ''
-    # rama-boring-sys 0.6.4 treats GCC 15's upstream false positives as errors.
-    export CXXFLAGS="''${CXXFLAGS:-} -Wno-error=array-bounds -Wno-error=stringop-overflow"
-  '';
 }
