@@ -650,12 +650,6 @@ impl ResourceAccess {
         }
     }
 
-    /// Whether this access level covers every access level that `other` covers.
-    #[must_use]
-    pub const fn access_superset(self, other: Self) -> bool {
-        self.covers(other)
-    }
-
     /// Whether this access level covers the requested access.
     #[must_use]
     pub const fn covers(self, requested: Self) -> bool {
@@ -969,7 +963,7 @@ pub struct DbusSection {
     pub deny: Vec<DbusRule>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
     #[serde(default)]
     pub network: NetworkSection,
@@ -985,41 +979,6 @@ pub struct Policy {
 
     #[serde(default)]
     pub dbus: DbusSection,
-}
-
-#[derive(Deserialize)]
-struct PolicyWire {
-    #[serde(default)]
-    network: NetworkSection,
-
-    #[serde(default)]
-    sudo: SudoSection,
-
-    #[serde(default)]
-    filesystem: FilesystemSection,
-
-    #[serde(default)]
-    resources: ResourceSection,
-
-    #[serde(default)]
-    dbus: DbusSection,
-}
-
-impl<'de> Deserialize<'de> for Policy {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = PolicyWire::deserialize(deserializer)?;
-
-        Ok(Self {
-            network: wire.network,
-            sudo: wire.sudo,
-            filesystem: wire.filesystem,
-            resources: wire.resources,
-            dbus: wire.dbus,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

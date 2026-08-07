@@ -233,7 +233,7 @@ fn resource_rule_key(rule: &ResourceRule) -> ResourceRuleKey {
 fn resource_rules_overlap(deny: &ResourceRule, allow: &ResourceRule) -> bool {
     deny.kind == allow.kind
         && deny.path_matches(&allow.path, None)
-        && deny.access.access_superset(allow.access)
+        && deny.access.covers(allow.access)
 }
 
 fn merge_resources(layers: &[Policy]) -> ResourceSection {

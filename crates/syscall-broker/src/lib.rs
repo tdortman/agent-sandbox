@@ -613,18 +613,6 @@ fn sendmmsg_destination_bytes(
     Ok(destinations)
 }
 
-#[cfg(not(target_pointer_width = "64"))]
-fn sendmmsg_destination_bytes(
-    _notif: &SeccompNotif,
-    _msgvec: u64,
-    vlen: usize,
-) -> io::Result<Vec<Vec<u8>>> {
-    if vlen > 1 {
-        return Ok(vec![vec![1], vec![2]]);
-    }
-    Ok(Vec::new())
-}
-
 /// Parse a tracee sockaddr buffer and classify it. `Inet` results become a
 /// `Network` target (gated by policyd's `Check` RPC) and `Unix` results
 /// become a `Resource` target of kind `UnixSocket` gated by `CheckResource`.
@@ -701,13 +689,6 @@ fn filesystem_checks_rename(old: &Path, new: &Path) -> Option<SyscallTarget> {
     ])
 }
 
-fn filesystem_checks_link(old: &Path, new: &Path) -> Option<SyscallTarget> {
-    filesystem_target(vec![
-        (normalize_path(old), FileAccess::ReadWrite),
-        (normalize_path(new), FileAccess::ReadWrite),
-    ])
-}
-
 fn filesystem_checks_symlink(target: Option<&Path>, linkpath: &Path) -> Option<SyscallTarget> {
     let mut checks = Vec::new();
 
@@ -720,10 +701,6 @@ fn filesystem_checks_symlink(target: Option<&Path>, linkpath: &Path) -> Option<S
 }
 
 fn filesystem_checks_unlink(path: &Path) -> Option<SyscallTarget> {
-    filesystem_target(vec![(normalize_path(path), FileAccess::Write)])
-}
-
-fn filesystem_checks_truncate(path: &Path) -> Option<SyscallTarget> {
     filesystem_target(vec![(normalize_path(path), FileAccess::Write)])
 }
 
@@ -823,11 +800,11 @@ fs_two_path_target!(
     3
 );
 
-fs_two_path_target!(target_from_link, filesystem_checks_link, cwd, 0, cwd, 1);
+fs_two_path_target!(target_from_link, filesystem_checks_rename, cwd, 0, cwd, 1);
 
 fs_two_path_target!(
     target_from_linkat,
-    filesystem_checks_link,
+    filesystem_checks_rename,
     arg(0),
     1,
     arg(2),
@@ -881,13 +858,13 @@ macro_rules! fs_path_target {
 }
 fs_path_target!(target_from_unlink, filesystem_checks_unlink, cwd, 0);
 fs_path_target!(target_from_unlinkat, filesystem_checks_unlink, arg(0), 1);
-fs_path_target!(target_from_truncate, filesystem_checks_truncate, cwd, 0);
+fs_path_target!(target_from_truncate, filesystem_checks_unlink, cwd, 0);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let fd = notif.data.args[0];
     let path = tracee_fd_path(notif.pid, fd)?;
-    Ok(filesystem_checks_truncate(&path))
+    Ok(filesystem_checks_unlink(&path))
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -905,11 +882,6 @@ fn target_from_filesystem_mutation(notif: &SeccompNotif) -> io::Result<Option<Sy
         nr::FTRUNCATE => target_from_ftruncate(notif),
         _ => Ok(None),
     }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn target_from_filesystem_mutation(_notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    Ok(None)
 }
 
 /// Re-read filesystem mutation paths and verify they still match the
@@ -1269,8 +1241,8 @@ mod tests {
         FileAccess, FilesystemTarget, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID,
         SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
         SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg, device_file_type,
-        filesystem_checks_link, filesystem_checks_rename, filesystem_checks_symlink,
-        filesystem_checks_truncate, filesystem_checks_unlink, hex_encode_lower, is_at_fdcwd,
+        filesystem_checks_rename, filesystem_checks_symlink, filesystem_checks_unlink,
+        hex_encode_lower, is_at_fdcwd,
         is_device_bypass, is_device_file, is_device_node_for_resource_gate,
         notification_arch_valid, parse_sockaddr, read_resolved_path_arg, resolve_open_path,
         resolve_tracee_path, revalidate_filesystem_mutation, scheme_for_socket_type,
@@ -1505,9 +1477,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn notification_arch_valid_rejects_compat_audit_arch() {
-        use agent_sandbox_syscall::policy::{AUDIT_ARCH_I686, AUDIT_ARCH_X86_32};
-
-        for arch in [AUDIT_ARCH_X86_32, AUDIT_ARCH_I686, 0] {
+        // x32 (0x4000_0002) and i686 (0x4000_0003) compat audit arch values,
+        // kept as literals since the syscall crate no longer exports them.
+        for arch in [0x4000_0002, 0x4000_0003, 0] {
             let notif = SeccompNotif {
                 data: SeccompData {
                     arch,
@@ -1767,21 +1739,6 @@ mod tests {
         assert!(checks[1].0.ends_with("new.txt"));
     }
 
-    #[test]
-    fn filesystem_checks_link_requires_read_write_on_both_paths() {
-        let target = filesystem_checks_link(Path::new("/tmp/src"), Path::new("/tmp/dst"))
-            .expect("link target");
-
-        let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {
-            panic!("expected filesystem target");
-        };
-
-        assert_eq!(checks, vec![
-            (PathBuf::from("/tmp/src"), FileAccess::ReadWrite),
-            (PathBuf::from("/tmp/dst"), FileAccess::ReadWrite),
-        ]);
-    }
-
     /// Mirrors `dispatch_filesystem_target`: every `(path, access)` must pass
     /// before the broker may continue the syscall.
     #[cfg(test)]
@@ -1857,7 +1814,7 @@ mod tests {
             filesystem_checks_rename(Path::new("/repo/old.txt"), Path::new("/repo/new.txt"))
                 .expect("rename");
 
-        let link = filesystem_checks_link(Path::new("/repo/src.txt"), Path::new("/repo/dst.txt"))
+        let link = filesystem_checks_rename(Path::new("/repo/src.txt"), Path::new("/repo/dst.txt"))
             .expect("link");
 
         for (name, target, expected_paths) in [
@@ -1914,7 +1871,7 @@ mod tests {
     #[test]
     fn filesystem_checks_unlink_and_truncate_are_write_only() {
         let unlink = filesystem_checks_unlink(Path::new("/tmp/gone")).expect("unlink target");
-        let truncate = filesystem_checks_truncate(Path::new("/tmp/file")).expect("truncate target");
+        let truncate = filesystem_checks_unlink(Path::new("/tmp/file")).expect("truncate target");
 
         for target in [unlink, truncate] {
             let SyscallTarget::Filesystem(FilesystemTarget { checks }) = target else {

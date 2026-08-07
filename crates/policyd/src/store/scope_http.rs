@@ -1,7 +1,7 @@
 //! Typed HTTP session/project/global scope mutations.
 
 use super::{
-    http::http_context,
+    http::{http_context, target_for_request},
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
 
@@ -269,7 +269,7 @@ impl PolicyStore {
             if target.is_some() {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
-            Self::exact_http_target(&pending.request)
+            target_for_request(&pending.request)
         } else {
             let target = target.ok_or(PolicydError::InvalidDecisionTarget)?;
             if !target.matches(&pending.request) {

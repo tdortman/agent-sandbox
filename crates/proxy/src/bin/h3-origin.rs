@@ -8,6 +8,7 @@
 //! exists before sending the rest. This gives deterministic streaming
 //! tests a way to observe partial responses.
 
+use agent_sandbox_proxy::http3::CapsuleDecoder;
 use bytes::{Buf, Bytes};
 use clap::Parser;
 use h3::quic::{SendStream as _, SendStreamUnframed as _};
@@ -319,50 +320,11 @@ async fn serve_connect_udp(
     Ok(())
 }
 
-fn validate_capsules(mut encoded: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    while !encoded.is_empty() {
-        let Some((_, kind_len)) = decode_origin_varint(encoded) else {
-            return Err("truncated Capsule Protocol type".into());
-        };
-
-        let Some((length, length_len)) = decode_origin_varint(&encoded[kind_len..]) else {
-            return Err("truncated Capsule Protocol length".into());
-        };
-
-        let length = usize::try_from(length)
-            .map_err(|_| std::io::Error::other("Capsule Protocol length is too large"))?;
-
-        let start = kind_len + length_len;
-
-        let end = start
-            .checked_add(length)
-            .ok_or_else(|| std::io::Error::other("Capsule Protocol length overflows"))?;
-
-        if end > encoded.len() {
-            return Err("truncated Capsule Protocol payload".into());
-        }
-
-        encoded = &encoded[end..];
-    }
-
+fn validate_capsules(encoded: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut decoder = CapsuleDecoder::default();
+    decoder.push(encoded)?;
+    decoder.finish()?;
     Ok(())
-}
-
-fn decode_origin_varint(encoded: &[u8]) -> Option<(u64, usize)> {
-    let first = encoded.first().copied()?;
-    let length = 1usize << (first >> 6);
-
-    if encoded.len() < length {
-        return None;
-    }
-
-    let mut value = u64::from(first & 0x3F);
-
-    for byte in &encoded[1..length] {
-        value = (value << 8) | u64::from(*byte);
-    }
-
-    Some((value, length))
 }
 
 async fn serve_websocket(

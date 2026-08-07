@@ -1,26 +1,26 @@
 //! Policy store: filesystem (fanotify monitor spawn and declarative checks).
 
-use super::types::{
-    MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
-    PendingFilesystem, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+use super::{
+    types::{
+        MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
+        PendingFilesystem, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    },
+    ui::VerdictExit,
 };
-
-use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest, UiSpawnContext};
-
+use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest};
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
     InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
     normalize_directory_traverse_access,
 };
-
 use std::{
     io::BufRead,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-
-use tokio::{sync::oneshot, time};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Timeout for waiting for the fsmon `ready` line.
@@ -259,43 +259,17 @@ impl PolicyStore {
                 project_root: project_root.clone(),
             };
 
-            self.notify_standalone_ui(&ctx, &push).await;
+            self.notify_general_ui(&ctx, &push).await;
 
-            if !self.has_standalone_ui_for_context(&ctx).await {
-                let mut spawn_uid = wire_ids.uid();
-
-                if spawn_uid.is_none_or(|u| u == 0)
-                    && let Some(h) = &home
-                {
-                    spawn_uid =
-                        nix::unistd::User::from_name(&Self::user_for_home(Some(h.as_path())))
-                            .ok()
-                            .flatten()
-                            .map(|u| u.uid.as_raw());
-                }
-
-                if spawn_uid.is_none_or(|u| u == 0)
-                    && let Some(session_id) = sandbox_session_id.as_deref()
-                {
-                    spawn_uid = self
-                        .sandbox_sessions
-                        .read()
-                        .ok()
-                        .and_then(|sessions| sessions.get(session_id).map(|reg| reg.owner_uid))
-                        .filter(|uid| *uid > 0);
-                }
-
-                let spawn = UiSpawnContext {
-                    has_matching_ui: false,
-                    uid: spawn_uid,
-                    home: home.as_deref(),
-                    cwd: cwd.as_deref(),
-                    project_root: project_root.as_deref(),
-                    sandbox_session_id: sandbox_session_id.as_deref(),
-                };
-
-                self.spawn_policy_ui(spawn).await;
-            }
+            self.maybe_spawn_ui(
+                || self.has_ui_for_context(&ctx),
+                wire_ids.uid(),
+                home.as_deref(),
+                cwd.as_deref(),
+                project_root.as_deref(),
+                sandbox_session_id.as_deref(),
+            )
+            .await;
         }
 
         self.await_filesystem_verdict(&ctx, &result.id, path, access, result.rx)
@@ -443,85 +417,77 @@ impl PolicyStore {
         access: FileAccess,
         rx: oneshot::Receiver<FilesystemCheckReply>,
     ) -> FilesystemCheckReply {
-        // Race UI registration against the verdict channel so a CLI approval
-        // can unblock the request even if no policy UI ever appears.
-        // Preserve the existing two-timeout contract: a short wait for the
-        // UI to register, then a full approval_timeout for the verdict.
-        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        let logged_ui_wait = AtomicBool::new(false);
 
-        let ui_deadline = Instant::now() + ui_wait;
-        tokio::pin!(rx);
-        let mut logged_ui_wait = false;
+        let path = &path;
+        let access = &access;
 
-        loop {
-            if self.has_standalone_ui_for_context(ctx).await {
-                tracing::info!(
-                    pending_id,
-                    path = %path.display(),
-                    access = ?access,
-                    "filesystem approval waiting for user decision"
-                );
+        self.wait_for_ui_or_verdict(
+            || async {
+                if self.has_ui_for_context(ctx).await {
+                    tracing::info!(
+                        pending_id,
+                        path = %path.display(),
+                        access = ?access,
+                        "filesystem approval waiting for user decision"
+                    );
 
-                break;
-            }
+                    true
+                } else {
+                    if !logged_ui_wait.load(Ordering::Relaxed) {
+                        tracing::info!(
+                            pending_id,
+                            path = %path.display(),
+                            access = ?access,
+                            "filesystem approval waiting for policy UI to register"
+                        );
 
-            if !logged_ui_wait {
-                tracing::info!(
-                    pending_id,
-                    path = %path.display(),
-                    access = ?access,
-                    "filesystem approval waiting for policy UI to register"
-                );
+                        logged_ui_wait.store(true, Ordering::Relaxed);
+                    }
 
-                logged_ui_wait = true;
-            }
-
-            let now = Instant::now();
-
-            if now >= ui_deadline {
-                let mut inner = self.inner.lock().await;
-                inner.take_pending(pending_id);
-                inner.filesystem_futures.remove(pending_id);
-                drop(inner);
-
-                return FilesystemCheckReply::blocked(
-                    "agent-sandbox: no standalone filesystem policy UI registered \
-                     (agent-sandbox-ui or auto-spawn)",
-                    path.clone(),
-                    access,
-                );
-            }
-
-            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
-
-            tokio::select! {
-                biased;
-                () = time::sleep(sleep_dur) => {}
-                result = &mut rx => {
-                    return result.unwrap_or_else(|_| FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), access));
+                    false
                 }
-            }
-        }
+            },
+            rx,
+            None,
+            |reason| async move {
+                match reason {
+                    VerdictExit::NoUi => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.filesystem_futures.remove(pending_id);
+                        drop(inner);
 
-        match time::timeout(self.args.approval_timeout, &mut rx).await {
-            Ok(Ok(v)) => v,
+                        FilesystemCheckReply::blocked(
+                            "agent-sandbox: no standalone filesystem policy UI registered \
+                             (agent-sandbox-ui or auto-spawn)",
+                            path.clone(),
+                            *access,
+                        )
+                    }
+                    VerdictExit::ChannelClosed => {
+                        FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), *access)
+                    }
+                    VerdictExit::Timeout => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.filesystem_futures.remove(pending_id);
+                        drop(inner);
 
-            Ok(Err(_)) => {
-                FilesystemCheckReply::denied(VerdictSource::Blocked, path.clone(), access)
-            }
-
-            Err(_) => {
-                let mut inner = self.inner.lock().await;
-                inner.take_pending(pending_id);
-                inner.filesystem_futures.remove(pending_id);
-                drop(inner);
-                FilesystemCheckReply::blocked(
-                    "agent-sandbox: filesystem approval timed out (no response from policy UI)",
-                    path,
-                    access,
-                )
-            }
-        }
+                        FilesystemCheckReply::blocked(
+                            "agent-sandbox: filesystem approval timed out (no response from \
+                             policy UI)",
+                            path.clone(),
+                            *access,
+                        )
+                    }
+                    VerdictExit::Cancelled => {
+                        unreachable!("no cancel channel wired for filesystem waits")
+                    }
+                }
+            },
+        )
+        .await
     }
 
     pub(crate) async fn finish_filesystem(
@@ -566,12 +532,10 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
-
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
         SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,

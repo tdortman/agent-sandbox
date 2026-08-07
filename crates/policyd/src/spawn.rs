@@ -10,6 +10,7 @@ use nix::unistd::User;
 
 use std::{
     collections::HashMap,
+    future::Future,
     hash::BuildHasher,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -146,6 +147,62 @@ impl PolicyStore {
 
         let mut inner = self.inner.lock().await;
         inner.ui_spawn_last = throttle;
+    }
+
+    /// Resolve the uid to run the policy UI as and spawn it when `ui_ready`
+    /// reports no registered UI. `base_uid` is the requesting process uid;
+    /// when it is missing or 0, fall back to the home directory owner, then
+    /// to the sandbox session owner.
+    pub(crate) async fn maybe_spawn_ui<U, F>(
+        &self,
+        ui_ready: U,
+        base_uid: Option<u32>,
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+        project_root: Option<&Path>,
+        sandbox_session_id: Option<&str>,
+    ) where
+        U: FnMut() -> F,
+        F: Future<Output = bool>,
+    {
+        let mut ui_ready = ui_ready;
+
+        if ui_ready().await {
+            return;
+        }
+
+        let mut spawn_uid = base_uid;
+
+        if spawn_uid.is_none_or(|u| u == 0)
+            && let Some(h) = home
+        {
+            spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
+                .ok()
+                .flatten()
+                .map(|u| u.uid.as_raw());
+        }
+
+        if spawn_uid.is_none_or(|u| u == 0)
+            && let Some(session_id) = sandbox_session_id
+        {
+            spawn_uid = self
+                .sandbox_sessions
+                .read()
+                .ok()
+                .and_then(|sessions| sessions.get(session_id).map(|reg| reg.owner_uid))
+                .filter(|uid| *uid > 0);
+        }
+
+        let spawn = UiSpawnContext {
+            has_matching_ui: false,
+            uid: spawn_uid,
+            home,
+            cwd,
+            project_root,
+            sandbox_session_id,
+        };
+
+        self.spawn_policy_ui(spawn).await;
     }
 }
 

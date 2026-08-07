@@ -290,12 +290,8 @@ fn resolve_event_path(host_proc: &HostProc, event_fd: &impl AsFd) -> io::Result<
     Ok(path.to_string_lossy().into_owned())
 }
 
-fn is_at_fdcwd(dirfd: i64) -> bool {
-    dirfd == i64::from(libc::AT_FDCWD)
-}
-
 fn tracee_open_dir_base(host_proc: &HostProc, pid: i32, dirfd: i64) -> io::Result<PathBuf> {
-    let leaf = if is_at_fdcwd(dirfd) {
+    let leaf = if dirfd == i64::from(libc::AT_FDCWD) {
         "cwd".to_owned()
     } else {
         format!("fd/{dirfd}")
@@ -368,31 +364,53 @@ fn parse_open_syscall_path(host_proc: &HostProc, trace_pid: i32, content: &str) 
     }
 }
 
-fn scan_threads_for_open_syscall_path(host_proc: &HostProc, tgid: i32) -> Option<PathBuf> {
+/// Scan every thread in `tgid` for a blocked open-family syscall.
+fn scan_threads<T>(
+    host_proc: &HostProc,
+    tgid: i32,
+    parse: fn(&HostProc, i32, &str) -> Option<T>,
+) -> Option<T> {
     for thread_id in host_proc.numeric_entries(tgid, "task").ok()? {
         let content = host_proc.read_to_string(thread_id, "syscall").ok()?;
 
-        if let Some(path) = parse_open_syscall_path(host_proc, thread_id, &content) {
-            return Some(path);
+        if let Some(value) = parse(host_proc, thread_id, &content) {
+            return Some(value);
         }
     }
 
     None
 }
 
-fn syscall_open_path(host_proc: &HostProc, trace_pid: i32) -> Option<PathBuf> {
+/// Read the blocked tracee's open syscall args from `/proc/{pid}/syscall`.
+///
+/// During a `FAN_OPEN_PERM` event the open is blocked: the tracee's fd
+/// does not exist yet, and the fanotify event fd is always `O_RDONLY`.
+/// The only reliable way to learn the real access mode (or path) is to
+/// read the syscall arguments from `/proc/{pid}/syscall`, which the kernel
+/// exposes while the task is blocked inside the syscall.
+///
+/// Fanotify normally reports the process id. On multi-threaded programs the
+/// blocked `open` runs on a worker thread, so `/proc/<tgid>/syscall` shows
+/// `0` (not in a syscall) while `/proc/<tid>/syscall` has the real args.
+/// With `FAN_REPORT_TID`, `trace_pid` is already the opener's tid; otherwise
+/// we scan `/proc/<tgid>/task/*/syscall`.
+fn syscall_lookup<T>(
+    host_proc: &HostProc,
+    trace_pid: i32,
+    parse: fn(&HostProc, i32, &str) -> Option<T>,
+) -> Option<T> {
     if trace_pid <= 0 {
         return None;
     }
 
     if let Ok(content) = host_proc.read_to_string(trace_pid, "syscall")
-        && let Some(path) = parse_open_syscall_path(host_proc, trace_pid, &content)
+        && let Some(value) = parse(host_proc, trace_pid, &content)
     {
-        return Some(path);
+        return Some(value);
     }
 
     let tgid = host_proc.thread_group_id(trace_pid)?;
-    scan_threads_for_open_syscall_path(host_proc, tgid)
+    scan_threads(host_proc, tgid, parse)
 }
 
 /// Best-effort path for a fanotify permission event: event fd first, then the
@@ -403,13 +421,9 @@ fn resolve_blocked_open_path(
     event_fd: &OwnedFd,
 ) -> Option<String> {
     resolve_event_path(host_proc, event_fd).ok().or_else(|| {
-        syscall_open_path(host_proc, trace_pid).map(|path| path.to_string_lossy().into_owned())
+        syscall_lookup(host_proc, trace_pid, parse_open_syscall_path)
+            .map(|path| path.to_string_lossy().into_owned())
     })
-}
-
-/// Convert an unresolved fanotify path into a fail-closed verdict.
-fn path_resolution_verdict(path: Option<String>) -> Result<String, u32> {
-    path.ok_or(FAN_DENY)
 }
 
 fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32> {
@@ -532,47 +546,6 @@ fn parse_open_syscall_access(
     }
 }
 
-/// Scan every thread in `tgid` for a blocked open-family syscall.
-fn scan_threads_for_open_syscall(host_proc: &HostProc, tgid: i32) -> Option<FileAccess> {
-    for thread_id in host_proc.numeric_entries(tgid, "task").ok()? {
-        let content = host_proc.read_to_string(thread_id, "syscall").ok()?;
-
-        if let Some(access) = parse_open_syscall_access(host_proc, thread_id, &content) {
-            return Some(access);
-        }
-    }
-
-    None
-}
-
-/// Read the blocked tracee's open flags from `/proc/{pid}/syscall`.
-///
-/// During a `FAN_OPEN_PERM` event the open is blocked: the tracee's fd
-/// does not exist yet, and the fanotify event fd is always `O_RDONLY`.
-/// The only reliable way to learn the real access mode is to read the
-/// syscall arguments from `/proc/{pid}/syscall`, which the kernel
-/// exposes while the task is blocked inside the syscall.
-///
-/// Fanotify normally reports the process id. On multi-threaded programs the
-/// blocked `open` runs on a worker thread, so `/proc/<tgid>/syscall` shows
-/// `0` (not in a syscall) while `/proc/<tid>/syscall` has the real flags.
-/// With `FAN_REPORT_TID`, `trace_pid` is already the opener's tid; otherwise
-/// we scan `/proc/<tgid>/task/*/syscall`.
-fn syscall_open_access(host_proc: &HostProc, trace_pid: i32) -> Option<FileAccess> {
-    if trace_pid <= 0 {
-        return None;
-    }
-
-    if let Ok(content) = host_proc.read_to_string(trace_pid, "syscall")
-        && let Some(access) = parse_open_syscall_access(host_proc, trace_pid, &content)
-    {
-        return Some(access);
-    }
-
-    let tgid = host_proc.thread_group_id(trace_pid)?;
-    scan_threads_for_open_syscall(host_proc, tgid)
-}
-
 fn process_fd_access(host_proc: &HostProc, pid: i32, event_fd: &impl AsFd) -> Option<FileAccess> {
     if pid <= 0 {
         return None;
@@ -640,7 +613,7 @@ fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i3
         // tracee's own fd does not exist yet (the open is blocked).
         // Read the blocked syscall args from /proc/{pid}/syscall to get
         // the real open flags.
-        return syscall_open_access(host_proc, pid).unwrap_or_else(|| {
+        return syscall_lookup(host_proc, pid, parse_open_syscall_access).unwrap_or_else(|| {
             tracing::warn!(
                 pid,
                 mask = format_args!("{mask:#x}"),
@@ -785,13 +758,7 @@ fn run_event_loop(
 
     let mut buf = vec![0u8; 4096];
 
-    let mut rpc = match rpc_client::PersistentClient::connect(socket_path) {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(%error, "initial policyd connection failed; will retry on demand");
-            rpc_client::PersistentClient::new(socket_path)
-        }
-    };
+    let mut rpc = rpc_client::PersistentClient::new(socket_path);
 
     loop {
         let n = match nix::unistd::read(fan_fd.as_fd(), &mut buf) {
@@ -841,9 +808,9 @@ fn run_event_loop(
                     continue;
                 }
 
-                let path = match path_resolution_verdict(resolve_blocked_open_path(
-                    host_proc, meta.pid, &event_fd,
-                )) {
+                let path = match resolve_blocked_open_path(host_proc, meta.pid, &event_fd)
+                    .ok_or(FAN_DENY)
+                {
                     Ok(path) => path,
                     Err(verdict) => {
                         tracing::warn!(
@@ -1278,7 +1245,7 @@ mod tests {
 
     #[test]
     fn open_perm_without_pid_falls_back_to_read_write() {
-        // Without a valid pid, syscall_open_access returns None.
+        // Without a valid pid, syscall_lookup returns None.
         // The fallback is ReadWrite (conservative: may prompt but won't
         // misclassify a write as a read).
         let host_proc = test_host_proc();
@@ -1359,13 +1326,6 @@ mod tests {
             open_how_flags_from_bytes(&how).map(open_flags_to_file_access),
             Some(FileAccess::ReadWrite)
         );
-    }
-
-    #[test]
-    fn path_resolution_failure_is_fail_closed() {
-        let host_proc = test_host_proc();
-        assert!(host_proc.read_self_fd_link(-1).is_err());
-        assert_eq!(path_resolution_verdict(None), Err(FAN_DENY));
     }
 
     #[test]

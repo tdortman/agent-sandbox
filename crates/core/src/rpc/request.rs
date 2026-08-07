@@ -14,7 +14,7 @@ use crate::{
     policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,7 +144,7 @@ pub enum ApprovalTarget {
 ///
 /// `Check` attribution hints are embedded in `url` via
 /// [`attach_check_aliases`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RpcRequest {
     RegisterUi {
@@ -337,212 +337,21 @@ pub enum RpcRequest {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum RpcRequestWire {
-    RegisterUi {
-        #[serde(default)]
-        ui_client: Option<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    UnregisterUi,
-    OpenProxySession,
-
-    RegisterNetworkFlow {
-        registration: FlowRegistration,
-    },
-
-    ClaimNetworkFlow {
-        proxy_session: ProxySessionToken,
-        flow: NetworkFlowKey,
-        connection_id: ProxyConnectionId,
-    },
-
-    ClaimNetworkFlowBySource {
-        proxy_session: ProxySessionToken,
-        selector: NetworkFlowSelector,
-        connection_id: ProxyConnectionId,
-    },
-
-    RebindNetworkFlow {
-        proxy_session: ProxySessionToken,
-        attribution_token: AttributionToken,
-        connection_id: ProxyConnectionId,
-        flow: NetworkFlowKey,
-    },
-
-    CheckHttp {
-        proxy_session: ProxySessionToken,
-        request_id: ProxyRequestId,
-        attribution_token: AttributionToken,
-        request: HttpRequest,
-    },
-
-    CheckNetworkFlow {
-        proxy_session: ProxySessionToken,
-        request_id: ProxyRequestId,
-        attribution_token: AttributionToken,
-    },
-
-    CancelCheck {
-        proxy_session: ProxySessionToken,
-        request_id: ProxyRequestId,
-    },
-
-    ReleaseNetworkFlow {
-        proxy_session: ProxySessionToken,
-        attribution_token: AttributionToken,
-        connection_id: ProxyConnectionId,
-    },
-
-    Check {
-        #[serde(default)]
-        host: Option<String>,
-
-        #[serde(default)]
-        connect_host: Option<String>,
-
-        #[serde(default)]
-        port: Option<u16>,
-
-        #[serde(default = "default_https")]
-        scheme: String,
-
-        url: Option<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    CheckFilesystem {
-        path: PathBuf,
-
-        #[serde(default)]
-        access: FileAccess,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    CheckDbus {
-        target: DbusTarget,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    CheckResource {
-        kind: ResourceKind,
-        path: PathBuf,
-
-        #[serde(default)]
-        access: ResourceAccess,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    StartFilesystemMonitor {
-        #[serde(default)]
-        ctx: RequestContext,
-
-        #[serde(default)]
-        static_allow: Vec<FilesystemRule>,
-    },
-
-    Elevate {
-        argv: Vec<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    Approve {
-        id: String,
-        scope: ApprovalScope,
-
-        #[serde(default)]
-        session_id: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target: Option<ApprovalTarget>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        comment: Option<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    ApproveHost {
-        host: String,
-        port: u16,
-        scope: ApprovalScope,
-
-        #[serde(default)]
-        session_id: Option<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    ApproveHttp {
-        target: HttpRuleTarget,
-        scope: ApprovalScope,
-
-        #[serde(default)]
-        session_id: Option<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    Deny {
-        id: String,
-
-        #[serde(default = "default_once_scope")]
-        scope: ApprovalScope,
-
-        #[serde(default)]
-        session_id: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target: Option<ApprovalTarget>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        comment: Option<String>,
-
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    Status {
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-
-    Reload {
-        #[serde(default)]
-        ctx: RequestContext,
-    },
-}
-
-impl<'de> Deserialize<'de> for RpcRequest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        validate_proxy_fields(&value).map_err(serde::de::Error::custom)?;
-
-        let wire: RpcRequestWire =
-            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-
-        Ok(wire.into())
-    }
+/// Parse a JSON-line RPC request, rejecting unknown fields on proxy ops.
+///
+/// The derived [`Deserialize`] for [`RpcRequest`] is intentionally lenient
+/// about unknown fields so UI clients can send extra metadata. Proxy
+/// attribution requests are strict: a mistyped field would otherwise be
+/// silently dropped and a flow attributed without its session token.
+///
+/// # Errors
+///
+/// Returns a JSON error when the line is not a valid request or carries an
+/// unknown field on a proxy op.
+pub fn parse_rpc_request(line: &str) -> Result<RpcRequest, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    validate_proxy_fields(&value).map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    serde_json::from_value(value)
 }
 
 fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
@@ -589,321 +398,6 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-impl RpcRequest {
-    const fn register_network_flow(registration: FlowRegistration) -> Self {
-        Self::RegisterNetworkFlow { registration }
-    }
-
-    const fn claim_network_flow(
-        proxy_session: ProxySessionToken,
-        flow: NetworkFlowKey,
-        connection_id: ProxyConnectionId,
-    ) -> Self {
-        Self::ClaimNetworkFlow {
-            proxy_session,
-            flow,
-            connection_id,
-        }
-    }
-
-    const fn claim_network_flow_by_source(
-        proxy_session: ProxySessionToken,
-        selector: NetworkFlowSelector,
-        connection_id: ProxyConnectionId,
-    ) -> Self {
-        Self::ClaimNetworkFlowBySource {
-            proxy_session,
-            selector,
-            connection_id,
-        }
-    }
-
-    const fn rebind_network_flow(
-        proxy_session: ProxySessionToken,
-        attribution_token: AttributionToken,
-        connection_id: ProxyConnectionId,
-        flow: NetworkFlowKey,
-    ) -> Self {
-        Self::RebindNetworkFlow {
-            proxy_session,
-            attribution_token,
-            connection_id,
-            flow,
-        }
-    }
-
-    const fn check_http(
-        proxy_session: ProxySessionToken,
-        request_id: ProxyRequestId,
-        attribution_token: AttributionToken,
-        request: HttpRequest,
-    ) -> Self {
-        Self::CheckHttp {
-            proxy_session,
-            request_id,
-            attribution_token,
-            request,
-        }
-    }
-
-    const fn check_network_flow(
-        proxy_session: ProxySessionToken,
-        request_id: ProxyRequestId,
-        attribution_token: AttributionToken,
-    ) -> Self {
-        Self::CheckNetworkFlow {
-            proxy_session,
-            request_id,
-            attribution_token,
-        }
-    }
-
-    const fn cancel_check(proxy_session: ProxySessionToken, request_id: ProxyRequestId) -> Self {
-        Self::CancelCheck {
-            proxy_session,
-            request_id,
-        }
-    }
-
-    const fn release_network_flow(
-        proxy_session: ProxySessionToken,
-        attribution_token: AttributionToken,
-        connection_id: ProxyConnectionId,
-    ) -> Self {
-        Self::ReleaseNetworkFlow {
-            proxy_session,
-            attribution_token,
-            connection_id,
-        }
-    }
-
-    const fn check(
-        host: Option<String>,
-        connect_host: Option<String>,
-        port: Option<u16>,
-        scheme: String,
-        url: Option<String>,
-        ctx: RequestContext,
-    ) -> Self {
-        Self::Check {
-            host,
-            connect_host,
-            port,
-            scheme,
-            url,
-            ctx,
-        }
-    }
-
-    const fn check_resource(
-        kind: ResourceKind,
-        path: PathBuf,
-        access: ResourceAccess,
-        ctx: RequestContext,
-    ) -> Self {
-        Self::CheckResource {
-            kind,
-            path,
-            access,
-            ctx,
-        }
-    }
-
-    const fn start_filesystem_monitor(
-        ctx: RequestContext,
-        static_allow: Vec<FilesystemRule>,
-    ) -> Self {
-        Self::StartFilesystemMonitor { ctx, static_allow }
-    }
-
-    const fn approve(
-        id: String,
-        scope: ApprovalScope,
-        session_id: Option<String>,
-        target: Option<ApprovalTarget>,
-        comment: Option<String>,
-        ctx: RequestContext,
-    ) -> Self {
-        Self::Approve {
-            id,
-            scope,
-            session_id,
-            target,
-            comment,
-            ctx,
-        }
-    }
-
-    const fn approve_host(
-        host: String,
-        port: u16,
-        scope: ApprovalScope,
-        session_id: Option<String>,
-        ctx: RequestContext,
-    ) -> Self {
-        Self::ApproveHost {
-            host,
-            port,
-            scope,
-            session_id,
-            ctx,
-        }
-    }
-
-    const fn approve_http(
-        target: HttpRuleTarget,
-        scope: ApprovalScope,
-        session_id: Option<String>,
-        ctx: RequestContext,
-    ) -> Self {
-        Self::ApproveHttp {
-            target,
-            scope,
-            session_id,
-            ctx,
-        }
-    }
-
-    const fn deny(
-        id: String,
-        scope: ApprovalScope,
-        session_id: Option<String>,
-        target: Option<ApprovalTarget>,
-        comment: Option<String>,
-        ctx: RequestContext,
-    ) -> Self {
-        Self::Deny {
-            id,
-            scope,
-            session_id,
-            target,
-            comment,
-            ctx,
-        }
-    }
-}
-
-impl From<RpcRequestWire> for RpcRequest {
-    fn from(value: RpcRequestWire) -> Self {
-        match value {
-            RpcRequestWire::RegisterUi { ui_client, ctx } => Self::RegisterUi { ui_client, ctx },
-            RpcRequestWire::UnregisterUi => Self::UnregisterUi,
-            RpcRequestWire::OpenProxySession => Self::OpenProxySession,
-
-            RpcRequestWire::RegisterNetworkFlow { registration } => {
-                Self::register_network_flow(registration)
-            }
-
-            RpcRequestWire::ClaimNetworkFlow {
-                proxy_session,
-                flow,
-                connection_id,
-            } => Self::claim_network_flow(proxy_session, flow, connection_id),
-
-            RpcRequestWire::ClaimNetworkFlowBySource {
-                proxy_session,
-                selector,
-                connection_id,
-            } => Self::claim_network_flow_by_source(proxy_session, selector, connection_id),
-
-            RpcRequestWire::RebindNetworkFlow {
-                proxy_session,
-                attribution_token,
-                connection_id,
-                flow,
-            } => Self::rebind_network_flow(proxy_session, attribution_token, connection_id, flow),
-
-            RpcRequestWire::CheckHttp {
-                proxy_session,
-                request_id,
-                attribution_token,
-                request,
-            } => Self::check_http(proxy_session, request_id, attribution_token, request),
-
-            RpcRequestWire::CheckNetworkFlow {
-                proxy_session,
-                request_id,
-                attribution_token,
-            } => Self::check_network_flow(proxy_session, request_id, attribution_token),
-
-            RpcRequestWire::CancelCheck {
-                proxy_session,
-                request_id,
-            } => Self::cancel_check(proxy_session, request_id),
-
-            RpcRequestWire::ReleaseNetworkFlow {
-                proxy_session,
-                attribution_token,
-                connection_id,
-            } => Self::release_network_flow(proxy_session, attribution_token, connection_id),
-
-            RpcRequestWire::Check {
-                host,
-                connect_host,
-                port,
-                scheme,
-                url,
-                ctx,
-            } => Self::check(host, connect_host, port, scheme, url, ctx),
-
-            RpcRequestWire::CheckFilesystem { path, access, ctx } => {
-                Self::CheckFilesystem { path, access, ctx }
-            }
-
-            RpcRequestWire::CheckResource {
-                kind,
-                path,
-                access,
-                ctx,
-            } => Self::check_resource(kind, path, access, ctx),
-
-            RpcRequestWire::CheckDbus { target, ctx } => Self::CheckDbus { target, ctx },
-
-            RpcRequestWire::StartFilesystemMonitor { ctx, static_allow } => {
-                Self::start_filesystem_monitor(ctx, static_allow)
-            }
-
-            RpcRequestWire::Elevate { argv, ctx } => Self::Elevate { argv, ctx },
-
-            RpcRequestWire::Approve {
-                id,
-                scope,
-                session_id,
-                target,
-                comment,
-                ctx,
-            } => Self::approve(id, scope, session_id, target, comment, ctx),
-
-            RpcRequestWire::ApproveHost {
-                host,
-                port,
-                scope,
-                session_id,
-                ctx,
-            } => Self::approve_host(host, port, scope, session_id, ctx),
-
-            RpcRequestWire::ApproveHttp {
-                target,
-                scope,
-                session_id,
-                ctx,
-            } => Self::approve_http(target, scope, session_id, ctx),
-
-            RpcRequestWire::Deny {
-                id,
-                scope,
-                session_id,
-                target,
-                comment,
-                ctx,
-            } => Self::deny(id, scope, session_id, target, comment, ctx),
-
-            RpcRequestWire::Status { ctx } => Self::Status { ctx },
-            RpcRequestWire::Reload { ctx } => Self::Reload { ctx },
-        }
-    }
 }
 
 impl RpcRequest {
@@ -1049,9 +543,8 @@ mod tests {
 
     #[test]
     fn proxy_request_rejects_unknown_fields() {
-        let error =
-            serde_json::from_str::<RpcRequest>(r#"{"op":"open_proxy_session","unexpected":true}"#)
-                .expect_err("proxy wire must reject unknown fields");
+        let error = super::parse_rpc_request(r#"{"op":"open_proxy_session","unexpected":true}"#)
+            .expect_err("proxy wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
     }
@@ -1092,7 +585,8 @@ mod tests {
         let mut unknown = wire;
         unknown["unexpected"] = serde_json::json!(true);
 
-        let error = serde_json::from_value::<RpcRequest>(unknown)
+        let line = serde_json::to_string(&unknown).expect("serialize rebind with unknown field");
+        let error = super::parse_rpc_request(&line)
             .expect_err("rebind wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
@@ -1122,7 +616,8 @@ mod tests {
         let mut unknown = wire;
         unknown["unexpected"] = serde_json::json!(true);
 
-        let error = serde_json::from_value::<RpcRequest>(unknown)
+        let line = serde_json::to_string(&unknown).expect("serialize release with unknown field");
+        let error = super::parse_rpc_request(&line)
             .expect_err("release wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));

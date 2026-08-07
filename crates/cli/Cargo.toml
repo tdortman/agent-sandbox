@@ -22,23 +22,14 @@ path = "src/bin/ui.rs"
 
 [dependencies]
 agent-sandbox-core = { path = "../core" }
-agent-sandbox-sysutil = { path = "../sysutil" }
 
 clap = { workspace = true, features = ["env"] }
-nix = { workspace = true, features = ["fs", "process", "user"] }
+nix = { workspace = true, features = ["fs", "user"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = {
   workspace = true,
-  features = [
-    "io-util",
-    "macros",
-    "net",
-    "process",
-    "rt-multi-thread",
-    "sync",
-    "time",
-  ]
+  features = ["macros", "rt-multi-thread", "sync", "time"]
 }
 tracing.workspace = true
 tracing-subscriber.workspace = true

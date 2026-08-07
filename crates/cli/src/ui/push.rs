@@ -1,6 +1,7 @@
 use super::{
     bus_name,
     choice::{deny_cancellation, format_elevation_title, resolve_choice},
+    dbus_fd_display,
     dialog::{ApprovalReviewOutcome, pick_option, pick_text, review_approval},
     error::UiCliError,
     message_kind_name,
@@ -12,19 +13,13 @@ use super::{
     },
     prompt_blocking, signature_display,
 };
-
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
     HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
     ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
     host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
 };
-
-use std::{
-    fmt::Write as _,
-    path::{Path, PathBuf},
-};
-
+use std::path::{Path, PathBuf};
 use tracing::warn;
 
 /// Default project-relative rule path shown in approval prompts.
@@ -285,26 +280,22 @@ fn elevation_presentation(argv: &[String]) -> ApprovalFormPresentation {
     }
 }
 
-fn dbus_fd_display(target: &DbusTarget) -> String {
-    let mut value = format!("count={}", target.fd_metadata.len());
-
-    for (index, metadata) in target.fd_metadata.iter().enumerate() {
-        let _ = write!(
-            value,
-            "; {index}: kind={}, read_only={}",
-            metadata.kind, metadata.read_only
-        );
-    }
-
-    value
-}
-
 fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
+    let fds = if target.fd_metadata.is_empty() {
+        "count=0".to_owned()
+    } else {
+        format!(
+            "count={}; {}",
+            target.fd_metadata.len(),
+            dbus_fd_display(target)
+        )
+    };
+
     ApprovalFormPresentation {
         heading: "Allow this D-Bus message?".into(),
         subject: format!(
             "bus: {}\ndestination: {}\nobject path: {}\ninterface: {}\nmember: {}\nmessage kind: \
-             {}\nsignature: {}\nFDs: {}",
+             {}\nsignature: {}\nFDs: {fds}",
             bus_name(target.bus),
             target.destination,
             target.object_path,
@@ -312,7 +303,6 @@ fn dbus_presentation(target: &DbusTarget) -> ApprovalFormPresentation {
             target.member,
             message_kind_name(target.message_kind),
             signature_display(&target.signature),
-            dbus_fd_display(target),
         ),
     }
 }
@@ -1559,12 +1549,10 @@ mod tests {
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
-
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess,
     };
-
     use std::{collections::HashMap, path::Path};
 
     #[test]
@@ -1822,7 +1810,7 @@ mod tests {
                 ("member".into(), "Introspect".into()),
                 ("message_kind".into(), "method_call".into()),
                 ("signature".into(), "<empty>".into()),
-                ("fd_metadata".into(), "count=0".into()),
+                ("fd_metadata".into(), String::new()),
             ]),
         };
 
@@ -1867,7 +1855,7 @@ mod tests {
                 ("member".into(), "SearchItems".into()),
                 ("message_kind".into(), "method_call".into()),
                 ("signature".into(), "a{ss}".into()),
-                ("fd_metadata".into(), "count=0".into()),
+                ("fd_metadata".into(), String::new()),
             ]),
         };
 

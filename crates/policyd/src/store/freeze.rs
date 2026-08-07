@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-
 use tracing::warn;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -81,13 +80,6 @@ impl CgroupFreezeManager {
                 registry,
             })),
         }
-    }
-
-    pub fn cleanup_default_registry() -> Result<(), CgroupFreezeError> {
-        let registry = std::env::var_os("AGENT_SANDBOX_CGROUP_FREEZE_STATE")
-            .map_or_else(|| PathBuf::from(DEFAULT_REGISTRY), PathBuf::from);
-
-        thaw_stale_registry(&registry)
     }
 
     /// Freeze the agent-sandbox scope containing `pid` and share a hold with
@@ -178,20 +170,24 @@ impl CgroupFreezeManager {
     }
 }
 
-/// Thaw every cgroup recorded by the previous policy daemon instance.
-///
-/// # Errors
-///
-/// Returns an error when a recorded cgroup cannot be thawed or the registry
-/// cannot be removed.
-pub fn cleanup_default_registry() -> Result<(), CgroupFreezeError> {
-    CgroupFreezeManager::cleanup_default_registry()
-}
-
 impl Default for CgroupFreezeManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Thaw the stale cgroup freeze registry, if any.
+///
+/// The registry path honours `AGENT_SANDBOX_CGROUP_FREEZE_STATE`.
+///
+/// # Errors
+///
+/// Returns an error when the registry cannot be read or thawed.
+pub fn cleanup_cgroup_freeze() -> Result<(), CgroupFreezeError> {
+    let registry = std::env::var_os("AGENT_SANDBOX_CGROUP_FREEZE_STATE")
+        .map_or_else(|| PathBuf::from(DEFAULT_REGISTRY), PathBuf::from);
+
+    thaw_stale_registry(&registry)
 }
 
 impl Drop for CgroupFreezeHold {

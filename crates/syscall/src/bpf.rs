@@ -39,18 +39,7 @@ pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         syscalls.iter().map(|&nr| (nr, Vec::new())).collect();
 
-    let action = {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        {
-            SeccompAction::UserNotif
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            SeccompAction::Trap
-        }
-    };
-
-    SeccompFilter::new(rules, SeccompAction::Allow, action, target_arch())
+    SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::UserNotif, target_arch())
         .expect("seccomp filter construction is total for non-empty rule maps")
         .try_into()
         .expect("seccomp filter length is bounded by seccompiler::BPF_MAX_LEN")
@@ -65,14 +54,6 @@ const fn target_arch() -> TargetArch {
     #[cfg(target_arch = "aarch64")]
     {
         TargetArch::aarch64
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        // The agent only ships for x86_64 and aarch64. This branch exists
-        // so `cargo check --workspace --all-targets` still compiles on
-        // unusual build hosts; the runtime path is unreachable.
-        TargetArch::x86_64
     }
 }
 

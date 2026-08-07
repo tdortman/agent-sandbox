@@ -23,7 +23,7 @@ use crate::{
     policy::{FlowClaim, PendingPolicyCheck, PolicySession, normalize_authority},
     semantic::{
         BoundedRequestBody, HttpVersion, SemanticHeaders, SemanticRequest, SemanticRequestParts,
-        is_hop_by_hop_header,
+        semantic_request_headers,
     },
 };
 use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, ProxyRequestId};
@@ -2623,7 +2623,7 @@ async fn relay_webtransport_bidi_reverse(
     Ok(())
 }
 
-fn reject_webtransport_stream(stream: IncomingWebTransportStream) {
+pub(super) fn reject_webtransport_stream(stream: IncomingWebTransportStream) {
     match stream {
         IncomingWebTransportStream::Bidi(mut stream) => {
             stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
@@ -2940,28 +2940,6 @@ fn require_capsule_protocol(enabled: bool) -> Result<(), BoxError> {
             "HTTP/3 CONNECT-UDP body requires Capsule-Protocol: ?1",
         ))
     }
-}
-
-fn semantic_request_headers(headers: &http::HeaderMap) -> Result<SemanticHeaders, BoxError> {
-    let connection_tokens = headers
-        .get_all("connection")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-
-    let mut semantic = SemanticHeaders::new();
-
-    for (name, value) in headers {
-        if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
-            continue;
-        }
-
-        semantic.try_push(name.as_str(), value.as_bytes())?;
-    }
-
-    Ok(semantic)
 }
 
 async fn relay_request(

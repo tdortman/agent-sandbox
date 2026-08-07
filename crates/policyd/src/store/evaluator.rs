@@ -5,7 +5,8 @@ use super::{
 
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, ResolvedRequestContext, ResourceAccess, ResourceKind,
-    Verdict, VerdictSource, normalize_directory_traverse_access, normalize_host,
+    Verdict, VerdictSource, host_pattern_matches, normalize_directory_traverse_access,
+    normalize_host,
 };
 
 use std::path::Path;
@@ -41,7 +42,7 @@ impl PolicyStore {
         let merged = self.merged_for(ctx);
 
         for rule in &merged.network.direct.allow {
-            if Self::host_matches(&rule.host, &host) && rule.port == port {
+            if host_pattern_matches(&rule.host, &host) && rule.port == port {
                 if let Some(comment) = &rule.comment
                     && !comment.is_empty()
                 {
@@ -55,18 +56,6 @@ impl PolicyStore {
         }
 
         None
-    }
-
-    pub(crate) async fn network_allowed(
-        &self,
-        host: &str,
-        port: u16,
-        ctx: &ResolvedRequestContext,
-        consume_once: bool,
-    ) -> bool {
-        self.network_verdict(host, port, ctx, consume_once)
-            .await
-            .is_some_and(|verdict| verdict.allowed)
     }
 
     pub(crate) async fn filesystem_allow_source(
@@ -283,7 +272,10 @@ mod tests {
             Some(Verdict::denied(VerdictSource::policy()))
         );
 
-        assert!(!store.network_allowed("example.com", 443, &ctx, true).await);
+        assert!(!store
+            .network_verdict("example.com", 443, &ctx, true)
+            .await
+            .is_some_and(|v| v.allowed));
     }
 
     #[tokio::test]

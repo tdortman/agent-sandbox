@@ -31,9 +31,8 @@ pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 
 pub use hosts::{
-    DnsNameError, HostResolution, NetworkRuleKey, NetworkSortKey, approval_host_patterns,
-    host_pattern_matches, is_ip_literal, normalize_dns_name, normalize_host,
-    policy_host_for_connect, reverse_hostname,
+    DnsNameError, HostResolution, NetworkRuleKey, NetworkSortKey, host_pattern_matches,
+    is_ip_literal, normalize_dns_name, normalize_host, policy_host_for_connect,
 };
 
 pub use http::{
@@ -73,7 +72,7 @@ pub use rpc::{
     ProxyReplyBody, ProxyRequestId, ProxySessionReply, ProxySessionToken, RegisterUiReply,
     RequestContext, ResourceCheckReply, ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest,
     ScopeActionReply, SimpleOkReply, SocketIdentity, SocketInode, StatusReply, UiPush, Verdict,
-    VerdictSource, attach_check_aliases, split_check_aliases,
+    VerdictSource, attach_check_aliases, parse_rpc_request, split_check_aliases,
 };
 
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};

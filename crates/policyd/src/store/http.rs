@@ -1,17 +1,17 @@
 //! Typed HTTP policy evaluation, pending requests, and cancellation.
 
-use super::types::{
-    HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
-    PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
+use super::{
+    types::{
+        HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
+        PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
+    },
+    ui::VerdictExit,
 };
-
-use crate::{error::PolicydError, wire::UiSpawnContext};
-
+use crate::error::PolicydError;
 use agent_sandbox_core::{
     ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
     PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
 };
-
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -32,7 +32,7 @@ fn http_key(request: &HttpRequest, ctx: &ResolvedRequestContext) -> HttpPendingK
     }
 }
 
-fn target_for_request(request: &HttpRequest) -> HttpRuleTarget {
+pub(super) fn target_for_request(request: &HttpRequest) -> HttpRuleTarget {
     // A request has already passed core HTTP validation, so constructing the
     // exact matcher cannot fail here.
     HttpRuleTarget::new(
@@ -215,22 +215,19 @@ impl PolicyStore {
             })
             .await;
 
-            if !self.has_ui_for_context(&ctx).await {
-                let spawn = UiSpawnContext {
-                    has_matching_ui: false,
-                    uid: ctx.ids.uid(),
-                    home: pending.context.home.as_deref(),
-                    cwd: pending.context.cwd.as_deref(),
-                    project_root: pending.context.project_root.as_deref(),
-                    sandbox_session_id: pending.context.sandbox_session_id.as_deref(),
-                };
-
-                self.spawn_policy_ui(spawn).await;
-            }
+            self.maybe_spawn_ui(
+                || self.has_ui_for_context(&ctx),
+                ctx.ids.uid(),
+                pending.context.home.as_deref(),
+                pending.context.cwd.as_deref(),
+                pending.context.project_root.as_deref(),
+                pending.context.sandbox_session_id.as_deref(),
+            )
+            .await;
         }
 
         Ok(self
-            .await_http_verdict(proxy_session, request_id, &request, &ctx, pending_id, rx)
+            .await_http_verdict(proxy_session, request_id, &ctx, rx)
             .await)
     }
 
@@ -319,46 +316,35 @@ impl PolicyStore {
         &self,
         proxy_session: agent_sandbox_core::ProxySessionToken,
         request_id: agent_sandbox_core::ProxyRequestId,
-        request: &HttpRequest,
         ctx: &ResolvedRequestContext,
-        pending_id: PendingHttpId,
         rx: tokio::sync::oneshot::Receiver<HttpCheckReply>,
     ) -> HttpCheckReply {
-        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-        let deadline = Instant::now() + ui_wait;
-        tokio::pin!(rx);
-
-        loop {
-            if self.has_ui_for_context(ctx).await {
-                break;
-            }
-
-            let now = Instant::now();
-
-            if now >= deadline {
-                self.remove_http_waiter(proxy_session, request_id).await;
-                return HttpCheckReply::blocked("agent-sandbox: no policy UI registered");
-            }
-
-            tokio::select! {
-                biased;
-                () = tokio::time::sleep((deadline - now).min(Duration::from_millis(50))) => {}
-                result = &mut rx => {
-                    return result.unwrap_or_else(|_| HttpCheckReply::blocked("agent-sandbox: HTTP approval waiter closed"));
+        self.wait_for_ui_or_verdict(
+            || self.has_ui_for_context(ctx),
+            rx,
+            None,
+            |reason| async move {
+                match reason {
+                    VerdictExit::NoUi => {
+                        self.remove_http_waiter(proxy_session.clone(), request_id)
+                            .await;
+                        HttpCheckReply::blocked("agent-sandbox: no policy UI registered")
+                    }
+                    VerdictExit::ChannelClosed => {
+                        HttpCheckReply::blocked("agent-sandbox: HTTP approval waiter closed")
+                    }
+                    VerdictExit::Timeout => {
+                        self.remove_http_waiter(proxy_session.clone(), request_id)
+                            .await;
+                        HttpCheckReply::blocked("agent-sandbox: HTTP approval timed out")
+                    }
+                    VerdictExit::Cancelled => {
+                        unreachable!("no cancel channel wired for HTTP waits")
+                    }
                 }
-            }
-        }
-
-        match tokio::time::timeout(self.args.approval_timeout, &mut rx).await {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(_)) => HttpCheckReply::blocked("agent-sandbox: HTTP approval waiter closed"),
-
-            Err(_) => {
-                self.remove_http_waiter(proxy_session, request_id).await;
-                let _ = (request, pending_id);
-                HttpCheckReply::blocked("agent-sandbox: HTTP approval timed out")
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Cancel exactly one HTTP waiter identified by its proxy session and
@@ -521,16 +507,11 @@ impl PolicyStore {
     pub(crate) fn clear_http_verdict_cache_locked(inner: &mut super::types::PolicyDecisionState) {
         inner.http_verdict_cache.clear();
     }
-
-    pub(crate) fn exact_http_target(request: &HttpRequest) -> HttpRuleTarget {
-        target_for_request(request)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::types::{PendingResult, PolicyStore};
-
     use agent_sandbox_core::{
         ApprovalScope, AttributionToken, FlowContext, FlowProtocol, FlowRegistration,
         HttpCheckReply, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRule, HttpRuleTarget,
@@ -538,7 +519,6 @@ mod tests {
         ProxyConnectionId, ProxyRequestId, ProxySessionToken, ResolvedRequestContext, SandboxPaths,
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
-
     use std::time::Duration;
 
     #[tokio::test]

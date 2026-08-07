@@ -18,10 +18,6 @@ use agent_sandbox_core::{
 
 use std::path::{Path, PathBuf};
 
-fn session_network_entries(host: &str, port: u16) -> Vec<NetworkRuleKey> {
-    vec![NetworkRuleKey::new(host, port)]
-}
-
 impl PolicyStore {
     pub(crate) async fn apply_network_scope(
         &self,
@@ -45,7 +41,7 @@ impl PolicyStore {
 
         let home = paths.home();
         let project_root = paths.project_root();
-        let session_entries = session_network_entries(&host, port);
+        let session_entries = vec![NetworkRuleKey::new(&host, port)];
 
         let target = match self
             .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
@@ -168,15 +164,4 @@ impl PolicyStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::session_network_entries;
-    use agent_sandbox_core::NetworkRuleKey;
 
-    #[test]
-    fn wildcard_session_entry_is_kept_as_pattern() {
-        assert_eq!(session_network_entries("*.baz.com", 443), vec![
-            NetworkRuleKey::new("*.baz.com", 443)
-        ]);
-    }
-}

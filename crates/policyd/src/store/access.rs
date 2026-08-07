@@ -4,7 +4,7 @@ use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
     ResourceRuleKey, SocketAccess, Verdict, contains_glob_syntax, discover_git_project_root,
-    expand_policy_path, normalize_directory_traverse_access, normalize_host,
+    expand_policy_path, host_pattern_matches, normalize_directory_traverse_access, normalize_host,
 };
 
 use std::{
@@ -24,7 +24,7 @@ fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u
         rule.port == port
             && keys
                 .iter()
-                .any(|key| PolicyStore::host_matches(&rule.host, &key.host))
+                .any(|key| host_pattern_matches(&rule.host, &key.host))
     })
 }
 
@@ -139,7 +139,7 @@ impl PolicyStore {
             .direct
             .deny
             .iter()
-            .any(|rule| Self::host_matches(&rule.host, &host) && rule.port == port)
+            .any(|rule| host_pattern_matches(&rule.host, &host) && rule.port == port)
     }
 
     pub(crate) fn sudo_policy_denied(&self, argv: &[String], ctx: &ResolvedRequestContext) -> bool {
@@ -195,16 +195,6 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
     ) -> Option<Verdict> {
         self.network_verdict(host, port, ctx, false).await
-    }
-
-    pub async fn is_allowed(
-        &self,
-        host: &str,
-        port: u16,
-        ctx: &ResolvedRequestContext,
-        consume_once: bool,
-    ) -> bool {
-        self.network_allowed(host, port, ctx, consume_once).await
     }
 }
 
@@ -314,7 +304,7 @@ impl PolicyStore {
         access: FileAccess,
         ctx: &ResolvedRequestContext,
     ) -> bool {
-        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let session_ids = self.session_ids_for_context(ctx).await;
         let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
 
@@ -334,7 +324,7 @@ impl PolicyStore {
         access: FileAccess,
         ctx: &ResolvedRequestContext,
     ) -> bool {
-        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let session_ids = self.session_ids_for_context(ctx).await;
         let project_root = ctx.paths.project_root();
         let inner = self.inner.lock().await;
 
@@ -361,7 +351,7 @@ impl PolicyStore {
             return false;
         };
 
-        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
 
         session_ids.iter().any(|sid| {
@@ -743,7 +733,7 @@ impl PolicyStore {
         access: ResourceAccess,
         ctx: &ResolvedRequestContext,
     ) -> bool {
-        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
 
         session_ids.iter().any(|sid| {
@@ -761,7 +751,7 @@ impl PolicyStore {
         access: ResourceAccess,
         ctx: &ResolvedRequestContext,
     ) -> bool {
-        let session_ids = self.standalone_session_ids_for_context(ctx).await;
+        let session_ids = self.session_ids_for_context(ctx).await;
         let inner = self.inner.lock().await;
 
         session_ids.iter().any(|sid| {
@@ -971,7 +961,10 @@ mod tests {
         };
 
         assert!(store.policy_denied("34.230.40.69", 443, &ctx));
-        assert!(!store.is_allowed("34.230.40.69", 443, &ctx, false).await);
+        assert!(!store
+            .network_verdict("34.230.40.69", 443, &ctx, false)
+            .await
+            .is_some_and(|v| v.allowed));
     }
 
     #[test]
@@ -1103,7 +1096,10 @@ mod tests {
         };
 
         assert!(store.policy_denied("example.com", 443, &ctx));
-        assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
+        assert!(!store
+            .network_verdict("example.com", 443, &ctx, false)
+            .await
+            .is_some_and(|v| v.allowed));
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
 
@@ -1199,10 +1195,16 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(store.is_allowed("example.com", 443, &ctx, false).await);
+        assert!(store
+            .network_verdict("example.com", 443, &ctx, false)
+            .await
+            .is_some_and(|v| v.allowed));
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
-        assert!(!store.is_allowed("example.com", 443, &ctx, false).await);
+        assert!(!store
+            .network_verdict("example.com", 443, &ctx, false)
+            .await
+            .is_some_and(|v| v.allowed));
     }
 
     #[tokio::test]

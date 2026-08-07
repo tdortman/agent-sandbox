@@ -12,19 +12,14 @@
 //! policy target. An unverifiable advertised configuration fails closed.
 
 use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
-
 use agent_sandbox_core::AttributionToken;
 use bytes::Bytes;
-
 use h3::{
     ConnectionState,
     client::SendRequest,
-    error::Code,
-    quic::{OpenStreams as _, RecvStream as _, SendStream as _},
+    quic::{OpenStreams as _, SendStream as _},
 };
-
 use rustls::pki_types::pem::PemObject;
-
 use std::{
     collections::HashMap,
     future::poll_fn,
@@ -501,26 +496,13 @@ async fn dispatch_incoming(
 
             Err(error) => {
                 sessions.lock().await.remove(&session_id);
-                reject_incoming(error.0);
+                super::association::reject_webtransport_stream(error.0);
                 return;
             }
         }
     }
 
-    reject_incoming(stream);
-}
-
-fn reject_incoming(stream: IncomingWebTransportStream) {
-    match stream {
-        IncomingWebTransportStream::Bidi(mut stream) => {
-            stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
-            stream.reset(Code::H3_REQUEST_REJECTED.value());
-        }
-
-        IncomingWebTransportStream::Uni(mut stream) => {
-            stream.stop_sending(Code::H3_REQUEST_REJECTED.value());
-        }
-    }
+    super::association::reject_webtransport_stream(stream);
 }
 
 /// One live upstream HTTP/3 association.
@@ -694,12 +676,6 @@ impl UpstreamConnection {
             .read_datagram()
             .await
             .map_err(|error| BoxError::from(format!("upstream HTTP Datagram failed: {error}")))
-    }
-
-    /// Return the maximum datagram payload accepted by the peer.
-    #[must_use]
-    pub fn max_datagram_size(&self) -> Option<usize> {
-        self.connection.max_datagram_size()
     }
 }
 

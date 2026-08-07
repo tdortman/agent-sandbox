@@ -1,5 +1,7 @@
 //! Environment for Qt/KDE dialogs spawned outside the user's shell.
 
+use crate::proc_context::read_proc_environ;
+
 use std::{collections::HashMap, path::Path, process::Command};
 
 const PLASMA_COMM_NAMES: &[&str] = &["plasmashell", "kwin_wayland", "kwin_x11"];
@@ -52,29 +54,6 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
-fn environ_for_pid(pid: u32) -> HashMap<String, String> {
-    let path = format!("/proc/{pid}/environ");
-
-    let Ok(raw) = std::fs::read(&path) else {
-        return HashMap::new();
-    };
-
-    let mut env = HashMap::new();
-
-    for item in raw.split(|&b| b == 0) {
-        if let Some(eq) = item.iter().position(|&b| b == b'=') {
-            let (key, value) = item.split_at(eq);
-            let value = &value[1..];
-
-            if let (Ok(k), Ok(v)) = (std::str::from_utf8(key), std::str::from_utf8(value)) {
-                env.insert(k.to_string(), v.to_string());
-            }
-        }
-    }
-
-    env
-}
-
 pub fn inherit_plasma_env(uid: u32) -> HashMap<String, String> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return HashMap::new();
@@ -110,7 +89,7 @@ pub fn inherit_plasma_env(uid: u32) -> HashMap<String, String> {
             continue;
         }
 
-        let proc_env = environ_for_pid(pid);
+        let proc_env = read_proc_environ(pid);
 
         return ENV_INHERIT
             .iter()

@@ -9,7 +9,7 @@ use crate::{
         },
         peer::ClientPeer,
     },
-    store::{PolicyStore, UiClientHandle},
+    store::{DecisionAction, PolicyStore, UiClientHandle},
     wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire},
 };
 
@@ -249,17 +249,20 @@ async fn handle_non_proxy_tail(
             comment,
             ctx,
         } => Ok(store
-            .approve(PendingDecision {
-                pending_id: id,
-                scope,
-                target,
-                wire: ScopeWire {
-                    comment,
-                    ..ScopeWire::from_resolved(&ctx, session_id)
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id: id,
+                    scope,
+                    target,
+                    wire: ScopeWire {
+                        comment,
+                        ..ScopeWire::from_resolved(&ctx, session_id)
+                    },
+                    client_id: client.id,
+                    approver_uid: (peer.uid > 0).then_some(peer.uid),
                 },
-                client_id: client.id,
-                approver_uid: (peer.uid > 0).then_some(peer.uid),
-            })
+                DecisionAction::Approve,
+            )
             .await),
 
         ResolvedRpcRequest::ApproveHost {
@@ -287,17 +290,20 @@ async fn handle_non_proxy_tail(
             comment,
             ctx,
         } => Ok(store
-            .deny(PendingDecision {
-                pending_id: id,
-                scope,
-                target,
-                wire: ScopeWire {
-                    comment,
-                    ..ScopeWire::from_resolved(&ctx, session_id)
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id: id,
+                    scope,
+                    target,
+                    wire: ScopeWire {
+                        comment,
+                        ..ScopeWire::from_resolved(&ctx, session_id)
+                    },
+                    client_id: client.id,
+                    approver_uid: (peer.uid > 0).then_some(peer.uid),
                 },
-                client_id: client.id,
-                approver_uid: (peer.uid > 0).then_some(peer.uid),
-            })
+                DecisionAction::Deny,
+            )
             .await),
 
         ResolvedRpcRequest::Status { ctx } => Ok(RpcReply::Status(store.status(ctx).await)),
@@ -417,10 +423,6 @@ async fn handle_approve_host(
     session_id: Option<String>,
     ctx: ResolvedRequestContext,
 ) -> Result<RpcReply, PolicydError> {
-    if port == 0 {
-        return Err(PolicydError::PortRequired);
-    }
-
     Ok(store
         .approve_host(HostApproveRequest {
             host,

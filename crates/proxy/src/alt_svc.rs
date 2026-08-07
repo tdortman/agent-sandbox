@@ -20,22 +20,67 @@ use std::{
 };
 use tracing::debug;
 
+/// Minimal `Alt-Svc` rewrite surface shared by the rama (TCP) and `http`
+/// (h3) response types, which are distinct forked header-map types.
+pub trait AltSvcResponse {
+    fn alt_svc_values(&self) -> Vec<Vec<u8>>;
+
+    fn rewrite_alt_svc(&mut self, rewritten: Option<Vec<u8>>);
+}
+
+impl<B> AltSvcResponse for http::Response<B> {
+    fn alt_svc_values(&self) -> Vec<Vec<u8>> {
+        self.headers()
+            .get_all("alt-svc")
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect()
+    }
+
+    fn rewrite_alt_svc(&mut self, rewritten: Option<Vec<u8>>) {
+        let headers = self.headers_mut();
+        headers.remove("alt-svc");
+
+        if let Some(value) = rewritten
+            && let Ok(value) = http::HeaderValue::from_bytes(&value)
+        {
+            headers.append("alt-svc", value);
+        }
+    }
+}
+
+impl<B> AltSvcResponse for rama_http::Response<B> {
+    fn alt_svc_values(&self) -> Vec<Vec<u8>> {
+        self.headers()
+            .get_all("alt-svc")
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect()
+    }
+
+    fn rewrite_alt_svc(&mut self, rewritten: Option<Vec<u8>>) {
+        let headers = self.headers_mut();
+        headers.remove("alt-svc");
+
+        if let Some(value) = rewritten
+            && let Ok(value) = rama_http::HeaderValue::from_bytes(&value)
+        {
+            headers.append("alt-svc", value);
+        }
+    }
+}
+
 /// Rewrite the `Alt-Svc` headers of one approved response.
 ///
 /// Validated alternatives are preserved, filtered alternatives are removed,
 /// and the special `clear` value passes through. The header is removed
 /// entirely when no alternative survives validation.
-pub async fn preserve_response_alt_svc<B>(
-    response: &mut http::Response<B>,
+pub async fn preserve_response_alt_svc<R: AltSvcResponse>(
+    response: &mut R,
     store: &AltSvcStore,
     origin: &str,
 ) {
-    let values = response
-        .headers()
-        .get_all("alt-svc")
-        .iter()
-        .map(|value| value.as_bytes().to_vec())
-        .collect::<Vec<_>>();
+    let values = response.alt_svc_values();
 
     if values.is_empty() {
         return;
@@ -43,14 +88,8 @@ pub async fn preserve_response_alt_svc<B>(
 
     let borrowed = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let rewritten = store.record(origin, &borrowed).await;
-    let headers = response.headers_mut();
-    headers.remove("alt-svc");
 
-    if let Some(value) = rewritten
-        && let Ok(value) = http::HeaderValue::from_bytes(&value)
-    {
-        headers.append("alt-svc", value);
-    }
+    response.rewrite_alt_svc(rewritten);
 }
 
 /// Default lifetime of an alternative when no `ma` parameter is present

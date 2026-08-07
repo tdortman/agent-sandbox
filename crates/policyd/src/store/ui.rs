@@ -7,19 +7,39 @@ use super::{
     },
     ui_route::{UiRoute, paths_match},
 };
-
-use crate::wire::UiSpawnContext;
-
 use agent_sandbox_core::{
     ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
 };
-
-use std::{collections::HashSet, path::Path, sync::atomic::Ordering, time::Duration};
-use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::Mutex};
+use std::{
+    collections::HashSet,
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::AsyncWriteExt,
+    net::unix::OwnedWriteHalf,
+    sync::{Mutex, oneshot},
+    time,
+};
 use uuid::Uuid;
 
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
 const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
+
+/// Why a verdict wait ended without a reply from the verdict channel.
+pub enum VerdictExit {
+    /// The policy UI never registered within the short wait window.
+    NoUi,
+    /// The verdict channel closed before a reply arrived.
+    ChannelClosed,
+    /// The full approval timeout elapsed.
+    Timeout,
+    /// The out-of-band cancellation channel fired.
+    Cancelled,
+}
 type UiNotificationTarget = (u64, std::sync::Arc<Mutex<OwnedWriteHalf>>);
 
 impl PolicyStore {
@@ -80,14 +100,6 @@ impl PolicyStore {
         self.session_ids_for_route(&route).await
     }
 
-    pub(crate) async fn standalone_session_ids_for_context(
-        &self,
-        ctx: &ResolvedRequestContext,
-    ) -> HashSet<String> {
-        let route = Self::route_for_context(ctx);
-        self.session_ids_for_route(&route).await
-    }
-
     pub(crate) async fn standalone_session_ids_for_filesystem_pending(
         &self,
         pending: &PendingFilesystem,
@@ -123,14 +135,97 @@ impl PolicyStore {
         self.has_ui_for_route(&route).await
     }
 
-    pub(crate) async fn has_standalone_ui_for_context(&self, ctx: &ResolvedRequestContext) -> bool {
-        let route = Self::route_for_context(ctx);
-        self.has_ui_for_route(&route).await
-    }
-
     pub(crate) async fn has_ui_for_pending(&self, pending: &Pending) -> bool {
         let route = Self::route_for_pending(pending);
         self.has_ui_for_route(&route).await
+    }
+
+    /// Race UI registration against the verdict channel so a CLI approval can
+    /// unblock a request even if no policy UI ever appears. Preserve the
+    /// existing two-timeout contract: a short wait for the UI to register,
+    /// then a full `approval_timeout` for the verdict.
+    ///
+    /// `ui_ready` is polled fresh on every iteration. `cancel` is an optional
+    /// out-of-band cancellation channel; `on_exit` produces the reply for
+    /// every non-verdict exit.
+    pub(crate) async fn wait_for_ui_or_verdict<R, U, F, E, X>(
+        &self,
+        ui_ready: U,
+        rx: oneshot::Receiver<R>,
+        cancel: Option<Pin<&mut oneshot::Receiver<()>>>,
+        on_exit: E,
+    ) -> R
+    where
+        U: FnMut() -> F,
+        F: Future<Output = bool>,
+        E: FnOnce(VerdictExit) -> X,
+        X: Future<Output = R>,
+    {
+        let mut ui_ready = ui_ready;
+        let mut cancel = cancel;
+
+        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        let ui_deadline = Instant::now() + ui_wait;
+        tokio::pin!(rx);
+
+        loop {
+            if ui_ready().await {
+                break;
+            }
+
+            let now = Instant::now();
+
+            if now >= ui_deadline {
+                return on_exit(VerdictExit::NoUi).await;
+            }
+
+            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
+
+            if let Some(cancel) = cancel.as_mut() {
+                tokio::select! {
+                    biased;
+                    () = time::sleep(sleep_dur) => {}
+                    result = &mut rx => {
+                        match result {
+                            Ok(reply) => return reply,
+                            Err(_) => return on_exit(VerdictExit::ChannelClosed).await,
+                        }
+                    }
+                    _ = cancel => return on_exit(VerdictExit::Cancelled).await,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = time::sleep(sleep_dur) => {}
+                    result = &mut rx => {
+                        match result {
+                            Ok(reply) => return reply,
+                            Err(_) => return on_exit(VerdictExit::ChannelClosed).await,
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(cancel) = cancel.as_mut() {
+            let verdict = time::timeout(self.args.approval_timeout, &mut rx);
+            tokio::pin!(verdict);
+
+            tokio::select! {
+                result = &mut verdict => match result {
+                    Ok(Ok(reply)) => reply,
+                    Ok(Err(_)) => on_exit(VerdictExit::ChannelClosed).await,
+                    Err(_) => on_exit(VerdictExit::Timeout).await,
+                },
+                _ = cancel => on_exit(VerdictExit::Cancelled).await,
+            }
+        } else {
+            match time::timeout(self.args.approval_timeout, &mut rx).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_)) => on_exit(VerdictExit::ChannelClosed).await,
+                Err(_) => on_exit(VerdictExit::Timeout).await,
+            }
+        }
     }
 
     async fn ui_notification_targets_for(&self, route: &UiRoute) -> Vec<UiNotificationTarget> {
@@ -174,7 +269,7 @@ impl PolicyStore {
     }
 
     pub async fn end_ui_session(&self, client_id: u64) {
-        self.end_ui_session_by_id(client_id).await;
+        self.remove_ui_client(client_id, true).await;
     }
 
     pub async fn try_acquire_connection(&self, peer: crate::server::peer::ClientPeer) -> bool {
@@ -208,10 +303,6 @@ impl PolicyStore {
                 inner.connections_by_uid.remove(&peer.uid);
             }
         }
-    }
-
-    async fn end_ui_session_by_id(&self, client_id: u64) {
-        self.remove_ui_client(client_id, true).await;
     }
 
     fn remove_ui_client_locked(
@@ -255,29 +346,20 @@ impl PolicyStore {
                 continue;
             }
 
-            if !self.has_ui_for_pending(&p).await {
-                let spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(p.home()))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.uid.as_raw());
+            self.maybe_spawn_ui(
+                || self.has_ui_for_pending(&p),
+                None,
+                p.home(),
+                p.cwd(),
+                p.project_root(),
+                p.sandbox_session_id(),
+            )
+            .await;
 
-                let spawn = UiSpawnContext {
-                    has_matching_ui: false,
-                    uid: spawn_uid,
-                    home: p.home(),
-                    cwd: p.cwd(),
-                    project_root: p.project_root(),
-                    sandbox_session_id: p.sandbox_session_id(),
-                };
-
-                self.spawn_policy_ui(spawn).await;
-
-                if self.args.ui_spawn_cmd.is_some()
-                    && self.wait_for_ui_for_pending(&p, deadline).await
-                {
-                    registration_flush_observed = true;
-                    continue;
-                }
+            if self.args.ui_spawn_cmd.is_some() && self.wait_for_ui_for_pending(&p, deadline).await
+            {
+                registration_flush_observed = true;
+                continue;
             }
 
             self.notify_pending_once(&p).await;
@@ -413,20 +495,6 @@ impl PolicyStore {
         }
     }
 
-    /// Filesystem delivery: targets standalone-matching UI clients (which is
-    /// every UI client under the unified registration model).
-    pub(crate) async fn notify_standalone_ui(
-        &self,
-        ctx: &ResolvedRequestContext,
-        payload: &UiPush,
-    ) {
-        let route = Self::route_for_context(ctx);
-
-        if !self.notify_ui(&route, payload).await {
-            self.reroute_orphaned_pending().await;
-        }
-    }
-
     async fn send_to_targets(&self, payload: &UiPush, targets: &[UiNotificationTarget]) -> bool {
         let line = match RpcMessage::UiPush(payload.clone()).encode_line() {
             Ok(line) => line,
@@ -463,14 +531,11 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
-
     use crate::store::{
         Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
-
     use agent_sandbox_core::FileAccess;
     use std::{sync::Arc, time::Duration};
-
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,

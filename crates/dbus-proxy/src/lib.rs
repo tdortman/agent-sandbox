@@ -96,16 +96,6 @@ impl SerialMap {
     pub fn take(&mut self, upstream_serial: NonZeroU32) -> Option<NonZeroU32> {
         self.replies.remove(&upstream_serial)
     }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.replies.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.replies.is_empty()
-    }
 }
 
 /// Extract the structured policy target from a message header.
@@ -455,7 +445,7 @@ mod tests {
         let upstream = map.allocate(client);
         assert_eq!(upstream.get(), 1);
         assert_eq!(map.take(upstream), Some(client));
-        assert!(map.is_empty());
+        assert_eq!(map.take(upstream), None);
     }
 
     #[test]

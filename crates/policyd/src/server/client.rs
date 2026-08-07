@@ -10,12 +10,13 @@ use crate::{
 
 use agent_sandbox_core::{
     ProxyReply, ProxyRequestId, ProxySessionToken, RpcMessage, RpcReply, RpcRequest,
+    parse_rpc_request,
 };
 
 use std::sync::Arc;
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
     sync::Mutex,
 };
@@ -68,7 +69,7 @@ pub async fn handle_client(
             continue;
         }
 
-        let req: RpcRequest = if let Ok(req) = serde_json::from_str(&line) {
+        let req: RpcRequest = if let Ok(req) = parse_rpc_request(&line) {
             req
         } else {
             reply(writer.clone(), &PolicydError::InvalidJson.into()).await;
@@ -256,36 +257,27 @@ async fn read_line_limited(
     max_bytes: usize,
 ) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
-    let mut chunk = [0_u8; 1];
 
-    loop {
-        let n = reader.read(&mut chunk).await?;
+    let n = reader.read_until(b'\n', &mut buf).await?;
 
-        if n == 0 {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(String::from_utf8(buf).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
-                })?))
-            };
-        }
-
-        if chunk[0] == b'\n' {
-            return Ok(Some(String::from_utf8(buf).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
-            })?));
-        }
-
-        if buf.len() >= max_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "RPC line too large",
-            ));
-        }
-
-        buf.push(chunk[0]);
+    if n == 0 {
+        return Ok(None);
     }
+
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+
+    if buf.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "RPC line too large",
+        ));
+    }
+
+    Ok(Some(String::from_utf8(buf).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
+    })?))
 }
 
 async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {

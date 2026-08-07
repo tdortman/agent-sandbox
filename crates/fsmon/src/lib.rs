@@ -7,8 +7,6 @@ pub mod rpc_client {
         RpcReply, RpcRequest,
     };
 
-    use serde_json;
-
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::net::UnixStream,
@@ -51,19 +49,6 @@ pub mod rpc_client {
                 socket_path: socket_path.to_path_buf(),
                 stream: None,
             }
-        }
-
-        /// Connect immediately and create a persistent client.
-        ///
-        /// # Errors
-        /// Returns [`Error::Io`] if the Unix socket cannot be opened.
-        pub fn connect(socket_path: &Path) -> Result<Self, Error> {
-            let stream = UnixStream::connect(socket_path).map_err(Error::Io)?;
-
-            Ok(Self {
-                socket_path: socket_path.to_path_buf(),
-                stream: Some(BufReader::new(stream)),
-            })
         }
 
         /// Send a `CheckFilesystem` request over the persistent connection.
@@ -250,7 +235,7 @@ mod tests {
             }
         });
 
-        let mut client = PersistentClient::connect(&path).expect("connect persistent client");
+        let mut client = PersistentClient::new(&path);
 
         let first = client
             .check_filesystem(
@@ -299,7 +284,7 @@ mod tests {
             second.flush().expect("flush reconnect reply");
         });
 
-        let mut client = PersistentClient::connect(&path).expect("connect persistent client");
+        let mut client = PersistentClient::new(&path);
 
         assert!(
             client
@@ -352,7 +337,7 @@ mod tests {
             second.flush().expect("flush reconnect reply");
         });
 
-        let mut client = PersistentClient::connect(&path).expect("connect persistent client");
+        let mut client = PersistentClient::new(&path);
 
         assert!(
             client

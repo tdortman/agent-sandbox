@@ -5,7 +5,7 @@
 //! identity. Every candidate is checked against the socket table's UID and
 //! inode, the process start-time ticks, and the descriptor's socket target.
 
-use crate::{FlowProtocol, ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
+use crate::{ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
 
 use std::{
     collections::HashMap,
@@ -64,35 +64,6 @@ impl SocketTuple {
         Self::new(local_ip, local_port, remote_ip, 0)
     }
 
-    #[must_use]
-    pub const fn local_ip(self) -> IpAddr {
-        self.local_ip
-    }
-
-    #[must_use]
-    pub const fn local_port(self) -> u16 {
-        self.local_port
-    }
-
-    #[must_use]
-    pub const fn remote_ip(self) -> IpAddr {
-        self.remote_ip
-    }
-
-    #[must_use]
-    pub const fn remote_port(self) -> u16 {
-        self.remote_port
-    }
-
-    #[must_use]
-    pub const fn local_addr(self) -> (IpAddr, u16) {
-        (self.local_ip, self.local_port)
-    }
-
-    #[must_use]
-    pub const fn remote_addr(self) -> (IpAddr, u16) {
-        (self.remote_ip, self.remote_port)
-    }
 }
 
 /// A process and descriptor snapshot for a resolved socket.
@@ -164,18 +135,6 @@ pub enum OwnerResolution<T = OwnerSnapshot> {
     Unique(T),
     Missing,
     Ambiguous,
-}
-
-impl<T> OwnerResolution<T> {
-    /// Transform a unique owner while preserving fail-closed outcomes.
-    #[must_use]
-    pub fn map<U>(self, function: impl FnOnce(T) -> U) -> OwnerResolution<U> {
-        match self {
-            Self::Unique(owner) => OwnerResolution::Unique(function(owner)),
-            Self::Missing => OwnerResolution::Missing,
-            Self::Ambiguous => OwnerResolution::Ambiguous,
-        }
-    }
 }
 
 /// Revalidate a previously captured socket identity through the owning process.
@@ -474,24 +433,6 @@ fn proc_addr_field(ip: IpAddr, port: u16) -> String {
                 }
             }
             format!("{reversed}:{port:04X}")
-        }
-    }
-}
-
-impl From<FlowProtocol> for SocketProtocol {
-    fn from(protocol: FlowProtocol) -> Self {
-        match protocol {
-            FlowProtocol::Tcp => Self::Tcp,
-            FlowProtocol::Udp => Self::Udp,
-        }
-    }
-}
-
-impl From<SocketProtocol> for FlowProtocol {
-    fn from(protocol: SocketProtocol) -> Self {
-        match protocol {
-            SocketProtocol::Tcp => Self::Tcp,
-            SocketProtocol::Udp => Self::Udp,
         }
     }
 }

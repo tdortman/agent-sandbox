@@ -75,7 +75,6 @@ pub enum ResponsePlan {
     },
 
     FilesystemPolicyDenied {
-        errno: i32,
         path: std::path::PathBuf,
         access: FileAccess,
         source: VerdictSource,
@@ -83,7 +82,6 @@ pub enum ResponsePlan {
     },
 
     FilesystemRpcFailure {
-        errno: i32,
         path: std::path::PathBuf,
         access: FileAccess,
         error: String,
@@ -117,10 +115,13 @@ pub async fn decide(
             transient: true, ..
         } => ResponsePlan::Continue,
 
-        NormalizedNotification::Deny { errno }
-        | NormalizedNotification::Target {
-            target: SyscallTarget::Errno(errno),
-        } => ResponsePlan::deny(errno),
+        NormalizedNotification::Deny { errno } => ResponsePlan::deny(errno),
+
+        // `normalize` maps `SyscallTarget::Errno` to `Deny`, so a `Target`
+        // carrying `Errno` cannot reach `decide`.
+        NormalizedNotification::Target {
+            target: SyscallTarget::Errno(_),
+        } => unreachable!("normalize maps SyscallTarget::Errno to Deny"),
 
         NormalizedNotification::ClassificationFailure {
             transient: false, ..
@@ -194,7 +195,6 @@ fn filesystem_plan(
         Ok(reply) if reply.allowed => None,
 
         Ok(reply) => Some(ResponsePlan::FilesystemPolicyDenied {
-            errno: libc::EACCES,
             path: reply.path,
             access: reply.access,
             source: reply.source,
@@ -202,7 +202,6 @@ fn filesystem_plan(
         }),
 
         Err(error) => Some(ResponsePlan::FilesystemRpcFailure {
-            errno: libc::EACCES,
             path: path.to_path_buf(),
             access,
             error: error.to_string(),

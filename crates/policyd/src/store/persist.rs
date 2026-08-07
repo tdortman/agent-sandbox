@@ -31,10 +31,6 @@ fn network_rule_sort_key(rule: &NetworkRule) -> NetworkSortKey {
     NetworkSortKey::new(&rule.host, rule.port)
 }
 
-fn network_sort_key(host: &str, port: u16) -> NetworkSortKey {
-    NetworkSortKey::new(host, port)
-}
-
 fn path_key(path: &Path) -> String {
     let s = path.to_string_lossy();
     let trimmed = s.trim_end_matches('/');
@@ -307,7 +303,7 @@ impl PolicyStore {
     ) -> std::io::Result<()> {
         let mut current = load_policy(path, home, None);
         let host_norm = normalize_host(host);
-        let key = network_sort_key(&host_norm, port);
+        let key = NetworkSortKey::new(&host_norm, port);
 
         let mut allow: BTreeMap<NetworkSortKey, NetworkRule> = current
             .network

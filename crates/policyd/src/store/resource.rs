@@ -1,23 +1,22 @@
 //! Policy store: resource gate (declarative approval flow).
 
-use super::types::{
-    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
-    VerdictEntry, enforce_verdict_cache_limit,
+use super::{
+    types::{
+        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
+        VerdictEntry, enforce_verdict_cache_limit,
+    },
+    ui::VerdictExit,
 };
-
-use crate::wire::{ResourceCheckRequest, UiSpawnContext};
-
+use crate::wire::ResourceCheckRequest;
 use agent_sandbox_core::{
     DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
     ResourceRuleKey, UiPush, VerdictSource,
 };
-
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-
-use tokio::{sync::oneshot, time};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 struct PendingResResult {
@@ -132,32 +131,17 @@ impl PolicyStore {
                 },
             };
 
-            self.notify_standalone_ui(&ctx, &push).await;
+            self.notify_general_ui(&ctx, &push).await;
 
-            if !self.has_standalone_ui_for_context(&ctx).await {
-                let mut spawn_uid = wire_ids.uid();
-
-                if spawn_uid.is_none_or(|u| u == 0)
-                    && let Some(h) = &home
-                {
-                    spawn_uid =
-                        nix::unistd::User::from_name(&Self::user_for_home(Some(h.as_path())))
-                            .ok()
-                            .flatten()
-                            .map(|u| u.uid.as_raw());
-                }
-
-                let spawn = UiSpawnContext {
-                    has_matching_ui: false,
-                    uid: spawn_uid,
-                    home: home.as_deref(),
-                    cwd: cwd.as_deref(),
-                    project_root: project_root.as_deref(),
-                    sandbox_session_id: sandbox_session_id.as_deref(),
-                };
-
-                self.spawn_policy_ui(spawn).await;
-            }
+            self.maybe_spawn_ui(
+                || self.has_ui_for_context(&ctx),
+                wire_ids.uid(),
+                home.as_deref(),
+                cwd.as_deref(),
+                project_root.as_deref(),
+                sandbox_session_id.as_deref(),
+            )
+            .await;
         }
 
         self.await_resource_verdict(&ctx, &result.id, kind, path, access, result.rx)
@@ -311,66 +295,53 @@ impl PolicyStore {
         access: ResourceAccess,
         rx: oneshot::Receiver<ResourceCheckReply>,
     ) -> ResourceCheckReply {
-        // Race UI registration against the verdict channel so a CLI approval
-        // can unblock the request even if no policy UI ever appears.
-        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        self.wait_for_ui_or_verdict(
+            || self.has_ui_for_context(ctx),
+            rx,
+            None,
+            |reason| async move {
+                match reason {
+                    VerdictExit::NoUi => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.resource_futures.remove(pending_id);
+                        drop(inner);
 
-        let ui_deadline = Instant::now() + ui_wait;
-        tokio::pin!(rx);
+                        ResourceCheckReply::blocked(
+                            "agent-sandbox: no standalone resource policy UI registered \
+                             (agent-sandbox-ui or auto-spawn)",
+                            kind,
+                            path.clone(),
+                            access,
+                        )
+                    }
+                    VerdictExit::ChannelClosed => ResourceCheckReply::denied(
+                        VerdictSource::Blocked,
+                        kind,
+                        path.clone(),
+                        access,
+                    ),
+                    VerdictExit::Timeout => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.resource_futures.remove(pending_id);
+                        drop(inner);
 
-        loop {
-            if self.has_standalone_ui_for_context(ctx).await {
-                break;
-            }
-
-            let now = Instant::now();
-
-            if now >= ui_deadline {
-                let mut inner = self.inner.lock().await;
-                inner.take_pending(pending_id);
-                inner.resource_futures.remove(pending_id);
-                drop(inner);
-
-                return ResourceCheckReply::blocked(
-                    "agent-sandbox: no standalone resource policy UI registered (agent-sandbox-ui \
-                     or auto-spawn)",
-                    kind,
-                    path.clone(),
-                    access,
-                );
-            }
-
-            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
-
-            tokio::select! {
-                biased;
-                () = time::sleep(sleep_dur) => {}
-                result = &mut rx => {
-                    return result.unwrap_or_else(|_| ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access));
+                        ResourceCheckReply::blocked(
+                            "agent-sandbox: resource approval timed out (no response from policy \
+                             UI)",
+                            kind,
+                            path.clone(),
+                            access,
+                        )
+                    }
+                    VerdictExit::Cancelled => {
+                        unreachable!("no cancel channel wired for resource waits")
+                    }
                 }
-            }
-        }
-
-        match time::timeout(self.args.approval_timeout, &mut rx).await {
-            Ok(Ok(v)) => v,
-
-            Ok(Err(_)) => {
-                ResourceCheckReply::denied(VerdictSource::Blocked, kind, path.clone(), access)
-            }
-
-            Err(_) => {
-                let mut inner = self.inner.lock().await;
-                inner.take_pending(pending_id);
-                inner.resource_futures.remove(pending_id);
-                drop(inner);
-                ResourceCheckReply::blocked(
-                    "agent-sandbox: resource approval timed out (no response from policy UI)",
-                    kind,
-                    path,
-                    access,
-                )
-            }
-        }
+            },
+        )
+        .await
     }
 
     pub(crate) async fn finish_resource(
@@ -412,23 +383,19 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
-
     use crate::{
         store::{UiSessionContext, types::UiClient},
         wire::ResourceCheckRequest,
     };
-
     use agent_sandbox_core::{
         ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess, VerdictSource,
     };
-
     use std::{
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
-
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {

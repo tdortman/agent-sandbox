@@ -8,14 +8,12 @@ mod options;
 mod push;
 
 use agent_sandbox_core::{
-    DbusBus, DbusMessageKind, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest,
-    SandboxPaths, UiPush,
+    DbusBus, DbusMessageKind, DbusTarget, RequestContext, RpcConnection, RpcMessage, RpcReply,
+    RpcRequest, SandboxPaths, UiPush,
 };
-
 use clap::Parser;
 pub use error::UiCliError;
 use nix::fcntl::{Flock, FlockArg, OFlag};
-
 use std::{
     fs::{File, OpenOptions},
     future::Future,
@@ -23,7 +21,6 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-
 use tracing::{info, warn};
 
 #[must_use]
@@ -51,6 +48,24 @@ pub const fn signature_display(signature: &str) -> &str {
     } else {
         signature
     }
+}
+
+/// Format fd metadata as a semicolon-joined "index: kind=..., `read_only`=..."
+/// list.
+#[must_use]
+pub(crate) fn dbus_fd_display(target: &DbusTarget) -> String {
+    target
+        .fd_metadata
+        .iter()
+        .enumerate()
+        .map(|(index, metadata)| {
+            format!(
+                "{index}: kind={}, read_only={}",
+                metadata.kind, metadata.read_only
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 const PROMPT_LOCK_FILE_NAME: &str = "agent-sandbox-ui.prompt.lock";
@@ -322,12 +337,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-
     use tokio::{
         sync::{Mutex, Notify, oneshot},
         time::timeout,

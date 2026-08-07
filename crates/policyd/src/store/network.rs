@@ -1,24 +1,23 @@
 //! Policy store, network.
 
-use super::types::{
-    MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
-    PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+use super::{
+    types::{
+        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
+        PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+    },
+    ui::VerdictExit,
 };
-
-use crate::wire::{NetworkCheckRequest, UiSpawnContext};
-
+use crate::wire::NetworkCheckRequest;
 use agent_sandbox_core::{
     CheckReply, NetworkRuleKey, ProcessIds, ProxyRequestId, ProxySessionToken,
     ResolvedRequestContext, SandboxPaths, UiPush, VerdictSource, attach_check_aliases,
     normalize_host,
 };
-
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-
-use tokio::{sync::oneshot, time};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// How long a network verdict is cached after the first policy check for the
@@ -252,30 +251,15 @@ impl PolicyStore {
             })
             .await;
 
-            if !self.has_ui_for_context(&ctx).await {
-                let mut spawn_uid = wire_ids.uid();
-
-                if spawn_uid.is_none_or(|u| u == 0)
-                    && let Some(h) = &home
-                {
-                    spawn_uid =
-                        nix::unistd::User::from_name(&Self::user_for_home(Some(h.as_path())))
-                            .ok()
-                            .flatten()
-                            .map(|u| u.uid.as_raw());
-                }
-
-                let spawn = UiSpawnContext {
-                    has_matching_ui: false,
-                    uid: spawn_uid,
-                    home: home.as_deref(),
-                    cwd: cwd.as_deref(),
-                    project_root: project_root.as_deref(),
-                    sandbox_session_id: sandbox_session_id.as_deref(),
-                };
-
-                self.spawn_policy_ui(spawn).await;
-            }
+            self.maybe_spawn_ui(
+                || self.has_ui_for_context(&ctx),
+                wire_ids.uid(),
+                home.as_deref(),
+                cwd.as_deref(),
+                project_root.as_deref(),
+                sandbox_session_id.as_deref(),
+            )
+            .await;
         }
 
         self.await_network_verdict(
@@ -489,101 +473,85 @@ impl PolicyStore {
         cancel: Option<oneshot::Receiver<()>>,
         proxy: Option<(ProxySessionToken, ProxyRequestId)>,
     ) -> CheckReply {
-        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
-        let ui_deadline = Instant::now() + ui_wait;
-        tokio::pin!(rx);
         let (_fallback_cancel_tx, fallback_cancel_rx) = oneshot::channel();
         let cancel_rx = cancel.unwrap_or(fallback_cancel_rx);
         tokio::pin!(cancel_rx);
 
-        loop {
-            if self.has_ui_for_context(target.ctx).await {
-                break;
-            }
+        self.wait_for_ui_or_verdict(
+            || self.has_ui_for_context(target.ctx),
+            rx,
+            Some(cancel_rx.as_mut()),
+            |reason| async move {
+                match reason {
+                    VerdictExit::NoUi => {
+                        let (canceled, last) =
+                            self.expire_network_wait(&target, proxy.as_ref()).await;
 
-            let now = Instant::now();
+                        for tx in canceled {
+                            let _ = tx.send(CheckReply::blocked(
+                                "agent-sandbox: no policy UI registered",
+                            ));
+                        }
 
-            if now >= ui_deadline {
-                let (canceled, last) = self.expire_network_wait(&target, proxy.as_ref()).await;
+                        tracing::warn!(
+                            host = %target.policy_host,
+                            port = target.port,
+                            last,
+                            "network approval blocked (no policy UI)"
+                        );
 
-                for tx in canceled {
-                    let _ = tx.send(CheckReply::blocked(
-                        "agent-sandbox: no policy UI registered",
-                    ));
-                }
-
-                tracing::warn!(
-                    host = %target.policy_host,
-                    port = target.port,
-                    last,
-                    "network approval blocked (no policy UI)"
-                );
-
-                return CheckReply::blocked(
-                    "agent-sandbox: no policy UI registered (agent-sandbox-ui or auto-spawn)",
-                );
-            }
-
-            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
-
-            tokio::select! {
-                biased;
-                () = time::sleep(sleep_dur) => {}
-                result = &mut rx => {
-                    return result.unwrap_or_else(|_| CheckReply::denied(VerdictSource::Blocked));
-                }
-                _ = &mut cancel_rx => {
-                    let canceled = self
-                        .cancel_network_wait(target.pending_id, proxy.as_ref())
-                        .await;
-                    for tx in canceled {
-                        let _ = tx.send(CheckReply::blocked("agent-sandbox: network check cancelled"));
+                        CheckReply::blocked(
+                            "agent-sandbox: no policy UI registered (agent-sandbox-ui or \
+                             auto-spawn)",
+                        )
                     }
-                    return CheckReply::blocked("agent-sandbox: network check cancelled");
-                }
-            }
-        }
+                    VerdictExit::ChannelClosed => CheckReply::denied(VerdictSource::Blocked),
+                    VerdictExit::Timeout => {
+                        let (canceled, last) =
+                            self.expire_network_wait(&target, proxy.as_ref()).await;
 
-        let verdict = time::timeout(self.args.approval_timeout, &mut rx);
-        tokio::pin!(verdict);
+                        for tx in canceled {
+                            let _ = tx.send(CheckReply::blocked(
+                                "agent-sandbox: network approval timed out",
+                            ));
+                        }
 
-        tokio::select! {
-            result = &mut verdict => match result {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(_)) => CheckReply::denied(VerdictSource::Blocked),
-                Err(_) => {
-                    let (canceled, last) =
-                        self.expire_network_wait(&target, proxy.as_ref()).await;
-                    for tx in canceled {
-                        let _ = tx.send(CheckReply::blocked("agent-sandbox: network approval timed out"));
+                        Self::audit(
+                            "timeout",
+                            Some(&target.policy_host),
+                            Some(target.port),
+                            target.scheme,
+                        );
+
+                        tracing::warn!(
+                            host = %target.policy_host,
+                            port = target.port,
+                            last,
+                            "network approval timed out"
+                        );
+
+                        CheckReply::blocked(
+                            "agent-sandbox: network approval timed out (no response from policy \
+                             UI)",
+                        )
                     }
-                    Self::audit(
-                        "timeout",
-                        Some(&target.policy_host),
-                        Some(target.port),
-                        target.scheme,
-                    );
-                    tracing::warn!(
-                        host = %target.policy_host,
-                        port = target.port,
-                        last,
-                        "network approval timed out"
-                    );
-                    CheckReply::blocked(
-                        "agent-sandbox: network approval timed out (no response from policy UI)",
-                    )
+                    VerdictExit::Cancelled => {
+                        let canceled = self
+                            .cancel_network_wait(target.pending_id, proxy.as_ref())
+                            .await;
+
+                        for tx in canceled {
+                            let _ = tx.send(CheckReply::blocked(
+                                "agent-sandbox: network check cancelled",
+                            ));
+                        }
+
+                        CheckReply::blocked("agent-sandbox: network check cancelled")
+                    }
                 }
             },
-            _ = &mut cancel_rx => {
-                let canceled = self
-                    .cancel_network_wait(target.pending_id, proxy.as_ref())
-                    .await;
-                for tx in canceled {
-                    let _ = tx.send(CheckReply::blocked("agent-sandbox: network check cancelled"));
-                }
-                CheckReply::blocked("agent-sandbox: network check cancelled")
-            }
-        }
+        )
+        .await
     }
 }
 
@@ -634,16 +602,13 @@ mod tests {
         store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
         wire::NetworkCheckRequest,
     };
-
     use agent_sandbox_core::{
         FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
     };
-
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
-
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {

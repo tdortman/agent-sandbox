@@ -1,11 +1,9 @@
 use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
 use agent_sandbox_core::ResourceKind;
-
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
     SyscallTarget, notification_arch_valid, revalidate_filesystem_mutation, send_response,
 };
-
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
@@ -124,6 +122,11 @@ pub async fn dispatch_notification_with_mode(
     execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
 }
 
+/// Reply to the tracee with `EACCES` and log the notification response.
+fn respond_denied(listener_fd: i32, notif: &SeccompNotif) {
+    super::log_notification_response(send_response(listener_fd, notif.id, 0, -libc::EACCES, 0));
+}
+
 fn execute_response_plan(
     plan: ResponsePlan,
     listener_fd: i32,
@@ -156,45 +159,31 @@ fn execute_response_plan(
             error,
         } => {
             info!(target = ?target, source = ?source, error = ?error, "resource syscall denied by policy");
-            super::log_notification_response(send_response(
-                listener_fd,
-                notif.id,
-                0,
-                -libc::EACCES,
-                0,
-            ));
+            respond_denied(listener_fd, notif);
         }
 
         ResponsePlan::ResourceRpcFailure { target, error } => {
             warn!(target = ?target, error = %error, "resource policy RPC failed");
-            super::log_notification_response(send_response(
-                listener_fd,
-                notif.id,
-                0,
-                -libc::EACCES,
-                0,
-            ));
+            respond_denied(listener_fd, notif);
         }
 
         ResponsePlan::FilesystemPolicyDenied {
-            errno,
             path,
             access,
             source,
             error,
         } => {
             info!(path = %path.display(), access = ?access, source = ?source, error = ?error, "filesystem syscall denied by policy");
-            super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
+            respond_denied(listener_fd, notif);
         }
 
         ResponsePlan::FilesystemRpcFailure {
-            errno,
             path,
             access,
             error,
         } => {
             warn!(path = %path.display(), access = ?access, error = %error, "filesystem policy RPC failed");
-            super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
+            respond_denied(listener_fd, notif);
         }
 
         ResponsePlan::EmulateResource { target } => {
@@ -218,13 +207,7 @@ fn execute_response_plan(
         ResponsePlan::RevalidateFilesystemThenContinue { target } => {
             if let Err(err) = revalidate_filesystem_mutation(notif, &target) {
                 warn!(error = %err, target = ?target, "filesystem dispatch failed");
-                super::log_notification_response(send_response(
-                    listener_fd,
-                    notif.id,
-                    0,
-                    -libc::EACCES,
-                    0,
-                ));
+                respond_denied(listener_fd, notif);
             } else {
                 super::log_notification_response(send_response(
                     listener_fd,

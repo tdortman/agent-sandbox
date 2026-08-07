@@ -1,7 +1,6 @@
 //! Session-scoped hostname attribution persisted across NFQUEUE restarts.
 
 use serde::{Deserialize, Serialize};
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -49,6 +48,7 @@ pub struct SessionAttribution {
 
 impl SessionAttribution {
     /// Construct an in-memory attribution map, primarily for unit tests.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             path: None,
@@ -163,12 +163,6 @@ impl SessionAttribution {
         std::fs::rename(tmp, path)?;
         self.dirty = false;
         Ok(())
-    }
-}
-
-impl Default for SessionAttribution {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

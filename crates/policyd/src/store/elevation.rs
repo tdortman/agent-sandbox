@@ -1,21 +1,16 @@
 //! Policy store: elevation.
 
-use super::types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore};
-
-use crate::{
-    error::PolicydError,
-    wire::{ElevationRequest, UiSpawnContext},
+use super::{
+    types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore},
+    ui::VerdictExit,
 };
-
+use crate::{error::PolicydError, wire::ElevationRequest};
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
-
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
 };
-
-use tokio::{sync::oneshot, time};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
@@ -302,31 +297,15 @@ impl PolicyStore {
         project_root: Option<&Path>,
         sandbox_session_id: Option<&str>,
     ) {
-        if self.has_ui_for_context(ctx).await {
-            return;
-        }
-
-        let mut spawn_uid = wire_ids.uid();
-
-        if spawn_uid.is_none_or(|u| u == 0)
-            && let Some(h) = home
-        {
-            spawn_uid = nix::unistd::User::from_name(&Self::user_for_home(Some(h)))
-                .ok()
-                .flatten()
-                .map(|u| u.uid.as_raw());
-        }
-
-        let spawn = UiSpawnContext {
-            has_matching_ui: false,
-            uid: spawn_uid,
+        self.maybe_spawn_ui(
+            || self.has_ui_for_context(ctx),
+            wire_ids.uid(),
             home,
             cwd,
             project_root,
             sandbox_session_id,
-        };
-
-        self.spawn_policy_ui(spawn).await;
+        )
+        .await;
     }
 
     async fn await_elevation_verdict(
@@ -335,70 +314,53 @@ impl PolicyStore {
         pending_id: &str,
         rx: oneshot::Receiver<ElevateReply>,
     ) -> ElevateReply {
-        // Race UI registration against the verdict channel so a CLI approval
-        // can unblock the request even if no policy UI ever appears.
-        // Preserve the existing two-timeout contract: a short wait for the
-        // UI to register, then a full approval_timeout for the verdict.
-        let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
+        self.wait_for_ui_or_verdict(
+            || self.has_ui_for_context(ctx),
+            rx,
+            None,
+            |reason| async move {
+                match reason {
+                    VerdictExit::NoUi => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.elevation_futures.remove(pending_id);
+                        drop(inner);
 
-        let ui_deadline = Instant::now() + ui_wait;
-        tokio::pin!(rx);
+                        ElevateReply {
+                            ok: true,
+                            allowed: false,
+                            exit_code: 1,
+                            stdout: String::new(),
+                            stderr: "agent-sandbox: no policy UI registered (agent-sandbox-ui or \
+                                     auto-spawn)"
+                                .into(),
+                        }
+                    }
+                    VerdictExit::ChannelClosed => ElevateReply::denied(),
+                    VerdictExit::Timeout => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.elevation_futures.remove(pending_id);
+                        drop(inner);
+                        Self::audit("timeout", None, None, pending_id);
 
-        loop {
-            if self.has_ui_for_context(ctx).await {
-                break;
-            }
-
-            let now = Instant::now();
-
-            if now >= ui_deadline {
-                let mut inner = self.inner.lock().await;
-                inner.take_pending(pending_id);
-                inner.elevation_futures.remove(pending_id);
-                drop(inner);
-
-                return ElevateReply {
-                    ok: true,
-                    allowed: false,
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: "agent-sandbox: no policy UI registered (agent-sandbox-ui or \
-                             auto-spawn)"
-                        .into(),
-                };
-            }
-
-            let sleep_dur = (ui_deadline - now).min(Duration::from_millis(50));
-
-            tokio::select! {
-                biased;
-                () = time::sleep(sleep_dur) => {}
-                result = &mut rx => {
-                    return result.unwrap_or_else(|_| ElevateReply::denied());
+                        ElevateReply {
+                            ok: true,
+                            allowed: false,
+                            exit_code: 1,
+                            stdout: String::new(),
+                            stderr: "agent-sandbox: elevation timed out (no response from policy \
+                                     UI)"
+                            .into(),
+                        }
+                    }
+                    VerdictExit::Cancelled => {
+                        unreachable!("no cancel channel wired for elevation waits")
+                    }
                 }
-            }
-        }
-
-        match time::timeout(self.args.approval_timeout, &mut rx).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => ElevateReply::denied(),
-
-            Err(_) => {
-                let mut inner = self.inner.lock().await;
-                inner.take_pending(pending_id);
-                inner.elevation_futures.remove(pending_id);
-                drop(inner);
-                Self::audit("timeout", None, None, pending_id);
-                ElevateReply {
-                    ok: true,
-                    allowed: false,
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: "agent-sandbox: elevation timed out (no response from policy UI)"
-                        .into(),
-                }
-            }
-        }
+            },
+        )
+        .await
     }
 }
 
@@ -407,7 +369,6 @@ mod tests {
     use super::ELEVATION_PATH;
     use crate::{store::types::PolicyStore, wire::ElevationRequest};
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,

@@ -16,13 +16,10 @@ use std::collections::BTreeSet;
 /// `SYS_` prefix.
 pub mod nr {
     pub use libc::{
-        SYS_clone3 as CLONE3, SYS_connect as CONNECT, SYS_creat as CREAT,
-        SYS_io_uring_enter as IO_URING_ENTER, SYS_io_uring_register as IO_URING_REGISTER,
-        SYS_io_uring_setup as IO_URING_SETUP, SYS_open as OPEN, SYS_openat as OPENAT,
-        SYS_openat2 as OPENAT2, SYS_sendfile as SENDFILE, SYS_sendmmsg as SENDMMSG,
-        SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO, SYS_socket as SOCKET,
-        SYS_socketpair as SOCKETPAIR, SYS_unshare as UNSHARE, SYS_write as WRITE,
-        SYS_writev as WRITEV,
+        SYS_connect as CONNECT, SYS_creat as CREAT, SYS_io_uring_enter as IO_URING_ENTER,
+        SYS_io_uring_register as IO_URING_REGISTER, SYS_io_uring_setup as IO_URING_SETUP,
+        SYS_open as OPEN, SYS_openat as OPENAT, SYS_openat2 as OPENAT2, SYS_sendmmsg as SENDMMSG,
+        SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO,
     };
 
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for
@@ -44,19 +41,7 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
     () => 0xC000_003E,
     #[cfg(target_arch = "aarch64")]
     () => 0xC000_00B7,
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    () => 0,
 };
-
-/// x32 compat audit arch on `x86_64`. Non-native values must never reach
-/// broker policy checks; the BPF filter kills these before allow fallback.
-#[cfg(target_arch = "x86_64")]
-pub const AUDIT_ARCH_X86_32: u32 = 0x4000_0002;
-
-/// i686 compat audit arch on `x86_64`. Non-native values must never reach
-/// broker policy checks; the BPF filter kills these before allow fallback.
-#[cfg(target_arch = "x86_64")]
-pub const AUDIT_ARCH_I686: u32 = 0x4000_0003;
 
 /// Syscalls trapped by the seccomp filter and routed to the broker.
 ///
@@ -132,9 +117,6 @@ fn push_filesystem_mutation_syscalls(syscalls: &mut BTreeSet<i64>) {
         syscalls.insert(nr);
     }
 }
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn push_filesystem_mutation_syscalls(_syscalls: &mut BTreeSet<i64>) {}
 
 #[cfg(test)]
 mod tests {
@@ -251,17 +233,6 @@ mod tests {
                 "filesystem mutation syscall {nr} must not be trapped"
             );
         }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn compat_audit_arch_constants_match_linux_headers() {
-        use super::{AUDIT_ARCH_I686, AUDIT_ARCH_X86_32};
-
-        assert_eq!(AUDIT_ARCH_X86_32, 0x4000_0002);
-        assert_eq!(AUDIT_ARCH_I686, 0x4000_0003);
-        assert_ne!(AUDIT_ARCH_X86_32, super::AUDIT_ARCH_NATIVE);
-        assert_ne!(AUDIT_ARCH_I686, super::AUDIT_ARCH_NATIVE);
     }
 
     #[test]

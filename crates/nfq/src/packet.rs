@@ -38,6 +38,9 @@ pub struct PacketMeta {
     pub dst_port: u16,
     pub protocol: TransportProtocol,
     pub tcp_syn: bool,
+    /// Offset of the transport header within the packet: the IPv4 IHL, or 40
+    /// plus the total IPv6 extension header length.
+    pub transport_offset: usize,
 }
 
 impl PacketMeta {
@@ -253,6 +256,7 @@ fn parse_tcp(
         dst_port,
         protocol: TransportProtocol::Tcp,
         tcp_syn,
+        transport_offset: ip_hdr_len,
     })
 }
 
@@ -278,6 +282,7 @@ const fn parse_udp(
         dst_port,
         protocol: TransportProtocol::Udp,
         tcp_syn: false,
+        transport_offset: ip_hdr_len,
     })
 }
 
@@ -292,23 +297,9 @@ pub fn udp_payload<'a>(payload: &'a [u8], meta: &PacketMeta) -> Option<&'a [u8]>
         return None;
     }
 
-    let ip_hdr_len = if meta.ip_version() == 6 {
-        if payload.len() < 40 {
-            return None;
-        }
-        let plen = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-        let pkt_len = (40 + plen).min(payload.len());
-        walk_ipv6_ext_headers(payload, pkt_len).map(|ext| ext.transport_offset)?
-    } else {
-        if payload.len() < 20 {
-            return None;
-        }
-        let ihl = usize::from(payload[0] & 0x0F) * 4;
-        if ihl < 20 || payload.len() < ihl {
-            return None;
-        }
-        ihl
-    };
+    // The transport offset was already computed by parse_ipv4/parse_ipv6; do
+    // not re-walk the IPv4 IHL or IPv6 extension headers here.
+    let ip_hdr_len = meta.transport_offset;
 
     if payload.len() < ip_hdr_len + 8 {
         return None;

@@ -22,11 +22,6 @@ use agent_sandbox_core::{
 use std::path::{Path, PathBuf};
 
 impl PolicyStore {
-    pub async fn approve(&self, decision: PendingDecision) -> RpcReply {
-        self.apply_pending_decision(decision, DecisionAction::Approve)
-            .await
-    }
-
     pub(crate) async fn apply_pending_decision(
         &self,
         decision: PendingDecision,
@@ -738,8 +733,8 @@ impl PolicyStore {
         let pending_path = &pending.path;
         let project_root = project_root.or(pending.project_root.as_deref());
 
-        let (kind, path) = match target {
-            None => (pending.kind, pending_path.clone()),
+        let path = match target {
+            None => pending_path.clone(),
             Some(ApprovalTarget::ResourcePath {
                 resource_kind,
                 path,
@@ -747,12 +742,10 @@ impl PolicyStore {
                 if *resource_kind != pending.kind {
                     return Err(PolicydError::InvalidDecisionTarget);
                 }
-                (*resource_kind, path.clone())
+                path.clone()
             }
             Some(_) => return Err(PolicydError::InvalidDecisionTarget),
         };
-
-        let _ = kind;
 
         // For Once scope, only exact match is allowed.
         if scope == ApprovalScope::Once {
@@ -844,6 +837,8 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use super::DecisionAction;
+
     use crate::{
         store::{
             Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
@@ -1204,7 +1199,7 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Global,
                 target: Some(ApprovalTarget::FilesystemPath {
@@ -1223,7 +1218,7 @@ mod tests {
                 },
                 client_id: 1,
                 approver_uid: None,
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1265,7 +1260,7 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Global,
                 target: Some(ApprovalTarget::FilesystemPath {
@@ -1284,7 +1279,7 @@ mod tests {
                 },
                 client_id: 1,
                 approver_uid: None,
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1348,7 +1343,7 @@ mod tests {
             .insert_pending(Pending::Resource(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Global,
                 target: Some(ApprovalTarget::ResourcePath {
@@ -1364,7 +1359,7 @@ mod tests {
                 },
                 client_id: 1,
                 approver_uid: None,
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1471,7 +1466,7 @@ mod tests {
         add_ui_sessions(&store).await;
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Once,
                 target: Some(ApprovalTarget::Dbus {
@@ -1480,7 +1475,7 @@ mod tests {
                 wire: ScopeWire::from_resolved(&ctx, None),
                 client_id: 1,
                 approver_uid: Some(1000),
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(matches!(
@@ -1555,7 +1550,7 @@ mod tests {
         add_ui_sessions(&store).await;
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Global,
                 target: Some(ApprovalTarget::Dbus {
@@ -1570,7 +1565,7 @@ mod tests {
                 },
                 client_id: 1,
                 approver_uid: Some(1000),
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1644,7 +1639,7 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Session,
                 target: Some(ApprovalTarget::FilesystemPath {
@@ -1653,7 +1648,7 @@ mod tests {
                 wire: scope_wire(submitting_session_id),
                 client_id: 1,
                 approver_uid: None,
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(reply.scope_succeeded());
@@ -1739,7 +1734,7 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id: pending_id.clone(),
                 scope: ApprovalScope::Once,
                 target: None,
@@ -1752,7 +1747,7 @@ mod tests {
                 },
                 client_id: 99,
                 approver_uid: Some(1001),
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1802,14 +1797,14 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id: pending_id.clone(),
                 scope: ApprovalScope::Once,
                 target: None,
                 wire: scope_wire("ui-b"),
                 client_id: 1,
                 approver_uid: None,
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1859,14 +1854,14 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Once,
                 target: None,
                 wire: scope_wire("ui-a"),
                 client_id: 1,
                 approver_uid: None,
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(
@@ -1899,7 +1894,7 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .approve(PendingDecision {
+            .apply_pending_decision(PendingDecision {
                 pending_id,
                 scope: ApprovalScope::Once,
                 target: None,
@@ -1912,7 +1907,7 @@ mod tests {
                 },
                 client_id: 99,
                 approver_uid: Some(1000),
-            })
+            }, DecisionAction::Approve)
             .await;
 
         assert!(

@@ -27,9 +27,6 @@ pub enum PolicydError {
     #[error("invalid port")]
     InvalidPort,
 
-    #[error("port required (1-65535)")]
-    PortRequired,
-
     #[error("unknown pending id")]
     UnknownPendingId,
 

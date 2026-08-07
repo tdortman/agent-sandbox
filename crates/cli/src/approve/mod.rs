@@ -1,6 +1,6 @@
 //! Host CLI for pending policy approvals.
 
-use crate::ui::{bus_name, message_kind_name, signature_display};
+use crate::ui::{bus_name, dbus_fd_display, message_kind_name, signature_display};
 
 use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
@@ -414,28 +414,13 @@ async fn handle_pending(
                     message_kind_name(target.message_kind),
                     signature_display(&target.signature),
                     target.fd_metadata.len(),
-                    dbus_fd_metadata_display(&target),
+                    dbus_fd_display(&target),
                 );
             }
         }
     }
 
     Ok(())
-}
-
-fn dbus_fd_metadata_display(target: &agent_sandbox_core::DbusTarget) -> String {
-    target
-        .fd_metadata
-        .iter()
-        .enumerate()
-        .map(|(index, metadata)| {
-            format!(
-                "{index}: kind={}, read_only={}",
-                metadata.kind, metadata.read_only
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 async fn rpc(socket: &Path, req: RpcRequest) -> Result<RpcReply, ApproveCliError> {

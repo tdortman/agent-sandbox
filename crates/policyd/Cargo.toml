@@ -12,7 +12,7 @@ path = "src/main.rs"
 agent-sandbox-core = { path = "../core" }
 
 clap = { workspace = true, features = ["env"] }
-nix = { workspace = true, features = ["fs", "user"] }
+nix = { workspace = true, features = ["user"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = {

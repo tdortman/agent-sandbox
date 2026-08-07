@@ -155,7 +155,6 @@ struct NfqState {
     dns_server_ip: IpAddr,
     nft_binary: String,
     proxy_mode: bool,
-    proxy_mark: u32,
     udp_proxy_ports: Vec<u16>,
 }
 
@@ -186,7 +185,6 @@ impl NfqState {
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
             proxy_mode: cli.proxy_mode,
-            proxy_mark: PROXY_MARK,
             udp_proxy_ports: cli
                 .udp_proxy_ports
                 .split(',')
@@ -297,8 +295,8 @@ fn main() {
             }
         };
 
-        let verdict = handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
-        mark_accepted_proxy_udp(&state, &mut message, verdict);
+        let (verdict, meta) = handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
+        mark_accepted_proxy_udp(&state, &mut message, verdict, meta);
         message.set_verdict(verdict);
 
         if let Err(err) = queue.verdict(message) {
@@ -309,14 +307,18 @@ fn main() {
 
 /// Mark an accepted configured HTTP/3 datagram so NFQUEUE reinjection reroutes
 /// it locally.
-fn mark_accepted_proxy_udp(state: &NfqState, message: &mut Message, verdict: Verdict) {
+fn mark_accepted_proxy_udp(
+    state: &NfqState,
+    message: &mut Message,
+    verdict: Verdict,
+    meta: Option<packet::PacketMeta>,
+) {
     if verdict != Verdict::Accept || !state.proxy_mode {
         return;
     }
 
-    let Some(meta) = packet::parse_ipv4(message.get_payload())
-        .or_else(|| packet::parse_ipv6(message.get_payload()))
-    else {
+    // Reuse the metadata parsed by handle_packet; do not re-parse the payload.
+    let Some(meta) = meta else {
         return;
     };
 
@@ -329,7 +331,7 @@ fn mark_accepted_proxy_udp(state: &NfqState, message: &mut Message, verdict: Ver
         && state.udp_proxy_port(meta.dst_port)
         && !dns_response
     {
-        message.set_nfmark(state.proxy_mark);
+        message.set_nfmark(PROXY_MARK);
     }
 }
 
@@ -580,24 +582,12 @@ fn run_nft_real(binary: &str, args: &[&str]) -> std::io::Result<std::process::Ou
 /// return `Verdict::Repeat` so nftables re-evaluates and rejects the packet.
 ///
 /// Falls back to `Verdict::Drop` if nft add fails.
-fn nft_reject_and_repeat(
-    nft_binary: &str,
-    dst_ip: IpAddr,
-    dst_port: u16,
-    protocol: packet::TransportProtocol,
-) -> Verdict {
-    nft_reject_and_repeat_inner(dst_ip, dst_port, protocol, |args| {
-        run_nft_real(nft_binary, args)
-    })
+fn nft_reject_and_repeat(nft_binary: &str, dst_ip: IpAddr, dst_port: u16) -> Verdict {
+    nft_reject_and_repeat_inner(dst_ip, dst_port, |args| run_nft_real(nft_binary, args))
 }
 
 /// Inner reject helper with injectable command runner.
-fn nft_reject_and_repeat_inner<F>(
-    dst_ip: IpAddr,
-    dst_port: u16,
-    _protocol: packet::TransportProtocol,
-    run_nft: F,
-) -> Verdict
+fn nft_reject_and_repeat_inner<F>(dst_ip: IpAddr, dst_port: u16, run_nft: F) -> Verdict
 where
     F: FnOnce(&[&str]) -> std::io::Result<std::process::Output>,
 {
@@ -808,6 +798,8 @@ fn register_proxy_flow(
 /// registration.
 ///
 /// Seam for unit testing: inject a mock `check` to verify policy is consulted.
+/// Returns the verdict and the parsed packet metadata, so callers can apply
+/// side effects (such as the proxy nfmark) without re-parsing the payload.
 fn handle_packet_payload_with_registration<F>(
     state: &NfqState,
     policy_socket: &str,
@@ -815,7 +807,7 @@ fn handle_packet_payload_with_registration<F>(
     payload: &[u8],
     check: &mut F,
     register: Option<&mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>>,
-) -> Verdict
+) -> (Verdict, Option<packet::PacketMeta>)
 where
     F: FnMut(
         &str,
@@ -833,7 +825,7 @@ where
 
     let Some(meta) = meta else {
         warn!("dropping unparseable queued packet");
-        return Verdict::Drop;
+        return (Verdict::Drop, None);
     };
 
     // UDP DNS responses: cache hostname mappings from the response and accept
@@ -858,12 +850,12 @@ where
             debug!(count = mappings.len(), "cached DNS response mappings");
         }
 
-        return Verdict::Accept;
+        return (Verdict::Accept, Some(meta));
     }
 
     if is_bypass_traffic(meta.dst_ip, meta.dst_port, state.dns_server_ip) {
         debug!(ip = %meta.dst_ip, port = meta.dst_port, "bypass policy");
-        return Verdict::Accept;
+        return (Verdict::Accept, Some(meta));
     }
 
     info!(
@@ -877,7 +869,7 @@ where
     );
 
     if !meta.is_policy_boundary() {
-        return Verdict::Accept;
+        return (Verdict::Accept, Some(meta));
     }
 
     // Loopback traffic never traverses the transparent proxy route. Proxy-mode
@@ -906,19 +898,20 @@ where
     if (tcp_proxy_flow || udp_proxy_flow)
         && is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity))
     {
-        return Verdict::Accept;
+        return (Verdict::Accept, Some(meta));
     }
 
     if tcp_proxy_flow || udp_proxy_flow {
         let Some(register) = register else {
             warn!("proxy mode has no registration RPC handler");
-            return Verdict::Drop;
+            return (Verdict::Drop, Some(meta));
         };
 
         // Proxy-owned flows are classified by decoded HTTP requests. The
         // initial HTTP/3 packet must not use network.direct, or HTTP/3 would
         // need a second transport policy rule before reaching HTTP policy.
-        return register_proxy_flow(state, meta, source_owner, register);
+        let verdict = register_proxy_flow(state, meta, source_owner, register);
+        return (verdict, Some(meta));
     }
 
     let allowed = match transport_check(
@@ -930,7 +923,7 @@ where
         session_id.as_deref(),
         check,
     ) {
-        TransportCheck::Rejected(verdict) => return verdict,
+        TransportCheck::Rejected(verdict) => return (verdict, Some(meta)),
         TransportCheck::Allowed(destination) => destination,
     };
 
@@ -942,7 +935,7 @@ where
         "accept"
     );
 
-    Verdict::Accept
+    (Verdict::Accept, Some(meta))
 }
 
 struct AllowedDestination {
@@ -1030,7 +1023,6 @@ where
             &state.nft_binary,
             meta.dst_ip,
             meta.dst_port,
-            meta.protocol,
         ));
     }
 
@@ -1049,7 +1041,7 @@ fn handle_packet(
     timeout: Duration,
     message: &nfq_updated::Message,
     runtime: &tokio::runtime::Runtime,
-) -> Verdict {
+) -> (Verdict, Option<packet::PacketMeta>) {
     let payload = message.get_payload();
 
     let mut check = |socket: &str,
@@ -1142,7 +1134,6 @@ mod tests {
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
             proxy_mode: false,
-            proxy_mark: PROXY_MARK,
             udp_proxy_ports: vec![443],
         }
     }
@@ -1231,7 +1222,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1309,7 +1300,7 @@ mod tests {
             Ok(true)
         };
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1395,7 +1386,7 @@ mod tests {
             Ok(true)
         };
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1469,7 +1460,7 @@ mod tests {
             Ok(true)
         };
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1535,7 +1526,7 @@ mod tests {
         };
 
         // First packet of the flow: registration without a transport check.
-        let first = handle_packet_payload_with_registration(
+        let (first, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1549,7 +1540,7 @@ mod tests {
         assert_eq!(registration_count.get(), 1);
 
         // QUIC opening burst: the same flow skips both callbacks on the fast path.
-        let second = handle_packet_payload_with_registration(
+        let (second, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1610,7 +1601,7 @@ mod tests {
             Ok(false)
         };
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1693,7 +1684,7 @@ mod tests {
                          _: Duration| Ok(true);
         let mut register = |_: FlowRegistration| Ok(true);
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1744,7 +1735,7 @@ mod tests {
             Ok(true)
         };
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1793,7 +1784,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1844,7 +1835,7 @@ mod tests {
             Ok(true)
         };
 
-        let verdict = handle_packet_payload_with_registration(
+        let (verdict, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1935,7 +1926,7 @@ mod tests {
         };
 
         // First check: policy consulted.
-        let v1 = handle_packet_payload_with_registration(
+        let (v1, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1948,7 +1939,7 @@ mod tests {
         assert_eq!(call_count.get(), 1);
 
         // Second check: policy consulted again (no NFQ-side verdict cache).
-        let v2 = handle_packet_payload_with_registration(
+        let (v2, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -1975,7 +1966,6 @@ mod tests {
         let v = nft_reject_and_repeat_inner(
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             443,
-            packet::TransportProtocol::Tcp,
             mock_run,
         );
 
@@ -1996,7 +1986,6 @@ mod tests {
         let v = nft_reject_and_repeat_inner(
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             443,
-            packet::TransportProtocol::Tcp,
             mock_run,
         );
 
@@ -2399,7 +2388,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -2445,7 +2434,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -2491,7 +2480,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -2527,7 +2516,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -2569,7 +2558,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -2699,7 +2688,7 @@ mod tests {
                          _: &[String],
                          _: Duration| Ok(true);
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),
@@ -2737,7 +2726,7 @@ mod tests {
             Ok(true)
         };
 
-        let v = handle_packet_payload_with_registration(
+        let (v, _) = handle_packet_payload_with_registration(
             &state,
             "",
             Duration::from_secs(1),

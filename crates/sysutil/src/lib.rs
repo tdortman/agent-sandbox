@@ -407,18 +407,6 @@ pub struct FanotifyResponse {
     pub response: u32,
 }
 
-/// Set an environment variable in a single-threaded pre-exec context.
-///
-/// # Safety context
-///
-/// Call only from the main thread before any threads are spawned and
-/// immediately before `exec`. The caller guarantees no other Rust
-/// thread is concurrently reading or writing the environment.
-pub fn pre_exec_set_var(key: &str, value: &str) {
-    // SAFETY: documented pre-exec single-threaded constraint.
-    unsafe { std::env::set_var(key, value) }
-}
-
 /// Remove an environment variable in a single-threaded pre-exec context.
 ///
 /// # Safety context

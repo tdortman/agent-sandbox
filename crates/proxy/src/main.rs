@@ -2,7 +2,7 @@ mod ech_state;
 pub(crate) mod upstream;
 use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
 use agent_sandbox_proxy::{
-    alt_svc::AltSvcStore,
+    alt_svc::{AltSvcStore, preserve_response_alt_svc},
     cert::CertificateIssuer,
     http3::{self, Http3Config},
     policy::{
@@ -12,7 +12,7 @@ use agent_sandbox_proxy::{
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
         ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, SemanticRequestParts,
-        TerminalError, is_hop_by_hop_header,
+        TerminalError, is_hop_by_hop_header, semantic_request_headers,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -925,40 +925,6 @@ async fn rewrite_doh_response(
     Ok(response)
 }
 
-/// Rewrite the `Alt-Svc` headers of one approved response.
-///
-/// Validated alternatives are preserved for HTTP/3 discovery, filtered
-/// alternatives are removed, and the special `clear` value passes through.
-/// The header is removed entirely when no alternative survives validation.
-async fn preserve_alt_svc(
-    response: &mut Response,
-    store: &AltSvcStore,
-    origin: &str,
-) -> Result<(), BoxError> {
-    let values = response
-        .headers()
-        .get_all("alt-svc")
-        .iter()
-        .map(|value| value.as_bytes().to_vec())
-        .collect::<Vec<_>>();
-
-    if values.is_empty() {
-        return Ok(());
-    }
-
-    let borrowed = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let rewritten = store.record(origin, &borrowed).await;
-    response.headers_mut().remove("alt-svc");
-
-    if let Some(value) = rewritten
-        && let Ok(value) = HeaderValue::from_bytes(&value)
-    {
-        response.headers_mut().insert("alt-svc", value);
-    }
-
-    Ok(())
-}
-
 async fn check_http_policy(
     request: &Request,
     state: &FlowState,
@@ -1032,7 +998,16 @@ async fn check_http_policy(
         authority: &authority,
         path: &path,
         raw_query: raw_query.as_deref(),
-        headers: semantic_request_headers(request)?,
+        headers: semantic_request_headers(&http::HeaderMap::from_iter(
+            request.headers().iter().map(|(name, value)| {
+                (
+                    http::HeaderName::from_bytes(name.as_str().as_bytes())
+                        .expect("rama header names are valid"),
+                    http::HeaderValue::from_bytes(value.as_bytes())
+                        .expect("rama header values are valid"),
+                )
+            }),
+        ))?,
         source_version: semantic_version,
         target_version: semantic_version,
         session: None,
@@ -1123,7 +1098,7 @@ async fn proxy_request(
         response = adapt_http10_response(response);
     }
 
-    preserve_alt_svc(&mut response, &state.alt_svc, &authority).await?;
+    preserve_response_alt_svc(&mut response, &state.alt_svc, &authority).await;
 
     if doh {
         response = rewrite_doh_response(
@@ -1630,21 +1605,6 @@ fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
     Ok(response)
 }
 
-fn semantic_request_headers(request: &Request) -> Result<SemanticHeaders, BoxError> {
-    let connection_tokens = connection_tokens(request.headers());
-    let mut headers = SemanticHeaders::new();
-
-    for (name, value) in request.headers() {
-        if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
-            continue;
-        }
-
-        headers.try_push(name.as_str(), value.as_bytes())?;
-    }
-
-    Ok(headers)
-}
-
 fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, BoxError> {
     match version {
         Version::HTTP_10 => Ok(SemanticHttpVersion::Http10),
@@ -1697,10 +1657,10 @@ mod tests {
         adapt_http10_response, adapt_response_version, blocked_http_request, bridge_response_body,
         canonical_http10_origin, force_websocket_http11, is_doh_request,
         is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
-        request_head_clone, select_ech_config_list, semantic_request_headers,
-        semantic_response_headers,
+        request_head_clone, select_ech_config_list, semantic_response_headers,
     };
     use crate::ech_state::EchState;
+    use agent_sandbox_proxy::semantic::semantic_request_headers;
     use clap::Parser;
     use rama_core::{
         Service,
@@ -1848,7 +1808,17 @@ mod tests {
             HeaderValue::from_bytes(&[0x80, b'a']).expect("opaque header"),
         );
 
-        let headers = semantic_request_headers(&request).expect("semantic headers");
+        let headers = semantic_request_headers(&http::HeaderMap::from_iter(
+            request.headers().iter().map(|(name, value)| {
+                (
+                    http::HeaderName::from_bytes(name.as_str().as_bytes())
+                        .expect("rama header names are valid"),
+                    http::HeaderValue::from_bytes(value.as_bytes())
+                        .expect("rama header values are valid"),
+                )
+            }),
+        ))
+        .expect("semantic headers");
         assert_eq!(headers.as_slice()[0].value(), &[0x80, b'a']);
     }
 
@@ -1862,7 +1832,17 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let headers = semantic_request_headers(&request).expect("semantic headers");
+        let headers = semantic_request_headers(&http::HeaderMap::from_iter(
+            request.headers().iter().map(|(name, value)| {
+                (
+                    http::HeaderName::from_bytes(name.as_str().as_bytes())
+                        .expect("rama header names are valid"),
+                    http::HeaderValue::from_bytes(value.as_bytes())
+                        .expect("rama header values are valid"),
+                )
+            }),
+        ))
+        .expect("semantic headers");
 
         assert!(
             headers.as_slice().iter().all(|header| {

@@ -15,6 +15,7 @@ mod association;
 mod ech;
 pub mod hpke;
 mod session;
+pub use session::{Capsule, CapsuleDecoder, SessionError};
 mod socket;
 pub mod upstream;
 use crate::{alt_svc::AltSvcStore, cert::CertificateIssuer, policy::PolicySession};
