@@ -674,10 +674,21 @@ async fn serve_request(
     Ok(())
 }
 
-/// Read the advertised alternative port from `path`, written by the harness
-/// once the proxy reports the port it actually bound.
+/// Read the advertised alternative endpoint from `path`, written by the
+/// harness once the proxy reports the port it actually bound.
+///
+/// The file holds either a bare port (`4444`, advertising the same host)
+/// or a validated `host:port` (`169.254.100.1:4444`, advertising an
+/// absolute alternative that needs no hostname resolution).
 fn read_alt_svc(path: &Path) -> Option<String> {
-    let port: u16 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let contents = contents.trim();
+
+    if let Ok(address) = contents.parse::<SocketAddr>() {
+        return Some(format!("h3=\"{address}\"; persist=1"));
+    }
+
+    let port: u16 = contents.parse().ok()?;
     Some(format!("h3=\":{port}\"; persist=1"))
 }
 
@@ -710,5 +721,55 @@ fn log_line(log: &Arc<std::sync::Mutex<std::fs::File>>, line: &str) {
     if let Ok(mut log) = log.lock() {
         let _ = writeln!(log, "{line}");
         let _ = log.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_alt_svc;
+    use std::io::Write as _;
+
+    fn alt_svc_file(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(contents.as_bytes()).expect("write contents");
+        file
+    }
+
+    #[test]
+    fn bare_port_advertises_the_same_host() {
+        let file = alt_svc_file("4444");
+        assert_eq!(
+            read_alt_svc(file.path()),
+            Some("h3=\":4444\"; persist=1".to_owned())
+        );
+    }
+
+    #[test]
+    fn absolute_v4_advertises_host_and_port() {
+        let file = alt_svc_file("169.254.100.1:4444");
+        assert_eq!(
+            read_alt_svc(file.path()),
+            Some("h3=\"169.254.100.1:4444\"; persist=1".to_owned())
+        );
+    }
+
+    #[test]
+    fn absolute_v6_advertises_host_and_port() {
+        let file = alt_svc_file("[fd00:dead:beef::1]:4444");
+        assert_eq!(
+            read_alt_svc(file.path()),
+            Some("h3=\"[fd00:dead:beef::1]:4444\"; persist=1".to_owned())
+        );
+    }
+
+    #[test]
+    fn malformed_contents_are_rejected() {
+        let file = alt_svc_file("bad;persist=1:4444");
+        assert_eq!(read_alt_svc(file.path()), None);
+    }
+
+    #[test]
+    fn missing_file_yields_no_advertisement() {
+        assert_eq!(read_alt_svc(std::path::Path::new("/nonexistent")), None);
     }
 }
