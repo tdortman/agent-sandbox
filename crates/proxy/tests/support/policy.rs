@@ -1,20 +1,5 @@
 use super::*;
 
-/// One observed flow claim with the connection identity that owns it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimEvent {
-    pub flow: agent_sandbox_core::NetworkFlowKey,
-    pub connection_id: ProxyConnectionId,
-}
-
-/// One observed ownership release. The connection identifier must match the
-/// identifier recorded when the flow was claimed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlowRelease {
-    pub token: AttributionToken,
-    pub connection_id: ProxyConnectionId,
-}
-
 #[derive(Debug, Default)]
 pub struct PolicyEvents {
     pub claims: Vec<ClaimEvent>,

@@ -36,6 +36,24 @@ pub mod harness;
 pub mod origins;
 pub mod policy;
 
+/// One observed flow claim with the connection identity that owns it.
+///
+/// Lives in the aggregator so the original `support::ClaimEvent` path stays
+/// valid. The fake policy service in `policy.rs` constructs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimEvent {
+    pub flow: agent_sandbox_core::NetworkFlowKey,
+    pub connection_id: ProxyConnectionId,
+}
+
+/// One observed ownership release. The connection identifier must match the
+/// identifier recorded when the flow was claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowRelease {
+    pub token: AttributionToken,
+    pub connection_id: ProxyConnectionId,
+}
+
 pub use h3::{Http3Client, Http3Origin, Http3Response};
 pub use harness::{IpVersion, TransparentHarness, loopback};
 pub use origins::{TcpOrigin, UdpOrigin};
