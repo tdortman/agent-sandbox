@@ -75,7 +75,7 @@ use tracing::{error, info};
 use upstream::UpstreamClients;
 
 pub const MAX_ACTIVE_CHECKS: usize = 256;
-const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
+pub(crate) const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
 #[derive(Debug)]
 pub(crate) struct PolicyDenied;
