@@ -1,12 +1,10 @@
-use crate::{
+use super::{
     FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
     is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
 };
-
+use crate::semantic::SemanticRequest;
 use agent_sandbox_core::HttpRequest;
-use agent_sandbox_proxy::semantic::SemanticRequest;
 use async_trait::async_trait;
-
 use rama_core::{
     Layer, Service,
     bytes::Bytes,
@@ -14,19 +12,15 @@ use rama_core::{
     extensions::ExtensionsRef,
     rt::Executor,
 };
-
 use rama_dns::client::DnsConnectorLayer;
-
 use rama_http::{
     Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
 };
-
 use rama_http_backend::client::{HttpConnector, HttpPooledConnectorConfig};
 use rama_net::client::EstablishedClientConnection;
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
-
 use std::{
     pin::Pin,
     sync::{
@@ -330,7 +324,7 @@ pub async fn send_upstream_request(
         .port_or_known_default()
         .ok_or_else(|| BoxError::from_static_str("normalized policy target has no port"))?;
 
-    let upstream_authority = crate::authority_for_policy(upstream_host, upstream_port);
+    let upstream_authority = super::authority_for_policy(upstream_host, upstream_port);
 
     let upstream_origin =
         canonical_http10_origin(&format!("{}://{upstream_authority}", upstream_url.scheme()))?;
@@ -453,9 +447,7 @@ mod tests {
         ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
         is_protocol_negotiation_failure, select_upstream_version,
     };
-
     use rama_http::{Body, Version};
-
     use std::{
         pin::Pin,
         sync::{Arc, Mutex, atomic::AtomicBool},
