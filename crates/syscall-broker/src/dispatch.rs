@@ -38,11 +38,11 @@ fn should_bypass_network_policy(
         return true;
     }
 
-    // In proxy mode the nfq base table accepts every UDP datagram; only UDP
-    // flows to proxy-owned ports are mediated by the HTTP/3 proxy, and the
-    // remainder passes un-inspected. Mirror that decision at the syscall gate
-    // so UDP egress does not surface transport prompts for a traffic class
-    // the packet filter already lets through.
+    // In proxy mode the nfq base table queues new UDP flows (except DNS to
+    // the forwarder) for a transport check: one deduped prompt per host:port,
+    // then established flows pass via the conntrack rule. UDP policy lives
+    // at the packet filter, so the syscall gate must not double-gate every
+    // sendto/connect with a per-syscall prompt.
     target.scheme == "udp"
 }
 
@@ -109,11 +109,8 @@ pub async fn dispatch_notification_with_mode(
         // every other notification; routing this infrastructure connection
         // back through the resource policy would deadlock the gate.
         ResponsePlan::Continue
-    } else if should_bypass_network_policy(
-        network_policy.mode,
-        network_policy.dns_endpoint,
-        &facts,
-    ) {
+    } else if should_bypass_network_policy(network_policy.mode, network_policy.dns_endpoint, &facts)
+    {
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // also delegates only its transparent service ports.
         ResponsePlan::Continue
@@ -298,8 +295,9 @@ mod tests {
             &target("tcp", "192.0.2.10", 853)
         ));
 
-        // The proxy-mode packet filter accepts every UDP datagram, so the
-        // syscall gate must not prompt for any UDP port.
+        // The proxy-mode packet filter queues new UDP flows (except DNS to
+        // the forwarder) for one deduped transport check per host:port, so
+        // the syscall gate must not add a per-sendto prompt on top.
         for port in [53, 80, 443, 853, 4444, 5353] {
             assert!(should_bypass_network_policy(
                 NetworkMode::Proxy,
