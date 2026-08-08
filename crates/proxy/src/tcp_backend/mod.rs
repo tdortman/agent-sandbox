@@ -3,10 +3,11 @@ pub(crate) mod upstream;
 use crate::{
     alt_svc::{AltSvcStore, preserve_response_alt_svc},
     cert::CertificateIssuer,
+    ech_state::DownstreamEch,
     http3,
     policy::{
-        FlowClaim, PendingPolicyCheck, PolicySession, authority_for_policy, flow_key,
-        normalize_authority,
+        FlowClaim, PolicySession, authority_for_policy, flow_key, normalize_authority,
+        reconcile_authorities,
     },
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
@@ -14,7 +15,7 @@ use crate::{
         TerminalError, is_hop_by_hop_header, semantic_request_headers,
     },
 };
-use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, ProxyRequestId, rewrite_ech_config};
+use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, rewrite_ech_config};
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
     Service,
@@ -169,7 +170,7 @@ pub(crate) struct FlowState {
     active_checks: Arc<Semaphore>,
     policy: Arc<PolicySession>,
     claim: FlowClaim,
-    ech_config_list: Option<Arc<Vec<u8>>>,
+    ech: Option<DownstreamEch>,
     alt_svc: Arc<AltSvcStore>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
     http10_upstream_origins: Arc<Vec<String>>,
@@ -193,6 +194,14 @@ struct TlsServerName(String);
 
 impl rama_core::extensions::Extension for TlsServerName {}
 
+/// Resolve the original destination of one accepted connection.
+///
+/// The production build is a plain function pointer. Only debug builds
+/// pay for the `dyn Fn` indirection that hosts the test override hook.
+#[cfg(not(debug_assertions))]
+pub type DestinationResolver = fn(&TcpStream, u16) -> Result<SocketAddr, BoxError>;
+
+#[cfg(debug_assertions)]
 pub type DestinationResolver =
     Arc<dyn Fn(&TcpStream, u16) -> Result<SocketAddr, BoxError> + Send + Sync>;
 
@@ -248,8 +257,7 @@ where
 /// so resumption state survives between handshakes.
 fn build_tcp_tls_config(
     issuer: CertificateIssuer,
-    ech_config_list: Option<&Arc<Vec<u8>>>,
-    ech_private_key: Option<[u8; 32]>,
+    ech: Option<&DownstreamEch>,
     fallback_name: String,
 ) -> Result<rustls::ServerConfig, BoxError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -268,20 +276,8 @@ fn build_tcp_tls_config(
     // Terminate downstream ECH with the same key material the HTTP/3 leg
     // uses, so clients that fetch their configuration through the sandbox
     // DNS rewrite get a decryptable offer on both legs.
-    if let (Some(config_list), Some(private_key)) = (&ech_config_list, ech_private_key) {
-        let keys = http3::hpke::ECH_SUPPORTED_SUITES
-            .iter()
-            .map(|hpke| {
-                rustls::server::ech::EchKeys::new(
-                    rustls::pki_types::EchConfigListBytes::from(config_list.as_slice()),
-                    &private_key,
-                    *hpke,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BoxError::from)?;
-
-        tls = tls.with_ech_keys(keys).map_err(BoxError::from)?;
+    if let Some(ech) = ech {
+        tls = tls.with_ech_keys(ech.ech_keys()?).map_err(BoxError::from)?;
     }
 
     // h2 preferred, http/1.1 fallback: server preference order matching
@@ -454,8 +450,7 @@ pub struct ListenConfig {
     pub listen_port: u16,
     pub transparent: bool,
     pub issuer: CertificateIssuer,
-    pub ech_config_list: Option<Arc<Vec<u8>>>,
-    pub ech_private_key: Option<[u8; 32]>,
+    pub ech: Option<DownstreamEch>,
     pub alt_svc: Arc<AltSvcStore>,
     pub websocket_http11_urls: Arc<Vec<HttpUrl>>,
     pub http10_upstream_origins: Arc<Vec<String>>,
@@ -463,6 +458,22 @@ pub struct ListenConfig {
     pub test_tls: bool,
     #[cfg(debug_assertions)]
     pub write_bound_ports: Option<(PathBuf, Vec<u16>)>,
+}
+
+/// Build the per-flow upstream client pool, releasing the flow claim when
+/// connector construction fails so policyd does not hold the claim until
+/// the session ends.
+async fn build_upstream_clients(
+    policy: &Arc<PolicySession>,
+    claim: &FlowClaim,
+) -> Result<Arc<UpstreamClients>, BoxError> {
+    match UpstreamClients::new() {
+        Ok(clients) => Ok(Arc::new(clients)),
+        Err(error) => {
+            let _ = policy.release(claim).await;
+            Err(error)
+        }
+    }
 }
 
 fn build_listener_service(
@@ -475,8 +486,7 @@ fn build_listener_service(
 ) -> Result<impl Service<TcpStream, Output = (), Error = BoxError> + Clone, BoxError> {
     let tls_config = Arc::new(build_tcp_tls_config(
         listener_config.issuer.clone(),
-        listener_config.ech_config_list.as_ref(),
-        listener_config.ech_private_key,
+        listener_config.ech.as_ref(),
         Ipv4Addr::LOCALHOST.to_string(),
     )?);
 
@@ -487,12 +497,15 @@ fn build_listener_service(
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
         let shutdown = shutdown.clone();
+        #[cfg(debug_assertions)]
         let destination_resolver = listener_config.destination_resolver.clone();
+        #[cfg(not(debug_assertions))]
+        let destination_resolver = listener_config.destination_resolver;
         let test_tls = listener_config.test_tls;
         let active_checks = active_checks.clone();
         let tls_config = tls_config.clone();
         let issuer = listener_config.issuer.clone();
-        let ech_config_list = listener_config.ech_config_list.clone();
+        let ech = listener_config.ech.clone();
 
         async move {
             let peer: SocketAddr = stream.peer_addr()?.into();
@@ -501,20 +514,23 @@ fn build_listener_service(
             let source = peer;
             info!(%peer, %source, %destination, "accepted transparent proxy stream");
             let flow = flow_key(source, destination)?;
-            let upstream_clients = Arc::new(UpstreamClients::new()?);
             let claim = policy.claim(flow).await?;
 
-            let state = FlowState {
-                destination,
-                tls: test_tls || matches!(destination.port(), 443 | 8443),
-                active_checks: active_checks.clone(),
-                policy: policy.clone(),
-                claim: claim.clone(),
-                ech_config_list: ech_config_list.clone(),
-                alt_svc: alt_svc.clone(),
-                websocket_http11_urls: websocket_http11_urls.clone(),
-                http10_upstream_origins,
-                upstream_clients,
+            let state = {
+                let upstream_clients = build_upstream_clients(&policy, &claim).await?;
+
+                FlowState {
+                    destination,
+                    tls: test_tls || matches!(destination.port(), 443 | 8443),
+                    active_checks: active_checks.clone(),
+                    policy: policy.clone(),
+                    claim: claim.clone(),
+                    ech: ech.clone(),
+                    alt_svc: alt_svc.clone(),
+                    websocket_http11_urls: websocket_http11_urls.clone(),
+                    http10_upstream_origins,
+                    upstream_clients,
+                }
             };
 
             let request_service = service_fn(move |request: Request| {
@@ -734,14 +750,8 @@ async fn check_http_policy(
     let uri_host = request.uri().authority().map(|value| value.to_string());
 
     if let (Some(header_host), Some(uri_host)) = (&header_host, &uri_host) {
-        let header_authority = normalize_authority(header_host, state.authority_fallback_port())?;
-        let uri_authority = normalize_authority(uri_host, state.authority_fallback_port())?;
-
-        if header_authority != uri_authority {
-            return Err(BoxError::from_static_str(
-                "HTTP request has conflicting origin authorities",
-            ));
-        }
+        reconcile_authorities(&[header_host, uri_host], state.authority_fallback_port())
+            .map_err(|error| error.into_boxed("HTTP request has conflicting origin authorities"))?;
     }
 
     let tls_host = request
@@ -752,14 +762,8 @@ async fn check_http_policy(
     if let Some(tls_host) = tls_host.as_deref()
         && let Some(request_host) = header_host.as_deref().or(uri_host.as_deref())
     {
-        let tls_authority = normalize_authority(tls_host, state.authority_fallback_port())?;
-        let request_authority = normalize_authority(request_host, state.authority_fallback_port())?;
-
-        if tls_authority != request_authority {
-            return Err(BoxError::from_static_str(
-                "HTTP request conflicts with TLS server identity",
-            ));
-        }
+        reconcile_authorities(&[tls_host, request_host], state.authority_fallback_port())
+            .map_err(|error| error.into_boxed("HTTP request conflicts with TLS server identity"))?;
     }
 
     let host = header_host
@@ -809,30 +813,16 @@ async fn check_http_policy(
         body: BoundedRequestBody::empty(),
     })?;
 
-    let request_id = ProxyRequestId::new();
-
-    let _permit = state
-        .active_checks
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| BoxError::from_static_str("too many active policy checks"))?;
-
-    let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
-
-    let check = tokio::select! {
-        result = state.policy.check_http(
-            request_id,
+    let check = state
+        .policy
+        .check_http_cancellable(
             state.claim.attribution_token.clone(),
             semantic_request.policy_request()?,
-        ) => result?,
-        () = shutdown.notified() => {
-            state.policy.cancel(request_id).await?;
-            pending.disarm();
-            return Err(BoxError::from_static_str("proxy shutting down"));
-        }
-    };
+            &state.active_checks,
+            shutdown,
+        )
+        .await?;
 
-    pending.disarm();
     Ok((semantic_request, check, authority, path))
 }
 
@@ -898,7 +888,7 @@ async fn proxy_request(
     if doh {
         response = rewrite_doh_response(
             response,
-            state.ech_config_list.as_ref().map(|value| value.as_slice()),
+            state.ech.as_ref().map(|ech| ech.config_list.as_slice()),
         )
         .await?;
     }
@@ -1162,13 +1152,12 @@ impl StreamingBody for SemanticRequestBody {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
                     for chunk in data.chunks(SEMANTIC_BODY_CHUNK_BYTES) {
-                        if let Err(error) = self.semantic.push_chunk(chunk.to_vec()) {
+                        if let Err(error) = self.semantic.push_chunk(chunk) {
                             self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
                                 error.to_string().into_boxed_str(),
                             )));
                             return Poll::Ready(Some(Err(Box::new(error))));
                         }
-                        let _ = self.semantic.pop_chunk();
                     }
                     Poll::Ready(Some(Ok(Frame::data(data))))
                 }
@@ -1231,10 +1220,10 @@ impl SemanticResponseBody {
     fn new(inner: Body, head: ResponseHead) -> Result<Self, BoxError> {
         let terminal = inner.is_end_stream();
         let mut sequence = ResponseSequence::new();
-        record_response_event(&mut sequence, ResponseEvent::Final(head))?;
+        sequence.push(ResponseEvent::Final(head))?;
 
         if terminal {
-            record_response_event(&mut sequence, ResponseEvent::Complete)?;
+            sequence.push(ResponseEvent::Complete)?;
         }
 
         Ok(Self {
@@ -1246,7 +1235,7 @@ impl SemanticResponseBody {
 
     fn finish(&mut self, event: ResponseEvent) {
         if !self.terminal {
-            let _ = record_response_event(&mut self.sequence, event);
+            let _ = self.sequence.push(event);
             self.terminal = true;
         }
     }
@@ -1277,14 +1266,12 @@ impl StreamingBody for SemanticResponseBody {
 
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
-                    if let Err(error) = record_response_event(
-                        &mut self.sequence,
-                        ResponseEvent::BodyChunk(data.to_vec()),
-                    ) {
+                    if let Err(error) = self.sequence.push(ResponseEvent::BodyChunk(data.to_vec()))
+                    {
                         self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
                             error.to_string().into_boxed_str(),
                         )));
-                        return Poll::Ready(Some(Err(error)));
+                        return Poll::Ready(Some(Err(Box::new(error))));
                     }
 
                     Poll::Ready(Some(Ok(Frame::data(data))))
@@ -1303,14 +1290,11 @@ impl StreamingBody for SemanticResponseBody {
                             }
                         };
 
-                        if let Err(error) = record_response_event(
-                            &mut self.sequence,
-                            ResponseEvent::Trailers(semantic),
-                        ) {
+                        if let Err(error) = self.sequence.push(ResponseEvent::Trailers(semantic)) {
                             self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
                                 error.to_string().into_boxed_str(),
                             )));
-                            return Poll::Ready(Some(Err(error)));
+                            return Poll::Ready(Some(Err(Box::new(error))));
                         }
 
                         Poll::Ready(Some(Ok(Frame::trailers(trailers))))
@@ -1376,18 +1360,6 @@ fn semantic_response_headers(headers: &HeaderMap) -> Result<SemanticHeaders, Box
     Ok(semantic)
 }
 
-fn record_response_event(
-    sequence: &mut ResponseSequence,
-    event: ResponseEvent,
-) -> Result<(), BoxError> {
-    sequence.push(event)?;
-
-    sequence
-        .pop_event()
-        .ok_or_else(|| BoxError::from_static_str("semantic response event was not queued"))
-        .map(|_| ())
-}
-
 fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
     if response.status().as_u16() < 200 || is_websocket_upgrade_response(&response) {
         return Ok(response);
@@ -1447,14 +1419,23 @@ fn blocked_http_request(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Body, BoundedRequestBody, HttpUrl, POLICY_DENIED_BODY, Request, ResponseVersionAdaptCtx,
-        SemanticRequestBody, StatusCode, TargetHttpVersion, Version, adapt_http10_response,
-        adapt_response_version, blocked_http_request, bridge_response_body,
-        canonical_http10_origin, force_websocket_http11, is_doh_request,
-        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
-        request_head_clone, semantic_response_headers,
+        Body, BoundedRequestBody, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY,
+        Request, ResponseVersionAdaptCtx, SemanticRequestBody, StatusCode, TargetHttpVersion,
+        TlsServerName, Version, adapt_http10_response, adapt_response_version,
+        blocked_http_request, bridge_response_body, canonical_http10_origin, check_http_policy,
+        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
+        is_websocket_upgrade_response, policy_denied_response, request_head_clone,
+        semantic_response_headers,
     };
-    use crate::semantic::semantic_request_headers;
+    use crate::{
+        alt_svc::AltSvcStore,
+        policy::{FlowClaim, PolicySession, test_support::FakePolicy},
+        semantic::semantic_request_headers,
+        tcp_backend::upstream::UpstreamClients,
+    };
+    use agent_sandbox_core::{
+        AttributionToken, FlowProtocol, NetworkFlowKey, NormalizedPolicyHost, ProxyConnectionId,
+    };
     use rama_core::{
         Service,
         bytes::Bytes,
@@ -1472,12 +1453,16 @@ mod tests {
     use rama_net::proxy::IoForwardService;
     use std::{
         convert::Infallible,
+        net::{IpAddr, SocketAddr},
+        num::NonZeroU16,
+        path::PathBuf,
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
     };
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
+        sync::{Notify, Semaphore},
         time::{Duration, timeout},
     };
 
@@ -2233,5 +2218,141 @@ mod tests {
                 .signature_verification_algorithms
                 .supported_schemes()
         }
+    }
+
+    async fn flow_state(
+        policy_socket: PathBuf,
+    ) -> Result<FlowState, Box<dyn std::error::Error + Send + Sync>> {
+        let policy = Arc::new(PolicySession::open(policy_socket, Duration::from_secs(2)).await?);
+
+        Ok(FlowState {
+            destination: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            tls: false,
+            active_checks: Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS)),
+            policy,
+            claim: FlowClaim {
+                attribution_token: AttributionToken::from_bytes([2; 32]),
+                connection_id: ProxyConnectionId::new(),
+                flow: NetworkFlowKey::new(
+                    FlowProtocol::Tcp,
+                    IpAddr::from([127, 0, 0, 1]),
+                    NonZeroU16::new(12345).expect("source port"),
+                    IpAddr::from([127, 0, 0, 1]),
+                    NonZeroU16::new(8080).expect("destination port"),
+                ),
+                policy_host: NormalizedPolicyHost::parse("localhost").expect("policy host"),
+            },
+            ech: None,
+            alt_svc: Arc::new(AltSvcStore::new(Vec::new())),
+            websocket_http11_urls: Arc::new(Vec::new()),
+            http10_upstream_origins: Arc::new(Vec::new()),
+            upstream_clients: Arc::new(UpstreamClients::new()?),
+        })
+    }
+
+    #[tokio::test]
+    async fn check_http_policy_rejects_conflicting_origin_authorities()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fake = FakePolicy::start();
+        let state = flow_state(fake.socket.clone()).await?;
+        let shutdown = Arc::new(Notify::new());
+
+        let request = Request::builder()
+            .uri("http://other.test/")
+            .header("host", "example.test")
+            .body(Body::empty())
+            .expect("request");
+
+        let error = check_http_policy(&request, &state, &shutdown)
+            .await
+            .expect_err("conflicting authorities are rejected");
+
+        drop(state);
+
+        assert_eq!(
+            error.to_string(),
+            "HTTP request has conflicting origin authorities"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_http_policy_rejects_tls_server_name_conflict()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fake = FakePolicy::start();
+        let state = flow_state(fake.socket.clone()).await?;
+        let shutdown = Arc::new(Notify::new());
+
+        let request = Request::builder()
+            .uri("http://example.test/")
+            .header("host", "example.test")
+            .extension(TlsServerName("other.test".to_owned()))
+            .body(Body::empty())
+            .expect("request");
+
+        let error = check_http_policy(&request, &state, &shutdown)
+            .await
+            .expect_err("TLS identity conflict is rejected");
+
+        drop(state);
+
+        assert_eq!(
+            error.to_string(),
+            "HTTP request conflicts with TLS server identity"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_http_policy_rejects_request_without_authority()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fake = FakePolicy::start();
+        let state = flow_state(fake.socket.clone()).await?;
+        let shutdown = Arc::new(Notify::new());
+
+        let request = Request::builder()
+            .version(Version::HTTP_11)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+
+        let error = check_http_policy(&request, &state, &shutdown)
+            .await
+            .expect_err("missing authority is rejected");
+
+        drop(state);
+
+        assert_eq!(error.to_string(), "HTTP request has no authority");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_http_policy_falls_back_to_destination_for_http10()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fake = FakePolicy::start();
+        let state = flow_state(fake.socket.clone()).await?;
+        let shutdown = Arc::new(Notify::new());
+
+        fake.release_checks.notify_one();
+
+        let request = Request::builder()
+            .version(Version::HTTP_10)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+
+        let (semantic, check, authority, path) =
+            check_http_policy(&request, &state, &shutdown).await?;
+
+        assert!(check.ok);
+        assert!(check.allowed);
+        assert_eq!(authority, "127.0.0.1:8080");
+        assert_eq!(path, "/");
+        assert_eq!(semantic.authority(), "127.0.0.1:8080");
+
+        Ok(())
     }
 }

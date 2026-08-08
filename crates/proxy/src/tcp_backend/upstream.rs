@@ -4,20 +4,22 @@ use super::{
 };
 use crate::semantic::SemanticRequest;
 use agent_sandbox_core::HttpRequest;
-use async_trait::async_trait;
 use rama_core::{
     Layer, Service,
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
     extensions::ExtensionsRef,
     rt::Executor,
+    service::BoxService,
 };
 use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
     Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
 };
-use rama_http_backend::client::{HttpConnector, HttpPooledConnectorConfig};
-use rama_net::client::EstablishedClientConnection;
+use rama_http_backend::client::{
+    BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnector, HttpPooledConnectorConfig,
+};
+use rama_net::client::{EstablishedClientConnection, pool::MultiplexedConnection};
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
@@ -30,53 +32,24 @@ use std::{
     task::{Context, Poll},
 };
 
-#[async_trait]
-trait UpstreamConnection: Send {
-    fn h2_without_alpn(&self) -> bool;
-    async fn send(self: Box<Self>) -> Result<Response, BoxError>;
+/// The connection type the pooled upstream client establishes.
+type UpstreamConnection = EstablishedClientConnection<
+    BindBodyToConn<MultiplexedConnection<HttpClientService<Body>, BasicHttpConId>>,
+    Request,
+>;
+
+/// Report whether an HTTP/2-targeted connection negotiated no ALPN protocol.
+fn connection_h2_without_alpn(connection: &UpstreamConnection) -> bool {
+    connection
+        .conn
+        .extensions()
+        .get_ref::<NegotiatedTlsParameters>()
+        .is_some_and(|params| params.application_layer_protocol.is_none())
 }
 
-#[async_trait]
-impl<C> UpstreamConnection for EstablishedClientConnection<C, Request>
-where
-    C: Service<Request, Output = Response, Error: Into<BoxError>> + ExtensionsRef + Send + 'static,
-{
-    fn h2_without_alpn(&self) -> bool {
-        self.conn
-            .extensions()
-            .get_ref::<NegotiatedTlsParameters>()
-            .is_some_and(|params| params.application_layer_protocol.is_none())
-    }
-
-    async fn send(self: Box<Self>) -> Result<Response, BoxError> {
-        let connection = *self;
-
-        connection
-            .conn
-            .serve(connection.input)
-            .await
-            .map_err(Into::into)
-    }
-}
-
-#[async_trait]
-trait UpstreamClient: Send + Sync {
-    async fn connect(&self, request: Request) -> Result<Box<dyn UpstreamConnection>, BoxError>;
-}
-
-#[async_trait]
-impl<S, C> UpstreamClient for Arc<S>
-where
-    S: Service<Request, Output = EstablishedClientConnection<C, Request>> + Send + Sync + 'static,
-    S::Error: Into<BoxError>,
-    C: Service<Request, Output = Response, Error: Into<BoxError>> + ExtensionsRef + Send + 'static,
-{
-    async fn connect(&self, request: Request) -> Result<Box<dyn UpstreamConnection>, BoxError> {
-        self.serve(request)
-            .await
-            .map(|connection| Box::new(connection) as Box<dyn UpstreamConnection>)
-            .map_err(Into::into)
-    }
+/// Send one request over an established upstream connection.
+async fn send_connection(connection: UpstreamConnection) -> Result<Response, BoxError> {
+    connection.conn.serve(connection.input).await
 }
 
 struct ReplayBodyState {
@@ -169,26 +142,14 @@ impl StreamingBody for ReplayBody {
 }
 
 pub struct UpstreamClients {
-    http10: Arc<dyn UpstreamClient>,
-    http11: Arc<dyn UpstreamClient>,
-    http2: Arc<dyn UpstreamClient>,
+    client: BoxService<Request, UpstreamConnection, BoxError>,
 }
 
 impl UpstreamClients {
     pub fn new() -> Result<Self, BoxError> {
         Ok(Self {
-            http10: build_upstream_client()?,
-            http11: build_upstream_client()?,
-            http2: build_upstream_client()?,
+            client: build_upstream_client()?,
         })
-    }
-
-    fn for_version(&self, version: Version) -> &dyn UpstreamClient {
-        match version {
-            Version::HTTP_10 => self.http10.as_ref(),
-            Version::HTTP_2 => self.http2.as_ref(),
-            _ => self.http11.as_ref(),
-        }
     }
 }
 
@@ -276,7 +237,7 @@ where
     }
 }
 
-fn build_upstream_client() -> Result<Arc<dyn UpstreamClient>, BoxError> {
+fn build_upstream_client() -> Result<BoxService<Request, UpstreamConnection, BoxError>, BoxError> {
     let connector = DnsConnectorLayer::new().into_layer(TcpConnector::default());
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
     let connector = TlsAlpnConnector::new(connector);
@@ -285,8 +246,8 @@ fn build_upstream_client() -> Result<Arc<dyn UpstreamClient>, BoxError> {
         .with_default_version(Version::HTTP_11);
 
     let client = HttpConnector::new(connector, Executor::default());
-    let client = Arc::new(HttpPooledConnectorConfig::default().build_connector(client)?);
-    Ok(Arc::new(client))
+    let client = HttpPooledConnectorConfig::default().build_connector(client)?;
+    Ok(BoxService::new(client))
 }
 
 fn is_no_alpn_h2_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -396,46 +357,39 @@ pub async fn send_upstream_request(
     });
 
     request = request.map(|_| Body::new(ReplayBody::new(replay_state.clone())));
-    let client = state.upstream_clients.for_version(selected_version);
 
-    let connection = match client.connect(request).await {
-        Ok(connection) => connection,
-        Err(error)
-            if retry_request.is_some()
-                && !replay_state.started.load(Ordering::Acquire)
-                && is_protocol_negotiation_failure(&error) =>
-        {
-            let retry_request = retry_request.take().expect("retry request was checked");
-            state
-                .upstream_clients
-                .for_version(Version::HTTP_11)
-                .connect(retry_request)
-                .await?
+    let response = {
+        let connection = match state.upstream_clients.client.serve(request).await {
+            Ok(connection) => connection,
+            Err(error)
+                if retry_request.is_some()
+                    && !replay_state.started.load(Ordering::Acquire)
+                    && is_protocol_negotiation_failure(&error) =>
+            {
+                let retry_request = retry_request.take().expect("retry request was checked");
+                state.upstream_clients.client.serve(retry_request).await?
+            }
+            Err(error) => return Err(error),
+        };
+
+        let h2_without_alpn = connection_h2_without_alpn(&connection);
+
+        match send_connection(connection).await {
+            Ok(response) => response,
+
+            Err(error)
+                if retry_request.is_some()
+                    && !replay_state.started.load(Ordering::Acquire)
+                    && (is_h2_protocol_negotiation_failure(error.as_ref(), h2_without_alpn)
+                        || (h2_without_alpn && is_no_alpn_h2_cancellation(error.as_ref()))) =>
+            {
+                let retry_request = retry_request.expect("retry request was checked");
+                let connection = state.upstream_clients.client.serve(retry_request).await?;
+                send_connection(connection).await?
+            }
+
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
-    };
-
-    let h2_without_alpn = connection.h2_without_alpn();
-
-    let response = match connection.send().await {
-        Ok(response) => response,
-
-        Err(error)
-            if retry_request.is_some()
-                && !replay_state.started.load(Ordering::Acquire)
-                && (is_h2_protocol_negotiation_failure(error.as_ref(), h2_without_alpn)
-                    || (h2_without_alpn && is_no_alpn_h2_cancellation(error.as_ref()))) =>
-        {
-            let retry_request = retry_request.expect("retry request was checked");
-            let connection = state
-                .upstream_clients
-                .for_version(Version::HTTP_11)
-                .connect(retry_request)
-                .await?;
-            connection.send().await?
-        }
-
-        Err(error) => return Err(error),
     };
 
     Ok((response, upstream_authority))

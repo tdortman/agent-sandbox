@@ -6,9 +6,8 @@ use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
     HttpSessionMetadata as CoreHttpSessionMetadata,
 };
-
 use http::HeaderMap;
-use std::{collections::VecDeque, fmt};
+use std::fmt;
 
 /// Whether a header must not be forwarded end to end.
 ///
@@ -238,32 +237,29 @@ pub enum RequestTerminal {
     Error(TerminalError),
 }
 
-/// A bounded queue of request body chunks.
-
+/// Validates request body chunks without buffering them.
+///
+/// Production pushes each chunk and forwards it immediately, so the queue
+/// never holds more than one element and the buffer limits are unreachable.
+/// What survives is single-chunk validation: the chunk bound, trailers, and
+/// terminal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedRequestBody {
-    chunks: VecDeque<Vec<u8>>,
-    buffered_bytes: usize,
     max_chunk_bytes: usize,
-    max_buffered_bytes: usize,
     trailers: Option<SemanticHeaders>,
     terminal: Option<RequestTerminal>,
 }
 
 impl BoundedRequestBody {
     /// # Errors
-    /// Returns [`BodyError::InvalidLimit`] when either limit is zero or
-    /// inconsistent.
-    pub const fn new(max_chunk_bytes: usize, max_buffered_bytes: usize) -> Result<Self, BodyError> {
-        if max_chunk_bytes == 0 || max_buffered_bytes < max_chunk_bytes {
+    /// Returns [`BodyError::InvalidLimit`] when the chunk bound is zero.
+    pub const fn new(max_chunk_bytes: usize) -> Result<Self, BodyError> {
+        if max_chunk_bytes == 0 {
             return Err(BodyError::InvalidLimit);
         }
 
         Ok(Self {
-            chunks: VecDeque::new(),
-            buffered_bytes: 0,
             max_chunk_bytes,
-            max_buffered_bytes,
             trailers: None,
             terminal: None,
         })
@@ -273,13 +269,13 @@ impl BoundedRequestBody {
     /// # Panics
     /// This function uses fixed nonzero limits.
     pub fn empty() -> Self {
-        Self::new(16 * 1024, 1024 * 1024).expect("constant body limits are valid")
+        Self::new(16 * 1024).expect("constant body limits are valid")
     }
 
     /// # Errors
-    /// Returns [`BodyError`] when the body is terminal or exceeds a configured
-    /// limit.
-    pub fn push_chunk(&mut self, chunk: Vec<u8>) -> Result<(), BodyError> {
+    /// Returns [`BodyError`] when the body is terminal or the chunk exceeds
+    /// the configured chunk bound.
+    pub const fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), BodyError> {
         if self.terminal.is_some() || self.trailers.is_some() {
             return Err(BodyError::AfterTerminal);
         }
@@ -288,19 +284,7 @@ impl BoundedRequestBody {
             return Err(BodyError::ChunkTooLarge);
         }
 
-        if chunk.len() > self.max_buffered_bytes.saturating_sub(self.buffered_bytes) {
-            return Err(BodyError::BufferFull);
-        }
-
-        self.buffered_bytes += chunk.len();
-        self.chunks.push_back(chunk);
         Ok(())
-    }
-
-    pub fn pop_chunk(&mut self) -> Option<Vec<u8>> {
-        let chunk = self.chunks.pop_front()?;
-        self.buffered_bytes -= chunk.len();
-        Some(chunk)
     }
 
     /// # Errors
@@ -333,26 +317,6 @@ impl BoundedRequestBody {
 
         self.terminal = Some(terminal);
         Ok(())
-    }
-
-    #[must_use]
-    pub const fn terminal(&self) -> Option<&RequestTerminal> {
-        self.terminal.as_ref()
-    }
-
-    #[must_use]
-    pub const fn buffered_bytes(&self) -> usize {
-        self.buffered_bytes
-    }
-
-    #[must_use]
-    pub const fn trailers(&self) -> Option<&SemanticHeaders> {
-        self.trailers.as_ref()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
     }
 }
 
@@ -602,26 +566,17 @@ pub enum TerminalError {
     ProtocolViolation(Box<str>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponsePhase {
-    Initial,
-    Final,
-    Trailers,
-    TerminalBeforeFinal,
-    TerminalAfterFinal,
-    TerminalAfterTrailers,
-}
-
 /// Response event sequence validator.
+///
+/// Production validates each event as it arrives and forwards it immediately,
+/// so events are never queued and the event-count limit is unreachable. What
+/// survives is phase validation: final head ordering, trailers, terminal
+/// state, and the single-chunk bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseSequence {
-    events: VecDeque<ResponseEvent>,
     final_seen: bool,
     trailers_seen: bool,
     terminal_seen: bool,
-    body_bytes: usize,
-    consumed_phase: ResponsePhase,
-    max_events: usize,
     max_body_bytes: usize,
 }
 
@@ -629,43 +584,30 @@ impl ResponseSequence {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            events: VecDeque::new(),
             final_seen: false,
             trailers_seen: false,
             terminal_seen: false,
-            consumed_phase: ResponsePhase::Initial,
-            body_bytes: 0,
-            max_events: 1024,
             max_body_bytes: 1024 * 1024,
         }
     }
 
-    /// # Errors
-    /// Returns [`EventError::InvalidLimit`] when `max_events` is zero.
-    pub const fn with_limits(max_events: usize, max_body_bytes: usize) -> Result<Self, EventError> {
-        if max_events == 0 {
-            return Err(EventError::InvalidLimit);
-        }
-
+    /// Construct a sequence with a custom body bound.
+    #[must_use]
+    pub const fn with_limits(max_body_bytes: usize) -> Self {
         let mut sequence = Self::new();
-        sequence.max_events = max_events;
         sequence.max_body_bytes = max_body_bytes;
-        Ok(sequence)
+        sequence
     }
 
     /// # Errors
-    /// Returns [`EventError`] when the event is out of order or exceeds a
-    /// limit.
+    /// Returns [`EventError`] when the event is out of order or exceeds the
+    /// chunk bound.
     pub fn push(&mut self, event: ResponseEvent) -> Result<(), EventError> {
         if self.terminal_seen {
             return Err(EventError::AfterTerminal);
         }
 
-        if self.events.len() >= self.max_events {
-            return Err(EventError::BufferFull);
-        }
-
-        match &event {
+        match event {
             ResponseEvent::Final(head) => {
                 if self.final_seen || !(200..1000).contains(&head.status()) {
                     return Err(EventError::InvalidOrdering);
@@ -677,10 +619,9 @@ impl ResponseSequence {
                 if !self.final_seen || self.trailers_seen {
                     return Err(EventError::InvalidOrdering);
                 }
-                if chunk.len() > self.max_body_bytes.saturating_sub(self.body_bytes) {
+                if chunk.len() > self.max_body_bytes {
                     return Err(EventError::BufferFull);
                 }
-                self.body_bytes += chunk.len();
             }
 
             ResponseEvent::Trailers(_) => {
@@ -702,41 +643,7 @@ impl ResponseSequence {
             }
         }
 
-        self.events.push_back(event);
         Ok(())
-    }
-
-    pub fn pop_event(&mut self) -> Option<ResponseEvent> {
-        let event = self.events.pop_front()?;
-
-        match &event {
-            ResponseEvent::Final(_) => self.consumed_phase = ResponsePhase::Final,
-            ResponseEvent::Trailers(_) => self.consumed_phase = ResponsePhase::Trailers,
-
-            ResponseEvent::Complete
-            | ResponseEvent::Cancelled
-            | ResponseEvent::Error(_) => {
-                self.consumed_phase = match self.consumed_phase {
-                    ResponsePhase::Initial => ResponsePhase::TerminalBeforeFinal,
-                    ResponsePhase::Final => ResponsePhase::TerminalAfterFinal,
-                    ResponsePhase::Trailers => ResponsePhase::TerminalAfterTrailers,
-                    phase => phase,
-                };
-            }
-
-            ResponseEvent::BodyChunk(_) => {}
-        }
-
-        if let ResponseEvent::BodyChunk(chunk) = &event {
-            self.body_bytes -= chunk.len();
-        }
-
-        Some(event)
-    }
-
-    #[must_use]
-    pub const fn events(&self) -> &VecDeque<ResponseEvent> {
-        &self.events
     }
 }
 
@@ -887,11 +794,12 @@ mod tests {
     }
 
     #[test]
-    fn body_is_bounded() {
-        let mut body = BoundedRequestBody::new(2, 3).expect("valid limits");
-        body.push_chunk(vec![1, 2]).expect("first chunk");
-        assert_eq!(body.push_chunk(vec![3, 4]), Err(BodyError::BufferFull));
-        assert_eq!(body.pop_chunk(), Some(vec![1, 2]));
+    fn body_chunk_bound_and_limits_are_validated() {
+        let mut body = BoundedRequestBody::new(2).expect("valid limits");
+        body.push_chunk(&[1, 2]).expect("chunk at the bound");
+        assert_eq!(body.push_chunk(&[1, 2, 3]), Err(BodyError::ChunkTooLarge));
+
+        assert_eq!(BoundedRequestBody::new(0), Err(BodyError::InvalidLimit));
     }
 
     #[test]
@@ -914,28 +822,6 @@ mod tests {
             sequence.push(ResponseEvent::BodyChunk(vec![2])),
             Err(EventError::AfterTerminal)
         );
-    }
-
-    #[test]
-    fn response_sequence_drains_events() {
-        let mut sequence = ResponseSequence::new();
-
-        sequence
-            .push(ResponseEvent::Final(
-                ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
-            ))
-            .expect("final");
-
-        sequence
-            .push(ResponseEvent::BodyChunk(vec![1]))
-            .expect("body");
-
-        sequence.push(ResponseEvent::Complete).expect("complete");
-
-        assert!(sequence.pop_event().is_some());
-        assert!(sequence.pop_event().is_some());
-        assert!(sequence.pop_event().is_some());
-        assert!(sequence.pop_event().is_none());
     }
 
     #[test]
@@ -1022,7 +908,10 @@ mod tests {
         let event = ResponseEvent::Error(error.clone());
 
         assert_eq!(error.to_string(), "transport failure: closed");
-        assert_eq!(event, ResponseEvent::Error(TerminalError::Transport("closed".into())));
+        assert_eq!(
+            event,
+            ResponseEvent::Error(TerminalError::Transport("closed".into()))
+        );
     }
 
     #[test]
@@ -1045,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn request_trailers_and_response_buffers_are_bounded() {
+    fn request_trailers_and_response_chunk_bound_apply() {
         let mut body = BoundedRequestBody::empty();
         body.set_trailers(SemanticHeaders::new()).expect("trailers");
 
@@ -1055,8 +944,8 @@ mod tests {
         );
 
         body.finish().expect("finish");
-        assert_eq!(body.push_chunk(vec![1]), Err(BodyError::AfterTerminal));
-        let mut sequence = ResponseSequence::with_limits(3, 1).expect("limits");
+        assert_eq!(body.push_chunk(&[1]), Err(BodyError::AfterTerminal));
+        let mut sequence = ResponseSequence::with_limits(1);
 
         sequence
             .push(ResponseEvent::Final(
@@ -1069,9 +958,8 @@ mod tests {
             .expect("body");
 
         assert_eq!(
-            sequence.push(ResponseEvent::BodyChunk(vec![2])),
+            sequence.push(ResponseEvent::BodyChunk(vec![2; 2])),
             Err(EventError::BufferFull)
         );
     }
-
 }

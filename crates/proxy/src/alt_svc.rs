@@ -141,25 +141,6 @@ impl AltSvcStore {
         }
     }
 
-    /// Record one more intercepted UDP port.
-    ///
-    /// Port-0 listeners learn their real port only after binding, so the
-    /// intercepted set is filled in once the HTTP/3 backend is prepared.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the ports lock is poisoned by a panicking task.
-    pub fn intercept(&self, port: u16) {
-        let mut ports = self
-            .intercepted_udp_ports
-            .lock()
-            .expect("alt-svc ports lock");
-
-        if !ports.contains(&port) {
-            ports.push(port);
-        }
-    }
-
     /// Whether transparent UDP interception covers `port`.
     ///
     /// # Panics

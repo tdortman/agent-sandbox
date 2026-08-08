@@ -18,7 +18,12 @@ mod session;
 pub use session::{Capsule, CapsuleDecoder, SessionError};
 mod socket;
 pub mod upstream;
-use crate::{alt_svc::AltSvcStore, cert::CertificateIssuer, policy::PolicySession};
+use crate::{
+    alt_svc::AltSvcStore,
+    cert::CertificateIssuer,
+    ech_state::DownstreamEch,
+    policy::PolicySession,
+};
 use agent_sandbox_core::ProxyConnectionId;
 use socket::TransparentUdpSocket;
 use std::{
@@ -109,6 +114,12 @@ impl ConnectionIdRegistry {
 }
 
 /// Shared state for every downstream QUIC association.
+///
+/// The struct is both the HTTP/3 leg's configuration and its runtime
+/// state: [`prepare`] moves the caller-provided fields into the state and
+/// fills the runtime-only fields once the UDP listeners are bound. The
+/// requested listeners and the debug overrides stay in the small
+/// [`Http3Config`].
 pub struct Http3State {
     pub policy: Arc<PolicySession>,
     pub issuer: CertificateIssuer,
@@ -118,27 +129,17 @@ pub struct Http3State {
     pub destination_port: u16,
     pub alt_svc: Arc<AltSvcStore>,
     pub(crate) connection_ids: Arc<ConnectionIdRegistry>,
-    /// Downstream ECH configuration distributed to clients.
-    pub ech_config_list: Option<Arc<Vec<u8>>>,
-    /// Downstream ECH private key matching `ech_config_list`.
-    pub ech_private_key: Option<[u8; 32]>,
+    /// Downstream ECH configuration and key, shared with the TCP leg.
+    pub ech: Option<DownstreamEch>,
 }
 
-/// Configuration for the HTTP/3 backend.
+/// The small HTTP/3 backend configuration that does not survive into the
+/// shared state: the requested listeners and the debug-only overrides.
 pub struct Http3Config {
-    pub policy: Arc<PolicySession>,
-    pub issuer: CertificateIssuer,
-    pub shutdown: Arc<Notify>,
-    pub active_checks: Arc<Semaphore>,
     pub listen_port: u16,
     pub alt_ports: Vec<u16>,
-    pub alt_svc: Arc<AltSvcStore>,
     pub test_destination: Option<SocketAddr>,
     pub test_ech_dns: Option<SocketAddr>,
-    /// Downstream ECH configuration distributed to clients.
-    pub ech_config_list: Option<Arc<Vec<u8>>>,
-    /// Downstream ECH private key matching `ech_config_list`.
-    pub ech_private_key: Option<[u8; 32]>,
 }
 
 /// Prepare the HTTP/3 backend so every fallible setup step runs before
@@ -152,7 +153,14 @@ pub struct Http3Config {
 /// # Panics
 ///
 /// Panics when the freshly built shared state is unexpectedly shared.
-pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
+pub fn prepare(
+    config: Http3Config,
+    policy: Arc<PolicySession>,
+    issuer: CertificateIssuer,
+    shutdown: Arc<Notify>,
+    active_checks: Arc<Semaphore>,
+    ech: Option<DownstreamEch>,
+) -> Result<Http3Backend, BoxError> {
     let ca_file = std::env::var_os("SSL_CERT_FILE")
         .map(PathBuf::from)
         .ok_or_else(|| boxed("SSL_CERT_FILE is required to verify upstream HTTP/3 certificates"))?;
@@ -161,16 +169,15 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
     let transparent = config.test_destination.is_none();
 
     let mut state = Arc::new(Http3State {
-        policy: config.policy,
-        issuer: config.issuer,
-        shutdown: config.shutdown,
-        active_checks: config.active_checks,
+        policy,
+        issuer,
+        shutdown,
+        active_checks,
         upstream,
         destination_port: 0,
-        alt_svc: config.alt_svc.clone(),
+        alt_svc: Arc::new(AltSvcStore::new(Vec::new())),
         connection_ids: Arc::new(ConnectionIdRegistry::default()),
-        ech_config_list: config.ech_config_list,
-        ech_private_key: config.ech_private_key,
+        ech,
     });
 
     // A port of 0 asks the kernel for an ephemeral port; the real port is
@@ -232,6 +239,15 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         });
     }
 
+    // The Alt-Svc store is shared with the TCP leg and must be built with
+    // the real bound ports, which port-0 listeners only learn once bound.
+    // No association can run before `prepare` returns, so replacing the
+    // placeholder store in the freshly built state is safe.
+    let alt_svc = Arc::new(AltSvcStore::new(ports.clone()));
+    Arc::get_mut(&mut state)
+        .expect("fresh HTTP/3 state")
+        .alt_svc = alt_svc.clone();
+
     Ok(Http3Backend {
         v4,
         v6,
@@ -239,6 +255,7 @@ pub fn prepare(config: Http3Config) -> Result<Http3Backend, BoxError> {
         destination: main_destination,
         alternatives,
         ports,
+        alt_svc,
     })
 }
 
@@ -250,6 +267,7 @@ pub struct Http3Backend {
     destination: association::DestinationResolver,
     alternatives: Vec<AltEndpoint>,
     ports: Vec<u16>,
+    alt_svc: Arc<AltSvcStore>,
 }
 
 impl Http3Backend {
@@ -257,6 +275,13 @@ impl Http3Backend {
     #[must_use]
     pub fn bound_ports(&self) -> &[u16] {
         &self.ports
+    }
+
+    /// The Alt-Svc store shared with the TCP leg, built with the bound
+    /// UDP ports.
+    #[must_use]
+    pub fn alt_svc(&self) -> Arc<AltSvcStore> {
+        self.alt_svc.clone()
     }
 }
 
@@ -338,21 +363,8 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
     // Terminate downstream ECH with the same key material the TCP listener
     // uses, so clients that fetch their configuration through the sandbox
     // DNS rewrite get a decryptable offer on both legs.
-    if let (Some(config_list), Some(private_key)) = (&state.ech_config_list, state.ech_private_key)
-    {
-        let keys = hpke::ECH_SUPPORTED_SUITES
-            .iter()
-            .map(|hpke| {
-                rustls::server::ech::EchKeys::new(
-                    rustls::pki_types::EchConfigListBytes::from(config_list.as_slice()),
-                    &private_key,
-                    *hpke,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BoxError::from)?;
-
-        tls = tls.with_ech_keys(keys).map_err(BoxError::from)?;
+    if let Some(ech) = &state.ech {
+        tls = tls.with_ech_keys(ech.ech_keys()?).map_err(BoxError::from)?;
     }
 
     tls.alpn_protocols = vec![b"h3".to_vec()];

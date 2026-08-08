@@ -4,7 +4,7 @@ use agent_sandbox_core::{
     ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
     RpcRequest, policy_rpc,
 };
-
+use rama_core::error::{BoxError, BoxErrorExt};
 use std::{
     env, fs,
     io::ErrorKind,
@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::{Notify, Semaphore};
 
 /// One claimed intercepted flow and the stable connection identity that owns
 /// the claim. The proxy presents both when it rebinds or releases the
@@ -29,7 +30,6 @@ pub struct FlowClaim {
 
 pub struct PolicySession {
     socket: PathBuf,
-    _connection: RpcConnection,
     token: ProxySessionToken,
     timeout: Duration,
     ready_path: Option<PathBuf>,
@@ -122,7 +122,6 @@ impl PolicySession {
 
         Ok(Self {
             socket,
-            _connection: connection,
             token: proxy_session,
             timeout,
             ready_path,
@@ -161,10 +160,7 @@ impl PolicySession {
             self.timeout,
         )
         .await
-        .map_err(|error| {
-            self.clear_session_ready();
-            PolicyError::Rpc(error.to_string())
-        })?;
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
 
         if let RpcReply::FlowClaim(FlowClaimReply {
             ok: true,
@@ -180,7 +176,6 @@ impl PolicySession {
                 policy_host,
             })
         } else {
-            self.clear_session_ready();
             Err(PolicyError::UnexpectedReply("claim_network_flow"))
         }
     }
@@ -219,10 +214,7 @@ impl PolicySession {
             self.timeout,
         )
         .await
-        .map_err(|error| {
-            self.clear_session_ready();
-            PolicyError::Rpc(error.to_string())
-        })?;
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
 
         if let RpcReply::FlowClaim(FlowClaimReply {
             ok: true,
@@ -238,7 +230,6 @@ impl PolicySession {
                 policy_host,
             })
         } else {
-            self.clear_session_ready();
             Err(PolicyError::UnexpectedReply("claim_network_flow_by_source"))
         }
     }
@@ -261,14 +252,9 @@ impl PolicySession {
             self.timeout,
         )
         .await
-        .map_err(|error| {
-            self.clear_session_ready();
-            PolicyError::Rpc(error.to_string())
-        })?;
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
 
-        decode_simple_reply(reply, "rebind_network_flow").inspect_err(|_| {
-            self.clear_session_ready();
-        })
+        decode_simple_reply(reply, "rebind_network_flow")
     }
 
     /// Ask policyd for a decision on one normalized HTTP request.
@@ -293,14 +279,49 @@ impl PolicySession {
             self.timeout,
         )
         .await
-        .map_err(|error| {
-            self.clear_session_ready();
-            PolicyError::Rpc(error.to_string())
-        })?;
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
 
-        decode_http_check_reply(reply, request_id).inspect_err(|_| {
-            self.clear_session_ready();
-        })
+        decode_http_check_reply(reply, request_id)
+    }
+
+    /// Ask policyd for a decision on one normalized HTTP request, holding
+    /// one concurrency permit for the whole decision.
+    ///
+    /// The pending check is cancelled when the proxy shuts down before the
+    /// decision arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the permit is unavailable, the policy RPC
+    /// fails, or the proxy shuts down while the decision is pending.
+    pub async fn check_http_cancellable(
+        self: &Arc<Self>,
+        attribution_token: AttributionToken,
+        request: HttpRequest,
+        active_checks: &Arc<Semaphore>,
+        shutdown: &Notify,
+    ) -> Result<HttpCheckReply, PolicyError> {
+        let _permit = active_checks
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PolicyError::TooManyActiveChecks)?;
+
+        let request_id = ProxyRequestId::new();
+
+        let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
+
+        let check = tokio::select! {
+            result = self.check_http(request_id, attribution_token, request) => result?,
+            () = shutdown.notified() => {
+                self.cancel(request_id).await?;
+                pending.disarm();
+                return Err(PolicyError::Shutdown);
+            }
+        };
+
+        pending.disarm();
+
+        Ok(check)
     }
 
     /// Cancel a pending HTTP approval request.
@@ -318,10 +339,7 @@ impl PolicySession {
             self.timeout,
         )
         .await
-        .map_err(|error| {
-            self.clear_session_ready();
-            PolicyError::Rpc(error.to_string())
-        })?;
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
 
         Ok(())
     }
@@ -343,14 +361,9 @@ impl PolicySession {
             self.timeout,
         )
         .await
-        .map_err(|error| {
-            self.clear_session_ready();
-            PolicyError::Rpc(error.to_string())
-        })?;
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
 
-        decode_simple_reply(reply, "release_network_flow").inspect_err(|_| {
-            self.clear_session_ready();
-        })
+        decode_simple_reply(reply, "release_network_flow")
     }
 
     fn clear_session_ready(&self) {
@@ -438,6 +451,26 @@ pub enum PolicyError {
 
     #[error("policyd returned an unexpected reply for {0}")]
     UnexpectedReply(&'static str),
+
+    #[error("proxy shutting down")]
+    Shutdown,
+
+    #[error("too many active policy checks")]
+    TooManyActiveChecks,
+
+    #[error("conflicting HTTP authorities")]
+    AuthorityConflict,
+}
+
+impl PolicyError {
+    /// Convert to a boxed error, replacing the generic authority conflict
+    /// with the call-site message while preserving any other cause.
+    pub(crate) fn into_boxed(self, conflict_message: &'static str) -> BoxError {
+        match self {
+            Self::AuthorityConflict => BoxError::from_static_str(conflict_message),
+            other => BoxError::from(other),
+        }
+    }
 }
 
 /// Build the typed flow key used to claim an intercepted TCP connection.
@@ -516,13 +549,186 @@ pub fn normalize_authority(value: &str, fallback_port: u16) -> Result<String, Po
     ))
 }
 
+/// Reconcile HTTP authority candidates into one canonical authority.
+///
+/// Every present candidate must normalize to the same authority.
+///
+/// # Errors
+///
+/// Returns an error when the candidates disagree or none is present.
+pub fn reconcile_authorities(
+    candidates: &[&str],
+    fallback_port: u16,
+) -> Result<String, PolicyError> {
+    let mut canonical: Option<String> = None;
+
+    for candidate in candidates {
+        let normalized = normalize_authority(candidate, fallback_port)?;
+
+        if canonical
+            .as_deref()
+            .is_some_and(|existing| existing != normalized)
+        {
+            return Err(PolicyError::AuthorityConflict);
+        }
+
+        canonical = Some(normalized);
+    }
+
+    canonical.ok_or_else(|| PolicyError::Rpc("HTTP request has no authority".to_owned()))
+}
+
+/// Minimal policyd used by policy-decision tests in this crate.
+///
+/// Answers session opens and policy checks, and records every check and
+/// cancellation it observes. Check replies wait on `release_checks`, so a
+/// test can hold a decision pending while it exercises the shutdown path.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use agent_sandbox_core::{
+        HttpCheckReply, HttpRequest, ProxyReply, ProxyRequestId, ProxySessionReply,
+        ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
+    };
+    use std::{path::PathBuf, sync::Arc};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+        sync::{Notify, mpsc},
+    };
+
+    /// One policy operation observed by the fake service.
+    pub enum FakePolicyEvent {
+        Check,
+        Cancel,
+    }
+
+    /// A fake policyd bound to a Unix socket in a temporary directory.
+    pub struct FakePolicy {
+        pub socket: PathBuf,
+        pub events: mpsc::UnboundedReceiver<FakePolicyEvent>,
+        pub release_checks: Arc<Notify>,
+        _dir: tempfile::TempDir,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakePolicy {
+        /// Start the fake service on a fresh socket in a temporary directory.
+        pub fn start() -> Self {
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let socket = dir.path().join("policy.sock");
+            let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
+            let (events_tx, events) = mpsc::unbounded_channel();
+            let release_checks = Arc::new(Notify::new());
+
+            let task = tokio::spawn(serve(listener, events_tx, release_checks.clone()));
+
+            Self {
+                socket,
+                events,
+                release_checks,
+                _dir: dir,
+                _task: task,
+            }
+        }
+    }
+
+    async fn serve(
+        listener: UnixListener,
+        events: mpsc::UnboundedSender<FakePolicyEvent>,
+        release_checks: Arc<Notify>,
+    ) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+
+            let events = events.clone();
+            let release_checks = release_checks.clone();
+
+            tokio::spawn(serve_connection(stream, events, release_checks));
+        }
+    }
+
+    async fn serve_connection(
+        stream: tokio::net::UnixStream,
+        events: mpsc::UnboundedSender<FakePolicyEvent>,
+        release_checks: Arc<Notify>,
+    ) {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+
+        if reader.read_line(&mut line).await.is_err() || line.is_empty() {
+            return;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+
+        let reply = match value.get("op").and_then(serde_json::Value::as_str) {
+            Some("open_proxy_session") => Some(RpcReply::ProxySession(ProxySessionReply {
+                ok: true,
+                proxy_session: ProxySessionToken::from_bytes([1; 32]),
+            })),
+
+            Some("check_http") => {
+                let request_id: ProxyRequestId = field(&value, "request_id");
+
+                let _ = events.send(FakePolicyEvent::Check);
+
+                release_checks.notified().await;
+
+                let request: HttpRequest = field(&value, "request");
+
+                Some(RpcReply::Proxy(ProxyReply::from_reply(
+                    request_id,
+                    RpcReply::HttpCheck(HttpCheckReply::from_verdict(
+                        request,
+                        Verdict::allowed(VerdictSource::policy()),
+                    )),
+                )))
+            }
+
+            Some("cancel_check") => {
+                let _ = events.send(FakePolicyEvent::Cancel);
+
+                Some(RpcReply::Simple(SimpleOkReply { ok: true }))
+            }
+
+            _ => None,
+        };
+
+        let Some(reply) = reply else {
+            return;
+        };
+
+        let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
+
+        let _ = writer.write_all(&encoded).await;
+        let _ = writer.write_all(b"\n").await;
+        let _ = writer.flush().await;
+    }
+
+    fn field<T: serde::de::DeserializeOwned>(value: &serde_json::Value, name: &str) -> T {
+        serde_json::from_value(value.get(name).cloned().expect(name)).expect(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PolicyError, decode_http_check_reply, normalize_authority};
-
-    use agent_sandbox_core::{
-        ErrorReply, HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RpcReply,
+    use super::{
+        PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
+        reconcile_authorities,
     };
+    use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
+    use agent_sandbox_core::{
+        AttributionToken, ErrorReply, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody,
+        ProxyRequestId, RpcReply,
+    };
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{Notify, Semaphore};
 
     #[test]
     fn accepts_matching_pipelined_http_reply() -> Result<(), Box<dyn std::error::Error>> {
@@ -580,6 +786,143 @@ mod tests {
             normalize_authority("[2001:db8::1]:8443", 443)?,
             "[2001:db8::1]:8443"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_authorities_accepts_matching_candidates() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(
+            reconcile_authorities(&["example.test", "example.test:80"], 80)?,
+            "example.test:80"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_authorities_applies_fallback_port() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            reconcile_authorities(&["example.test"], 8080)?,
+            "example.test:8080"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_authorities_rejects_conflicting_candidates() {
+        assert!(reconcile_authorities(&["example.test", "other.test"], 80).is_err());
+        assert!(reconcile_authorities(&["example.test:80", "example.test:8080"], 80).is_err());
+    }
+
+    #[test]
+    fn reconcile_authorities_requires_at_least_one_candidate() {
+        assert!(reconcile_authorities(&[], 80).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellable_check_returns_allowed_decision() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut fake = FakePolicy::start();
+        let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
+        let active_checks = Arc::new(Semaphore::new(2));
+        let shutdown = Arc::new(Notify::new());
+
+        fake.release_checks.notify_one();
+
+        let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
+
+        let check = policy
+            .check_http_cancellable(
+                AttributionToken::from_bytes([2; 32]),
+                request,
+                &active_checks,
+                &shutdown,
+            )
+            .await?;
+
+        assert!(check.ok);
+        assert!(check.allowed);
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Check)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellable_check_cancels_on_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+        let mut fake = FakePolicy::start();
+        let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
+        let active_checks = Arc::new(Semaphore::new(2));
+        let shutdown = Arc::new(Notify::new());
+
+        let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
+
+        let task = {
+            let policy = policy.clone();
+            let active_checks = active_checks.clone();
+            let shutdown = shutdown.clone();
+
+            tokio::spawn(async move {
+                policy
+                    .check_http_cancellable(
+                        AttributionToken::from_bytes([2; 32]),
+                        request,
+                        &active_checks,
+                        &shutdown,
+                    )
+                    .await
+            })
+        };
+
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Check)
+        ));
+
+        shutdown.notify_one();
+
+        assert!(matches!(
+            task.await.expect("check task"),
+            Err(PolicyError::Shutdown)
+        ));
+
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Cancel)
+        ));
+
+        fake.release_checks.notify_one();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellable_check_rejects_when_semaphore_is_full()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakePolicy::start();
+        let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
+        let active_checks = Arc::new(Semaphore::new(1));
+        let shutdown = Arc::new(Notify::new());
+
+        let _held = active_checks.clone().try_acquire_owned().expect("permit");
+
+        let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
+
+        let result = policy
+            .check_http_cancellable(
+                AttributionToken::from_bytes([2; 32]),
+                request,
+                &active_checks,
+                &shutdown,
+            )
+            .await;
+
+        assert!(matches!(result, Err(PolicyError::TooManyActiveChecks)));
 
         Ok(())
     }

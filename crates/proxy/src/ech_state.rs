@@ -6,9 +6,14 @@ use std::{
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
+
+use crate::http3::BoxError;
 
 /// Directory containing the proxy's persistent ECH key and configuration.
 pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";
@@ -26,6 +31,48 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct EchState {
     pub config_list: Vec<u8>,
     pub private_key: [u8; 32],
+}
+
+/// One downstream ECH value: the client-facing configuration and the
+/// matching private key.
+///
+/// Built once from the persisted [`EchState`] and shared by the TCP and
+/// HTTP/3 legs, so both terminate ECH with identical key material.
+#[derive(Clone)]
+pub struct DownstreamEch {
+    pub config_list: Arc<Vec<u8>>,
+    pub private_key: [u8; 32],
+}
+
+impl From<EchState> for DownstreamEch {
+    fn from(state: EchState) -> Self {
+        Self {
+            config_list: Arc::new(state.config_list),
+            private_key: state.private_key,
+        }
+    }
+}
+
+impl DownstreamEch {
+    /// Build the rustls ECH keys for one downstream TLS configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rustls error produced while building an
+    /// `EchKeys` value for a supported HPKE suite.
+    pub fn ech_keys(&self) -> Result<Vec<rustls::server::ech::EchKeys>, BoxError> {
+        crate::http3::hpke::ECH_SUPPORTED_SUITES
+            .iter()
+            .map(|hpke| {
+                rustls::server::ech::EchKeys::new(
+                    rustls::pki_types::EchConfigListBytes::from(self.config_list.as_slice()),
+                    &self.private_key,
+                    *hpke,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BoxError::from)
+    }
 }
 
 /// Load the persisted ECH key or generate it atomically on first use.
@@ -211,30 +258,24 @@ mod tests {
         assert_eq!(first.config_list, second.config_list);
         assert_eq!(first.private_key, second.private_key);
 
-        let keys = crate::http3::hpke::ECH_SUPPORTED_SUITES
-            .iter()
-            .map(|hpke| {
-                rustls::server::ech::EchKeys::new(
-                    rustls::pki_types::EchConfigListBytes::from(first.config_list.as_slice()),
-                    &first.private_key,
-                    *hpke,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("valid ECH config");
+        let downstream = DownstreamEch::from(first);
+        let keys = downstream.ech_keys().expect("valid ECH config");
 
         assert!(!keys.is_empty());
 
         assert_eq!(
             usize::from(u16::from_be_bytes([
-                first.config_list[0],
-                first.config_list[1],
+                downstream.config_list[0],
+                downstream.config_list[1],
             ])),
-            first.config_list.len() - 2
+            downstream.config_list.len() - 2
         );
 
-        assert_eq!(&first.config_list[43..53], &[0, 8, 0, 1, 0, 2, 0, 1, 0, 1],);
-        assert_eq!(first.config_list.len(), 84);
+        assert_eq!(
+            &downstream.config_list[43..53],
+            &[0, 8, 0, 1, 0, 2, 0, 1, 0, 1],
+        );
+        assert_eq!(downstream.config_list.len(), 84);
         fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 

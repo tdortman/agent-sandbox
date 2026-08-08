@@ -4,15 +4,14 @@ use agent_sandbox_proxy::tcp_backend::destination_override;
 use agent_sandbox_proxy::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
-    ech_state,
-    http3::{self, Http3Config},
+    ech_state::{self, DownstreamEch},
+    http3::{self, Http3Backend, Http3Config},
     policy::PolicySession,
     tcp_backend::{
         ListenConfig, MAX_ACTIVE_CHECKS, canonical_http10_origins, destination_for_stream,
         run_tcp_listener,
     },
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use rama_core::{
     error::{BoxError, BoxErrorExt},
@@ -20,35 +19,6 @@ use rama_core::{
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore};
-
-/// Select the client-facing ECH configuration and verify explicit overrides.
-///
-/// An override is accepted only when it is byte-for-byte identical to the
-/// persisted configuration whose private key the proxy will use.
-fn select_ech_config_list(
-    encoded: Option<&str>,
-    state: Option<&ech_state::EchState>,
-) -> Result<Option<Arc<Vec<u8>>>, BoxError> {
-    let Some(encoded) = encoded else {
-        return Ok(state.map(|state| Arc::new(state.config_list.clone())));
-    };
-
-    let config_list = STANDARD.decode(encoded)?;
-
-    let Some(state) = state else {
-        return Err(BoxError::from_static_str(
-            "ECH config override requires ECH state",
-        ));
-    };
-
-    if config_list != state.config_list {
-        return Err(BoxError::from_static_str(
-            "ECH config override does not match ECH private key",
-        ));
-    }
-
-    Ok(Some(Arc::new(config_list)))
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-sandbox-proxy")]
@@ -114,9 +84,6 @@ struct Args {
     #[arg(long = "http10-upstream-origin", value_name = "ORIGIN")]
     http10_upstream_origins: Vec<String>,
 
-    #[arg(long, env = "AGENT_SANDBOX_ECH_CONFIG_LIST")]
-    ech_config_list: Option<String>,
-
     #[arg(
         long,
         env = "AGENT_SANDBOX_ECH_STATE_DIR",
@@ -148,7 +115,8 @@ async fn main() -> Result<(), BoxError> {
         return Ok(());
     }
 
-    let (issuer, listener_config) = load_listener_config(&args)?;
+    let issuer = load_ca_issuer(&args)?;
+    let ech = load_downstream_ech(&args)?;
 
     let policy = Arc::new(
         PolicySession::open(
@@ -161,22 +129,14 @@ async fn main() -> Result<(), BoxError> {
     let shutdown = Arc::new(Notify::new());
     let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
     let executor = Executor::default();
-    let alt_svc = listener_config.alt_svc.clone();
-    let ech_config_list = listener_config.ech_config_list.clone();
-    let ech_private_key = listener_config.ech_private_key;
 
-    #[cfg(debug_assertions)]
-    let mut http3_ports = Vec::new();
-
-    if args.http3 {
-        let http3 = Http3Config {
-            policy: policy.clone(),
-            issuer: issuer.clone(),
-            shutdown: shutdown.clone(),
-            active_checks: active_checks.clone(),
+    // The HTTP/3 backend binds its UDP listeners before the listener
+    // configuration is built: the Alt-Svc store must be constructed with
+    // the real bound ports, which port-0 listeners only learn once bound.
+    let http3_backend = if args.http3 {
+        let config = Http3Config {
             listen_port: args.http3_listen_port,
             alt_ports: args.http3_alt_ports.clone(),
-            alt_svc: alt_svc.clone(),
             #[cfg(debug_assertions)]
             test_destination: args.test_destination,
             #[cfg(not(debug_assertions))]
@@ -185,25 +145,36 @@ async fn main() -> Result<(), BoxError> {
             test_ech_dns: args.test_ech_dns,
             #[cfg(not(debug_assertions))]
             test_ech_dns: None,
-            ech_config_list,
-            ech_private_key,
         };
 
-        let backend = http3::prepare(http3)?;
+        Some(http3::prepare(
+            config,
+            policy.clone(),
+            issuer.clone(),
+            shutdown.clone(),
+            active_checks.clone(),
+            ech.clone(),
+        )?)
+    } else {
+        None
+    };
 
-        for port in backend.bound_ports() {
-            alt_svc.intercept(*port);
-        }
+    // The Alt-Svc store is built with the bound ports by `prepare` and
+    // shared by both legs. Without the HTTP/3 backend no UDP port is
+    // intercepted.
+    let alt_svc = http3_backend.as_ref().map_or_else(
+        || Arc::new(AltSvcStore::new(Vec::new())),
+        Http3Backend::alt_svc,
+    );
 
-        #[cfg(debug_assertions)]
-        http3_ports.extend(backend.bound_ports().iter().copied());
-
-        tokio::spawn(http3::run(backend));
-    }
+    let listener_config = load_listener_config(&args, issuer, alt_svc, ech)?;
 
     #[cfg(debug_assertions)]
     let listener_config = {
         let mut config = listener_config;
+        let http3_ports = http3_backend
+            .as_ref()
+            .map_or_else(Vec::new, |backend| backend.bound_ports().to_vec());
 
         if let Some(path) = &args.write_bound_ports {
             config.write_bound_ports = Some((path.clone(), http3_ports));
@@ -212,10 +183,53 @@ async fn main() -> Result<(), BoxError> {
         config
     };
 
+    if let Some(backend) = http3_backend {
+        tokio::spawn(http3::run(backend));
+    }
+
     run_tcp_listener(listener_config, executor, policy, shutdown, active_checks).await
 }
 
-fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenConfig), BoxError> {
+fn load_ca_issuer(args: &Args) -> Result<CertificateIssuer, BoxError> {
+    let ca_certificate = args
+        .ca_certificate
+        .as_deref()
+        .ok_or_else(|| BoxError::from_static_str("CA certificate is required"))?;
+
+    let ca_certificate = std::fs::read_to_string(ca_certificate)?;
+
+    let ca_private_key = args
+        .ca_private_key
+        .as_deref()
+        .ok_or_else(|| BoxError::from_static_str("CA private key is required"))?;
+
+    let ca_private_key = std::fs::read_to_string(ca_private_key)?;
+
+    Ok(CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?)
+}
+
+/// Load the downstream ECH value from the persisted state, when an ECH
+/// state directory is configured.
+///
+/// # Errors
+///
+/// Returns an I/O error when the ECH state cannot be loaded or generated.
+fn load_downstream_ech(args: &Args) -> Result<Option<DownstreamEch>, BoxError> {
+    let ech_state = args
+        .ech_state_dir
+        .as_deref()
+        .map(ech_state::load_or_generate)
+        .transpose()?;
+
+    Ok(ech_state.map(DownstreamEch::from))
+}
+
+fn load_listener_config(
+    args: &Args,
+    issuer: CertificateIssuer,
+    alt_svc: Arc<AltSvcStore>,
+    ech: Option<DownstreamEch>,
+) -> Result<ListenConfig, BoxError> {
     let websocket_http11_urls = args
         .websocket_http11_urls
         .iter()
@@ -233,47 +247,18 @@ fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenConfig)
     let http10_upstream_origins =
         Arc::new(canonical_http10_origins(&args.http10_upstream_origins)?);
 
-    let ech_state = args
-        .ech_state_dir
-        .as_deref()
-        .map(ech_state::load_or_generate)
-        .transpose()?;
-
-    let ech_config_list =
-        select_ech_config_list(args.ech_config_list.as_deref(), ech_state.as_ref())?;
-
-    let ech_private_key = ech_state.map(|state| state.private_key);
-
-    let ca_certificate = args
-        .ca_certificate
-        .as_deref()
-        .ok_or_else(|| BoxError::from_static_str("CA certificate is required"))?;
-
-    let ca_certificate = std::fs::read_to_string(ca_certificate)?;
-
-    let ca_private_key = args
-        .ca_private_key
-        .as_deref()
-        .ok_or_else(|| BoxError::from_static_str("CA private key is required"))?;
-
-    let ca_private_key = std::fs::read_to_string(ca_private_key)?;
-    let issuer = CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?;
-
     #[cfg(debug_assertions)]
     let transparent = args.test_destination.is_none();
 
     #[cfg(not(debug_assertions))]
     let transparent = true;
 
-    // The intercepted UDP set is filled after the HTTP/3 backend binds:
-    // port-0 listeners only learn their real ports once bound.
-    let listener_config = ListenConfig {
+    Ok(ListenConfig {
         listen_port: args.listen_port,
         transparent,
-        issuer: issuer.clone(),
-        ech_config_list,
-        ech_private_key,
-        alt_svc: Arc::new(AltSvcStore::new(Vec::new())),
+        issuer,
+        ech,
+        alt_svc,
         websocket_http11_urls,
         http10_upstream_origins,
         #[cfg(debug_assertions)]
@@ -281,22 +266,19 @@ fn load_listener_config(args: &Args) -> Result<(CertificateIssuer, ListenConfig)
             .test_destination
             .map_or_else(|| Arc::new(destination_for_stream), destination_override),
         #[cfg(not(debug_assertions))]
-        destination_resolver: Arc::new(destination_for_stream),
+        destination_resolver: destination_for_stream,
         #[cfg(debug_assertions)]
         test_tls: args.test_tls,
         #[cfg(not(debug_assertions))]
         test_tls: false,
         #[cfg(debug_assertions)]
         write_bound_ports: None,
-    };
-
-    Ok((issuer, listener_config))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, select_ech_config_list};
-    use agent_sandbox_proxy::ech_state::EchState;
+    use super::Args;
     use clap::Parser;
 
     #[test]
@@ -333,20 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn ech_config_override_must_match_private_key() {
-        let state = EchState {
-            config_list: vec![1],
-            private_key: [0; 32],
-        };
+    fn args_reject_ech_config_list_knob() {
+        let error = Args::try_parse_from(["agent-sandbox-proxy", "--ech-config-list", "AQ=="])
+            .expect_err("removed ECH config override knob");
 
-        assert!(select_ech_config_list(Some("Ag=="), Some(&state)).is_err());
-
-        assert_eq!(
-            select_ech_config_list(Some("AQ=="), Some(&state))
-                .expect("matching ECH config")
-                .expect("ECH config")
-                .as_slice(),
-            &[1]
-        );
+        assert!(error.to_string().contains("--ech-config-list"));
     }
 }

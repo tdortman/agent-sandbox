@@ -20,13 +20,13 @@ use crate::{
         session::{self, SessionKey, SessionProtocol},
         upstream::{IncomingWebTransportReceiver, IncomingWebTransportStream},
     },
-    policy::{FlowClaim, PendingPolicyCheck, PolicySession, normalize_authority},
+    policy::{FlowClaim, PolicySession, normalize_authority, reconcile_authorities},
     semantic::{
         BoundedRequestBody, HttpVersion, SemanticHeaders, SemanticRequest, SemanticRequestParts,
         semantic_request_headers,
     },
 };
-use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, ProxyRequestId};
+use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest};
 use bytes::{Buf, Bytes};
 use h3::{
     ConnectionState,
@@ -1626,7 +1626,11 @@ async fn approve_webtransport_request(
     ),
     BoxError,
 > {
-    let semantic = match semantic_request(request, state, origin_port, origin_authority) {
+    // An alternative endpoint changes only the transport. The fallback
+    // port for a port-less authority stays the origin's port.
+    let fallback_port = origin_port.unwrap_or(state.destination_port);
+
+    let semantic = match semantic_request(request, origin_authority, fallback_port) {
         Ok(semantic) => semantic,
         Err(error) => {
             stream.stop_sending(Code::H3_MESSAGE_ERROR);
@@ -1652,30 +1656,15 @@ async fn approve_webtransport_request(
         return Ok((semantic, normalized, stream));
     }
 
-    let request_id = ProxyRequestId::new();
-
-    let _permit = state
-        .active_checks
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| boxed("too many active policy checks"))?;
-
-    let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
-
-    let check = tokio::select! {
-        result = state.policy.check_http(
-            request_id,
+    let check = state
+        .policy
+        .check_http_cancellable(
             claim.attribution_token.clone(),
             semantic.policy_request()?,
-        ) => result?,
-        () = state.shutdown.notified() => {
-            state.policy.cancel(request_id).await?;
-            pending.disarm();
-            return Err(boxed("proxy shutting down"));
-        }
-    };
-
-    pending.disarm();
+            &state.active_checks,
+            &state.shutdown,
+        )
+        .await?;
 
     let HttpCheckReply {
         ok: true,
@@ -2710,16 +2699,19 @@ async fn serve_request(
         pending_webtransport,
     } = context;
 
-    let semantic =
-        match semantic_request(&request, &state, origin_port, origin_authority.as_deref()) {
-            Ok(semantic) => semantic,
-            Err(error) => {
-                let mut stream = stream;
-                stream.stop_sending(Code::H3_MESSAGE_ERROR);
-                stream.stop_stream(Code::H3_MESSAGE_ERROR);
-                return Err(error);
-            }
-        };
+    // An alternative endpoint changes only the transport. The fallback
+    // port for a port-less authority stays the origin's port.
+    let fallback_port = origin_port.unwrap_or(state.destination_port);
+
+    let semantic = match semantic_request(&request, origin_authority.as_deref(), fallback_port) {
+        Ok(semantic) => semantic,
+        Err(error) => {
+            let mut stream = stream;
+            stream.stop_sending(Code::H3_MESSAGE_ERROR);
+            stream.stop_stream(Code::H3_MESSAGE_ERROR);
+            return Err(error);
+        }
+    };
 
     let requested_protocol = request
         .extensions()
@@ -2791,30 +2783,15 @@ async fn authorize_request(
     };
 
     let Some(reused) = reused else {
-        let request_id = ProxyRequestId::new();
-
-        let _permit = state
-            .active_checks
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| boxed("too many active policy checks"))?;
-
-        let mut pending = PendingPolicyCheck::new(state.policy.clone(), request_id);
-
-        let check = tokio::select! {
-            result = state.policy.check_http(
-                request_id,
+        let check = state
+            .policy
+            .check_http_cancellable(
                 claim.attribution_token.clone(),
                 semantic.policy_request()?,
-            ) => result?,
-            () = state.shutdown.notified() => {
-                state.policy.cancel(request_id).await?;
-                pending.disarm();
-                return Err(boxed("proxy shutting down"));
-            }
-        };
-
-        pending.disarm();
+                &state.active_checks,
+                &state.shutdown,
+            )
+            .await?;
 
         let HttpCheckReply {
             ok: true,
@@ -2840,9 +2817,8 @@ async fn authorize_request(
 
 fn semantic_request(
     request: &http::Request<()>,
-    state: &Http3State,
-    origin_port: Option<u16>,
     origin_authority: Option<&str>,
+    fallback_port: u16,
 ) -> Result<SemanticRequest, BoxError> {
     let uri = request.uri();
 
@@ -2850,20 +2826,11 @@ fn semantic_request(
         .authority()
         .ok_or_else(|| boxed("HTTP/3 request has no :authority"))?;
 
-    // An alternative endpoint changes only the transport; the fallback port
-    // for a port-less authority stays the origin's port.
-    let fallback_port = origin_port.unwrap_or(state.destination_port);
-
-    let request_authority = normalize_authority(authority.as_str(), fallback_port)?;
-
     let authority = if let Some(origin_authority) = origin_authority {
-        let origin_authority = normalize_authority(origin_authority, fallback_port)?;
-        if request_authority != origin_authority {
-            return Err(boxed("HTTP/3 authority does not match its origin"));
-        }
-        origin_authority
+        reconcile_authorities(&[authority.as_str(), origin_authority], fallback_port)
+            .map_err(|error| error.into_boxed("HTTP/3 authority does not match its origin"))?
     } else {
-        request_authority
+        normalize_authority(authority.as_str(), fallback_port)?
     };
 
     let scheme = uri
@@ -2899,9 +2866,8 @@ fn semantic_request(
         let host = std::str::from_utf8(header.value())
             .map_err(|_| boxed("HTTP/3 Host header is not valid UTF-8"))?;
 
-        if normalize_authority(host, fallback_port)? != authority {
-            return Err(boxed("HTTP/3 Host header does not match :authority"));
-        }
+        reconcile_authorities(&[&authority, host], fallback_port)
+            .map_err(|error| error.into_boxed("HTTP/3 Host header does not match :authority"))?;
     }
 
     Ok(SemanticRequest::from_parts(SemanticRequestParts {
@@ -3741,4 +3707,93 @@ fn boxed_owned(message: impl Into<String>) -> BoxError {
 
 fn varint(code: Code) -> quinn::VarInt {
     quinn::VarInt::from_u64(code.value()).expect("HTTP/3 error codes fit in VarInt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::semantic_request;
+
+    fn request(uri: &str, host: Option<&str>) -> http::Request<()> {
+        let mut builder = http::Request::builder().uri(uri);
+
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+
+        builder.body(()).expect("valid request")
+    }
+
+    #[test]
+    fn semantic_request_accepts_authority_matching_host()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = request("https://example.test/path", Some("example.test"));
+
+        let semantic = semantic_request(&request, None, 8443)?;
+
+        assert_eq!(semantic.authority(), "example.test:8443");
+
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_request_accepts_matching_origin_authority()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = request("https://example.test/path", None);
+
+        let semantic = semantic_request(&request, Some("example.test"), 8443)?;
+
+        assert_eq!(semantic.authority(), "example.test:8443");
+
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_request_applies_fallback_port()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = request("https://example.test/path", None);
+
+        let semantic = semantic_request(&request, None, 443)?;
+
+        assert_eq!(semantic.authority(), "example.test");
+
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_request_rejects_mismatched_origin_authority() {
+        let request = request("https://example.test/path", None);
+
+        let error = semantic_request(&request, Some("other.test"), 8443)
+            .expect_err("origin mismatch is rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "HTTP/3 authority does not match its origin"
+        );
+    }
+
+    #[test]
+    fn semantic_request_rejects_mismatched_host_header() {
+        let request = request("https://example.test/path", Some("other.test"));
+
+        let error = semantic_request(&request, None, 8443).expect_err("host mismatch is rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "HTTP/3 Host header does not match :authority"
+        );
+    }
+
+    #[test]
+    fn semantic_request_rejects_request_without_authority() {
+        let request = http::Request::builder()
+            .uri("/path")
+            .body(())
+            .expect("request");
+
+        let error =
+            semantic_request(&request, None, 8443).expect_err("missing authority is rejected");
+
+        assert_eq!(error.to_string(), "HTTP/3 request has no :authority");
+    }
 }
