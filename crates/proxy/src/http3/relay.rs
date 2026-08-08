@@ -312,6 +312,14 @@ pub(super) async fn serve_request(
             ))
             .await?;
         stream.finish().await?;
+
+        // Read the request body to its end so the stream closes cleanly on
+        // drop. quinn sends STOP_SENDING on an unread receive stream, which
+        // clients report as a reset after the deny response.
+        while stream.recv_data().await?.is_some() {}
+
+        let _ = stream.recv_trailers().await?;
+
         return Ok(());
     };
 

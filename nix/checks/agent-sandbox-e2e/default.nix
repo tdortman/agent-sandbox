@@ -1323,7 +1323,9 @@ let
       sandbox_shell(proxy, "sandbox-proxy-bash", "printf blocked | timeout 3 socat - UDP4:169.254.100.1:18083 | grep -q blocked", wrapper=session_wrapper, expect_success=False)
       proxy.succeed("journalctl --no-pager -b -u agent-sandbox-proxy.service | grep -F -q 'attributed alternative QUIC endpoint'")
 
-      proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -ne 0; test \"$before\" = \"$after\"")
+      # The denied HTTP/3 request must complete as a clean 403 response.
+      # A stream reset after the deny body would make curl exit non-zero.
+      proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -eq 0; grep -F -q 'blocked by agent-sandbox policy' /tmp/h3-denied.log; test \"$before\" = \"$after\"")
 
 
       # DoH: the proxy rewrites the advertised ECH configuration with its
