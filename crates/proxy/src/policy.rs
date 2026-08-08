@@ -29,6 +29,10 @@ pub struct FlowClaim {
 }
 
 pub struct PolicySession {
+    /// The session lease: policyd closes the proxy session when this
+    /// connection ends, so it must outlive the session even though RPC
+    /// calls use fresh connections.
+    _connection: RpcConnection,
     socket: PathBuf,
     token: ProxySessionToken,
     timeout: Duration,
@@ -121,6 +125,7 @@ impl PolicySession {
         let ready_path = session_ready_path();
 
         Ok(Self {
+            _connection: connection,
             socket,
             token: proxy_session,
             timeout,
