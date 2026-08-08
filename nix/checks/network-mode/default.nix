@@ -352,8 +352,8 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "proxy firewall must allow public IPv4 upstream destinations"
   grep -F -q -- 'ip6 daddr != {' ${proxyFirewallSource} \
     || fail "proxy firewall must allow public IPv6 upstream destinations"
-  grep -F -q -- 'lib.optionalString cfg.httpProxy.enable "    # Direct ports were approved by seccomp user notification' ${networkModuleSource} \
-    || fail "proxy mode must accept seccomp-approved direct traffic"
+  grep -F -q -- '# Direct TCP ports were approved by seccomp user notification' ${networkModuleSource} \
+    || fail "proxy mode must accept seccomp-approved direct TCP traffic"
 
 
   grep -F -q -- '--setenv AGENT_SANDBOX_NETWORK_MODE direct' "$static_direct" \
@@ -416,6 +416,22 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   ${proxyGroupLookupCheck}/bin/proxy-group-lookup-regression nixbld \
     || fail "single proxy-group lookup was rejected"
 
+
+  netns_launcher=$(cat ${
+    validPolicySystem.config.systemd.services."agent-sandbox-netns".serviceConfig.ExecStart
+  })
+  netns_up_path=$(sed -n 's#.*exec /nix/store/[^ ]*/bin/bash \(/nix/store/[^ ]*\.sh\).*#\1#p' <<< "$netns_launcher")
+  netns_up=$(cat "$netns_up_path")
+  grep -F -q -- 'set proxy_uid {' <<< "$netns_up" \
+    || fail "netns rules must declare the proxy uid set"
+  grep -F -q -- 'meta skuid @proxy_uid accept' <<< "$netns_up" \
+    || fail "proxy-mode netns rules must exempt the proxy uid from the UDP queue"
+  grep -F -q -- 'ip protocol udp ct state new,untracked queue num' <<< "$netns_up" \
+    || fail "proxy-mode netns rules must queue new UDP flows for transport checks"
+  grep -F -q -- 'meta nfproto ipv6 meta l4proto udp ct state new,untracked queue num' <<< "$netns_up" \
+    || fail "proxy-mode netns rules must queue new IPv6 UDP flows"
+  grep -F -q -- 'nft add element inet agent_sandbox proxy_uid' <<< "$netns_up" \
+    || fail "netns up script must populate the proxy uid set at runtime"
 
   echo "PASS: direct and proxy network modes are wired"
   touch "$out"

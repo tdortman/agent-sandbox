@@ -113,6 +113,11 @@ let
     netnsIp = runtime.network.netnsIp;
     netnsIp6Cidr = "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}";
     netnsName = runtime.network.netnsName;
+
+    proxyUidElement = lib.optionalString cfg.httpProxy.enable ''
+      ip netns exec "$NETNS" nft add element inet agent_sandbox proxy_uid { $(id -u "${proxyUser}") }
+    '';
+
     vethHost = runtime.network.vethHost;
     vethNetns = runtime.network.vethNetns;
   };
@@ -172,12 +177,12 @@ let
   # pending policy check, breaking name resolution for every new hostname.
   #
   # There is no allow fast-path for NFQUEUE-owned traffic. In proxy mode,
-  # NFQUEUE handles only the transparently proxied service ports; direct
-  # destinations are gated by seccomp user notification and then accepted by
-  # the kernel route. Denied destinations get a short reject-set entry only
-  # so client calls fail quickly instead of retrying until TCP timeout.
-  # Established/related conntrack entries, DNS traffic to the forwarder, and
-  # transient reject entries bypass NFQUEUE.
+  # NFQUEUE handles the transparently proxied service ports and new UDP
+  # flows; direct TCP destinations are gated by seccomp user notification
+  # and then accepted by the kernel route. Denied destinations get a short
+  # reject-set entry only so client calls fail quickly instead of retrying
+  # until TCP timeout. Established/related conntrack entries, DNS traffic
+  # to the forwarder, and transient reject entries bypass NFQUEUE.
   nftRules = ''
     table inet agent_sandbox {
       # Transient reject sets for denied destinations.
@@ -195,6 +200,13 @@ let
         size 65535;
         policy performance;
         timeout 10s;
+      }
+      # The transparent proxy runs inside the netns. Its own sockets are
+      # exempt from the UDP queue below; the netns up script populates this
+      # set with the proxy uid at runtime.
+      set proxy_uid {
+        type uid;
+        size 1;
       }
 
       chain output {
@@ -221,7 +233,20 @@ let
         ${lib.optionalString (!cfg.httpProxy.enable)
           "    ip protocol tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    ip protocol udp queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto tcp tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}\n    meta nfproto ipv6 meta l4proto udp queue num ${toString runtime.queueNumber}\n"
         }
-        ${lib.optionalString cfg.httpProxy.enable "    # Direct ports were approved by seccomp user notification; keep them on the kernel route.\n    ip protocol tcp accept\n    ip protocol udp accept\n    meta nfproto ipv6 meta l4proto tcp accept\n    meta nfproto ipv6 meta l4proto udp accept\n"}
+        ${lib.optionalString cfg.httpProxy.enable ''
+          # The proxy's own upstream sockets must not be queued back for
+          # policy; without this its HTTP/3 backend flows would be
+          # registered as intercepted proxy flows.
+          meta skuid @proxy_uid accept
+          # Direct TCP ports were approved by seccomp user notification;
+          # keep them on the kernel route. New UDP flows are queued for a
+          # transport check (one deduped prompt per host:port), then
+          # established flows pass via the conntrack rule above.
+          ip protocol tcp accept
+          ip protocol udp ct state new,untracked queue num ${toString runtime.queueNumber}
+          meta nfproto ipv6 meta l4proto tcp accept
+          meta nfproto ipv6 meta l4proto udp ct state new,untracked queue num ${toString runtime.queueNumber}
+        ''}
       }
     }
   '';

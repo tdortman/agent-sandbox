@@ -34,6 +34,8 @@ ip netns exec "$NETNS" nft -f - <<EOF
 @nftRules@
 EOF
 
+@proxyUidElement@
+
 "@hostNatBin@"
 
 nft add rule ip agent_sandbox_host postrouting \

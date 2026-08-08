@@ -360,6 +360,21 @@ let
 
           network = {
             enable = true;
+
+            declarativeAllow = [
+              {
+                host = "169.254.100.1";
+                port = 18082;
+              }
+            ];
+
+            declarativeDeny = [
+              {
+                host = "169.254.100.1";
+                port = 18083;
+              }
+            ];
+
             dnsForwardTarget = "169.254.100.1:5353";
 
             httpProxy = {
@@ -516,6 +531,26 @@ let
             preStart = ''
               echo -n 169.254.100.1:4444 > /var/lib/h3-origin/alt-svc
             '';
+          };
+
+          agent-sandbox-vm-udp-18082 = {
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18082,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+              Restart = "on-failure";
+              User = "sandbox";
+            };
+          };
+
+          agent-sandbox-vm-udp-18083 = {
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18083,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+              Restart = "on-failure";
+              User = "sandbox";
+            };
           };
         };
       };
@@ -1271,6 +1306,13 @@ let
               wrapper=session_wrapper,
           )
       )
+      # Proxy mode gates UDP at the packet layer: new flows are queued for a
+      # transport check (one prompt per host:port), then established flows
+      # pass via conntrack.
+      proxy.wait_for_unit("agent-sandbox-vm-udp-18082.service")
+      proxy.wait_for_unit("agent-sandbox-vm-udp-18083.service")
+      sandbox_shell(proxy, "sandbox-proxy-bash", "printf udp-ok | timeout 5 socat - UDP4:169.254.100.1:18082 | grep -q udp-ok", wrapper=session_wrapper)
+      sandbox_shell(proxy, "sandbox-proxy-bash", "printf blocked | timeout 3 socat - UDP4:169.254.100.1:18083 | grep -q blocked", wrapper=session_wrapper, expect_success=False)
       proxy.succeed("journalctl --no-pager -b -u agent-sandbox-proxy.service | grep -F -q 'attributed alternative QUIC endpoint'")
 
       proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -ne 0; test \"$before\" = \"$after\"")
