@@ -1,10 +1,8 @@
 use crate::{NetworkTarget, ResourceTarget};
-
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
     ResourceCheckReply, RpcReply, RpcRequest, resolve_sandbox_paths,
 };
-
 use std::{
     io,
     path::{Path, PathBuf},
@@ -152,18 +150,74 @@ impl PersistentPolicyClient {
 
 #[cfg(test)]
 mod tests {
-    use super::PersistentPolicyClient;
-
+    use super::{PersistentPolicyClient, request_context};
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
-
     use std::{path::Path, time::Duration};
-
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    /// Restore process environment mutated by tests that exercise the
+    /// sandbox-path resolution fallback.
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024; test-only.
+    impl EnvGuard {
+        fn set(entries: &[(&'static str, &str)]) -> Self {
+            let previous = entries
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect();
+
+            for (key, value) in entries {
+                // SAFETY: tests run single-threaded within this binary's
+                // test threads, and every key is restored on drop.
+                unsafe { std::env::set_var(key, value) };
+            }
+
+            Self(previous)
+        }
+    }
+
+    #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024; test-only.
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                // SAFETY: restoring the values captured in `set`.
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_context_resolves_sandbox_paths_from_environment() {
+        let _guard = EnvGuard::set(&[
+            (
+                "AGENT_SANDBOX_SESSION_CONTEXT_PATH",
+                "/nonexistent/agent-sandbox-session-context.json",
+            ),
+            ("AGENT_SANDBOX_CWD", "/work"),
+            ("AGENT_SANDBOX_HOME", "/home/sbx"),
+            ("AGENT_SANDBOX_PROJECT_ROOT", "/work/repo"),
+        ]);
+
+        let ctx = request_context(42, Some("session-a".into()));
+
+        assert_eq!(ctx.sandbox_paths().cwd(), Some(Path::new("/work")));
+        assert_eq!(ctx.sandbox_paths().home(), Some(Path::new("/home/sbx")));
+        assert_eq!(
+            ctx.sandbox_paths().project_root(),
+            Some(Path::new("/work/repo"))
+        );
+        assert_eq!(ctx.sandbox_session_id.as_deref(), Some("session-a"));
+        assert_eq!(ctx.ids().pid(), Some(42));
+    }
 
     #[tokio::test]
     async fn mismatched_reply_invalidates_connection_before_next_request() {
