@@ -9,8 +9,8 @@ use super::{
 };
 use crate::wire::ResourceCheckRequest;
 use agent_sandbox_core::{
-    DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply, ResourceKind,
-    ResourceRuleKey, UiPush, VerdictSource,
+    DbusCheckReply, DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
+    ResourceKind, ResourceRuleKey, UiPush, VerdictSource,
 };
 use std::{
     path::{Path, PathBuf},
@@ -19,10 +19,10 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-struct PendingResResult {
+struct PendingResResult<T> {
     id: String,
     is_new: bool,
-    rx: oneshot::Receiver<ResourceCheckReply>,
+    rx: oneshot::Receiver<T>,
 }
 
 /// Context fields threaded into
@@ -58,14 +58,6 @@ impl PolicyStore {
     }
 
     pub async fn request_resource_approval(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
-        self.request_resource_approval_with_target(req, None).await
-    }
-
-    pub(crate) async fn request_resource_approval_with_target(
-        &self,
-        req: ResourceCheckRequest,
-        dbus_target: Option<DbusTarget>,
-    ) -> ResourceCheckReply {
         let ResourceCheckRequest {
             kind,
             path,
@@ -79,7 +71,7 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root_path();
         let sandbox_session_id = ctx.sandbox_session_id.clone();
 
-        if dbus_target.is_none() && self.resource_policy_denied(kind, &path, access, &ctx).await {
+        if self.resource_policy_denied(kind, &path, access, &ctx).await {
             return ResourceCheckReply::denied(VerdictSource::policy(), kind, path.clone(), access);
         }
 
@@ -92,18 +84,12 @@ impl PolicyStore {
         }
 
         let result = match self
-            .dedup_or_create_pending_resource(
-                kind,
-                &path,
-                access,
-                dbus_target.as_ref(),
-                &PendingCtx {
-                    cwd: cwd.as_deref(),
-                    home: home.as_deref(),
-                    project_root: project_root.as_deref(),
-                    sandbox_session_id: sandbox_session_id.as_deref(),
-                },
-            )
+            .dedup_or_create_pending_resource(kind, &path, access, &PendingCtx {
+                cwd: cwd.as_deref(),
+                home: home.as_deref(),
+                project_root: project_root.as_deref(),
+                sandbox_session_id: sandbox_session_id.as_deref(),
+            })
             .await
         {
             Ok(r) => r,
@@ -111,24 +97,14 @@ impl PolicyStore {
         };
 
         if result.is_new {
-            let push = match dbus_target.as_ref() {
-                Some(target) => UiPush::DbusRequest {
-                    id: result.id.clone(),
-                    target: target.clone(),
-                    cwd: cwd.clone(),
-                    home: home.clone(),
-                    project_root: project_root.clone(),
-                    sandbox_session_id: sandbox_session_id.clone(),
-                },
-                None => UiPush::ResourceRequest {
-                    id: result.id.clone(),
-                    kind,
-                    path: path.clone(),
-                    access,
-                    cwd: cwd.clone(),
-                    home: home.clone(),
-                    project_root: project_root.clone(),
-                },
+            let push = UiPush::ResourceRequest {
+                id: result.id.clone(),
+                kind,
+                path: path.clone(),
+                access,
+                cwd: cwd.clone(),
+                home: home.clone(),
+                project_root: project_root.clone(),
             };
 
             self.notify_general_ui(&ctx, &push).await;
@@ -146,6 +122,84 @@ impl PolicyStore {
 
         self.await_resource_verdict(&ctx, &result.id, kind, path, access, result.rx)
             .await
+    }
+
+    /// Route a D-Bus capability through the interactive approval pipeline.
+    /// Callers apply declarative rules first. `target` is the typed
+    /// capability, so no path encoding is involved.
+    pub async fn request_dbus_approval(
+        &self,
+        target: DbusTarget,
+        ctx: ResolvedRequestContext,
+    ) -> DbusCheckReply {
+        if !self.args.interactive_approval {
+            return DbusCheckReply::denied(VerdictSource::Blocked, target);
+        }
+
+        if let Some(reply) = self.check_dbus_verdict_cache(&target).await {
+            return reply;
+        }
+
+        let cwd = ctx.paths.cwd_path();
+        let home = ctx.paths.home_path();
+        let project_root = ctx.paths.project_root_path();
+        let sandbox_session_id = ctx.sandbox_session_id.clone();
+
+        let result = match self
+            .dedup_or_create_pending_dbus(&target, &PendingCtx {
+                cwd: cwd.as_deref(),
+                home: home.as_deref(),
+                project_root: project_root.as_deref(),
+                sandbox_session_id: sandbox_session_id.as_deref(),
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(reply) => return *reply,
+        };
+
+        if result.is_new {
+            let push = UiPush::DbusRequest {
+                id: result.id.clone(),
+                target: target.clone(),
+                cwd: cwd.clone(),
+                home: home.clone(),
+                project_root: project_root.clone(),
+                sandbox_session_id: sandbox_session_id.clone(),
+            };
+
+            self.notify_general_ui(&ctx, &push).await;
+
+            self.maybe_spawn_ui(
+                || self.has_ui_for_context(&ctx),
+                ctx.ids.uid(),
+                home.as_deref(),
+                cwd.as_deref(),
+                project_root.as_deref(),
+                sandbox_session_id.as_deref(),
+            )
+            .await;
+        }
+
+        self.await_dbus_verdict(&ctx, &result.id, target, result.rx)
+            .await
+    }
+
+    async fn check_dbus_verdict_cache(&self, target: &DbusTarget) -> Option<DbusCheckReply> {
+        let inner = self.inner.lock().await;
+
+        if let Some(entry) = inner.dbus_verdict_cache.get(target)
+            && entry.time.elapsed() < Duration::from_secs(2)
+        {
+            return Some(if entry.allowed {
+                DbusCheckReply::allowed(entry.source.clone(), target.clone())
+            } else {
+                DbusCheckReply::denied(entry.source.clone(), target.clone())
+            });
+        }
+
+        drop(inner);
+        None
     }
 
     async fn check_resource_verdict_cache(
@@ -178,9 +232,8 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        dbus_target: Option<&DbusTarget>,
         ctx: &PendingCtx<'_>,
-    ) -> Result<PendingResResult, ResourceCheckReply> {
+    ) -> Result<PendingResResult<ResourceCheckReply>, ResourceCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
@@ -189,16 +242,7 @@ impl PolicyStore {
         // a new prompt.
         let existing_id = inner.pending_values().find_map(|p| match p {
             Pending::Resource(res)
-                if dbus_target.is_none()
-                    && res.kind == kind
-                    && res.path == path
-                    && res.access == access =>
-            {
-                Some(res.id.clone())
-            }
-            Pending::Dbus(res)
-                if dbus_target == Some(&res.target)
-                    && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
+                if res.kind == kind && res.path == path && res.access == access =>
             {
                 Some(res.id.clone())
             }
@@ -248,33 +292,96 @@ impl PolicyStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
 
-        let pending = dbus_target.map_or_else(
-            || {
-                Pending::Resource(PendingResource {
-                    id: pending_id.clone(),
-                    created_at,
-                    kind,
-                    path: path.to_path_buf(),
-                    access,
-                    cwd: ctx.cwd.map(PathBuf::from),
-                    home: ctx.home.map(PathBuf::from),
-                    project_root: ctx.project_root.map(PathBuf::from),
-                    sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-                })
-            },
-            |target| {
-                Pending::Dbus(crate::store::types::PendingDbus {
-                    id: pending_id.clone(),
-                    created_at,
-                    target: target.clone(),
-                    path: path.to_path_buf(),
-                    cwd: ctx.cwd.map(PathBuf::from),
-                    home: ctx.home.map(PathBuf::from),
-                    project_root: ctx.project_root.map(PathBuf::from),
-                    sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-                })
-            },
-        );
+        let pending = Pending::Resource(PendingResource {
+            id: pending_id.clone(),
+            created_at,
+            kind,
+            path: path.to_path_buf(),
+            access,
+            cwd: ctx.cwd.map(PathBuf::from),
+            home: ctx.home.map(PathBuf::from),
+            project_root: ctx.project_root.map(PathBuf::from),
+            sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+        });
+
+        inner.insert_pending(pending);
+        drop(inner);
+
+        Ok(PendingResResult {
+            id: pending_id,
+            is_new: true,
+            rx,
+        })
+    }
+
+    async fn dedup_or_create_pending_dbus(
+        &self,
+        target: &DbusTarget,
+        ctx: &PendingCtx<'_>,
+    ) -> Result<PendingResResult<DbusCheckReply>, Box<DbusCheckReply>> {
+        let (tx, rx) = oneshot::channel();
+        let mut inner = self.inner.lock().await;
+
+        // Deduplicate: if a pending already exists for the same target and
+        // sandbox session, join its waiters instead of creating a new prompt.
+        let existing_id = inner.pending_values().find_map(|p| match p {
+            Pending::Dbus(res)
+                if &res.target == target
+                    && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
+            {
+                Some(res.id.clone())
+            }
+            _ => None,
+        });
+
+        if let Some(existing_id) = existing_id {
+            let waiter_count = inner.dbus_futures.get(&existing_id).map_or(0, Vec::len);
+
+            if waiter_count >= MAX_WAITERS_PER_PENDING {
+                return Err(Box::new(DbusCheckReply::blocked(
+                    "agent-sandbox: too many waiters for one D-Bus approval",
+                    target.clone(),
+                )));
+            }
+
+            inner
+                .dbus_futures
+                .entry(existing_id.clone())
+                .or_default()
+                .push(tx);
+
+            drop(inner);
+
+            return Ok(PendingResResult {
+                id: existing_id,
+                is_new: false,
+                rx,
+            });
+        }
+
+        if inner.pending_len() >= MAX_PENDING_APPROVALS {
+            return Err(Box::new(DbusCheckReply::blocked(
+                "agent-sandbox: too many pending approvals",
+                target.clone(),
+            )));
+        }
+
+        let pending_id = format!("dbus:{}", Uuid::now_v7().simple());
+        inner.dbus_futures.insert(pending_id.clone(), vec![tx]);
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+
+        let pending = Pending::Dbus(crate::store::types::PendingDbus {
+            id: pending_id.clone(),
+            created_at,
+            target: target.clone(),
+            cwd: ctx.cwd.map(PathBuf::from),
+            home: ctx.home.map(PathBuf::from),
+            project_root: ctx.project_root.map(PathBuf::from),
+            sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+        });
 
         inner.insert_pending(pending);
         drop(inner);
@@ -344,6 +451,54 @@ impl PolicyStore {
         .await
     }
 
+    async fn await_dbus_verdict(
+        &self,
+        ctx: &ResolvedRequestContext,
+        pending_id: &str,
+        target: DbusTarget,
+        rx: oneshot::Receiver<DbusCheckReply>,
+    ) -> DbusCheckReply {
+        self.wait_for_ui_or_verdict(
+            || self.has_ui_for_context(ctx),
+            rx,
+            None,
+            |reason| async move {
+                match reason {
+                    VerdictExit::NoUi => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.dbus_futures.remove(pending_id);
+                        drop(inner);
+
+                        DbusCheckReply::blocked(
+                            "agent-sandbox: no standalone policy UI registered (agent-sandbox-ui \
+                             or auto-spawn)",
+                            target,
+                        )
+                    }
+                    VerdictExit::ChannelClosed => {
+                        DbusCheckReply::denied(VerdictSource::Blocked, target)
+                    }
+                    VerdictExit::Timeout => {
+                        let mut inner = self.inner.lock().await;
+                        inner.take_pending(pending_id);
+                        inner.dbus_futures.remove(pending_id);
+                        drop(inner);
+
+                        DbusCheckReply::blocked(
+                            "agent-sandbox: D-Bus approval timed out (no response from policy UI)",
+                            target,
+                        )
+                    }
+                    VerdictExit::Cancelled => {
+                        unreachable!("no cancel channel wired for D-Bus waits")
+                    }
+                }
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn finish_resource(
         &self,
         pending_id: &str,
@@ -378,6 +533,37 @@ impl PolicyStore {
 
         enforce_verdict_cache_limit(&mut inner.resource_verdict_cache);
     }
+
+    pub(crate) async fn finish_dbus(
+        &self,
+        pending_id: &str,
+        target: DbusTarget,
+        allowed: bool,
+        source: VerdictSource,
+    ) {
+        let mut inner = self.inner.lock().await;
+
+        if let Some(waiters) = inner.dbus_futures.remove(pending_id) {
+            let reply = if allowed {
+                DbusCheckReply::allowed(source.clone(), target.clone())
+            } else {
+                DbusCheckReply::denied(source.clone(), target.clone())
+            };
+
+            for tx in waiters {
+                let _ = tx.send(reply.clone());
+            }
+        }
+
+        // Cache the verdict for deduplication.
+        inner.dbus_verdict_cache.insert(target, VerdictEntry {
+            allowed,
+            source,
+            time: Instant::now(),
+        });
+
+        enforce_verdict_cache_limit(&mut inner.dbus_verdict_cache);
+    }
 }
 
 #[cfg(test)]
@@ -388,8 +574,8 @@ mod tests {
         wire::ResourceCheckRequest,
     };
     use agent_sandbox_core::{
-        ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, SandboxPaths,
-        SocketAccess, VerdictSource,
+        DbusMessageKind, DbusTarget, ProcessIds, ResolvedRequestContext, ResourceAccess,
+        ResourceKind, SandboxPaths, SocketAccess, VerdictSource,
     };
     use std::{
         path::PathBuf,
@@ -495,6 +681,109 @@ mod tests {
         let reply = task.await.expect("task should not panic");
         assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
         assert_eq!(reply.source, VerdictSource::policy_with_comment("test"));
+    }
+
+    #[tokio::test]
+    async fn request_dbus_approval_prompts_standalone_ui_with_typed_target() {
+        let store = Arc::new(test_store());
+        let (a, b) = UnixStream::pair().expect("unix stream pair");
+        let (_, standalone_write) = a.into_split();
+        let (mut standalone_read, _) = b.into_split();
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui1".into(),
+                writer: Arc::new(Mutex::new(standalone_write)),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui1".into(), UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-cap".into()),
+                    ..Default::default()
+                });
+        }
+
+        let target = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Read",
+            DbusMessageKind::MethodCall,
+            "s",
+            Vec::new(),
+        );
+
+        let store_for_task = store.clone();
+        let target_for_task = target.clone();
+
+        let task = tokio::spawn(async move {
+            store_for_task
+                .request_dbus_approval(target_for_task, ResolvedRequestContext {
+                    paths: SandboxPaths::from_wire(
+                        Some("/repo".into()),
+                        Some("/home/user".into()),
+                        Some("/repo".into()),
+                    ),
+                    ids: ProcessIds::from_options(None, Some(1000)),
+                    sandbox_session_id: Some("sandbox-cap".into()),
+                })
+                .await
+        });
+
+        let mut buf = [0u8; 4096];
+
+        let n = tokio::time::timeout(Duration::from_millis(200), standalone_read.read(&mut buf))
+            .await
+            .expect("standalone UI should receive D-Bus prompt within 200ms")
+            .expect("read should succeed");
+
+        let received = String::from_utf8_lossy(&buf[..n]);
+
+        assert!(
+            received.contains("dbus:") && received.contains("org.example.Service"),
+            "expected pending id and typed D-Bus target in prompt, got: {received}"
+        );
+
+        assert!(
+            !received.contains("@dbus:"),
+            "no fake resource path may appear in the D-Bus prompt, got: {received}"
+        );
+
+        let pending_id = {
+            let inner = store.inner.lock().await;
+            inner
+                .pending_keys()
+                .find(|k| k.starts_with("dbus:"))
+                .cloned()
+                .expect("pending D-Bus request should be tracked")
+        };
+
+        store
+            .finish_dbus(
+                &pending_id,
+                target.clone(),
+                true,
+                VerdictSource::policy_with_comment("test"),
+            )
+            .await;
+
+        let reply = task.await.expect("task should not panic");
+        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
+        assert_eq!(reply.source, VerdictSource::policy_with_comment("test"));
+        assert_eq!(reply.target, target);
+
+        let inner = store.inner.lock().await;
+
+        assert!(
+            inner.dbus_verdict_cache.contains_key(&target),
+            "approved D-Bus target should be cached under the typed key"
+        );
+
+        drop(inner);
     }
 
     #[tokio::test]

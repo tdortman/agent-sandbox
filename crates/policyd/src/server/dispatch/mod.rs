@@ -24,8 +24,7 @@ pub async fn dispatch(
         return Err(PolicydError::UnauthorizedRequest);
     }
 
-    let req = context::plan(store, peer, role, req);
-    handlers::handle(store, client, peer, req).await
+    handlers::handle(store, client, peer, role, req).await
 }
 
 #[cfg(test)]

@@ -4,66 +4,66 @@ use crate::{
     error::PolicydError,
     server::{
         dispatch::{
+            SocketRole,
             check::{CheckArgs, handle_check},
-            context::ResolvedRpcRequest,
+            context,
         },
         peer::ClientPeer,
     },
-    store::{DecisionAction, PolicyStore, UiClientHandle},
-    wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire},
+    store::{DecisionAction, PolicyStore, TrustedPeer, UiClientHandle},
+    wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire},
 };
-
 use agent_sandbox_core::{
-    ApprovalScope, RegisterUiReply, ResolvedRequestContext, RpcReply, SimpleOkReply,
-    split_check_aliases,
+    ApprovalScope, RegisterUiReply, RequestContext, ResolvedRequestContext, RpcReply, RpcRequest,
+    SimpleOkReply, split_check_aliases,
 };
-
 use std::{path::PathBuf, sync::Arc};
 
 pub async fn handle(
     store: &Arc<PolicyStore>,
     client: &UiClientHandle,
     peer: ClientPeer,
-    req: ResolvedRpcRequest,
+    role: SocketRole,
+    req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     if is_proxy_request(&req) {
         return handle_proxy_request(store, client.id, req).await;
     }
 
-    handle_non_proxy_request(store, client, peer, req).await
+    handle_non_proxy_request(store, client, peer, role, req).await
 }
 
-const fn is_proxy_request(req: &ResolvedRpcRequest) -> bool {
+const fn is_proxy_request(req: &RpcRequest) -> bool {
     matches!(
         req,
-        ResolvedRpcRequest::OpenProxySession
-            | ResolvedRpcRequest::RegisterNetworkFlow { .. }
-            | ResolvedRpcRequest::ClaimNetworkFlow { .. }
-            | ResolvedRpcRequest::ClaimNetworkFlowBySource { .. }
-            | ResolvedRpcRequest::RebindNetworkFlow { .. }
-            | ResolvedRpcRequest::CheckHttp { .. }
-            | ResolvedRpcRequest::CheckNetworkFlow { .. }
-            | ResolvedRpcRequest::CancelCheck { .. }
-            | ResolvedRpcRequest::ReleaseNetworkFlow { .. }
+        RpcRequest::OpenProxySession
+            | RpcRequest::RegisterNetworkFlow { .. }
+            | RpcRequest::ClaimNetworkFlow { .. }
+            | RpcRequest::ClaimNetworkFlowBySource { .. }
+            | RpcRequest::RebindNetworkFlow { .. }
+            | RpcRequest::CheckHttp { .. }
+            | RpcRequest::CheckNetworkFlow { .. }
+            | RpcRequest::CancelCheck { .. }
+            | RpcRequest::ReleaseNetworkFlow { .. }
     )
 }
 
 async fn handle_proxy_request(
     store: &Arc<PolicyStore>,
     client_id: u64,
-    req: ResolvedRpcRequest,
+    req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
     match req {
-        ResolvedRpcRequest::OpenProxySession => Ok(RpcReply::ProxySession(
+        RpcRequest::OpenProxySession => Ok(RpcReply::ProxySession(
             store.open_proxy_session(client_id).await?,
         )),
 
-        ResolvedRpcRequest::RegisterNetworkFlow { registration } => {
+        RpcRequest::RegisterNetworkFlow { registration } => {
             store.register_network_flow(registration).await?;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
-        ResolvedRpcRequest::ClaimNetworkFlow {
+        RpcRequest::ClaimNetworkFlow {
             proxy_session,
             flow,
             connection_id,
@@ -73,7 +73,7 @@ async fn handle_proxy_request(
                 .await?,
         )),
 
-        ResolvedRpcRequest::ClaimNetworkFlowBySource {
+        RpcRequest::ClaimNetworkFlowBySource {
             proxy_session,
             selector,
             connection_id,
@@ -83,7 +83,7 @@ async fn handle_proxy_request(
                 .await?,
         )),
 
-        ResolvedRpcRequest::RebindNetworkFlow {
+        RpcRequest::RebindNetworkFlow {
             proxy_session,
             attribution_token,
             connection_id,
@@ -95,7 +95,7 @@ async fn handle_proxy_request(
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
-        ResolvedRpcRequest::CheckHttp {
+        RpcRequest::CheckHttp {
             proxy_session,
             request_id,
             attribution_token,
@@ -106,7 +106,7 @@ async fn handle_proxy_request(
                 .await?,
         )),
 
-        ResolvedRpcRequest::CheckNetworkFlow {
+        RpcRequest::CheckNetworkFlow {
             proxy_session,
             request_id,
             attribution_token,
@@ -116,7 +116,7 @@ async fn handle_proxy_request(
                 .await?,
         )),
 
-        ResolvedRpcRequest::CancelCheck {
+        RpcRequest::CancelCheck {
             proxy_session,
             request_id,
         } => {
@@ -124,7 +124,7 @@ async fn handle_proxy_request(
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
-        ResolvedRpcRequest::ReleaseNetworkFlow {
+        RpcRequest::ReleaseNetworkFlow {
             proxy_session,
             attribution_token,
             connection_id,
@@ -171,19 +171,22 @@ async fn handle_non_proxy_request(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,
-    req: ResolvedRpcRequest,
+    role: SocketRole,
+    req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
+    let resolve = |ctx: &RequestContext| context::resolve_request_context(store, peer, role, ctx);
+
     match req {
-        ResolvedRpcRequest::RegisterUi { ctx } => {
-            handle_register_ui(store, client, peer, ctx).await
+        RpcRequest::RegisterUi { ui_client: _, ctx } => {
+            handle_register_ui(store, client, peer, resolve(&ctx)).await
         }
 
-        ResolvedRpcRequest::UnregisterUi => {
+        RpcRequest::UnregisterUi => {
             store.end_ui_session(client.id).await;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
-        ResolvedRpcRequest::Check {
+        RpcRequest::Check {
             host,
             connect_host,
             port,
@@ -198,37 +201,55 @@ async fn handle_non_proxy_request(
                 scheme,
                 url,
                 aliases: Vec::new(),
-                ctx,
+                ctx: resolve(&ctx),
             })
             .await
         }
 
-        ResolvedRpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
+        RpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
             store
-                .check_filesystem(crate::wire::FilesystemCheckRequest { path, access, ctx })
+                .check_filesystem(crate::wire::FilesystemCheckRequest {
+                    path,
+                    access,
+                    ctx: resolve(&ctx),
+                })
                 .await,
         )),
 
-        ResolvedRpcRequest::CheckResource {
+        RpcRequest::CheckResource {
             kind,
             path,
             access,
             ctx,
-        } => handle_check_resource(store, kind, path, access, ctx).await,
+        } => handle_check_resource(store, kind, path, access, resolve(&ctx)).await,
 
-        ResolvedRpcRequest::CheckDbus { target, ctx } => Ok(RpcReply::DbusCheck(
-            store
-                .check_dbus(crate::wire::DbusCheckRequest { target, ctx })
-                .await,
-        )),
+        RpcRequest::CheckDbus { target, ctx } => {
+            let ctx = if role == SocketRole::Host {
+                PolicyStore::resolve_dbus_proxy_context(&MergeContext::from(&ctx), TrustedPeer {
+                    pid: peer.pid,
+                    uid: peer.uid,
+                })
+            } else {
+                resolve(&ctx)
+            };
+            Ok(RpcReply::DbusCheck(
+                store
+                    .check_dbus(crate::wire::DbusCheckRequest { target, ctx })
+                    .await,
+            ))
+        }
 
-        ResolvedRpcRequest::StartFilesystemMonitor {
-            peer_pid,
-            ctx,
-            static_allow,
-        } => handle_start_filesystem_monitor(store, peer_pid, ctx, static_allow).await,
+        RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
+            let ctx = resolve(&ctx);
+            let peer_pid = if peer.pid > 0 {
+                peer.pid
+            } else {
+                ctx.ids.pid().unwrap_or(0)
+            };
+            handle_start_filesystem_monitor(store, peer_pid, ctx, static_allow).await
+        }
 
-        req => handle_non_proxy_tail(store, client, peer, req).await,
+        req => handle_non_proxy_tail(store, client, peer, role, req).await,
     }
 }
 
@@ -236,12 +257,17 @@ async fn handle_non_proxy_tail(
     store: &Arc<PolicyStore>,
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,
-    req: ResolvedRpcRequest,
+    role: SocketRole,
+    req: RpcRequest,
 ) -> Result<RpcReply, PolicydError> {
-    match req {
-        ResolvedRpcRequest::Elevate { argv, ctx } => handle_elevate_request(store, argv, ctx).await,
+    let resolve = |ctx: &RequestContext| context::resolve_request_context(store, peer, role, ctx);
 
-        ResolvedRpcRequest::Approve {
+    match req {
+        RpcRequest::Elevate { argv, ctx } => {
+            handle_elevate_request(store, argv, resolve(&ctx)).await
+        }
+
+        RpcRequest::Approve {
             id,
             scope,
             session_id,
@@ -256,7 +282,7 @@ async fn handle_non_proxy_tail(
                     target,
                     wire: ScopeWire {
                         comment,
-                        ..ScopeWire::from_resolved(&ctx, session_id)
+                        ..ScopeWire::from_resolved(&resolve(&ctx), session_id)
                     },
                     client_id: client.id,
                     approver_uid: (peer.uid > 0).then_some(peer.uid),
@@ -265,24 +291,26 @@ async fn handle_non_proxy_tail(
             )
             .await),
 
-        ResolvedRpcRequest::ApproveHost {
+        RpcRequest::ApproveHost {
             host,
             port,
             scope,
             session_id,
             ctx,
-        } => handle_approve_host(store, host, port, scope, session_id, ctx).await,
+        } => handle_approve_host(store, host, port, scope, session_id, resolve(&ctx)).await,
 
-        ResolvedRpcRequest::ApproveHttp {
+        RpcRequest::ApproveHttp {
             target,
             scope,
             session_id,
             ctx,
         } => Ok(RpcReply::ScopeAction(
-            store.approve_http(target, scope, session_id, ctx).await?,
+            store
+                .approve_http(target, scope, session_id, resolve(&ctx))
+                .await?,
         )),
 
-        ResolvedRpcRequest::Deny {
+        RpcRequest::Deny {
             id,
             scope,
             session_id,
@@ -297,7 +325,7 @@ async fn handle_non_proxy_tail(
                     target,
                     wire: ScopeWire {
                         comment,
-                        ..ScopeWire::from_resolved(&ctx, session_id)
+                        ..ScopeWire::from_resolved(&resolve(&ctx), session_id)
                     },
                     client_id: client.id,
                     approver_uid: (peer.uid > 0).then_some(peer.uid),
@@ -306,10 +334,10 @@ async fn handle_non_proxy_tail(
             )
             .await),
 
-        ResolvedRpcRequest::Status { ctx } => Ok(RpcReply::Status(store.status(ctx).await)),
+        RpcRequest::Status { ctx } => Ok(RpcReply::Status(store.status(resolve(&ctx)).await)),
 
-        ResolvedRpcRequest::Reload { ctx } => store
-            .export_policy_files(ctx.paths)
+        RpcRequest::Reload { ctx } => store
+            .export_policy_files(resolve(&ctx).paths)
             .map_err(PolicydError::from)
             .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
 
@@ -437,12 +465,10 @@ async fn handle_approve_host(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         error::PolicydError,
         store::{PolicyStore, TrustedPeer},
     };
-
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
     use std::{sync::Arc, time::Duration};
     use tokio::{net::UnixStream, sync::Mutex};

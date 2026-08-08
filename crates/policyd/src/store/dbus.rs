@@ -1,16 +1,11 @@
 use super::PolicyStore;
 use crate::wire::DbusCheckRequest;
 
-use agent_sandbox_core::{
-    ApprovalScope, DbusCheckReply, ResourceAccess, ResourceKind, Verdict, VerdictSource,
-};
-
-use std::path::PathBuf;
+use agent_sandbox_core::{ApprovalScope, DbusCheckReply, Verdict, VerdictSource};
 
 impl PolicyStore {
     /// Check a D-Bus target against declarative rules, then route unknown
-    /// capabilities through the typed approval path. The encoded target is
-    /// retained only as an internal deduplication key.
+    /// capabilities through the typed approval path.
     pub async fn check_dbus(&self, req: DbusCheckRequest) -> DbusCheckReply {
         let DbusCheckRequest { target, ctx } = req;
         let policy_verdict = self.dbus_verdict(&target, &ctx);
@@ -36,16 +31,6 @@ impl PolicyStore {
             return DbusCheckReply::from_verdict(verdict, target);
         }
 
-        let encoded = match serde_json::to_string(&target) {
-            Ok(value) => value,
-            Err(err) => {
-                return DbusCheckReply::blocked(
-                    format!("agent-sandbox: invalid D-Bus target: {err}"),
-                    target,
-                );
-            }
-        };
-
         let Some(pid) = ctx.ids.pid() else {
             return DbusCheckReply::blocked(
                 "agent-sandbox: cannot identify sandbox process for D-Bus approval",
@@ -63,27 +48,6 @@ impl PolicyStore {
             }
         };
 
-        let reply = self
-            .request_resource_approval_with_target(
-                crate::wire::ResourceCheckRequest {
-                    kind: ResourceKind::UnixSocket,
-                    path: PathBuf::from(format!("@dbus:{encoded}")),
-                    access: ResourceAccess::default(),
-                    ctx,
-                },
-                Some(target.clone()),
-            )
-            .await;
-
-        let mut result = DbusCheckReply::from_verdict(
-            Verdict {
-                allowed: reply.allowed,
-                source: reply.source,
-            },
-            target,
-        );
-
-        result.error = reply.error;
-        result
+        self.request_dbus_approval(target, ctx).await
     }
 }

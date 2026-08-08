@@ -15,8 +15,8 @@ use crate::{
 
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
-    NetworkRuleKey, ResourceAccess, ResourceKind, ResourceRule, RpcReply, ScopeActionReply,
-    SocketAccess, SudoRule, VerdictSource, host_pattern_matches,
+    NetworkRuleKey, ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SocketAccess,
+    SudoRule, VerdictSource, host_pattern_matches,
 };
 
 use std::path::{Path, PathBuf};
@@ -540,18 +540,9 @@ impl PolicyStore {
             VerdictSource::User
         };
 
-        let path = res.path.clone();
-
         if scope == ApprovalScope::Once {
-            self.finish_resource(
-                &res.id,
-                ResourceKind::UnixSocket,
-                path,
-                ResourceAccess::default(),
-                allowed,
-                source,
-            )
-            .await;
+            self.finish_dbus(&res.id, res.target.clone(), allowed, source)
+                .await;
 
             return RpcReply::ScopeAction(ScopeActionReply::ok_dbus(dbus_target, scope, None));
         }
@@ -563,15 +554,8 @@ impl PolicyStore {
             .await;
 
         if result.scope_succeeded() {
-            self.finish_resource(
-                &res.id,
-                ResourceKind::UnixSocket,
-                path,
-                ResourceAccess::default(),
-                allowed,
-                source,
-            )
-            .await;
+            self.finish_dbus(&res.id, res.target.clone(), allowed, source)
+                .await;
         } else {
             self.inner.lock().await.insert_pending(Pending::Dbus(res));
         }
@@ -850,8 +834,8 @@ mod tests {
 
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
-        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, ResourceRuleKey, RpcReply,
-        SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
+        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
+        ScopeActionReply, SocketAccess, load_policy,
     };
 
     use std::{
@@ -1426,7 +1410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dbus_once_approval_caches_encoded_pending_path() {
+    async fn dbus_once_approval_caches_typed_target() {
         let store = test_store("dbus-once");
 
         let target = DbusTarget::session(
@@ -1439,8 +1423,6 @@ mod tests {
             Vec::new(),
         );
 
-        let encoded = serde_json::to_string(&target).expect("encode D-Bus target");
-        let path = PathBuf::from(format!("@dbus:{encoded}"));
         let pending_id = "dbus:once".to_owned();
 
         {
@@ -1449,7 +1431,6 @@ mod tests {
                 id: pending_id.clone(),
                 created_at: 0.0,
                 target: target.clone(),
-                path: path.clone(),
                 cwd: Some("/repo".into()),
                 home: Some("/home/user".into()),
                 project_root: Some("/repo".into()),
@@ -1485,18 +1466,9 @@ mod tests {
 
         let inner = store.inner.lock().await;
 
-        assert!(inner.resource_verdict_cache.contains_key(&ResourceRuleKey {
-            kind: ResourceKind::UnixSocket,
-            path: path.clone(),
-            access: ResourceAccess::default(),
-        }));
-
         assert!(
-            !inner.resource_verdict_cache.contains_key(&ResourceRuleKey {
-                kind: ResourceKind::UnixSocket,
-                path: PathBuf::from("@dbus"),
-                access: ResourceAccess::default(),
-            })
+            inner.dbus_verdict_cache.contains_key(&target),
+            "once-approved D-Bus target should be cached under the typed key"
         );
 
         drop(inner);
@@ -1539,7 +1511,6 @@ mod tests {
                 id: pending_id.clone(),
                 created_at: 0.0,
                 target: requested.clone(),
-                path: PathBuf::from("@dbus:placeholder"),
                 cwd: Some("/repo".into()),
                 home: Some(home.clone()),
                 project_root: None,

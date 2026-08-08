@@ -1,11 +1,11 @@
 //! Policy store types and shared state.
 
 use agent_sandbox_core::{
-    AttributionToken, CheckReply, DbusTarget, ElevateReply, FileAccess, FilesystemCheckReply,
-    FilesystemRule, FilesystemRuleKey, FlowRegistration, HttpCheckReply, HttpContextKey,
-    HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId, ProxyConnectionId,
-    ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
-    ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
+    AttributionToken, CheckReply, DbusCheckReply, DbusTarget, ElevateReply, FileAccess,
+    FilesystemCheckReply, FilesystemRule, FilesystemRuleKey, FlowRegistration, HttpCheckReply,
+    HttpContextKey, HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId,
+    ProxyConnectionId, ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess,
+    ResourceCheckReply, ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
 };
 
 use std::{
@@ -203,7 +203,6 @@ pub struct PendingDbus {
     pub id: String,
     pub created_at: f64,
     pub target: DbusTarget,
-    pub path: PathBuf,
     pub cwd: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
@@ -457,6 +456,7 @@ pub struct PolicyDecisionState {
     pub(crate) network_futures: HashMap<String, Vec<NetworkWaiter>>,
     pub(crate) filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
     pub(crate) resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,
+    pub(crate) dbus_futures: HashMap<String, Vec<oneshot::Sender<DbusCheckReply>>>,
     pub(crate) http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
     pub(crate) http_waiters: HashMap<(ProxySessionToken, ProxyRequestId), PendingHttpId>,
     pub(crate) proxy_cancellations: HashMap<(ProxySessionToken, ProxyRequestId), ProxyCancellation>,
@@ -465,6 +465,7 @@ pub struct PolicyDecisionState {
     pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
     pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
     pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,
+    pub(crate) dbus_verdict_cache: HashMap<DbusTarget, VerdictEntry>,
     pub(crate) http_verdict_cache: HashMap<HttpPendingKey, VerdictEntry>,
     pub(crate) ui_spawn_last: HashMap<String, Instant>,
     pub(crate) session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
