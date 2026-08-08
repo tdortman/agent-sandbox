@@ -10,7 +10,7 @@ use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
     ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity,
-    socket_owner::validate_socket_identity,
+    scheme_for, socket_owner::validate_socket_identity,
 };
 
 use std::time::{Duration, Instant};
@@ -75,15 +75,6 @@ fn validate_rebind_candidate(
     }
 
     Ok(())
-}
-
-const fn transport_scheme(protocol: FlowProtocol, port: u16) -> &'static str {
-    match (protocol, port) {
-        (FlowProtocol::Tcp, 80 | 8008 | 8080) => "http",
-        (FlowProtocol::Udp, 443) => "http3",
-        (FlowProtocol::Tcp, _) => "tcp",
-        (FlowProtocol::Udp, _) => "udp",
-    }
 }
 
 impl PolicyStore {
@@ -372,7 +363,7 @@ impl PolicyStore {
                 NetworkCheckRequest {
                     host,
                     port,
-                    scheme: transport_scheme(protocol, port).into(),
+                    scheme: scheme_for(protocol, port).into(),
                     url: String::new(),
                     ctx,
                 },

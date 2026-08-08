@@ -13,8 +13,8 @@ mod policy;
 
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
-    FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost,
-    OwnerSnapshot, SandboxPaths, SocketIdentity, lookup_dns_cache, mappings_from_response,
+    FlowContext, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost, OwnerSnapshot,
+    SandboxPaths, SocketIdentity, is_http_service_port, lookup_dns_cache, mappings_from_response,
     sandbox_session_id_from_pid,
 };
 use clap::Parser;
@@ -634,16 +634,6 @@ where
     }
 }
 
-const fn proxy_flow_port(protocol: packet::TransportProtocol, port: u16) -> bool {
-    matches!(
-        (protocol, port),
-        (
-            packet::TransportProtocol::Tcp,
-            80 | 443 | 8008 | 8080 | 8443
-        )
-    )
-}
-
 impl NfqState {
     /// Whether this UDP port's flows are registered for the transparent
     /// HTTP/3 proxy.
@@ -666,10 +656,7 @@ fn is_approved_flow(
         return false;
     };
 
-    let protocol = match meta.protocol {
-        packet::TransportProtocol::Tcp => FlowProtocol::Tcp,
-        packet::TransportProtocol::Udp => FlowProtocol::Udp,
-    };
+    let protocol = meta.protocol;
 
     let Ok(flow) = NetworkFlowKey::try_new(
         protocol,
@@ -734,10 +721,7 @@ fn register_proxy_flow(
         return Verdict::Drop;
     };
 
-    let protocol = match meta.protocol {
-        packet::TransportProtocol::Tcp => FlowProtocol::Tcp,
-        packet::TransportProtocol::Udp => FlowProtocol::Udp,
-    };
+    let protocol = meta.protocol;
 
     let Ok(flow) = NetworkFlowKey::try_new(
         protocol,
@@ -884,8 +868,7 @@ where
 
     let tcp_proxy_flow = state.proxy_mode
         && !meta.dst_ip.is_loopback()
-        && meta.protocol == packet::TransportProtocol::Tcp
-        && proxy_flow_port(meta.protocol, meta.dst_port);
+        && is_http_service_port(meta.protocol, meta.dst_port);
 
     let udp_proxy_flow = state.proxy_mode
         && !meta.dst_ip.is_loopback()
@@ -1087,6 +1070,7 @@ fn handle_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sandbox_core::FlowProtocol;
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType, rdata::A},
@@ -1141,10 +1125,10 @@ mod tests {
     #[test]
     fn proxy_flow_ports_match_routed_protocols() {
         for port in [80, 443, 8008, 8080, 8443] {
-            assert!(proxy_flow_port(packet::TransportProtocol::Tcp, port));
+            assert!(is_http_service_port(FlowProtocol::Tcp, port));
         }
 
-        assert!(!proxy_flow_port(packet::TransportProtocol::Tcp, 853));
+        assert!(!is_http_service_port(FlowProtocol::Tcp, 853));
     }
 
     #[test]

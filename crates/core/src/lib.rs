@@ -15,6 +15,7 @@ pub mod rpc;
 pub mod rpc_client;
 pub mod scope_target;
 pub mod socket_owner;
+pub mod transport;
 
 pub use context::{
     PeerCredentials, ProcContext, ProcessIds, ResolvedRequestContext, SandboxPaths,
@@ -74,3 +75,4 @@ pub use scope_target::{ScopeContext, ScopeTarget};
 pub use socket_owner::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };
+pub use transport::{is_http_service_port, scheme_for};

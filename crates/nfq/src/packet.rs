@@ -13,21 +13,7 @@ pub struct Ipv6ExtResult {
 }
 
 /// Transport protocols enforced by the network policy daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransportProtocol {
-    Tcp,
-    Udp,
-}
-
-impl TransportProtocol {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-        }
-    }
-}
+pub use agent_sandbox_core::transport::FlowProtocol as TransportProtocol;
 
 /// Parsed metadata from a queued IP packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

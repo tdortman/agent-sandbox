@@ -1,5 +1,5 @@
 use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
-use agent_sandbox_core::ResourceKind;
+use agent_sandbox_core::{FlowProtocol, ResourceKind, is_http_service_port};
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
     SyscallTarget, notification_arch_valid, revalidate_filesystem_mutation, send_response,
@@ -31,10 +31,9 @@ fn should_bypass_network_policy(
         return false;
     }
 
-    if matches!(
-        (target.scheme.as_str(), target.port),
-        ("tcp", 80 | 443 | 8008 | 8080 | 8443)
-    ) {
+    // The proxy backend owns the registered HTTP(S) service ports, so the
+    // syscall gate must not double-gate them.
+    if target.scheme == "tcp" && is_http_service_port(FlowProtocol::Tcp, target.port) {
         return true;
     }
 

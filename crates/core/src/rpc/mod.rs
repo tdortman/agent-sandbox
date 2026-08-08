@@ -14,9 +14,11 @@ mod tests;
 
 pub use message::RpcMessage;
 
+pub use crate::transport::FlowProtocol;
+
 pub use proxy::{
-    AttributionToken, FlowContext, FlowProtocol, FlowRegistration, HttpApprovalRequest,
-    HttpCheckRequest, NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, ProcessIdentity,
+    AttributionToken, FlowContext, FlowRegistration, HttpApprovalRequest, HttpCheckRequest,
+    NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, ProcessIdentity,
     ProcessStartTimeTicks, ProxyConnectionId, ProxyRequestId, ProxySessionToken, SocketIdentity,
     SocketInode,
 };

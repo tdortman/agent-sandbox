@@ -5,6 +5,7 @@ use super::request::RequestContext;
 use crate::{
     HttpRequest, HttpRuleTarget, SandboxPaths,
     hosts::{normalize_dns_name, normalize_host},
+    transport::FlowProtocol,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
@@ -484,14 +485,6 @@ macro_rules! capability_token {
 
 capability_token!(ProxySessionToken);
 capability_token!(AttributionToken);
-
-/// Transport protocol attached to a registered flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FlowProtocol {
-    Tcp,
-    Udp,
-}
 
 /// Complete local/remote tuple used for owner revalidation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

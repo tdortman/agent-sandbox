@@ -15,9 +15,10 @@ use super::{
 };
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
-    HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess, ResourceKind,
-    ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush, contract_project_path,
-    host_pattern_matches, is_ip_literal, normalize_dns_name, split_check_aliases,
+    FlowProtocol, HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess,
+    ResourceKind, ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush,
+    contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name,
+    scheme_for, split_check_aliases,
 };
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -1486,10 +1487,18 @@ async fn choose_target_level(
 }
 
 fn network_prompt_scheme(transport: &str, port: u16) -> &str {
-    match (transport, port) {
-        ("tcp", 80 | 8008 | 8080) => "http",
-        ("tcp", 443 | 8443) | ("udp" | "http3", 443) => "https",
-        _ => transport,
+    let protocol = match transport {
+        "tcp" => FlowProtocol::Tcp,
+        "udp" | "http3" => FlowProtocol::Udp,
+        // "http"/"https" inputs are already schemes, not transport hints.
+        _ => return transport,
+    };
+
+    match scheme_for(protocol, port) {
+        // The wire classification for UDP 443 is "http3"; display URLs
+        // render it as https with a QUIC hint.
+        "http3" => "https",
+        scheme => scheme,
     }
 }
 
