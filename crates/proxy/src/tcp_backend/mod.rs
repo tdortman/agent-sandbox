@@ -1,3 +1,6 @@
+mod doh;
+mod semantic;
+mod tls;
 pub(crate) mod upstream;
 
 use crate::{
@@ -10,26 +13,24 @@ use crate::{
         reconcile_authorities,
     },
     semantic::{
-        BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
-        ResponseHead, ResponseSequence, SemanticHeaders, SemanticRequest, SemanticRequestParts,
-        TerminalError, is_hop_by_hop_header, semantic_request_headers,
+        BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
     },
 };
-use agent_sandbox_core::{EchRewrite, HttpCheckReply, HttpUrl, rewrite_ech_config};
+use agent_sandbox_core::{HttpCheckReply, HttpUrl};
+use doh::{is_doh_request, rewrite_doh_response};
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
     Service,
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
     extensions::ExtensionsRef,
-    io::Io,
     matcher::{match_fn, service::MatcherServicePair},
     rt::Executor,
     service::service_fn,
 };
 use rama_http::{
-    Body, HeaderMap, HeaderValue, Request, Response, StatusCode, Version,
-    body::{Frame, StreamingBody, util::BodyExt},
+    Body, HeaderValue, Request, Response, StatusCode, Version,
+    body::{Frame, StreamingBody},
     conn::TargetHttpVersion,
     io::upgrade::OnUpgrade,
     layer::{
@@ -47,7 +48,8 @@ use rama_net::{
 };
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
-use rama_tls_rustls::server::TlsStream as RustlsTlsStream;
+pub(crate) use semantic::SemanticRequestBody;
+use semantic::{bridge_response_body, semantic_http_version};
 #[cfg(debug_assertions)]
 use std::path::{Path, PathBuf};
 use std::{
@@ -58,6 +60,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tls::{RustlsTlsService, TlsServerName, build_tcp_tls_config};
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 use upstream::UpstreamClients;
@@ -66,7 +69,7 @@ pub const MAX_ACTIVE_CHECKS: usize = 256;
 const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
 #[derive(Debug)]
-struct PolicyDenied;
+pub(crate) struct PolicyDenied;
 
 impl Display for PolicyDenied {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -189,11 +192,6 @@ impl FlowState {
     }
 }
 
-#[derive(Debug, Clone)]
-struct TlsServerName(String);
-
-impl rama_core::extensions::Extension for TlsServerName {}
-
 /// Resolve the original destination of one accepted connection.
 ///
 /// The production build is a plain function pointer. Only debug builds
@@ -209,86 +207,6 @@ pub type DestinationResolver =
 #[must_use]
 pub fn destination_override(destination: SocketAddr) -> DestinationResolver {
     Arc::new(move |_stream: &TcpStream, _listen_port: u16| Ok(destination))
-}
-
-#[derive(Clone)]
-struct RustlsTlsService<S> {
-    config: Arc<rustls::ServerConfig>,
-    inner: S,
-}
-
-impl<S, IO> Service<IO> for RustlsTlsService<S>
-where
-    IO: Io + Unpin + ExtensionsRef + std::fmt::Debug + Sync + 'static,
-    S: Service<RustlsTlsStream<IO>, Error: Into<BoxError>>,
-{
-    type Error = BoxError;
-    type Output = S::Output;
-
-    async fn serve(&self, stream: IO) -> Result<Self::Output, Self::Error> {
-        // `TlsAcceptor` drives the full handshake state machine on a
-        // `ServerConnection`, including ECH decryption. The
-        // `LazyConfigAcceptor` path cannot be used: its config-independent
-        // ClientHello pre-processing skips ECH entirely.
-        let acceptor = rama_tls_rustls::dep::tokio_rustls::TlsAcceptor::from(self.config.clone());
-        let stream = acceptor.accept(stream).await?;
-
-        // Record the negotiated SNI on the connection extensions. The HTTP
-        // server clones those extensions into each request's `Ingress`,
-        // giving policy the verified TLS identity for authority resolution.
-        // With an accepted ECH offer this is the decrypted inner name.
-        let server_name = stream.get_ref().1.server_name().map(ToString::to_string);
-
-        let stream = RustlsTlsStream::new(stream);
-
-        if let Some(server_name) = server_name {
-            stream.extensions().insert(TlsServerName(server_name));
-        }
-
-        self.inner.serve(stream).await.map_err(Into::into)
-    }
-}
-
-/// Build the shared TLS configuration for one TCP listener.
-///
-/// The configuration is built once per listener and cloned per
-/// connection with a destination-aware certificate resolver. The clone
-/// shares the ticketer and session storage through their `Arc` fields,
-/// so resumption state survives between handshakes.
-fn build_tcp_tls_config(
-    issuer: CertificateIssuer,
-    ech: Option<&DownstreamEch>,
-    fallback_name: String,
-) -> Result<rustls::ServerConfig, BoxError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-    // The per-connection clone replaces this resolver with one that
-    // issues certificates for the destination address, so the placeholder
-    // is never used for a real handshake.
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(http3::SandboxCertResolver {
-            issuer,
-            fallback_name,
-        }));
-
-    // Terminate downstream ECH with the same key material the HTTP/3 leg
-    // uses, so clients that fetch their configuration through the sandbox
-    // DNS rewrite get a decryptable offer on both legs.
-    if let Some(ech) = ech {
-        tls = tls.with_ech_keys(ech.ech_keys()?).map_err(BoxError::from)?;
-    }
-
-    // h2 preferred, http/1.1 fallback: server preference order matching
-    // the previous accept implementation's ALPN callback.
-    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    // Real stateless tickets for TLS 1.2 and 1.3 resumption; the rustls
-    // default ticketer never produces tickets.
-    tls.ticketer = rustls::crypto::ring::Ticketer::new()?;
-
-    Ok(tls)
 }
 
 /// Run the TCP listener backend until shutdown.
@@ -652,90 +570,6 @@ fn original_destination(stream: &TcpStream) -> Option<SocketAddr> {
         })
 }
 
-fn is_doh_request(request: &Request) -> bool {
-    let content_type = request
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
-        });
-
-    let dns_query = request.uri().query().is_some_and(|query| {
-        query
-            .to_string()
-            .split('&')
-            .any(|part| part.starts_with("dns="))
-    });
-
-    (request.method().as_str().eq_ignore_ascii_case("POST") && content_type)
-        || (request.method().as_str().eq_ignore_ascii_case("GET") && dns_query)
-}
-
-fn is_doh_response(response: &Response) -> bool {
-    response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
-        })
-}
-
-/// Rewrite a successful `DoH` DNS response before returning it to the client.
-///
-/// Only `application/dns-message` responses are inspected. Unsupported content
-/// encodings and DNSSEC-protected ECH answers fail closed.
-async fn rewrite_doh_response(
-    mut response: Response,
-    ech_config_list: Option<&[u8]>,
-) -> Result<Response, BoxError> {
-    let Some(replacement) = ech_config_list else {
-        return Ok(response);
-    };
-
-    if !is_doh_response(&response) {
-        return Err(Box::new(PolicyDenied));
-    }
-
-    if response
-        .headers()
-        .get("content-encoding")
-        .is_some_and(|value| value != "identity")
-    {
-        return Err(BoxError::from_static_str(
-            "cannot inspect encoded DoH response",
-        ));
-    }
-
-    let body = std::mem::replace(response.body_mut(), Body::empty());
-    let body = body.limited(65_535).collect().await?.to_bytes();
-
-    let body = match rewrite_ech_config(&body, replacement)? {
-        EchRewrite::Rewritten(body) => body,
-        EchRewrite::Unchanged => body.to_vec(),
-        EchRewrite::DnssecProtected => {
-            return Err(Box::new(PolicyDenied));
-        }
-    };
-
-    response.headers_mut().remove("transfer-encoding");
-
-    response.headers_mut().insert(
-        "content-length",
-        HeaderValue::from_str(&body.len().to_string())?,
-    );
-
-    *response.body_mut() = Body::from(body);
-    Ok(response)
-}
-
 async fn check_http_policy(
     request: &Request,
     state: &FlowState,
@@ -1077,7 +911,7 @@ fn force_websocket_http11(request: &Request, target: &HttpUrl, patterns: &[HttpU
     }
 }
 
-fn is_websocket_upgrade_response(response: &Response) -> bool {
+pub(crate) fn is_websocket_upgrade_response(response: &Response) -> bool {
     matches!(
         response.status(),
         StatusCode::SWITCHING_PROTOCOLS | StatusCode::OK
@@ -1092,293 +926,6 @@ fn request_target(request: &Request) -> String {
         path
     } else {
         format!("{path}?{query}")
-    }
-}
-
-const SEMANTIC_BODY_CHUNK_BYTES: usize = 16 * 1024;
-
-struct SemanticRequestBody {
-    inner: Body,
-    semantic: BoundedRequestBody,
-    terminal: bool,
-}
-
-impl SemanticRequestBody {
-    fn new(inner: Body, mut semantic: BoundedRequestBody) -> Self {
-        let terminal = inner.is_end_stream();
-
-        if terminal {
-            let _ = semantic.finish();
-        }
-
-        Self {
-            inner,
-            semantic,
-            terminal,
-        }
-    }
-
-    fn finish(&mut self, terminal: RequestTerminal) {
-        if !self.terminal {
-            let _ = self.semantic.terminate(terminal);
-            self.terminal = true;
-        }
-    }
-}
-
-impl StreamingBody for SemanticRequestBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
-
-            Poll::Ready(None) => {
-                self.finish(RequestTerminal::Complete);
-                Poll::Ready(None)
-            }
-
-            Poll::Ready(Some(Err(error))) => {
-                self.finish(RequestTerminal::Error(TerminalError::Transport(
-                    error.to_string().into_boxed_str(),
-                )));
-                Poll::Ready(Some(Err(error)))
-            }
-
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    for chunk in data.chunks(SEMANTIC_BODY_CHUNK_BYTES) {
-                        if let Err(error) = self.semantic.push_chunk(chunk) {
-                            self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
-                                error.to_string().into_boxed_str(),
-                            )));
-                            return Poll::Ready(Some(Err(Box::new(error))));
-                        }
-                    }
-                    Poll::Ready(Some(Ok(Frame::data(data))))
-                }
-                Err(frame) => {
-                    if let Ok(trailers) = frame.into_trailers() {
-                        let semantic = match semantic_headers_from_map(&trailers) {
-                            Ok(semantic) => semantic,
-                            Err(error) => {
-                                self.finish(RequestTerminal::Error(
-                                    TerminalError::ProtocolViolation(
-                                        error.to_string().into_boxed_str(),
-                                    ),
-                                ));
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                        };
-
-                        if let Err(error) = self.semantic.set_trailers(semantic) {
-                            self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
-                                error.to_string().into_boxed_str(),
-                            )));
-                            return Poll::Ready(Some(Err(Box::new(error))));
-                        }
-
-                        Poll::Ready(Some(Ok(Frame::trailers(trailers))))
-                    } else {
-                        let error = BoxError::from_static_str("HTTP body frame has unknown type");
-                        self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
-                            error.to_string().into_boxed_str(),
-                        )));
-                        Poll::Ready(Some(Err(error)))
-                    }
-                }
-            },
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> rama_http::body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl Drop for SemanticRequestBody {
-    fn drop(&mut self) {
-        self.finish(RequestTerminal::Cancellation);
-    }
-}
-
-struct SemanticResponseBody {
-    inner: Body,
-    sequence: ResponseSequence,
-    terminal: bool,
-}
-
-impl SemanticResponseBody {
-    fn new(inner: Body, head: ResponseHead) -> Result<Self, BoxError> {
-        let terminal = inner.is_end_stream();
-        let mut sequence = ResponseSequence::new();
-        sequence.push(ResponseEvent::Final(head))?;
-
-        if terminal {
-            sequence.push(ResponseEvent::Complete)?;
-        }
-
-        Ok(Self {
-            inner,
-            sequence,
-            terminal,
-        })
-    }
-
-    fn finish(&mut self, event: ResponseEvent) {
-        if !self.terminal {
-            let _ = self.sequence.push(event);
-            self.terminal = true;
-        }
-    }
-}
-
-impl StreamingBody for SemanticResponseBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
-
-            Poll::Ready(None) => {
-                self.finish(ResponseEvent::Complete);
-                Poll::Ready(None)
-            }
-
-            Poll::Ready(Some(Err(error))) => {
-                self.finish(ResponseEvent::Error(TerminalError::Transport(
-                    error.to_string().into_boxed_str(),
-                )));
-                Poll::Ready(Some(Err(error)))
-            }
-
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    if let Err(error) = self.sequence.push(ResponseEvent::BodyChunk(data.to_vec()))
-                    {
-                        self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
-                            error.to_string().into_boxed_str(),
-                        )));
-                        return Poll::Ready(Some(Err(Box::new(error))));
-                    }
-
-                    Poll::Ready(Some(Ok(Frame::data(data))))
-                }
-                Err(frame) => {
-                    if let Ok(trailers) = frame.into_trailers() {
-                        let semantic = match semantic_headers_from_map(&trailers) {
-                            Ok(semantic) => semantic,
-                            Err(error) => {
-                                self.finish(ResponseEvent::Error(
-                                    TerminalError::ProtocolViolation(
-                                        error.to_string().into_boxed_str(),
-                                    ),
-                                ));
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                        };
-
-                        if let Err(error) = self.sequence.push(ResponseEvent::Trailers(semantic)) {
-                            self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
-                                error.to_string().into_boxed_str(),
-                            )));
-                            return Poll::Ready(Some(Err(Box::new(error))));
-                        }
-
-                        Poll::Ready(Some(Ok(Frame::trailers(trailers))))
-                    } else {
-                        let error = BoxError::from_static_str("HTTP body frame has unknown type");
-                        self.finish(ResponseEvent::Error(TerminalError::ProtocolViolation(
-                            error.to_string().into_boxed_str(),
-                        )));
-                        Poll::Ready(Some(Err(error)))
-                    }
-                }
-            },
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> rama_http::body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl Drop for SemanticResponseBody {
-    fn drop(&mut self) {
-        self.finish(ResponseEvent::Cancelled);
-    }
-}
-
-fn semantic_headers_from_map(headers: &HeaderMap) -> Result<SemanticHeaders, BoxError> {
-    let mut semantic = SemanticHeaders::new();
-
-    for (name, value) in headers {
-        semantic.try_push(name.as_str(), value.as_bytes())?;
-    }
-
-    Ok(semantic)
-}
-
-fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get_all("connection")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
-        .collect()
-}
-
-fn semantic_response_headers(headers: &HeaderMap) -> Result<SemanticHeaders, BoxError> {
-    let connection_tokens = connection_tokens(headers);
-    let mut semantic = SemanticHeaders::new();
-
-    for (name, value) in headers {
-        if is_hop_by_hop_header(name.as_str(), &connection_tokens) {
-            continue;
-        }
-
-        semantic.try_push(name.as_str(), value.as_bytes())?;
-    }
-
-    Ok(semantic)
-}
-
-fn bridge_response_body(mut response: Response) -> Result<Response, BoxError> {
-    if response.status().as_u16() < 200 || is_websocket_upgrade_response(&response) {
-        return Ok(response);
-    }
-
-    let headers = semantic_response_headers(response.headers())?;
-    let head = ResponseHead::final_head(response.status().as_u16(), headers)?;
-    let body = std::mem::replace(response.body_mut(), Body::empty());
-    *response.body_mut() = Body::new(SemanticResponseBody::new(body, head)?);
-    Ok(response)
-}
-
-fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, BoxError> {
-    match version {
-        Version::HTTP_10 => Ok(SemanticHttpVersion::Http10),
-        Version::HTTP_11 => Ok(SemanticHttpVersion::Http11),
-        Version::HTTP_2 => Ok(SemanticHttpVersion::Http2),
-        Version::HTTP_3 => Ok(SemanticHttpVersion::Http3),
-        Version::HTTP_09 => Err(BoxError::from_static_str("HTTP/0.9 is not supported")),
     }
 }
 
@@ -1419,18 +966,16 @@ fn blocked_http_request(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Body, BoundedRequestBody, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY,
-        Request, ResponseVersionAdaptCtx, SemanticRequestBody, StatusCode, TargetHttpVersion,
-        TlsServerName, Version, adapt_http10_response, adapt_response_version,
-        blocked_http_request, bridge_response_body, canonical_http10_origin, check_http_policy,
-        force_websocket_http11, is_doh_request, is_websocket_upgrade_request,
-        is_websocket_upgrade_response, policy_denied_response, request_head_clone,
-        semantic_response_headers,
+        Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, Request,
+        ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
+        adapt_http10_response, adapt_response_version, blocked_http_request,
+        canonical_http10_origin, check_http_policy, force_websocket_http11,
+        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
+        request_head_clone,
     };
     use crate::{
         alt_svc::AltSvcStore,
         policy::{FlowClaim, PolicySession, test_support::FakePolicy},
-        semantic::semantic_request_headers,
         tcp_backend::upstream::UpstreamClients,
     };
     use agent_sandbox_core::{
@@ -1539,68 +1084,6 @@ mod tests {
         assert!(canonical_http10_origin("http://example.com/?query").is_err());
         assert!(canonical_http10_origin("http://example.com/#fragment").is_err());
         assert!(canonical_http10_origin("http://user:pass@example.com").is_err());
-    }
-
-    #[test]
-    fn semantic_headers_preserve_opaque_values() {
-        let mut request = Request::builder()
-            .uri("http://localhost/")
-            .body(Body::empty())
-            .expect("request");
-
-        request.headers_mut().insert(
-            "x-opaque",
-            HeaderValue::from_bytes(&[0x80, b'a']).expect("opaque header"),
-        );
-
-        let headers = semantic_request_headers(&http::HeaderMap::from_iter(
-            request.headers().iter().map(|(name, value)| {
-                (
-                    http::HeaderName::from_bytes(name.as_str().as_bytes())
-                        .expect("rama header names are valid"),
-                    http::HeaderValue::from_bytes(value.as_bytes())
-                        .expect("rama header values are valid"),
-                )
-            }),
-        ))
-        .expect("semantic headers");
-        assert_eq!(headers.as_slice()[0].value(), &[0x80, b'a']);
-    }
-
-    #[test]
-    fn semantic_headers_filter_hop_by_hop_fields_and_connection_tokens() {
-        let request = Request::builder()
-            .header("connection", "x-remove")
-            .header("x-remove", "one")
-            .header("keep-alive", "timeout=5")
-            .header("x-end-to-end", "yes")
-            .body(Body::empty())
-            .expect("request");
-
-        let headers = semantic_request_headers(&http::HeaderMap::from_iter(
-            request.headers().iter().map(|(name, value)| {
-                (
-                    http::HeaderName::from_bytes(name.as_str().as_bytes())
-                        .expect("rama header names are valid"),
-                    http::HeaderValue::from_bytes(value.as_bytes())
-                        .expect("rama header values are valid"),
-                )
-            }),
-        ))
-        .expect("semantic headers");
-
-        assert!(
-            headers.as_slice().iter().all(|header| {
-                !["connection", "x-remove", "keep-alive"].contains(&header.name())
-            })
-        );
-
-        assert!(
-            headers
-                .as_slice()
-                .iter()
-                .any(|header| header.name() == "x-end-to-end")
-        );
     }
 
     #[test]
@@ -1868,81 +1351,6 @@ mod tests {
         assert_eq!(&received, b"pong");
     }
 
-    #[test]
-    fn filters_hop_by_hop_response_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("connection", HeaderValue::from_static("x-private"));
-        headers.insert("x-private", HeaderValue::from_static("hidden"));
-        headers.insert("keep-alive", HeaderValue::from_static("hidden"));
-        headers.insert("x-visible", HeaderValue::from_static("visible"));
-        let semantic = semantic_response_headers(&headers).expect("response headers");
-
-        assert!(
-            semantic
-                .as_slice()
-                .iter()
-                .any(|header| { header.name() == "x-visible" && header.value() == b"visible" })
-        );
-
-        assert!(
-            !semantic
-                .as_slice()
-                .iter()
-                .any(|header| header.name() == "x-private")
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_semantic_body_finishes_without_frames() {
-        let mut body = Body::new(SemanticRequestBody::new(
-            Body::empty(),
-            BoundedRequestBody::empty(),
-        ));
-
-        assert!(body.frame().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn semantic_body_bridges_data_and_trailers() {
-        let mut trailers = HeaderMap::new();
-        trailers.insert("x-request-trailer", HeaderValue::from_static("present"));
-        let source = Body::from("request-body").with_trailer_headers(trailers);
-
-        let mut body = Body::new(SemanticRequestBody::new(
-            source,
-            BoundedRequestBody::empty(),
-        ));
-
-        let data = body
-            .frame()
-            .await
-            .expect("data frame")
-            .expect("data frame result")
-            .into_data()
-            .expect("data");
-
-        assert_eq!(data, "request-body");
-
-        let trailers = body
-            .frame()
-            .await
-            .expect("trailer frame")
-            .expect("trailer frame result")
-            .into_trailers()
-            .expect("trailers");
-
-        assert_eq!(
-            trailers
-                .get("x-request-trailer")
-                .expect("request trailer")
-                .to_str()
-                .expect("trailer value"),
-            "present"
-        );
-
-        assert!(body.frame().await.is_none());
-    }
-
     #[tokio::test]
     async fn http10_adaptation_removes_framing_and_drops_trailers() {
         let mut trailers = HeaderMap::new();
@@ -1982,69 +1390,6 @@ mod tests {
         assert!(response.body_mut().frame().await.is_none());
     }
 
-    #[tokio::test]
-    async fn semantic_response_bridge_preserves_data_and_trailers() {
-        let mut trailers = HeaderMap::new();
-        trailers.insert("x-response-trailer", HeaderValue::from_static("present"));
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::from("response-body").with_trailer_headers(trailers))
-            .expect("response");
-
-        let mut response = bridge_response_body(response).expect("bridge response");
-
-        let data = response
-            .body_mut()
-            .frame()
-            .await
-            .expect("data frame")
-            .expect("data frame result")
-            .into_data()
-            .expect("data");
-
-        assert_eq!(data, "response-body");
-
-        let trailers = response
-            .body_mut()
-            .frame()
-            .await
-            .expect("trailer frame")
-            .expect("trailer frame result")
-            .into_trailers()
-            .expect("trailers");
-
-        assert_eq!(
-            trailers
-                .get("x-response-trailer")
-                .expect("response trailer")
-                .to_str()
-                .expect("trailer value"),
-            "present"
-        );
-
-        assert!(response.body_mut().frame().await.is_none());
-    }
-
-    #[test]
-    fn detects_doh_post_and_get_requests() {
-        let post = Request::builder()
-            .method("POST")
-            .header("content-type", "application/dns-message")
-            .body(Body::empty())
-            .expect("test request");
-
-        assert!(is_doh_request(&post));
-
-        let get = Request::builder()
-            .method("GET")
-            .uri("/dns-query?dns=abc")
-            .body(Body::empty())
-            .expect("test request");
-
-        assert!(is_doh_request(&get));
-    }
-
     #[test]
     fn policy_denial_response_is_explicit() {
         let response = policy_denied_response();
@@ -2059,165 +1404,6 @@ mod tests {
         );
 
         assert_eq!(POLICY_DENIED_BODY, "blocked by agent-sandbox policy\n");
-    }
-
-    /// Drive a rustls client and server handshake through an in-memory pipe.
-    fn drive_handshake(
-        client: &mut rustls::ClientConnection,
-        server: &mut rustls::ServerConnection,
-    ) {
-        let mut to_server = Vec::new();
-        let mut to_client = Vec::new();
-
-        for _ in 0..64 {
-            while client.wants_write() {
-                client.write_tls(&mut to_server).expect("client writes");
-            }
-            while server.wants_write() {
-                server.write_tls(&mut to_client).expect("server writes");
-            }
-            if client.wants_read() && !to_client.is_empty() {
-                let read = client
-                    .read_tls(&mut to_client.as_slice())
-                    .expect("client reads");
-                to_client.drain(..read);
-                client.process_new_packets().expect("client processes");
-            }
-            if server.wants_read() && !to_server.is_empty() {
-                let read = server
-                    .read_tls(&mut to_server.as_slice())
-                    .expect("server reads");
-                to_server.drain(..read);
-                server.process_new_packets().expect("server processes");
-            }
-            if !client.is_handshaking() && !server.is_handshaking() {
-                return;
-            }
-        }
-
-        panic!("TLS handshake did not finish");
-    }
-
-    #[test]
-    fn downstream_ech_handshake_decrypts_inner_hello() {
-        // Generate the same key material the proxy persists in its ECH state.
-        let dir = tempfile::tempdir().expect("temp ECH state");
-        let state = crate::ech_state::load_or_generate(dir.path()).expect("ECH state");
-
-        // A server that terminates ECH with that state, issuing certificates
-        // for the inner (real) server name.
-        let inner_name = "ech-test.example";
-        let certified = rcgen::generate_simple_self_signed(vec![inner_name.to_owned()])
-            .expect("test certificate");
-        let certificate = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-        let private_key =
-            rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
-                .expect("test key");
-
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let keys = crate::http3::hpke::ECH_SUPPORTED_SUITES
-            .iter()
-            .map(|hpke| {
-                rustls::server::ech::EchKeys::new(
-                    rustls::pki_types::EchConfigListBytes::from(state.config_list.as_slice()),
-                    &state.private_key,
-                    *hpke,
-                )
-                .expect("ECH keys")
-            })
-            .collect();
-
-        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .expect("TLS versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate], private_key)
-            .expect("server certificate")
-            .with_ech_keys(keys)
-            .expect("server ECH keys");
-        let mut server =
-            rustls::ServerConnection::new(Arc::new(server_config)).expect("server connection");
-
-        // A client that fetched the proxy's ECH configuration (the same bytes
-        // the sandbox DNS rewrite distributes) and connects to the inner name.
-        let config = rustls::client::EchConfig::new(
-            rustls::pki_types::EchConfigListBytes::from(state.config_list.as_slice()),
-            crate::http3::hpke::ECH_SUPPORTED_SUITES,
-        )
-        .expect("client ECH configuration");
-
-        let client_config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_ech(rustls::client::EchMode::Enable(config))
-            .expect("client ECH mode")
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
-            .with_no_client_auth();
-        let mut client = rustls::ClientConnection::new(
-            Arc::new(client_config),
-            rustls::pki_types::ServerName::try_from(inner_name).expect("server name"),
-        )
-        .expect("client connection");
-
-        drive_handshake(&mut client, &mut server);
-
-        assert_eq!(client.ech_status(), rustls::client::EchStatus::Accepted);
-        assert!(!server.is_handshaking());
-        assert_eq!(
-            server.server_name().map(ToString::to_string),
-            Some(inner_name.to_owned())
-        );
-    }
-
-    /// Accepts any server certificate; the test asserts ECH behaviour, not
-    /// certificate verification.
-    #[derive(Debug)]
-    struct AcceptAllVerifier;
-
-    impl rustls::client::danger::ServerCertVerifier for AcceptAllVerifier {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-            _server_name: &rustls::pki_types::ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: rustls::pki_types::UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            certificate: &rustls::pki_types::CertificateDer<'_>,
-            dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(
-                message,
-                certificate,
-                dss,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-            )
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            certificate: &rustls::pki_types::CertificateDer<'_>,
-            dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(
-                message,
-                certificate,
-                dss,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-            )
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
     }
 
     async fn flow_state(
