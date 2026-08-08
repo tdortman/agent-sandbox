@@ -17,7 +17,7 @@ use rama_core::{
     error::{BoxError, BoxErrorExt},
     rt::Executor,
 };
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Debug, Parser)]
@@ -58,11 +58,11 @@ struct Args {
 
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
-    test_destination: Option<SocketAddr>,
+    test_destination: Option<std::net::SocketAddr>,
 
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
-    test_ech_dns: Option<SocketAddr>,
+    test_ech_dns: Option<std::net::SocketAddr>,
 
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
