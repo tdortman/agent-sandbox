@@ -961,10 +961,13 @@ mod tests {
         };
 
         assert!(store.policy_denied("34.230.40.69", 443, &ctx));
-        assert!(!store
-            .network_verdict("34.230.40.69", 443, &ctx, false)
-            .await
-            .is_some_and(|v| v.allowed));
+
+        assert!(
+            !store
+                .network_verdict("34.230.40.69", 443, &ctx, false)
+                .await
+                .is_some_and(|v| v.allowed)
+        );
     }
 
     #[test]
@@ -1096,10 +1099,14 @@ mod tests {
         };
 
         assert!(store.policy_denied("example.com", 443, &ctx));
-        assert!(!store
-            .network_verdict("example.com", 443, &ctx, false)
-            .await
-            .is_some_and(|v| v.allowed));
+
+        assert!(
+            !store
+                .network_verdict("example.com", 443, &ctx, false)
+                .await
+                .is_some_and(|v| v.allowed)
+        );
+
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
 
@@ -1195,16 +1202,22 @@ mod tests {
             sandbox_session_id: None,
         };
 
-        assert!(store
-            .network_verdict("example.com", 443, &ctx, false)
-            .await
-            .is_some_and(|v| v.allowed));
+        assert!(
+            store
+                .network_verdict("example.com", 443, &ctx, false)
+                .await
+                .is_some_and(|v| v.allowed)
+        );
+
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
-        assert!(!store
-            .network_verdict("example.com", 443, &ctx, false)
-            .await
-            .is_some_and(|v| v.allowed));
+
+        assert!(
+            !store
+                .network_verdict("example.com", 443, &ctx, false)
+                .await
+                .is_some_and(|v| v.allowed)
+        );
     }
 
     #[tokio::test]

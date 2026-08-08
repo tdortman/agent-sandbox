@@ -67,7 +67,6 @@ mod tests {
         assert_eq!(scheme_for(FlowProtocol::Udp, 443), "http3");
         assert_eq!(scheme_for(FlowProtocol::Tcp, 853), "tcp");
         assert_eq!(scheme_for(FlowProtocol::Udp, 53), "udp");
-
         assert!(is_http_service_port(FlowProtocol::Tcp, 443));
         assert!(!is_http_service_port(FlowProtocol::Tcp, 853));
         assert!(!is_http_service_port(FlowProtocol::Udp, 443));

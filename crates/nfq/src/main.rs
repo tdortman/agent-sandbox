@@ -6,6 +6,7 @@
 //! actively rejects the packet.
 
 mod args;
+
 mod attribution;
 mod flow;
 mod owner;
@@ -20,6 +21,7 @@ use crate::{
     push::spawn_push_socket_listener,
     queue::{open_queue, write_ready_marker_or_exit},
 };
+
 use clap::Parser;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -70,7 +72,9 @@ fn main() {
             }
         };
 
-        let (verdict, meta) = handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
+        let (verdict, meta) =
+            handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
+
         mark_accepted_proxy_udp(&state, &mut message, verdict, meta);
         message.set_verdict(verdict);
 
@@ -79,4 +83,3 @@ fn main() {
         }
     }
 }
-

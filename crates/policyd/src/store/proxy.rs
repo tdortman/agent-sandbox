@@ -9,8 +9,8 @@ use crate::{error::PolicydError, wire::NetworkCheckRequest};
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
-    ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity,
-    scheme_for, socket_owner::validate_socket_identity,
+    ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity, scheme_for,
+    socket_owner::validate_socket_identity,
 };
 
 use std::time::{Duration, Instant};

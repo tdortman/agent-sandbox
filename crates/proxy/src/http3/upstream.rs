@@ -12,14 +12,18 @@
 //! policy target. An unverifiable advertised configuration fails closed.
 
 use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
+
 use agent_sandbox_core::AttributionToken;
 use bytes::Bytes;
+
 use h3::{
     ConnectionState,
     client::SendRequest,
     quic::{OpenStreams as _, SendStream as _},
 };
+
 use rustls::pki_types::pem::PemObject;
+
 use std::{
     collections::HashMap,
     future::poll_fn,

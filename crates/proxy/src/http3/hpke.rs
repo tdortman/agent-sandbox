@@ -15,6 +15,7 @@ use ring::{
     hmac,
     rand::SystemRandom,
 };
+
 use rustls::{
     Error, OtherError,
     crypto::hpke::{
@@ -25,6 +26,7 @@ use rustls::{
         handshake::HpkeSymmetricCipherSuite,
     },
 };
+
 use std::{
     fmt,
     io::{Error as IoError, ErrorKind},
@@ -316,10 +318,8 @@ fn decap(enc: &[u8], sk_r: &[u8]) -> Result<[u8; SHA256_OUTPUT_LEN], Error> {
 
     let sk_r: [u8; 32] = sk_r.try_into().map_err(|_| key_error())?;
     let enc: [u8; 32] = enc.try_into().map_err(|_| key_error())?;
-
     let sk_r = x25519_dalek::StaticSecret::from(sk_r);
     let pk_e = x25519_dalek::PublicKey::from(enc);
-
     let shared = sk_r.diffie_hellman(&pk_e);
 
     // RFC 9180 4.1 requires decapsulation to fail on a non-contributory
@@ -329,7 +329,6 @@ fn decap(enc: &[u8], sk_r: &[u8]) -> Result<[u8; SHA256_OUTPUT_LEN], Error> {
     }
 
     let pk_r = x25519_dalek::PublicKey::from(&sk_r).to_bytes();
-
     let kem_context = [enc, pk_r].concat();
     Ok(extract_and_expand(shared.as_bytes(), &kem_context))
 }
@@ -477,6 +476,7 @@ fn unsupported() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{DHKEM_X25519_HKDF_SHA256_AES_128, KeySchedule, labeled_extract};
+
     use rustls::{
         crypto::hpke::{Hpke, HpkePrivateKey, HpkePublicKey},
         internal::msgs::enums::HpkeKem,

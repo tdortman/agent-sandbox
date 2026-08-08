@@ -1,6 +1,8 @@
-use super::*;
-use super::h3::{Http3Origin, Http3OriginSettings};
-use super::origins::{TlsAlpn, TlsOrigin, harness_tls_alpn, read_http_response, start_tls_origin};
+use super::{
+    h3::{Http3Origin, Http3OriginSettings},
+    origins::{TlsAlpn, TlsOrigin, harness_tls_alpn, read_http_response, start_tls_origin},
+    *,
+};
 
 #[derive(Clone, Copy)]
 enum Http3SessionSettings {
@@ -748,6 +750,7 @@ impl TransparentHarness {
     pub async fn http3_ech_request(&self, path: &str) -> Result<Http3Response, String> {
         let config_list = std::fs::read(self.ech_state_dir().join("ech-config-list"))
             .map_err(|error| format!("read proxy ECH configuration: {error}"))?;
+
         let client = Http3Client::with_ech(&self.ca_file(), &config_list);
         client.request(self.proxy_address, "localhost", path).await
     }
@@ -811,6 +814,7 @@ fn resolve_harness_addresses(
     bound_ports: &BoundProxyPorts,
 ) -> (SocketAddr, Option<SocketAddr>) {
     let proxy_address = SocketAddr::new(ip, bound_ports.http3_main.unwrap_or(bound_ports.tcp));
+
     let h3_alt_address = bound_ports
         .http3_alts
         .first()

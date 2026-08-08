@@ -1,6 +1,7 @@
 //! HTTP/3 extended-session validation and wire helpers.
 
 use agent_sandbox_core::{AttributionToken, HttpSessionMetadata};
+
 use bytes::Bytes;
 use h3::{ext::Protocol, quic::StreamId};
 use std::fmt;

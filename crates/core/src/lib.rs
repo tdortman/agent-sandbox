@@ -2,6 +2,7 @@
 //! agent-sandbox.
 
 pub mod approved_bindings;
+
 pub mod context;
 pub mod dns_cache;
 pub mod dns_wire;
@@ -16,15 +17,15 @@ pub mod rpc_client;
 pub mod scope_target;
 pub mod socket_owner;
 pub mod transport;
+pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
 
 pub use context::{
-    PeerCredentials, ProcContext, ProcessIds, ResolvedRequestContext, SandboxPaths,
-    SessionContext, daemon_context, discover_git_project_root, home_from_uid, is_descendant_of,
-    is_path_descendant, peer_context, peer_cred_unix, persist_session_paths, read_proc_environ,
+    PeerCredentials, ProcContext, ProcessIds, ResolvedRequestContext, SandboxPaths, SessionContext,
+    daemon_context, discover_git_project_root, home_from_uid, is_descendant_of, is_path_descendant,
+    peer_context, peer_cred_unix, persist_session_paths, read_proc_environ,
     sandbox_session_id_from_pid, wire_context,
 };
 
-pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
 pub use dns_cache::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_cache};
 pub use dns_wire::{DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config};
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
@@ -75,4 +76,5 @@ pub use scope_target::{ScopeContext, ScopeTarget};
 pub use socket_owner::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };
+
 pub use transport::{is_http_service_port, scheme_for};

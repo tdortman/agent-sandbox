@@ -1,20 +1,26 @@
 //! TLS termination and ECH scenarios: SNI routing, ALPN fallback, and
 //! downstream ECH decryption.
 
-use crate::support::{IpVersion, TransparentHarness, loopback};
-use crate::transparent_common::{assert_release_matches_claim, wait_for_release};
+use crate::{
+    support::{IpVersion, TransparentHarness, loopback},
+    transparent_common::{assert_release_matches_claim, wait_for_release},
+};
+
 use rama_core::{Service, extensions::ExtensionsRef, rt::Executor};
 use rama_http::{Body, Request, StatusCode, Version, body::util::BodyExt, conn::TargetHttpVersion};
 use rama_http_backend::client::HttpConnector;
+
 use rama_net::{
     address::{Host, HostWithPort},
     client::{ConnectorService, ConnectorTarget, EstablishedClientConnection},
 };
+
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
 use rustls::pki_types::pem::PemObject as _;
 use std::{sync::atomic::Ordering, time::Duration};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -226,7 +232,6 @@ async fn transparent_https_ech_offer_is_decrypted_over_tcp() {
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(certificates);
-
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
 
     let config = rustls::client::EchConfig::new(
@@ -267,6 +272,7 @@ async fn transparent_https_ech_offer_is_decrypted_over_tcp() {
         .expect("write TLS request");
 
     let mut response = Vec::new();
+
     stream
         .read_to_end(&mut response)
         .await
@@ -280,6 +286,7 @@ async fn transparent_https_ech_offer_is_decrypted_over_tcp() {
     );
 
     let status = response.starts_with(b"HTTP/1.0 200") || response.starts_with(b"HTTP/1.1 200");
+
     assert!(
         status,
         "unexpected HTTPS response: {}",

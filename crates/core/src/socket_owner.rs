@@ -63,7 +63,6 @@ impl SocketTuple {
 
         Self::new(local_ip, local_port, remote_ip, 0)
     }
-
 }
 
 /// A process and descriptor snapshot for a resolved socket.

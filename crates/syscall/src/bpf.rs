@@ -39,10 +39,15 @@ pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         syscalls.iter().map(|&nr| (nr, Vec::new())).collect();
 
-    SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::UserNotif, target_arch())
-        .expect("seccomp filter construction is total for non-empty rule maps")
-        .try_into()
-        .expect("seccomp filter length is bounded by seccompiler::BPF_MAX_LEN")
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::UserNotif,
+        target_arch(),
+    )
+    .expect("seccomp filter construction is total for non-empty rule maps")
+    .try_into()
+    .expect("seccomp filter length is bounded by seccompiler::BPF_MAX_LEN")
 }
 
 const fn target_arch() -> TargetArch {

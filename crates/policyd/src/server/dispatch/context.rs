@@ -6,7 +6,6 @@ use crate::{
 };
 
 use agent_sandbox_core::{RequestContext, ResolvedRequestContext};
-
 use std::sync::Arc;
 
 pub(super) fn resolve_request_context(

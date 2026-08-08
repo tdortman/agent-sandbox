@@ -346,6 +346,7 @@ pub(super) async fn start_tls_origin(
         .prefix("asot")
         .tempdir_in("/tmp")
         .expect("create TLS origin socket directory");
+
     let inner_socket = socket_dir.path().join("s.sock");
     let mut command = Command::new("openssl");
 

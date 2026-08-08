@@ -1,6 +1,8 @@
 use agent_sandbox_core::HttpUrl;
+
 #[cfg(debug_assertions)]
 use agent_sandbox_proxy::tcp_backend::destination_override;
+
 use agent_sandbox_proxy::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
@@ -12,11 +14,14 @@ use agent_sandbox_proxy::{
         run_tcp_listener,
     },
 };
+
 use clap::Parser;
+
 use rama_core::{
     error::{BoxError, BoxErrorExt},
     rt::Executor,
 };
+
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore};
 
@@ -205,7 +210,10 @@ fn load_ca_issuer(args: &Args) -> Result<CertificateIssuer, BoxError> {
 
     let ca_private_key = std::fs::read_to_string(ca_private_key)?;
 
-    Ok(CertificateIssuer::from_pem(&ca_certificate, &ca_private_key)?)
+    Ok(CertificateIssuer::from_pem(
+        &ca_certificate,
+        &ca_private_key,
+    )?)
 }
 
 /// Load the downstream ECH value from the persisted state, when an ECH

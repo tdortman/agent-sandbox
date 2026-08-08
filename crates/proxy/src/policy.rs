@@ -4,7 +4,9 @@ use agent_sandbox_core::{
     ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
     RpcRequest, policy_rpc,
 };
+
 use rama_core::error::{BoxError, BoxErrorExt};
+
 use std::{
     env, fs,
     io::ErrorKind,
@@ -15,6 +17,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
 use tokio::sync::{Notify, Semaphore};
 
 /// One claimed intercepted flow and the stable connection identity that owns
@@ -33,6 +36,7 @@ pub struct PolicySession {
     /// connection ends, so it must outlive the session even though RPC
     /// calls use fresh connections.
     _connection: RpcConnection,
+
     socket: PathBuf,
     token: ProxySessionToken,
     timeout: Duration,
@@ -312,7 +316,6 @@ impl PolicySession {
             .map_err(|_| PolicyError::TooManyActiveChecks)?;
 
         let request_id = ProxyRequestId::new();
-
         let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
 
         let check = tokio::select! {
@@ -325,7 +328,6 @@ impl PolicySession {
         };
 
         pending.disarm();
-
         Ok(check)
     }
 
@@ -594,7 +596,9 @@ pub(crate) mod test_support {
         HttpCheckReply, HttpRequest, ProxyReply, ProxyRequestId, ProxySessionReply,
         ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
     };
+
     use std::{path::PathBuf, sync::Arc};
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
@@ -624,7 +628,6 @@ pub(crate) mod test_support {
             let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
             let (events_tx, events) = mpsc::unbounded_channel();
             let release_checks = Arc::new(Notify::new());
-
             let task = tokio::spawn(serve(listener, events_tx, release_checks.clone()));
 
             Self {
@@ -649,7 +652,6 @@ pub(crate) mod test_support {
 
             let events = events.clone();
             let release_checks = release_checks.clone();
-
             tokio::spawn(serve_connection(stream, events, release_checks));
         }
     }
@@ -710,7 +712,6 @@ pub(crate) mod test_support {
         };
 
         let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
-
         let _ = writer.write_all(&encoded).await;
         let _ = writer.write_all(b"\n").await;
         let _ = writer.flush().await;
@@ -727,11 +728,14 @@ mod tests {
         PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
         reconcile_authorities,
     };
+
     use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
+
     use agent_sandbox_core::{
         AttributionToken, ErrorReply, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody,
         ProxyRequestId, RpcReply,
     };
+
     use std::{sync::Arc, time::Duration};
     use tokio::sync::{Notify, Semaphore};
 
@@ -834,9 +838,7 @@ mod tests {
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
         let active_checks = Arc::new(Semaphore::new(2));
         let shutdown = Arc::new(Notify::new());
-
         fake.release_checks.notify_one();
-
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
 
         let check = policy
@@ -850,6 +852,7 @@ mod tests {
 
         assert!(check.ok);
         assert!(check.allowed);
+
         assert!(matches!(
             fake.events.recv().await,
             Some(FakePolicyEvent::Check)
@@ -864,7 +867,6 @@ mod tests {
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
         let active_checks = Arc::new(Semaphore::new(2));
         let shutdown = Arc::new(Notify::new());
-
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
 
         let task = {
@@ -902,7 +904,6 @@ mod tests {
         ));
 
         fake.release_checks.notify_one();
-
         Ok(())
     }
 
@@ -913,9 +914,7 @@ mod tests {
         let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
         let active_checks = Arc::new(Semaphore::new(1));
         let shutdown = Arc::new(Notify::new());
-
         let _held = active_checks.clone().try_acquire_owned().expect("permit");
-
         let request = HttpRequest::from_parts("GET", "https", "example.test", "/")?;
 
         let result = policy
@@ -928,7 +927,6 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(PolicyError::TooManyActiveChecks)));
-
         Ok(())
     }
 }

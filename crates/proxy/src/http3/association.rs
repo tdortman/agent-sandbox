@@ -15,11 +15,12 @@
 
 use crate::{
     http3::{
-        BoxError, Http3State, boxed, varint,
+        BoxError, Http3State, boxed,
         connection_id::ConnectionIdBindings,
         datagram::{DatagramRelay, DatagramRouter, DatagramRouterState},
         relay::serve_request,
         session_registry::SessionRegistry,
+        varint,
         webtransport::{
             PendingWebTransportSessions, WebTransportPrep, WebTransportServeInput,
             is_webtransport_request, prepare_webtransport, reject_webtransport_request,
@@ -28,12 +29,15 @@ use crate::{
     },
     policy::{FlowClaim, PolicySession},
 };
+
 use bytes::Bytes;
+
 use h3::{
     error::{Code, StreamError},
-    quic::{StreamId},
+    quic::StreamId,
     server::RequestStream,
 };
+
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -346,7 +350,9 @@ impl H3RequestContext {
     }
 }
 
-pub(super) fn reject_0rtt_stream(stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) -> bool {
+pub(super) fn reject_0rtt_stream(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> bool {
     if !stream.is_0rtt() {
         return false;
     }
@@ -426,10 +432,11 @@ async fn serve_h3_connection(
     origin_authority: Option<String>,
 ) -> Result<(), BoxError> {
     let mut h3 = build_h3_server(&connection).await?;
+
     let mut connection_ids =
         ConnectionIdBindings::new(&connection, &claim, state.connection_ids.clone());
-    connection_ids.drain_or_close(&connection)?;
 
+    connection_ids.drain_or_close(&connection)?;
     let mut bound_source = source;
 
     let mut request_context =
@@ -513,7 +520,6 @@ async fn serve_h3_connection(
     };
 
     connection_ids.drain_or_close(&connection)?;
-
     finish_h3_connection(&mut request_context).await;
     connection.close(varint(Code::H3_NO_ERROR), b"proxy shutdown");
     result
@@ -580,11 +586,13 @@ async fn handle_resolved_request(
             if let Err(error) = reject_webtransport_request(stream).await {
                 warn!(%error, "malformed WebTransport request rejected");
             }
+
             return false;
         }
 
         let task =
             queue_webtransport_preparation(request_context, h3, request, stream, webtransport_tx);
+
         request_context.tasks.push(task);
         return true;
     }

@@ -584,10 +584,10 @@ mod tests {
 
         let mut unknown = wire;
         unknown["unexpected"] = serde_json::json!(true);
-
         let line = serde_json::to_string(&unknown).expect("serialize rebind with unknown field");
-        let error = super::parse_rpc_request(&line)
-            .expect_err("rebind wire must reject unknown fields");
+
+        let error =
+            super::parse_rpc_request(&line).expect_err("rebind wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
     }
@@ -615,10 +615,10 @@ mod tests {
 
         let mut unknown = wire;
         unknown["unexpected"] = serde_json::json!(true);
-
         let line = serde_json::to_string(&unknown).expect("serialize release with unknown field");
-        let error = super::parse_rpc_request(&line)
-            .expect_err("release wire must reject unknown fields");
+
+        let error =
+            super::parse_rpc_request(&line).expect_err("release wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
     }

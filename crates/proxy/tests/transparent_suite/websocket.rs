@@ -1,7 +1,10 @@
 //! WebSocket upgrade scenarios over HTTP/1.1 and HTTP/3.
 
-use crate::support::{Http3Client, IpVersion, TransparentHarness, loopback};
-use crate::transparent_common::wait_for_release;
+use crate::{
+    support::{Http3Client, IpVersion, TransparentHarness, loopback},
+    transparent_common::wait_for_release,
+};
+
 use std::sync::atomic::Ordering;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

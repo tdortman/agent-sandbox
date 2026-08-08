@@ -7,9 +7,11 @@ use super::{
     },
     ui_route::{UiRoute, paths_match},
 };
+
 use agent_sandbox_core::{
     ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
 };
+
 use std::{
     collections::HashSet,
     future::Future,
@@ -18,12 +20,14 @@ use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
+
 use tokio::{
     io::AsyncWriteExt,
     net::unix::OwnedWriteHalf,
     sync::{Mutex, oneshot},
     time,
 };
+
 use uuid::Uuid;
 
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
@@ -33,13 +37,17 @@ const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
 pub enum VerdictExit {
     /// The policy UI never registered within the short wait window.
     NoUi,
+
     /// The verdict channel closed before a reply arrived.
     ChannelClosed,
+
     /// The full approval timeout elapsed.
     Timeout,
+
     /// The out-of-band cancellation channel fired.
     Cancelled,
 }
+
 type UiNotificationTarget = (u64, std::sync::Arc<Mutex<OwnedWriteHalf>>);
 
 impl PolicyStore {
@@ -163,7 +171,6 @@ impl PolicyStore {
     {
         let mut ui_ready = ui_ready;
         let mut cancel = cancel;
-
         let ui_wait = self.args.approval_timeout.min(Duration::from_mins(1));
         let ui_deadline = Instant::now() + ui_wait;
         tokio::pin!(rx);
@@ -531,11 +538,14 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
+
     use crate::store::{
         Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
+
     use agent_sandbox_core::FileAccess;
     use std::{sync::Arc, time::Duration};
+
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,

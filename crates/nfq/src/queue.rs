@@ -1,6 +1,7 @@
 //! NFQUEUE binding, copy range, and the systemd readiness marker.
 
 use nfq_updated::Queue;
+
 use std::path::{Path, PathBuf};
 
 /// Number of bytes to copy from each queued packet.

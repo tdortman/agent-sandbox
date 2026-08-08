@@ -163,5 +163,3 @@ impl PolicyStore {
         ScopeTarget::resolve(&ctx).map_err(|err| Box::new(RpcReply::from(err)))
     }
 }
-
-

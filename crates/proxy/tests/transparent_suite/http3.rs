@@ -1,10 +1,14 @@
 //! HTTP/3 scenarios: QUIC policy flow, WebTransport, CONNECT-UDP,
 //! streaming, migration, and upstream ECH discovery.
 
-use crate::support::{Http3Client, IpVersion, TransparentHarness, loopback};
-use crate::transparent_common::{assert_release_matches_claim, wait_for_release};
+use crate::{
+    support::{Http3Client, IpVersion, TransparentHarness, loopback},
+    transparent_common::{assert_release_matches_claim, wait_for_release},
+};
+
 use bytes::Buf;
 use std::{collections::BTreeSet, sync::atomic::Ordering, time::Duration};
+
 use tokio::{
     net::UdpSocket,
     time::{sleep, timeout},
@@ -830,16 +834,17 @@ async fn transparent_http3_tracks_authenticated_connection_ids() {
         .http3_request("/allow")
         .await
         .expect("HTTP/3 request");
+
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
-
     wait_for_release(&harness).await;
-
     let log = strip_ansi(&std::fs::read_to_string(&harness.proxy_log).unwrap_or_default());
+
     let bound: Vec<&str> = log
         .lines()
         .filter(|line| line.contains("QUIC connection ID bound to policy association"))
         .collect();
+
     let released: Vec<&str> = log
         .lines()
         .filter(|line| {

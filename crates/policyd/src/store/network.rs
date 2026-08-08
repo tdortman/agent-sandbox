@@ -7,16 +7,20 @@ use super::{
     },
     ui::VerdictExit,
 };
+
 use crate::wire::NetworkCheckRequest;
+
 use agent_sandbox_core::{
     CheckReply, NetworkRuleKey, ProcessIds, ProxyRequestId, ProxySessionToken,
     ResolvedRequestContext, SandboxPaths, UiPush, VerdictSource, attach_check_aliases,
     normalize_host,
 };
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -602,13 +606,16 @@ mod tests {
         store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
         wire::NetworkCheckRequest,
     };
+
     use agent_sandbox_core::{
         FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
     };
+
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
+
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {

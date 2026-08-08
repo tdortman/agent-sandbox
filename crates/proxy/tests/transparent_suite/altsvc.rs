@@ -1,6 +1,7 @@
 //! Alt-Svc scenarios: preservation, attribution, filtering, and clearing.
 
 use crate::support::{IpVersion, TransparentHarness, loopback};
+
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -43,6 +44,7 @@ async fn transparent_http3_alt_svc_preserved_and_attributed() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
+
     // The main and alternative associations each claim and release their
     // own flow, so wait until both releases are recorded before pairing
     // each one with its claim.

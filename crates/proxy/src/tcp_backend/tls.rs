@@ -28,6 +28,7 @@ where
         // `LazyConfigAcceptor` path cannot be used: its config-independent
         // ClientHello pre-processing skips ECH entirely.
         let acceptor = rama_tls_rustls::dep::tokio_rustls::TlsAcceptor::from(self.config.clone());
+
         let stream = acceptor.accept(stream).await?;
 
         // Record the negotiated SNI on the connection extensions. The HTTP
@@ -104,23 +105,29 @@ mod tests {
             while client.wants_write() {
                 client.write_tls(&mut to_server).expect("client writes");
             }
+
             while server.wants_write() {
                 server.write_tls(&mut to_client).expect("server writes");
             }
+
             if client.wants_read() && !to_client.is_empty() {
                 let read = client
                     .read_tls(&mut to_client.as_slice())
                     .expect("client reads");
+
                 to_client.drain(..read);
                 client.process_new_packets().expect("client processes");
             }
+
             if server.wants_read() && !to_server.is_empty() {
                 let read = server
                     .read_tls(&mut to_server.as_slice())
                     .expect("server reads");
+
                 to_server.drain(..read);
                 server.process_new_packets().expect("server processes");
             }
+
             if !client.is_handshaking() && !server.is_handshaking() {
                 return;
             }
@@ -133,19 +140,24 @@ mod tests {
     fn downstream_ech_handshake_decrypts_inner_hello() {
         // Generate the same key material the proxy persists in its ECH state.
         let dir = tempfile::tempdir().expect("temp ECH state");
+
         let state = crate::ech_state::load_or_generate(dir.path()).expect("ECH state");
 
         // A server that terminates ECH with that state, issuing certificates
         // for the inner (real) server name.
         let inner_name = "ech-test.example";
+
         let certified = rcgen::generate_simple_self_signed(vec![inner_name.to_owned()])
             .expect("test certificate");
+
         let certificate = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+
         let private_key =
             rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
                 .expect("test key");
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+
         let keys = crate::http3::hpke::ECH_SUPPORTED_SUITES
             .iter()
             .map(|hpke| {
@@ -166,6 +178,7 @@ mod tests {
             .expect("server certificate")
             .with_ech_keys(keys)
             .expect("server ECH keys");
+
         let mut server =
             rustls::ServerConnection::new(Arc::new(server_config)).expect("server connection");
 
@@ -183,6 +196,7 @@ mod tests {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
             .with_no_client_auth();
+
         let mut client = rustls::ClientConnection::new(
             Arc::new(client_config),
             rustls::pki_types::ServerName::try_from(inner_name).expect("server name"),
@@ -190,9 +204,9 @@ mod tests {
         .expect("client connection");
 
         drive_handshake(&mut client, &mut server);
-
         assert_eq!(client.ech_status(), rustls::client::EchStatus::Accepted);
         assert!(!server.is_handshaking());
+
         assert_eq!(
             server.server_name().map(ToString::to_string),
             Some(inner_name.to_owned())

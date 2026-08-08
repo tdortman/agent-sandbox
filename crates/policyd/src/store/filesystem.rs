@@ -7,12 +7,15 @@ use super::{
     },
     ui::VerdictExit,
 };
+
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest};
+
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
     InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
     normalize_directory_traverse_access,
 };
+
 use std::{
     io::BufRead,
     path::{Path, PathBuf},
@@ -20,6 +23,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -418,7 +422,6 @@ impl PolicyStore {
         rx: oneshot::Receiver<FilesystemCheckReply>,
     ) -> FilesystemCheckReply {
         let logged_ui_wait = AtomicBool::new(false);
-
         let path = &path;
         let access = &access;
 
@@ -532,10 +535,12 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
+
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
         SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,

@@ -1183,26 +1183,29 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Global,
-                target: Some(ApprovalTarget::FilesystemPath {
-                    path: PathBuf::from("./.git"),
-                }),
-                wire: ScopeWire {
-                    paths: SandboxPaths::new(
-                        project_root.clone(),
-                        home.clone(),
-                        project_root.clone(),
-                    ),
-                    session_id: None,
-                    owner_uid: Some(1000),
-                    sandbox_session_id: None,
-                    comment: None,
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Global,
+                    target: Some(ApprovalTarget::FilesystemPath {
+                        path: PathBuf::from("./.git"),
+                    }),
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new(
+                            project_root.clone(),
+                            home.clone(),
+                            project_root.clone(),
+                        ),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: None,
+                        comment: None,
+                    },
+                    client_id: 1,
+                    approver_uid: None,
                 },
-                client_id: 1,
-                approver_uid: None,
-            }, DecisionAction::Approve)
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1244,26 +1247,29 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Global,
-                target: Some(ApprovalTarget::FilesystemPath {
-                    path: PathBuf::from("./.git"),
-                }),
-                wire: ScopeWire {
-                    paths: SandboxPaths::new(
-                        project_root.clone(),
-                        home.clone(),
-                        project_root.clone(),
-                    ),
-                    session_id: None,
-                    owner_uid: Some(1000),
-                    sandbox_session_id: None,
-                    comment: None,
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Global,
+                    target: Some(ApprovalTarget::FilesystemPath {
+                        path: PathBuf::from("./.git"),
+                    }),
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new(
+                            project_root.clone(),
+                            home.clone(),
+                            project_root.clone(),
+                        ),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: None,
+                        comment: None,
+                    },
+                    client_id: 1,
+                    approver_uid: None,
                 },
-                client_id: 1,
-                approver_uid: None,
-            }, DecisionAction::Approve)
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1327,23 +1333,26 @@ mod tests {
             .insert_pending(Pending::Resource(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Global,
-                target: Some(ApprovalTarget::ResourcePath {
-                    resource_kind: ResourceKind::UnixSocket,
-                    path: "/dev/fd/*".into(),
-                }),
-                wire: ScopeWire {
-                    paths: SandboxPaths::new("/repo", home.clone(), "/repo"),
-                    session_id: None,
-                    owner_uid: Some(1000),
-                    sandbox_session_id: None,
-                    comment: None,
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Global,
+                    target: Some(ApprovalTarget::ResourcePath {
+                        resource_kind: ResourceKind::UnixSocket,
+                        path: "/dev/fd/*".into(),
+                    }),
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new("/repo", home.clone(), "/repo"),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: None,
+                        comment: None,
+                    },
+                    client_id: 1,
+                    approver_uid: None,
                 },
-                client_id: 1,
-                approver_uid: None,
-            }, DecisionAction::Approve)
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1447,16 +1456,19 @@ mod tests {
         add_ui_sessions(&store).await;
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Once,
-                target: Some(ApprovalTarget::Dbus {
-                    target: target.clone(),
-                }),
-                wire: ScopeWire::from_resolved(&ctx, None),
-                client_id: 1,
-                approver_uid: Some(1000),
-            }, DecisionAction::Approve)
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Once,
+                    target: Some(ApprovalTarget::Dbus {
+                        target: target.clone(),
+                    }),
+                    wire: ScopeWire::from_resolved(&ctx, None),
+                    client_id: 1,
+                    approver_uid: Some(1000),
+                },
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(matches!(
@@ -1521,22 +1533,25 @@ mod tests {
         add_ui_sessions(&store).await;
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Global,
-                target: Some(ApprovalTarget::Dbus {
-                    target: edited.clone(),
-                }),
-                wire: ScopeWire {
-                    paths: SandboxPaths::new("/repo", home.clone(), "/repo"),
-                    session_id: None,
-                    owner_uid: Some(1000),
-                    sandbox_session_id: None,
-                    comment: Some("allow introspect".into()),
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Global,
+                    target: Some(ApprovalTarget::Dbus {
+                        target: edited.clone(),
+                    }),
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new("/repo", home.clone(), "/repo"),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: None,
+                        comment: Some("allow introspect".into()),
+                    },
+                    client_id: 1,
+                    approver_uid: Some(1000),
                 },
-                client_id: 1,
-                approver_uid: Some(1000),
-            }, DecisionAction::Approve)
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1610,16 +1625,19 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Session,
-                target: Some(ApprovalTarget::FilesystemPath {
-                    path: "/home/user/projects/foo".into(),
-                }),
-                wire: scope_wire(submitting_session_id),
-                client_id: 1,
-                approver_uid: None,
-            }, DecisionAction::Approve)
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Session,
+                    target: Some(ApprovalTarget::FilesystemPath {
+                        path: "/home/user/projects/foo".into(),
+                    }),
+                    wire: scope_wire(submitting_session_id),
+                    client_id: 1,
+                    approver_uid: None,
+                },
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(reply.scope_succeeded());
@@ -1705,20 +1723,23 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id: pending_id.clone(),
-                scope: ApprovalScope::Once,
-                target: None,
-                wire: ScopeWire {
-                    paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
-                    session_id: None,
-                    owner_uid: Some(1001),
-                    sandbox_session_id: Some("sandbox-a".into()),
-                    comment: None,
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id: pending_id.clone(),
+                    scope: ApprovalScope::Once,
+                    target: None,
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                        session_id: None,
+                        owner_uid: Some(1001),
+                        sandbox_session_id: Some("sandbox-a".into()),
+                        comment: None,
+                    },
+                    client_id: 99,
+                    approver_uid: Some(1001),
                 },
-                client_id: 99,
-                approver_uid: Some(1001),
-            }, DecisionAction::Approve)
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1768,14 +1789,17 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id: pending_id.clone(),
-                scope: ApprovalScope::Once,
-                target: None,
-                wire: scope_wire("ui-b"),
-                client_id: 1,
-                approver_uid: None,
-            }, DecisionAction::Approve)
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id: pending_id.clone(),
+                    scope: ApprovalScope::Once,
+                    target: None,
+                    wire: scope_wire("ui-b"),
+                    client_id: 1,
+                    approver_uid: None,
+                },
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1825,14 +1849,17 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Once,
-                target: None,
-                wire: scope_wire("ui-a"),
-                client_id: 1,
-                approver_uid: None,
-            }, DecisionAction::Approve)
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Once,
+                    target: None,
+                    wire: scope_wire("ui-a"),
+                    client_id: 1,
+                    approver_uid: None,
+                },
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(
@@ -1865,20 +1892,23 @@ mod tests {
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
-            .apply_pending_decision(PendingDecision {
-                pending_id,
-                scope: ApprovalScope::Once,
-                target: None,
-                wire: ScopeWire {
-                    paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
-                    session_id: None,
-                    owner_uid: Some(1000),
-                    sandbox_session_id: Some("sandbox-a".into()),
-                    comment: None,
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Once,
+                    target: None,
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: Some("sandbox-a".into()),
+                        comment: None,
+                    },
+                    client_id: 99,
+                    approver_uid: Some(1000),
                 },
-                client_id: 99,
-                approver_uid: Some(1000),
-            }, DecisionAction::Approve)
+                DecisionAction::Approve,
+            )
             .await;
 
         assert!(

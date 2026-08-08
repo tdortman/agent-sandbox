@@ -6,6 +6,7 @@ use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
     HttpSessionMetadata as CoreHttpSessionMetadata,
 };
+
 use http::HeaderMap;
 use std::fmt;
 
@@ -798,7 +799,6 @@ mod tests {
         let mut body = BoundedRequestBody::new(2).expect("valid limits");
         body.push_chunk(&[1, 2]).expect("chunk at the bound");
         assert_eq!(body.push_chunk(&[1, 2, 3]), Err(BodyError::ChunkTooLarge));
-
         assert_eq!(BoundedRequestBody::new(0), Err(BodyError::InvalidLimit));
     }
 
@@ -906,8 +906,8 @@ mod tests {
     fn terminal_errors_are_typed() {
         let error = TerminalError::Transport("closed".into());
         let event = ResponseEvent::Error(error.clone());
-
         assert_eq!(error.to_string(), "transport failure: closed");
+
         assert_eq!(
             event,
             ResponseEvent::Error(TerminalError::Transport("closed".into()))

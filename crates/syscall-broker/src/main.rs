@@ -111,7 +111,6 @@ async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
-
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
     let mut policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());

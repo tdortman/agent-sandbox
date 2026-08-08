@@ -10,8 +10,8 @@ use crate::{
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
     SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
-    read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
-    peer_context, trusted_project_policy_path,
+    peer_context, read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
+    trusted_project_policy_path,
 };
 
 use std::path::{Path, PathBuf};

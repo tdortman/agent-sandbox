@@ -257,7 +257,6 @@ async fn read_line_limited(
     max_bytes: usize,
 ) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
-
     let n = reader.read_until(b'\n', &mut buf).await?;
 
     if n == 0 {

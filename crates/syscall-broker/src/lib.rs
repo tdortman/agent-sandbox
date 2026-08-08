@@ -1242,11 +1242,11 @@ mod tests {
         SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
         SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg, device_file_type,
         filesystem_checks_rename, filesystem_checks_symlink, filesystem_checks_unlink,
-        hex_encode_lower, is_at_fdcwd,
-        is_device_bypass, is_device_file, is_device_node_for_resource_gate,
-        notification_arch_valid, parse_sockaddr, read_resolved_path_arg, resolve_open_path,
-        resolve_tracee_path, revalidate_filesystem_mutation, scheme_for_socket_type,
-        target_from_notification, tracee_fd_path, tracee_open_dir_base,
+        hex_encode_lower, is_at_fdcwd, is_device_bypass, is_device_file,
+        is_device_node_for_resource_gate, notification_arch_valid, parse_sockaddr,
+        read_resolved_path_arg, resolve_open_path, resolve_tracee_path,
+        revalidate_filesystem_mutation, scheme_for_socket_type, target_from_notification,
+        tracee_fd_path, tracee_open_dir_base,
     };
     use agent_sandbox_syscall::policy::nr;
     use std::{

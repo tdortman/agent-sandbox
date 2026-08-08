@@ -2,8 +2,10 @@ use super::{
     FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
     is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
 };
+
 use crate::semantic::SemanticRequest;
 use agent_sandbox_core::HttpRequest;
+
 use rama_core::{
     Layer, Service,
     bytes::Bytes,
@@ -12,17 +14,22 @@ use rama_core::{
     rt::Executor,
     service::BoxService,
 };
+
 use rama_dns::client::DnsConnectorLayer;
+
 use rama_http::{
     Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
 };
+
 use rama_http_backend::client::{
     BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnector, HttpPooledConnectorConfig,
 };
+
 use rama_net::client::{EstablishedClientConnection, pool::MultiplexedConnection};
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
+
 use std::{
     pin::Pin,
     sync::{
@@ -401,7 +408,9 @@ mod tests {
         ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
         is_protocol_negotiation_failure, select_upstream_version,
     };
+
     use rama_http::{Body, Version};
+
     use std::{
         pin::Pin,
         sync::{Arc, Mutex, atomic::AtomicBool},

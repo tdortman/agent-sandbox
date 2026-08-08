@@ -24,13 +24,16 @@ use crate::{
     policy::FlowClaim,
     semantic::SemanticRequest,
 };
+
 use agent_sandbox_core::HttpCheckReply;
 use bytes::{Buf, Bytes};
+
 use h3::{
     error::Code,
     quic::{BidiStream as _, RecvStream as _, SendStream as _, StreamId},
     server::RequestStream,
 };
+
 use h3_datagram::datagram_handler::DatagramSender;
 use h3_quinn::datagram::SendDatagramHandler;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -1652,17 +1655,20 @@ mod tests {
             .uri("https://example.test/path")
             .body(())
             .expect("valid request");
-        assert!(!is_webtransport_request(&request));
 
+        assert!(!is_webtransport_request(&request));
         let mut request = request;
+
         request
             .extensions_mut()
             .insert(h3::ext::Protocol::WEB_TRANSPORT);
+
         assert!(is_webtransport_request(&request));
 
         request
             .extensions_mut()
             .insert(h3::ext::Protocol::CONNECT_UDP);
+
         assert!(!is_webtransport_request(&request));
     }
 }

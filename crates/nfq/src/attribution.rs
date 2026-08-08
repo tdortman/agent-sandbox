@@ -1,6 +1,7 @@
 //! Session-scoped hostname attribution persisted across NFQUEUE restarts.
 
 use serde::{Deserialize, Serialize};
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

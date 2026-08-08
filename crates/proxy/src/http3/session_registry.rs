@@ -8,6 +8,7 @@ use crate::{
     },
     semantic::SemanticRequest,
 };
+
 use agent_sandbox_core::HttpRequest;
 use h3::quic::StreamId;
 use std::collections::HashMap;
@@ -143,10 +144,12 @@ pub(super) fn session_key(
 #[cfg(test)]
 mod tests {
     use super::{SessionBinding, SessionRegistry, session_key};
+
     use crate::http3::{
         relay::semantic_request,
         session::{SessionKey, SessionProtocol},
     };
+
     use agent_sandbox_core::{AttributionToken, HttpRequest};
     use h3::quic::StreamId;
 
@@ -155,6 +158,7 @@ mod tests {
             .uri("https://example.test/path")
             .body(())
             .expect("valid request");
+
         semantic_request(&request, None, 8443).expect("valid semantic request")
     }
 
@@ -179,7 +183,6 @@ mod tests {
     #[test]
     fn session_key_carries_the_semantic_identity() {
         let key = key(SessionProtocol::WebSocket);
-
         assert_eq!(key.origin, "example.test:8443");
         assert_eq!(key.target, "https://example.test:8443/path");
         assert_eq!(key.protocol, SessionProtocol::WebSocket);
@@ -190,16 +193,19 @@ mod tests {
     async fn reserve_rejects_an_identity_change() {
         let registry = SessionRegistry::default();
         let first = key(SessionProtocol::WebSocket);
+
         registry
             .reserve(stream(0), &first)
             .await
             .expect("reserves the first identity");
 
         let second = key(SessionProtocol::ConnectUdp);
+
         let error = registry
             .reserve(stream(0), &second)
             .await
             .expect_err("identity change is rejected");
+
         assert_eq!(
             error.to_string(),
             "HTTP/3 session identity changed during reconnect"
@@ -216,12 +222,14 @@ mod tests {
             .validate(stream(0), &first)
             .await
             .expect_err("unleased identity is rejected");
+
         assert_eq!(
             error.to_string(),
             "HTTP/3 session identity changed during reconnect"
         );
 
         registry.reserve(stream(0), &first).await.expect("reserves");
+
         registry
             .validate(stream(0), &first)
             .await
@@ -231,6 +239,7 @@ mod tests {
             .validate(stream(0), &second)
             .await
             .expect_err("different identity is rejected");
+
         assert_eq!(
             error.to_string(),
             "HTTP/3 session identity changed during reconnect"
@@ -240,11 +249,13 @@ mod tests {
     #[tokio::test]
     async fn set_registers_the_binding_and_approval() {
         let registry = SessionRegistry::default();
+
         let binding = SessionBinding {
             key: key(SessionProtocol::WebSocket),
             downstream_stream_id: stream(0),
             upstream_stream_id: stream(4),
         };
+
         let normalized = normalized();
 
         registry
@@ -263,28 +274,33 @@ mod tests {
     #[tokio::test]
     async fn remove_keeps_the_approval_until_the_last_lease_releases() {
         let registry = SessionRegistry::default();
+
         let binding = SessionBinding {
             key: key(SessionProtocol::WebSocket),
             downstream_stream_id: stream(0),
             upstream_stream_id: stream(4),
         };
+
         let second = SessionBinding {
             key: binding.key.clone(),
             downstream_stream_id: stream(8),
             upstream_stream_id: stream(12),
         };
+
         let normalized = normalized();
 
         registry
             .set(&binding, &normalized)
             .await
             .expect("first binding registers");
+
         registry
             .set(&second, &normalized)
             .await
             .expect("second binding registers");
 
         registry.remove(stream(0)).await;
+
         assert_eq!(
             registry
                 .approved(&semantic(), SessionProtocol::WebSocket, attribution())
@@ -294,6 +310,7 @@ mod tests {
         );
 
         registry.remove(stream(8)).await;
+
         assert_eq!(
             registry
                 .approved(&semantic(), SessionProtocol::WebSocket, attribution())

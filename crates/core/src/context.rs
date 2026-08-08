@@ -3,14 +3,14 @@
 //! One module, three entry points. Each entry point encodes its trust level
 //! internally:
 //!
-//! - [`wire_context`]: peer env. Assembles the `RequestContext` a client
-//!   sends to policyd from the caller's own paths, falling back to the
-//!   persisted session file and the process environment.
+//! - [`wire_context`]: peer env. Assembles the `RequestContext` a client sends
+//!   to policyd from the caller's own paths, falling back to the persisted
+//!   session file and the process environment.
 //! - [`peer_context`]: `/proc`. Resolves paths by inspecting the peer process
 //!   itself. The environment comes from `/proc/<pid>/environ` and the home
 //!   directory is verified against the uid's passwd entry.
-//! - [`daemon_context`]: `/proc`, persisted session file, and daemon env.
-//!   Full daemon-side resolution for requests that name a process.
+//! - [`daemon_context`]: `/proc`, persisted session file, and daemon env. Full
+//!   daemon-side resolution for requests that name a process.
 //!
 //! The session-context JSON file at `/run/agent-sandbox/session-context.json`
 //! is read and written here. [`persist_session_paths`] exposes the write side
@@ -315,7 +315,6 @@ pub fn wire_context(
     sandbox_session_id: Option<String>,
 ) -> RequestContext {
     let paths = resolve_sandbox_paths(cwd, home, project_root, ids);
-
     let mut ctx = RequestContext::from_paths_and_ids(&paths, ids);
     ctx.sandbox_session_id = sandbox_session_id;
     ctx
@@ -624,6 +623,7 @@ mod tests {
     use super::{
         ProcessIds, SandboxPaths, daemon_context, discover_git_project_root, wire_context,
     };
+
     use crate::SessionContext;
     use std::path::Path;
 
@@ -664,10 +664,12 @@ mod tests {
 
         assert_eq!(ctx.sandbox_paths().cwd(), Some(Path::new("/cwd")));
         assert_eq!(ctx.sandbox_paths().home(), Some(Path::new("/home/user")));
+
         assert_eq!(
             ctx.sandbox_paths().project_root(),
             Some(Path::new("/cwd/repo"))
         );
+
         assert_eq!(ctx.ids(), ProcessIds::new(42, 1000));
         assert_eq!(ctx.sandbox_session_id.as_deref(), Some("session-a"));
     }
@@ -675,8 +677,8 @@ mod tests {
     #[test]
     fn daemon_context_resolves_the_calling_process() {
         let ctx = daemon_context(Some(std::process::id()));
-
         assert_eq!(ctx.ids.pid(), Some(std::process::id()));
+
         assert!(
             ctx.paths.cwd().is_some(),
             "cwd must resolve from /proc/self/cwd"

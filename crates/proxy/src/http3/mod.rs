@@ -11,6 +11,7 @@
 //! port to the proxy before any HTTP/3 traffic can arrive.
 
 mod association;
+
 mod connection_id;
 mod datagram;
 mod ech;
@@ -18,16 +19,20 @@ pub mod hpke;
 mod relay;
 mod session;
 pub use session::{Capsule, CapsuleDecoder, SessionError};
+
 mod session_registry;
 mod socket;
 pub mod upstream;
 mod webtransport;
+
 use crate::{
     alt_svc::AltSvcStore, cert::CertificateIssuer, ech_state::DownstreamEch, policy::PolicySession,
 };
+
 use agent_sandbox_core::ProxyConnectionId;
 use h3::error::Code;
 use socket::TransparentUdpSocket;
+
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -35,6 +40,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
 use tokio::sync::{Notify, Semaphore};
 
 /// Owner of one locally-issued QUIC connection-ID route.
@@ -67,10 +73,12 @@ impl ConnectionIdRegistry {
 
         match owners.get(&id) {
             Some(existing) if *existing == owner => Ok(()),
+
             Some(existing) => Err(format!(
                 "QUIC connection ID {id} already belongs to stable connection {}",
                 existing.stable_id
             )),
+
             None => {
                 owners.insert(id, owner);
                 drop(owners);
@@ -99,10 +107,12 @@ impl ConnectionIdRegistry {
                 drop(owners);
                 Ok(())
             }
+
             Some(existing) => Err(format!(
                 "QUIC connection ID {id} belongs to stable connection {}, not {}",
                 existing.stable_id, owner.stable_id
             )),
+
             None => Err(format!("unknown QUIC connection ID {id}")),
         }
     }
@@ -111,6 +121,7 @@ impl ConnectionIdRegistry {
         let Ok(mut owners) = self.owners.lock() else {
             return;
         };
+
         owners.retain(|_, existing| *existing != owner);
     }
 }
@@ -131,6 +142,7 @@ pub struct Http3State {
     pub destination_port: u16,
     pub alt_svc: Arc<AltSvcStore>,
     pub(crate) connection_ids: Arc<ConnectionIdRegistry>,
+
     /// Downstream ECH configuration and key, shared with the TCP leg.
     pub ech: Option<DownstreamEch>,
 }
@@ -234,6 +246,7 @@ pub fn prepare(
             association::DestinationResolver::new(bound_port, config.test_destination, true);
 
         ports.push(bound_port);
+
         alternatives.push(AltEndpoint {
             v4,
             v6,
@@ -246,6 +259,7 @@ pub fn prepare(
     // No association can run before `prepare` returns, so replacing the
     // placeholder store in the freshly built state is safe.
     let alt_svc = Arc::new(AltSvcStore::new(ports.clone()));
+
     Arc::get_mut(&mut state)
         .expect("fresh HTTP/3 state")
         .alt_svc = alt_svc.clone();
@@ -461,7 +475,6 @@ mod tests {
         let id = quinn::ConnectionId::new(&[0x42; 8]);
         let first = owner(1);
         let second = owner(2);
-
         registry.bind(id, first).expect("first owner binds");
         registry.bind(id, first).expect("same owner is idempotent");
         assert!(registry.bind(id, second).is_err());
@@ -477,18 +490,22 @@ mod tests {
         let second = owner(2);
         let first_id = quinn::ConnectionId::new(&[0x41; 8]);
         let second_id = quinn::ConnectionId::new(&[0x42; 8]);
-
         registry.bind(first_id, first).expect("first owner binds");
+
         registry
             .bind(second_id, first)
             .expect("first owner binds again");
+
         registry
             .bind(second_id, second)
             .expect_err("IDs cannot be stolen");
+
         registry.remove_owner(first);
+
         registry
             .bind(first_id, second)
             .expect("teardown releases first ID");
+
         registry
             .bind(second_id, second)
             .expect("teardown releases second ID");
@@ -504,6 +521,7 @@ mod tests {
         registry
             .bind(id, first)
             .expect("zero-length CID binds locally");
+
         registry
             .bind(id, second)
             .expect("zero-length CIDs use tuple routing");

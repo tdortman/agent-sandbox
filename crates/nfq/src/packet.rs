@@ -24,6 +24,7 @@ pub struct PacketMeta {
     pub dst_port: u16,
     pub protocol: TransportProtocol,
     pub tcp_syn: bool,
+
     /// Offset of the transport header within the packet: the IPv4 IHL, or 40
     /// plus the total IPv6 extension header length.
     pub transport_offset: usize,

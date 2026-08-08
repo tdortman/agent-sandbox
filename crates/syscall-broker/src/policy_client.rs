@@ -1,8 +1,10 @@
 use crate::{NetworkTarget, ResourceTarget};
+
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
     ResourceCheckReply, RpcReply, RpcRequest, wire_context,
 };
+
 use std::{
     io,
     path::{Path, PathBuf},
@@ -17,6 +19,7 @@ fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestConte
     // root the UI cannot record project-scope approvals and every project-scope
     // approval attempt fails with "project_root required".
     let ids = ProcessIds::from_options(Some(pid), None);
+
     wire_context(None, None, None, ids, sandbox_session_id)
 }
 
@@ -147,10 +150,13 @@ impl PersistentPolicyClient {
 #[cfg(test)]
 mod tests {
     use super::{PersistentPolicyClient, request_context};
+
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
+
     use std::{path::Path, time::Duration};
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
@@ -171,7 +177,9 @@ mod tests {
             for (key, value) in entries {
                 // SAFETY: tests run single-threaded within this binary's
                 // test threads, and every key is restored on drop.
-                unsafe { std::env::set_var(key, value) };
+                unsafe { std::env::set_var(key, value) }
+
+                ;
             }
 
             Self(previous)
@@ -204,13 +212,14 @@ mod tests {
         ]);
 
         let ctx = request_context(42, Some("session-a".into()));
-
         assert_eq!(ctx.sandbox_paths().cwd(), Some(Path::new("/work")));
         assert_eq!(ctx.sandbox_paths().home(), Some(Path::new("/home/sbx")));
+
         assert_eq!(
             ctx.sandbox_paths().project_root(),
             Some(Path::new("/work/repo"))
         );
+
         assert_eq!(ctx.sandbox_session_id.as_deref(), Some("session-a"));
         assert_eq!(ctx.ids().pid(), Some(42));
     }

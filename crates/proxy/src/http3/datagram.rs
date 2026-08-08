@@ -1,6 +1,7 @@
 //! HTTP Datagram routing for downstream HTTP/3 streams.
 
 use bytes::Bytes;
+
 use h3::quic::StreamId;
 use h3_datagram::datagram_handler::{DatagramReader, DatagramSender};
 use h3_quinn::datagram::{RecvDatagramHandler, SendDatagramHandler};
@@ -77,7 +78,6 @@ impl DatagramRouter {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::DatagramRouter;
@@ -109,15 +109,13 @@ mod tests {
             .get(&stream(0))
             .cloned()
             .expect("route for stream 0");
+
         sender
             .send(Ok(Bytes::from_static(b"payload")))
             .await
             .expect("payload delivers");
 
-        assert_eq!(
-            first.recv().await,
-            Some(Ok(Bytes::from_static(b"payload")))
-        );
+        assert_eq!(first.recv().await, Some(Ok(Bytes::from_static(b"payload"))));
         assert!(second.try_recv().is_err(), "stream 4 receives no payload");
     }
 
@@ -125,6 +123,7 @@ mod tests {
     async fn unregister_drops_the_route() {
         let router = router();
         let receiver = router.register(stream(0)).await;
+
         let sender = router
             .routes
             .lock()
@@ -134,14 +133,19 @@ mod tests {
             .expect("route registered");
 
         router.unregister(stream(0)).await;
+
         assert!(
             router.routes.lock().await.get(&stream(0)).is_none(),
             "route is removed"
         );
 
         drop(receiver);
+
         assert!(
-            sender.send(Ok(Bytes::from_static(b"payload"))).await.is_err(),
+            sender
+                .send(Ok(Bytes::from_static(b"payload")))
+                .await
+                .is_err(),
             "the dropped route receiver closes the channel"
         );
     }

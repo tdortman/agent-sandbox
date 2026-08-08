@@ -23,14 +23,17 @@ use crate::{
         semantic_request_headers,
     },
 };
+
 use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest};
 use bytes::{Buf, Bytes};
+
 use h3::{
     ConnectionState,
     error::{Code, StreamError},
     quic::StreamId,
     server::RequestStream,
 };
+
 use h3_datagram::datagram_handler::DatagramSender;
 use h3_quinn::datagram::SendDatagramHandler;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -1171,10 +1174,12 @@ mod tests {
         body_task_result, build_upstream_request, has_capsule_protocol, require_capsule_protocol,
         semantic_request, session_open_error, upstream_headers,
     };
+
     use crate::http3::{
         BoxError,
         session::{SessionKey, SessionProtocol},
     };
+
     use agent_sandbox_core::AttributionToken;
 
     fn request(uri: &str, host: Option<&str>) -> http::Request<()> {
@@ -1208,11 +1213,8 @@ mod tests {
     fn semantic_request_accepts_authority_matching_host()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = request("https://example.test/path", Some("example.test"));
-
         let semantic = semantic_request(&request, None, 8443)?;
-
         assert_eq!(semantic.authority(), "example.test:8443");
-
         Ok(())
     }
 
@@ -1220,11 +1222,8 @@ mod tests {
     fn semantic_request_accepts_matching_origin_authority()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = request("https://example.test/path", None);
-
         let semantic = semantic_request(&request, Some("example.test"), 8443)?;
-
         assert_eq!(semantic.authority(), "example.test:8443");
-
         Ok(())
     }
 
@@ -1232,11 +1231,8 @@ mod tests {
     fn semantic_request_applies_fallback_port()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = request("https://example.test/path", None);
-
         let semantic = semantic_request(&request, None, 443)?;
-
         assert_eq!(semantic.authority(), "example.test");
-
         Ok(())
     }
 
@@ -1256,7 +1252,6 @@ mod tests {
     #[test]
     fn semantic_request_rejects_mismatched_host_header() {
         let request = request("https://example.test/path", Some("other.test"));
-
         let error = semantic_request(&request, None, 8443).expect_err("host mismatch is rejected");
 
         assert_eq!(
@@ -1294,11 +1289,13 @@ mod tests {
     fn has_capsule_protocol_rejects_missing_wrong_or_duplicate_markers()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let plain = request("https://example.test/path", None);
+
         assert!(!has_capsule_protocol(&semantic_request(
             &plain, None, 8443
         )?));
 
         let wrong = request_with_header("capsule-protocol", "?0");
+
         assert!(!has_capsule_protocol(&semantic_request(
             &wrong, None, 8443
         )?));
@@ -1309,6 +1306,7 @@ mod tests {
             .header("capsule-protocol", "?1")
             .body(())
             .expect("valid request");
+
         assert!(!has_capsule_protocol(&semantic_request(
             &duplicate, None, 8443
         )?));
@@ -1322,6 +1320,7 @@ mod tests {
 
         let error =
             require_capsule_protocol(false).expect_err("missing capsule protocol is rejected");
+
         assert_eq!(
             error.to_string(),
             "HTTP/3 CONNECT-UDP body requires Capsule-Protocol: ?1"
@@ -1343,6 +1342,7 @@ mod tests {
 
         assert_eq!(built.method(), http::Method::GET);
         assert_eq!(built.uri().to_string(), "https://example.test:8443/path");
+
         assert_eq!(
             built.extensions().get::<h3::ext::Protocol>(),
             Some(&h3::ext::Protocol::WEBSOCKET)
@@ -1356,11 +1356,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let semantic = semantic_request(&request("https://example.test/path", None), None, 8443)?;
         let upstream_url = url::Url::parse("https://example.test/path")?;
-
         let built = build_upstream_request(&semantic, &upstream_url, "example.test:8443", None)?;
-
         assert!(built.extensions().get::<h3::ext::Protocol>().is_none());
-
         Ok(())
     }
 
@@ -1372,21 +1369,19 @@ mod tests {
             .header("host", "example.test")
             .header("x-custom", "value")
             .body(())?;
+
         let semantic = semantic_request(&request, None, 8443)?;
-
         let headers = upstream_headers(semantic.headers())?;
-
         assert!(!headers.contains_key("host"));
         assert_eq!(headers.get("x-custom").expect("custom header"), "value");
-
         Ok(())
     }
 
     #[test]
     fn session_open_error_reports_the_last_attempt_or_the_protocol() {
         let key = session_key();
-
         let last_error: BoxError = "upstream refused".into();
+
         assert_eq!(
             session_open_error(Some(last_error), &key).to_string(),
             "upstream refused"
@@ -1403,7 +1398,6 @@ mod tests {
         let task = tokio::spawn(std::future::pending::<Result<(), BoxError>>());
         task.abort();
         let join_error = task.await.expect_err("aborted task fails to join");
-
         assert!(body_task_result(Err(join_error)).is_ok());
     }
 
@@ -1412,6 +1406,7 @@ mod tests {
         let body_error: BoxError = "body failed".into();
         let task = tokio::spawn(async { Err::<(), BoxError>(body_error) });
         let result = task.await.expect("body task joins");
+
         assert_eq!(
             body_task_result(Ok(result))
                 .expect_err("body error propagates")
@@ -1423,6 +1418,7 @@ mod tests {
         let join_error = task.await.expect_err("panicking task fails to join");
         assert!(!join_error.is_cancelled());
         let error = body_task_result(Err(join_error)).expect_err("join error surfaces");
+
         assert!(
             error
                 .to_string()

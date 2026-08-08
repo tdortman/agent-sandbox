@@ -9,11 +9,13 @@
 //! tests a way to observe partial responses.
 
 use agent_sandbox_proxy::http3::CapsuleDecoder;
+
 use bytes::{Buf, Bytes};
 use clap::Parser;
 use h3::quic::{SendStream as _, SendStreamUnframed as _};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use rustls::pki_types::pem::PemObject;
+
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -26,6 +28,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
 use tokio::io::unix::AsyncFd;
 
 #[derive(Debug)]
@@ -700,6 +703,7 @@ mod tests {
     #[test]
     fn bare_port_advertises_the_same_host() {
         let file = alt_svc_file("4444");
+
         assert_eq!(
             read_alt_svc(file.path()),
             Some("h3=\":4444\"; persist=1".to_owned())
@@ -709,6 +713,7 @@ mod tests {
     #[test]
     fn absolute_v4_advertises_host_and_port() {
         let file = alt_svc_file("169.254.100.1:4444");
+
         assert_eq!(
             read_alt_svc(file.path()),
             Some("h3=\"169.254.100.1:4444\"; persist=1".to_owned())
@@ -718,6 +723,7 @@ mod tests {
     #[test]
     fn absolute_v6_advertises_host_and_port() {
         let file = alt_svc_file("[fd00:dead:beef::1]:4444");
+
         assert_eq!(
             read_alt_svc(file.path()),
             Some("h3=\"[fd00:dead:beef::1]:4444\"; persist=1".to_owned())

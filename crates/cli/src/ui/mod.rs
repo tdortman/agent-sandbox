@@ -11,9 +11,11 @@ use agent_sandbox_core::{
     DbusBus, DbusMessageKind, DbusTarget, RequestContext, RpcConnection, RpcMessage, RpcReply,
     RpcRequest, SandboxPaths, UiPush,
 };
+
 use clap::Parser;
 pub use error::UiCliError;
 use nix::fcntl::{Flock, FlockArg, OFlag};
+
 use std::{
     fs::{File, OpenOptions},
     future::Future,
@@ -21,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
 use tracing::{info, warn};
 
 #[must_use]
@@ -337,10 +340,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
     use tokio::{
         sync::{Mutex, Notify, oneshot},
         time::timeout,

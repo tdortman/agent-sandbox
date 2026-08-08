@@ -5,11 +5,10 @@
 //! exist or cannot be bound, the daemon falls back to the on-disk cache.
 
 use crate::flow::NfqState;
-use agent_sandbox_core::{DnsCache, DEFAULT_MAX_TTL};
+
+use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache};
 use std::{path::Path, sync::Arc};
 use tracing::{debug, info, warn};
-
-
 
 /// Background thread that consumes `{"ip","host","ttl"}` lines from the DNS
 /// forwarder's push socket and inserts them into the in-memory cache. The
@@ -90,7 +89,6 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
         .expect("spawn push socket listener");
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UnixPeerCred {
     pid: u32,
@@ -98,20 +96,17 @@ struct UnixPeerCred {
     gid: u32,
 }
 
-
 fn restrict_push_socket_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-
 fn enable_passcred(sock: &std::os::unix::net::UnixDatagram) -> std::io::Result<()> {
     use nix::sys::socket::{setsockopt, sockopt::PassCred};
 
     setsockopt(sock, PassCred, &true).map_err(std::io::Error::from)
 }
-
 
 fn recv_datagram_with_creds(
     sock: &std::os::unix::net::UnixDatagram,
@@ -151,7 +146,6 @@ fn recv_datagram_with_creds(
     Ok((msg.bytes, cred))
 }
 
-
 /// Apply a validated push mapping to the in-memory DNS cache.
 fn apply_push_mapping(cache: &Arc<std::sync::Mutex<DnsCache>>, entry: &PushMapping) {
     if entry.host.is_empty() {
@@ -163,7 +157,6 @@ fn apply_push_mapping(cache: &Arc<std::sync::Mutex<DnsCache>>, entry: &PushMappi
     }
 }
 
-
 #[derive(serde::Deserialize)]
 struct PushMapping {
     ip: String,
@@ -173,14 +166,10 @@ struct PushMapping {
     ttl: u32,
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::flow::tests::state_for_tests;
-
-
 
     #[test]
     fn push_mapping_applies_to_cache() {
@@ -204,7 +193,6 @@ mod tests {
             Some("example.com")
         );
     }
-
 
     #[test]
     fn push_socket_rejects_untrusted_peer_uid() {
@@ -273,8 +261,4 @@ mod tests {
 
         let _ = std::fs::remove_file(socket_path);
     }
-
-
-
 }
-

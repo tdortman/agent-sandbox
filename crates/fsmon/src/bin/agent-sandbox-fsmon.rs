@@ -837,6 +837,7 @@ fn run_event_loop(
                 tracing::info!(%path, ?access, pid = meta.pid, "filesystem check");
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
+
                 let reply =
                     runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
 

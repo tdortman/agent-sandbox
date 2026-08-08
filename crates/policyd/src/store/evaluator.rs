@@ -272,10 +272,12 @@ mod tests {
             Some(Verdict::denied(VerdictSource::policy()))
         );
 
-        assert!(!store
-            .network_verdict("example.com", 443, &ctx, true)
-            .await
-            .is_some_and(|v| v.allowed));
+        assert!(
+            !store
+                .network_verdict("example.com", 443, &ctx, true)
+                .await
+                .is_some_and(|v| v.allowed)
+        );
     }
 
     #[tokio::test]

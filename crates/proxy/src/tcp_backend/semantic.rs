@@ -5,14 +5,17 @@ use crate::{
     },
     tcp_backend::is_websocket_upgrade_response,
 };
+
 use rama_core::{
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
 };
+
 use rama_http::{
     Body, HeaderMap, Response, Version,
     body::{Frame, StreamingBody},
 };
+
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -309,6 +312,7 @@ pub fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, Bo
 mod tests {
     use super::{SemanticRequestBody, bridge_response_body, semantic_response_headers};
     use crate::semantic::{BoundedRequestBody, semantic_request_headers};
+
     use rama_http::{
         Body, HeaderMap, HeaderValue, Request, Response, StatusCode, body::util::BodyExt,
     };
@@ -336,6 +340,7 @@ mod tests {
             }),
         ))
         .expect("semantic headers");
+
         assert_eq!(headers.as_slice()[0].value(), &[0x80, b'a']);
     }
 

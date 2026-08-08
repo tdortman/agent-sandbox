@@ -9,6 +9,7 @@ use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, PersistentRpcClient,
     RequestContext, RpcClientError, RpcReply, RpcRequest,
 };
+
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -99,6 +100,7 @@ pub async fn start_monitor(
 
     match reply {
         RpcReply::FilesystemMonitor(reply) => Ok(reply),
+
         _ => Err(RpcClientError::UnexpectedReply(
             "expected a filesystem monitor reply",
         )),
@@ -108,11 +110,14 @@ pub async fn start_monitor(
 #[cfg(test)]
 mod tests {
     use super::MonitorClient;
+
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RequestContext, RpcMessage, RpcReply,
         VerdictSource,
     };
+
     use std::path::Path;
+
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,

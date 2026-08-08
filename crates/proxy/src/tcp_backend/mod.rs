@@ -16,9 +16,11 @@ use crate::{
         BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
     },
 };
+
 use agent_sandbox_core::{HttpCheckReply, HttpUrl};
 use doh::{is_doh_request, rewrite_doh_response};
 use nix::sys::socket::{getsockopt, sockopt};
+
 use rama_core::{
     Service,
     bytes::Bytes,
@@ -28,6 +30,7 @@ use rama_core::{
     rt::Executor,
     service::service_fn,
 };
+
 use rama_http::{
     Body, HeaderValue, Request, Response, StatusCode, Version,
     body::{Frame, StreamingBody},
@@ -38,7 +41,9 @@ use rama_http::{
         version_adapter::{ResponseVersionAdaptCtx, adapt_response_version},
     },
 };
+
 use rama_http_backend::server::HttpServer;
+
 use rama_net::{
     address::SocketAddress,
     http::server::HttpPeekRouter,
@@ -46,12 +51,15 @@ use rama_net::{
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
+
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
 pub(crate) use semantic::SemanticRequestBody;
 use semantic::{bridge_response_body, semantic_http_version};
+
 #[cfg(debug_assertions)]
 use std::path::{Path, PathBuf};
+
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
@@ -60,6 +68,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+
 use tls::{RustlsTlsService, TlsServerName, build_tcp_tls_config};
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
@@ -374,6 +383,7 @@ pub struct ListenConfig {
     pub http10_upstream_origins: Arc<Vec<String>>,
     pub destination_resolver: DestinationResolver,
     pub test_tls: bool,
+
     #[cfg(debug_assertions)]
     pub write_bound_ports: Option<(PathBuf, Vec<u16>)>,
 }
@@ -387,6 +397,7 @@ async fn build_upstream_clients(
 ) -> Result<Arc<UpstreamClients>, BoxError> {
     match UpstreamClients::new() {
         Ok(clients) => Ok(Arc::new(clients)),
+
         Err(error) => {
             let _ = policy.release(claim).await;
             Err(error)
@@ -415,10 +426,13 @@ fn build_listener_service(
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
         let shutdown = shutdown.clone();
+
         #[cfg(debug_assertions)]
         let destination_resolver = listener_config.destination_resolver.clone();
+
         #[cfg(not(debug_assertions))]
         let destination_resolver = listener_config.destination_resolver;
+
         let test_tls = listener_config.test_tls;
         let active_checks = active_checks.clone();
         let tls_config = tls_config.clone();
@@ -506,6 +520,7 @@ fn build_listener_service(
             // and session storage through their `Arc` fields, so resumption
             // state survives between connections.
             let mut tls_config = tls_config.as_ref().clone();
+
             tls_config.cert_resolver = Arc::new(http3::SandboxCertResolver {
                 issuer: issuer.clone(),
                 fallback_name: destination_ip.to_string(),
@@ -973,14 +988,17 @@ mod tests {
         is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
         request_head_clone,
     };
+
     use crate::{
         alt_svc::AltSvcStore,
         policy::{FlowClaim, PolicySession, test_support::FakePolicy},
         tcp_backend::upstream::UpstreamClients,
     };
+
     use agent_sandbox_core::{
         AttributionToken, FlowProtocol, NetworkFlowKey, NormalizedPolicyHost, ProxyConnectionId,
     };
+
     use rama_core::{
         Service,
         bytes::Bytes,
@@ -989,13 +1007,16 @@ mod tests {
         rt::Executor,
         service::service_fn,
     };
+
     use rama_http::{
         HeaderMap, HeaderValue, Response,
         body::util::BodyExt,
         io::upgrade::{Upgraded, pending},
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
+
     use rama_net::proxy::IoForwardService;
+
     use std::{
         convert::Infallible,
         net::{IpAddr, SocketAddr},
@@ -1005,6 +1026,7 @@ mod tests {
         sync::Arc,
         task::{Context, Poll},
     };
+
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         sync::{Notify, Semaphore},
@@ -1509,9 +1531,7 @@ mod tests {
             .expect_err("missing authority is rejected");
 
         drop(state);
-
         assert_eq!(error.to_string(), "HTTP request has no authority");
-
         Ok(())
     }
 
@@ -1521,7 +1541,6 @@ mod tests {
         let fake = FakePolicy::start();
         let state = flow_state(fake.socket.clone()).await?;
         let shutdown = Arc::new(Notify::new());
-
         fake.release_checks.notify_one();
 
         let request = Request::builder()
@@ -1538,7 +1557,6 @@ mod tests {
         assert_eq!(authority, "127.0.0.1:8080");
         assert_eq!(path, "/");
         assert_eq!(semantic.authority(), "127.0.0.1:8080");
-
         Ok(())
     }
 }

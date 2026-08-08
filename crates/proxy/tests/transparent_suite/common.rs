@@ -1,6 +1,7 @@
 //! Helpers shared by the transparent acceptance scenario families.
 
 use crate::support::TransparentHarness;
+
 use std::time::Duration;
 use tokio::time::sleep;
 

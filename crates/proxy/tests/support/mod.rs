@@ -3,13 +3,17 @@ use agent_sandbox_core::{
     NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxySessionReply,
     ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
 };
+
 use bytes::{Buf, Bytes};
+
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
 };
+
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::pem::PemObject;
+
 use std::{
     io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -22,7 +26,9 @@ use std::{
     },
     time::Duration,
 };
+
 use tempfile::TempDir;
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},

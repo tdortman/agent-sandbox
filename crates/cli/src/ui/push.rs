@@ -13,13 +13,15 @@ use super::{
     },
     prompt_blocking, signature_display,
 };
+
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
     FlowProtocol, HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess,
     ResourceKind, ResourceRule, SandboxPaths, SocketAccess, SudoRule, UiPush,
-    contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name,
-    scheme_for, split_check_aliases,
+    contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name, scheme_for,
+    split_check_aliases,
 };
+
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -1498,6 +1500,7 @@ fn network_prompt_scheme(transport: &str, port: u16) -> &str {
         // The wire classification for UDP 443 is "http3"; display URLs
         // render it as https with a QUIC hint.
         "http3" => "https",
+
         scheme => scheme,
     }
 }
@@ -1558,10 +1561,12 @@ mod tests {
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
+
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess,
     };
+
     use std::{collections::HashMap, path::Path};
 
     #[test]

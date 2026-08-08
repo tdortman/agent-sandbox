@@ -1,6 +1,9 @@
 //! Persistent ECH key material and DNS configuration for the transparent proxy.
 
+use crate::http3::BoxError;
+
 use ring::rand::SecureRandom as _;
+
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -11,9 +14,8 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
 
-use crate::http3::BoxError;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
 
 /// Directory containing the proxy's persistent ECH key and configuration.
 pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";
@@ -101,9 +103,7 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
         })?;
 
         let key = X25519PrivateKey::from(private_key);
-
         let public_key = X25519PublicKey::from(&key).to_bytes();
-
         let config_list = encode_config_list(&public_key);
         atomic_write(&config_path, &config_list)?;
 
@@ -115,7 +115,6 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
 
     let key = generate_x25519_private_key()?;
     let private_key = key.to_bytes();
-
     let public_key = X25519PublicKey::from(&key).to_bytes();
 
     if let Err(error) = create_if_missing(&private_key_path, &private_key, 0o600) {
@@ -257,10 +256,8 @@ mod tests {
         let second = load_or_generate(&directory).expect("load ECH state");
         assert_eq!(first.config_list, second.config_list);
         assert_eq!(first.private_key, second.private_key);
-
         let downstream = DownstreamEch::from(first);
         let keys = downstream.ech_keys().expect("valid ECH config");
-
         assert!(!keys.is_empty());
 
         assert_eq!(
@@ -271,10 +268,10 @@ mod tests {
             downstream.config_list.len() - 2
         );
 
-        assert_eq!(
-            &downstream.config_list[43..53],
-            &[0, 8, 0, 1, 0, 2, 0, 1, 0, 1],
-        );
+        assert_eq!(&downstream.config_list[43..53], &[
+            0, 8, 0, 1, 0, 2, 0, 1, 0, 1
+        ],);
+
         assert_eq!(downstream.config_list.len(), 84);
         fs::remove_dir_all(directory).expect("remove temporary directory");
     }

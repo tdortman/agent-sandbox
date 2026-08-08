@@ -1,6 +1,5 @@
 use super::PolicyStore;
 use crate::wire::DbusCheckRequest;
-
 use agent_sandbox_core::{ApprovalScope, DbusCheckReply, Verdict, VerdictSource};
 
 impl PolicyStore {

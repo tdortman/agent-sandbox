@@ -7,15 +7,19 @@ use super::{
     },
     ui::VerdictExit,
 };
+
 use crate::wire::ResourceCheckRequest;
+
 use agent_sandbox_core::{
     DbusCheckReply, DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, UiPush, VerdictSource,
 };
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -569,19 +573,23 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
+
     use crate::{
         store::{UiSessionContext, types::UiClient},
         wire::ResourceCheckRequest,
     };
+
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, ProcessIds, ResolvedRequestContext, ResourceAccess,
         ResourceKind, SandboxPaths, SocketAccess, VerdictSource,
     };
+
     use std::{
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
+
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {
@@ -775,7 +783,6 @@ mod tests {
         assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
         assert_eq!(reply.source, VerdictSource::policy_with_comment("test"));
         assert_eq!(reply.target, target);
-
         let inner = store.inner.lock().await;
 
         assert!(

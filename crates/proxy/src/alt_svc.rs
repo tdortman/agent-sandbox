@@ -18,13 +18,13 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+
 use tracing::debug;
 
 /// Minimal `Alt-Svc` rewrite surface shared by the rama (TCP) and `http`
 /// (h3) response types, which are distinct forked header-map types.
 pub trait AltSvcResponse {
     fn alt_svc_values(&self) -> Vec<Vec<u8>>;
-
     fn rewrite_alt_svc(&mut self, rewritten: Option<Vec<u8>>);
 }
 
@@ -88,7 +88,6 @@ pub async fn preserve_response_alt_svc<R: AltSvcResponse>(
 
     let borrowed = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let rewritten = store.record(origin, &borrowed).await;
-
     response.rewrite_alt_svc(rewritten);
 }
 

@@ -12,9 +12,8 @@ mod scope;
 #[cfg(test)]
 mod tests;
 
-pub use message::RpcMessage;
-
 pub use crate::transport::FlowProtocol;
+pub use message::RpcMessage;
 
 pub use proxy::{
     AttributionToken, FlowContext, FlowRegistration, HttpApprovalRequest, HttpCheckRequest,

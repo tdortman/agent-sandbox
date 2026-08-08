@@ -62,12 +62,7 @@ mod tests {
     #[test]
     fn host_matches_ipv6_prefix_wildcard() {
         assert!(host_pattern_matches("2001:db8:*", "2001:db8::1"));
-
-        assert!(host_pattern_matches(
-            "2001:db8:0:0:0:0:0:*",
-            "2001:db8::1"
-        ));
-
+        assert!(host_pattern_matches("2001:db8:0:0:0:0:0:*", "2001:db8::1"));
         assert!(host_pattern_matches("2001:*", "2001:db8::1"));
     }
 
