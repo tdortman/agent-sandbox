@@ -11,20 +11,22 @@
 //! port to the proxy before any HTTP/3 traffic can arrive.
 
 mod association;
-
+mod connection_id;
+mod datagram;
 mod ech;
 pub mod hpke;
+mod relay;
 mod session;
 pub use session::{Capsule, CapsuleDecoder, SessionError};
+mod session_registry;
 mod socket;
 pub mod upstream;
+mod webtransport;
 use crate::{
-    alt_svc::AltSvcStore,
-    cert::CertificateIssuer,
-    ech_state::DownstreamEch,
-    policy::PolicySession,
+    alt_svc::AltSvcStore, cert::CertificateIssuer, ech_state::DownstreamEch, policy::PolicySession,
 };
 use agent_sandbox_core::ProxyConnectionId;
+use h3::error::Code;
 use socket::TransparentUdpSocket;
 use std::{
     collections::HashMap,
@@ -431,6 +433,14 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 fn boxed(message: &'static str) -> BoxError {
     message.into()
+}
+
+fn boxed_owned(message: impl Into<String>) -> BoxError {
+    std::io::Error::other(message.into()).into()
+}
+
+fn varint(code: Code) -> quinn::VarInt {
+    quinn::VarInt::from_u64(code.value()).expect("HTTP/3 error codes fit in VarInt")
 }
 
 #[cfg(test)]

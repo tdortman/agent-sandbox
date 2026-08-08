@@ -496,13 +496,13 @@ async fn dispatch_incoming(
 
             Err(error) => {
                 sessions.lock().await.remove(&session_id);
-                super::association::reject_webtransport_stream(error.0);
+                super::webtransport::reject_webtransport_stream(error.0);
                 return;
             }
         }
     }
 
-    super::association::reject_webtransport_stream(stream);
+    super::webtransport::reject_webtransport_stream(stream);
 }
 
 /// One live upstream HTTP/3 association.
