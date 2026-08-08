@@ -5,21 +5,16 @@ use agent_sandbox_core::{
     FileAccess, ProcessIds, normalize_directory_traverse_access, open_flags_to_file_access,
     wire_context,
 };
-
 use agent_sandbox_fsmon::MonitorClient;
-
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
 };
-
 use clap::Parser;
-
 use nix::{
     dir::Dir,
     fcntl::{AtFlags, OFlag, openat, readlinkat},
     sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
 };
-
 use std::{
     ffi::CString,
     fs,
@@ -933,6 +928,20 @@ fn main() {
         process::exit(1);
     });
 
+    // Resolve the request context before joining the sandbox mount namespace.
+    // wire_context reads /run/agent-sandbox/session-context.json, and after
+    // mark_mountpoints installs FAN_OPEN_PERM marks below, that read would
+    // raise a permission event to our own fanotify group. The event loop that
+    // answers it starts only after this read returns, so the read would
+    // deadlock (the process wedges in the kernel, state D).
+    let ctx = wire_context(
+        cli.cwd,
+        cli.home.clone(),
+        cli.project_root,
+        ProcessIds::default(),
+        std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
+    );
+
     // setns into the target mount namespace before marking its mounts.
     join_target_mount_namespace(cli.pid);
 
@@ -969,16 +978,6 @@ fn main() {
     println!("ready");
 
     let _ = io::stdout().flush();
-
-    // Build the request context for RPC checks.
-    let ctx = wire_context(
-        cli.cwd,
-        cli.home,
-        cli.project_root,
-        ProcessIds::default(),
-        std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
-    );
-
     let socket_path = cli.socket.as_path();
 
     let target_pid = i32::try_from(cli.pid).unwrap_or_else(|_| {
