@@ -1,241 +1,161 @@
 //! Shared types for the fanotify-based filesystem monitor binaries.
+//!
+//! Both binaries talk to policyd through core's single async RPC client
+//! ([`agent_sandbox_core::PersistentRpcClient`]). This crate adds the
+//! filesystem-specific request shapes: the event-loop check client and the
+//! one-shot monitor start.
 
-/// Minimal RPC client for connecting to policyd over a Unix socket.
-pub mod rpc_client {
-    use agent_sandbox_core::{
-        FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, RequestContext,
-        RpcReply, RpcRequest,
-    };
+use agent_sandbox_core::{
+    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, PersistentRpcClient,
+    RequestContext, RpcClientError, RpcReply, RpcRequest,
+};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-    use std::{
-        io::{BufRead, BufReader, Write},
-        os::unix::net::UnixStream,
-        path::{Path, PathBuf},
-    };
+/// Per-check RPC timeout.
+///
+/// A filesystem verdict may wait for user approval, so the timeout is
+/// generous. On expiry the in-flight event fails closed (denied).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 
-    /// Error from the fsmon RPC client.
-    #[derive(Debug)]
-    pub enum Error {
-        Io(std::io::Error),
-        Json(serde_json::Error),
-        Reply(&'static str),
-    }
+/// Timeout for the one-shot monitor-start request from fs-arm.
+///
+/// Policyd spawns the monitor and waits up to 10 seconds for its ready line,
+/// so 30 seconds is ample headroom.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-    impl std::fmt::Display for Error {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Io(e) => write!(f, "io error: {e}"),
-                Self::Json(e) => write!(f, "json error: {e}"),
-                Self::Reply(msg) => f.write_str(msg),
-            }
+/// Async policyd client for the fanotify monitor event loop.
+///
+/// Wraps core's [`PersistentRpcClient`] for filesystem checks. Any error or
+/// unexpected reply fails the in-flight event closed at the caller, and a
+/// protocol-level mismatch discards the connection before the next check.
+pub struct MonitorClient {
+    client: PersistentRpcClient,
+}
+
+impl MonitorClient {
+    /// Create a client that connects lazily on its first request.
+    #[must_use]
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            client: PersistentRpcClient::new(socket_path),
         }
     }
 
-    /// Sequential client for multiple JSON-line requests on one Unix socket.
-    ///
-    /// A failed request permanently discards the current connection. The next
-    /// request connects a new socket, and the failed request is never replayed.
-    #[derive(Debug)]
-    pub struct PersistentClient {
-        socket_path: PathBuf,
-        stream: Option<BufReader<UnixStream>>,
-    }
-
-    impl PersistentClient {
-        /// Create a client that connects lazily when its first request is sent.
-        #[must_use]
-        pub fn new(socket_path: &Path) -> Self {
-            Self {
-                socket_path: socket_path.to_path_buf(),
-                stream: None,
-            }
-        }
-
-        /// Send a `CheckFilesystem` request over the persistent connection.
-        ///
-        /// # Errors
-        /// Returns an error when the socket, JSON framing, or reply is invalid.
-        /// After a socket or framing error, this client drops the connection
-        /// before returning, so the next request starts on a fresh socket.
-        pub fn check_filesystem(
-            &mut self,
-            path: &Path,
-            access: FileAccess,
-            ctx: RequestContext,
-        ) -> Result<FilesystemCheckReply, Error> {
-            let req = RpcRequest::CheckFilesystem {
-                path: path.to_path_buf(),
-                access,
-                ctx,
-            };
-
-            let reply = self.request(&req)?;
-
-            match reply {
-                RpcReply::FilesystemCheck(r) => Ok(r),
-
-                RpcReply::Error(_) => {
-                    self.stream = None;
-                    Err(Error::Reply("policyd returned an error"))
-                }
-
-                _ => {
-                    self.stream = None;
-                    Err(Error::Reply("unexpected reply type from policyd"))
-                }
-            }
-        }
-
-        fn ensure_connected(&mut self) -> Result<(), Error> {
-            if self.stream.is_none() {
-                let stream = UnixStream::connect(&self.socket_path).map_err(Error::Io)?;
-                self.stream = Some(BufReader::new(stream));
-            }
-
-            Ok(())
-        }
-
-        fn request(&mut self, req: &RpcRequest) -> Result<RpcReply, Error> {
-            let line = serde_json::to_vec(req).map_err(Error::Json)?;
-            self.ensure_connected()?;
-
-            let io_result = {
-                let reader = self
-                    .stream
-                    .as_mut()
-                    .expect("persistent client connected after ensure_connected");
-                reader
-                    .get_mut()
-                    .write_all(&line)
-                    .and_then(|()| reader.get_mut().write_all(b"\n"))
-                    .and_then(|()| reader.get_mut().flush())
-            };
-
-            if let Err(error) = io_result {
-                self.stream = None;
-                return Err(Error::Io(error));
-            }
-
-            let mut response = String::new();
-
-            let read_result = self
-                .stream
-                .as_mut()
-                .expect("persistent client connected after request write")
-                .read_line(&mut response);
-
-            let bytes_read = match read_result {
-                Ok(bytes_read) => bytes_read,
-                Err(error) => {
-                    self.stream = None;
-                    return Err(Error::Io(error));
-                }
-            };
-
-            if bytes_read == 0 {
-                self.stream = None;
-                return Err(Error::Reply("policyd closed the connection"));
-            }
-
-            if !response.ends_with('\n') {
-                self.stream = None;
-                return Err(Error::Reply("policyd returned an incomplete reply"));
-            }
-
-            match serde_json::from_str(response.trim()) {
-                Ok(reply) => Ok(reply),
-
-                Err(error) => {
-                    self.stream = None;
-                    Err(Error::Json(error))
-                }
-            }
-        }
-    }
-
-    /// Send a `StartFilesystemMonitor` request and wait for a success reply.
+    /// Check one `open()` against policyd.
     ///
     /// # Errors
-    /// Returns [`Error::Io`] on socket/stream I/O failure, [`Error::Json`] on
-    /// serialization failure, or [`Error::Reply`] if policyd returns an error
-    /// or an unexpected reply type.
-    pub fn start_monitor(
-        socket_path: &Path,
+    /// Returns any core RPC error. An unexpected reply type discards the
+    /// connection before returning, so the next check starts on a fresh
+    /// socket.
+    pub async fn check_filesystem(
+        &mut self,
+        path: &Path,
+        access: FileAccess,
         ctx: RequestContext,
-        static_allow: Vec<FilesystemRule>,
-    ) -> Result<FilesystemMonitorReply, Error> {
-        let req = RpcRequest::StartFilesystemMonitor { ctx, static_allow };
-        let reply = PersistentClient::new(socket_path).request(&req)?;
+    ) -> Result<FilesystemCheckReply, RpcClientError> {
+        let reply = self
+            .client
+            .request(
+                RpcRequest::CheckFilesystem {
+                    path: path.to_path_buf(),
+                    access,
+                    ctx,
+                },
+                CHECK_TIMEOUT,
+            )
+            .await?;
 
-        match reply {
-            RpcReply::FilesystemMonitor(r) => Ok(r),
-            RpcReply::Error(_) => Err(Error::Reply("policyd returned an error")),
-            _ => Err(Error::Reply("unexpected reply type from policyd")),
+        if let RpcReply::FilesystemCheck(reply) = reply {
+            Ok(reply)
+        } else {
+            self.client.invalidate();
+
+            Err(RpcClientError::UnexpectedReply(
+                "expected a filesystem check reply",
+            ))
         }
+    }
+}
+
+/// Send a `StartFilesystemMonitor` request and wait for a success reply.
+///
+/// # Errors
+/// Returns any core RPC error, or [`RpcClientError::UnexpectedReply`] if
+/// policyd does not answer with a `FilesystemMonitor` reply.
+pub async fn start_monitor(
+    socket_path: &Path,
+    ctx: RequestContext,
+    static_allow: Vec<FilesystemRule>,
+) -> Result<FilesystemMonitorReply, RpcClientError> {
+    let reply = PersistentRpcClient::new(socket_path)
+        .request(
+            RpcRequest::StartFilesystemMonitor { ctx, static_allow },
+            START_TIMEOUT,
+        )
+        .await?;
+
+    match reply {
+        RpcReply::FilesystemMonitor(reply) => Ok(reply),
+        _ => Err(RpcClientError::UnexpectedReply(
+            "expected a filesystem monitor reply",
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rpc_client::PersistentClient;
-
+    use super::MonitorClient;
     use agent_sandbox_core::{
-        FileAccess, FilesystemCheckReply, RequestContext, RpcReply, VerdictSource,
+        CheckReply, FileAccess, FilesystemCheckReply, RequestContext, RpcMessage, RpcReply,
+        VerdictSource,
+    };
+    use std::path::Path;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
     };
 
-    use std::{
-        io::{BufRead, BufReader, Write},
-        os::unix::net::UnixListener,
-        path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
-        thread,
-    };
-
-    static SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn socket_path(label: &str) -> PathBuf {
-        let id = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        std::env::temp_dir().join(format!(
-            "agent-sandbox-fsmon-{label}-{}-{id}.sock",
+    #[tokio::test]
+    async fn unexpected_reply_invalidates_connection_before_next_check() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "agent-sandbox-fsmon-check-{}.sock",
             std::process::id()
-        ))
-    }
+        ));
 
-    fn reply_line() -> String {
-        serde_json::to_string(&RpcReply::FilesystemCheck(FilesystemCheckReply::allowed(
-            VerdictSource::policy(),
-            PathBuf::from("/tmp/reply"),
-            FileAccess::Read,
-        )))
-        .expect("serialize filesystem reply")
-    }
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind policy socket");
 
-    fn read_request(reader: &mut BufReader<std::os::unix::net::UnixStream>) {
-        let mut request = String::new();
-        let bytes = reader.read_line(&mut request).expect("read request");
-        assert!(bytes > 0);
-        assert!(request.ends_with('\n'));
-    }
+        let server = tokio::spawn(async move {
+            let replies = [
+                RpcMessage::Reply(RpcReply::Check(CheckReply::allowed(VerdictSource::Static))),
+                RpcMessage::Reply(RpcReply::FilesystemCheck(FilesystemCheckReply::allowed(
+                    VerdictSource::Static,
+                    "/tmp/allowed".into(),
+                    FileAccess::Read,
+                ))),
+            ];
 
-    #[test]
-    fn persistent_client_reuses_one_connection_for_ordered_requests() {
-        let path = socket_path("reuse");
-        let listener = UnixListener::bind(&path).expect("bind test socket");
-        let reply = reply_line();
+            for reply in replies {
+                let (stream, _) = listener.accept().await.expect("accept monitor client");
+                let (read, mut write) = stream.into_split();
+                let mut reader = BufReader::new(read);
+                let mut request = String::new();
 
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept persistent client");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone test stream"));
-
-            for _ in 0..2 {
-                read_request(&mut reader);
-                writeln!(stream, "{reply}").expect("write filesystem reply");
-                stream.flush().expect("flush filesystem reply");
+                reader
+                    .read_line(&mut request)
+                    .await
+                    .expect("read monitor request");
+                write
+                    .write_all(reply.to_string().as_bytes())
+                    .await
+                    .expect("write monitor reply");
             }
         });
 
-        let mut client = PersistentClient::new(&path);
+        let mut client = MonitorClient::new(socket_path.clone());
 
         let first = client
             .check_filesystem(
@@ -243,123 +163,24 @@ mod tests {
                 FileAccess::Read,
                 RequestContext::default(),
             )
-            .expect("first filesystem check");
+            .await;
+
+        assert!(
+            first.is_err(),
+            "an unexpected reply variant must fail the in-flight event"
+        );
 
         let second = client
             .check_filesystem(
-                Path::new("/tmp/second"),
-                FileAccess::Write,
+                Path::new("/tmp/allowed"),
+                FileAccess::Read,
                 RequestContext::default(),
             )
-            .expect("second filesystem check");
+            .await
+            .expect("next check must reconnect");
 
-        assert!(first.allowed);
         assert!(second.allowed);
-        server.join().expect("persistent server");
-        std::fs::remove_file(path).expect("remove test socket");
-    }
-
-    #[test]
-    fn persistent_client_reconnects_after_eof_without_replaying_request() {
-        let path = socket_path("eof");
-        let listener = UnixListener::bind(&path).expect("bind test socket");
-        let reply = reply_line();
-
-        let server = thread::spawn(move || {
-            let (first, _) = listener.accept().expect("accept first connection");
-
-            let mut first_reader =
-                BufReader::new(first.try_clone().expect("clone first test stream"));
-
-            read_request(&mut first_reader);
-            drop(first_reader);
-            drop(first);
-            let (mut second, _) = listener.accept().expect("accept reconnect");
-
-            let mut second_reader =
-                BufReader::new(second.try_clone().expect("clone second test stream"));
-
-            read_request(&mut second_reader);
-            writeln!(second, "{reply}").expect("write reconnect reply");
-            second.flush().expect("flush reconnect reply");
-        });
-
-        let mut client = PersistentClient::new(&path);
-
-        assert!(
-            client
-                .check_filesystem(
-                    Path::new("/tmp/first"),
-                    FileAccess::Read,
-                    RequestContext::default(),
-                )
-                .is_err(),
-            "EOF must deny the in-flight event"
-        );
-
-        let reply = client
-            .check_filesystem(
-                Path::new("/tmp/second"),
-                FileAccess::Read,
-                RequestContext::default(),
-            )
-            .expect("reconnected filesystem check");
-
-        assert!(reply.allowed);
-        server.join().expect("reconnect server");
-        std::fs::remove_file(path).expect("remove test socket");
-    }
-
-    #[test]
-    fn persistent_client_reconnects_after_malformed_reply() {
-        let path = socket_path("malformed");
-        let listener = UnixListener::bind(&path).expect("bind test socket");
-        let reply = reply_line();
-
-        let server = thread::spawn(move || {
-            let (mut first, _) = listener.accept().expect("accept first connection");
-
-            let mut first_reader =
-                BufReader::new(first.try_clone().expect("clone first test stream"));
-
-            read_request(&mut first_reader);
-            writeln!(first, "{{malformed").expect("write malformed reply");
-            first.flush().expect("flush malformed reply");
-            drop(first_reader);
-            drop(first);
-            let (mut second, _) = listener.accept().expect("accept reconnect");
-
-            let mut second_reader =
-                BufReader::new(second.try_clone().expect("clone second test stream"));
-
-            read_request(&mut second_reader);
-            writeln!(second, "{reply}").expect("write reconnect reply");
-            second.flush().expect("flush reconnect reply");
-        });
-
-        let mut client = PersistentClient::new(&path);
-
-        assert!(
-            client
-                .check_filesystem(
-                    Path::new("/tmp/first"),
-                    FileAccess::Read,
-                    RequestContext::default(),
-                )
-                .is_err(),
-            "malformed reply must deny the in-flight event"
-        );
-
-        let reply = client
-            .check_filesystem(
-                Path::new("/tmp/second"),
-                FileAccess::Read,
-                RequestContext::default(),
-            )
-            .expect("reconnected filesystem check");
-
-        assert!(reply.allowed);
-        server.join().expect("malformed reply server");
-        std::fs::remove_file(path).expect("remove test socket");
+        server.await.expect("monitor test server");
+        std::fs::remove_file(socket_path).expect("remove test socket");
     }
 }

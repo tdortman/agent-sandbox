@@ -1,9 +1,8 @@
 //! Shared policy merge, host normalization, session context, and RPC types for
 //! agent-sandbox.
 
-pub mod agent_context;
-
 pub mod approved_bindings;
+pub mod context;
 pub mod dns_cache;
 pub mod dns_wire;
 pub mod error;
@@ -12,16 +11,16 @@ pub mod hosts;
 pub mod http;
 pub mod merge_policy;
 pub mod policy;
-pub mod proc_context;
 pub mod rpc;
 pub mod rpc_client;
 pub mod scope_target;
-pub mod session_context;
 pub mod socket_owner;
 
-pub use agent_context::{
-    ProcessIds, ResolvedRequestContext, SandboxPaths, peer_sandbox_paths, persist_session_paths,
-    resolve_daemon_paths, resolve_sandbox_paths,
+pub use context::{
+    PeerCredentials, ProcContext, ProcessIds, ResolvedRequestContext, SandboxPaths,
+    SessionContext, daemon_context, discover_git_project_root, home_from_uid, is_descendant_of,
+    is_path_descendant, peer_context, peer_cred_unix, persist_session_paths, read_proc_environ,
+    sandbox_session_id_from_pid, wire_context,
 };
 
 pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
@@ -56,12 +55,6 @@ pub use policy::{
     open_flags_to_file_access,
 };
 
-pub use proc_context::{
-    PeerCredentials, ProcContext, context_from_pid, discover_git_project_root, home_from_uid,
-    is_descendant_of, is_path_descendant, peer_cred_unix, read_proc_environ,
-    sandbox_session_id_from_pid, trusted_context_from_pid,
-};
-
 pub use rpc::{
     AliasSplit, ApprovalScope, ApprovalTarget, AttributionToken, CheckReply, DbusCheckReply,
     DbusScopeActionReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
@@ -77,7 +70,6 @@ pub use rpc::{
 
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
-pub use session_context::SessionContext;
 
 pub use socket_owner::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,

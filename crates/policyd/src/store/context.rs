@@ -11,7 +11,7 @@ use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
     SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
     read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
-    trusted_context_from_pid, trusted_project_policy_path,
+    peer_context, trusted_project_policy_path,
 };
 
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ impl PolicyStore {
             return;
         }
 
-        let trusted = trusted_context_from_pid(peer.pid, Some(peer.uid));
+        let trusted = peer_context(peer.pid, Some(peer.uid));
 
         let project_root = trusted
             .project_root
@@ -135,7 +135,7 @@ impl PolicyStore {
         if (cwd.is_none() || project_root.is_none())
             && let Some(pid) = pid
         {
-            let proc = trusted_context_from_pid(pid, uid);
+            let proc = peer_context(pid, uid);
 
             if cwd.is_none() {
                 cwd = proc.cwd;
@@ -233,7 +233,7 @@ impl PolicyStore {
                         .map(PathBuf::from);
                 }
 
-                let proc = trusted_context_from_pid(pid, trusted_uid);
+                let proc = peer_context(pid, trusted_uid);
 
                 if cwd.is_none() {
                     cwd = proc.cwd;

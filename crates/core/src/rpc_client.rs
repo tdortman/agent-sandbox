@@ -24,6 +24,9 @@ pub enum RpcClientError {
     #[error("policyd closed connection")]
     Closed,
 
+    #[error("policyd returned an unexpected reply: {0}")]
+    UnexpectedReply(&'static str),
+
     #[error("invalid JSON from policyd")]
     InvalidJson(#[from] serde_json::Error),
 

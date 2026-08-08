@@ -2,10 +2,11 @@
 //! mark each mountpoint, then event-loop handling permission events.
 
 use agent_sandbox_core::{
-    FileAccess, normalize_directory_traverse_access, open_flags_to_file_access,
+    FileAccess, ProcessIds, normalize_directory_traverse_access, open_flags_to_file_access,
+    wire_context,
 };
 
-use agent_sandbox_fsmon::rpc_client;
+use agent_sandbox_fsmon::MonitorClient;
 
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
@@ -758,7 +759,12 @@ fn run_event_loop(
 
     let mut buf = vec![0u8; 4096];
 
-    let mut rpc = rpc_client::PersistentClient::new(socket_path);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let mut rpc = MonitorClient::new(socket_path);
 
     loop {
         let n = match nix::unistd::read(fan_fd.as_fd(), &mut buf) {
@@ -831,7 +837,8 @@ fn run_event_loop(
                 tracing::info!(%path, ?access, pid = meta.pid, "filesystem check");
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
-                let reply = rpc.check_filesystem(Path::new(&path), access, event_ctx);
+                let reply =
+                    runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
 
                 let verdict = match &reply {
                     Ok(r) if r.allowed => FAN_ALLOW,
@@ -963,14 +970,13 @@ fn main() {
     let _ = io::stdout().flush();
 
     // Build the request context for RPC checks.
-    let ctx = agent_sandbox_core::RequestContext {
-        cwd: cli.cwd,
-        home: cli.home,
-        project_root: cli.project_root,
-        pid: None,
-        uid: None,
-        sandbox_session_id: std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
-    };
+    let ctx = wire_context(
+        cli.cwd,
+        cli.home,
+        cli.project_root,
+        ProcessIds::default(),
+        std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
+    );
 
     let socket_path = cli.socket.as_path();
 

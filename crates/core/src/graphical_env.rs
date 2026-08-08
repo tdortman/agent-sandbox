@@ -1,6 +1,6 @@
 //! Environment for Qt/KDE dialogs spawned outside the user's shell.
 
-use crate::proc_context::read_proc_environ;
+use crate::context::read_proc_environ;
 
 use std::{collections::HashMap, path::Path, process::Command};
 

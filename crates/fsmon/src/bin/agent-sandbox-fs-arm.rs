@@ -3,9 +3,9 @@
 //! Connects to policyd, sends `StartFilesystemMonitor { ctx, static_allow }`,
 //! before the command is accepted but not required.
 
-use agent_sandbox_core::{FilesystemRule, RequestContext};
+use agent_sandbox_core::{FilesystemRule, ProcessIds, wire_context};
 
-use agent_sandbox_fsmon::rpc_client;
+use agent_sandbox_fsmon::start_monitor;
 use clap::Parser as _;
 
 use std::{
@@ -75,14 +75,13 @@ fn main() {
     let socket_path = std::env::var("AGENT_SANDBOX_POLICY_SOCKET")
         .unwrap_or_else(|_| "/run/agent-sandbox/policy.sock".to_owned());
 
-    let ctx = RequestContext {
-        cwd: cwd.map(PathBuf::from),
-        home: home.clone().map(PathBuf::from),
-        project_root: project_root.map(PathBuf::from),
-        pid: Some(process::id()),
-        uid: None,
+    let ctx = wire_context(
+        cwd.map(PathBuf::from),
+        home.clone().map(PathBuf::from),
+        project_root.map(PathBuf::from),
+        ProcessIds::new(process::id(), 0),
         sandbox_session_id,
-    };
+    );
 
     // Parse static allow rules from environment (set by Nix wrapper).
     let mut static_allow: Vec<FilesystemRule> = std::env::var("AGENT_SANDBOX_FS_STATIC_ALLOW")
@@ -94,7 +93,13 @@ fn main() {
     eprintln!("agent-sandbox-fs-arm: starting filesystem monitor...");
 
     // Connect to policyd and request monitor startup.
-    let reply = rpc_client::start_monitor(Path::new(&socket_path), ctx, static_allow)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let reply = runtime
+        .block_on(start_monitor(Path::new(&socket_path), ctx, static_allow))
         .unwrap_or_else(|e| {
             eprintln!("agent-sandbox-fs-arm: failed to start filesystem monitor: {e}");
             process::exit(1);

@@ -3,16 +3,11 @@
 use crate::packet::TransportProtocol;
 
 use agent_sandbox_core::{
-    FlowRegistration, ProcessIds, RequestContext, RpcReply, RpcRequest, SandboxPaths,
-    attach_check_aliases, policy_rpc,
+    FlowRegistration, RequestContext, RpcReply, RpcRequest, attach_check_aliases, daemon_context,
+    persist_session_paths, policy_rpc,
 };
 
 use std::time::Duration;
-
-struct PolicyContext {
-    paths: SandboxPaths,
-    ids: ProcessIds,
-}
 
 /// Inputs for a single policy check, grouped to keep the call signature small.
 pub struct CheckDestinationArgs<'a> {
@@ -33,7 +28,8 @@ pub async fn check_destination(
     args: CheckDestinationArgs<'_>,
     timeout: Duration,
 ) -> std::io::Result<bool> {
-    let ctx = resolve_context(args.src_pid);
+    let ctx = daemon_context(args.src_pid);
+    persist_session_paths(&ctx.paths);
     let scheme = args.protocol.as_str();
     let url = format!("{scheme}://{}:{}", args.hostname, args.dst_port);
 
@@ -43,12 +39,7 @@ pub async fn check_destination(
         port: Some(args.dst_port),
         scheme: scheme.to_string(),
         url: attach_check_aliases(Some(url), args.aliases),
-        ctx: request_context(
-            &ctx.paths,
-            ctx.ids,
-            args.src_pid
-                .and_then(agent_sandbox_core::sandbox_session_id_from_pid),
-        ),
+        ctx: RequestContext::from(&ctx),
     };
 
     let resp = policy_rpc(socket, req, timeout)
@@ -85,61 +76,5 @@ pub async fn register_network_flow(
             std::io::ErrorKind::InvalidData,
             "policyd returned an unexpected reply for RegisterNetworkFlow",
         )),
-    }
-}
-
-/// Resolve sandbox paths and process IDs from a PID by reading
-/// `/proc/<pid>/environ`.
-fn resolve_context(pid: Option<u32>) -> PolicyContext {
-    let pid = pid.unwrap_or(0);
-    let uid = pid_uid(pid).unwrap_or(0);
-    let ids = ProcessIds::new(pid, uid);
-    let paths = agent_sandbox_core::resolve_daemon_paths(ids);
-    agent_sandbox_core::persist_session_paths(&paths);
-    PolicyContext { paths, ids }
-}
-
-fn request_context(
-    paths: &SandboxPaths,
-    ids: ProcessIds,
-    sandbox_session_id: Option<String>,
-) -> RequestContext {
-    let mut ctx = RequestContext::from_paths_and_ids(paths, ids);
-    ctx.sandbox_session_id = sandbox_session_id;
-    ctx
-}
-
-/// Read the UID of a process from `/proc/<pid>/status`.
-fn pid_uid(pid: u32) -> Option<u32> {
-    if pid == 0 {
-        return None;
-    }
-
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            return parts.first().and_then(|s| s.parse().ok());
-        }
-    }
-
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::request_context;
-    use agent_sandbox_core::{ProcessIds, SandboxPaths};
-    use std::path::Path;
-
-    #[test]
-    fn request_context_preserves_sandbox_session_id() {
-        let paths = SandboxPaths::new("/work", "/home/user", "/work");
-        let ctx = request_context(&paths, ProcessIds::new(0, 1000), Some("s1".into()));
-        assert_eq!(ctx.sandbox_session_id.as_deref(), Some("s1"));
-        assert_eq!(ctx.cwd.as_deref(), Some(Path::new("/work")));
-        assert_eq!(ctx.home.as_deref(), Some(Path::new("/home/user")));
-        assert_eq!(ctx.project_root.as_deref(), Some(Path::new("/work")));
     }
 }

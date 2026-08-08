@@ -2,17 +2,17 @@ use agent_sandbox_core::{
     FileAccess, FilesystemMonitorReply, FilesystemRule, RequestContext, RpcReply,
 };
 
-use agent_sandbox_fsmon::rpc_client::start_monitor;
+use agent_sandbox_fsmon::start_monitor;
 
-use std::{
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixListener,
-    path::PathBuf,
-    thread,
+use std::path::PathBuf;
+
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixListener,
 };
 
-#[test]
-fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
+#[tokio::test]
+async fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
     let socket_path = std::env::temp_dir().join(format!(
         "agent-sandbox-fsmon-start-{}.sock",
         std::process::id()
@@ -21,13 +21,13 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).expect("bind test socket");
 
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept client");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
         let mut request = String::new();
 
-        BufReader::new(stream.try_clone().expect("clone stream"))
-            .read_line(&mut request)
-            .expect("read request");
+        reader.read_line(&mut request).await.expect("read request");
 
         let request: serde_json::Value =
             serde_json::from_str(request.trim()).expect("valid request JSON");
@@ -36,16 +36,17 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
         assert_eq!(request["ctx"]["pid"], std::process::id());
         assert_eq!(request["static_allow"][0]["path"], "/workspace");
         assert_eq!(request["static_allow"][0]["access"], "write");
+
         let reply = RpcReply::FilesystemMonitor(FilesystemMonitorReply::active());
 
-        writeln!(
-            stream,
-            "{}",
-            serde_json::to_string(&reply).expect("serialize reply")
-        )
-        .expect("write reply");
+        let reply = serde_json::to_string(&reply).expect("serialize reply") + "\n";
 
-        stream.flush().expect("flush reply");
+        write
+            .write_all(reply.as_bytes())
+            .await
+            .expect("write reply");
+
+        write.flush().await.expect("flush reply");
     });
 
     let ctx = RequestContext {
@@ -59,9 +60,12 @@ fn start_monitor_round_trips_static_allow_rules_over_unix_socket() {
         comment: None,
     }];
 
-    let reply = start_monitor(&socket_path, ctx, rules).expect("start monitor RPC");
+    let reply = start_monitor(&socket_path, ctx, rules)
+        .await
+        .expect("start monitor RPC");
+
     assert!(reply.ok);
     assert!(reply.active);
-    server.join().expect("server thread");
+    server.await.expect("server task");
     std::fs::remove_file(socket_path).expect("remove test socket");
 }

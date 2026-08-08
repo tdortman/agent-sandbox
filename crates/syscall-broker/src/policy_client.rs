@@ -1,7 +1,7 @@
 use crate::{NetworkTarget, ResourceTarget};
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
-    ResourceCheckReply, RpcReply, RpcRequest, resolve_sandbox_paths,
+    ResourceCheckReply, RpcReply, RpcRequest, wire_context,
 };
 use std::{
     io,
@@ -12,16 +12,12 @@ use std::{
 fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestContext {
     // The broker is exec'd inside the bwrap jail and inherits the sandbox
     // environment, where the wrapper sets AGENT_SANDBOX_CWD, AGENT_SANDBOX_HOME
-    // and AGENT_SANDBOX_PROJECT_ROOT. Resolve the paths from that environment
-    // instead of sending empty paths to policyd: without a project root the UI
-    // cannot record project-scope approvals and every project-scope approval
-    // attempt fails with "project_root required".
+    // and AGENT_SANDBOX_PROJECT_ROOT. wire_context resolves the paths from that
+    // environment instead of sending empty paths to policyd: without a project
+    // root the UI cannot record project-scope approvals and every project-scope
+    // approval attempt fails with "project_root required".
     let ids = ProcessIds::from_options(Some(pid), None);
-    let paths = resolve_sandbox_paths(None, None, None, ids);
-
-    let mut ctx = RequestContext::from_paths_and_ids(&paths, ids);
-    ctx.sandbox_session_id = sandbox_session_id;
-    ctx
+    wire_context(None, None, None, ids, sandbox_session_id)
 }
 
 /// Persistent sequential policyd client owned by one syscall broker.

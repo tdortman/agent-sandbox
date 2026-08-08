@@ -86,6 +86,7 @@ dependencies = [
  "libc",
  "nix",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
