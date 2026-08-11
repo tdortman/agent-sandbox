@@ -38,18 +38,17 @@ let
       ];
     assert !(lib.all (assertion: assertion.assertion) invalidProxySystem.config.assertions);
     assert
-      !(builtins.tryEval invalidModeSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      !(builtins.tryEval invalidModeSystem.config.environment.etc."agent-sandbox/policy.json".text)
       .success;
     assert
-      !(builtins.tryEval invalidMethodSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      !(builtins.tryEval invalidMethodSystem.config.environment.etc."agent-sandbox/policy.json".text)
       .success;
     assert
-      !(builtins.tryEval
-        invalidFragmentSystem.config.environment.etc."agent-sandbox/declarative.json".text
-      ).success;
+      !(builtins.tryEval invalidFragmentSystem.config.environment.etc."agent-sandbox/policy.json".text)
+      .success;
 
     assert
-      !(builtins.tryEval invalidPortSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      !(builtins.tryEval invalidPortSystem.config.environment.etc."agent-sandbox/policy.json".text)
       .success;
     assert
       validPortJson.network.http.allow == [
@@ -66,15 +65,13 @@ let
         }
       ];
     assert
-      (builtins.tryEval validFullGlobSystem.config.environment.etc."agent-sandbox/declarative.json".text)
+      (builtins.tryEval validFullGlobSystem.config.environment.etc."agent-sandbox/policy.json".text)
       .success;
     assert
-      (builtins.tryEval validIpv6System.config.environment.etc."agent-sandbox/declarative.json".text)
-      .success;
+      (builtins.tryEval validIpv6System.config.environment.etc."agent-sandbox/policy.json".text).success;
     assert
-      !(builtins.tryEval
-        invalidZeroPortSystem.config.environment.etc."agent-sandbox/declarative.json".text
-      ).success;
+      !(builtins.tryEval invalidZeroPortSystem.config.environment.etc."agent-sandbox/policy.json".text)
+      .success;
     true;
   dynamicDirect = mkWrapper {
     dynamic = true;
@@ -264,7 +261,7 @@ let
   };
   validPaddedPortJson =
     builtins.fromJSON
-      validPaddedPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+      validPaddedPortSystem.config.environment.etc."agent-sandbox/policy.json".text;
   validPaddedPortSystem = mkNixosSystem {
     agent-sandbox.network.httpProxy = {
       enable = true;
@@ -279,7 +276,7 @@ let
   };
   validPolicyJson =
     builtins.fromJSON
-      validPolicySystem.config.environment.etc."agent-sandbox/declarative.json".text;
+      validPolicySystem.config.environment.etc."agent-sandbox/policy.json".text;
   validPolicySystem = mkNixosSystem {
     agent-sandbox.network.httpProxy = {
       enable = true;
@@ -302,7 +299,7 @@ let
   };
   validPortJson =
     builtins.fromJSON
-      validPortSystem.config.environment.etc."agent-sandbox/declarative.json".text;
+      validPortSystem.config.environment.etc."agent-sandbox/policy.json".text;
   validPortSystem = mkNixosSystem {
     agent-sandbox.network.httpProxy = {
       enable = true;

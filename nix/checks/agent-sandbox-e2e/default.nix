@@ -45,6 +45,11 @@ let
       "f /home/user/.snapshots/marker 0644 sandbox users - snapshot-marker"
       "d /home/.snapshots 0755 root root -"
       "f /home/.snapshots/marker 0644 root root - snapshot-marker"
+      "d /home/user/agent-sandbox-pkg-link-target 0755 sandbox users -"
+      "f /var/lib/agent-sandbox-test/pkg-allowed-marker 0666 sandbox users - pkg-allowed-marker"
+      "f /var/lib/agent-sandbox-test/pkg-denied-marker 0666 sandbox users - pkg-denied-marker"
+      "f /var/lib/agent-sandbox-test/pkg-ext-marker 0666 sandbox users - pkg-ext-marker"
+      "f /var/lib/agent-sandbox-test/pkg-global-marker 0666 sandbox users - pkg-global-marker"
     ];
 
     users.users.sandbox = testUser;
@@ -268,24 +273,43 @@ let
   httpServers = specs: {
     systemd.services = lib.listToAttrs (map httpServer specs);
   };
-  installPolicy = policy: {
-    environment.etc."agent-sandbox-vm-policy.json".source = policy;
+  # Install a store path as a policy file owned by the sandbox user before
+  # policyd starts, optionally symlinking a second path to it. The symlink
+  # support lets per-package extension files exercise the wrapper's symlink
+  # protection end to end.
+  installHomePolicy =
+    serviceName:
+    {
+      content,
+      path,
+      symlink ? null,
+    }:
+    {
+      systemd.services."agent-sandbox-vm-${serviceName}" = {
+        before = [ "agent-sandbox-policy.service" ];
+        wantedBy = [ "multi-user.target" ];
 
-    systemd.services.agent-sandbox-vm-policy = {
-      before = [ "agent-sandbox-policy.service" ];
-      wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
 
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
+        script = ''
+          install -d -o sandbox -g users "$(dirname ${lib.escapeShellArg path})"
+          install -o sandbox -g users ${content} ${lib.escapeShellArg path}
+          ${lib.optionalString (symlink != null) ''
+            install -d -o sandbox -g users "$(dirname ${lib.escapeShellArg symlink})"
+            ln -sf ${lib.escapeShellArg path} ${lib.escapeShellArg symlink}
+          ''}
+        '';
       };
-
-      script = ''
-        install -d -o sandbox -g users /home/user/.config/agent-sandbox
-        install -o sandbox -g users ${policy} /home/user/.config/agent-sandbox/policy.json
-      '';
     };
-  };
+  installPolicy =
+    policy:
+    installHomePolicy "policy" {
+      content = policy;
+      path = "/home/user/.config/agent-sandbox/policy.json";
+    };
   mkBash =
     name: options:
     options
@@ -324,6 +348,22 @@ let
       }
     '';
   module = ../../modules/nixos/agent-sandbox;
+  packageExtension = pkgs.writeText "agent-sandbox-vm-pkg-extension.json" ''
+    {
+      "filesystem": {
+        "allow": [ { "path": "/var/lib/agent-sandbox-test/pkg-ext-marker", "access": "read" } ],
+        "deny": []
+      }
+    }
+  '';
+  packagePolicy = mkPolicy "package" {
+    filesystem = ''
+      {
+        "allow": [ { "path": "/var/lib/agent-sandbox-test/pkg-global-marker", "access": "read" } ],
+        "deny": []
+      }
+    '';
+  };
   proxyNetworkPackages = [
     (mkCurl "sandbox-proxy-curl" {
       extraPkgs = commonExtraPkgs;
@@ -554,6 +594,16 @@ let
           };
         };
       };
+  resourceApprovalPolicy = mkPolicy "resource-approval" {
+    resources = ''
+      {
+        "allow": [],
+        "deny": [
+          { "kind": "unix_socket", "path": "/var/run/nscd/socket", "access": "connect" }
+        ]
+      }
+    '';
+  };
   resourcePackages = [
     (mkBash "sandbox-resource-bash" {
       extraPkgs = commonExtraPkgs;
@@ -679,6 +729,125 @@ let
     node.specialArgs = { inherit inputs; };
 
     nodes = {
+      package =
+        _:
+        lib.recursiveUpdate baseNode (
+          lib.recursiveUpdate (installPolicy packagePolicy) (
+            lib.recursiveUpdate
+              (installHomePolicy "pkg-extension" {
+                content = packageExtension;
+                path = "/home/user/agent-sandbox-pkg-link-target/extension.json";
+                symlink = "/home/user/.config/agent-sandbox/packages/sandbox-pkg-allowed-bash.json";
+              })
+              {
+                imports = [ module ];
+
+                agent-sandbox = {
+                  enable = true;
+                  gates.filesystem.enable = true;
+
+                  packages = [
+                    (mkBash "sandbox-pkg-allowed-bash" {
+                      extraPkgs = commonExtraPkgs;
+
+                      policy.filesystem = {
+                        allow = [
+                          {
+                            access = "read";
+                            path = "/var/lib/agent-sandbox-test/pkg-allowed-marker";
+                          }
+                        ];
+
+                        deny = [
+                          {
+                            access = "all";
+                            path = "/var/lib/agent-sandbox-test/pkg-denied-marker";
+                          }
+                        ];
+                      };
+                    })
+
+                    (mkBash "sandbox-pkg-other-bash" {
+                      extraPkgs = commonExtraPkgs;
+
+                      policy.filesystem.deny = [
+                        {
+                          access = "all";
+                          path = "/var/lib/agent-sandbox-test/pkg-global-marker";
+                        }
+                      ];
+                    })
+                  ];
+
+                  policy = {
+                    interactiveApproval = false;
+                    uiBackend = "none";
+                  };
+                };
+              }
+          )
+        );
+
+      approval =
+        _:
+        lib.recursiveUpdate baseNode (
+          lib.recursiveUpdate (httpServers [ { port = 8008; } ]) {
+            imports = [ module ];
+
+            agent-sandbox = {
+              enable = true;
+
+              network = {
+                enable = true;
+                dnsForwardTarget = "169.254.100.1:5353";
+
+                httpProxy = {
+                  enable = true;
+                  caCertificateFile = "${tlsFixture}/ca-cert.pem";
+                  caPrivateKeyFile = "${tlsFixture}/ca-key.pem";
+                  upstreamAllowCidrs = [ "169.254.100.1/32" ];
+                };
+              };
+
+              packages = [
+                (mkBash "sandbox-approve-bash" {
+                  extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
+                })
+                (mkBash "sandbox-approve-other-bash" {
+                  extraPkgs = commonExtraPkgs ++ [ pkgs.curl ];
+                })
+              ];
+
+              # Pending requests are recorded but no UI is spawned; the
+              # scenario resolves them with agent-sandbox-approve.
+              policy.uiBackend = "none";
+            };
+
+            networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [ 8008 ];
+
+            systemd.services.agent-sandbox-vm-dns = {
+              after = [ "agent-sandbox-netns.service" ];
+              requires = [ "agent-sandbox-netns.service" ];
+              wantedBy = [ "multi-user.target" ];
+
+              serviceConfig = {
+                ExecStart = lib.escapeShellArgs [
+                  "${pkgs.dnsmasq}/bin/dnsmasq"
+                  "--keep-in-foreground"
+                  "--no-resolv"
+                  "--no-hosts"
+                  "--bind-interfaces"
+                  "--listen-address=169.254.100.1"
+                  "--port=5353"
+                  "--user=sandbox"
+                ];
+
+                Restart = "on-failure";
+              };
+            };
+          }
+        );
+
       dbus =
         _:
         lib.recursiveUpdate baseNode (
@@ -953,6 +1122,48 @@ let
           }
         );
 
+      resource-approval =
+        _:
+        lib.recursiveUpdate baseNode (
+          lib.recursiveUpdate (installPolicy resourceApprovalPolicy) {
+            imports = [ module ];
+
+            agent-sandbox = {
+              enable = true;
+
+              gates = {
+                filesystem.enable = true;
+                resources.enable = true;
+              };
+
+              packages = [
+                (mkBash "sandbox-resource-approve-bash" {
+                  extraPkgs = commonExtraPkgs;
+                })
+              ];
+
+              policy = {
+                dbus.enable = false;
+                uiBackend = "none";
+              };
+            };
+
+            services.dbus.enable = true;
+
+            systemd.services.agent-sandbox-vm-resource-pending-server = {
+              after = [ "agent-sandbox-vm-policy.service" ];
+              wantedBy = [ "multi-user.target" ];
+
+              serviceConfig = {
+                ExecStart = "${pkgs.socat}/bin/socat UNIX-LISTEN:/run/agent-sandbox-test/pending.sock,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                Restart = "on-failure";
+                RuntimeDirectory = "agent-sandbox-test";
+                User = "sandbox";
+              };
+            };
+          }
+        );
+
       static =
         _:
         baseNode
@@ -1050,7 +1261,7 @@ let
           "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
       )
 
-      for node in [static, wrapping, dynamic, resource, dbus, direct, proxy, sudo_deny, sudo_approve]:
+      for node in [static, wrapping, dynamic, package, resource, dbus, direct, proxy, sudo_deny, sudo_approve, approval, resource_approval]:
           node.wait_for_unit("multi-user.target")
 
       # Static bubblewrap mounts: read-only directory/file, writable directory,
@@ -1167,6 +1378,29 @@ let
           "test -z \"$AWS_SECRET_ACCESS_KEY\" && test -z \"$OPENAI_API_KEY\"",
           env=("env", "AWS_SECRET_ACCESS_KEY=secret", "OPENAI_API_KEY=secret"),
       )
+
+      # Per-package policy: declarative base files, the user-writable home
+      # extension (symlinked), deny-wins, cross-package isolation, and
+      # in-sandbox read/write protection of the policy files.
+      package.wait_for_unit("agent-sandbox-policy.service")
+      package.succeed(
+          "test -f /etc/agent-sandbox/packages/sandbox-pkg-allowed-bash.json && test -f /etc/agent-sandbox/packages/sandbox-pkg-other-bash.json"
+      )
+      # Declared base allow and deny apply without a prompt.
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "grep -q pkg-allowed-marker /var/lib/agent-sandbox-test/pkg-allowed-marker")
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "cat /var/lib/agent-sandbox-test/pkg-denied-marker >/dev/null", expect_success=False)
+      # Cross-package isolation: the other package has no rule for the marker.
+      sandbox_shell(package, "sandbox-pkg-other-bash", "cat /var/lib/agent-sandbox-test/pkg-allowed-marker >/dev/null", expect_success=False)
+      # Deny-wins: the user policy allows the marker, the package deny shadows it.
+      sandbox_shell(package, "sandbox-pkg-other-bash", "cat /var/lib/agent-sandbox-test/pkg-global-marker >/dev/null", expect_success=False)
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "grep -q pkg-global-marker /var/lib/agent-sandbox-test/pkg-global-marker")
+      # The symlinked home extension is loaded and its allow applies.
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "grep -q pkg-ext-marker /var/lib/agent-sandbox-test/pkg-ext-marker")
+      # The declarative base and the home extension are unreadable in-sandbox.
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "cat /etc/agent-sandbox/packages/sandbox-pkg-allowed-bash.json >/dev/null", expect_success=False)
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "cat ~/.config/agent-sandbox/packages/sandbox-pkg-allowed-bash.json >/dev/null", expect_success=False)
+      # A write through the symlinked extension is blocked (ro-bound target).
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "printf changed >> ~/.config/agent-sandbox/packages/sandbox-pkg-allowed-bash.json", expect_success=False)
 
       # Resource gates distinguish permitted Unix-socket connect/send and
       # device opens from denied host IPC sockets.
@@ -1363,6 +1597,121 @@ let
       sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo sh -c id", expect_success=False)
       sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "test \"$(sudo id -u)\" = 0")
       sandbox_shell(sudo_approve, "sandbox-sudo-approve-bash", "sudo -u nobody id", expect_success=False)
+
+      # Runtime approval flow: an unapproved URL pends, the per-package
+      # approval persists a package-scoped rule, other packages stay
+      # isolated, and a once-scoped deny resolves only its own request.
+      approval.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
+      approval.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
+      approval.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+      approval.wait_for_unit("agent-sandbox-policy.service")
+      approval.wait_for_open_port(8008)
+      approval.succeed(
+          "test \"$(runuser -u sandbox -- agent-sandbox-approve pending)\" = 'No pending approvals.'"
+      )
+
+      approve_env = ["env", "XDG_RUNTIME_DIR=/run/user/1000", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"]
+      pending_http_id = "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"http\" {print $1; exit}'"
+
+      def package_cmd(package, script, *, background=False):
+          # The wrapper records $PWD as the project root, so the sandboxed
+          # command runs from the sandbox user's home for the package rule
+          # to land in a predictable project file.
+          inner = f"cd /home/user && {shlex.join([package, '-c', script])}"
+          if background:
+              # Fully detach stdio so the test driver's shell prompt returns
+              # immediately instead of waiting on the sandbox's inherited fds.
+              detached = (
+                  "nohup runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 "
+                  "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+                  f"sh -c {shlex.quote(inner)} </dev/null >/tmp/approve-bg.out 2>&1 &"
+              )
+              return command("sh", "-c", detached)
+          return command("runuser", "-u", "sandbox", "--", *approve_env, "sh", "-c", inner)
+
+      # The first request from the package pends; approving it at
+      # project_package scope lets the held connection complete.
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "curl --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/allowed'"
+      )
+      allowed_id = approval.succeed(pending_http_id).strip()
+      assert "http:" in allowed_id, allowed_id
+      approval.succeed(
+          f"runuser -u sandbox -- agent-sandbox-approve approve {allowed_id} project_package"
+      )
+      approval.wait_until_succeeds("grep -q allowed-get /tmp/approve-bg.out")
+
+      # The rule persists to the package-specific project file and applies
+      # to later requests from the same package without a prompt.
+      approval.succeed("test -f /home/user/.agent-sandbox/packages/sandbox-approve-bash.json")
+      approval.succeed(
+          "grep -F -q 'http://169.254.100.1:8008/allowed' /home/user/.agent-sandbox/packages/sandbox-approve-bash.json"
+      )
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "curl --fail --silent --show-error --max-time 15 http://169.254.100.1:8008/allowed | grep -q allowed-get")
+      )
+      approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -v -F 'http://169.254.100.1:8008/allowed'"
+      )
+
+      # Another package is not covered by the rule: its request to the same
+      # approved URL pends separately, and a once-scoped deny blocks only
+      # that request without persisting.
+      approval.succeed(
+          package_cmd("sandbox-approve-other-bash", "curl --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/allowed'"
+      )
+      other_id = approval.succeed(pending_http_id).strip()
+      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve deny {other_id} once")
+      approval.wait_until_succeeds("grep -F -q 'blocked by agent-sandbox policy' /tmp/approve-bg.out")
+
+      # The once deny did not persist: the same request pends again.
+      approval.succeed(
+          package_cmd("sandbox-approve-other-bash", "curl --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/allowed'"
+      )
+
+      # Resource pending attribution: an unlisted socket connect pends with
+      # the package attributed, and a project_package approval persists the
+      # rule to the package-specific project file.
+      resource_approval.wait_for_unit("agent-sandbox-vm-resource-pending-server.service")
+      resource_approval.succeed("test -S /run/agent-sandbox-test/pending.sock")
+
+      def resource_bg(script):
+          inner = f"cd /home/user && {shlex.join(['sandbox-resource-approve-bash', '-c', script])}"
+          detached = (
+              "nohup runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 "
+              f"sh -c {shlex.quote(inner)} </dev/null >/tmp/resource-pending.out 2>&1 &"
+          )
+          return command("sh", "-c", detached)
+
+      resource_approval.succeed(
+          resource_bg("printf pending-ok | socat -T 30 - UNIX-CONNECT:/run/agent-sandbox-test/pending.sock")
+      )
+      resource_approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q '/run/agent-sandbox-test/pending.sock'"
+      )
+      # The pending carries the package attribution.
+      resource_approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"resource\" {print $5}' | grep -q 'sandbox-resource-approve-bash'"
+      )
+      pending_res_id = resource_approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"resource\" {print $1; exit}'"
+      ).strip()
+      resource_approval.succeed(
+          f"runuser -u sandbox -- agent-sandbox-approve approve {pending_res_id} project_package"
+      )
+      resource_approval.wait_until_succeeds("grep -q pending-ok /tmp/resource-pending.out")
+      resource_approval.succeed(
+          "test -f /home/user/.agent-sandbox/packages/sandbox-resource-approve-bash.json"
+      )
     '';
   });
   wrappingPackages = [

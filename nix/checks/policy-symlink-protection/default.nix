@@ -31,6 +31,7 @@ let
     package = pkgs.hello;
     binary = "hello";
     fsArmPkg = pkgs.hello;
+    packageName = "hello";
     policyContext = true;
     policySocket = "/tmp/policy-symlink-regression.sock";
     sandboxPolicySocket = "/tmp/policy-symlink-regression-sandbox.sock";
@@ -89,6 +90,26 @@ pkgs.runCommand "policy-symlink-regression" { } ''
   # 9. The project .agent-sandbox directory is ro-bound when it exists.
   grep -F -q '_asbx_ro_bind_once "$_asbx_project_agent_sandbox"' wrapper.sh \
     || fail "project .agent-sandbox ro-bind missing"
+
+  # 10. The home-extension package policy file is a protection candidate,
+  #     with the package name baked in.
+  grep -F -q "_asbx_package_policy_home=\"\$_asbx_user_config/packages/hello.json\"" wrapper.sh \
+    || fail "home-extension package policy candidate missing"
+  grep -F -q '_asbx_policy_candidates+=("$_asbx_package_policy_home")' wrapper.sh \
+    || fail "home-extension package policy candidate not appended to candidates"
+
+  # 11. The package-specific project policy file is a protection candidate.
+  grep -F -q "_asbx_package_policy_project=\"\$_agent_sandbox_project_root/.agent-sandbox/packages/hello.json\"" wrapper.sh \
+    || fail "package project policy candidate missing"
+  grep -F -q '_asbx_policy_candidates+=("$_asbx_package_policy_project")' wrapper.sh \
+    || fail "package project policy candidate not appended to candidates"
+
+  # 12. Both package candidates are covered by the candidate loop that
+  #     ro-binds the resolved target's existing parent and the resolved
+  #     real path (asserted in checks 6-8), so a write through a symlinked
+  #     package policy file lands on a read-only bind.
+  grep -F -q '_asbx_policy_candidates[@]' wrapper.sh \
+    || fail "candidate loop over package policy files missing"
 
   echo "PASS: policy-symlink protection regression guard satisfied"
   touch $out
