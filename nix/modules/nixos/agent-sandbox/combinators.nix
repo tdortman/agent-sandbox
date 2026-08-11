@@ -297,6 +297,27 @@ in
   # Bind all host NVIDIA nodes (including nvidia-fs* when nvidia-fs is enabled).
   # Must run after inherit-shell-env so LD_LIBRARY_PATH can prefer /run/opengl-driver.
   agent-sandbox-nvidia-gpu = add-runtime nvidiaSetupScript;
+
+  # Register the sandbox session's package identity with policyd before the
+  # jail starts. Must run after `agent-sandbox-context-env` so that
+  # `_agent_sandbox_session_id` is set by policyContextScript. Fail-open: a
+  # registration failure (nonzero exit) must never prevent the sandbox from
+  # starting, so output is discarded and the exit status is ignored.
+  agent-sandbox-register-sandbox =
+    {
+      packageName,
+      policySocket,
+      registerCommand,
+    }:
+    compose [
+      (add-runtime ''
+        if [[ -n "''${_agent_sandbox_session_id:-}" ]]; then
+          export AGENT_SANDBOX_SESSION_ID="$_agent_sandbox_session_id"
+          ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" >/dev/null 2>&1 || true
+        fi
+      '')
+    ];
+
   agent-sandbox-restricted-net = restrictedNet false;
   agent-sandbox-restricted-net-dynamic = restrictedNet true;
 

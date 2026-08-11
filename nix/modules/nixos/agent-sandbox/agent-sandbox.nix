@@ -28,6 +28,30 @@ let
       };
     };
   };
+  dbusRuleJson =
+    rule:
+    {
+      target = {
+        inherit (rule.target)
+          bus
+          destination
+          interface
+          member
+          signature
+          ;
+
+        fd_metadata = map (fd: {
+          inherit (fd) kind;
+          read_only = fd.readOnly;
+        }) rule.target.fdMetadata;
+
+        message_kind = rule.target.messageKind;
+        object_path = rule.target.objectPath;
+      };
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
   dbusRuleType = lib.types.submodule {
     options = {
       comment = lib.mkOption {
@@ -74,6 +98,27 @@ let
       signature = lib.mkOption { type = lib.types.str; };
     };
   };
+  filesystemAccessType = lib.types.enum [
+    "read"
+    "write"
+    "read_write"
+    "execute"
+    "all"
+  ];
+  filesystemRuleType = lib.types.submodule {
+    options = {
+      access = lib.mkOption {
+        type = filesystemAccessType;
+        default = "all";
+        description = "Access mode covered by this rule.";
+      };
+
+      path = lib.mkOption {
+        type = policyPathType;
+        description = "Filesystem path matched by this rule. ${policyPathDescription}";
+      };
+    };
+  };
   flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
   # The Rust workspace package installs agent-sandbox-fs-arm and agent-sandbox-fsmon.
   fsArmPkg = policyPkg;
@@ -100,6 +145,21 @@ let
       builtins.stringLength method <= 64 && builtins.match "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" method != null
     ) "agent-sandbox HTTP rule methods must contain valid HTTP method tokens, got: ${method}"
   );
+  httpRuleJson =
+    rule:
+    assert lib.assertMsg
+      (
+        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
+        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
+      )
+      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
+    {
+      inherit (rule) url;
+      methods = if rule.allMethods then [ ] else rule.methods;
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
   httpRuleType = lib.types.submodule {
     options = {
       allMethods = lib.mkOption {
@@ -201,6 +261,29 @@ let
       agent-sandbox mount path must start with ~/ or / (for example "~/.agents" or "/run/user/1000"), got: ${path}
     ''
   );
+  packageEffectiveName =
+    value:
+    if value.name != null then
+      value.name
+    else if value.binary != null then
+      value.binary
+    else
+      value.package.pname or (lib.getName value.package);
+  packageHasPolicy =
+    value:
+    value.policy.network.direct.allow != [ ]
+    || value.policy.network.direct.deny != [ ]
+    || value.policy.network.http.allow != [ ]
+    || value.policy.network.http.deny != [ ]
+    || value.policy.filesystem.allow != [ ]
+    || value.policy.filesystem.deny != [ ]
+    || value.policy.resources.allow != [ ]
+    || value.policy.resources.deny != [ ]
+    || value.policy.dbus.allow != [ ]
+    || value.policy.dbus.deny != [ ]
+    || value.policy.sudo.allow != [ ]
+    || value.policy.sudo.deny != [ ];
+  packageNameValid = name: name != "" && !(lib.hasInfix "/" name) && !(lib.hasInfix ".." name);
   packageOptions = mountOptions // {
     package = lib.mkOption {
       type = lib.types.package;
@@ -253,14 +336,197 @@ let
       '';
     };
 
+    name = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Package name used for sandbox session attribution and per-package policy files; when null, uses the wrapped binary name.";
+    };
+
+    policy = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          dbus = {
+            allow = lib.mkOption {
+              type = lib.types.listOf dbusRuleType;
+              default = [ ];
+              description = "D-Bus capabilities allowed without interactive approval for this package.";
+            };
+
+            deny = lib.mkOption {
+              type = lib.types.listOf dbusRuleType;
+              default = [ ];
+              description = "D-Bus capabilities denied for this package even when another policy allows them.";
+            };
+          };
+
+          filesystem = {
+            allow = lib.mkOption {
+              type = lib.types.listOf filesystemRuleType;
+              default = [ ];
+              description = "Filesystem rules allowed without interactive approval for this package.";
+            };
+
+            deny = lib.mkOption {
+              type = lib.types.listOf filesystemRuleType;
+              default = [ ];
+              description = "Filesystem rules denied for this package even when another policy allows them.";
+            };
+          };
+
+          network = {
+            direct = {
+              allow = lib.mkOption {
+                type = lib.types.listOf ruleType;
+                default = [ ];
+                description = "Hosts allowed without interactive approval for this package.";
+              };
+
+              deny = lib.mkOption {
+                type = lib.types.listOf ruleType;
+                default = [ ];
+                description = "Hosts denied for this package even when another policy allows them.";
+              };
+            };
+
+            http = {
+              allow = lib.mkOption {
+                inherit (httpRules) type;
+                default = [ ];
+                description = "HTTP(S) URL rules allowed without interactive approval for this package.";
+              };
+
+              deny = lib.mkOption {
+                inherit (httpRules) type;
+                default = [ ];
+                description = "HTTP(S) URL rules denied for this package even when another policy allows them.";
+              };
+            };
+          };
+
+          resources = {
+            allow = lib.mkOption {
+              type = lib.types.listOf resourceRuleType;
+              default = [ ];
+              description = "Resource rules allowed without interactive approval for this package.";
+            };
+
+            deny = lib.mkOption {
+              type = lib.types.listOf resourceRuleType;
+              default = [ ];
+              description = "Resource rules denied for this package even when another policy allows them.";
+            };
+          };
+
+          sudo = {
+            allow = lib.mkOption {
+              type = lib.types.listOf sudoRuleType;
+              default = [ ];
+              description = "Sudo command rules allowed without interactive approval for this package.";
+            };
+
+            deny = lib.mkOption {
+              type = lib.types.listOf sudoRuleType;
+              default = [ ];
+              description = "Sudo command rules denied for this package even when another policy allows them.";
+            };
+          };
+        };
+      };
+
+      default = { };
+      description = "Per-package declarative policy; declaring a rule removes the approval prompt for this package only.";
+    };
+
     runtimeReadonlyDirs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = agentSandboxLib.defaultRuntimeReadonlyDirs;
     };
   };
+  packagePolicyJson =
+    policy:
+    {
+      network = {
+        direct = {
+          allow = map (r: { inherit (r) host port; }) policy.network.direct.allow;
+          deny = map (r: { inherit (r) host port; }) policy.network.direct.deny;
+        };
+
+        http = {
+          allow = map httpRuleJson policy.network.http.allow;
+          deny = map httpRuleJson policy.network.http.deny;
+        };
+      };
+
+      sudo = {
+        allow = map (r: { inherit (r) argv; }) policy.sudo.allow;
+        deny = map (r: { inherit (r) argv; }) policy.sudo.deny;
+      };
+    }
+    // lib.optionalAttrs (policy.filesystem.allow != [ ] || policy.filesystem.deny != [ ]) {
+      filesystem = {
+        allow = map (r: { inherit (r) access path; }) policy.filesystem.allow;
+        deny = map (r: { inherit (r) access path; }) policy.filesystem.deny;
+      };
+    }
+    // lib.optionalAttrs (policy.resources.allow != [ ] || policy.resources.deny != [ ]) {
+      resources = {
+        allow = map (r: { inherit (r) access kind path; }) policy.resources.allow;
+        deny = map (r: { inherit (r) access kind path; }) policy.resources.deny;
+      };
+    }
+    // lib.optionalAttrs (policy.dbus.allow != [ ] || policy.dbus.deny != [ ]) {
+      dbus = {
+        allow = map dbusRuleJson policy.dbus.allow;
+        deny = map dbusRuleJson policy.dbus.deny;
+      };
+    };
   policyContextEnabled =
-    cfg.network.enable || cfg.gates.filesystem.enable || cfg.sudoPolicy == "approve";
+    cfg.network.enable
+    || cfg.gates.filesystem.enable
+    || cfg.sudoPolicy == "approve"
+    || lib.any packageHasPolicy cfg.packages;
+  policyPathDescription = ''
+    Each path must start with ~/ under the invoking user's $HOME (for example
+    "~/.agents"), /… on the host (for example "/run/user/1000"), or ./ for
+    project-relative paths.
+  '';
+  policyPathType = lib.types.addCheck lib.types.str (
+    path:
+    lib.assertMsg (isValidMountPath path || lib.hasPrefix "./" path) ''
+      agent-sandbox policy rule path must start with ~/ or / (for example "~/.agents" or "/run/user/1000"), or ./ for project-relative paths, got: ${path}
+    ''
+  );
   policyPkg = flake.package "agent-sandbox";
+  resourceAccessType = lib.types.enum [
+    "connect"
+    "send"
+    "all"
+    "open_read"
+    "open_write"
+    "open_read_write"
+  ];
+  resourceRuleType = lib.types.submodule {
+    options = {
+      access = lib.mkOption {
+        type = resourceAccessType;
+        description = "Access mode covered by this rule.";
+      };
+
+      kind = lib.mkOption {
+        type = lib.types.enum [
+          "unix_socket"
+          "device"
+        ];
+
+        description = "Kind of capability-granting resource matched by this rule.";
+      };
+
+      path = lib.mkOption {
+        type = policyPathType;
+        description = "Path of the socket or device node matched by this rule. ${policyPathDescription}";
+      };
+    };
+  };
   ruleType = lib.types.submodule {
     options = {
       host = lib.mkOption { type = lib.types.str; };
@@ -276,6 +542,18 @@ let
     inherit pkgs policyPkg;
     policy = cfg.sudoPolicy;
   };
+  sudoRuleType = lib.types.submodule {
+    options.argv = lib.mkOption {
+      type = lib.types.addCheck (lib.types.listOf lib.types.str) (
+        argv:
+        lib.assertMsg (builtins.length argv > 0) ''
+          agent-sandbox sudo rule argv must be a non-empty command list (for example ["systemctl" "restart"]), got: ${builtins.toJSON argv}
+        ''
+      );
+
+      description = "Command prefix (argv[0] and arguments) matched by this rule.";
+    };
+  };
   # The Rust workspace package also installs agent-sandbox-syscall-arm and
   # agent-sandbox-syscall-broker. We expose both as `syscallArmPkg` so the
   # sandbox entry chain can prepend the arm helper that installs the seccomp
@@ -285,7 +563,10 @@ let
   wrapOne =
     value:
     agentSandboxLib.mkWrapPackage pkgs (
-      mergePackageMounts value
+      lib.removeAttrs (mergePackageMounts value) [
+        "name"
+        "policy"
+      ]
       // {
         inherit (cfg.wrapping) replaceOriginalBinary unsafeAliasPrefix;
         inherit runtime;
@@ -293,13 +574,17 @@ let
         inherit (runtime)
           dbus
           network
-          policyContext
           policySocket
           sandboxPolicySocket
           ;
 
+        inherit policyPkg;
         dbusProxyPkg = policyPkg;
         filesystemGate = cfg.gates.filesystem.enable;
+        packageName = packageEffectiveName value;
+        # Register the sandbox session when this package declares policy, even
+        # when no global policy gate is enabled, so its package layer applies.
+        policyContext = runtime.policyContext || packageHasPolicy value;
         sudoGuard = sudoGuardPkg;
       }
       // lib.optionalAttrs cfg.gates.filesystem.enable {
@@ -615,6 +900,20 @@ in
         description = "Optional path to export merged policy as a .nix file beside your config repo.";
       };
 
+      filesystem = {
+        declarativeAllow = lib.mkOption {
+          type = lib.types.listOf filesystemRuleType;
+          default = [ ];
+          description = "Filesystem rules allowed without interactive approval.";
+        };
+
+        declarativeDeny = lib.mkOption {
+          type = lib.types.listOf filesystemRuleType;
+          default = [ ];
+          description = "Filesystem rules denied even when another policy allows them.";
+        };
+      };
+
       interactiveApproval = lib.mkOption {
         type = lib.types.bool;
         default = true;
@@ -626,6 +925,20 @@ in
         '';
       };
 
+      resources = {
+        declarativeAllow = lib.mkOption {
+          type = lib.types.listOf resourceRuleType;
+          default = [ ];
+          description = "Resource rules allowed without interactive approval.";
+        };
+
+        declarativeDeny = lib.mkOption {
+          type = lib.types.listOf resourceRuleType;
+          default = [ ];
+          description = "Resource rules denied even when another policy allows them.";
+        };
+      };
+
       sandboxSocketPath = lib.mkOption {
         type = lib.types.str;
         default = "/run/agent-sandbox/sandbox-policy.sock";
@@ -635,6 +948,20 @@ in
       socketPath = lib.mkOption {
         type = lib.types.str;
         default = "/run/agent-sandbox/policy.sock";
+      };
+
+      sudo = {
+        declarativeAllow = lib.mkOption {
+          type = lib.types.listOf sudoRuleType;
+          default = [ ];
+          description = "Sudo command rules allowed without interactive approval. sudoPolicy remains the master switch for elevation.";
+        };
+
+        declarativeDeny = lib.mkOption {
+          type = lib.types.listOf sudoRuleType;
+          default = [ ];
+          description = "Sudo command rules denied even when another policy allows them. sudoPolicy remains the master switch for elevation.";
+        };
       };
 
       uiBackend = lib.mkOption {
@@ -758,9 +1085,50 @@ in
         assertion = cfg.network.httpProxy.http3.enable || cfg.network.httpProxy.http3.altUdpPorts == [ ];
         message = "agent-sandbox.network.httpProxy.http3.altUdpPorts requires http3.enable";
       }
+      {
+        assertion =
+          let
+            invalid = lib.filter (value: !(packageNameValid (packageEffectiveName value))) cfg.packages;
+          in
+          invalid == [ ];
+
+        message =
+          let
+            invalid = lib.filter (value: !(packageNameValid (packageEffectiveName value))) cfg.packages;
+          in
+          "agent-sandbox package names must be non-empty and contain neither '/' nor '..', got: ${
+            lib.concatMapStringsSep ", " packageEffectiveName invalid
+          }";
+      }
+      {
+        assertion =
+          let
+            names = map packageEffectiveName (lib.filter packageHasPolicy cfg.packages);
+          in
+          lib.all (name: lib.length (builtins.filter (n: n == name) names) == 1) names;
+
+        message =
+          let
+            duplicates = lib.unique (
+              builtins.filter (name: lib.length (builtins.filter (n: n == name) names) > 1) names
+            );
+            names = map packageEffectiveName (lib.filter packageHasPolicy cfg.packages);
+          in
+          "agent-sandbox packages declaring policy must have unique effective names (each emits /etc/agent-sandbox/packages/<name>.json); duplicates: ${lib.concatStringsSep ", " duplicates}";
+      }
     ];
 
     environment = {
+      # One root-owned declarative policy file per package that declares
+      # policy; policyd loads these via --package-declarative NAME=PATH for
+      # sessions attributed to the package.
+      etc = lib.listToAttrs (
+        map (value: {
+          name = "agent-sandbox/packages/${packageEffectiveName value}.json";
+          value.text = builtins.toJSON (packagePolicyJson value.policy);
+        }) (lib.filter packageHasPolicy cfg.packages)
+      );
+
       # Propagate UI backend choice to session so manually run agent-sandbox-ui
       # picks up the configured backend without needing the service environment.
       sessionVariables.AGENT_SANDBOX_UI_BACKEND = cfg.policy.uiBackend;

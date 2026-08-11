@@ -13,10 +13,15 @@ let
       exposeWorkingDirectory ? true,
       extraBwrapArgs ? [ ],
       extraPkgs ? [ ],
+      packageName ? null,
+      policyContext ? false,
+      policyPkg ? null,
+      policySocket ? null,
       readonlyDirs ? [ ],
       readonlyFiles ? [ ],
       readwriteDirs ? [ ],
       readwriteFiles ? [ ],
+      registerCommand ? "",
       runtime ? null,
       runtimeReadonlyDirs ? defaultRuntimeReadonlyDirs,
       sudoGuard ? null,
@@ -56,6 +61,11 @@ let
     ]
     ++ lib.optionals (runtime != null && runtime.policyContext) [
       (agent-sandbox-context-env { inherit runtime; })
+    ]
+    ++ lib.optionals (policyContext && policyPkg != null && policySocket != null) [
+      (agent-sandbox-register-sandbox {
+        inherit packageName policySocket registerCommand;
+      })
     ]
     ++ lib.optionals (runtime != null && runtime.network != null) [
       (if dynamicFs then c.agent-sandbox-restricted-net-dynamic else agent-sandbox-restricted-net)
@@ -262,7 +272,9 @@ in
       fsArmPkg ? null,
       hiddenPaths ? [ ],
       network ? null,
+      packageName ? if binary != null then binary else lib.baseNameOf (lib.getExe package),
       policyContext ? false,
+      policyPkg ? null,
       policySocket ? null,
       readonlyDirs ? [ ],
       readonlyFiles ? [ ],
@@ -401,6 +413,7 @@ in
           done < <(env -0)
 
           ${policyScript}
+          ${registerSandboxScript}
           ${dbusScript}
           ${dnsScript}
 
@@ -499,18 +512,30 @@ in
       hidePathsScript = ''
         RUNTIME_ARGS+=(--tmpfs /run/wrappers)
       ''
-      + lib.concatMapStringsSep "\n" (path: ''
-          ${hidePathAssignment path}
-        _asbx_hide_target=""
-        if [[ -e "$_asbx_hide" ]]; then
-          _asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)" || _asbx_hide_target=""
-        fi
-        if [[ -d "$_asbx_hide_target" ]]; then
-          RUNTIME_ARGS+=(--tmpfs "$_asbx_hide_target")
-        elif [[ -e "$_asbx_hide_target" ]]; then
-          RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
-        fi
-      '') hiddenPaths;
+      +
+        lib.concatMapStringsSep "\n"
+          (path: ''
+              ${hidePathAssignment path}
+            _asbx_hide_target=""
+            if [[ -e "$_asbx_hide" ]]; then
+              _asbx_hide_target="$(readlink -f -- "$_asbx_hide" 2>/dev/null)" || _asbx_hide_target=""
+            fi
+            if [[ -d "$_asbx_hide_target" ]]; then
+              RUNTIME_ARGS+=(--tmpfs "$_asbx_hide_target")
+            elif [[ -e "$_asbx_hide_target" ]]; then
+              RUNTIME_ARGS+=(--ro-bind /dev/null "$_asbx_hide_target")
+            fi
+          '')
+          (
+            [
+              # The declarative policy inputs under /etc/agent-sandbox are
+              # NixOS-managed symlinks into /nix/store, which the static allow
+              # list serves without a policy check. Mask the whole directory so
+              # the sandbox cannot read the declared policy files at any path.
+              "/etc/agent-sandbox"
+            ]
+            ++ hiddenPaths
+          );
       http3UdpProxyPorts =
         if runtime == null then
           "443"
@@ -581,10 +606,15 @@ in
             extraPkgs
             fsArmPkg
             package
+            packageName
+            policyContext
+            policyPkg
+            policySocket
             readonlyDirs
             readonlyFiles
             readwriteDirs
             readwriteFiles
+            registerCommand
             runtime
             sudoGuard
             syscallArmPkg
@@ -696,6 +726,18 @@ in
             if [[ -e "$_asbx_user_config/policy.json" || -L "$_asbx_user_config/policy.json" ]]; then
               _asbx_policy_candidates+=("$_asbx_user_config/policy.json")
             fi
+            # Package-specific policy files (home extension and package
+            # project file) live under the config directories ro-bound
+            # above, so the write-through risk is the symlink target path:
+            # protect them exactly like the per-scope policy files above.
+            _asbx_package_policy_home="$_asbx_user_config/packages/${lib.escapeShellArg packageName}.json"
+            if [[ -e "$_asbx_package_policy_home" || -L "$_asbx_package_policy_home" ]]; then
+              _asbx_policy_candidates+=("$_asbx_package_policy_home")
+            fi
+            _asbx_package_policy_project="$_agent_sandbox_project_root/.agent-sandbox/packages/${lib.escapeShellArg packageName}.json"
+            if [[ -e "$_asbx_package_policy_project" || -L "$_asbx_package_policy_project" ]]; then
+              _asbx_policy_candidates+=("$_asbx_package_policy_project")
+            fi
             for _asbx_policy_candidate in "''${_asbx_policy_candidates[@]}"; do
               _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_policy_candidate")"
               _asbx_ro_bind_once "$_asbx_policy_parent"
@@ -742,6 +784,14 @@ in
         RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS ${proxyTrustBundle})
       '';
+      registerCommand = if policyPkg != null then "${policyPkg}/bin/agent-sandbox-approve" else "";
+      registerSandboxScript =
+        lib.optionalString (policyContext && policySocket != null && policyPkg != null)
+          ''
+            if [[ -n "''${_agent_sandbox_session_id:-}" ]]; then
+              ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" >/dev/null 2>&1 || true
+            fi
+          '';
       # Rebind explicit narrow /run/* mounts configured by the package
       # definition. Skip the broad /run path so the host's runtime sockets
       # stay hidden by the surrounding tmpfs.

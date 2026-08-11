@@ -6,7 +6,7 @@ _arguments -C \
 
 case "$state" in
   cmd)
-    _values 'subcommand' pending approve approve-host deny
+    _values 'subcommand' pending approve approve-host deny register-sandbox
     ;;
   arg)
     case "$words[2]" in
@@ -33,7 +33,7 @@ case "$state" in
           done
           (( ${#requests} )) && compadd -l -d descriptions -- "${requests[@]}"
         elif (( CURRENT == 4 )); then
-          _values 'scope' once session project global
+          _values 'scope' once session project_package project global_package global
         fi
         ;;
     esac

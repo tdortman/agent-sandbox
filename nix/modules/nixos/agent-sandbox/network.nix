@@ -255,11 +255,40 @@ let
     hosts: files dns
     networks: files
   '';
+  packageEffectiveName =
+    value:
+    if value.name != null then
+      value.name
+    else if value.binary != null then
+      value.binary
+    else
+      lib.baseNameOf (lib.getExe value.package);
+  packageHasPolicy =
+    value:
+    value.policy.network.direct.allow != [ ]
+    || value.policy.network.direct.deny != [ ]
+    || value.policy.network.http.allow != [ ]
+    || value.policy.network.http.deny != [ ]
+    || value.policy.filesystem.allow != [ ]
+    || value.policy.filesystem.deny != [ ]
+    || value.policy.resources.allow != [ ]
+    || value.policy.resources.deny != [ ]
+    || value.policy.dbus.allow != [ ]
+    || value.policy.dbus.deny != [ ]
+    || value.policy.sudo.allow != [ ]
+    || value.policy.sudo.deny != [ ];
   policyEnabled =
     cfg.enable
     || rootCfg.policy.dbus.enable
     || rootCfg.sudoPolicy == "approve"
-    || rootCfg.gates.filesystem.enable;
+    || rootCfg.gates.filesystem.enable
+    || rootCfg.policy.filesystem.declarativeAllow != [ ]
+    || rootCfg.policy.filesystem.declarativeDeny != [ ]
+    || rootCfg.policy.resources.declarativeAllow != [ ]
+    || rootCfg.policy.resources.declarativeDeny != [ ]
+    || rootCfg.policy.sudo.declarativeAllow != [ ]
+    || rootCfg.policy.sudo.declarativeDeny != [ ]
+    || lib.any packageHasPolicy rootCfg.packages;
   proxyBundlePath = "/run/agent-sandbox/proxy-ca-bundle.pem";
   proxyCaCertificate = cfg.httpProxy.caCertificateFile;
   proxyCaPrivateKey = cfg.httpProxy.caPrivateKeyFile;
@@ -391,7 +420,7 @@ in
 lib.mkIf policyEnabled (
   lib.mkMerge [
     {
-      environment.etc."agent-sandbox/declarative.json".text = builtins.toJSON (
+      environment.etc."agent-sandbox/policy.json".text = builtins.toJSON (
         {
           network = {
             direct = {
@@ -406,8 +435,8 @@ lib.mkIf policyEnabled (
           };
 
           sudo = {
-            allow = [ ];
-            deny = [ ];
+            allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
+            deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
           };
         }
         // lib.optionalAttrs rootCfg.policy.dbus.enable {
@@ -416,18 +445,37 @@ lib.mkIf policyEnabled (
             deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
           };
         }
-        // lib.optionalAttrs config.agent-sandbox.gates.filesystem.enable {
-          filesystem = {
-            allow = [
-              {
-                access = "all";
-                path = "/nix/store";
-              }
-            ];
+        //
+          lib.optionalAttrs
+            (
+              config.agent-sandbox.gates.filesystem.enable
+              || rootCfg.policy.filesystem.declarativeAllow != [ ]
+              || rootCfg.policy.filesystem.declarativeDeny != [ ]
+            )
+            {
+              filesystem = {
+                allow = [
+                  {
+                    access = "all";
+                    path = "/nix/store";
+                  }
+                ]
+                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
 
-            deny = [ ];
-          };
-        }
+                deny = map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
+              };
+            }
+        //
+          lib.optionalAttrs
+            (
+              rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
+            )
+            {
+              resources = {
+                allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
+                deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
+              };
+            }
       );
 
       networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
@@ -466,12 +514,16 @@ lib.mkIf policyEnabled (
               "--sandbox-socket"
               runtime.sandboxPolicySocket
               "--declarative"
-              "/etc/agent-sandbox/declarative.json"
+              "/etc/agent-sandbox/policy.json"
               "--export-json"
               runtime.exportedJson
               "--approval-timeout"
               (toString runtime.approvalTimeout)
             ]
+            ++ lib.concatMap (value: [
+              "--package-declarative"
+              "${packageEffectiveName value}=/etc/agent-sandbox/packages/${packageEffectiveName value}.json"
+            ]) (lib.filter packageHasPolicy rootCfg.packages)
             ++ lib.optionals (!runtime.interactiveApproval) [
               "--no-interactive-approval"
             ]

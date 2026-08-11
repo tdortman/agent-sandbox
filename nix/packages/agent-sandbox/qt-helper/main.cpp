@@ -89,7 +89,10 @@ static int runReview() {
     }
 
     QDialog dialog;
-    dialog.setWindowTitle("agent-sandbox approval");
+    const QString summary = request.value("summary").toString();
+    dialog.setWindowTitle(
+        summary.isEmpty() ? "agent-sandbox approval" : summary
+    );
     dialog.setMinimumWidth(520);
     auto* layout = new QVBoxLayout(&dialog);
 
@@ -280,6 +283,19 @@ static int runReview() {
     deny->setDefault(true);
     deny->setAutoDefault(true);
     deny->setFocus();
+    // Keep both buttons at one stable width across scope changes, sized to
+    // the widest scope label plus comfortable padding, so the text never
+    // sits flush against the button edges.
+    int buttonMinWidth =
+        deny->fontMetrics().horizontalAdvance("Deny for this package everywhere");
+    const int allowWidth =
+        deny->fontMetrics().horizontalAdvance("Allow for this package everywhere");
+    if (allowWidth > buttonMinWidth) {
+        buttonMinWidth = allowWidth;
+    }
+    buttonMinWidth += 64;
+    deny->setMinimumWidth(buttonMinWidth);
+    allow->setMinimumWidth(buttonMinWidth);
     buttons->addStretch(1);
     buttons->addWidget(deny);
     buttons->addWidget(allow);
@@ -360,11 +376,20 @@ static int runReview() {
             deny->setText("Deny once");
             allow->setText("Allow once");
         } else if (scopeValue == "global") {
-            deny->setText("Deny globally");
-            allow->setText("Allow globally");
+            deny->setText("Deny everywhere");
+            allow->setText("Allow everywhere");
+        } else if (scopeValue == "session") {
+            deny->setText("Deny for this session");
+            allow->setText("Allow for this session");
+        } else if (scopeValue == "project_package") {
+            deny->setText("Deny for this package");
+            allow->setText("Allow for this package");
+        } else if (scopeValue == "project") {
+            deny->setText("Deny for this project");
+            allow->setText("Allow for this project");
         } else {
-            deny->setText("Deny for " + scope->currentText().toLower());
-            allow->setText("Allow for " + scope->currentText().toLower());
+            deny->setText("Deny for this package everywhere");
+            allow->setText("Allow for this package everywhere");
         }
     };
     QObject::connect(scope, qOverload<int>(&QComboBox::currentIndexChanged), &dialog, [&](int) {
