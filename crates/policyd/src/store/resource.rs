@@ -7,19 +7,15 @@ use super::{
     },
     ui::VerdictExit,
 };
-
 use crate::wire::ResourceCheckRequest;
-
 use agent_sandbox_core::{
     DbusCheckReply, DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
     ResourceKind, ResourceRuleKey, UiPush, VerdictSource,
 };
-
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -37,6 +33,7 @@ struct PendingCtx<'a> {
     home: Option<&'a Path>,
     project_root: Option<&'a Path>,
     sandbox_session_id: Option<&'a str>,
+    package: Option<&'a str>,
 }
 
 impl PolicyStore {
@@ -93,6 +90,7 @@ impl PolicyStore {
                 home: home.as_deref(),
                 project_root: project_root.as_deref(),
                 sandbox_session_id: sandbox_session_id.as_deref(),
+                package: ctx.package.as_deref(),
             })
             .await
         {
@@ -109,6 +107,7 @@ impl PolicyStore {
                 cwd: cwd.clone(),
                 home: home.clone(),
                 project_root: project_root.clone(),
+                package: ctx.package.clone(),
             };
 
             self.notify_general_ui(&ctx, &push).await;
@@ -155,6 +154,7 @@ impl PolicyStore {
                 home: home.as_deref(),
                 project_root: project_root.as_deref(),
                 sandbox_session_id: sandbox_session_id.as_deref(),
+                package: ctx.package.as_deref(),
             })
             .await
         {
@@ -170,6 +170,7 @@ impl PolicyStore {
                 home: home.clone(),
                 project_root: project_root.clone(),
                 sandbox_session_id: sandbox_session_id.clone(),
+                package: ctx.package.clone(),
             };
 
             self.notify_general_ui(&ctx, &push).await;
@@ -242,11 +243,16 @@ impl PolicyStore {
         let mut inner = self.inner.lock().await;
 
         // Deduplicate: if a pending already exists for the same resource
-        // kind, path, and access type, join its waiters instead of creating
-        // a new prompt.
+        // kind, path, access type, and sandbox session, join its waiters
+        // instead of creating a new prompt. The session is part of the key
+        // so one sandbox's stale pending is not reused for another's
+        // requests to the same socket.
         let existing_id = inner.pending_values().find_map(|p| match p {
             Pending::Resource(res)
-                if res.kind == kind && res.path == path && res.access == access =>
+                if res.kind == kind
+                    && res.path == path
+                    && res.access == access
+                    && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
             {
                 Some(res.id.clone())
             }
@@ -306,6 +312,7 @@ impl PolicyStore {
             home: ctx.home.map(PathBuf::from),
             project_root: ctx.project_root.map(PathBuf::from),
             sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+            package: ctx.package.map(String::from),
         });
 
         inner.insert_pending(pending);
@@ -385,6 +392,7 @@ impl PolicyStore {
             home: ctx.home.map(PathBuf::from),
             project_root: ctx.project_root.map(PathBuf::from),
             sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+            package: ctx.package.map(String::from),
         });
 
         inner.insert_pending(pending);
@@ -573,23 +581,19 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
-
     use crate::{
         store::{UiSessionContext, types::UiClient},
         wire::ResourceCheckRequest,
     };
-
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, ProcessIds, ResolvedRequestContext, ResourceAccess,
         ResourceKind, SandboxPaths, SocketAccess, VerdictSource,
     };
-
     use std::{
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::Arc,
         time::{Duration, Instant},
     };
-
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {
@@ -616,6 +620,7 @@ mod tests {
                 ),
                 ids: ProcessIds::from_options(Some(0), Some(1000)),
                 sandbox_session_id: Some("sandbox-cap".into()),
+                package: None,
             },
         }
     }
@@ -738,6 +743,7 @@ mod tests {
                     ),
                     ids: ProcessIds::from_options(None, Some(1000)),
                     sandbox_session_id: Some("sandbox-cap".into()),
+                    package: None,
                 })
                 .await
         });
@@ -842,5 +848,47 @@ mod tests {
 
         assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
         assert_eq!(reply.source, VerdictSource::policy_with_comment("cli"));
+    }
+
+    #[tokio::test]
+    async fn resource_pending_dedup_is_scoped_to_the_sandbox_session() {
+        fn pending_ctx(session: &str) -> super::PendingCtx<'_> {
+            super::PendingCtx {
+                cwd: Some(Path::new("/repo")),
+                home: Some(Path::new("/home/user")),
+                project_root: Some(Path::new("/repo")),
+                sandbox_session_id: Some(session),
+                package: None,
+            }
+        }
+
+        let store = test_store();
+        let kind = ResourceKind::UnixSocket;
+        let path = PathBuf::from("/repo/shared.sock");
+        let access = ResourceAccess::Socket(SocketAccess::Connect);
+
+        let a = store
+            .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-a"))
+            .await
+            .expect("first session pending");
+        assert!(a.is_new, "first session must create its own pending");
+
+        let b = store
+            .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-b"))
+            .await
+            .expect("second session pending");
+        assert!(
+            b.is_new,
+            "a different sandbox session must not reuse the first pending"
+        );
+
+        let c = store
+            .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-a"))
+            .await
+            .expect("same session pending");
+        assert!(
+            !c.is_new,
+            "the same session must deduplicate to its own pending"
+        );
     }
 }

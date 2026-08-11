@@ -37,6 +37,7 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id: _,
             comment,
+            package,
         } = wire;
 
         let home = paths.home();
@@ -44,7 +45,13 @@ impl PolicyStore {
         let session_entries = vec![NetworkRuleKey::new(&host, port)];
 
         let target = match self
-            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
+            .resolve_scope_target(
+                scope,
+                session_id.as_deref(),
+                home,
+                project_root,
+                package.as_deref(),
+            )
             .await
         {
             Ok(target) => target,
@@ -52,6 +59,25 @@ impl PolicyStore {
         };
 
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+
+        let persist =
+            |policy_path: &Path, home: Option<&Path>, invalidate: bool| -> std::io::Result<()> {
+                Self::persist_network_rule(
+                    policy_path,
+                    &host,
+                    port,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    home,
+                    owner_uid,
+                )?;
+
+                if invalidate {
+                    self.invalidate_merged_policy_cache();
+                }
+
+                Ok(())
+            };
 
         match target {
             ScopeTarget::Ephemeral => {
@@ -75,16 +101,15 @@ impl PolicyStore {
             }
 
             ScopeTarget::Global { policy_path, home } => {
-                let persist = Self::persist_network_rule(
-                    &policy_path,
-                    &host,
-                    port,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    Some(home.as_path()),
-                    owner_uid,
-                );
-                if let Err(err) = persist {
+                if let Err(err) = persist(&policy_path, Some(home.as_path()), false) {
+                    return PolicydError::from(err).into();
+                }
+            }
+
+            ScopeTarget::GlobalPackage {
+                policy_path, home, ..
+            } => {
+                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
                     return PolicydError::from(err).into();
                 }
             }
@@ -93,19 +118,17 @@ impl PolicyStore {
                 policy_path,
                 project_root: _,
             } => {
-                let persist = Self::persist_network_rule(
-                    &policy_path,
-                    &host,
-                    port,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    home,
-                    owner_uid,
-                );
-                if let Err(err) = persist {
+                if let Err(err) = persist(&policy_path, home, false) {
                     return PolicydError::from(err).into();
                 }
                 tracing::info!(path = ?policy_path, "project policy saved");
+            }
+
+            ScopeTarget::ProjectPackage { policy_path, .. } => {
+                if let Err(err) = persist(&policy_path, home, true) {
+                    return PolicydError::from(err).into();
+                }
+                tracing::info!(path = ?policy_path, "project package policy saved");
             }
         }
 
@@ -147,6 +170,7 @@ impl PolicyStore {
         session_id: Option<&str>,
         home: Option<&Path>,
         project_root: Option<&Path>,
+        package: Option<&str>,
     ) -> Result<ScopeTarget, Box<RpcReply>> {
         let active = self.active_session_ids().await;
         let home_str = home.and_then(Path::to_str);
@@ -157,6 +181,7 @@ impl PolicyStore {
             session_id,
             home: home_str,
             project_root: project_root_str,
+            package,
             active_session_ids: &active,
         };
 

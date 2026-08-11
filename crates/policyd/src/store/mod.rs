@@ -97,6 +97,7 @@ pub(crate) const fn test_args(
         approval_timeout,
         interactive_approval,
         ui_spawn_cmd: None,
+        package_declarative: Vec::new(),
         fs_monitor_cmd: None,
         syscall_broker_cmd: None,
     }

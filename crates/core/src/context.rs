@@ -204,11 +204,17 @@ impl ProcessIds {
 }
 
 /// Canonical daemon-side sandbox context after applying trust and enrichment.
+///
+/// `package` is server-derived attribution from a validated sandbox
+/// registration. It is never read from wire input: policyd fills it from the
+/// session registration only after verifying the requesting peer owns the
+/// session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedRequestContext {
     pub paths: SandboxPaths,
     pub ids: ProcessIds,
     pub sandbox_session_id: Option<String>,
+    pub package: Option<String>,
 }
 
 impl ResolvedRequestContext {
@@ -222,6 +228,7 @@ impl ResolvedRequestContext {
             paths,
             ids,
             sandbox_session_id,
+            package: None,
         }
     }
 }

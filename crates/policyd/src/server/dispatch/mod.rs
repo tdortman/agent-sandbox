@@ -34,8 +34,8 @@ mod tests {
 
     use agent_sandbox_core::{
         FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
-        NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcRequest, SocketIdentity,
-        SocketInode,
+        NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcReply, RpcRequest,
+        SocketIdentity, SocketInode,
     };
 
     use std::{sync::Arc, time::Duration};
@@ -162,5 +162,60 @@ mod tests {
             matches!(result, Err(PolicydError::UnauthorizedRequest)),
             "sandbox socket must reject unprivileged flow registration, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn host_dispatch_registers_sandbox_package() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = test_store(&dir);
+        let client = PolicyStore::new_client_handle(writer());
+
+        // The launcher binding check reads /proc/<peer.pid>/stat, so the
+        // test peer must be a real child of the launcher pid.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child of the test process");
+
+        let launcher_pid = std::process::id();
+        let peer_pid = child.id();
+
+        let result = dispatch(
+            &store,
+            &client,
+            ClientPeer {
+                pid: peer_pid,
+                uid: 1000,
+                gid: 0,
+            },
+            SocketRole::Host,
+            RpcRequest::RegisterSandbox {
+                session_id: "sandbox-a".into(),
+                package: "omp".into(),
+                launcher_pid,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(RpcReply::Simple(_))),
+            "host dispatch must accept RegisterSandbox, got: {result:?}"
+        );
+
+        let sessions = store
+            .sandbox_sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let reg = sessions
+            .get("sandbox-a")
+            .expect("RegisterSandbox must store the registration");
+
+        assert_eq!(reg.package.as_deref(), Some("omp"));
+        assert_eq!(reg.owner_uid, 1000);
+        assert_eq!(reg.launcher_pid, launcher_pid);
+        drop(sessions);
+        child.kill().expect("kill child");
+        let _ = child.wait();
     }
 }

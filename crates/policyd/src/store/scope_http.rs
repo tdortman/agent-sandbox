@@ -98,7 +98,10 @@ fn apply_http_memory_locked(
             }
         }
 
-        ScopeTarget::Project { .. } | ScopeTarget::Global { .. } => {}
+        ScopeTarget::Project { .. }
+        | ScopeTarget::ProjectPackage { .. }
+        | ScopeTarget::Global { .. }
+        | ScopeTarget::GlobalPackage { .. } => {}
     }
 
     Ok(())
@@ -153,6 +156,7 @@ impl PolicyStore {
                 session_id.as_deref(),
                 ctx.paths.home_path().as_deref(),
                 ctx.paths.project_root_path().as_deref(),
+                ctx.package.as_deref(),
             )
             .await
             .map_err(|reply| PolicydError::Proxy(format!("invalid HTTP scope: {reply:?}")))?;
@@ -160,9 +164,10 @@ impl PolicyStore {
         let context = http_context(&ctx);
 
         let scope_path = match &scope_target {
-            ScopeTarget::Global { policy_path, .. } | ScopeTarget::Project { policy_path, .. } => {
-                Some(policy_path.clone())
-            }
+            ScopeTarget::Global { policy_path, .. }
+            | ScopeTarget::GlobalPackage { policy_path, .. }
+            | ScopeTarget::Project { policy_path, .. }
+            | ScopeTarget::ProjectPackage { policy_path, .. } => Some(policy_path.clone()),
             ScopeTarget::Session { .. } | ScopeTarget::Ephemeral => None,
         };
 
@@ -261,21 +266,33 @@ impl PolicyStore {
         allowed: bool,
     ) -> Result<ScopeActionReply, PolicydError> {
         let ids = ProcessIds::from_options(None, wire.owner_uid);
-        let pending_context = context_for_pending(&pending, ids);
+        let mut pending_context = context_for_pending(&pending, ids);
+
+        // The requester's package attribution was recorded on the pending at
+        // request time. The approver's wire context (host CLI or dialog) has
+        // no session and therefore no package, so the pending's attribution
+        // is what scopes the rule.
+        pending_context.package = pending.package.clone().or_else(|| wire.package.clone());
+
         let session_id = wire.session_id;
         let comment = wire.comment.as_deref();
 
+        // A pending approval names no target; the rule applies to the
+        // request's own target, like the other pending resource types.
+        // An explicit target is honoured for persistent scopes only when it
+        // matches the pending request, and is rejected for Once where the
+        // rule must stay exact.
         let target = if scope == ApprovalScope::Once {
             if target.is_some() {
                 return Err(PolicydError::InvalidDecisionTarget);
             }
             target_for_request(&pending.request)
         } else {
-            let target = target.ok_or(PolicydError::InvalidDecisionTarget)?;
-            if !target.matches(&pending.request) {
-                return Err(PolicydError::InvalidDecisionTarget);
+            match target {
+                Some(target) if target.matches(&pending.request) => target,
+                Some(_) => return Err(PolicydError::InvalidDecisionTarget),
+                None => target_for_request(&pending.request),
             }
-            target
         };
 
         {
@@ -343,6 +360,7 @@ mod tests {
                 project_root: Some(PathBuf::from("/pending/project")),
                 sandbox_session_id: Some("pending-session".into()),
             },
+            package: None,
         };
 
         let context = context_for_pending(&pending, ProcessIds::new(42, 1000));
@@ -400,6 +418,7 @@ mod tests {
                 project_root: Some("/pending/project".into()),
                 sandbox_session_id: Some("pending-session".into()),
             },
+            package: None,
         };
 
         let ui_context = ResolvedRequestContext::new(
@@ -509,6 +528,7 @@ mod tests {
                 project_root: Some(pending_project),
                 sandbox_session_id: Some("pending-session".into()),
             },
+            package: None,
         };
 
         let ui_context = ResolvedRequestContext::new(
@@ -557,5 +577,98 @@ mod tests {
             .any(|value| value == target && value.matches(&request));
 
         assert!(found, "global HTTP approval missing from {policy_path:?}");
+    }
+
+    #[tokio::test]
+    async fn pending_http_approval_without_target_persists_at_package_project_scope() {
+        // The CLI "approve" and "deny" commands send no target. policyd must
+        // derive the rule from the pending request itself, like the other
+        // pending resource types, instead of rejecting the decision.
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let pending_home = dir.path().join("pending-home");
+        let pending_cwd = dir.path().join("pending-cwd");
+        let pending_project = dir.path().join("pending-project");
+        std::fs::create_dir_all(&pending_home).expect("create pending home");
+        std::fs::create_dir_all(&pending_cwd).expect("create pending cwd");
+        std::fs::create_dir_all(&pending_project).expect("create pending project");
+        let policy_path = pending_project.join(".agent-sandbox/packages/curl.json");
+
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ));
+
+        let pending_id = PendingHttpId::new();
+
+        let request = HttpRequest {
+            method: HttpMethod::parse("GET").expect("valid method"),
+            url: HttpUrl::parse("https://example.com/").expect("valid URL"),
+            session: None,
+        };
+
+        let pending = PendingHttp {
+            id: pending_id.to_string(),
+            pending_id,
+            created_at: 0.0,
+            request: request.clone(),
+            context: HttpContextKey {
+                cwd: Some(pending_cwd.clone()),
+                home: Some(pending_home.clone()),
+                project_root: Some(pending_project.clone()),
+                sandbox_session_id: Some("pending-session".into()),
+            },
+            package: Some("curl".into()),
+        };
+
+        // The approver (host CLI or dialog) has no session and so resolves
+        // with no package; the rule must scope to the pending's attribution.
+        let ui_context = ResolvedRequestContext::new(
+            SandboxPaths::new(
+                dir.path().join("ui-cwd"),
+                dir.path().join("ui-home"),
+                dir.path().join("ui-project"),
+            ),
+            ProcessIds::new(7, 0),
+            Some("ui-session".into()),
+        );
+
+        let reply = store
+            .apply_pending_http(
+                pending,
+                ApprovalScope::ProjectPackage,
+                None,
+                ScopeWire::from_resolved(&ui_context, None),
+                true,
+            )
+            .await
+            .expect("project_package approval without an explicit target");
+
+        match &reply {
+            ScopeActionReply::Http(value) => {
+                assert_eq!(value.path.as_deref(), Some(policy_path.as_path()));
+            }
+
+            _ => panic!("expected HTTP scope reply"),
+        }
+
+        let policy = load_policy(&policy_path, Some(&pending_home), None);
+
+        let found = policy
+            .network
+            .http
+            .allow
+            .iter()
+            .filter_map(|rule| rule.target().ok())
+            .any(|value| value.matches(&request));
+
+        assert!(
+            found,
+            "project_package HTTP approval missing from {policy_path:?}"
+        );
     }
 }

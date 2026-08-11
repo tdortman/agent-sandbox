@@ -48,6 +48,7 @@ pub struct ScopeWire {
     pub owner_uid: Option<u32>,
     pub sandbox_session_id: Option<String>,
     pub comment: Option<String>,
+    pub package: Option<String>,
 }
 
 impl ScopeWire {
@@ -61,6 +62,7 @@ impl ScopeWire {
             owner_uid,
             sandbox_session_id: ctx.sandbox_session_id.clone(),
             comment: None,
+            package: ctx.package.clone(),
         }
     }
 }

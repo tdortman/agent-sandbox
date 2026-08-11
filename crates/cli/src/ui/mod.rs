@@ -363,6 +363,7 @@ mod tests {
                 cwd: None,
                 home: None,
                 project_root: None,
+                package: None,
             })
             .collect::<Vec<_>>();
 

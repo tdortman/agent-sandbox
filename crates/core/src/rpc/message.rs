@@ -47,6 +47,8 @@ mod tests {
             cwd: None,
             home: None,
             project_root: None,
+
+            package: None,
         });
 
         assert!(message.to_string().ends_with('\n'));

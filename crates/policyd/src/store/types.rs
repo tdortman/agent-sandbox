@@ -57,6 +57,12 @@ pub struct SandboxSessionRegistration {
     pub root_pid: u32,
     pub owner_uid: u32,
     pub project_root: PathBuf,
+    pub package: Option<String>,
+
+    /// PID of the launcher (wrapper) process that pre-registered the
+    /// session. 0 means the session was not pre-registered. Such sessions
+    /// keep the first-peer-claims-root adoption model.
+    pub launcher_pid: u32,
 }
 
 /// Exact HTTP request and context used for pending approval deduplication.
@@ -123,6 +129,11 @@ pub struct PolicydArgs {
     pub interactive_approval: bool,
     pub ui_spawn_cmd: Option<PathBuf>,
 
+    /// Per-package declarative base policy files, keyed by package name.
+    /// Loaded as the package layer (between the global declarative policy
+    /// and the user policy) for sessions attributed to that package.
+    pub package_declarative: Vec<(String, PathBuf)>,
+
     /// Path to the agent-sandbox-fsmon binary.
     pub fs_monitor_cmd: Option<PathBuf>,
 
@@ -145,6 +156,7 @@ pub struct PendingElevation {
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +172,7 @@ pub struct PendingNetwork {
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +184,7 @@ pub struct PendingHttp {
     pub created_at: f64,
     pub request: HttpRequest,
     pub context: HttpContextKey,
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +197,7 @@ pub struct PendingFilesystem {
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +211,7 @@ pub struct PendingResource {
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +223,7 @@ pub struct PendingDbus {
     pub home: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     pub sandbox_session_id: Option<String>,
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +242,7 @@ pub(super) struct PendingContext<'a> {
     pub(super) home: Option<&'a Path>,
     pub(super) project_root: Option<&'a Path>,
     pub(super) sandbox_session_id: Option<&'a str>,
+    pub(super) package: Option<&'a str>,
 }
 
 /// Discriminated union of pending approval requests.
@@ -379,6 +397,10 @@ pub struct MergedCacheKey {
     pub declarative_mtime: Option<MtimeKey>,
     pub home_policy_mtime: Option<MtimeKey>,
     pub project_policy_mtime: Option<MtimeKey>,
+    pub package: Option<String>,
+    pub package_base_mtime: Option<MtimeKey>,
+    pub package_home_mtime: Option<MtimeKey>,
+    pub package_project_mtime: Option<MtimeKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

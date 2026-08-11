@@ -259,6 +259,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_sandbox_host_accepted_sandbox_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let store = Arc::new(PolicyStore::new(args.clone()));
+        let server = PolicyServer::new(store.clone());
+
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        // Allow sockets to be created.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 1. RegisterSandbox to the host socket is accepted. The wrapper performs this
+        //    before the sandbox starts so policy requests are attributed to the
+        //    package. The socket peer is this test process, so the launcher pid must be
+        //    its real parent.
+        let pid = std::process::id();
+
+        let launcher_pid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let end = stat.rfind(')')?;
+                let mut fields = stat[end + 1..].split_whitespace();
+                fields.next()?;
+                fields.next()?.parse().ok()
+            })
+            .expect("parent pid of the test process");
+
+        let reply = send_and_recv(&args.host_socket, RpcRequest::RegisterSandbox {
+            session_id: "sandbox-a".into(),
+            package: "omp".into(),
+            launcher_pid,
+        })
+        .await
+        .expect("host RegisterSandbox");
+
+        assert!(
+            matches!(&reply, RpcReply::Simple(s) if s.ok),
+            "host RegisterSandbox must be accepted, got: {reply:?}"
+        );
+
+        // 2. RegisterSandbox to the sandbox socket must be REJECTED. The sandbox socket
+        //    is exposed inside the jail; allowing registration there would let a
+        //    malicious agent attribute its own session to any package (or none) and
+        //    forge its identity.
+        let reply = send_and_recv(&args.sandbox_socket, RpcRequest::RegisterSandbox {
+            session_id: "sandbox-a".into(),
+            package: "omp".into(),
+            launcher_pid: 0,
+        })
+        .await
+        .expect("sandbox RegisterSandbox");
+
+        assert!(
+            matches!(&reply, RpcReply::Error(e) if e.error == "request not allowed on sandbox policy socket"),
+            "sandbox RegisterSandbox must be rejected, got: {reply:?}"
+        );
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
     async fn registered_connection_becomes_uifd_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);

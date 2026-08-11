@@ -11,7 +11,9 @@ use std::fmt;
 pub enum ApprovalScope {
     Once,
     Session,
+    ProjectPackage,
     Project,
+    GlobalPackage,
     Global,
 }
 
@@ -22,7 +24,9 @@ impl std::str::FromStr for ApprovalScope {
         match scope {
             "once" => Ok(Self::Once),
             "session" => Ok(Self::Session),
+            "project_package" => Ok(Self::ProjectPackage),
             "project" => Ok(Self::Project),
+            "global_package" => Ok(Self::GlobalPackage),
             "global" => Ok(Self::Global),
             other => Err(InvalidScopeError::new(other)),
         }
@@ -41,7 +45,9 @@ impl ApprovalScope {
         match self {
             Self::Once => "once",
             Self::Session => "session",
+            Self::ProjectPackage => "project_package",
             Self::Project => "project",
+            Self::GlobalPackage => "global_package",
             Self::Global => "global",
         }
     }
@@ -54,5 +60,23 @@ mod tests {
     #[test]
     fn display_uses_wire_label() {
         assert_eq!(ApprovalScope::Project.to_string(), "project");
+        assert_eq!(ApprovalScope::ProjectPackage.to_string(), "project_package");
+        assert_eq!(ApprovalScope::GlobalPackage.to_string(), "global_package");
+    }
+
+    #[test]
+    fn parses_every_wire_label() {
+        for scope in [
+            ApprovalScope::Once,
+            ApprovalScope::Session,
+            ApprovalScope::ProjectPackage,
+            ApprovalScope::Project,
+            ApprovalScope::GlobalPackage,
+            ApprovalScope::Global,
+        ] {
+            assert_eq!(scope.to_string().parse(), Ok(scope));
+        }
+
+        assert!("nonsense".parse::<ApprovalScope>().is_err());
     }
 }

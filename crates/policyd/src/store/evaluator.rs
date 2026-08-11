@@ -265,6 +265,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -307,6 +308,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -370,6 +372,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -421,6 +424,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         let target = DbusTarget::session(

@@ -37,6 +37,7 @@ struct NetworkRequestIdentity<'a> {
     home: Option<&'a Path>,
     project_root: Option<&'a Path>,
     sandbox_session_id: Option<&'a str>,
+    package: Option<&'a str>,
 }
 
 impl NetworkRequestIdentity<'_> {
@@ -47,6 +48,7 @@ impl NetworkRequestIdentity<'_> {
             && pending.home.as_deref() == self.home
             && pending.project_root.as_deref() == self.project_root
             && pending.sandbox_session_id.as_deref() == self.sandbox_session_id
+            && pending.package.as_deref() == self.package
     }
 }
 
@@ -98,6 +100,7 @@ impl PolicyStore {
                 ),
                 ids: ProcessIds::default(),
                 sandbox_session_id: net.sandbox_session_id.clone(),
+                package: None,
             };
 
             let Some(verdict) = self.allow_verdict(&host, port, &merge).await else {
@@ -228,6 +231,7 @@ impl PolicyStore {
             home: home.as_deref(),
             project_root: project_root.as_deref(),
             sandbox_session_id: sandbox_session_id.as_deref(),
+            package: ctx.package.as_deref(),
         };
 
         let result = match self
@@ -252,6 +256,7 @@ impl PolicyStore {
                 cwd: cwd.clone(),
                 home: home.clone(),
                 project_root: project_root.clone(),
+                package: ctx.package.clone(),
             })
             .await;
 
@@ -387,6 +392,7 @@ impl PolicyStore {
             home: identity.home.map(PathBuf::from),
             project_root: identity.project_root.map(PathBuf::from),
             sandbox_session_id: identity.sandbox_session_id.map(String::from),
+            package: identity.package.map(String::from),
         }));
 
         drop(inner);
@@ -578,6 +584,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: sandbox_session_id.map(str::to_string),
+            package: None,
         }
     }
 
@@ -595,6 +602,7 @@ mod tests {
             home: home.as_deref().map(Path::new),
             project_root: project_root.as_deref().map(Path::new),
             sandbox_session_id: sandbox_session_id.as_deref(),
+            package: None,
         };
 
         assert!(identity.matches(&pending_network("example.com", Some("sandbox-a"))));
@@ -645,6 +653,7 @@ mod tests {
                 // paths are preserved verbatim.
                 ids: ProcessIds::from_options(Some(0), Some(1000)),
                 sandbox_session_id: Some("sandbox-cap".into()),
+                package: None,
             },
         }
     }
@@ -778,6 +787,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: Some("sandbox-cap".into()),
+            package: None,
         }
     }
 
@@ -874,12 +884,14 @@ mod tests {
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
+            package: None,
         };
 
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         store.notify_general_ui(&ctx, &payload).await;
@@ -927,12 +939,14 @@ mod tests {
             cwd: Some("/repo".into()),
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
+            package: None,
         };
 
         let ctx = ResolvedRequestContext {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         store.notify_general_ui(&ctx, &payload).await;
@@ -1117,6 +1131,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: None,
+            package: None,
         });
 
         store.inner.lock().await.insert_pending(pending);

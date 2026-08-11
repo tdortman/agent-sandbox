@@ -38,6 +38,7 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id,
             comment,
+            package,
         } = wire;
 
         ScopeWire {
@@ -51,6 +52,7 @@ impl PolicyStore {
             sandbox_session_id: sandbox_session_id
                 .or_else(|| context.sandbox_session_id.map(str::to_owned)),
             comment,
+            package: package.or_else(|| context.package.map(str::to_owned)),
         }
     }
 
@@ -63,6 +65,7 @@ impl PolicyStore {
             home: net.home.as_deref(),
             project_root: net.project_root.as_deref(),
             sandbox_session_id: net.sandbox_session_id.as_deref(),
+            package: net.package.as_deref(),
         })
     }
 
@@ -75,6 +78,7 @@ impl PolicyStore {
             home: elev.home.as_deref(),
             project_root: elev.project_root.as_deref(),
             sandbox_session_id: elev.sandbox_session_id.as_deref(),
+            package: elev.package.as_deref(),
         })
     }
 
@@ -87,6 +91,7 @@ impl PolicyStore {
             home: fs.home.as_deref(),
             project_root: fs.project_root.as_deref(),
             sandbox_session_id: fs.sandbox_session_id.as_deref(),
+            package: fs.package.as_deref(),
         })
     }
 
@@ -99,6 +104,7 @@ impl PolicyStore {
             home: res.home.as_deref(),
             project_root: res.project_root.as_deref(),
             sandbox_session_id: res.sandbox_session_id.as_deref(),
+            package: res.package.as_deref(),
         })
     }
 
@@ -108,6 +114,7 @@ impl PolicyStore {
             home: dbus.home.as_deref(),
             project_root: dbus.project_root.as_deref(),
             sandbox_session_id: dbus.sandbox_session_id.as_deref(),
+            package: dbus.package.as_deref(),
         })
     }
 

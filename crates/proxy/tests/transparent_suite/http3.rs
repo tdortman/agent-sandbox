@@ -714,6 +714,7 @@ async fn transparent_http3_reuses_and_releases_upstream_associations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_denied_no_upstream() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
+
     let response = harness
         .http3_request("/deny")
         .await
@@ -721,7 +722,6 @@ async fn transparent_http3_denied_no_upstream() {
 
     assert_eq!(response.status(), 403);
     assert_eq!(response.body().await, b"blocked by agent-sandbox policy\n");
-
     wait_for_release(&harness).await;
     let events = harness.policy_events();
     let events = events.lock().expect("policy events lock");

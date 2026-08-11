@@ -12,7 +12,7 @@ use crate::{
 };
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 impl PolicyStore {
     fn finalize_sudo_scope(
@@ -52,6 +52,7 @@ impl PolicyStore {
             owner_uid,
             sandbox_session_id: _,
             comment,
+            package,
         } = wire;
 
         let cwd = paths.cwd_path();
@@ -60,7 +61,13 @@ impl PolicyStore {
         let key = argv.clone();
 
         let target = match self
-            .resolve_scope_target(scope, session_id.as_deref(), home, project_root)
+            .resolve_scope_target(
+                scope,
+                session_id.as_deref(),
+                home,
+                project_root,
+                package.as_deref(),
+            )
             .await
         {
             Ok(target) => target,
@@ -68,6 +75,24 @@ impl PolicyStore {
         };
 
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+
+        let persist =
+            |policy_path: &Path, home: Option<&Path>, invalidate: bool| -> std::io::Result<()> {
+                Self::persist_sudo_rule(
+                    policy_path,
+                    &argv,
+                    scope_label,
+                    action == DecisionAction::Approve,
+                    home,
+                    owner_uid,
+                )?;
+
+                if invalidate {
+                    self.invalidate_merged_policy_cache();
+                }
+
+                Ok(())
+            };
 
         match target {
             ScopeTarget::Ephemeral => {}
@@ -84,15 +109,15 @@ impl PolicyStore {
             }
 
             ScopeTarget::Global { policy_path, home } => {
-                let persist = Self::persist_sudo_rule(
-                    &policy_path,
-                    &argv,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    Some(home.as_path()),
-                    owner_uid,
-                );
-                if let Err(err) = persist {
+                if let Err(err) = persist(&policy_path, Some(home.as_path()), false) {
+                    return PolicydError::from(err).into();
+                }
+            }
+
+            ScopeTarget::GlobalPackage {
+                policy_path, home, ..
+            } => {
+                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
                     return PolicydError::from(err).into();
                 }
             }
@@ -101,18 +126,17 @@ impl PolicyStore {
                 policy_path,
                 project_root: _,
             } => {
-                let persist = Self::persist_sudo_rule(
-                    &policy_path,
-                    &argv,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    home,
-                    owner_uid,
-                );
-                if let Err(err) = persist {
+                if let Err(err) = persist(&policy_path, home, false) {
                     return PolicydError::from(err).into();
                 }
                 tracing::info!(path = ?policy_path, "project sudo policy saved");
+            }
+
+            ScopeTarget::ProjectPackage { policy_path, .. } => {
+                if let Err(err) = persist(&policy_path, home, true) {
+                    return PolicydError::from(err).into();
+                }
+                tracing::info!(path = ?policy_path, "project package sudo policy saved");
             }
         }
 

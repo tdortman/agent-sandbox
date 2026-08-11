@@ -298,7 +298,9 @@ pub(super) async fn serve_request(
         // Answer the denied request like the TCP backend does, so clients see
         // a policy block instead of a reset connection (and stop retrying).
         let mut response = http::Response::new(());
+
         *response.status_mut() = http::StatusCode::FORBIDDEN;
+
         response.headers_mut().insert(
             "x-agent-sandbox-policy",
             http::HeaderValue::from_static("blocked"),
@@ -306,11 +308,13 @@ pub(super) async fn serve_request(
 
         let mut stream = stream;
         stream.send_response(response).await?;
+
         stream
             .send_data(Bytes::from_static(
                 crate::tcp_backend::POLICY_DENIED_BODY.as_bytes(),
             ))
             .await?;
+
         stream.finish().await?;
 
         // Read the request body to its end so the stream closes cleanly on
@@ -319,7 +323,6 @@ pub(super) async fn serve_request(
         while stream.recv_data().await?.is_some() {}
 
         let _ = stream.recv_trailers().await?;
-
         return Ok(());
     };
 

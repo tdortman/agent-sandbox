@@ -958,6 +958,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert!(store.policy_denied("34.230.40.69", 443, &ctx));
@@ -1033,6 +1034,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert!(store.policy_denied("2001:db8::1", 443, &ctx));
@@ -1096,6 +1098,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert!(store.policy_denied("example.com", 443, &ctx));
@@ -1158,6 +1161,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         // The repo-local deny rule is applied: policy_denied returns
@@ -1200,6 +1204,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root, &home, &project_root),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert!(
@@ -1256,12 +1261,14 @@ mod tests {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         let without_root = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, ""),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -1319,12 +1326,14 @@ mod tests {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         let without_root = ResolvedRequestContext {
             paths: SandboxPaths::new(&root_s, &home_s, ""),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -1380,6 +1389,7 @@ mod tests {
             paths: SandboxPaths::new("/tmp", &home_s, "/tmp"),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -1428,6 +1438,7 @@ mod tests {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: None,
+            package: None,
         };
 
         assert_eq!(
@@ -1517,6 +1528,7 @@ mod tests {
             paths: SandboxPaths::new(&root_s, &home_s, &root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some(session_id.into()),
+            package: None,
         };
 
         assert_eq!(
@@ -1568,6 +1580,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-test".into()),
+            package: None,
         };
 
         {
@@ -1631,6 +1644,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-inode".into()),
+            package: None,
         };
 
         {
@@ -1705,6 +1719,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-allow".into()),
+            package: None,
         };
 
         {
@@ -1769,6 +1784,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob".into()),
+            package: None,
         };
 
         {
@@ -1817,6 +1833,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob-allow".into()),
+            package: None,
         };
 
         {
@@ -1879,6 +1896,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-broad-glob-deny".into()),
+            package: None,
         };
 
         {
@@ -1918,6 +1936,7 @@ mod tests {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-dbus".into()),
+            package: None,
         };
 
         let (stream, _) = UnixStream::pair().expect("unix stream pair");

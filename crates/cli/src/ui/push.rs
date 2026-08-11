@@ -13,7 +13,6 @@ use super::{
     },
     prompt_blocking, signature_display,
 };
-
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, DbusTarget, DeviceAccess, FileAccess, FilesystemRule,
     FlowProtocol, HttpMethodMatcher, HttpRequest, HttpRuleTarget, HttpUrl, ResourceAccess,
@@ -21,7 +20,6 @@ use agent_sandbox_core::{
     contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name, scheme_for,
     split_check_aliases,
 };
-
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -32,9 +30,20 @@ fn suggest_project_rule_path(path: &Path, project_root: Option<&Path>) -> String
         .to_string()
 }
 
-fn approval_context(paths: &SandboxPaths, session_id: Option<&str>) -> Vec<ApprovalFormContext> {
+fn approval_context(
+    paths: &SandboxPaths,
+    session_id: Option<&str>,
+    package: Option<&str>,
+) -> Vec<ApprovalFormContext> {
     let mut context = Vec::new();
     let project_root = paths.project_root();
+
+    if let Some(package) = package {
+        context.push(ApprovalFormContext {
+            label: "Package".into(),
+            value: package.into(),
+        });
+    }
 
     if let Some(project) = project_root {
         context.push(ApprovalFormContext {
@@ -60,8 +69,20 @@ fn approval_context(paths: &SandboxPaths, session_id: Option<&str>) -> Vec<Appro
     context
 }
 
-fn approval_scopes(session_available: bool) -> Vec<ApprovalScope> {
-    scope_only_options(session_available)
+/// Prompt identity prefix: "agent-sandbox" or "agent-sandbox (omp)".
+///
+/// The package name identifies the sandboxed application (omp, codex, ...);
+/// showing it in every prompt title and dialog summary lets the user tell
+/// requests from concurrently running packages apart.
+fn prompt_tag(package: Option<&str>) -> String {
+    package.map_or_else(
+        || "agent-sandbox".to_owned(),
+        |p| format!("agent-sandbox ({p})"),
+    )
+}
+
+fn approval_scopes(session_available: bool, package_available: bool) -> Vec<ApprovalScope> {
+    scope_only_options(session_available, package_available)
         .into_iter()
         .map(|option| option.scope)
         .collect()
@@ -83,7 +104,7 @@ fn build_elevation_review(
     argv: &[String],
     paths: &SandboxPaths,
     session_id: Option<&str>,
-    title: &str,
+    package: Option<&str>,
 ) -> ElevationReview {
     let prefixes = SudoRule::approval_prefixes(argv);
 
@@ -98,10 +119,10 @@ fn build_elevation_review(
 
     ElevationReview {
         request: ApprovalFormRequest::new(
-            title.to_owned(),
-            approval_context(paths, session_id),
+            prompt_tag(package),
+            approval_context(paths, session_id, package),
             Some(elevation_presentation(argv)),
-            approval_scopes(session_id.is_some()),
+            approval_scopes(session_id.is_some(), package.is_some()),
             vec![
                 choice_field("target", "Command prefix", "0", prefix_options),
                 comment_field(),
@@ -116,6 +137,16 @@ struct ReviewActionScope {
     scope: ApprovalScope,
 }
 
+/// Build the sudo approval target from the chosen command-prefix index.
+fn sudo_target_from_result(
+    result: &ApprovalFormResult,
+    prefixes: &[Vec<String>],
+) -> Option<ApprovalTarget> {
+    let index = result.values.get("target")?.parse::<usize>().ok()?;
+    let argv = prefixes.get(index)?.clone();
+    Some(ApprovalTarget::SudoCommand { argv })
+}
+
 struct ReviewedChoice {
     action: PromptAction,
     choice: ScopeOption,
@@ -124,6 +155,7 @@ struct ReviewedChoice {
 fn validated_review_action(
     result: &ApprovalFormResult,
     session_available: bool,
+    package_available: bool,
 ) -> Option<ReviewActionScope> {
     let action = result.action?;
     let scope = result.scope;
@@ -131,13 +163,21 @@ fn validated_review_action(
     let allowed = scope == ApprovalScope::Once
         || scope == ApprovalScope::Project
         || scope == ApprovalScope::Global
+        || (scope == ApprovalScope::ProjectPackage && package_available)
+        || (scope == ApprovalScope::GlobalPackage && package_available)
         || (scope == ApprovalScope::Session && session_available);
 
     allowed.then_some(ReviewActionScope { action, scope })
 }
 
 fn persistent_comment(result: &ApprovalFormResult, scope: ApprovalScope) -> Option<String> {
-    if !matches!(scope, ApprovalScope::Project | ApprovalScope::Global) {
+    if !matches!(
+        scope,
+        ApprovalScope::Project
+            | ApprovalScope::ProjectPackage
+            | ApprovalScope::GlobalPackage
+            | ApprovalScope::Global
+    ) {
         return None;
     }
 
@@ -153,9 +193,11 @@ fn persistent_comment(result: &ApprovalFormResult, scope: ApprovalScope) -> Opti
 fn reviewed_choice(
     result: &ApprovalFormResult,
     session_available: bool,
+    package_available: bool,
     target: impl FnOnce(&ApprovalFormResult) -> Option<ApprovalTarget>,
 ) -> Option<ReviewedChoice> {
-    let ReviewActionScope { action, scope } = validated_review_action(result, session_available)?;
+    let ReviewActionScope { action, scope } =
+        validated_review_action(result, session_available, package_available)?;
 
     let target = if scope == ApprovalScope::Once {
         None
@@ -179,10 +221,11 @@ fn reviewed_choice(
 /// error so the Qt dialog can keep the form open for correction.
 fn make_validator(
     session_available: bool,
+    package_available: bool,
     parse_target: impl Fn(&ApprovalFormResult) -> Option<ApprovalTarget> + Send + 'static,
 ) -> ReviewValidator {
     Box::new(move |result: &ApprovalFormResult| {
-        if validated_review_action(result, session_available).is_none() {
+        if validated_review_action(result, session_available, package_available).is_none() {
             return Err("This scope is not available.".into());
         }
 
@@ -438,9 +481,11 @@ async fn handle_dbus_unavailable(
     sandbox_session_id: Option<&str>,
     id: &str,
     target: DbusTarget,
+    package: Option<&str>,
 ) -> Result<(), UiCliError> {
     let Some(action) = choose_action(&format!(
-        "agent-sandbox: D-Bus {} {}",
+        "{}: D-Bus {} {}",
+        prompt_tag(package),
         message_kind_name(target.message_kind),
         target.member,
     ))
@@ -450,8 +495,9 @@ async fn handle_dbus_unavailable(
     };
 
     let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} D-Bus scope?", action.verb()),
+        &format!("{}: {} D-Bus scope?", prompt_tag(package), action.verb()),
         session_id.is_some(),
+        package.is_some(),
     )
     .await?
     else {
@@ -491,22 +537,21 @@ async fn handle_dbus_push(
         home,
         project_root,
         sandbox_session_id,
+        package,
     } = push
     else {
         unreachable!("D-Bus variant was validated by the dispatcher")
     };
 
+    let package = package.as_deref();
+    let package_available = package.is_some();
     let paths = paths.merged_with(cwd, home, project_root);
 
     let review = ApprovalFormRequest::new(
-        format!(
-            "D-Bus {} {}",
-            message_kind_name(target.message_kind),
-            target.member
-        ),
-        approval_context(&paths, session_id),
+        prompt_tag(package),
+        approval_context(&paths, session_id, package),
         Some(dbus_presentation(&target)),
-        approval_scopes(session_id.is_some()),
+        approval_scopes(session_id.is_some(), package_available),
         vec![
             text_field("bus", "Bus", bus_name(target.bus).into()),
             text_field("destination", "Destination", target.destination.clone()),
@@ -532,15 +577,17 @@ async fn handle_dbus_push(
 
     match rich_review(
         review,
-        Some(make_validator(session_id.is_some(), move |result| {
-            parse_dbus_target(result, &requested)
-        })),
+        Some(make_validator(
+            session_id.is_some(),
+            package_available,
+            move |result| parse_dbus_target(result, &requested),
+        )),
     )
     .await?
     {
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
-                reviewed_choice(&result, session_id.is_some(), |result| {
+                reviewed_choice(&result, session_id.is_some(), package_available, |result| {
                     parse_dbus_target(result, &target)
                 })
             else {
@@ -570,6 +617,7 @@ async fn handle_dbus_push(
                 sandbox_session_id.as_deref(),
                 &id,
                 target,
+                package,
             )
             .await
         }
@@ -593,11 +641,14 @@ async fn handle_network_push(
         cwd,
         home,
         project_root,
+        package,
     } = push
     else {
         unreachable!("network variant was validated by the dispatcher")
     };
 
+    let package = package.as_deref();
+    let package_available = package.is_some();
     let host = host.unwrap_or_default();
     let port = port.unwrap_or(0);
     let transport = transport.unwrap_or_else(|| "https".into());
@@ -620,10 +671,10 @@ async fn handle_network_push(
     let paths = paths.merged_with(cwd, home, project_root);
 
     let review = ApprovalFormRequest::new(
-        format!("Network request to {url}"),
-        approval_context(&paths, session_id),
+        prompt_tag(package),
+        approval_context(&paths, session_id, package),
         Some(network_presentation(&url)),
-        approval_scopes(session_id.is_some()),
+        approval_scopes(session_id.is_some(), package_available),
         vec![
             text_field("target", "Host rule", host.clone()),
             comment_field(),
@@ -632,7 +683,7 @@ async fn handle_network_push(
 
     match rich_review(
         review,
-        Some(make_validator(session_id.is_some(), {
+        Some(make_validator(session_id.is_some(), package_available, {
             let requested = host.clone();
             move |result| parse_network_target(result, &requested)
         })),
@@ -641,7 +692,7 @@ async fn handle_network_push(
     {
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
-                reviewed_choice(&result, session_id.is_some(), |result| {
+                reviewed_choice(&result, session_id.is_some(), package_available, |result| {
                     parse_network_target(result, &host)
                 })
             else {
@@ -672,8 +723,11 @@ async fn handle_network_push(
         session_id,
         sandbox_session_id,
         &id,
-        &url,
-        &host,
+        NetworkPrompt {
+            url: &url,
+            host: &host,
+        },
+        package,
     )
     .await
 }
@@ -684,16 +738,19 @@ async fn network_push_cli_fallback(
     session_id: Option<&str>,
     sandbox_session_id: Option<&str>,
     id: &str,
-    url: &str,
-    host: &str,
+    prompt: NetworkPrompt<'_>,
+    package: Option<&str>,
 ) -> Result<(), UiCliError> {
-    let Some(action) = choose_action(&format!("agent-sandbox: {url}")).await? else {
+    let NetworkPrompt { url, host } = prompt;
+
+    let Some(action) = choose_action(&format!("{}: {url}", prompt_tag(package))).await? else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
 
     let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} {url} scope?", action.verb()),
+        &format!("{}: {} {url} scope?", prompt_tag(package), action.verb()),
         session_id.is_some(),
+        package.is_some(),
     )
     .await?
     else {
@@ -703,7 +760,7 @@ async fn network_push_cli_fallback(
     let target = if scope == ApprovalScope::Once {
         None
     } else {
-        let title = format!("agent-sandbox: {} {url} target?", action.verb());
+        let title = format!("{}: {} {url} target?", prompt_tag(package), action.verb());
         let default_host = host.to_owned();
         let entered = prompt_blocking(move || pick_text(&title, &default_host)).await?;
         match entered {
@@ -738,6 +795,7 @@ async fn handle_http_review(
     sandbox_session_id: Option<&str>,
     id: &str,
     request: &HttpRequest,
+    package: Option<&str>,
 ) -> Result<bool, UiCliError> {
     let method_options = vec![
         ApprovalFormOption {
@@ -751,10 +809,10 @@ async fn handle_http_review(
     ];
 
     let review = ApprovalFormRequest::new(
-        format!("HTTP {} {}", request.method.as_str(), request.url),
-        approval_context(paths, session_id),
+        prompt_tag(package),
+        approval_context(paths, session_id, package),
         Some(http_presentation(request)),
-        approval_scopes(session_id.is_some()),
+        approval_scopes(session_id.is_some(), package.is_some()),
         vec![
             choice_field("method", "Methods", "exact", method_options),
             text_field("url", "URL", request.url.to_string()),
@@ -765,10 +823,11 @@ async fn handle_http_review(
     let method = request.method.clone();
     let request_url = request.url.clone();
     let session = session_id.is_some();
+    let package_available = package.is_some();
 
     match rich_review(
         review,
-        Some(make_validator(session, move |result| {
+        Some(make_validator(session, package_available, move |result| {
             let matcher = match result.values.get("method")?.as_str() {
                 "exact" => HttpMethodMatcher::Exact(method.clone()),
                 "all" => HttpMethodMatcher::All,
@@ -788,7 +847,7 @@ async fn handle_http_review(
     {
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
-                reviewed_choice(&result, session_id.is_some(), |result| {
+                reviewed_choice(&result, session_id.is_some(), package_available, |result| {
                     let matcher = match result.values.get("method")?.as_str() {
                         "exact" => HttpMethodMatcher::Exact(request.method.clone()),
                         "all" => HttpMethodMatcher::All,
@@ -845,15 +904,24 @@ async fn handle_http_push(
         home,
         project_root,
         sandbox_session_id: push_session_id,
+        package,
     } = push
     else {
         unreachable!("HTTP variant was validated by the dispatcher")
     };
 
+    let package = package.as_deref();
+    let package_available = package.is_some();
     let sandbox_session_id = push_session_id.as_deref();
     let id = id.to_string();
     let paths = paths.merged_with(cwd, home, project_root);
-    let title = format!("agent-sandbox: {} {}", request.method.as_str(), request.url);
+
+    let title = format!(
+        "{}: {} {}",
+        prompt_tag(package),
+        request.method.as_str(),
+        request.url
+    );
 
     if handle_http_review(
         socket,
@@ -862,6 +930,7 @@ async fn handle_http_push(
         sandbox_session_id,
         &id,
         &request,
+        package,
     )
     .await?
     {
@@ -873,8 +942,9 @@ async fn handle_http_push(
     };
 
     let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} HTTP scope?", action.verb()),
+        &format!("{}: {} HTTP scope?", prompt_tag(package), action.verb()),
         session_id.is_some(),
+        package_available,
     )
     .await?
     else {
@@ -884,46 +954,10 @@ async fn handle_http_push(
     let target = if scope == ApprovalScope::Once {
         None
     } else {
-        let exact = HttpRuleTarget::new(
-            HttpMethodMatcher::Exact(request.method.clone()),
-            request.url.clone(),
-        )
-        .map_err(|error| UiCliError::Register(format!("invalid HTTP request target: {error}")))?;
-        let all_methods = HttpRuleTarget::new(HttpMethodMatcher::All, request.url.clone())
-            .map_err(|error| {
-                UiCliError::Register(format!("invalid HTTP request target: {error}"))
-            })?;
-        let Some(ApprovalTarget::Http {
-            target: method_target,
-        }) = choose_target_level(
-            &format!("agent-sandbox: {} HTTP method?", action.verb()),
-            vec![
-                ScopeOption {
-                    label: request.method.as_str().to_owned(),
-                    scope,
-                    target: Some(ApprovalTarget::Http { target: exact }),
-                    comment: None,
-                },
-                ScopeOption {
-                    label: "All methods".into(),
-                    scope,
-                    target: Some(ApprovalTarget::Http {
-                        target: all_methods,
-                    }),
-                    comment: None,
-                },
-            ],
-        )
-        .await?
-        else {
-            return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-        };
-        choose_http_target(
-            &format!("agent-sandbox: {} HTTP path?", action.verb()),
-            &request,
-            method_target.method,
-        )
-        .await?
+        match choose_http_scope_target(&action, scope, &request, package).await? {
+            Some(target) => Some(target),
+            None => return deny_cancellation(socket, &paths, sandbox_session_id, &id).await,
+        }
     };
 
     let choice = ScopeOption {
@@ -945,6 +979,56 @@ async fn handle_http_push(
     .await
 }
 
+/// Choose the HTTP method and path target for a non-`Once` approval scope.
+async fn choose_http_scope_target(
+    action: &PromptAction,
+    scope: ApprovalScope,
+    request: &HttpRequest,
+    package: Option<&str>,
+) -> Result<Option<ApprovalTarget>, UiCliError> {
+    let exact = HttpRuleTarget::new(
+        HttpMethodMatcher::Exact(request.method.clone()),
+        request.url.clone(),
+    )
+    .map_err(|error| UiCliError::Register(format!("invalid HTTP request target: {error}")))?;
+
+    let all_methods = HttpRuleTarget::new(HttpMethodMatcher::All, request.url.clone())
+        .map_err(|error| UiCliError::Register(format!("invalid HTTP request target: {error}")))?;
+
+    let Some(ApprovalTarget::Http {
+        target: method_target,
+    }) = choose_target_level(
+        &format!("{}: {} HTTP method?", prompt_tag(package), action.verb()),
+        vec![
+            ScopeOption {
+                label: request.method.as_str().to_owned(),
+                scope,
+                target: Some(ApprovalTarget::Http { target: exact }),
+                comment: None,
+            },
+            ScopeOption {
+                label: "All methods".into(),
+                scope,
+                target: Some(ApprovalTarget::Http {
+                    target: all_methods,
+                }),
+                comment: None,
+            },
+        ],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    choose_http_target(
+        &format!("{}: {} HTTP path?", prompt_tag(package), action.verb()),
+        request,
+        method_target.method,
+    )
+    .await
+}
+
 /// Prompt the user for an elevation (sudo) request approval.
 async fn handle_elevation_push(
     socket: &Path,
@@ -959,34 +1043,35 @@ async fn handle_elevation_push(
         cwd,
         home,
         project_root,
+        package,
     } = push
     else {
         unreachable!("elevation variant was validated by the dispatcher")
     };
 
+    let package = package.as_deref();
+    let package_available = package.is_some();
     let argv = argv.unwrap_or_default();
     let paths = paths.merged_with(cwd, home, project_root);
-    let title = format_elevation_title(&argv);
-    let elevation_review = build_elevation_review(&argv, &paths, session_id, &title);
+    let elevation_review = build_elevation_review(&argv, &paths, session_id, package);
     let prefixes = elevation_review.prefixes;
     let prefixes_clone = prefixes.clone();
+    let title = format_elevation_title(&argv);
 
     match rich_review(
         elevation_review.request,
-        Some(make_validator(session_id.is_some(), move |result| {
-            let index = result.values.get("target")?.parse::<usize>().ok()?;
-            let argv = prefixes_clone.get(index)?.clone();
-            Some(ApprovalTarget::SudoCommand { argv })
-        })),
+        Some(make_validator(
+            session_id.is_some(),
+            package_available,
+            move |result| sudo_target_from_result(result, &prefixes_clone),
+        )),
     )
     .await?
     {
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
-                reviewed_choice(&result, session_id.is_some(), |result| {
-                    let index = result.values.get("target")?.parse::<usize>().ok()?;
-                    let argv = prefixes.get(index)?.clone();
-                    Some(ApprovalTarget::SudoCommand { argv })
+                reviewed_choice(&result, session_id.is_some(), package_available, |result| {
+                    sudo_target_from_result(result, &prefixes)
                 })
             else {
                 return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
@@ -1010,13 +1095,14 @@ async fn handle_elevation_push(
         ApprovalReviewOutcome::Unavailable => {}
     }
 
-    let Some(action) = choose_action(&title).await? else {
+    let Some(action) = choose_action(&format!("{}: {title}", prompt_tag(package))).await? else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
 
     let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} sudo scope?", action.verb()),
+        &format!("{}: {} sudo scope?", prompt_tag(package), action.verb()),
         session_id.is_some(),
+        package_available,
     )
     .await?
     else {
@@ -1027,7 +1113,7 @@ async fn handle_elevation_push(
         None
     } else {
         match choose_target_level(
-            &format!("agent-sandbox: {} sudo target?", action.verb()),
+            &format!("{}: {} sudo target?", prompt_tag(package), action.verb()),
             sudo_target_options(&argv, scope),
         )
         .await?
@@ -1108,19 +1194,22 @@ async fn handle_filesystem_push(
         cwd,
         home,
         project_root,
+        package,
     } = push
     else {
         unreachable!("filesystem variant was validated by the dispatcher")
     };
 
+    let package = package.as_deref();
+    let package_available = package.is_some();
     let paths = paths.merged_with(cwd, home, project_root.clone());
     let default_rule_path = suggest_project_rule_path(&path, paths.project_root());
 
     let review = ApprovalFormRequest::new(
-        format!("Filesystem {access} request for {}", path.display()),
-        approval_context(&paths, session_id),
+        prompt_tag(package),
+        approval_context(&paths, session_id, package),
         Some(filesystem_presentation(access, &default_rule_path)),
-        approval_scopes(session_id.is_some()),
+        approval_scopes(session_id.is_some(), package_available),
         vec![
             text_field("target", "Path or pattern", default_rule_path.clone()),
             comment_field(),
@@ -1129,7 +1218,7 @@ async fn handle_filesystem_push(
 
     match rich_review(
         review,
-        Some(make_validator(session_id.is_some(), {
+        Some(make_validator(session_id.is_some(), package_available, {
             let requested_path = path.clone();
             let project_root = paths.project_root_path();
             move |result| parse_filesystem_target(result, &requested_path, project_root.as_deref())
@@ -1139,7 +1228,7 @@ async fn handle_filesystem_push(
     {
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
-                reviewed_choice(&result, session_id.is_some(), |result| {
+                reviewed_choice(&result, session_id.is_some(), package_available, |result| {
                     parse_filesystem_target(result, &path, paths.project_root())
                 })
             else {
@@ -1165,7 +1254,7 @@ async fn handle_filesystem_push(
     }
 
     let Some((action, choice)) =
-        choose_filesystem_choice(access, &default_rule_path, session_id.is_some()).await?
+        choose_filesystem_choice(access, &default_rule_path, session_id.is_some(), package).await?
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
     };
@@ -1186,16 +1275,25 @@ async fn choose_filesystem_choice(
     access: FileAccess,
     default_rule_path: &str,
     session_available: bool,
+    package: Option<&str>,
 ) -> Result<Option<(PromptAction, ScopeOption)>, UiCliError> {
-    let Some(action) =
-        choose_action(&format!("agent-sandbox: filesystem {access} action?")).await?
+    let Some(action) = choose_action(&format!(
+        "{}: filesystem {access} action?",
+        prompt_tag(package)
+    ))
+    .await?
     else {
         return Ok(None);
     };
 
     let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} filesystem scope?", action.verb()),
+        &format!(
+            "{}: {} filesystem scope?",
+            prompt_tag(package),
+            action.verb()
+        ),
         session_available,
+        package.is_some(),
     )
     .await?
     else {
@@ -1206,7 +1304,7 @@ async fn choose_filesystem_choice(
         None
     } else {
         let Some(target) = choose_path_target(
-            &format!("agent-sandbox: allow filesystem {access} path?"),
+            &format!("{}: allow filesystem {access} path?", prompt_tag(package)),
             default_rule_path,
             |rule_path| ApprovalTarget::FilesystemPath { path: rule_path },
         )
@@ -1233,6 +1331,11 @@ struct ResourcePrompt<'a> {
     path: &'a Path,
 }
 
+struct NetworkPrompt<'a> {
+    url: &'a str,
+    host: &'a str,
+}
+
 /// Prompt the user for a resource access approval.
 async fn handle_resource_push(
     socket: &Path,
@@ -1249,23 +1352,26 @@ async fn handle_resource_push(
         cwd,
         home,
         project_root,
+        package,
     } = push
     else {
         unreachable!("resource variant was validated by the dispatcher")
     };
 
+    let package = package.as_deref();
+    let package_available = package.is_some();
     let paths = paths.merged_with(cwd, home, project_root);
     let display_path = suggest_project_rule_path(&path, paths.project_root());
 
     let review = ApprovalFormRequest::new(
-        format!("{kind} {access} request for {display_path}"),
-        approval_context(&paths, session_id),
+        prompt_tag(package),
+        approval_context(&paths, session_id, package),
         Some(resource_presentation(
             access,
             kind,
             Path::new(&display_path),
         )),
-        approval_scopes(session_id.is_some()),
+        approval_scopes(session_id.is_some(), package_available),
         vec![
             text_field("target", "Path or pattern", display_path),
             comment_field(),
@@ -1278,20 +1384,24 @@ async fn handle_resource_push(
 
     match rich_review(
         review,
-        Some(make_validator(session_id.is_some(), move |result| {
-            parse_resource_target(
-                result,
-                validator_kind,
-                &validator_path,
-                project_root.as_deref(),
-            )
-        })),
+        Some(make_validator(
+            session_id.is_some(),
+            package_available,
+            move |result| {
+                parse_resource_target(
+                    result,
+                    validator_kind,
+                    &validator_path,
+                    project_root.as_deref(),
+                )
+            },
+        )),
     )
     .await?
     {
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
-                reviewed_choice(&result, session_id.is_some(), |result| {
+                reviewed_choice(&result, session_id.is_some(), package_available, |result| {
                     parse_resource_target(result, kind, &path, paths.project_root())
                 })
             else {
@@ -1327,6 +1437,7 @@ async fn handle_resource_push(
             access,
             path: &path,
         },
+        package,
     )
     .await
 }
@@ -1338,18 +1449,20 @@ async fn resource_push_cli_fallback(
     sandbox_session_id: Option<&str>,
     id: &str,
     prompt: ResourcePrompt<'_>,
+    package: Option<&str>,
 ) -> Result<(), UiCliError> {
     let ResourcePrompt { kind, access, path } = prompt;
     let display_path = suggest_project_rule_path(path, paths.project_root());
-    let title = format!("agent-sandbox: {kind} {access} {display_path}");
+    let title = format!("{}: {kind} {access} {display_path}", prompt_tag(package));
 
     let Some(action) = choose_action(&title).await? else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
 
     let Some(scope) = choose_scope_only(
-        &format!("agent-sandbox: {} {} scope?", action.verb(), kind),
+        &format!("{}: {} {} scope?", prompt_tag(package), action.verb(), kind),
         session_id.is_some(),
+        package.is_some(),
     )
     .await?
     else {
@@ -1360,7 +1473,7 @@ async fn resource_push_cli_fallback(
         None
     } else {
         match choose_path_target(
-            &format!("agent-sandbox: allow {kind} {access} path?"),
+            &format!("{}: allow {kind} {access} path?", prompt_tag(package)),
             &display_path,
             move |rule_path| ApprovalTarget::ResourcePath {
                 resource_kind: kind,
@@ -1463,8 +1576,9 @@ async fn choose_scope(
 async fn choose_scope_only(
     title: &str,
     session_available: bool,
+    package_available: bool,
 ) -> Result<Option<ApprovalScope>, UiCliError> {
-    let options = scope_only_options(session_available);
+    let options = scope_only_options(session_available, package_available);
     let choice = choose_scope(title, options).await?;
     Ok(choice.map(|opt| opt.scope))
 }
@@ -1561,12 +1675,10 @@ mod tests {
         resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
         valid_rule_path,
     };
-
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
         SocketAccess,
     };
-
     use std::{collections::HashMap, path::Path};
 
     #[test]
@@ -1624,7 +1736,7 @@ mod tests {
     #[test]
     fn approval_context_omits_cwd_when_it_matches_project() {
         let paths = SandboxPaths::new("/work/project", "/home/user", "/work/project");
-        let context = approval_context(&paths, Some("session-id"));
+        let context = approval_context(&paths, Some("session-id"), None);
         assert_eq!(context.len(), 2);
         assert_eq!(context[0].label, "Project");
         assert_eq!(context[1].label, "Session");
@@ -1633,9 +1745,17 @@ mod tests {
     #[test]
     fn approval_context_keeps_distinct_cwd() {
         let paths = SandboxPaths::new("/work/project/src", "/home/user", "/work/project");
-        let context = approval_context(&paths, Some("session-id"));
+        let context = approval_context(&paths, Some("session-id"), None);
         assert_eq!(context.len(), 3);
         assert_eq!(context[1].label, "Working directory");
+    }
+
+    #[test]
+    fn approval_context_leads_with_the_package() {
+        let paths = SandboxPaths::new("/work/project", "/home/user", "/work/project");
+        let context = approval_context(&paths, Some("session-id"), Some("omp"));
+        assert_eq!(context[0].label, "Package");
+        assert_eq!(context[0].value, "omp");
     }
 
     #[test]
@@ -1738,7 +1858,7 @@ mod tests {
             values: HashMap::new(),
         };
 
-        let choice = reviewed_choice(&result, false, |_| {
+        let choice = reviewed_choice(&result, false, false, |_| {
             panic!("target validator must not run for Once")
         })
         .expect("valid Once choice")
@@ -1755,7 +1875,7 @@ mod tests {
             values: HashMap::from([("target".into(), String::new())]),
         };
 
-        let choice = reviewed_choice(&result, false, |result| {
+        let choice = reviewed_choice(&result, false, false, |result| {
             valid_rule_path(result.values.get("target")?)
                 .map(|path| ApprovalTarget::FilesystemPath { path })
         });
@@ -1771,7 +1891,7 @@ mod tests {
             values: HashMap::new(),
         };
 
-        assert!(reviewed_choice(&unavailable, false, |_| None).is_none());
+        assert!(reviewed_choice(&unavailable, false, false, |_| None).is_none());
 
         let cancelled = ApprovalFormResult {
             action: None,
@@ -1779,7 +1899,7 @@ mod tests {
             values: HashMap::new(),
         };
 
-        assert!(reviewed_choice(&cancelled, true, |_| None).is_none());
+        assert!(reviewed_choice(&cancelled, true, false, |_| None).is_none());
     }
 
     #[test]

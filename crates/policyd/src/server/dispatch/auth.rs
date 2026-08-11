@@ -181,6 +181,11 @@ mod tests {
     fn sandbox_socket_rejects_control_ops() {
         for req in [
             RpcRequest::UnregisterUi,
+            RpcRequest::RegisterSandbox {
+                session_id: "sandbox-a".into(),
+                package: "omp".into(),
+                launcher_pid: 0,
+            },
             RpcRequest::Approve {
                 id: "p1".into(),
                 scope: ApprovalScope::Once,
@@ -250,6 +255,11 @@ mod tests {
                 ctx: RequestContext::default(),
             },
             RpcRequest::UnregisterUi,
+            RpcRequest::RegisterSandbox {
+                session_id: "sandbox-a".into(),
+                package: "omp".into(),
+                launcher_pid: 0,
+            },
             RpcRequest::Approve {
                 id: "p1".into(),
                 scope: ApprovalScope::Once,

@@ -133,7 +133,7 @@ impl PolicyStore {
         // nfq registers flows with empty paths; enrich home/cwd/project_root
         // from the verified owner uid and pid so HTTP pendings carry enough
         // context for global/project scope resolution.
-        let context = Self::resolve_trusted_context(&raw_context);
+        let context = self.resolve_trusted_context(&raw_context);
 
         let key = registration.flow().clone();
         let mut inner = self.inner.lock().await;

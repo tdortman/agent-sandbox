@@ -3,7 +3,8 @@
 use super::{
     types::{
         MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
-        PendingFilesystem, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+        PendingContext, PendingFilesystem, PendingResult, PolicyStore, VerdictEntry,
+        enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
@@ -231,14 +232,13 @@ impl PolicyStore {
         }
 
         let result = match self
-            .dedup_or_create_pending_filesystem(
-                &path,
-                access,
-                cwd.as_deref(),
-                home.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-            )
+            .dedup_or_create_pending_filesystem(&path, access, PendingContext {
+                cwd: cwd.as_deref(),
+                home: home.as_deref(),
+                project_root: project_root.as_deref(),
+                sandbox_session_id: sandbox_session_id.as_deref(),
+                package: ctx.package.as_deref(),
+            })
             .await
         {
             Ok(r) => r,
@@ -261,6 +261,7 @@ impl PolicyStore {
                 cwd: cwd.clone(),
                 home: home.clone(),
                 project_root: project_root.clone(),
+                package: ctx.package.clone(),
             };
 
             self.notify_general_ui(&ctx, &push).await;
@@ -330,10 +331,7 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        cwd: Option<&Path>,
-        home: Option<&Path>,
-        project_root: Option<&Path>,
-        sandbox_session_id: Option<&str>,
+        ctx: PendingContext<'_>,
     ) -> Result<PendingResult<String, FilesystemCheckReply>, FilesystemCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
@@ -398,10 +396,11 @@ impl PolicyStore {
                 .map_or(0.0, |d| d.as_secs_f64()),
             path: path.to_path_buf(),
             access,
-            cwd: cwd.map(PathBuf::from),
-            home: home.map(PathBuf::from),
-            project_root: project_root.map(PathBuf::from),
-            sandbox_session_id: sandbox_session_id.map(String::from),
+            cwd: ctx.cwd.map(PathBuf::from),
+            home: ctx.home.map(PathBuf::from),
+            project_root: ctx.project_root.map(PathBuf::from),
+            sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+            package: ctx.package.map(String::from),
         }));
 
         drop(inner);
@@ -570,6 +569,7 @@ mod tests {
                 ),
                 ids: ProcessIds::from_options(Some(0), Some(1000)),
                 sandbox_session_id: Some("sandbox-cap".into()),
+                package: None,
             },
         }
     }
@@ -725,6 +725,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::from_options(Some(0), Some(1000)),
             sandbox_session_id: Some("sandbox-mutation".into()),
+            package: None,
         };
 
         let source_reply = store
@@ -801,6 +802,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::from_options(Some(0), Some(1000)),
             sandbox_session_id: Some("sandbox-symlink".into()),
+            package: None,
         };
 
         let target_reply = store
@@ -856,6 +858,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-glob-check".into()),
+            package: None,
         };
 
         {
@@ -930,6 +933,7 @@ mod tests {
             paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
             ids: ProcessIds::default(),
             sandbox_session_id: Some("sandbox-broad-glob-check-deny".into()),
+            package: None,
         };
 
         {

@@ -412,6 +412,7 @@ impl PolicyStore {
                 cwd: net.cwd.clone(),
                 home: net.home.clone(),
                 project_root: net.project_root.clone(),
+                package: net.package.clone(),
             },
             Pending::Http(http) => UiPush::HttpRequest {
                 id: http.pending_id,
@@ -420,6 +421,7 @@ impl PolicyStore {
                 home: http.context.home.clone(),
                 project_root: http.context.project_root.clone(),
                 sandbox_session_id: http.context.sandbox_session_id.clone(),
+                package: http.package.clone(),
             },
             Pending::Elevation(elev) => UiPush::ElevationRequest {
                 id: elev.id.clone(),
@@ -427,6 +429,7 @@ impl PolicyStore {
                 cwd: elev.cwd.clone(),
                 home: elev.home.clone(),
                 project_root: elev.project_root.clone(),
+                package: elev.package.clone(),
             },
             Pending::Filesystem(fs) => UiPush::FilesystemRequest {
                 id: fs.id.clone(),
@@ -435,6 +438,7 @@ impl PolicyStore {
                 cwd: fs.cwd.clone(),
                 home: fs.home.clone(),
                 project_root: fs.project_root.clone(),
+                package: fs.package.clone(),
             },
             Pending::Resource(res) => UiPush::ResourceRequest {
                 id: res.id.clone(),
@@ -444,6 +448,7 @@ impl PolicyStore {
                 cwd: res.cwd.clone(),
                 home: res.home.clone(),
                 project_root: res.project_root.clone(),
+                package: res.package.clone(),
             },
             Pending::Dbus(res) => UiPush::DbusRequest {
                 id: res.id.clone(),
@@ -452,6 +457,7 @@ impl PolicyStore {
                 home: res.home.clone(),
                 project_root: res.project_root.clone(),
                 sandbox_session_id: res.sandbox_session_id.clone(),
+                package: res.package.clone(),
             },
         };
 
@@ -606,6 +612,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: Some("sandbox-a".into()),
+            package: None,
         })
     }
 
@@ -619,6 +626,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: Some("sandbox-a".into()),
+            package: None,
         })
     }
 

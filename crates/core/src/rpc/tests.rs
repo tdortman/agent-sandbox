@@ -49,6 +49,7 @@ fn ui_push_network_request() {
         cwd: None,
         home: None,
         project_root: None,
+        package: None,
     })
     .to_string();
 
@@ -185,6 +186,22 @@ fn check_reply_deserializes_as_check_not_simple() {
         reply,
         RpcReply::Check(c) if c.allowed && c.source == VerdictSource::Scope(ApprovalScope::Once)
     ));
+}
+
+#[test]
+fn package_scope_verdict_sources_round_trip() {
+    for scope in [ApprovalScope::ProjectPackage, ApprovalScope::GlobalPackage] {
+        let line = serde_json::to_string(&CheckReply::allowed(VerdictSource::Scope(scope)))
+            .expect("serialize rpc reply");
+
+        let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
+
+        assert!(matches!(
+            reply,
+            RpcReply::Check(c)
+                if c.allowed && matches!(c.source, VerdictSource::Scope(s) if s == scope)
+        ));
+    }
 }
 
 #[test]

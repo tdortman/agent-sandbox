@@ -43,6 +43,7 @@ impl PolicyStore {
                     url: Some(net.url.clone()),
                     cwd: net.cwd.clone(),
                     home: net.home.clone(),
+                    package: net.package.clone(),
                 },
                 Pending::Http(http) => PendingSummary::Http {
                     id: http.pending_id,
@@ -51,12 +52,14 @@ impl PolicyStore {
                     home: http.context.home.clone(),
                     project_root: http.context.project_root.clone(),
                     sandbox_session_id: http.context.sandbox_session_id.clone(),
+                    package: http.package.clone(),
                 },
                 Pending::Elevation(elev) => PendingSummary::Elevation {
                     id: elev.id.clone(),
                     argv: Some(elev.argv.clone()),
                     cwd: elev.cwd.clone(),
                     home: elev.home.clone(),
+                    package: elev.package.clone(),
                 },
                 Pending::Filesystem(fs) => PendingSummary::Filesystem {
                     id: fs.id.clone(),
@@ -64,6 +67,7 @@ impl PolicyStore {
                     access: Some(fs.access),
                     cwd: fs.cwd.clone(),
                     home: fs.home.clone(),
+                    package: fs.package.clone(),
                 },
                 Pending::Resource(res) => PendingSummary::Resource {
                     id: res.id.clone(),
@@ -72,6 +76,7 @@ impl PolicyStore {
                     access: Some(res.access),
                     cwd: res.cwd.clone(),
                     home: res.home.clone(),
+                    package: res.package.clone(),
                 },
                 Pending::Dbus(dbus) => PendingSummary::Dbus {
                     id: dbus.id.clone(),
@@ -80,6 +85,7 @@ impl PolicyStore {
                     home: dbus.home.clone(),
                     project_root: dbus.project_root.clone(),
                     sandbox_session_id: dbus.sandbox_session_id.clone(),
+                    package: dbus.package.clone(),
                 },
             })
             .collect()

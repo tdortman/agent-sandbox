@@ -156,6 +156,20 @@ pub enum RpcRequest {
     },
 
     UnregisterUi,
+
+    RegisterSandbox {
+        session_id: String,
+        package: String,
+
+        /// PID of the launcher process that will spawn the sandbox (the
+        /// wrapper script's `$$`). policyd verifies it against the RPC
+        /// peer's real parent so a sandboxed attacker cannot adopt another
+        /// session's pre-registered package. 0 on legacy wires means no
+        /// binding and is rejected by the store.
+        #[serde(default)]
+        launcher_pid: u32,
+    },
+
     OpenProxySession,
 
     RegisterNetworkFlow {
@@ -427,7 +441,8 @@ impl RpcRequest {
             | Self::CheckHttp { .. }
             | Self::CheckNetworkFlow { .. }
             | Self::CancelCheck { .. }
-            | Self::ReleaseNetworkFlow { .. } => None,
+            | Self::ReleaseNetworkFlow { .. }
+            | Self::RegisterSandbox { .. } => None,
         }
     }
 
@@ -456,7 +471,8 @@ impl RpcRequest {
             | Self::CheckHttp { .. }
             | Self::CheckNetworkFlow { .. }
             | Self::CancelCheck { .. }
-            | Self::ReleaseNetworkFlow { .. } => None,
+            | Self::ReleaseNetworkFlow { .. }
+            | Self::RegisterSandbox { .. } => None,
         }
     }
 }
@@ -621,6 +637,45 @@ mod tests {
             super::parse_rpc_request(&line).expect_err("release wire must reject unknown fields");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn register_sandbox_round_trips() {
+        let request = RpcRequest::RegisterSandbox {
+            session_id: "sandbox-1".into(),
+            package: "omp".into(),
+            launcher_pid: 42,
+        };
+
+        let wire = serde_json::to_value(&request).expect("serialize register sandbox");
+        assert_eq!(wire["op"], "register_sandbox");
+        assert_eq!(wire["session_id"], "sandbox-1");
+        assert_eq!(wire["package"], "omp");
+        assert_eq!(wire["launcher_pid"], 42);
+
+        let decoded = serde_json::from_value::<RpcRequest>(wire.clone())
+            .expect("deserialize register sandbox");
+
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("reserialize register sandbox"),
+            wire
+        );
+    }
+
+    #[test]
+    fn register_sandbox_defaults_missing_launcher_pid_to_zero() {
+        let req: RpcRequest = serde_json::from_str(
+            r#"{"op":"register_sandbox","session_id":"sandbox-1","package":"omp"}"#,
+        )
+        .expect("legacy wire without launcher_pid must still deserialize");
+
+        match req {
+            RpcRequest::RegisterSandbox { launcher_pid, .. } => {
+                assert_eq!(launcher_pid, 0, "missing launcher_pid must default to 0");
+            }
+
+            _ => panic!("expected RegisterSandbox request"),
+        }
     }
 
     #[test]

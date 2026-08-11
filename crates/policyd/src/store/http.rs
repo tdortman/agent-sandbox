@@ -215,6 +215,7 @@ impl PolicyStore {
                 home: pending.context.home.clone(),
                 project_root: pending.context.project_root.clone(),
                 sandbox_session_id: pending.context.sandbox_session_id.clone(),
+                package: pending.package.clone(),
             })
             .await;
 
@@ -285,6 +286,7 @@ impl PolicyStore {
                     .map_or(0.0, |value| value.as_secs_f64()),
                 request: request.clone(),
                 context: key.context.clone(),
+                package: ctx.package.clone(),
             };
             inner.insert_pending(Pending::Http(pending));
             inner.http_futures.insert(id, Vec::new());

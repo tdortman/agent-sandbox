@@ -106,8 +106,10 @@ impl ApprovalFormRequest {
                 let label = match scope {
                     ApprovalScope::Once => "Once",
                     ApprovalScope::Session => "This session",
-                    ApprovalScope::Project => "This project",
-                    ApprovalScope::Global => "Globally",
+                    ApprovalScope::ProjectPackage => "This project, this package",
+                    ApprovalScope::Project => "This project, all packages",
+                    ApprovalScope::GlobalPackage => "All projects, this package",
+                    ApprovalScope::Global => "Everywhere",
                 };
 
                 json!({ "value": scope.as_str(), "label": label })
@@ -170,7 +172,7 @@ pub struct ApprovalFormResult {
 pub type ReviewValidator = Box<dyn Fn(&ApprovalFormResult) -> Result<(), String> + Send + 'static>;
 
 #[must_use]
-pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
+pub fn scope_only_options(session_available: bool, package_available: bool) -> Vec<ScopeOption> {
     let mut options = vec![ScopeOption {
         label: "Once".into(),
         scope: ApprovalScope::Once,
@@ -187,15 +189,33 @@ pub fn scope_only_options(session_available: bool) -> Vec<ScopeOption> {
         });
     }
 
+    if package_available {
+        options.push(ScopeOption {
+            label: "This project, this package".into(),
+            scope: ApprovalScope::ProjectPackage,
+            target: None,
+            comment: None,
+        });
+    }
+
     options.push(ScopeOption {
-        label: "This project".into(),
+        label: "This project, all packages".into(),
         scope: ApprovalScope::Project,
         target: None,
         comment: None,
     });
 
+    if package_available {
+        options.push(ScopeOption {
+            label: "All projects, this package".into(),
+            scope: ApprovalScope::GlobalPackage,
+            target: None,
+            comment: None,
+        });
+    }
+
     options.push(ScopeOption {
-        label: "Globally".into(),
+        label: "Everywhere".into(),
         scope: ApprovalScope::Global,
         target: None,
         comment: None,
@@ -234,7 +254,7 @@ pub fn format_command(argv: &[String]) -> String {
 mod tests {
     use super::{
         ApprovalFormContext, ApprovalFormControl, ApprovalFormField, ApprovalFormOption,
-        ApprovalFormRequest, ApprovalScope,
+        ApprovalFormRequest, ApprovalScope, scope_only_options,
     };
 
     #[test]
@@ -271,5 +291,53 @@ mod tests {
         assert_eq!(json["scopes"][0]["value"], "once");
         assert_eq!(json["fields"][0]["kind"], "choice");
         assert_eq!(json["fields"][0]["options"][1]["value"], "all");
+    }
+
+    #[test]
+    fn scope_ladder_places_project_package_between_session_and_project() {
+        let scopes: Vec<ApprovalScope> = scope_only_options(true, true)
+            .into_iter()
+            .map(|option| option.scope)
+            .collect();
+
+        assert_eq!(scopes, vec![
+            ApprovalScope::Once,
+            ApprovalScope::Session,
+            ApprovalScope::ProjectPackage,
+            ApprovalScope::Project,
+            ApprovalScope::GlobalPackage,
+            ApprovalScope::Global,
+        ]);
+    }
+
+    #[test]
+    fn scope_ladder_omits_package_scopes_when_unattributed() {
+        let scopes: Vec<ApprovalScope> = scope_only_options(true, false)
+            .into_iter()
+            .map(|option| option.scope)
+            .collect();
+
+        assert_eq!(scopes, vec![
+            ApprovalScope::Once,
+            ApprovalScope::Session,
+            ApprovalScope::Project,
+            ApprovalScope::Global,
+        ]);
+    }
+
+    #[test]
+    fn scope_ladder_keeps_once_first_without_session() {
+        let scopes: Vec<ApprovalScope> = scope_only_options(false, true)
+            .into_iter()
+            .map(|option| option.scope)
+            .collect();
+
+        assert_eq!(scopes, vec![
+            ApprovalScope::Once,
+            ApprovalScope::ProjectPackage,
+            ApprovalScope::Project,
+            ApprovalScope::GlobalPackage,
+            ApprovalScope::Global,
+        ]);
     }
 }

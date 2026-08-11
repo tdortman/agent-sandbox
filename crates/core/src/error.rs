@@ -13,7 +13,7 @@ pub enum ProjectPolicyError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 #[error("invalid approval scope: {scope}")]
 pub struct InvalidScopeError {
     pub scope: String,
@@ -41,6 +41,9 @@ pub enum ScopeResolveError {
 
     #[error("project_root required (set AGENT_SANDBOX_PROJECT_ROOT)")]
     ProjectRootRequired,
+
+    #[error("package required for global_package scope")]
+    PackageRequired,
 
     #[error(transparent)]
     ProjectPolicy(#[from] ProjectPolicyError),

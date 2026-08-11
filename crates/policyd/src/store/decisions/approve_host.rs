@@ -36,6 +36,7 @@ impl PolicyStore {
             paths: paths.clone(),
             ids: wire_ids,
             sandbox_session_id: ctx.sandbox_session_id.clone(),
+            package: None,
         };
 
         if self.policy_denied(&policy_host, port, &deny_ctx) {
@@ -53,6 +54,7 @@ impl PolicyStore {
                     owner_uid: wire_ids.uid(),
                     sandbox_session_id: ctx.sandbox_session_id,
                     comment: None,
+                    package: ctx.package.clone(),
                 },
             },
             DecisionAction::Approve,

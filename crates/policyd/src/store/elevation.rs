@@ -212,6 +212,7 @@ impl PolicyStore {
                 home.as_deref(),
                 project_root.as_deref(),
                 sandbox_session_id.as_deref(),
+                ctx.package.as_deref(),
             )
             .await
         else {
@@ -230,6 +231,7 @@ impl PolicyStore {
             cwd: cwd.clone(),
             home: home.clone(),
             project_root: project_root.clone(),
+            package: ctx.package.clone(),
         })
         .await;
 
@@ -254,6 +256,7 @@ impl PolicyStore {
         home: Option<&Path>,
         project_root: Option<&Path>,
         sandbox_session_id: Option<&str>,
+        package: Option<&str>,
     ) -> Option<PendingResult<String, ElevateReply>> {
         let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
@@ -278,6 +281,7 @@ impl PolicyStore {
                 home: home.map(PathBuf::from),
                 project_root: project_root.map(PathBuf::from),
                 sandbox_session_id: sandbox_session_id.map(String::from),
+                package: package.map(String::from),
             }));
         }
 
@@ -406,6 +410,7 @@ mod tests {
                 ),
                 ids: ProcessIds::from_options(Some(0), Some(1000)),
                 sandbox_session_id: Some("sandbox-cap".into()),
+                package: None,
             },
         }
     }

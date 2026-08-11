@@ -20,6 +20,7 @@ fn test_args(root: &Path) -> PolicydArgs {
         approval_timeout: Duration::from_secs(1),
         interactive_approval: false,
         ui_spawn_cmd: None,
+        package_declarative: Vec::new(),
         fs_monitor_cmd: None,
         syscall_broker_cmd: None,
     }

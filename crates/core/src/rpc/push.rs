@@ -19,6 +19,7 @@ pub enum PendingSummary {
         url: Option<String>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
+        package: Option<String>,
     },
 
     Http {
@@ -28,6 +29,7 @@ pub enum PendingSummary {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
         sandbox_session_id: Option<String>,
+        package: Option<String>,
     },
 
     Elevation {
@@ -35,6 +37,7 @@ pub enum PendingSummary {
         argv: Option<Vec<String>>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
+        package: Option<String>,
     },
 
     Filesystem {
@@ -43,6 +46,7 @@ pub enum PendingSummary {
         access: Option<FileAccess>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
+        package: Option<String>,
     },
 
     Resource {
@@ -52,6 +56,7 @@ pub enum PendingSummary {
         access: Option<ResourceAccess>,
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
+        package: Option<String>,
     },
 
     Dbus {
@@ -61,6 +66,7 @@ pub enum PendingSummary {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
         sandbox_session_id: Option<String>,
+        package: Option<String>,
     },
 }
 
@@ -80,6 +86,7 @@ pub enum UiPush {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
+        package: Option<String>,
     },
 
     HttpRequest {
@@ -89,6 +96,7 @@ pub enum UiPush {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
         sandbox_session_id: Option<String>,
+        package: Option<String>,
     },
 
     ElevationRequest {
@@ -97,6 +105,7 @@ pub enum UiPush {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
+        package: Option<String>,
     },
 
     FilesystemRequest {
@@ -106,6 +115,7 @@ pub enum UiPush {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
+        package: Option<String>,
     },
 
     ResourceRequest {
@@ -116,6 +126,7 @@ pub enum UiPush {
         cwd: Option<PathBuf>,
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
+        package: Option<String>,
     },
 
     DbusRequest {
@@ -125,5 +136,6 @@ pub enum UiPush {
         home: Option<PathBuf>,
         project_root: Option<PathBuf>,
         sandbox_session_id: Option<String>,
+        package: Option<String>,
     },
 }

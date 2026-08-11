@@ -28,9 +28,21 @@ pub enum ScopeTarget {
         project_root: PathBuf,
     },
 
+    ProjectPackage {
+        policy_path: PathBuf,
+        project_root: PathBuf,
+        package: String,
+    },
+
     Global {
         policy_path: PathBuf,
         home: PathBuf,
+    },
+
+    GlobalPackage {
+        policy_path: PathBuf,
+        home: PathBuf,
+        package: String,
     },
 }
 
@@ -40,6 +52,7 @@ pub struct ScopeContext<'a> {
     pub session_id: Option<&'a str>,
     pub home: Option<&'a str>,
     pub project_root: Option<&'a str>,
+    pub package: Option<&'a str>,
     pub active_session_ids: &'a HashSet<String>,
 }
 
@@ -52,7 +65,9 @@ impl ScopeTarget {
     /// used but no valid session is provided,
     /// [`ScopeResolveError::ProjectRootRequired`] if the project scope is
     /// used without a project root, [`ScopeResolveError::HomeRequired`] if
-    /// the global scope is used without a home directory, or
+    /// the global scope is used without a home directory,
+    /// [`ScopeResolveError::PackageRequired`] if a package scope is used
+    /// without an attributed package, or
     /// [`ScopeResolveError::ProjectPolicy`] if the project policy path
     /// cannot be resolved.
     pub fn resolve(ctx: &ScopeContext<'_>) -> Result<Self, ScopeResolveError> {
@@ -80,12 +95,36 @@ impl ScopeTarget {
                 })
             }
 
+            ApprovalScope::ProjectPackage => {
+                let project_root = ctx
+                    .project_root
+                    .ok_or(ScopeResolveError::ProjectRootRequired)?;
+                let package = ctx.package.ok_or(ScopeResolveError::PackageRequired)?;
+                let policy_path = project_package_policy_path(Path::new(project_root), package);
+                Ok(Self::ProjectPackage {
+                    policy_path,
+                    project_root: PathBuf::from(project_root),
+                    package: package.to_string(),
+                })
+            }
+
             ApprovalScope::Global => {
                 let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
                 let policy_path = global_policy_path(Path::new(home));
                 Ok(Self::Global {
                     policy_path,
                     home: PathBuf::from(home),
+                })
+            }
+
+            ApprovalScope::GlobalPackage => {
+                let home = ctx.home.ok_or(ScopeResolveError::HomeRequired)?;
+                let package = ctx.package.ok_or(ScopeResolveError::PackageRequired)?;
+                let policy_path = global_package_policy_path(Path::new(home), package);
+                Ok(Self::GlobalPackage {
+                    policy_path,
+                    home: PathBuf::from(home),
+                    package: package.to_string(),
                 })
             }
         }
@@ -103,4 +142,21 @@ impl ScopeTarget {
 fn global_policy_path(home: &Path) -> PathBuf {
     let canonical_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     canonical_home.join(".config/agent-sandbox/policy.json")
+}
+
+fn global_package_policy_path(home: &Path, package: &str) -> PathBuf {
+    let canonical_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+
+    canonical_home
+        .join(".config")
+        .join("agent-sandbox")
+        .join("packages")
+        .join(format!("{package}.json"))
+}
+
+fn project_package_policy_path(project_root: &Path, package: &str) -> PathBuf {
+    project_root
+        .join(".agent-sandbox")
+        .join("packages")
+        .join(format!("{package}.json"))
 }

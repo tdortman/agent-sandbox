@@ -27,6 +27,15 @@ pub enum PolicydError {
     #[error("invalid port")]
     InvalidPort,
 
+    #[error("invalid package name: {0}")]
+    InvalidPackageName(String),
+
+    #[error("launcher pid does not match the registering peer's parent")]
+    InvalidLauncherPid,
+
+    #[error("package is immutable for this session after first registration")]
+    PackageImmutable,
+
     #[error("unknown pending id")]
     UnknownPendingId,
 

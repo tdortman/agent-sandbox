@@ -23,12 +23,16 @@ agent-sandbox-policyd
 # Override the host socket and load policy from a custom JSON file.
 agent-sandbox-policyd \
     --socket /run/agent-sandbox/policy.sock \
-    --declarative /home/user/.config/agent-sandbox/declarative.json
+    --declarative /home/user/.config/agent-sandbox/policy.json
 
 # Use interactive approval with a longer timeout and a Nix expression export.
 agent-sandbox-policyd \
     --approval-timeout 600 \
-    --export-nix /var/lib/agent-sandbox/exported-policy.nix"
+    --export-nix /var/lib/agent-sandbox/exported-policy.nix
+
+# Declare per-package base policies (repeatable NAME=PATH).
+agent-sandbox-policyd \
+    --package-declarative omp=/etc/agent-sandbox/packages/omp.json"
 )]
 struct Cli {
     /// Host-side Unix socket path. UI clients (agent-sandbox-approve,
@@ -64,9 +68,21 @@ struct Cli {
     #[arg(
         long,
         value_name = "PATH",
-        default_value = "/etc/agent-sandbox/declarative.json"
+        default_value = "/etc/agent-sandbox/policy.json"
     )]
     declarative: PathBuf,
+
+    /// Repeatable per-package declarative base policy file, as NAME=PATH.
+    /// The file is loaded as the package layer (between the global
+    /// declarative policy and the user policy) for sandbox sessions
+    /// attributed to NAME. For example:
+    /// --package-declarative omp=/etc/agent-sandbox/packages/omp.json
+    #[arg(
+        long = "package-declarative",
+        value_name = "NAME=PATH",
+        value_parser = parse_package_declarative
+    )]
+    package_declarative: Vec<(String, PathBuf)>,
 
     /// Where the merged policy is written as JSON on startup. Consumed by the
     /// bwrap wrapper and by "agent-sandbox-nfq" to bootstrap the in-kernel deny
@@ -122,6 +138,19 @@ struct Cli {
     cleanup_cgroup_freeze: bool,
 }
 
+/// Parse a `NAME=PATH` value for `--package-declarative`.
+fn parse_package_declarative(value: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=PATH, got {value:?}"))?;
+
+    if name.is_empty() {
+        return Err("package name must not be empty".into());
+    }
+
+    Ok((name.to_string(), PathBuf::from(path)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), PolicydError> {
     tracing_subscriber::fmt()
@@ -158,6 +187,7 @@ async fn main() -> Result<(), PolicydError> {
         approval_timeout: Duration::from_secs_f64(cli.approval_timeout.max(1.0)),
         interactive_approval: cli.interactive_approval,
         ui_spawn_cmd: cli.ui_spawn_cmd,
+        package_declarative: cli.package_declarative,
         fs_monitor_cmd: cli.fs_monitor_cmd,
         syscall_broker_cmd: cli.syscall_broker_cmd,
     };
@@ -190,7 +220,7 @@ mod tests {
 
         assert_eq!(
             cli.declarative,
-            PathBuf::from("/etc/agent-sandbox/declarative.json")
+            PathBuf::from("/etc/agent-sandbox/policy.json")
         );
 
         assert_eq!(
@@ -202,6 +232,7 @@ mod tests {
         assert!((cli.approval_timeout - 300.0).abs() < f64::EPSILON);
         assert!(cli.interactive_approval);
         assert_eq!(cli.ui_spawn_cmd, None);
+        assert!(cli.package_declarative.is_empty());
         assert_eq!(cli.fs_monitor_cmd, None);
         assert_eq!(cli.syscall_broker_cmd, None);
     }
@@ -225,6 +256,10 @@ mod tests {
             "--no-interactive-approval",
             "--ui-spawn-cmd",
             "/bin/test-ui",
+            "--package-declarative",
+            "omp=/etc/test/packages/omp.json",
+            "--package-declarative",
+            "codex=/etc/test/packages/codex.json",
             "--fs-monitor-cmd",
             "/bin/test-fsmon",
             "--syscall-broker-cmd",
@@ -250,6 +285,18 @@ mod tests {
         assert!((cli.approval_timeout - 42.5).abs() < f64::EPSILON);
         assert!(!cli.interactive_approval);
         assert_eq!(cli.ui_spawn_cmd, Some(PathBuf::from("/bin/test-ui")));
+
+        assert_eq!(cli.package_declarative, vec![
+            (
+                "omp".to_string(),
+                PathBuf::from("/etc/test/packages/omp.json")
+            ),
+            (
+                "codex".to_string(),
+                PathBuf::from("/etc/test/packages/codex.json")
+            ),
+        ]);
+
         assert_eq!(cli.fs_monitor_cmd, Some(PathBuf::from("/bin/test-fsmon")));
 
         assert_eq!(

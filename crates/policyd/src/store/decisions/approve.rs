@@ -860,6 +860,7 @@ mod tests {
             home: None,
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::NetworkHost {
@@ -894,6 +895,7 @@ mod tests {
             home: None,
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         };
 
         let target = ApprovalTarget::NetworkHost {
@@ -921,6 +923,7 @@ mod tests {
             home: None,
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::SudoCommand {
@@ -952,6 +955,7 @@ mod tests {
             home: None,
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -984,6 +988,7 @@ mod tests {
             home: None,
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1016,6 +1021,7 @@ mod tests {
             home: None,
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         });
 
         // Once scope: exact match is valid
@@ -1063,6 +1069,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/home/user/repo".into()),
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1096,6 +1103,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/home/user/repo".into()),
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::ResourcePath {
@@ -1129,6 +1137,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1172,6 +1181,7 @@ mod tests {
             home: Some(home.clone()),
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         };
 
         let pending_id = pending.id.clone();
@@ -1200,6 +1210,7 @@ mod tests {
                         owner_uid: Some(1000),
                         sandbox_session_id: None,
                         comment: None,
+                        package: None,
                     },
                     client_id: 1,
                     approver_uid: None,
@@ -1236,6 +1247,7 @@ mod tests {
             home: Some(home.clone()),
             project_root: Some(project_root.clone()),
             sandbox_session_id: None,
+            package: None,
         };
 
         let pending_id = pending.id.clone();
@@ -1264,6 +1276,7 @@ mod tests {
                         owner_uid: Some(1000),
                         sandbox_session_id: None,
                         comment: None,
+                        package: None,
                     },
                     client_id: 1,
                     approver_uid: None,
@@ -1322,6 +1335,7 @@ mod tests {
             home: Some(home.clone()),
             project_root: None,
             sandbox_session_id: None,
+            package: None,
         };
 
         let pending_id = pending.id.clone();
@@ -1347,6 +1361,7 @@ mod tests {
                         owner_uid: Some(1000),
                         sandbox_session_id: None,
                         comment: None,
+                        package: None,
                     },
                     client_id: 1,
                     approver_uid: None,
@@ -1444,6 +1459,7 @@ mod tests {
                 home: Some("/home/user".into()),
                 project_root: Some("/repo".into()),
                 sandbox_session_id: None,
+                package: None,
             }));
         }
 
@@ -1451,6 +1467,7 @@ mod tests {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::from_options(Some(123), Some(1000)),
             sandbox_session_id: None,
+            package: None,
         };
 
         add_ui_sessions(&store).await;
@@ -1527,6 +1544,7 @@ mod tests {
                 home: Some(home.clone()),
                 project_root: None,
                 sandbox_session_id: None,
+                package: None,
             }));
         }
 
@@ -1546,6 +1564,7 @@ mod tests {
                         owner_uid: Some(1000),
                         sandbox_session_id: None,
                         comment: Some("allow introspect".into()),
+                        package: None,
                     },
                     client_id: 1,
                     approver_uid: Some(1000),
@@ -1598,6 +1617,7 @@ mod tests {
             home: Some("/home/user".into()),
             project_root: Some("/repo".into()),
             sandbox_session_id: None,
+            package: None,
         }
     }
 
@@ -1608,6 +1628,7 @@ mod tests {
             owner_uid: Some(1000),
             sandbox_session_id: None,
             comment: None,
+            package: None,
         }
     }
 
@@ -1648,6 +1669,7 @@ mod tests {
             paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
             ids: ProcessIds::from_options(pid, None),
             sandbox_session_id: None,
+            package: None,
         }
     }
 
@@ -1709,6 +1731,8 @@ mod tests {
                 root_pid: 42,
                 owner_uid: 1000,
                 project_root: "/repo".into(),
+                package: None,
+                launcher_pid: 0,
             },
         );
 
@@ -1734,6 +1758,7 @@ mod tests {
                         owner_uid: Some(1001),
                         sandbox_session_id: Some("sandbox-a".into()),
                         comment: None,
+                        package: None,
                     },
                     client_id: 99,
                     approver_uid: Some(1001),
@@ -1878,6 +1903,8 @@ mod tests {
                 root_pid: 42,
                 owner_uid: 1000,
                 project_root: "/repo".into(),
+                package: None,
+                launcher_pid: 0,
             },
         );
 
@@ -1903,6 +1930,7 @@ mod tests {
                         owner_uid: Some(1000),
                         sandbox_session_id: Some("sandbox-a".into()),
                         comment: None,
+                        package: None,
                     },
                     client_id: 99,
                     approver_uid: Some(1000),
@@ -1957,6 +1985,7 @@ mod tests {
                         paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                         ids: ProcessIds::default(),
                         sandbox_session_id: Some("sandbox-a".into()),
+                        package: None,
                     },
                 )
                 .await
@@ -1971,6 +2000,7 @@ mod tests {
                         paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
                         ids: ProcessIds::default(),
                         sandbox_session_id: Some("sandbox-b".into()),
+                        package: None,
                     },
                 )
                 .await

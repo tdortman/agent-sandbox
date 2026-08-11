@@ -188,6 +188,14 @@ async fn handle_non_proxy_request(
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
+        RpcRequest::RegisterSandbox {
+            session_id,
+            package,
+            launcher_pid,
+        } => store
+            .register_sandbox(&session_id, &package, peer.uid, launcher_pid, peer.pid)
+            .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
+
         RpcRequest::Check {
             host,
             connect_host,
@@ -227,7 +235,7 @@ async fn handle_non_proxy_request(
 
         RpcRequest::CheckDbus { target, ctx } => {
             let ctx = if role == SocketRole::Host {
-                PolicyStore::resolve_dbus_proxy_context(&MergeContext::from(&ctx), TrustedPeer {
+                store.resolve_dbus_proxy_context(&MergeContext::from(&ctx), TrustedPeer {
                     pid: peer.pid,
                     uid: peer.uid,
                 })
