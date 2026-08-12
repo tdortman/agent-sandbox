@@ -946,7 +946,7 @@ impl WebTransportAssociation {
                 let downstream = self.session.open_bi(session_id).await?;
                 self.tasks.push(tokio::spawn(async move {
                     tokio::select! {
-                        result = relay_webtransport_bidi_reverse(downstream, *upstream) => {
+                        result = relay_webtransport_bidi(downstream, *upstream) => {
                             if let Err(error) = result {
                                 warn!(%error, "upstream WebTransport bidirectional stream relay failed");
                             }
@@ -1493,22 +1493,15 @@ async fn relay_webtransport_datagrams(
     }
 }
 
-async fn relay_webtransport_bidi(
+async fn relay_webtransport_bidi<U>(
     downstream: h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    upstream: h3_quinn::BidiStream<Bytes>,
-) -> Result<(), BoxError> {
-    let (mut downstream_send, mut downstream_recv) = downstream.split();
-    let (mut upstream_send, mut upstream_recv) = upstream.split();
-    let downstream_to_upstream = relay_quic_direction(&mut downstream_recv, &mut upstream_send);
-    let upstream_to_downstream = relay_quic_direction(&mut upstream_recv, &mut downstream_send);
-    tokio::try_join!(downstream_to_upstream, upstream_to_downstream)?;
-    Ok(())
-}
-
-async fn relay_webtransport_bidi_reverse(
-    downstream: h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    upstream: h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-) -> Result<(), BoxError> {
+    upstream: U,
+) -> Result<(), BoxError>
+where
+    U: h3::quic::BidiStream<Bytes>,
+    U::SendStream: h3::quic::SendStreamUnframed<Bytes>,
+    U::RecvStream: h3::quic::RecvStream<Buf = Bytes>,
+{
     let (mut downstream_send, mut downstream_recv) = downstream.split();
     let (mut upstream_send, mut upstream_recv) = upstream.split();
     let downstream_to_upstream = relay_quic_direction(&mut downstream_recv, &mut upstream_send);

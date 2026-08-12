@@ -104,7 +104,9 @@ async fn proxy_upstream_pool_reaches_standalone_origin() {
         .connect(
             "https",
             &authority,
-            agent_sandbox_core::AttributionToken::from_bytes([0; 32]),
+            Some(
+                &agent_sandbox_core::AttributionToken::from_bytes([0; 32]),
+            ),
         )
         .await
         .expect("upstream connect");

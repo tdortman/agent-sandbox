@@ -708,20 +708,20 @@ async fn connect_upstream_for_request(
         (true, Some(destination)) => {
             state
                 .upstream
-                .connect_dedicated_to(scheme, authority, destination)
+                .connect_to(scheme, authority, destination, None)
                 .await?
         }
-        (true, None) => state.upstream.connect_dedicated(scheme, authority).await?,
+        (true, None) => state.upstream.connect(scheme, authority, None).await?,
         (false, Some(destination)) => {
             state
                 .upstream
-                .connect_to(scheme, authority, destination, security_context)
+                .connect_to(scheme, authority, destination, Some(&security_context))
                 .await?
         }
         (false, None) => {
             state
                 .upstream
-                .connect(scheme, authority, security_context)
+                .connect(scheme, authority, Some(&security_context))
                 .await?
         }
     };

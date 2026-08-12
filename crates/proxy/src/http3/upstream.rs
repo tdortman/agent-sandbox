@@ -119,7 +119,7 @@ impl UpstreamPool {
         self: &Arc<Self>,
         scheme: &str,
         authority: &str,
-        security_context: AttributionToken,
+        security_context: Option<&AttributionToken>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
         let (host, port) = split_authority(authority)?;
         let addresses = tokio::net::lookup_host((host, port)).await?;
@@ -127,7 +127,7 @@ impl UpstreamPool {
 
         for address in addresses {
             match self
-                .connect_address(scheme, authority, host, address, Some(&security_context))
+                .connect_address(scheme, authority, host, address, security_context)
                 .await
             {
                 Ok(connection) => return Ok(connection),
@@ -159,64 +159,12 @@ impl UpstreamPool {
         scheme: &str,
         authority: &str,
         address: SocketAddr,
-        security_context: AttributionToken,
+        security_context: Option<&AttributionToken>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
         let (host, port) = split_authority(authority)?;
         let address = SocketAddr::new(address.ip(), port);
 
-        self.connect_address(scheme, authority, host, address, Some(&security_context))
-            .await
-    }
-
-    /// Establish a separate upstream HTTP/3 association for one session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the origin cannot be resolved or the HTTP/3
-    /// handshake fails.
-    pub async fn connect_dedicated(
-        self: &Arc<Self>,
-        scheme: &str,
-        authority: &str,
-    ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let (host, port) = split_authority(authority)?;
-        let addresses = tokio::net::lookup_host((host, port)).await?;
-        let mut last_error = None;
-
-        for address in addresses {
-            match self
-                .connect_address(scheme, authority, host, address, None)
-                .await
-            {
-                Ok(connection) => return Ok(connection),
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            BoxError::from(format!("origin {authority} resolved to no addresses"))
-        }))
-    }
-
-    /// Establish a separate upstream HTTP/3 association at a known address.
-    ///
-    /// The address supplies routing only. The authority still supplies the
-    /// TLS server name and HTTP origin identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the advertised ECH configuration is unverifiable
-    /// or the HTTP/3 handshake fails.
-    pub async fn connect_dedicated_to(
-        self: &Arc<Self>,
-        scheme: &str,
-        authority: &str,
-        address: SocketAddr,
-    ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let (host, port) = split_authority(authority)?;
-        let address = SocketAddr::new(address.ip(), port);
-
-        self.connect_address(scheme, authority, host, address, None)
+        self.connect_address(scheme, authority, host, address, security_context)
             .await
     }
 

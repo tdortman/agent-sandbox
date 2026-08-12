@@ -18,7 +18,6 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-
 use tracing::debug;
 
 /// Minimal `Alt-Svc` rewrite surface shared by the rama (TCP) and `http`
@@ -98,21 +97,12 @@ const DEFAULT_MAX_AGE: Duration = Duration::from_hours(24);
 /// Default port for an `h3` alternative.
 const H3_DEFAULT_PORT: u16 = 443;
 
-/// Split an unbracketed authority into its host and optional port.
+/// Split `host` and an optional port into the host and port.
 ///
 /// A malformed explicit port filters the alternative instead of silently
 /// becoming the default port.
-fn split_host_port(authority: &str) -> Option<(&str, u16)> {
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Some((host, port.parse().ok()?)),
-        None => Some((authority, H3_DEFAULT_PORT)),
-    }
-}
-
-/// A `host:port` split where a malformed explicit port filters the
-/// alternative instead of silently becoming the default port.
-fn parse_bracketed<'a>(host: &'a str, suffix: &str) -> Option<(&'a str, u16)> {
-    match suffix.strip_prefix(':') {
+fn parse_host_port<'a>(host: &'a str, port: Option<&str>) -> Option<(&'a str, u16)> {
+    match port {
         Some(port) => Some((host, port.parse().ok()?)),
         None => Some((host, H3_DEFAULT_PORT)),
     }
@@ -403,12 +393,17 @@ fn parse_authority(authority: &str) -> Option<ParsedAuthority<'_>> {
 
     // Bracketed IPv6 literals split at the closing bracket; everything else
     // splits at the last colon. A malformed port filters the alternative.
-    let (host, port) = match authority
+    let (host, port) = if let Some((host, suffix)) = authority
         .strip_prefix('[')
         .and_then(|rest| rest.split_once(']'))
     {
-        Some((host, suffix)) => parse_bracketed(host, suffix)?,
-        None => split_host_port(authority)?,
+        parse_host_port(host, suffix.strip_prefix(':'))?
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        parse_host_port(host, port)?
     };
 
     Some(ParsedAuthority {
