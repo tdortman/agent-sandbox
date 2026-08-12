@@ -29,6 +29,72 @@ pub struct TakenPendingDecision {
     pub target: Option<ApprovalTarget>,
 }
 
+/// Extracts the context-style fields shared by every pending record that
+/// flows through [`scope_wire_for_pending`].
+pub(super) trait PendingContextSource {
+    fn pending_context(&self) -> PendingContext<'_>;
+}
+
+impl PendingContextSource for PendingElevation {
+    fn pending_context(&self) -> PendingContext<'_> {
+        PendingContext {
+            cwd: self.cwd.as_deref(),
+            home: self.home.as_deref(),
+            project_root: self.project_root.as_deref(),
+            sandbox_session_id: self.sandbox_session_id.as_deref(),
+            package: self.package.as_deref(),
+        }
+    }
+}
+
+impl PendingContextSource for PendingNetwork {
+    fn pending_context(&self) -> PendingContext<'_> {
+        PendingContext {
+            cwd: self.cwd.as_deref(),
+            home: self.home.as_deref(),
+            project_root: self.project_root.as_deref(),
+            sandbox_session_id: self.sandbox_session_id.as_deref(),
+            package: self.package.as_deref(),
+        }
+    }
+}
+
+impl PendingContextSource for PendingFilesystem {
+    fn pending_context(&self) -> PendingContext<'_> {
+        PendingContext {
+            cwd: self.cwd.as_deref(),
+            home: self.home.as_deref(),
+            project_root: self.project_root.as_deref(),
+            sandbox_session_id: self.sandbox_session_id.as_deref(),
+            package: self.package.as_deref(),
+        }
+    }
+}
+
+impl PendingContextSource for PendingResource {
+    fn pending_context(&self) -> PendingContext<'_> {
+        PendingContext {
+            cwd: self.cwd.as_deref(),
+            home: self.home.as_deref(),
+            project_root: self.project_root.as_deref(),
+            sandbox_session_id: self.sandbox_session_id.as_deref(),
+            package: self.package.as_deref(),
+        }
+    }
+}
+
+impl PendingContextSource for PendingDbus {
+    fn pending_context(&self) -> PendingContext<'_> {
+        PendingContext {
+            cwd: self.cwd.as_deref(),
+            home: self.home.as_deref(),
+            project_root: self.project_root.as_deref(),
+            sandbox_session_id: self.sandbox_session_id.as_deref(),
+            package: self.package.as_deref(),
+        }
+    }
+}
+
 impl PolicyStore {
     fn scope_wire_for_context(wire: ScopeWire, context: PendingContext<'_>) -> ScopeWire {
         let ScopeWire {
@@ -55,66 +121,11 @@ impl PolicyStore {
         }
     }
 
-    pub(crate) fn scope_wire_for_pending_network(
+    pub(super) fn scope_wire_for_pending<P: PendingContextSource>(
         wire: ScopeWire,
-        net: &PendingNetwork,
+        pending: &P,
     ) -> ScopeWire {
-        Self::scope_wire_for_context(wire, PendingContext {
-            cwd: net.cwd.as_deref(),
-            home: net.home.as_deref(),
-            project_root: net.project_root.as_deref(),
-            sandbox_session_id: net.sandbox_session_id.as_deref(),
-            package: net.package.as_deref(),
-        })
-    }
-
-    pub(crate) fn scope_wire_for_pending_elevation(
-        wire: ScopeWire,
-        elev: &PendingElevation,
-    ) -> ScopeWire {
-        Self::scope_wire_for_context(wire, PendingContext {
-            cwd: elev.cwd.as_deref(),
-            home: elev.home.as_deref(),
-            project_root: elev.project_root.as_deref(),
-            sandbox_session_id: elev.sandbox_session_id.as_deref(),
-            package: elev.package.as_deref(),
-        })
-    }
-
-    pub(crate) fn scope_wire_for_pending_filesystem(
-        wire: ScopeWire,
-        fs: &PendingFilesystem,
-    ) -> ScopeWire {
-        Self::scope_wire_for_context(wire, PendingContext {
-            cwd: fs.cwd.as_deref(),
-            home: fs.home.as_deref(),
-            project_root: fs.project_root.as_deref(),
-            sandbox_session_id: fs.sandbox_session_id.as_deref(),
-            package: fs.package.as_deref(),
-        })
-    }
-
-    pub(crate) fn scope_wire_for_pending_resource(
-        wire: ScopeWire,
-        res: &PendingResource,
-    ) -> ScopeWire {
-        Self::scope_wire_for_context(wire, PendingContext {
-            cwd: res.cwd.as_deref(),
-            home: res.home.as_deref(),
-            project_root: res.project_root.as_deref(),
-            sandbox_session_id: res.sandbox_session_id.as_deref(),
-            package: res.package.as_deref(),
-        })
-    }
-
-    pub(crate) fn scope_wire_for_pending_dbus(wire: ScopeWire, dbus: &PendingDbus) -> ScopeWire {
-        Self::scope_wire_for_context(wire, PendingContext {
-            cwd: dbus.cwd.as_deref(),
-            home: dbus.home.as_deref(),
-            project_root: dbus.project_root.as_deref(),
-            sandbox_session_id: dbus.sandbox_session_id.as_deref(),
-            package: dbus.package.as_deref(),
-        })
+        Self::scope_wire_for_context(wire, pending.pending_context())
     }
 
     async fn approval_client_authorized(

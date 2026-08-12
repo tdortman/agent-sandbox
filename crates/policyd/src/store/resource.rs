@@ -2,8 +2,8 @@
 
 use super::{
     types::{
-        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PolicyStore,
-        VerdictEntry, enforce_verdict_cache_limit,
+        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingContext, PendingResource,
+        PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
@@ -18,23 +18,6 @@ use std::{
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
-
-struct PendingResResult<T> {
-    id: String,
-    is_new: bool,
-    rx: oneshot::Receiver<T>,
-}
-
-/// Context fields threaded into
-/// [`PolicyStore::dedup_or_create_pending_resource`], grouped to keep the
-/// function signature under clippy's argument-count threshold.
-struct PendingCtx<'a> {
-    cwd: Option<&'a Path>,
-    home: Option<&'a Path>,
-    project_root: Option<&'a Path>,
-    sandbox_session_id: Option<&'a str>,
-    package: Option<&'a str>,
-}
 
 impl PolicyStore {
     pub async fn check_resource(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
@@ -85,7 +68,7 @@ impl PolicyStore {
         }
 
         let result = match self
-            .dedup_or_create_pending_resource(kind, &path, access, &PendingCtx {
+            .dedup_or_create_pending_resource(kind, &path, access, &PendingContext {
                 cwd: cwd.as_deref(),
                 home: home.as_deref(),
                 project_root: project_root.as_deref(),
@@ -149,7 +132,7 @@ impl PolicyStore {
         let sandbox_session_id = ctx.sandbox_session_id.clone();
 
         let result = match self
-            .dedup_or_create_pending_dbus(&target, &PendingCtx {
+            .dedup_or_create_pending_dbus(&target, &PendingContext {
                 cwd: cwd.as_deref(),
                 home: home.as_deref(),
                 project_root: project_root.as_deref(),
@@ -237,8 +220,8 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &PendingCtx<'_>,
-    ) -> Result<PendingResResult<ResourceCheckReply>, ResourceCheckReply> {
+        ctx: &PendingContext<'_>,
+    ) -> Result<PendingResult<String, ResourceCheckReply>, ResourceCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
@@ -284,7 +267,7 @@ impl PolicyStore {
 
             drop(inner);
 
-            return Ok(PendingResResult {
+            return Ok(PendingResult {
                 id: existing_id,
                 is_new: false,
                 rx,
@@ -326,7 +309,7 @@ impl PolicyStore {
         inner.pending.insert_pending(pending);
         drop(inner);
 
-        Ok(PendingResResult {
+        Ok(PendingResult {
             id: pending_id,
             is_new: true,
             rx,
@@ -336,8 +319,8 @@ impl PolicyStore {
     async fn dedup_or_create_pending_dbus(
         &self,
         target: &DbusTarget,
-        ctx: &PendingCtx<'_>,
-    ) -> Result<PendingResResult<DbusCheckReply>, Box<DbusCheckReply>> {
+        ctx: &PendingContext<'_>,
+    ) -> Result<PendingResult<String, DbusCheckReply>, Box<DbusCheckReply>> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
@@ -376,7 +359,7 @@ impl PolicyStore {
 
             drop(inner);
 
-            return Ok(PendingResResult {
+            return Ok(PendingResult {
                 id: existing_id,
                 is_new: false,
                 rx,
@@ -414,7 +397,7 @@ impl PolicyStore {
         inner.pending.insert_pending(pending);
         drop(inner);
 
-        Ok(PendingResResult {
+        Ok(PendingResult {
             id: pending_id,
             is_new: true,
             rx,
@@ -871,8 +854,8 @@ mod tests {
 
     #[tokio::test]
     async fn resource_pending_dedup_is_scoped_to_the_sandbox_session() {
-        fn pending_ctx(session: &str) -> super::PendingCtx<'_> {
-            super::PendingCtx {
+        fn pending_ctx(session: &str) -> super::PendingContext<'_> {
+            super::PendingContext {
                 cwd: Some(Path::new("/repo")),
                 home: Some(Path::new("/home/user")),
                 project_root: Some(Path::new("/repo")),

@@ -6,43 +6,12 @@ use super::{
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 use agent_sandbox_core::{
-    ApprovalScope, DbusTarget, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind,
-    ResourceRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
+    ApprovalScope, DbusTarget, FilesystemRuleKey, ResourceRuleKey, RpcReply, ScopeActionReply,
+    ScopeTarget, expand_policy_path,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 impl PolicyStore {
-    fn finalize_filesystem_scope(
-        &self,
-        paths: &SandboxPaths,
-        path: PathBuf,
-        access: FileAccess,
-        scope: ApprovalScope,
-        action: DecisionAction,
-    ) -> RpcReply {
-        let _ = self.export_policy_files(paths.clone());
-        let scope_label = scope.as_str();
-
-        let detail = format!(
-            "path={} access={access:?} scope={scope_label}",
-            path.display()
-        );
-
-        Self::audit(action.audit_verb(), None, None, &detail);
-
-        let policy_path = match (paths.home(), paths.project_root()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
-            _ => None,
-        };
-
-        RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
-            path,
-            access,
-            scope,
-            policy_path.map(PathBuf::from),
-        ))
-    }
-
     pub(crate) async fn apply_filesystem_scope(
         &self,
         op: FilesystemScopeOp,
@@ -130,40 +99,26 @@ impl PolicyStore {
             }
         }
 
-        self.finalize_filesystem_scope(&paths, path, access, scope, action)
-    }
-
-    fn finalize_resource_scope(
-        &self,
-        paths: &SandboxPaths,
-        kind: ResourceKind,
-        path: PathBuf,
-        access: ResourceAccess,
-        scope: ApprovalScope,
-        action: DecisionAction,
-    ) -> RpcReply {
-        let _ = self.export_policy_files(paths.clone());
         let scope_label = scope.as_str();
-
-        let detail = format!(
-            "kind={kind:?} path={} access={access:?} scope={scope_label}",
+        let audit_detail = format!(
+            "path={} access={access:?} scope={scope_label}",
             path.display()
         );
 
-        Self::audit(action.audit_verb(), None, None, &detail);
-
-        let policy_path = match (paths.home(), paths.project_root()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
-            _ => None,
-        };
-
-        RpcReply::ScopeAction(ScopeActionReply::ok_resource(
-            kind,
-            path,
-            access,
+        self.finalize_scope_reply(
+            &paths,
             scope,
-            policy_path.map(PathBuf::from),
-        ))
+            action,
+            (None, None, &audit_detail),
+            |scope, policy_path| {
+                RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
+                    path,
+                    access,
+                    scope,
+                    policy_path,
+                ))
+            },
+        )
     }
 
     pub(crate) async fn apply_dbus_scope(
@@ -346,7 +301,27 @@ impl PolicyStore {
             }
         }
 
-        self.finalize_resource_scope(&paths, kind, path, access, scope, action)
+        let scope_label = scope.as_str();
+        let audit_detail = format!(
+            "kind={kind:?} path={} access={access:?} scope={scope_label}",
+            path.display()
+        );
+
+        self.finalize_scope_reply(
+            &paths,
+            scope,
+            action,
+            (None, None, &audit_detail),
+            |scope, policy_path| {
+                RpcReply::ScopeAction(ScopeActionReply::ok_resource(
+                    kind,
+                    path,
+                    access,
+                    scope,
+                    policy_path,
+                ))
+            },
+        )
     }
 }
 

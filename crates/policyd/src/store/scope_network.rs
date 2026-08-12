@@ -5,10 +5,9 @@ use super::{
 };
 use crate::wire::{NetworkScopeOp, ScopeWire};
 use agent_sandbox_core::{
-    ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,
-    ScopeTarget,
+    ApprovalScope, NetworkRuleKey, RpcReply, ScopeActionReply, ScopeContext, ScopeTarget,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 impl PolicyStore {
     pub(crate) async fn apply_network_scope(
@@ -107,36 +106,20 @@ impl PolicyStore {
             }
         }
 
-        self.finalize_network_scope(&paths, host, port, scope, action)
-    }
-
-    fn finalize_network_scope(
-        &self,
-        paths: &SandboxPaths,
-        host: String,
-        port: u16,
-        scope: ApprovalScope,
-        action: DecisionAction,
-    ) -> RpcReply {
-        let _ = self.export_policy_files(SandboxPaths::from_wire(
-            paths.cwd_path(),
-            paths.home_path(),
-            paths.project_root_path(),
-        ));
-
-        Self::audit(action.audit_verb(), Some(&host), Some(port), scope.as_str());
-
-        let path = match (paths.home(), paths.project_root()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
-            _ => None,
-        };
-
-        RpcReply::ScopeAction(ScopeActionReply::ok_network(
-            host,
-            port,
+        self.finalize_scope_reply(
+            &paths,
             scope,
-            path.map(PathBuf::from),
-        ))
+            action,
+            (Some(host.as_str()), Some(port), scope.as_str()),
+            |scope, policy_path| {
+                RpcReply::ScopeAction(ScopeActionReply::ok_network(
+                    host.clone(),
+                    port,
+                    scope,
+                    policy_path,
+                ))
+            },
+        )
     }
 
     pub(crate) async fn resolve_scope_target(

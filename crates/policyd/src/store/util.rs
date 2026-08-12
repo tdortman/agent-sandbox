@@ -1,8 +1,38 @@
 //! Audit logging and host pattern matching.
 
+use super::decisions::DecisionAction;
+use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths};
+use std::path::PathBuf;
+
 impl super::types::PolicyStore {
     pub(crate) fn audit(action: &str, host: Option<&str>, port: Option<u16>, detail: &str) {
         tracing::info!(target: "audit", action, host, port, detail, "policy event");
+    }
+
+    /// Shared tail of every scope-apply flow: export policy files, emit the
+    /// audit event, then build the scope reply. Only the audit target, the
+    /// audit detail, and the concrete `ok_*` reply differ across capabilities.
+    pub(crate) fn finalize_scope_reply<F>(
+        &self,
+        paths: &SandboxPaths,
+        scope: ApprovalScope,
+        action: DecisionAction,
+        audit: (Option<&str>, Option<u16>, &str),
+        reply: F,
+    ) -> RpcReply
+    where
+        F: FnOnce(ApprovalScope, Option<PathBuf>) -> RpcReply,
+    {
+        let _ = self.export_policy_files(paths.clone());
+
+        Self::audit(action.audit_verb(), audit.0, audit.1, audit.2);
+
+        let policy_path = match (paths.home(), paths.project_root()) {
+            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
+            _ => None,
+        };
+
+        reply(scope, policy_path.map(PathBuf::from))
     }
 }
 

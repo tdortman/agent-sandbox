@@ -4,7 +4,7 @@ use super::{
     state::ProxyCheckId,
     types::{
         MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
-        PendingNetwork, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+        PendingNetwork, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
@@ -46,12 +46,6 @@ impl NetworkRequestIdentity<'_> {
             && pending.sandbox_session_id.as_deref() == self.sandbox_session_id
             && pending.package.as_deref() == self.package
     }
-}
-
-struct PendingNetResult {
-    id: String,
-    is_new: bool,
-    rx: oneshot::Receiver<CheckReply>,
 }
 
 struct NetworkWaitTarget<'a> {
@@ -313,7 +307,7 @@ impl PolicyStore {
         url: &str,
         aliases: &[String],
         waiter: Option<&ProxyCheckId>,
-    ) -> Result<PendingNetResult, CheckReply> {
+    ) -> Result<PendingResult<String, CheckReply>, CheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
@@ -362,7 +356,7 @@ impl PolicyStore {
 
             drop(inner);
 
-            return Ok(PendingNetResult {
+            return Ok(PendingResult {
                 id: existing_id,
                 is_new: false,
                 rx,
@@ -403,7 +397,7 @@ impl PolicyStore {
 
         drop(inner);
 
-        Ok(PendingNetResult {
+        Ok(PendingResult {
             id: pending_id,
             is_new: true,
             rx,

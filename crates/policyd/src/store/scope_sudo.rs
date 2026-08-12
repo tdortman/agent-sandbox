@@ -4,34 +4,10 @@ use super::{
     ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction, types::PolicyStore,
 };
 use crate::wire::{ScopeWire, SudoScopeOp};
-use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
+use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 use std::path::{Path, PathBuf};
 
 impl PolicyStore {
-    fn finalize_sudo_scope(
-        &self,
-        paths: &SandboxPaths,
-        argv: Vec<String>,
-        scope: ApprovalScope,
-        action: DecisionAction,
-    ) -> RpcReply {
-        let _ = self.export_policy_files(paths.clone());
-        let scope_label = scope.as_str();
-        let detail = format!("argv={argv:?} scope={scope_label}");
-        Self::audit(action.audit_verb(), None, None, &detail);
-
-        let path = match (paths.home(), paths.project_root()) {
-            (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
-            _ => None,
-        };
-
-        RpcReply::ScopeAction(ScopeActionReply::ok_sudo(
-            argv,
-            scope,
-            path.map(PathBuf::from),
-        ))
-    }
-
     pub(crate) async fn apply_sudo_scope(
         &self,
         op: SudoScopeOp,
@@ -113,15 +89,25 @@ impl PolicyStore {
             }
         }
 
-        self.finalize_sudo_scope(
+        let scope_label = scope.as_str();
+        let audit_detail = format!("argv={argv:?} scope={scope_label}");
+
+        self.finalize_scope_reply(
             &SandboxPaths::from_wire(
                 cwd,
                 home.map(PathBuf::from),
                 project_root.map(PathBuf::from),
             ),
-            argv,
             scope,
             action,
+            (None, None, &audit_detail),
+            |scope, policy_path| {
+                RpcReply::ScopeAction(ScopeActionReply::ok_sudo(
+                    argv,
+                    scope,
+                    policy_path,
+                ))
+            },
         )
     }
 }

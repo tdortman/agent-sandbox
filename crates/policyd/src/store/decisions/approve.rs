@@ -161,7 +161,7 @@ impl PolicyStore {
                     host: resolved.host.clone(),
                     port: resolved.port,
                     scope,
-                    wire: Self::scope_wire_for_pending_network(wire, &net),
+                    wire: Self::scope_wire_for_pending(wire, &net),
                 },
                 action,
             )
@@ -240,7 +240,7 @@ impl PolicyStore {
             }
         };
 
-        let scope_wire = Self::scope_wire_for_pending_elevation(wire, &elev);
+        let scope_wire = Self::scope_wire_for_pending(wire, &elev);
 
         if action == DecisionAction::Deny {
             if scope == ApprovalScope::Once {
@@ -453,7 +453,7 @@ impl PolicyStore {
         fs: &PendingFilesystem,
         scope: ApprovalScope,
     ) -> crate::wire::ScopeWire {
-        let mut scope_wire = Self::scope_wire_for_pending_filesystem(wire, fs);
+        let mut scope_wire = Self::scope_wire_for_pending(wire, fs);
 
         if scope != ApprovalScope::Session {
             return scope_wire;
@@ -560,7 +560,7 @@ impl PolicyStore {
             return RpcReply::ScopeAction(ScopeActionReply::ok_dbus(dbus_target, scope, None));
         }
 
-        let scope_wire = Self::scope_wire_for_pending_dbus(wire, &res);
+        let scope_wire = Self::scope_wire_for_pending(wire, &res);
 
         let result = self
             .apply_dbus_scope(dbus_target, scope, scope_wire, action)
@@ -704,7 +704,7 @@ impl PolicyStore {
         res: &PendingResource,
         scope: ApprovalScope,
     ) -> crate::wire::ScopeWire {
-        let mut scope_wire = Self::scope_wire_for_pending_resource(wire, res);
+        let mut scope_wire = Self::scope_wire_for_pending(wire, res);
 
         if scope != ApprovalScope::Session {
             return scope_wire;
