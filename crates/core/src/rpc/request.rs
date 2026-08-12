@@ -445,36 +445,6 @@ impl RpcRequest {
             | Self::RegisterSandbox { .. } => None,
         }
     }
-
-    pub const fn context_mut(&mut self) -> Option<&mut RequestContext> {
-        match self {
-            Self::RegisterUi { ctx, .. }
-            | Self::Check { ctx, .. }
-            | Self::CheckFilesystem { ctx, .. }
-            | Self::CheckResource { ctx, .. }
-            | Self::CheckDbus { ctx, .. }
-            | Self::StartFilesystemMonitor { ctx, .. }
-            | Self::Elevate { ctx, .. }
-            | Self::Approve { ctx, .. }
-            | Self::ApproveHost { ctx, .. }
-            | Self::ApproveHttp { ctx, .. }
-            | Self::Deny { ctx, .. }
-            | Self::Status { ctx }
-            | Self::Reload { ctx } => Some(ctx),
-
-            Self::UnregisterUi
-            | Self::OpenProxySession
-            | Self::RegisterNetworkFlow { .. }
-            | Self::ClaimNetworkFlow { .. }
-            | Self::ClaimNetworkFlowBySource { .. }
-            | Self::RebindNetworkFlow { .. }
-            | Self::CheckHttp { .. }
-            | Self::CheckNetworkFlow { .. }
-            | Self::CancelCheck { .. }
-            | Self::ReleaseNetworkFlow { .. }
-            | Self::RegisterSandbox { .. } => None,
-        }
-    }
 }
 
 const CHECK_ALIASES_MARKER: &str = "#agent-sandbox-aliases=";

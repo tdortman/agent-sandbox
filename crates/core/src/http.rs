@@ -757,18 +757,8 @@ impl HttpSessionMetadata {
     }
 
     #[must_use]
-    pub fn kind(&self) -> Option<&str> {
-        self.kind.as_deref()
-    }
-
-    #[must_use]
     pub fn protocol(&self) -> Option<&str> {
         self.protocol.as_deref()
-    }
-
-    #[must_use]
-    pub fn target(&self) -> Option<&str> {
-        self.target.as_deref()
     }
 }
 

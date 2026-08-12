@@ -199,11 +199,6 @@ impl VerdictSource {
         Self::Blocked
     }
 
-    #[must_use]
-    pub const fn is_once(&self) -> bool {
-        matches!(self, Self::Scope(ApprovalScope::Once))
-    }
-
     fn to_wire(&self, allowed: bool) -> Result<Cow<'_, str>, &'static str> {
         match (allowed, self) {
             (

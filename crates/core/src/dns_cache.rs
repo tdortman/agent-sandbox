@@ -48,7 +48,6 @@ pub(crate) fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
 
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
 pub const DEFAULT_MAX_TTL: u32 = 600;
-pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
@@ -70,7 +69,6 @@ struct LiveCacheEntry {
 pub struct DnsCache {
     path: Option<PathBuf>,
     max_ttl: u32,
-    max_entries: usize,
     entries: HashMap<String, LiveCacheEntry>,
 }
 
@@ -79,21 +77,6 @@ impl DnsCache {
         Self {
             path: path.map(|p| p.as_ref().to_path_buf()),
             max_ttl: max_ttl.max(1),
-            max_entries: DEFAULT_MAX_ENTRIES.max(1),
-            entries: HashMap::new(),
-        }
-    }
-
-    #[cfg(test)]
-    fn new_with_max_entries(
-        path: Option<impl AsRef<Path>>,
-        max_ttl: u32,
-        max_entries: usize,
-    ) -> Self {
-        Self {
-            path: path.map(|p| p.as_ref().to_path_buf()),
-            max_ttl: max_ttl.max(1),
-            max_entries: max_entries.max(1),
             entries: HashMap::new(),
         }
     }
@@ -128,15 +111,11 @@ impl DnsCache {
             expires: now + Duration::from_secs(u64::from(ttl)),
         });
 
-        self.enforce_max_entries();
+        evict_oldest(&mut self.entries, 4096, |entry| entry.expires);
     }
 
     fn prune_expired(&mut self, now: Instant) {
         self.entries.retain(|_, entry| entry.expires > now);
-    }
-
-    fn enforce_max_entries(&mut self) {
-        evict_oldest(&mut self.entries, self.max_entries, |entry| entry.expires);
     }
 
     #[must_use]
@@ -380,7 +359,7 @@ mod tests {
 
     #[test]
     fn expired_entries_removed_on_next_insert() {
-        let mut cache = DnsCache::new_with_max_entries(None::<std::path::PathBuf>, 1, 10);
+        let mut cache = DnsCache::new(None::<std::path::PathBuf>, 1);
         cache.remember_ephemeral("10.0.0.1", "first.example", 1);
         cache.remember_ephemeral("10.0.0.2", "second.example", 1);
         assert_eq!(cache.entries.len(), 2);
@@ -388,17 +367,5 @@ mod tests {
         cache.remember_ephemeral("10.0.0.3", "third.example", 1);
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.lookup("10.0.0.3").is_some());
-    }
-
-    #[test]
-    fn bounded_cache_evicts_earliest_expiring_entries() {
-        let mut cache = DnsCache::new_with_max_entries(None::<std::path::PathBuf>, 300, 3);
-        cache.remember_ephemeral("10.0.0.1", "first.example", 60);
-        cache.remember_ephemeral("10.0.0.2", "second.example", 120);
-        cache.remember_ephemeral("10.0.0.3", "third.example", 180);
-        cache.remember_ephemeral("10.0.0.4", "fourth.example", 240);
-        assert_eq!(cache.entries.len(), 3);
-        assert!(cache.lookup("10.0.0.1").is_none());
-        assert!(cache.lookup("10.0.0.4").is_some());
     }
 }

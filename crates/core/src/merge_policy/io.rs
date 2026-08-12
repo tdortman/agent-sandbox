@@ -8,7 +8,6 @@ use crate::{
         SudoRule, contract_home_path, expand_policy_path,
     },
 };
-
 use std::path::{Path, PathBuf};
 
 /// Maximum on-disk policy JSON size policyd/core will load.
@@ -226,7 +225,7 @@ pub fn resolve_policy_write_path(
 }
 
 #[must_use]
-pub fn resolve_owner_uid(path: &Path, home: Option<&Path>, uid: Option<u32>) -> Option<u32> {
+fn resolve_owner_uid(path: &Path, home: Option<&Path>, uid: Option<u32>) -> Option<u32> {
     if let Some(uid) = uid.filter(|u| *u > 0) {
         return Some(uid);
     }
@@ -544,7 +543,6 @@ fn push_spaced_json(out: &mut String, compact: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::policy::{
         DbusMessageKind, DbusRule, DbusTarget, FileAccess, FilesystemRule, NetworkRule, Policy,
     };

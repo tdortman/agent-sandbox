@@ -38,7 +38,6 @@ struct LiveIpBindings {
 
 pub struct ApprovedBindings {
     path: PathBuf,
-    ttl_secs: u64,
     entries: HashMap<String, LiveIpBindings>,
 }
 
@@ -48,7 +47,6 @@ impl ApprovedBindings {
 
         let mut bindings = Self {
             path,
-            ttl_secs: APPROVED_BINDINGS_TTL_SECS,
             entries: HashMap::new(),
         };
 
@@ -132,7 +130,7 @@ impl ApprovedBindings {
 
         entry
             .hosts
-            .insert(host, now + Duration::from_secs(self.ttl_secs));
+            .insert(host, now + Duration::from_secs(APPROVED_BINDINGS_TTL_SECS));
 
         self.enforce_limits(ip);
     }

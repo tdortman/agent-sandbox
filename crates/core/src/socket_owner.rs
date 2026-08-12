@@ -89,17 +89,6 @@ impl OwnerSnapshot {
     }
 
     #[must_use]
-    pub const fn tuple(self) -> SocketTuple {
-        self.tuple
-    }
-
-    /// Descriptor number whose procfs target was checked during resolution.
-    #[must_use]
-    pub const fn fd(self) -> u32 {
-        self.fd
-    }
-
-    #[must_use]
     pub const fn pid(self) -> NonZeroU32 {
         self.identity.pid()
     }
@@ -490,7 +479,6 @@ mod tests {
         };
 
         assert_eq!(snapshot.pid_value(), std::process::id());
-        assert_eq!(snapshot.tuple(), tuple);
         assert_ne!(snapshot.socket_inode().get(), 0);
         assert_ne!(snapshot.process_start_time_ticks().get(), 0);
         let identity = snapshot.identity();

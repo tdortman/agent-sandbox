@@ -1,22 +1,18 @@
 //! Typed capabilities and flow-registration wire values for the proxy socket.
 
 use super::request::RequestContext;
-
 use crate::{
     HttpRequest, HttpRuleTarget, SandboxPaths,
     hosts::{normalize_dns_name, normalize_host},
     transport::FlowProtocol,
 };
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
-
 use std::{
     fmt,
     net::IpAddr,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     path::PathBuf,
 };
-
 use uuid::Uuid;
 
 /// A non-zero inode number identifying a local socket.
@@ -128,11 +124,6 @@ impl ProcessIdentity {
     #[must_use]
     pub const fn process_start_time_ticks(self) -> ProcessStartTimeTicks {
         self.start_time
-    }
-
-    #[must_use]
-    pub const fn pid_value(self) -> u32 {
-        self.pid.get()
     }
 }
 
@@ -361,15 +352,14 @@ impl<'de> Deserialize<'de> for ProxyRequestId {
 }
 
 fn encode_token(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
+    use std::fmt::Write as _;
 
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-
-    encoded
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn decode_token(value: &str) -> Result<[u8; 32], String> {
@@ -384,20 +374,11 @@ fn decode_token(value: &str) -> Result<[u8; 32], String> {
     let mut bytes = [0_u8; 32];
 
     for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let high = hex_value(pair[0]);
-        let low = hex_value(pair[1]);
-        bytes[index] = (high << 4) | low;
+        let pair = std::str::from_utf8(pair).expect("token validated as lowercase hex");
+        bytes[index] = u8::from_str_radix(pair, 16).expect("token validated as lowercase hex");
     }
 
     Ok(bytes)
-}
-
-const fn hex_value(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => 0,
-    }
 }
 
 macro_rules! capability_token {

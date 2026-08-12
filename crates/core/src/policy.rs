@@ -447,7 +447,7 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
 /// `project_root` is `None`, `./` paths are kept as-is (matching will then fail
 /// closed).
 #[must_use]
-pub fn expand_project_relative(path: &Path, project_root: &Path) -> PathBuf {
+fn expand_project_relative(path: &Path, project_root: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     let pr = project_root.to_string_lossy();
 
