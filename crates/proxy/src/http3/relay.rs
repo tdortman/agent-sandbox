@@ -19,21 +19,18 @@ use crate::{
     },
     policy::{FlowClaim, normalize_authority, reconcile_authorities},
     semantic::{
-        BoundedRequestBody, HttpVersion, SemanticHeaders, SemanticRequest, SemanticRequestParts,
+        BoundedRequestBody, SemanticHeaders, SemanticRequest, SemanticRequestParts,
         semantic_request_headers,
     },
 };
-
 use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest};
 use bytes::{Buf, Bytes};
-
 use h3::{
     ConnectionState,
     error::{Code, StreamError},
     quic::StreamId,
     server::RequestStream,
 };
-
 use h3_datagram::datagram_handler::DatagramSender;
 use h3_quinn::datagram::SendDatagramHandler;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -457,8 +454,6 @@ pub(super) fn semantic_request(
         path: uri.path(),
         raw_query: uri.query(),
         headers,
-        source_version: HttpVersion::Http3,
-        target_version: HttpVersion::Http3,
         session,
         body: BoundedRequestBody::empty(),
     })?)
@@ -1199,12 +1194,10 @@ mod tests {
         body_task_result, build_upstream_request, has_capsule_protocol, require_capsule_protocol,
         semantic_request, session_open_error, upstream_headers,
     };
-
     use crate::http3::{
         BoxError,
         session::{SessionKey, SessionProtocol},
     };
-
     use agent_sandbox_core::AttributionToken;
 
     fn request(uri: &str, host: Option<&str>) -> http::Request<()> {

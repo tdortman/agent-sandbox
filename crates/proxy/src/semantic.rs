@@ -6,7 +6,6 @@ use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
     HttpSessionMetadata as CoreHttpSessionMetadata,
 };
-
 use http::HeaderMap;
 use std::fmt;
 
@@ -136,43 +135,19 @@ impl SemanticHeaders {
         Self(Vec::new())
     }
 
-    pub fn push(&mut self, header: SemanticHeader) {
-        self.0.push(header);
-    }
-
     /// # Errors
     /// Returns [`HeaderError`] for an invalid field name or value.
     pub fn try_push<V>(&mut self, name: &str, value: V) -> Result<(), HeaderError>
     where
         V: AsRef<[u8]>,
     {
-        self.push(SemanticHeader::new(name, value)?);
+        self.0.push(SemanticHeader::new(name, value)?);
         Ok(())
     }
 
     #[must_use]
     pub fn as_slice(&self) -> &[SemanticHeader] {
         &self.0
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl AsRef<[SemanticHeader]> for SemanticHeaders {
-    fn as_ref(&self) -> &[SemanticHeader] {
-        self.as_slice()
-    }
-}
-
-impl IntoIterator for SemanticHeaders {
-    type IntoIter = std::vec::IntoIter<SemanticHeader>;
-    type Item = SemanticHeader;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
     }
 }
 
@@ -200,30 +175,6 @@ impl RawQuery {
     }
 }
 
-impl TryFrom<String> for RawQuery {
-    type Error = ValueError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(&value)
-    }
-}
-
-impl TryFrom<&str> for RawQuery {
-    type Error = ValueError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
-impl std::str::FromStr for RawQuery {
-    type Err = ValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
 /// Optional session attribution for extended HTTP sessions.
 ///
 /// The core type owns the wire shape and validation; the semantic request
@@ -241,43 +192,44 @@ pub enum RequestTerminal {
 /// Validates request body chunks without buffering them.
 ///
 /// Production pushes each chunk and forwards it immediately, so the queue
-/// never holds more than one element and the buffer limits are unreachable.
+/// never holds more than one element and the buffer limit is unreachable.
 /// What survives is single-chunk validation: the chunk bound, trailers, and
 /// terminal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedRequestBody {
     max_chunk_bytes: usize,
-    trailers: Option<SemanticHeaders>,
-    terminal: Option<RequestTerminal>,
+    trailers: bool,
+    terminal: bool,
+}
+
+impl BoundedRequestBody {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            max_chunk_bytes: 16 * 1024,
+            trailers: false,
+            terminal: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for BoundedRequestBody {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BoundedRequestBody {
     /// # Errors
-    /// Returns [`BodyError::InvalidLimit`] when the chunk bound is zero.
-    pub const fn new(max_chunk_bytes: usize) -> Result<Self, BodyError> {
-        if max_chunk_bytes == 0 {
-            return Err(BodyError::InvalidLimit);
-        }
-
-        Ok(Self {
-            max_chunk_bytes,
-            trailers: None,
-            terminal: None,
-        })
-    }
-
-    #[must_use]
-    /// # Panics
-    /// This function uses fixed nonzero limits.
-    pub fn empty() -> Self {
-        Self::new(16 * 1024).expect("constant body limits are valid")
-    }
-
-    /// # Errors
     /// Returns [`BodyError`] when the body is terminal or the chunk exceeds
     /// the configured chunk bound.
     pub const fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), BodyError> {
-        if self.terminal.is_some() || self.trailers.is_some() {
+        if self.terminal || self.trailers {
             return Err(BodyError::AfterTerminal);
         }
 
@@ -290,33 +242,33 @@ impl BoundedRequestBody {
 
     /// # Errors
     /// Returns [`BodyError`] when the body is terminal or already has trailers.
-    pub fn set_trailers(&mut self, trailers: SemanticHeaders) -> Result<(), BodyError> {
-        if self.terminal.is_some() {
+    pub const fn set_trailers(&mut self) -> Result<(), BodyError> {
+        if self.terminal {
             return Err(BodyError::AfterTerminal);
         }
 
-        if self.trailers.is_some() {
+        if self.trailers {
             return Err(BodyError::TrailersAlreadySet);
         }
 
-        self.trailers = Some(trailers);
+        self.trailers = true;
         Ok(())
     }
 
     /// # Errors
     /// Returns [`BodyError::AfterTerminal`] when the body is already terminal.
-    pub fn finish(&mut self) -> Result<(), BodyError> {
-        self.terminate(RequestTerminal::Complete)
+    pub const fn finish(&mut self) -> Result<(), BodyError> {
+        self.terminate()
     }
 
     /// # Errors
     /// Returns [`BodyError::AfterTerminal`] when the body is already terminal.
-    pub fn terminate(&mut self, terminal: RequestTerminal) -> Result<(), BodyError> {
-        if self.terminal.is_some() {
+    pub const fn terminate(&mut self) -> Result<(), BodyError> {
+        if self.terminal {
             return Err(BodyError::AfterTerminal);
         }
 
-        self.terminal = Some(terminal);
+        self.terminal = true;
         Ok(())
     }
 }
@@ -331,8 +283,6 @@ pub struct SemanticRequest {
     raw_path: Box<str>,
     raw_query: Option<RawQuery>,
     headers: SemanticHeaders,
-    source_version: HttpVersion,
-    target_version: HttpVersion,
     session: Option<SessionMetadata>,
     body: BoundedRequestBody,
 }
@@ -345,8 +295,6 @@ pub struct SemanticRequestParts<'a> {
     pub path: &'a str,
     pub raw_query: Option<&'a str>,
     pub headers: SemanticHeaders,
-    pub source_version: HttpVersion,
-    pub target_version: HttpVersion,
     pub session: Option<SessionMetadata>,
     pub body: BoundedRequestBody,
 }
@@ -370,8 +318,6 @@ impl SemanticRequest {
             raw_path: parts.path.into(),
             raw_query,
             headers: parts.headers,
-            source_version: parts.source_version,
-            target_version: parts.target_version,
             session: parts.session,
             body: parts.body,
         })
@@ -412,28 +358,8 @@ impl SemanticRequest {
     }
 
     #[must_use]
-    pub const fn scheme(&self) -> HttpScheme {
-        self.scheme
-    }
-
-    #[must_use]
     pub fn authority(&self) -> &str {
         &self.authority
-    }
-
-    #[must_use]
-    pub const fn path(&self) -> &SemanticPath {
-        &self.path
-    }
-
-    #[must_use]
-    pub fn raw_path(&self) -> &str {
-        &self.raw_path
-    }
-
-    #[must_use]
-    pub const fn raw_query(&self) -> Option<&RawQuery> {
-        self.raw_query.as_ref()
     }
 
     #[must_use]
@@ -442,27 +368,8 @@ impl SemanticRequest {
     }
 
     #[must_use]
-    pub const fn source_version(&self) -> HttpVersion {
-        self.source_version
-    }
-
-    #[must_use]
-    pub const fn target_version(&self) -> HttpVersion {
-        self.target_version
-    }
-
-    #[must_use]
     pub const fn session(&self) -> Option<&SessionMetadata> {
         self.session.as_ref()
-    }
-
-    #[must_use]
-    pub const fn body(&self) -> &BoundedRequestBody {
-        &self.body
-    }
-
-    pub const fn body_mut(&mut self) -> &mut BoundedRequestBody {
-        &mut self.body
     }
 
     #[must_use]
@@ -523,17 +430,6 @@ pub struct ResponseHead {
 
 impl ResponseHead {
     /// # Errors
-    /// Returns [`EventError`] when the status is outside the informational
-    /// range.
-    pub fn informational(status: u16, headers: SemanticHeaders) -> Result<Self, EventError> {
-        if !(100..200).contains(&status) {
-            return Err(EventError::InvalidInformationalStatus);
-        }
-
-        Ok(Self { status, headers })
-    }
-
-    /// # Errors
     /// Returns [`EventError`] when the status is not a valid final status.
     pub fn final_head(status: u16, headers: SemanticHeaders) -> Result<Self, EventError> {
         if !(200..1000).contains(&status) {
@@ -571,14 +467,18 @@ pub enum TerminalError {
 ///
 /// Production validates each event as it arrives and forwards it immediately,
 /// so events are never queued and the event-count limit is unreachable. What
-/// survives is phase validation: final head ordering, trailers, terminal
-/// state, and the single-chunk bound.
+/// survives is phase validation: final head ordering, trailers, and terminal
+/// state.
+/// Upper bound on a single body chunk the proxy accepts from an upstream.
+/// A chunk above this size is rejected as [`EventError::BufferFull`] to stop
+/// a peer from forcing a single oversized allocation.
+const MAX_BODY_CHUNK_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseSequence {
     final_seen: bool,
     trailers_seen: bool,
     terminal_seen: bool,
-    max_body_bytes: usize,
 }
 
 impl ResponseSequence {
@@ -588,16 +488,7 @@ impl ResponseSequence {
             final_seen: false,
             trailers_seen: false,
             terminal_seen: false,
-            max_body_bytes: 1024 * 1024,
         }
-    }
-
-    /// Construct a sequence with a custom body bound.
-    #[must_use]
-    pub const fn with_limits(max_body_bytes: usize) -> Self {
-        let mut sequence = Self::new();
-        sequence.max_body_bytes = max_body_bytes;
-        sequence
     }
 
     /// # Errors
@@ -620,7 +511,7 @@ impl ResponseSequence {
                 if !self.final_seen || self.trailers_seen {
                     return Err(EventError::InvalidOrdering);
                 }
-                if chunk.len() > self.max_body_bytes {
+                if chunk.len() > MAX_BODY_CHUNK_BYTES {
                     return Err(EventError::BufferFull);
                 }
             }
@@ -671,23 +562,14 @@ pub enum ValueError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BodyError {
-    #[error("body limit is invalid")]
-    InvalidLimit,
-
     #[error("body chunk exceeds the configured limit")]
     ChunkTooLarge,
-
-    #[error("body buffer is full")]
-    BufferFull,
 
     #[error("body is already terminal")]
     AfterTerminal,
 
     #[error("request trailers are already set")]
     TrailersAlreadySet,
-
-    #[error("body buffered byte count is inconsistent")]
-    InvalidBufferedBytes,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -697,9 +579,6 @@ pub enum SemanticRequestError {
 
     #[error(transparent)]
     Query(#[from] ValueError),
-
-    #[error("serialized path does not match raw path normalization")]
-    PathMismatch,
 
     #[error("OPTIONS is required for the asterisk request target")]
     AsteriskRequiresOptions,
@@ -713,20 +592,11 @@ pub enum EventError {
     #[error("response event is out of order")]
     InvalidOrdering,
 
-    #[error("informational status is not in the 1xx range")]
-    InvalidInformationalStatus,
+    #[error("response body chunk exceeds the configured limit")]
+    BufferFull,
 
     #[error("final status is in the 1xx range")]
     InvalidFinalStatus,
-
-    #[error("response event limit is invalid")]
-    InvalidLimit,
-
-    #[error("response event buffer is full")]
-    BufferFull,
-
-    #[error("response sequence state does not match its events")]
-    InvalidState,
 }
 
 fn canonical_authority(scheme: HttpScheme, authority: &HttpAuthority) -> String {
@@ -759,6 +629,16 @@ const fn is_invalid_header_value_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
 
+    impl BoundedRequestBody {
+        fn with_chunk_bound(max_chunk_bytes: usize) -> Self {
+            Self {
+                max_chunk_bytes,
+                trailers: false,
+                terminal: false,
+            }
+        }
+    }
+
     #[test]
     fn request_wire_preserves_raw_query_and_policy_ignores_it() {
         let request = SemanticRequest::from_parts(SemanticRequestParts {
@@ -768,8 +648,6 @@ mod tests {
             path: "/a/../b",
             raw_query: Some("x=1&x=2"),
             headers: SemanticHeaders::new(),
-            source_version: HttpVersion::Http11,
-            target_version: HttpVersion::Http11,
             session: None,
             body: BoundedRequestBody::empty(),
         })
@@ -795,11 +673,10 @@ mod tests {
     }
 
     #[test]
-    fn body_chunk_bound_and_limits_are_validated() {
-        let mut body = BoundedRequestBody::new(2).expect("valid limits");
+    fn body_chunk_bound_is_validated() {
+        let mut body = BoundedRequestBody::with_chunk_bound(2);
         body.push_chunk(&[1, 2]).expect("chunk at the bound");
         assert_eq!(body.push_chunk(&[1, 2, 3]), Err(BodyError::ChunkTooLarge));
-        assert_eq!(BoundedRequestBody::new(0), Err(BodyError::InvalidLimit));
     }
 
     #[test]
@@ -837,8 +714,6 @@ mod tests {
                 path: "*",
                 raw_query: None,
                 headers: SemanticHeaders::new(),
-                source_version: HttpVersion::Http11,
-                target_version: HttpVersion::Http11,
                 session: None,
                 body: BoundedRequestBody::empty(),
             })
@@ -915,6 +790,21 @@ mod tests {
     }
 
     #[test]
+    fn sequence_rejects_single_body_chunk_over_the_bound() {
+        let mut sequence = ResponseSequence::new();
+        sequence
+            .push(ResponseEvent::Final(
+                ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
+            ))
+            .expect("final");
+
+        assert_eq!(
+            sequence.push(ResponseEvent::BodyChunk(vec![0; MAX_BODY_CHUNK_BYTES + 1])),
+            Err(EventError::BufferFull)
+        );
+    }
+
+    #[test]
     fn terminal_failures_can_end_before_response_head() {
         let events = [
             ResponseEvent::Cancelled,
@@ -934,32 +824,13 @@ mod tests {
     }
 
     #[test]
-    fn request_trailers_and_response_chunk_bound_apply() {
+    fn request_trailers_and_termination_apply() {
         let mut body = BoundedRequestBody::empty();
-        body.set_trailers(SemanticHeaders::new()).expect("trailers");
+        body.set_trailers().expect("trailers");
 
-        assert_eq!(
-            body.set_trailers(SemanticHeaders::new()),
-            Err(BodyError::TrailersAlreadySet)
-        );
+        assert_eq!(body.set_trailers(), Err(BodyError::TrailersAlreadySet));
 
         body.finish().expect("finish");
         assert_eq!(body.push_chunk(&[1]), Err(BodyError::AfterTerminal));
-        let mut sequence = ResponseSequence::with_limits(1);
-
-        sequence
-            .push(ResponseEvent::Final(
-                ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
-            ))
-            .expect("final");
-
-        sequence
-            .push(ResponseEvent::BodyChunk(vec![1]))
-            .expect("body");
-
-        assert_eq!(
-            sequence.push(ResponseEvent::BodyChunk(vec![2; 2])),
-            Err(EventError::BufferFull)
-        );
     }
 }

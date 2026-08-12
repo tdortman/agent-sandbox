@@ -16,11 +16,9 @@ use crate::{
         BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
     },
 };
-
 use agent_sandbox_core::{HttpCheckReply, HttpUrl};
 use doh::{is_doh_request, rewrite_doh_response};
 use nix::sys::socket::{getsockopt, sockopt};
-
 use rama_core::{
     Service,
     bytes::Bytes,
@@ -30,7 +28,6 @@ use rama_core::{
     rt::Executor,
     service::service_fn,
 };
-
 use rama_http::{
     Body, HeaderValue, Request, Response, StatusCode, Version,
     body::{Frame, StreamingBody},
@@ -41,9 +38,7 @@ use rama_http::{
         version_adapter::{ResponseVersionAdaptCtx, adapt_response_version},
     },
 };
-
 use rama_http_backend::server::HttpServer;
-
 use rama_net::{
     address::SocketAddress,
     http::server::HttpPeekRouter,
@@ -51,15 +46,12 @@ use rama_net::{
     socket::{SocketOptions, opts::Domain},
     stream::Socket,
 };
-
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
 pub(crate) use semantic::SemanticRequestBody;
 use semantic::{bridge_response_body, semantic_http_version};
-
 #[cfg(debug_assertions)]
 use std::path::{Path, PathBuf};
-
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
@@ -68,7 +60,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-
 use tls::{RustlsTlsService, TlsServerName, build_tcp_tls_config};
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
@@ -638,7 +629,7 @@ async fn check_http_policy(
         .to_owned();
 
     let raw_query = request.uri().query().map(|query| query.to_string());
-    let semantic_version = semantic_http_version(request.version())?;
+    semantic_http_version(request.version())?;
 
     let semantic_request = SemanticRequest::from_parts(SemanticRequestParts {
         method: request.method().as_str(),
@@ -656,8 +647,6 @@ async fn check_http_policy(
                 )
             }),
         ))?,
-        source_version: semantic_version,
-        target_version: semantic_version,
         session: None,
         body: BoundedRequestBody::empty(),
     })?;
@@ -988,17 +977,14 @@ mod tests {
         is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
         request_head_clone,
     };
-
     use crate::{
         alt_svc::AltSvcStore,
         policy::{FlowClaim, PolicySession, test_support::FakePolicy},
         tcp_backend::upstream::UpstreamClients,
     };
-
     use agent_sandbox_core::{
         AttributionToken, FlowProtocol, NetworkFlowKey, NormalizedPolicyHost, ProxyConnectionId,
     };
-
     use rama_core::{
         Service,
         bytes::Bytes,
@@ -1007,16 +993,13 @@ mod tests {
         rt::Executor,
         service::service_fn,
     };
-
     use rama_http::{
         HeaderMap, HeaderValue, Response,
         body::util::BodyExt,
         io::upgrade::{Upgraded, pending},
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
-
     use rama_net::proxy::IoForwardService;
-
     use std::{
         convert::Infallible,
         net::{IpAddr, SocketAddr},
@@ -1026,7 +1009,6 @@ mod tests {
         sync::Arc,
         task::{Context, Poll},
     };
-
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         sync::{Notify, Semaphore},

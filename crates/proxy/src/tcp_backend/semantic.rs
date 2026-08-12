@@ -1,21 +1,18 @@
 use crate::{
     semantic::{
-        BoundedRequestBody, HttpVersion as SemanticHttpVersion, RequestTerminal, ResponseEvent,
-        ResponseHead, ResponseSequence, SemanticHeaders, TerminalError, is_hop_by_hop_header,
+        BoundedRequestBody, HttpVersion as SemanticHttpVersion, ResponseEvent, ResponseHead,
+        ResponseSequence, SemanticHeaders, TerminalError, is_hop_by_hop_header,
     },
     tcp_backend::is_websocket_upgrade_response,
 };
-
 use rama_core::{
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
 };
-
 use rama_http::{
     Body, HeaderMap, Response, Version,
     body::{Frame, StreamingBody},
 };
-
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -44,9 +41,9 @@ impl SemanticRequestBody {
         }
     }
 
-    fn finish(&mut self, terminal: RequestTerminal) {
+    const fn finish(&mut self) {
         if !self.terminal {
-            let _ = self.semantic.terminate(terminal);
+            let _ = self.semantic.terminate();
             self.terminal = true;
         }
     }
@@ -64,14 +61,12 @@ impl StreamingBody for SemanticRequestBody {
             Poll::Pending => Poll::Pending,
 
             Poll::Ready(None) => {
-                self.finish(RequestTerminal::Complete);
+                self.finish();
                 Poll::Ready(None)
             }
 
             Poll::Ready(Some(Err(error))) => {
-                self.finish(RequestTerminal::Error(TerminalError::Transport(
-                    error.to_string().into_boxed_str(),
-                )));
+                self.finish();
                 Poll::Ready(Some(Err(error)))
             }
 
@@ -79,9 +74,7 @@ impl StreamingBody for SemanticRequestBody {
                 Ok(data) => {
                     for chunk in data.chunks(SEMANTIC_BODY_CHUNK_BYTES) {
                         if let Err(error) = self.semantic.push_chunk(chunk) {
-                            self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
-                                error.to_string().into_boxed_str(),
-                            )));
+                            self.finish();
                             return Poll::Ready(Some(Err(Box::new(error))));
                         }
                     }
@@ -89,31 +82,20 @@ impl StreamingBody for SemanticRequestBody {
                 }
                 Err(frame) => {
                     if let Ok(trailers) = frame.into_trailers() {
-                        let semantic = match semantic_headers_from_map(&trailers) {
-                            Ok(semantic) => semantic,
-                            Err(error) => {
-                                self.finish(RequestTerminal::Error(
-                                    TerminalError::ProtocolViolation(
-                                        error.to_string().into_boxed_str(),
-                                    ),
-                                ));
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                        };
+                        if let Err(error) = semantic_headers_from_map(&trailers) {
+                            self.finish();
+                            return Poll::Ready(Some(Err(error)));
+                        }
 
-                        if let Err(error) = self.semantic.set_trailers(semantic) {
-                            self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
-                                error.to_string().into_boxed_str(),
-                            )));
+                        if let Err(error) = self.semantic.set_trailers() {
+                            self.finish();
                             return Poll::Ready(Some(Err(Box::new(error))));
                         }
 
                         Poll::Ready(Some(Ok(Frame::trailers(trailers))))
                     } else {
                         let error = BoxError::from_static_str("HTTP body frame has unknown type");
-                        self.finish(RequestTerminal::Error(TerminalError::ProtocolViolation(
-                            error.to_string().into_boxed_str(),
-                        )));
+                        self.finish();
                         Poll::Ready(Some(Err(error)))
                     }
                 }
@@ -132,7 +114,7 @@ impl StreamingBody for SemanticRequestBody {
 
 impl Drop for SemanticRequestBody {
     fn drop(&mut self) {
-        self.finish(RequestTerminal::Cancellation);
+        self.finish();
     }
 }
 
@@ -312,7 +294,6 @@ pub fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, Bo
 mod tests {
     use super::{SemanticRequestBody, bridge_response_body, semantic_response_headers};
     use crate::semantic::{BoundedRequestBody, semantic_request_headers};
-
     use rama_http::{
         Body, HeaderMap, HeaderValue, Request, Response, StatusCode, body::util::BodyExt,
     };
