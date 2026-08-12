@@ -462,7 +462,17 @@ lib.mkIf policyEnabled (
                 ]
                 ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
 
-                deny = map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
+                deny = [
+                  {
+                    access = "all";
+                    path = "~/.config/agent-sandbox";
+                  }
+                  {
+                    access = "all";
+                    path = "./.agent-sandbox";
+                  }
+                ]
+                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
               };
             }
         //

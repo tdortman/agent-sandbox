@@ -1,12 +1,10 @@
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
-
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
     ResourceRuleKey, SocketAccess, Verdict, contains_glob_syntax, discover_git_project_root,
     expand_policy_path, host_pattern_matches, normalize_directory_traverse_access, normalize_host,
 };
-
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -516,7 +514,20 @@ impl PolicyStore {
             };
 
             if meta.is_dir() {
-                if !Self::walk_dir_inodes(&entry.path, entry.access, &mut inodes, &mut budget) {
+                // One visited set per rule: a directory reached through
+                // another rule's symlink must still be walked when this rule
+                // carries a different access level, or the narrower deny would
+                // be lost. Cycles within one rule's reachable tree terminate
+                // because the set is shared across that rule's recursion.
+                let mut visited_dirs: HashSet<(u64, u64)> = HashSet::new();
+
+                if !Self::walk_dir_inodes(
+                    &entry.path,
+                    entry.access,
+                    &mut inodes,
+                    &mut visited_dirs,
+                    &mut budget,
+                ) {
                     tracing::warn!(
                         path = %entry.path.display(),
                         limit = MAX_DENY_INODE_ENTRIES,
@@ -547,13 +558,32 @@ impl PolicyStore {
     /// per cached file; returns `false` when the budget is exhausted and the
     /// walk was abandoned (deny rules on huge trees, e.g. snapshot
     /// directories, would otherwise consume unbounded time and memory).
+    ///
+    /// Symlinks are followed: a member that is a symlink to a regular file is
+    /// indexed by its resolved target inode, and a member that is a symlink to
+    /// a directory recurses into that target. `visited_dirs` holds the inode
+    /// identity of every followed directory so a symlink cycle (`link -> .` or
+    /// `link -> ..`) terminates and aliases to the same real directory are
+    /// walked once.
     fn walk_dir_inodes(
         dir: &Path,
         access: FileAccess,
         inodes: &mut HashMap<InodeIdentity, Vec<DenyCacheEntry>>,
+        visited_dirs: &mut HashSet<(u64, u64)>,
         budget: &mut usize,
     ) -> bool {
         use std::os::unix::fs::MetadataExt;
+
+        // The followed target of `dir`: `read_dir` and recursion below follow
+        // a symlinked directory, so key the visit on the real directory's
+        // inode. This both terminates cycles and dedups aliases.
+        let Ok(dir_meta) = std::fs::metadata(dir) else {
+            return true;
+        };
+
+        if !visited_dirs.insert((dir_meta.dev(), dir_meta.ino())) {
+            return true;
+        }
 
         let Ok(entries) = std::fs::read_dir(dir) else {
             return true;
@@ -564,27 +594,44 @@ impl PolicyStore {
                 return false;
             }
 
-            let Ok(meta) = entry.metadata() else {
+            // `file_type` does not follow the link, so a real subdirectory is
+            // recursed into directly. Symlinked members are resolved below.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            if file_type.is_dir() {
+                if !Self::walk_dir_inodes(&entry.path(), access, inodes, visited_dirs, budget) {
+                    return false;
+                }
+                continue;
+            }
+
+            // Follow the target: a regular file is indexed by its real inode
+            // (matching `InodeIdentity::from_path` on the requested path), and
+            // a symlinked directory recurses into its target.
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
                 continue;
             };
 
             if meta.is_dir() {
-                if !Self::walk_dir_inodes(&entry.path(), access, inodes, budget) {
+                if !Self::walk_dir_inodes(&entry.path(), access, inodes, visited_dirs, budget) {
                     return false;
                 }
-            } else {
-                *budget -= 1;
-
-                let identity = InodeIdentity {
-                    inode: meta.ino(),
-                    device: meta.dev(),
-                };
-
-                inodes.entry(identity).or_default().push(DenyCacheEntry {
-                    path: entry.path(),
-                    access,
-                });
+                continue;
             }
+
+            *budget -= 1;
+
+            let identity = InodeIdentity {
+                inode: meta.ino(),
+                device: meta.dev(),
+            };
+
+            inodes.entry(identity).or_default().push(DenyCacheEntry {
+                path: entry.path(),
+                access,
+            });
         }
 
         true
@@ -801,16 +848,13 @@ mod tests {
         is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
         session_sudo_matches,
     };
-
     use crate::store::{UiSessionContext, types::UiClient};
-
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, DeviceAccess, FileAccess, FilesystemRule, FilesystemRuleKey,
         NetworkRule, NetworkRuleKey, Policy, ProcessIds, ResolvedRequestContext, ResourceAccess,
         ResourceKind, SandboxPaths, SocketAccess, Verdict, VerdictSource, atomic_write_policy,
         trusted_project_policy_path,
     };
-
     use std::{collections::HashSet, path::Path, sync::Arc};
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -1853,6 +1897,216 @@ mod tests {
                 .filesystem_allow_source(&nested_path, FileAccess::Read, &ctx)
                 .await,
             Some(Verdict::allowed(VerdictSource::Static))
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_directory_follows_symlink_to_real_target_inode() {
+        // A denied directory whose members are symlinks to files elsewhere
+        // must deny reads of the resolved target path. fsmon forwards the
+        // path after the kernel resolves the symlink, so a symlink cache hit
+        // on the link inode would miss the request for the real file.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let real = dir
+            .path()
+            .join("home/dotfiles/home/dot_config/agent-sandbox/packages");
+        std::fs::create_dir_all(&real).expect("real target dir");
+        std::fs::create_dir_all(home.join(".config/agent-sandbox/packages")).expect("alias dir");
+        let secret = real.join("codex.json");
+        std::fs::write(&secret, "policy").expect("write real policy file");
+        std::os::unix::fs::symlink(
+            &secret,
+            home.join(".config/agent-sandbox/packages/codex.json"),
+        )
+        .expect("symlink into denied dir");
+
+        // The declarative layer denies ~/.config/agent-sandbox, exactly as the
+        // host-wide policy declares.
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            "~/.config/agent-sandbox".to_string(),
+            FileAccess::All,
+            "deny policy tree",
+        ));
+        atomic_write_policy(
+            &dir.path().join("declarative.json"),
+            &policy,
+            Some(&home),
+            None,
+            None,
+        )
+        .expect("write declarative policy");
+
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
+
+        let project_root_s = real.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-symlink".into()),
+            package: None,
+        };
+
+        assert_eq!(
+            store
+                .filesystem_allow_source(&secret, FileAccess::Read, &ctx)
+                .await,
+            Some(Verdict::denied(VerdictSource::policy())),
+            "reading the symlink target under a denied directory must be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_walk_follows_symlinked_directories_and_terminates_cycles() {
+        // A file reachable only through a symlinked directory inside a denied
+        // tree must be denied: the walk follows the link to its target, so the
+        // real file's inode is indexed. A self-referential link (`.config/
+        // agent-sandbox/loop -> .config/agent-sandbox`) must terminate instead
+        // of looping the walk.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let denied = home.join(".config/agent-sandbox");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&denied).expect("denied dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let notes = outside.join("notes.txt");
+        std::fs::write(&notes, "plain").expect("outside file");
+        std::os::unix::fs::symlink(&outside, denied.join("escape")).expect("dir symlink");
+        // A self-referential link would send a naive recursive walk into a
+        // loop; the visited-directory guard must terminate it.
+        std::os::unix::fs::symlink(&denied, denied.join("loop")).expect("cycle symlink");
+        std::os::unix::fs::symlink(".", denied.join("dot")).expect("self-cycle symlink");
+
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            "~/.config/agent-sandbox".to_string(),
+            FileAccess::All,
+            "deny policy tree",
+        ));
+        atomic_write_policy(
+            &dir.path().join("declarative.json"),
+            &policy,
+            Some(&home),
+            None,
+            None,
+        )
+        .expect("write declarative policy");
+
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
+
+        let project_root_s = dir.path().to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-symlink-dir".into()),
+            package: None,
+        };
+
+        // The file outside the denied tree is reachable only through the
+        // symlinked directory. The walk follows the link, indexes the real
+        // inode, and denies the read.
+        assert_eq!(
+            store
+                .filesystem_allow_source(&notes, FileAccess::Read, &ctx)
+                .await,
+            Some(Verdict::denied(VerdictSource::policy())),
+            "a file reached through a symlinked directory must be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_walk_preserves_distinct_access_levels_across_rules() {
+        // Two deny rules where one directory is reached through a different
+        // rule's symlink must not collapse into the narrower access. Rule A
+        // denies `~/.config/a` read-only; rule B denies `~/.config/b`, which
+        // symlinks to the same real directory, read-write. The write deny
+        // must survive even though the shared directory was already walked
+        // for rule A's read.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let real = dir.path().join("real-shared");
+        std::fs::create_dir_all(&real).expect("real shared dir");
+        let secret = real.join("notes.txt");
+        std::fs::write(&secret, "secret").expect("write shared file");
+        std::fs::create_dir_all(home.join(".config/a")).expect("a dir");
+        std::fs::create_dir_all(home.join(".config/b")).expect("b dir");
+        std::os::unix::fs::symlink(&real, home.join(".config/a/shared")).expect("a link");
+        std::os::unix::fs::symlink(&real, home.join(".config/b/shared")).expect("b link");
+
+        let mut policy = Policy::default();
+        policy.filesystem.deny.push(FilesystemRule::new(
+            "~/.config/a".to_string(),
+            FileAccess::Read,
+            "deny a read-only",
+        ));
+        policy.filesystem.deny.push(FilesystemRule::new(
+            "~/.config/b".to_string(),
+            FileAccess::Write,
+            "deny b write",
+        ));
+        atomic_write_policy(
+            &dir.path().join("declarative.json"),
+            &policy,
+            Some(&home),
+            None,
+            None,
+        )
+        .expect("write declarative policy");
+
+        let store = super::super::types::PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_mins(1),
+            false,
+        ));
+
+        let project_root_s = real.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new(&project_root_s, &home_s, &project_root_s),
+            ids: ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-symlink-access".into()),
+            package: None,
+        };
+
+        // Rule A (Read) denies the read.
+        assert_eq!(
+            store
+                .filesystem_allow_source(&secret, FileAccess::Read, &ctx)
+                .await,
+            Some(Verdict::denied(VerdictSource::policy()))
+        );
+
+        // Rule B (Write) must also deny the write even though rule A already
+        // indexed the same shared directory, otherwise write access leaks.
+        assert_eq!(
+            store
+                .filesystem_allow_source(&secret, FileAccess::Write, &ctx)
+                .await,
+            Some(Verdict::denied(VerdictSource::policy())),
+            "a narrower write deny through a symlinked dir must survive an earlier read deny"
         );
     }
 

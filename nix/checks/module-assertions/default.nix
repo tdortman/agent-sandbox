@@ -431,6 +431,14 @@ let
           deny = [
             {
               access = "all";
+              path = "~/.config/agent-sandbox";
+            }
+            {
+              access = "all";
+              path = "./.agent-sandbox";
+            }
+            {
+              access = "all";
               path = "~/.ssh";
             }
           ];

@@ -1399,6 +1399,10 @@ let
       # The declarative base and the home extension are unreadable in-sandbox.
       sandbox_shell(package, "sandbox-pkg-allowed-bash", "cat /etc/agent-sandbox/packages/sandbox-pkg-allowed-bash.json >/dev/null", expect_success=False)
       sandbox_shell(package, "sandbox-pkg-allowed-bash", "cat ~/.config/agent-sandbox/packages/sandbox-pkg-allowed-bash.json >/dev/null", expect_success=False)
+      # Reading through the resolved symlink target must also be denied. The
+      # monitor sees the real path after the kernel resolves the link, so the
+      # deny must follow the symlink to its target inode.
+      sandbox_shell(package, "sandbox-pkg-allowed-bash", "cat /home/user/agent-sandbox-pkg-link-target/extension.json >/dev/null", expect_success=False)
       # A write through the symlinked extension is blocked (ro-bound target).
       sandbox_shell(package, "sandbox-pkg-allowed-bash", "printf changed >> ~/.config/agent-sandbox/packages/sandbox-pkg-allowed-bash.json", expect_success=False)
 
