@@ -20,7 +20,10 @@ use agent_sandbox_core::{
     contract_project_path, host_pattern_matches, is_ip_literal, normalize_dns_name, scheme_for,
     split_check_aliases,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+};
 use tracing::warn;
 
 /// Default project-relative rule path shown in approval prompts.
@@ -483,28 +486,25 @@ async fn handle_dbus_unavailable(
     target: DbusTarget,
     package: Option<&str>,
 ) -> Result<(), UiCliError> {
-    let Some(action) = choose_action(&format!(
+    let action_title = format!(
         "{}: D-Bus {} {}",
         prompt_tag(package),
         message_kind_name(target.message_kind),
         target.member,
-    ))
-    .await?
-    else {
-        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
-    };
+    );
 
-    let Some(scope) = choose_scope_only(
-        &format!("{}: {} D-Bus scope?", prompt_tag(package), action.verb()),
+    let Some((action, choice)) = choose_action_scope_target(
+        &action_title,
+        "D-Bus",
         session_id.is_some(),
         package.is_some(),
+        package,
+        move |_, _| async move { Ok(Some(ApprovalTarget::Dbus { target })) },
     )
     .await?
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
     };
-
-    let target = (scope != ApprovalScope::Once).then_some(ApprovalTarget::Dbus { target });
 
     resolve_choice(
         socket,
@@ -513,12 +513,7 @@ async fn handle_dbus_unavailable(
         sandbox_session_id,
         id,
         action,
-        Some(ScopeOption {
-            label: String::new(),
-            scope,
-            target,
-            comment: None,
-        }),
+        Some(choice),
     )
     .await
 }
@@ -742,38 +737,24 @@ async fn network_push_cli_fallback(
     package: Option<&str>,
 ) -> Result<(), UiCliError> {
     let NetworkPrompt { url, host } = prompt;
+    let action_title = format!("{}: {url}", prompt_tag(package));
 
-    let Some(action) = choose_action(&format!("{}: {url}", prompt_tag(package))).await? else {
-        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
-    };
-
-    let Some(scope) = choose_scope_only(
-        &format!("{}: {} {url} scope?", prompt_tag(package), action.verb()),
+    let Some((action, choice)) = choose_action_scope_target(
+        &action_title,
+        url,
         session_id.is_some(),
         package.is_some(),
+        package,
+        move |action, _scope| async move {
+            let title = format!("{}: {} {url} target?", prompt_tag(package), action.verb());
+            let default_host = host.to_owned();
+            let entered = prompt_blocking(move || pick_text(&title, &default_host)).await?;
+            Ok(entered.map(|host| ApprovalTarget::NetworkHost { host }))
+        },
     )
     .await?
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
-    };
-
-    let target = if scope == ApprovalScope::Once {
-        None
-    } else {
-        let title = format!("{}: {} {url} target?", prompt_tag(package), action.verb());
-        let default_host = host.to_owned();
-        let entered = prompt_blocking(move || pick_text(&title, &default_host)).await?;
-        match entered {
-            Some(host) => Some(ApprovalTarget::NetworkHost { host }),
-            None => return deny_cancellation(socket, paths, sandbox_session_id, id).await,
-        }
-    };
-
-    let choice = ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
     };
 
     resolve_choice(
@@ -937,34 +918,19 @@ async fn handle_http_push(
         return Ok(());
     }
 
-    let Some(action) = choose_action(&title).await? else {
-        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-    };
-
-    let Some(scope) = choose_scope_only(
-        &format!("{}: {} HTTP scope?", prompt_tag(package), action.verb()),
+    let Some((action, choice)) = choose_action_scope_target(
+        &title,
+        "HTTP",
         session_id.is_some(),
         package_available,
+        package,
+        move |action, scope| async move {
+            choose_http_scope_target(&action, scope, &request, package).await
+        },
     )
     .await?
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-    };
-
-    let target = if scope == ApprovalScope::Once {
-        None
-    } else {
-        match choose_http_scope_target(&action, scope, &request, package).await? {
-            Some(target) => Some(target),
-            None => return deny_cancellation(socket, &paths, sandbox_session_id, &id).await,
-        }
-    };
-
-    let choice = ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
     };
 
     resolve_choice(
@@ -1095,39 +1061,23 @@ async fn handle_elevation_push(
         ApprovalReviewOutcome::Unavailable => {}
     }
 
-    let Some(action) = choose_action(&format!("{}: {title}", prompt_tag(package))).await? else {
-        return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-    };
-
-    let Some(scope) = choose_scope_only(
-        &format!("{}: {} sudo scope?", prompt_tag(package), action.verb()),
+    let Some((action, choice)) = choose_action_scope_target(
+        &format!("{}: {title}", prompt_tag(package)),
+        "sudo",
         session_id.is_some(),
         package_available,
+        package,
+        move |action, scope| async move {
+            choose_target_level(
+                &format!("{}: {} sudo target?", prompt_tag(package), action.verb()),
+                sudo_target_options(&argv, scope),
+            )
+            .await
+        },
     )
     .await?
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
-    };
-
-    let target = if scope == ApprovalScope::Once {
-        None
-    } else {
-        match choose_target_level(
-            &format!("{}: {} sudo target?", prompt_tag(package), action.verb()),
-            sudo_target_options(&argv, scope),
-        )
-        .await?
-        {
-            Some(t) => Some(t),
-            None => return deny_cancellation(socket, &paths, sandbox_session_id, &id).await,
-        }
-    };
-
-    let choice = ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
     };
 
     resolve_choice(
@@ -1277,52 +1227,22 @@ async fn choose_filesystem_choice(
     session_available: bool,
     package: Option<&str>,
 ) -> Result<Option<(PromptAction, ScopeOption)>, UiCliError> {
-    let Some(action) = choose_action(&format!(
-        "{}: filesystem {access} action?",
-        prompt_tag(package)
-    ))
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    let Some(scope) = choose_scope_only(
-        &format!(
-            "{}: {} filesystem scope?",
-            prompt_tag(package),
-            action.verb()
-        ),
+    choose_action_scope_target(
+        &format!("{}: filesystem {access} action?", prompt_tag(package)),
+        "filesystem",
         session_available,
         package.is_some(),
+        package,
+        move |_action, _scope| async move {
+            choose_path_target(
+                &format!("{}: allow filesystem {access} path?", prompt_tag(package)),
+                default_rule_path,
+                |rule_path| ApprovalTarget::FilesystemPath { path: rule_path },
+            )
+            .await
+        },
     )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    let target = if scope == ApprovalScope::Once {
-        None
-    } else {
-        let Some(target) = choose_path_target(
-            &format!("{}: allow filesystem {access} path?", prompt_tag(package)),
-            default_rule_path,
-            |rule_path| ApprovalTarget::FilesystemPath { path: rule_path },
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-        Some(target)
-    };
-
-    let choice = ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
-    };
-
-    Ok(Some((action, choice)))
+    .await
 }
 
 struct ResourcePrompt<'a> {
@@ -1453,45 +1373,29 @@ async fn resource_push_cli_fallback(
 ) -> Result<(), UiCliError> {
     let ResourcePrompt { kind, access, path } = prompt;
     let display_path = suggest_project_rule_path(path, paths.project_root());
-    let title = format!("{}: {kind} {access} {display_path}", prompt_tag(package));
+    let action_title = format!("{}: {kind} {access} {display_path}", prompt_tag(package));
 
-    let Some(action) = choose_action(&title).await? else {
-        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
-    };
-
-    let Some(scope) = choose_scope_only(
-        &format!("{}: {} {} scope?", prompt_tag(package), action.verb(), kind),
+    let Some((action, choice)) = choose_action_scope_target(
+        &action_title,
+        &kind.to_string(),
         session_id.is_some(),
         package.is_some(),
+        package,
+        move |_action, _scope| async move {
+            choose_path_target(
+                &format!("{}: allow {kind} {access} path?", prompt_tag(package)),
+                &display_path,
+                move |rule_path| ApprovalTarget::ResourcePath {
+                    resource_kind: kind,
+                    path: rule_path,
+                },
+            )
+            .await
+        },
     )
     .await?
     else {
         return deny_cancellation(socket, paths, sandbox_session_id, id).await;
-    };
-
-    let target = if scope == ApprovalScope::Once {
-        None
-    } else {
-        match choose_path_target(
-            &format!("{}: allow {kind} {access} path?", prompt_tag(package)),
-            &display_path,
-            move |rule_path| ApprovalTarget::ResourcePath {
-                resource_kind: kind,
-                path: rule_path,
-            },
-        )
-        .await?
-        {
-            Some(t) => Some(t),
-            None => return deny_cancellation(socket, paths, sandbox_session_id, id).await,
-        }
-    };
-
-    let choice = ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
     };
 
     resolve_choice(
@@ -1504,6 +1408,58 @@ async fn resource_push_cli_fallback(
         Some(choice),
     )
     .await
+}
+
+/// Run the shared CLI action/scope/target prompt loop.
+///
+/// Returns `Ok(None)` when the user cancels at any step. `build_target`
+/// supplies the approval target for a non-`Once` scope, given the chosen
+/// action and scope; it may itself cancel by returning `Ok(None)`.
+async fn choose_action_scope_target<F, Fut>(
+    action_title: &str,
+    scope_phrase: &str,
+    session_available: bool,
+    package_available: bool,
+    package: Option<&str>,
+    build_target: F,
+) -> Result<Option<(PromptAction, ScopeOption)>, UiCliError>
+where
+    F: FnOnce(PromptAction, ApprovalScope) -> Fut,
+    Fut: Future<Output = Result<Option<ApprovalTarget>, UiCliError>>,
+{
+    let Some(action) = choose_action(action_title).await? else {
+        return Ok(None);
+    };
+
+    let Some(scope) = choose_scope_only(
+        &format!(
+            "{}: {} {scope_phrase} scope?",
+            prompt_tag(package),
+            action.verb()
+        ),
+        session_available,
+        package_available,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let target = if scope == ApprovalScope::Once {
+        None
+    } else {
+        match build_target(action, scope).await? {
+            Some(target) => Some(target),
+            None => return Ok(None),
+        }
+    };
+
+    Ok(Some((action, ScopeOption {
+        label: String::new(),
+        scope,
+        target,
+        comment: None,
+    })))
 }
 
 async fn choose_action(title: &str) -> Result<Option<PromptAction>, UiCliError> {
