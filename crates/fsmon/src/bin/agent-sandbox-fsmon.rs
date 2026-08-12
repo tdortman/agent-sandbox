@@ -306,13 +306,10 @@ fn read_tracee_path_ptr(
     pid: i32,
     path_ptr: u64,
 ) -> io::Result<Option<PathBuf>> {
-    if path_ptr == 0 {
-        return Ok(None);
-    }
-
-    let bytes = read_tracee_bytes(host_proc, pid, path_ptr, 4096)?;
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
+    agent_sandbox_sysutil::read_tracee_path_ptr_with(
+        |addr, len| read_tracee_bytes(host_proc, pid, addr, len),
+        path_ptr,
+    )
 }
 
 fn resolve_relative_open_path(
@@ -442,17 +439,9 @@ fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32
 /// Read bytes from a tracee's address space via `process_vm_readv`, falling
 /// back to `/proc/<pid>/mem` when the syscall is unavailable.
 fn read_tracee_bytes(host_proc: &HostProc, pid: i32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0_u8; len];
-
-    if let Some(n) =
-        agent_sandbox_sysutil::process_vm_readv_into(pid.cast_unsigned(), addr, &mut buf)
-    {
-        buf.truncate(n);
-        return Ok(buf);
-    }
-
-    host_proc.read_memory(pid, addr, &mut buf)?;
-    Ok(buf)
+    agent_sandbox_sysutil::read_tracee_bytes_with(pid.cast_unsigned(), addr, len, |addr, buf| {
+        host_proc.read_memory(pid, addr, buf)
+    })
 }
 
 /// Parse one hex argument from `/proc/<pid>/syscall` (`proc_pid_syscall(5)`).

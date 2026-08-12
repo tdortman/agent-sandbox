@@ -704,18 +704,6 @@ fn filesystem_checks_unlink(path: &Path) -> Option<SyscallTarget> {
     filesystem_target(vec![(normalize_path(path), FileAccess::Write)])
 }
 
-/// Read a NUL-terminated path pointer from the tracee. Returns `None` for a
-/// null pointer or non-UTF-8 path.
-fn read_tracee_path_ptr(pid: u32, path_ptr: u64) -> io::Result<Option<PathBuf>> {
-    if path_ptr == 0 {
-        return Ok(None);
-    }
-
-    let bytes = read_tracee_bytes(pid, path_ptr, 4096)?;
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
-}
-
 /// Resolve a relative tracee path against `dirfd` or cwd (`AT_FDCWD`).
 fn resolve_tracee_path(pid: u32, dirfd: u64, path: PathBuf) -> io::Result<PathBuf> {
     if path.is_absolute() {
@@ -743,7 +731,7 @@ fn resolve_symlink_target(target: Option<PathBuf>, linkpath: &Path) -> Option<Pa
 /// Resolve a tracee `(dirfd, path)` pair the same way the open-family helpers
 /// do.
 fn read_resolved_path_arg(pid: u32, dirfd: u64, path_ptr: u64) -> io::Result<Option<PathBuf>> {
-    let Some(path) = read_tracee_path_ptr(pid, path_ptr)? else {
+    let Some(path) = agent_sandbox_sysutil::read_tracee_path_ptr(pid, path_ptr)? else {
         return Ok(None);
     };
 
@@ -813,7 +801,7 @@ fs_two_path_target!(
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn target_from_symlink(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let target = read_tracee_path_ptr(notif.pid, notif.data.args[0])?;
+    let target = agent_sandbox_sysutil::read_tracee_path_ptr(notif.pid, notif.data.args[0])?;
     let linkpath = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[1])?;
 
     Ok(linkpath.and_then(|linkpath| {
@@ -824,7 +812,7 @@ fn target_from_symlink(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
-    let target = read_tracee_path_ptr(notif.pid, notif.data.args[0])?;
+    let target = agent_sandbox_sysutil::read_tracee_path_ptr(notif.pid, notif.data.args[0])?;
     let linkpath = read_resolved_path_arg(notif.pid, notif.data.args[1], notif.data.args[2])?;
 
     Ok(linkpath.and_then(|linkpath| {

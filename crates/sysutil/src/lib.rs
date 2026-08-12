@@ -14,7 +14,7 @@ use std::{
     ffi::CStr,
     io::{self, Read, Seek, SeekFrom},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 /// Open a pidfd referring to `pid` (Linux 5.3+ `pidfd_open(2)`).
@@ -112,13 +112,20 @@ pub fn ioctl<T>(fd: std::os::fd::RawFd, request: libc::c_ulong, arg: &mut T) -> 
 }
 
 /// Read `len` bytes from `pid`'s address space at `addr` via
-/// `process_vm_readv`, falling back to `/proc/<pid>/mem` when the syscall is
+/// `process_vm_readv`, falling back to `fallback` when the syscall is
 /// unavailable.
 ///
+/// `fallback` receives the address and output buffer. Callers with a
+/// non-default `/proc` mount (e.g. fsmon after `setns`) supply their own
+/// reader; [`read_tracee_bytes`] uses this with the default
+/// `/proc/<pid>/mem` path.
+///
 /// # Errors
-/// Returns an error when both paths fail (process gone, address invalid, or
-/// `/proc/<pid>/mem` unreadable).
-pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+/// Returns the `fallback` error when `process_vm_readv` fails.
+pub fn read_tracee_bytes_with<F>(pid: u32, addr: u64, len: usize, fallback: F) -> io::Result<Vec<u8>>
+where
+    F: FnOnce(u64, &mut [u8]) -> io::Result<()>,
+{
     let mut buf = vec![0u8; len];
 
     if let Some(n) = process_vm_readv_into(pid, addr, &mut buf) {
@@ -126,9 +133,22 @@ pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>>
         return Ok(buf);
     }
 
-    let mem_path = format!("/proc/{pid}/mem");
-    read_proc_mem(Path::new(&mem_path), addr, &mut buf)?;
+    fallback(addr, &mut buf)?;
     Ok(buf)
+}
+
+/// Read `len` bytes from `pid`'s address space at `addr` via
+/// `process_vm_readv`, falling back to `/proc/<pid>/mem` when the syscall is
+/// unavailable.
+///
+/// # Errors
+/// Returns an error when both paths fail (process gone, address invalid, or
+/// `/proc/<pid>/mem` unreadable).
+pub fn read_tracee_bytes(pid: u32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+    read_tracee_bytes_with(pid, addr, len, |addr, buf| {
+        let mem_path = format!("/proc/{pid}/mem");
+        read_proc_mem(Path::new(&mem_path), addr, buf)
+    })
 }
 
 /// Attempt `process_vm_readv` into `buf`. Returns the byte count read, or
@@ -161,6 +181,35 @@ pub fn read_proc_mem(mem_path: &Path, addr: u64, buf: &mut [u8]) -> io::Result<(
     mem.seek(SeekFrom::Start(addr))?;
     mem.read_exact(buf)?;
     Ok(())
+}
+
+/// Read a NUL-terminated path pointer from the tracee via `read_bytes`, which
+/// fetches `len` bytes from the tracee at `addr`. Returns `None` for a null
+/// pointer or non-UTF-8 path.
+///
+/// # Errors
+/// Returns the error from `read_bytes` when the tracee memory cannot be read.
+pub fn read_tracee_path_ptr_with<R>(read_bytes: R, path_ptr: u64) -> io::Result<Option<PathBuf>>
+where
+    R: FnOnce(u64, usize) -> io::Result<Vec<u8>>,
+{
+    if path_ptr == 0 {
+        return Ok(None);
+    }
+
+    let bytes = read_bytes(path_ptr, 4096)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
+}
+
+/// Read a NUL-terminated path pointer from `pid`'s address space using the
+/// default tracee read strategy ([`read_tracee_bytes`]). Returns `None` for
+/// a null pointer or non-UTF-8 path.
+///
+/// # Errors
+/// Returns an error when the tracee memory cannot be read.
+pub fn read_tracee_path_ptr(pid: u32, path_ptr: u64) -> io::Result<Option<PathBuf>> {
+    read_tracee_path_ptr_with(|addr, len| read_tracee_bytes(pid, addr, len), path_ptr)
 }
 
 /// Read the `SO_TYPE` of a socket fd. Returns `None` on any failure so
