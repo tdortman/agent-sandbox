@@ -24,6 +24,8 @@ const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const HELLO: &str = "Hello";
 
+const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
+
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub listen: PathBuf,
@@ -31,7 +33,6 @@ pub struct RelayConfig {
     pub policy_socket: PathBuf,
     pub bus: DbusBus,
     pub context: RequestContext,
-    pub policy_timeout: Duration,
 }
 
 impl RelayConfig {
@@ -47,7 +48,6 @@ impl RelayConfig {
             policy_socket: policy_socket.into(),
             bus: DbusBus::Session,
             context: RequestContext::default(),
-            policy_timeout: Duration::from_secs(305),
         }
     }
 }
@@ -272,7 +272,7 @@ async fn relay_loop(
                     continue;
                 }
                 let target = target_from_message(&client_message, config.bus);
-                let allowed = policy_check(policy, target, config.context.clone(), config.policy_timeout).await;
+                let allowed = policy_check(policy, target, config.context.clone(), POLICY_TIMEOUT).await;
                 if !allowed {
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
@@ -318,7 +318,7 @@ async fn relay_loop(
                     policy,
                     target_from_message(&upstream_message, config.bus),
                     config.context.clone(),
-                    config.policy_timeout,
+                    POLICY_TIMEOUT,
                 )
                 .await
                 {

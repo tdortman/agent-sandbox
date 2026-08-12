@@ -56,7 +56,7 @@ impl PersistentPolicyClient {
     ) -> bool {
         let req = RpcRequest::Check {
             host: Some(target.host.clone()),
-            connect_host: Some(target.connect_host.clone()),
+            connect_host: Some(target.host.clone()),
             port: Some(target.port),
             scheme: target.scheme.clone(),
             url: Some(format!(

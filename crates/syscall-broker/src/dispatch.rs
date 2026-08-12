@@ -22,7 +22,7 @@ fn should_bypass_network_policy(
     };
 
     let is_configured_dns = dns_endpoint.is_some_and(|endpoint| {
-        endpoint.port() == target.port && target.connect_host.parse() == Ok(endpoint.ip())
+        endpoint.port() == target.port && target.host.parse() == Ok(endpoint.ip())
     });
 
     if is_configured_dns {
@@ -230,7 +230,6 @@ mod tests {
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
         NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
             host: host.to_owned(),
-            connect_host: host.to_owned(),
             port,
             scheme: scheme.to_owned(),
         }))

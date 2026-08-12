@@ -10,7 +10,6 @@ fn relay_config_new_preserves_socket_endpoints_and_defaults() {
     assert_eq!(config.upstream_address, "unix:path=/tmp/bus");
     assert_eq!(config.policy_socket, PathBuf::from("/tmp/policy.sock"));
     assert_eq!(config.bus, DbusBus::Session);
-    assert_eq!(config.policy_timeout, std::time::Duration::from_secs(305));
 }
 
 #[test]

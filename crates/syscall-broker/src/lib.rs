@@ -94,7 +94,6 @@ pub enum NetworkMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkTarget {
     pub host: String,
-    pub connect_host: String,
     pub port: u16,
     pub scheme: String,
 }
@@ -646,7 +645,6 @@ fn sockaddr_target(
 
         SockaddrTarget::Inet { ip, port } => SyscallTarget::Network(NetworkTarget {
             host: ip.to_string(),
-            connect_host: ip.to_string(),
             port,
             scheme: scheme.to_string(),
         }),

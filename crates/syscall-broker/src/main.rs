@@ -61,8 +61,9 @@ struct Cli {
     #[arg(long, value_name = "IP:PORT", env = "AGENT_SANDBOX_DNS_ENDPOINT")]
     dns_endpoint: Option<SocketAddr>,
 
-    /// Inherited seccomp user-notification file descriptor. The arm uses
-    /// `SCM_RIGHTS` to pass this fd across exec. The broker sets it
+    /// Inherited seccomp user-notification file descriptor. The arm writes
+    /// the fd number over a `pipe2(O_CLOEXEC)` pair and re-acquires the fd
+    /// via `pidfd_getfd`, then passes it on exec. The broker sets it
     /// non-blocking and loops on `SECCOMP_IOCTL_NOTIF_RECV`.
     #[arg(long, value_name = "FD")]
     listener_fd: i32,

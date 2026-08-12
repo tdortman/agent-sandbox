@@ -19,7 +19,7 @@ use std::{
     fs::OpenOptions,
     io,
     os::unix::ffi::OsStrExt,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process,
 };
 
@@ -85,15 +85,6 @@ fn resolve_netns_path(name: &str) -> io::Result<PathBuf> {
             io::ErrorKind::PermissionDenied,
             "netns path escapes /run/netns",
         ));
-    }
-
-    for component in canonical.components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "netns path escapes /run/netns",
-            ));
-        }
     }
 
     if canonical.file_name().and_then(|n| n.to_str()) != Some(name) {
