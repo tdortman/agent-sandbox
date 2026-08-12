@@ -1,20 +1,16 @@
 //! Policy store types and shared state.
 
 use agent_sandbox_core::{
-    AttributionToken, CheckReply, DbusCheckReply, DbusTarget, ElevateReply, FileAccess,
-    FilesystemCheckReply, FilesystemRule, FilesystemRuleKey, FlowRegistration, HttpCheckReply,
-    HttpContextKey, HttpRequest, HttpRuleTarget, NetworkFlowKey, NetworkRuleKey, PendingHttpId,
-    ProxyConnectionId, ProxyRequestId, ProxySessionToken, ResolvedRequestContext, ResourceAccess,
-    ResourceCheckReply, ResourceKind, ResourceRuleKey, SocketIdentity, VerdictSource,
+    AttributionToken, DbusTarget, FileAccess, FlowRegistration, HttpContextKey, HttpRequest,
+    HttpRuleTarget, PendingHttpId, ProxyConnectionId, ProxySessionToken, ResolvedRequestContext,
+    ResourceAccess, ResourceKind, SocketIdentity, VerdictSource,
 };
-
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, RwLock, atomic::AtomicU64},
     time::{Duration, Instant},
 };
-
 use tokio::{
     net::unix::OwnedWriteHalf,
     sync::{Mutex, oneshot},
@@ -451,115 +447,14 @@ pub struct ProxyFlowState {
     pub last_check: Instant,
 }
 
-/// One decoded HTTP check waiting for the policy UI.
-pub struct HttpWaiter {
-    pub request_id: ProxyRequestId,
-    pub proxy_session: ProxySessionToken,
-    pub attribution_token: AttributionToken,
-    pub tx: oneshot::Sender<HttpCheckReply>,
-}
-
-/// One transport fallback check waiting for a policy verdict.
-pub struct NetworkWaiter {
-    pub proxy: Option<(ProxySessionToken, ProxyRequestId)>,
-    pub tx: oneshot::Sender<CheckReply>,
-}
-
 pub enum ProxyCancellation {
     Active(oneshot::Sender<()>),
     Canceled,
 }
 
-pub struct PolicyDecisionState {
-    pub(crate) session_allow: HashMap<String, HashSet<NetworkRuleKey>>,
-    pub(crate) once_allow: HashSet<NetworkRuleKey>,
-    pub(super) pending: HashMap<String, Pending>,
-    pub(crate) elevation_futures: HashMap<String, oneshot::Sender<ElevateReply>>,
-    pub(crate) network_futures: HashMap<String, Vec<NetworkWaiter>>,
-    pub(crate) filesystem_futures: HashMap<String, Vec<oneshot::Sender<FilesystemCheckReply>>>,
-    pub(crate) resource_futures: HashMap<String, Vec<oneshot::Sender<ResourceCheckReply>>>,
-    pub(crate) dbus_futures: HashMap<String, Vec<oneshot::Sender<DbusCheckReply>>>,
-    pub(crate) http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
-    pub(crate) http_waiters: HashMap<(ProxySessionToken, ProxyRequestId), PendingHttpId>,
-    pub(crate) proxy_cancellations: HashMap<(ProxySessionToken, ProxyRequestId), ProxyCancellation>,
-    pub(crate) ui_clients: HashMap<u64, UiClient>,
-    pub(crate) ui_context_by_session: HashMap<String, UiSessionContext>,
-    pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
-    pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
-    pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,
-    pub(crate) dbus_verdict_cache: HashMap<DbusTarget, VerdictEntry>,
-    pub(crate) http_verdict_cache: HashMap<HttpPendingKey, VerdictEntry>,
-    pub(crate) ui_spawn_last: HashMap<String, Instant>,
-    pub(crate) session_deny: HashMap<String, HashSet<NetworkRuleKey>>,
-    pub(crate) session_sudo_allow: HashMap<String, HashSet<Vec<String>>>,
-    pub(crate) session_sudo_deny: HashMap<String, HashSet<Vec<String>>>,
-    pub(crate) session_filesystem_allow: HashMap<String, HashSet<FilesystemRuleKey>>,
-    pub(crate) session_filesystem_deny: HashMap<String, HashSet<FilesystemRuleKey>>,
-    pub(crate) session_resource_allow: HashMap<String, HashSet<ResourceRuleKey>>,
-    pub(crate) session_dbus_allow: HashMap<String, HashSet<DbusTarget>>,
-    pub(crate) session_dbus_deny: HashMap<String, HashSet<DbusTarget>>,
-    pub(crate) session_resource_deny: HashMap<String, HashSet<ResourceRuleKey>>,
-    pub(crate) http_once_allow: HashSet<HttpPendingKey>,
-    pub(crate) http_once_deny: HashSet<HttpPendingKey>,
-    pub(crate) http_session_allow: HashMap<String, HashSet<HttpScopeKey>>,
-    pub(crate) http_session_deny: HashMap<String, HashSet<HttpScopeKey>>,
-
-    /// Static filesystem allow rules registered by `StartFilesystemMonitor`,
-    /// keyed by sandbox session id (or cwd/project-root context fallback).
-    pub(crate) sandbox_filesystem_static_allow: HashMap<String, Vec<FilesystemRule>>,
-
-    /// Inode cache for hardlink defense. Maps `(inode, device)` to canonical
-    /// paths for files under deny rules. Built by walking deny directories and
-    /// stat'ing concrete deny files. Fingerprinted by deny rule path mtimes.
-    /// When the fingerprint changes the cache is rebuilt on next access.
-    pub(crate) deny_inode_cache: DenyInodeCache,
-
-    /// Active RPC connections per peer uid.
-    pub(crate) connections_by_uid: HashMap<u32, usize>,
-
-    /// Registered flow identities and active claims.
-    pub(crate) proxy_flows: HashMap<NetworkFlowKey, ProxyFlowState>,
-
-    /// The one active trusted proxy session, if any.
-    pub(crate) proxy_session: Option<ProxySessionState>,
-}
-
-impl PolicyDecisionState {
-    pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub(crate) fn pending_values(&self) -> impl Iterator<Item = &Pending> {
-        self.pending.values()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_keys(&self) -> impl Iterator<Item = &String> {
-        self.pending.keys()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_entries(&self) -> impl Iterator<Item = (&String, &Pending)> {
-        self.pending.iter()
-    }
-
-    pub(crate) fn pending_get(&self, pending_id: &str) -> Option<&Pending> {
-        self.pending.get(pending_id)
-    }
-
-    pub(crate) fn insert_pending(&mut self, pending: Pending) -> Option<Pending> {
-        let pending_id = pending.id().to_owned();
-        self.pending.insert(pending_id, pending)
-    }
-
-    pub(crate) fn take_pending(&mut self, pending_id: &str) -> Option<Pending> {
-        self.pending.remove(pending_id)
-    }
-
-    pub(crate) fn restore_pending(&mut self, pending: Pending) {
-        let _ = self.insert_pending(pending);
-    }
-}
+// The decision state lives in `state`, where the deny-wins session
+// buckets and the pending board concentrate their invariants.
+pub use super::state::{HttpWaiter, NetworkWaiter, PolicyDecisionState, ProxyCheckId};
 
 /// Fingerprint entry for one concrete deny rule path.
 #[derive(Debug, Clone, PartialEq, Eq)]

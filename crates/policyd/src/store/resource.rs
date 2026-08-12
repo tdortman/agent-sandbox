@@ -247,7 +247,7 @@ impl PolicyStore {
         // instead of creating a new prompt. The session is part of the key
         // so one sandbox's stale pending is not reused for another's
         // requests to the same socket.
-        let existing_id = inner.pending_values().find_map(|p| match p {
+        let existing_id = inner.pending.pending_values().find_map(|p| match p {
             Pending::Resource(res)
                 if res.kind == kind
                     && res.path == path
@@ -260,7 +260,11 @@ impl PolicyStore {
         });
 
         if let Some(existing_id) = existing_id {
-            let waiter_count = inner.resource_futures.get(&existing_id).map_or(0, Vec::len);
+            let waiter_count = inner
+                .pending
+                .resource_futures
+                .get(&existing_id)
+                .map_or(0, Vec::len);
 
             if waiter_count >= MAX_WAITERS_PER_PENDING {
                 return Err(ResourceCheckReply::blocked(
@@ -272,6 +276,7 @@ impl PolicyStore {
             }
 
             inner
+                .pending
                 .resource_futures
                 .entry(existing_id.clone())
                 .or_default()
@@ -286,7 +291,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(ResourceCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 kind,
@@ -296,7 +301,10 @@ impl PolicyStore {
         }
 
         let pending_id = format!("res:{}", Uuid::now_v7().simple());
-        inner.resource_futures.insert(pending_id.clone(), vec![tx]);
+        inner
+            .pending
+            .resource_futures
+            .insert(pending_id.clone(), vec![tx]);
 
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -315,7 +323,7 @@ impl PolicyStore {
             package: ctx.package.map(String::from),
         });
 
-        inner.insert_pending(pending);
+        inner.pending.insert_pending(pending);
         drop(inner);
 
         Ok(PendingResResult {
@@ -335,7 +343,7 @@ impl PolicyStore {
 
         // Deduplicate: if a pending already exists for the same target and
         // sandbox session, join its waiters instead of creating a new prompt.
-        let existing_id = inner.pending_values().find_map(|p| match p {
+        let existing_id = inner.pending.pending_values().find_map(|p| match p {
             Pending::Dbus(res)
                 if &res.target == target
                     && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
@@ -346,7 +354,11 @@ impl PolicyStore {
         });
 
         if let Some(existing_id) = existing_id {
-            let waiter_count = inner.dbus_futures.get(&existing_id).map_or(0, Vec::len);
+            let waiter_count = inner
+                .pending
+                .dbus_futures
+                .get(&existing_id)
+                .map_or(0, Vec::len);
 
             if waiter_count >= MAX_WAITERS_PER_PENDING {
                 return Err(Box::new(DbusCheckReply::blocked(
@@ -356,6 +368,7 @@ impl PolicyStore {
             }
 
             inner
+                .pending
                 .dbus_futures
                 .entry(existing_id.clone())
                 .or_default()
@@ -370,7 +383,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(Box::new(DbusCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 target.clone(),
@@ -378,7 +391,10 @@ impl PolicyStore {
         }
 
         let pending_id = format!("dbus:{}", Uuid::now_v7().simple());
-        inner.dbus_futures.insert(pending_id.clone(), vec![tx]);
+        inner
+            .pending
+            .dbus_futures
+            .insert(pending_id.clone(), vec![tx]);
 
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -395,7 +411,7 @@ impl PolicyStore {
             package: ctx.package.map(String::from),
         });
 
-        inner.insert_pending(pending);
+        inner.pending.insert_pending(pending);
         drop(inner);
 
         Ok(PendingResResult {
@@ -422,8 +438,8 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.resource_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.resource_futures.remove(pending_id);
                         drop(inner);
 
                         ResourceCheckReply::blocked(
@@ -442,8 +458,8 @@ impl PolicyStore {
                     ),
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.resource_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.resource_futures.remove(pending_id);
                         drop(inner);
 
                         ResourceCheckReply::blocked(
@@ -478,8 +494,8 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.dbus_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.dbus_futures.remove(pending_id);
                         drop(inner);
 
                         DbusCheckReply::blocked(
@@ -493,8 +509,8 @@ impl PolicyStore {
                     }
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.dbus_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.dbus_futures.remove(pending_id);
                         drop(inner);
 
                         DbusCheckReply::blocked(
@@ -522,7 +538,7 @@ impl PolicyStore {
     ) {
         let mut inner = self.inner.lock().await;
 
-        if let Some(waiters) = inner.resource_futures.remove(pending_id) {
+        if let Some(waiters) = inner.pending.resource_futures.remove(pending_id) {
             let reply = if allowed {
                 ResourceCheckReply::allowed(source.clone(), kind, path.clone(), access)
             } else {
@@ -555,7 +571,7 @@ impl PolicyStore {
     ) {
         let mut inner = self.inner.lock().await;
 
-        if let Some(waiters) = inner.dbus_futures.remove(pending_id) {
+        if let Some(waiters) = inner.pending.dbus_futures.remove(pending_id) {
             let reply = if allowed {
                 DbusCheckReply::allowed(source.clone(), target.clone())
             } else {
@@ -674,6 +690,7 @@ mod tests {
         let pending_id = {
             let inner = store.inner.lock().await;
             inner
+                .pending
                 .pending_keys()
                 .find(|k| k.starts_with("res:"))
                 .cloned()
@@ -770,6 +787,7 @@ mod tests {
         let pending_id = {
             let inner = store.inner.lock().await;
             inner
+                .pending
                 .pending_keys()
                 .find(|k| k.starts_with("dbus:"))
                 .cloned()
@@ -815,6 +833,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
+                    .pending
                     .pending_keys()
                     .find(|k| k.starts_with("res:"))
                     .cloned()

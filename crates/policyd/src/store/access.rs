@@ -68,11 +68,11 @@ impl PolicyStore {
     pub(crate) async fn once_allowed(&self, host: &str, port: u16, consume: bool) -> bool {
         let keys = [NetworkRuleKey::new(host, port)];
         let mut inner = self.inner.lock().await;
-        let matched = keys.iter().any(|k| inner.once_allow.contains(k));
+        let matched = keys.iter().any(|k| inner.session.once_allow.contains(k));
 
         if matched && consume {
             for key in keys {
-                inner.once_allow.remove(&key);
+                inner.session.once_allow.remove(&key);
             }
         }
 
@@ -95,6 +95,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|session_id| {
             inner
+                .session
                 .session_allow
                 .get(session_id)
                 .is_some_and(|bucket| session_network_matches(bucket, host, port))
@@ -117,6 +118,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|session_id| {
             inner
+                .session
                 .session_deny
                 .get(session_id)
                 .is_some_and(|bucket| session_network_matches(bucket, host, port))
@@ -164,6 +166,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_sudo_deny
                 .get(sid)
                 .is_some_and(|bucket| session_sudo_matches(bucket, argv))
@@ -180,6 +183,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_sudo_allow
                 .get(sid)
                 .is_some_and(|bucket| session_sudo_matches(bucket, argv))
@@ -308,6 +312,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_filesystem_deny
                 .get(sid)
                 .is_some_and(|bucket| {
@@ -328,6 +333,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_filesystem_allow
                 .get(sid)
                 .is_some_and(|bucket| {
@@ -354,6 +360,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_filesystem_allow
                 .get(sid)
                 .is_some_and(|bucket| {
@@ -785,6 +792,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_resource_deny
                 .get(sid)
                 .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
@@ -803,6 +811,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_resource_allow
                 .get(sid)
                 .is_some_and(|bucket| session_resource_matches(bucket, kind, path, access))
@@ -819,6 +828,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_dbus_deny
                 .get(sid)
                 .is_some_and(|bucket| session_dbus_matches(bucket, target))
@@ -835,6 +845,7 @@ impl PolicyStore {
 
         session_ids.iter().any(|sid| {
             inner
+                .session
                 .session_dbus_allow
                 .get(sid)
                 .is_some_and(|bucket| session_dbus_matches(bucket, target))
@@ -1549,18 +1560,11 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            let super::super::types::PolicyDecisionState {
-                session_filesystem_allow: allow,
-                session_filesystem_deny: deny,
-                ..
-            } = &mut *inner;
             let key = FilesystemRuleKey::new("./.git", FileAccess::ReadWrite);
-            super::super::apply_session_rule(
+            inner.session.filesystem().apply(
                 crate::store::decisions::DecisionAction::Deny,
                 ui_session_id,
                 &key,
-                allow,
-                deny,
             );
             drop(inner);
         }
@@ -2244,15 +2248,13 @@ mod tests {
         {
             let mut inner = store.inner.lock().await;
             inner
+                .session
                 .session_dbus_allow
                 .insert("general-ui".into(), HashSet::from([concrete.clone()]));
         }
 
         assert!(store.session_dbus_allowed(&concrete, &ctx).await);
         assert!(!store.session_dbus_allowed(&other, &ctx).await);
-
-        // Wildcard match: broad pattern stored, concrete query allowed, other bus
-        // rejected.
         let wildcard = DbusTarget::session(
             "org.example.Service",
             "**",
@@ -2263,9 +2265,12 @@ mod tests {
             Vec::new(),
         );
 
+        // Wildcard match: broad pattern stored, concrete query allowed, other bus
+        // rejected.
         {
             let mut inner = store.inner.lock().await;
             inner
+                .session
                 .session_dbus_allow
                 .insert("general-ui".into(), HashSet::from([wildcard]));
         }

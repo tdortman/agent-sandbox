@@ -7,18 +7,15 @@ use super::{
     },
     DecisionAction,
 };
-
 use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp},
 };
-
 use agent_sandbox_core::{
     ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
     NetworkRuleKey, ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SocketAccess,
     SudoRule, VerdictSource, host_pattern_matches,
 };
-
 use std::path::{Path, PathBuf};
 
 impl PolicyStore {
@@ -125,6 +122,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Network(net));
                 return err.into();
             }
@@ -213,6 +211,7 @@ impl PolicyStore {
             self.inner
                 .lock()
                 .await
+                .pending
                 .insert_pending(Pending::Network(net));
         }
 
@@ -235,6 +234,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Elevation(elev));
                 return err.into();
             }
@@ -271,6 +271,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Elevation(elev));
             }
 
@@ -294,6 +295,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Elevation(elev));
                 return scope_result;
             }
@@ -316,6 +318,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Elevation(elev));
                 return err.into();
             }
@@ -350,6 +353,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Filesystem(fs));
                 return err.into();
             }
@@ -436,6 +440,7 @@ impl PolicyStore {
             self.inner
                 .lock()
                 .await
+                .pending
                 .insert_pending(Pending::Filesystem(fs));
         }
 
@@ -521,13 +526,21 @@ impl PolicyStore {
             None => res.target.clone(),
             Some(ApprovalTarget::Dbus { target }) => {
                 if !DbusRule::new(target.clone(), "").matches(&res.target) {
-                    self.inner.lock().await.insert_pending(Pending::Dbus(res));
+                    self.inner
+                        .lock()
+                        .await
+                        .pending
+                        .insert_pending(Pending::Dbus(res));
                     return PolicydError::InvalidDecisionTarget.into();
                 }
                 target.clone()
             }
             Some(_) => {
-                self.inner.lock().await.insert_pending(Pending::Dbus(res));
+                self.inner
+                    .lock()
+                    .await
+                    .pending
+                    .insert_pending(Pending::Dbus(res));
                 return PolicydError::InvalidDecisionTarget.into();
             }
         };
@@ -557,7 +570,11 @@ impl PolicyStore {
             self.finish_dbus(&res.id, res.target.clone(), allowed, source)
                 .await;
         } else {
-            self.inner.lock().await.insert_pending(Pending::Dbus(res));
+            self.inner
+                .lock()
+                .await
+                .pending
+                .insert_pending(Pending::Dbus(res));
         }
 
         result
@@ -584,6 +601,7 @@ impl PolicyStore {
                 self.inner
                     .lock()
                     .await
+                    .pending
                     .insert_pending(Pending::Resource(res));
                 return err.into();
             }
@@ -673,6 +691,7 @@ impl PolicyStore {
             self.inner
                 .lock()
                 .await
+                .pending
                 .insert_pending(Pending::Resource(res));
         }
 
@@ -822,7 +841,6 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::DecisionAction;
-
     use crate::{
         store::{
             Pending, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
@@ -831,19 +849,16 @@ mod tests {
         },
         wire::{PendingDecision, ScopeWire},
     };
-
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
         PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
         ScopeActionReply, SocketAccess, load_policy,
     };
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
         time::Duration,
     };
-
     use tokio::{net::UnixStream, sync::Mutex};
 
     #[test]
@@ -1190,6 +1205,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1256,6 +1272,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1344,6 +1361,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Resource(pending));
 
         let reply = store
@@ -1451,7 +1469,7 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.insert_pending(Pending::Dbus(PendingDbus {
+            inner.pending.insert_pending(Pending::Dbus(PendingDbus {
                 id: pending_id.clone(),
                 created_at: 0.0,
                 target: target.clone(),
@@ -1536,7 +1554,7 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.insert_pending(Pending::Dbus(PendingDbus {
+            inner.pending.insert_pending(Pending::Dbus(PendingDbus {
                 id: pending_id.clone(),
                 created_at: 0.0,
                 target: requested.clone(),
@@ -1643,6 +1661,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1681,7 +1700,10 @@ mod tests {
 
         let has_allow = {
             let inner = store.inner.lock().await;
-            inner.session_filesystem_allow.contains_key("ui-session")
+            inner
+                .session
+                .session_filesystem_allow
+                .contains_key("ui-session")
         };
 
         assert!(has_allow);
@@ -1705,7 +1727,10 @@ mod tests {
 
         let has_allow = {
             let inner = store.inner.lock().await;
-            inner.session_filesystem_allow.contains_key("ui-session")
+            inner
+                .session
+                .session_filesystem_allow
+                .contains_key("ui-session")
         };
 
         assert!(has_allow);
@@ -1744,6 +1769,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1811,6 +1837,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1871,6 +1898,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1916,6 +1944,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(Pending::Filesystem(pending));
 
         let reply = store
@@ -1970,6 +1999,7 @@ mod tests {
                     });
             }
             inner
+                .session
                 .session_allow
                 .entry("ui-a".into())
                 .or_default()

@@ -1,7 +1,6 @@
 //! Policy store: status.
 
 use super::types::{Pending, PolicyStore};
-
 use agent_sandbox_core::{PendingSummary, Policy, ResolvedRequestContext, StatusReply};
 use std::sync::Arc;
 
@@ -33,6 +32,7 @@ impl PolicyStore {
         let inner = self.inner.lock().await;
 
         inner
+            .pending
             .pending_values()
             .map(|p| match p {
                 Pending::Network(net) => PendingSummary::Network {

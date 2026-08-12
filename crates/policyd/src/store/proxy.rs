@@ -1,18 +1,16 @@
 //! Trusted transparent-proxy session and flow registry.
 
-use super::types::{
-    MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState,
+use super::{
+    state::ProxyCheckId,
+    types::{MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState},
 };
-
 use crate::{error::PolicydError, wire::NetworkCheckRequest};
-
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
     ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity, scheme_for,
     socket_owner::validate_socket_identity,
 };
-
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -320,7 +318,10 @@ impl PolicyStore {
         request_id: ProxyRequestId,
         attribution_token: AttributionToken,
     ) -> Result<CheckReply, PolicydError> {
-        let key = (proxy_session.clone(), request_id);
+        let key = ProxyCheckId {
+            session: proxy_session.clone(),
+            request: request_id,
+        };
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
         {
@@ -368,7 +369,10 @@ impl PolicyStore {
                     ctx,
                 },
                 Vec::new(),
-                Some((proxy_session.clone(), request_id)),
+                Some(ProxyCheckId {
+                    session: proxy_session.clone(),
+                    request: request_id,
+                }),
                 Some(cancel_rx),
             )
             .await;
@@ -390,7 +394,10 @@ impl PolicyStore {
         attribution_token: AttributionToken,
         request: HttpRequest,
     ) -> Result<HttpCheckReply, PolicydError> {
-        let key = (proxy_session.clone(), request_id);
+        let key = ProxyCheckId {
+            session: proxy_session.clone(),
+            request: request_id,
+        };
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
         {
@@ -463,16 +470,19 @@ impl PolicyStore {
         let cancel = {
             let mut inner = self.inner.lock().await;
             validate_session(&inner, &proxy_session)?;
-            match inner
-                .proxy_cancellations
-                .remove(&(proxy_session.clone(), request_id))
-            {
+            match inner.proxy_cancellations.remove(&ProxyCheckId {
+                session: proxy_session.clone(),
+                request: request_id,
+            }) {
                 Some(ProxyCancellation::Active(sender)) => Some(sender),
                 Some(ProxyCancellation::Canceled) => None,
                 None => {
                     if inner.proxy_cancellations.len() < MAX_PROXY_CANCEL_TOMBSTONES {
                         inner.proxy_cancellations.insert(
-                            (proxy_session.clone(), request_id),
+                            ProxyCheckId {
+                                session: proxy_session.clone(),
+                                request: request_id,
+                            },
                             ProxyCancellation::Canceled,
                         );
                     }
@@ -677,27 +687,33 @@ impl PolicyStore {
                 state.last_check = Instant::now();
             }
 
-            let pending_ids = inner.http_futures.keys().copied().collect::<Vec<_>>();
+            let pending_ids = inner
+                .pending
+                .http_futures
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
             let mut canceled = Vec::new();
             for pending_id in pending_ids {
-                let Some(waiters) = inner.http_futures.remove(&pending_id) else {
+                let Some(waiters) = inner.pending.http_futures.remove(&pending_id) else {
                     continue;
                 };
                 let mut retained = Vec::with_capacity(waiters.len());
                 for waiter in waiters {
                     if waiter.proxy_session == token {
-                        inner
-                            .http_waiters
-                            .remove(&(waiter.proxy_session.clone(), waiter.request_id));
+                        inner.pending.http_waiters.remove(&ProxyCheckId {
+                            session: waiter.proxy_session.clone(),
+                            request: waiter.request_id,
+                        });
                         canceled.push(waiter.tx);
                     } else {
                         retained.push(waiter);
                     }
                 }
                 if retained.is_empty() {
-                    inner.take_pending(&pending_id.to_string());
+                    inner.pending.take_pending(&pending_id.to_string());
                 } else {
-                    inner.http_futures.insert(pending_id, retained);
+                    inner.pending.http_futures.insert(pending_id, retained);
                 }
             }
             canceled
@@ -804,13 +820,11 @@ fn prune_flows(
 mod tests {
     use super::*;
     use crate::store::types::{Pending, PolicyStore};
-
     use agent_sandbox_core::{
         FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
         SocketIdentity, SocketInode, VerdictSource,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
-
     use std::{sync::Arc, time::Duration};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
@@ -989,7 +1003,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some((id, Pending::Network(pending))) =
-                    inner.pending_entries().find(|(id, pending)| {
+                    inner.pending.pending_entries().find(|(id, pending)| {
                         id.starts_with("net:") && matches!(pending, Pending::Network(_))
                     })
                 {
@@ -1028,7 +1042,7 @@ mod tests {
         );
 
         assert!(
-            store.inner.lock().await.network_futures.is_empty(),
+            store.inner.lock().await.pending.network_futures.is_empty(),
             "finished transport approval must release its waiter"
         );
 

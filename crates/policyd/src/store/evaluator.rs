@@ -2,13 +2,11 @@ use super::{
     PolicyStore,
     access::{filesystem_rules_match_allow, is_sandbox_infrastructure_path},
 };
-
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, ResolvedRequestContext, ResourceAccess, ResourceKind,
     Verdict, VerdictSource, host_pattern_matches, normalize_directory_traverse_access,
     normalize_host,
 };
-
 use std::path::Path;
 
 impl PolicyStore {
@@ -179,12 +177,10 @@ mod tests {
         super::types::{UiClient, UiSessionContext},
         *,
     };
-
     use agent_sandbox_core::{
         DbusMessageKind, DbusRule, DbusTarget, DeviceAccess, NetworkRule, NetworkRuleKey, Policy,
         ProcessIds, ResourceRule, ResourceRuleKey, SandboxPaths, atomic_write_policy,
     };
-
     use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -246,13 +242,14 @@ mod tests {
         {
             let mut inner = store.inner.lock().await;
             inner
+                .session
                 .once_allow
                 .insert(NetworkRuleKey::new("example.com", 443));
-            inner.session_allow.insert(
+            inner.session.session_allow.insert(
                 "ui-session".into(),
                 HashSet::from([NetworkRuleKey::new("example.com", 443)]),
             );
-            inner.session_deny.insert(
+            inner.session.session_deny.insert(
                 "ui-session".into(),
                 HashSet::from([NetworkRuleKey::new("example.com", 443)]),
             );
@@ -355,7 +352,7 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.session_resource_allow.insert(
+            inner.session.session_resource_allow.insert(
                 "ui-session".into(),
                 HashSet::from([ResourceRuleKey::new(
                     ResourceKind::Device,

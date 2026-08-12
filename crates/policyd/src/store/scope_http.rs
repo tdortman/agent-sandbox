@@ -1,12 +1,11 @@
 //! Typed HTTP session/project/global scope mutations.
 
 use super::{
+    decisions::DecisionAction,
     http::{http_context, target_for_request},
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
-
 use crate::{error::PolicydError, wire::ScopeWire};
-
 use agent_sandbox_core::{
     ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
     ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
@@ -63,11 +62,11 @@ fn apply_http_memory_locked(
         ScopeTarget::Ephemeral => {
             for key in build_once_keys(target, context)? {
                 if allowed {
-                    inner.http_once_deny.remove(&key);
-                    inner.http_once_allow.insert(key);
+                    inner.session.http_once_deny.remove(&key);
+                    inner.session.http_once_allow.insert(key);
                 } else {
-                    inner.http_once_allow.remove(&key);
-                    inner.http_once_deny.insert(key);
+                    inner.session.http_once_allow.remove(&key);
+                    inner.session.http_once_deny.insert(key);
                 }
             }
         }
@@ -77,25 +76,13 @@ fn apply_http_memory_locked(
                 target: target.clone(),
                 context: context.clone(),
             };
-            if allowed {
-                inner
-                    .http_session_allow
-                    .entry(session_id.clone())
-                    .or_default()
-                    .insert(key.clone());
-                if let Some(bucket) = inner.http_session_deny.get_mut(session_id) {
-                    bucket.remove(&key);
-                }
+            let action = if allowed {
+                DecisionAction::Approve
             } else {
-                inner
-                    .http_session_deny
-                    .entry(session_id.clone())
-                    .or_default()
-                    .insert(key.clone());
-                if let Some(bucket) = inner.http_session_allow.get_mut(session_id) {
-                    bucket.remove(&key);
-                }
-            }
+                DecisionAction::Deny
+            };
+
+            inner.session.http().apply(action, session_id, &key);
         }
 
         ScopeTarget::Project { .. }
@@ -201,6 +188,7 @@ impl PolicyStore {
         let pending_ids = {
             let inner = self.inner.lock().await;
             inner
+                .pending
                 .pending_values()
                 .filter_map(|pending| {
                     let Pending::Http(value) = pending else {
@@ -243,8 +231,8 @@ impl PolicyStore {
                 let mut inner = self.inner.lock().await;
 
                 for key in once_keys {
-                    inner.http_once_allow.remove(&key);
-                    inner.http_once_deny.remove(&key);
+                    inner.session.http_once_allow.remove(&key);
+                    inner.session.http_once_deny.remove(&key);
                 }
             }
         } else {
@@ -297,7 +285,7 @@ impl PolicyStore {
 
         {
             let mut inner = self.inner.lock().await;
-            inner.insert_pending(Pending::Http(pending.clone()));
+            inner.pending.insert_pending(Pending::Http(pending.clone()));
         }
 
         let reply = self
@@ -333,12 +321,10 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use agent_sandbox_core::{
         HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingHttpId,
         ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, load_policy,
     };
-
     use std::{path::PathBuf, time::Duration};
 
     #[test]
@@ -440,7 +426,12 @@ mod tests {
 
         let (cwd, home, project_root, sandbox_session_id) = {
             let inner = store.inner.lock().await;
-            let rule = inner.http_once_allow.iter().next().expect("once rule");
+            let rule = inner
+                .session
+                .http_once_allow
+                .iter()
+                .next()
+                .expect("once rule");
             let context = (
                 rule.context.cwd.clone(),
                 rule.context.home.clone(),
@@ -485,7 +476,7 @@ mod tests {
         apply_http_memory_locked(&mut inner, &target, &ScopeTarget::Ephemeral, &context, true)
             .expect("store any-of once target");
 
-        assert_eq!(inner.http_once_allow.len(), 2);
+        assert_eq!(inner.session.http_once_allow.len(), 2);
         drop(inner);
     }
 

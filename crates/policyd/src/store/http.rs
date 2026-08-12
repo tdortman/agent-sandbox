@@ -1,20 +1,18 @@
 //! Typed HTTP policy evaluation, pending requests, and cancellation.
 
 use super::{
+    state::ProxyCheckId,
     types::{
         HttpPendingKey, HttpWaiter, MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending,
         PendingHttp, PendingResult, PolicyStore, enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
-
 use crate::error::PolicydError;
-
 use agent_sandbox_core::{
     ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
     PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
 };
-
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -94,6 +92,7 @@ impl PolicyStore {
             let mut inner = self.inner.lock().await;
             let denied = session_ids.iter().any(|session_id| {
                 inner
+                    .session
                     .http_session_deny
                     .get(session_id)
                     .is_some_and(|rules| {
@@ -105,14 +104,15 @@ impl PolicyStore {
             if denied {
                 return Some(Verdict::denied(VerdictSource::User));
             }
-            if inner.http_once_deny.remove(&key) {
+            if inner.session.http_once_deny.remove(&key) {
                 return Some(Verdict::denied(VerdictSource::User));
             }
-            if inner.http_once_allow.remove(&key) {
+            if inner.session.http_once_allow.remove(&key) {
                 return Some(Verdict::allowed(VerdictSource::Scope(ApprovalScope::Once)));
             }
             let allowed = session_ids.iter().any(|session_id| {
                 inner
+                    .session
                     .http_session_allow
                     .get(session_id)
                     .is_some_and(|rules| {
@@ -198,7 +198,7 @@ impl PolicyStore {
         if is_new {
             let pending = {
                 let inner = self.inner.lock().await;
-                match inner.pending_get(&pending_id.to_string()) {
+                match inner.pending.pending_get(&pending_id.to_string()) {
                     Some(Pending::Http(value)) => value.clone(),
                     _ => {
                         return Ok(HttpCheckReply::blocked(
@@ -247,16 +247,16 @@ impl PolicyStore {
         let key = http_key(request, ctx);
         let mut inner = self.inner.lock().await;
 
-        if inner
-            .http_waiters
-            .contains_key(&(proxy_session.clone(), request_id))
-        {
+        if inner.pending.http_waiters.contains_key(&ProxyCheckId {
+            session: proxy_session.clone(),
+            request: request_id,
+        }) {
             return Err(PolicydError::Proxy(
                 "duplicate in-flight HTTP request ID".into(),
             ));
         }
 
-        let existing = inner.pending_values().find_map(|pending| {
+        let existing = inner.pending.pending_values().find_map(|pending| {
             let Pending::Http(value) = pending else {
                 return None;
             };
@@ -266,7 +266,7 @@ impl PolicyStore {
         });
 
         let pending_id = if let Some(id) = existing {
-            let waiters = inner.http_futures.get(&id).map_or(0, Vec::len);
+            let waiters = inner.pending.http_futures.get(&id).map_or(0, Vec::len);
             if waiters >= MAX_WAITERS_PER_PENDING {
                 return Err(PolicydError::Proxy(
                     "too many waiters for one HTTP approval".into(),
@@ -274,7 +274,7 @@ impl PolicyStore {
             }
             id
         } else {
-            if inner.pending_len() >= MAX_PENDING_APPROVALS {
+            if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
                 return Err(PolicydError::Proxy("too many pending approvals".into()));
             }
             let id = PendingHttpId::new();
@@ -288,12 +288,13 @@ impl PolicyStore {
                 context: key.context.clone(),
                 package: ctx.package.clone(),
             };
-            inner.insert_pending(Pending::Http(pending));
-            inner.http_futures.insert(id, Vec::new());
+            inner.pending.insert_pending(Pending::Http(pending));
+            inner.pending.http_futures.insert(id, Vec::new());
             id
         };
 
         inner
+            .pending
             .http_futures
             .entry(pending_id)
             .or_default()
@@ -303,10 +304,13 @@ impl PolicyStore {
                 attribution_token,
                 tx,
             });
-
-        inner
-            .http_waiters
-            .insert((proxy_session, request_id), pending_id);
+        inner.pending.http_waiters.insert(
+            ProxyCheckId {
+                session: proxy_session,
+                request: request_id,
+            },
+            pending_id,
+        );
 
         drop(inner);
 
@@ -408,11 +412,12 @@ impl PolicyStore {
         proxy_session: &agent_sandbox_core::ProxySessionToken,
         request_id: agent_sandbox_core::ProxyRequestId,
     ) -> Option<tokio::sync::oneshot::Sender<HttpCheckReply>> {
-        let pending_id = inner
-            .http_waiters
-            .remove(&(proxy_session.clone(), request_id))?;
+        let pending_id = inner.pending.http_waiters.remove(&ProxyCheckId {
+            session: proxy_session.clone(),
+            request: request_id,
+        })?;
 
-        let waiters = inner.http_futures.get_mut(&pending_id)?;
+        let waiters = inner.pending.http_futures.get_mut(&pending_id)?;
 
         let index = waiters.iter().position(|waiter| {
             waiter.proxy_session == *proxy_session && waiter.request_id == request_id
@@ -421,8 +426,8 @@ impl PolicyStore {
         let waiter = waiters.remove(index);
 
         if waiters.is_empty() {
-            inner.http_futures.remove(&pending_id);
-            inner.take_pending(&pending_id.to_string());
+            inner.pending.http_futures.remove(&pending_id);
+            inner.pending.take_pending(&pending_id.to_string());
         }
 
         Some(waiter.tx)
@@ -451,20 +456,26 @@ impl PolicyStore {
     ) -> bool {
         let mut inner = self.inner.lock().await;
 
-        let Some(Pending::Http(pending)) = inner.take_pending(&pending_id.to_string()) else {
+        let Some(Pending::Http(pending)) = inner.pending.take_pending(&pending_id.to_string())
+        else {
             return false;
         };
 
-        let waiters = inner.http_futures.remove(&pending_id).unwrap_or_default();
+        let waiters = inner
+            .pending
+            .http_futures
+            .remove(&pending_id)
+            .unwrap_or_default();
         let mut live_waiters = Vec::with_capacity(waiters.len());
 
         for waiter in waiters {
             if Self::http_waiter_is_live(&inner, &waiter) {
                 live_waiters.push(waiter);
             } else {
-                inner
-                    .http_waiters
-                    .remove(&(waiter.proxy_session.clone(), waiter.request_id));
+                inner.pending.http_waiters.remove(&ProxyCheckId {
+                    session: waiter.proxy_session.clone(),
+                    request: waiter.request_id,
+                });
 
                 let _ = waiter
                     .tx
@@ -482,9 +493,10 @@ impl PolicyStore {
         });
 
         for waiter in live_waiters {
-            inner
-                .http_waiters
-                .remove(&(waiter.proxy_session, waiter.request_id));
+            inner.pending.http_waiters.remove(&ProxyCheckId {
+                session: waiter.proxy_session,
+                request: waiter.request_id,
+            });
 
             let _ = waiter.tx.send(reply.clone());
         }
@@ -517,7 +529,6 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::super::types::{PendingResult, PolicyStore};
-
     use agent_sandbox_core::{
         ApprovalScope, AttributionToken, FlowContext, FlowProtocol, FlowRegistration,
         HttpCheckReply, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRule, HttpRuleTarget,
@@ -525,7 +536,6 @@ mod tests {
         ProxyConnectionId, ProxyRequestId, ProxySessionToken, ResolvedRequestContext, SandboxPaths,
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
-
     use std::time::Duration;
 
     #[tokio::test]
@@ -879,12 +889,12 @@ mod tests {
         let inner = store.inner.lock().await;
 
         assert!(
-            inner.http_futures.is_empty(),
+            inner.pending.http_futures.is_empty(),
             "once must remove all pending waiter futures"
         );
 
         assert!(
-            inner.http_waiters.is_empty(),
+            inner.pending.http_waiters.is_empty(),
             "once must remove all waiter identities"
         );
 

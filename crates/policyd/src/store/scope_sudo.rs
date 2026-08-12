@@ -1,9 +1,7 @@
 //! Policy store: sudo scope application.
 
 use super::{
-    ScopePersistFlags, apply_persistent_scope, apply_session_rule,
-    decisions::DecisionAction,
-    types::{PolicyDecisionState, PolicyStore},
+    ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction, types::PolicyStore,
 };
 use crate::wire::{ScopeWire, SudoScopeOp};
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
@@ -94,12 +92,7 @@ impl PolicyStore {
 
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
-                let PolicyDecisionState {
-                    session_sudo_allow: allow,
-                    session_sudo_deny: deny,
-                    ..
-                } = &mut *inner;
-                apply_session_rule(action, &session_id, &key, allow, deny);
+                inner.session.sudo().apply(action, &session_id, &key);
                 drop(inner);
             }
 

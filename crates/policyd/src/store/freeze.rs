@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-
 use tracing::warn;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";

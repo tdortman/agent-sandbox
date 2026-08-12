@@ -1,20 +1,15 @@
 //! Per-connection read loop and reply framing.
 
 use super::dispatch::SocketRole;
-
 use crate::{
     error::PolicydError,
     server::peer::ClientPeer,
-    store::{MAX_RPC_LINE_BYTES, PolicyStore, UiClientHandle},
+    store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, UiClientHandle},
 };
-
 use agent_sandbox_core::{
-    ProxyReply, ProxyRequestId, ProxySessionToken, RpcMessage, RpcReply, RpcRequest,
-    parse_rpc_request,
+    ProxyReply, ProxyRequestId, RpcMessage, RpcReply, RpcRequest, parse_rpc_request,
 };
-
 use std::sync::Arc;
-
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -41,8 +36,7 @@ pub async fn handle_client(
     let mut reader = BufReader::new(reader);
     let mut read_error = None;
 
-    let active_checks: Arc<Mutex<Vec<(ProxySessionToken, ProxyRequestId)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let active_checks: Arc<Mutex<Vec<ProxyCheckId>>> = Arc::new(Mutex::new(Vec::new()));
 
     let mut proxy_session_owner = false;
     let mut proxy_single_request = false;
@@ -141,7 +135,8 @@ async fn finish_client(
     client: UiClientHandle,
     peer: ClientPeer,
     role: SocketRole,
-    active_checks: Arc<Mutex<Vec<(ProxySessionToken, ProxyRequestId)>>>,
+    active_checks: Arc<Mutex<Vec<ProxyCheckId>>>,
+
     read_error: Option<std::io::Error>,
 ) -> std::io::Result<()> {
     let active_checks = {
@@ -149,8 +144,8 @@ async fn finish_client(
         std::mem::take(&mut *active)
     };
 
-    for (proxy_session, request_id) in active_checks {
-        let _ = store.cancel_check(proxy_session, request_id).await;
+    for check in active_checks {
+        let _ = store.cancel_check(check.session, check.request).await;
     }
 
     if role == SocketRole::Proxy {
@@ -171,18 +166,16 @@ async fn spawn_proxy_check(
     store: Arc<PolicyStore>,
     client: UiClientHandle,
     writer: Arc<Mutex<OwnedWriteHalf>>,
-    active_checks: Arc<Mutex<Vec<(ProxySessionToken, ProxyRequestId)>>>,
+    active_checks: Arc<Mutex<Vec<ProxyCheckId>>>,
+
     peer: ClientPeer,
     req: RpcRequest,
 ) -> bool {
-    let Some((proxy_session, request_id)) = proxy_check_identity(&req) else {
+    let Some(check) = proxy_check_identity(&req) else {
         return false;
     };
 
-    active_checks
-        .lock()
-        .await
-        .push((proxy_session.clone(), request_id));
+    active_checks.lock().await.push(check.clone());
 
     let active_checks_for_task = active_checks;
 
@@ -196,13 +189,14 @@ async fn spawn_proxy_check(
                 }
             };
 
-        let resp = envelope_proxy_reply(SocketRole::Proxy, Some(request_id), resp);
+        let resp = envelope_proxy_reply(SocketRole::Proxy, Some(check.request), resp);
+
         reply(writer, &resp).await;
         let mut active = active_checks_for_task.lock().await;
 
         if let Some(index) = active
             .iter()
-            .position(|(session, id)| *id == request_id && session == &proxy_session)
+            .position(|c| c.request == check.request && c.session == check.session)
         {
             active.remove(index);
         }
@@ -221,7 +215,7 @@ const fn proxy_request_id(req: &RpcRequest) -> Option<ProxyRequestId> {
     }
 }
 
-fn proxy_check_identity(req: &RpcRequest) -> Option<(ProxySessionToken, ProxyRequestId)> {
+fn proxy_check_identity(req: &RpcRequest) -> Option<ProxyCheckId> {
     match req {
         RpcRequest::CheckHttp {
             proxy_session,
@@ -232,7 +226,10 @@ fn proxy_check_identity(req: &RpcRequest) -> Option<(ProxySessionToken, ProxyReq
             proxy_session,
             request_id,
             ..
-        } => Some((proxy_session.clone(), *request_id)),
+        } => Some(ProxyCheckId {
+            session: proxy_session.clone(),
+            request: *request_id,
+        }),
 
         _ => None,
     }

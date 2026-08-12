@@ -4,7 +4,6 @@ use super::super::types::{
     Pending, PendingContext, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork,
     PendingResource, PolicyStore,
 };
-
 use crate::wire::{PendingDecision, ScopeWire};
 use agent_sandbox_core::{ApprovalScope, ApprovalTarget, RpcReply};
 
@@ -184,7 +183,7 @@ impl PolicyStore {
 
         let pending = {
             let mut inner = self.inner.lock().await;
-            inner.take_pending(&pending_id)
+            inner.pending.take_pending(&pending_id)
         };
 
         let pending = pending.ok_or_else(|| {
@@ -197,7 +196,7 @@ impl PolicyStore {
             .await
         {
             let mut inner = self.inner.lock().await;
-            inner.restore_pending(pending);
+            inner.pending.restore_pending(pending);
             drop(inner);
 
             return Err(Box::new(

@@ -7,11 +7,9 @@ use super::{
     },
     ui_route::{UiRoute, paths_match},
 };
-
 use agent_sandbox_core::{
     ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
 };
-
 use std::{
     collections::HashSet,
     future::Future,
@@ -20,14 +18,12 @@ use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
-
 use tokio::{
     io::AsyncWriteExt,
     net::unix::OwnedWriteHalf,
     sync::{Mutex, oneshot},
     time,
 };
-
 use uuid::Uuid;
 
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
@@ -317,14 +313,20 @@ impl PolicyStore {
         client_id: u64,
     ) -> bool {
         inner.ui_clients.remove(&client_id).is_some_and(|client| {
-            inner.session_allow.remove(&client.session_id);
-            inner.session_deny.remove(&client.session_id);
-            inner.session_sudo_allow.remove(&client.session_id);
-            inner.session_sudo_deny.remove(&client.session_id);
-            inner.session_filesystem_allow.remove(&client.session_id);
-            inner.session_dbus_allow.remove(&client.session_id);
-            inner.session_dbus_deny.remove(&client.session_id);
-            inner.session_filesystem_deny.remove(&client.session_id);
+            inner.session.session_allow.remove(&client.session_id);
+            inner.session.session_deny.remove(&client.session_id);
+            inner.session.session_sudo_allow.remove(&client.session_id);
+            inner.session.session_sudo_deny.remove(&client.session_id);
+            inner
+                .session
+                .session_filesystem_allow
+                .remove(&client.session_id);
+            inner.session.session_dbus_allow.remove(&client.session_id);
+            inner.session.session_dbus_deny.remove(&client.session_id);
+            inner
+                .session
+                .session_filesystem_deny
+                .remove(&client.session_id);
             inner.ui_context_by_session.remove(&client.session_id);
             true
         })
@@ -344,7 +346,14 @@ impl PolicyStore {
     /// Re-notify pending requests that lost their UI, and spawn a UI when
     /// needed.
     pub(crate) async fn reroute_orphaned_pending(&self) {
-        let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
+        let pending: Vec<Pending> = self
+            .inner
+            .lock()
+            .await
+            .pending
+            .pending_values()
+            .cloned()
+            .collect();
         let deadline = tokio::time::Instant::now() + UI_SPAWN_WAIT;
         let mut registration_flush_observed = false;
 
@@ -533,7 +542,14 @@ impl PolicyStore {
     }
 
     pub async fn flush_pending_to_ui(&self) {
-        let pending: Vec<Pending> = self.inner.lock().await.pending_values().cloned().collect();
+        let pending: Vec<Pending> = self
+            .inner
+            .lock()
+            .await
+            .pending
+            .pending_values()
+            .cloned()
+            .collect();
 
         for p in pending {
             self.notify_pending(&p).await;
@@ -544,14 +560,11 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::PolicyStore;
-
     use crate::store::{
         Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
-
     use agent_sandbox_core::FileAccess;
     use std::{sync::Arc, time::Duration};
-
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,
@@ -638,8 +651,8 @@ mod tests {
         let pending = pending_network("net:spawn-race");
         let pending_second = pending_network("net:spawn-race-second");
         let mut inner = store.inner.lock().await;
-        inner.insert_pending(pending);
-        inner.insert_pending(pending_second);
+        inner.pending.insert_pending(pending);
+        inner.pending.insert_pending(pending_second);
         drop(inner);
         let (read_tx, read_rx) = oneshot::channel();
         let registration_store = Arc::clone(&store);
@@ -711,6 +724,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(pending_network("net:reroute"));
 
         store.end_ui_session(1).await;
@@ -753,6 +767,7 @@ mod tests {
             .inner
             .lock()
             .await
+            .pending
             .insert_pending(pending_filesystem("fs:reroute"));
 
         store.end_ui_session(1).await;
@@ -876,8 +891,8 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.insert_pending(dead_pending.clone());
-            inner.insert_pending(recovered_pending);
+            inner.pending.insert_pending(dead_pending.clone());
+            inner.pending.insert_pending(recovered_pending);
         }
 
         store.notify_pending(&dead_pending).await;

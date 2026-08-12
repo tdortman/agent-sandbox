@@ -8,15 +8,12 @@ use super::{
     },
     ui::VerdictExit,
 };
-
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest};
-
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
     InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
     normalize_directory_traverse_access,
 };
-
 use std::{
     io::BufRead,
     path::{Path, PathBuf},
@@ -24,7 +21,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -338,7 +334,7 @@ impl PolicyStore {
 
         // Deduplicate: if a pending already exists for the same file and
         // access type, join its waiters instead of creating a new prompt.
-        let existing_id = inner.pending_values().find_map(|p| {
+        let existing_id = inner.pending.pending_values().find_map(|p| {
             let Pending::Filesystem(fs) = p else {
                 return None;
             };
@@ -348,6 +344,7 @@ impl PolicyStore {
 
         if let Some(existing_id) = existing_id {
             let waiter_count = inner
+                .pending
                 .filesystem_futures
                 .get(&existing_id)
                 .map_or(0, Vec::len);
@@ -361,6 +358,7 @@ impl PolicyStore {
             }
 
             inner
+                .pending
                 .filesystem_futures
                 .entry(existing_id.clone())
                 .or_default()
@@ -375,7 +373,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
             return Err(FilesystemCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 path.to_path_buf(),
@@ -386,22 +384,25 @@ impl PolicyStore {
         let pending_id = format!("fs:{}", Uuid::now_v7().simple());
 
         inner
+            .pending
             .filesystem_futures
             .insert(pending_id.clone(), vec![tx]);
 
-        inner.insert_pending(Pending::Filesystem(PendingFilesystem {
-            id: pending_id.clone(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64()),
-            path: path.to_path_buf(),
-            access,
-            cwd: ctx.cwd.map(PathBuf::from),
-            home: ctx.home.map(PathBuf::from),
-            project_root: ctx.project_root.map(PathBuf::from),
-            sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-            package: ctx.package.map(String::from),
-        }));
+        inner
+            .pending
+            .insert_pending(Pending::Filesystem(PendingFilesystem {
+                id: pending_id.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                path: path.to_path_buf(),
+                access,
+                cwd: ctx.cwd.map(PathBuf::from),
+                home: ctx.home.map(PathBuf::from),
+                project_root: ctx.project_root.map(PathBuf::from),
+                sandbox_session_id: ctx.sandbox_session_id.map(String::from),
+                package: ctx.package.map(String::from),
+            }));
 
         drop(inner);
 
@@ -456,8 +457,8 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.filesystem_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.filesystem_futures.remove(pending_id);
                         drop(inner);
 
                         FilesystemCheckReply::blocked(
@@ -472,8 +473,8 @@ impl PolicyStore {
                     }
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.filesystem_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.filesystem_futures.remove(pending_id);
                         drop(inner);
 
                         FilesystemCheckReply::blocked(
@@ -502,7 +503,7 @@ impl PolicyStore {
     ) {
         let mut inner = self.inner.lock().await;
 
-        if let Some(waiters) = inner.filesystem_futures.remove(pending_id) {
+        if let Some(waiters) = inner.pending.filesystem_futures.remove(pending_id) {
             let reply = if allowed {
                 FilesystemCheckReply::allowed(source.clone(), path.clone(), access)
             } else {
@@ -534,12 +535,10 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
-
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
         SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
@@ -598,7 +597,12 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 let inner = store.inner.lock().await;
-                if let Some(id) = inner.pending_keys().find(|k| k.starts_with("fs:")).cloned() {
+                if let Some(id) = inner
+                    .pending
+                    .pending_keys()
+                    .find(|k| k.starts_with("fs:"))
+                    .cloned()
+                {
                     break id;
                 }
                 assert!(

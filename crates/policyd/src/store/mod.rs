@@ -18,7 +18,9 @@ mod scope_filesystem;
 mod scope_http;
 mod scope_network;
 mod scope_sudo;
+mod state;
 mod status;
+
 mod types;
 mod ui;
 mod ui_route;
@@ -30,50 +32,18 @@ pub use freeze::cleanup_cgroup_freeze;
 #[cfg(test)]
 use std::time::Duration;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::Instant,
 };
+use types::MergedPolicyCache;
 pub(crate) use types::evict_oldest;
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
     MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation, PendingFilesystem, PendingHttp,
-    PendingKind, PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ProxyFlowState,
-    ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
+    PendingKind, PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ProxyCheckId,
+    ProxyFlowState, ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
-use types::{MergedPolicyCache, PolicyDecisionState};
-
-fn apply_session_rule<T>(
-    action: decisions::DecisionAction,
-    session_id: &str,
-    key: &T,
-    allow: &mut HashMap<String, HashSet<T>>,
-    deny: &mut HashMap<String, HashSet<T>>,
-) where
-    T: Clone + Eq + std::hash::Hash,
-{
-    match action {
-        decisions::DecisionAction::Approve => {
-            allow
-                .entry(session_id.to_owned())
-                .or_default()
-                .insert(key.clone());
-            if let Some(deny_bucket) = deny.get_mut(session_id) {
-                deny_bucket.remove(key);
-            }
-        }
-
-        decisions::DecisionAction::Deny => {
-            deny.entry(session_id.to_owned())
-                .or_default()
-                .insert(key.clone());
-            if let Some(allow_bucket) = allow.get_mut(session_id) {
-                allow_bucket.remove(key);
-            }
-        }
-    }
-}
 
 /// Whether a persistent scope write invalidates the merged-policy cache.
 ///
@@ -182,45 +152,7 @@ impl PolicyStore {
         Self {
             args,
             sandbox_sessions: Arc::new(RwLock::new(HashMap::new())),
-            inner: tokio::sync::Mutex::new(PolicyDecisionState {
-                session_allow: HashMap::new(),
-                once_allow: HashSet::new(),
-                pending: HashMap::new(),
-                elevation_futures: HashMap::new(),
-                network_futures: HashMap::new(),
-                filesystem_futures: HashMap::new(),
-                http_futures: HashMap::new(),
-                http_waiters: HashMap::new(),
-                proxy_cancellations: HashMap::new(),
-                resource_futures: HashMap::new(),
-                dbus_futures: HashMap::new(),
-                ui_clients: HashMap::new(),
-                ui_context_by_session: HashMap::new(),
-                ui_spawn_last: HashMap::<String, Instant>::new(),
-                session_deny: HashMap::new(),
-                session_sudo_allow: HashMap::new(),
-                session_sudo_deny: HashMap::new(),
-                session_filesystem_allow: HashMap::new(),
-                session_filesystem_deny: HashMap::new(),
-                session_resource_allow: HashMap::new(),
-                session_resource_deny: HashMap::new(),
-                session_dbus_allow: HashMap::new(),
-                session_dbus_deny: HashMap::new(),
-                http_once_allow: HashSet::new(),
-                http_once_deny: HashSet::new(),
-                http_session_allow: HashMap::new(),
-                http_session_deny: HashMap::new(),
-                sandbox_filesystem_static_allow: HashMap::new(),
-                http_verdict_cache: HashMap::new(),
-                network_verdict_cache: HashMap::new(),
-                filesystem_verdict_cache: HashMap::new(),
-                resource_verdict_cache: HashMap::new(),
-                dbus_verdict_cache: HashMap::new(),
-                deny_inode_cache: DenyInodeCache::default(),
-                connections_by_uid: HashMap::new(),
-                proxy_flows: HashMap::new(),
-                proxy_session: None,
-            }),
+            inner: tokio::sync::Mutex::new(types::PolicyDecisionState::default()),
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
             ui_spawn_lock: tokio::sync::Mutex::new(()),
             merged_cache: std::sync::Mutex::new(MergedPolicyCache::default()),

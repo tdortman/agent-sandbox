@@ -1,10 +1,8 @@
 //! Policy store: filesystem scope application.
 
 use super::{
-    ScopePersistFlags, apply_persistent_scope, apply_session_rule,
-    decisions::DecisionAction,
-    persist::PersistResourceRuleArgs,
-    types::{PolicyDecisionState, PolicyStore},
+    ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction,
+    persist::PersistResourceRuleArgs, types::PolicyStore,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 use agent_sandbox_core::{
@@ -111,12 +109,7 @@ impl PolicyStore {
                 let resolved_path = expand_policy_path(&path, home, project_root);
                 let key = FilesystemRuleKey::new(resolved_path, access);
                 let mut inner = self.inner.lock().await;
-                let PolicyDecisionState {
-                    session_filesystem_allow: allow,
-                    session_filesystem_deny: deny,
-                    ..
-                } = &mut *inner;
-                apply_session_rule(action, &session_id, &key, allow, deny);
+                inner.session.filesystem().apply(action, &session_id, &key);
                 drop(inner);
             }
 
@@ -230,12 +223,7 @@ impl PolicyStore {
 
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
-                let PolicyDecisionState {
-                    session_dbus_allow: allow,
-                    session_dbus_deny: deny,
-                    ..
-                } = &mut *inner;
-                apply_session_rule(action, &session_id, &target, allow, deny);
+                inner.session.dbus().apply(action, &session_id, &target);
                 drop(inner);
                 None
             }
@@ -337,12 +325,7 @@ impl PolicyStore {
 
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
-                let PolicyDecisionState {
-                    session_resource_allow: allow,
-                    session_resource_deny: deny,
-                    ..
-                } = &mut *inner;
-                apply_session_rule(action, &session_id, &key, allow, deny);
+                inner.session.resource().apply(action, &session_id, &key);
                 drop(inner);
             }
 

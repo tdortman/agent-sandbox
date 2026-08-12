@@ -1,12 +1,10 @@
 //! Network `Check` RPC handling.
 
 use crate::{error::PolicydError, store::PolicyStore, wire::NetworkCheckRequest};
-
 use agent_sandbox_core::{
     CheckReply, ResolvedRequestContext, RpcReply, Verdict, VerdictSource, is_ip_literal,
     normalize_host, policy_host_for_connect,
 };
-
 use std::sync::Arc;
 
 /// Inputs for `handle_check`, grouped to keep the call signature small.
@@ -137,12 +135,10 @@ pub async fn handle_check(
 mod tests {
     use super::{CheckArgs, PromptHost, handle_check, prompt_url};
     use crate::store::PolicyStore;
-
     use agent_sandbox_core::{
         ApprovalScope, NetworkRuleKey, ProcessIds, ResolvedRequestContext, RpcReply, SandboxPaths,
         VerdictSource,
     };
-
     use std::{sync::Arc, time::Duration};
     use uuid::Uuid;
 
@@ -291,6 +287,7 @@ mod tests {
         {
             let mut inner = store.inner.lock().await;
             inner
+                .session
                 .once_allow
                 .insert(NetworkRuleKey::new("chatgpt.com", 443));
         }
@@ -309,7 +306,7 @@ mod tests {
         }
 
         assert!(
-            store.inner.lock().await.once_allow.is_empty(),
+            store.inner.lock().await.session.once_allow.is_empty(),
             "once approval must be consumed after the first check"
         );
 

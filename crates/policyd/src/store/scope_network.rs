@@ -1,9 +1,7 @@
 //! Policy store: network scope application.
 
 use super::{
-    ScopePersistFlags, apply_persistent_scope, apply_session_rule,
-    decisions::DecisionAction,
-    types::{PolicyDecisionState, PolicyStore},
+    ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction, types::PolicyStore,
 };
 use crate::wire::{NetworkScopeOp, ScopeWire};
 use agent_sandbox_core::{
@@ -77,19 +75,17 @@ impl PolicyStore {
             ScopeTarget::Ephemeral => {
                 if action == DecisionAction::Approve {
                     let mut inner = self.inner.lock().await;
-                    inner.once_allow.insert(NetworkRuleKey::new(&host, port));
+                    inner
+                        .session
+                        .once_allow
+                        .insert(NetworkRuleKey::new(&host, port));
                 }
             }
 
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
-                let PolicyDecisionState {
-                    session_allow: allow,
-                    session_deny: deny,
-                    ..
-                } = &mut *inner;
                 for key in session_entries {
-                    apply_session_rule(action, &session_id, &key, allow, deny);
+                    inner.session.network().apply(action, &session_id, &key);
                 }
                 drop(inner);
             }

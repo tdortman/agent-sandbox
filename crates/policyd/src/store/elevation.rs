@@ -4,15 +4,12 @@ use super::{
     types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore},
     ui::VerdictExit,
 };
-
 use crate::{error::PolicydError, wire::ElevationRequest};
 use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
-
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
 };
-
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -163,7 +160,7 @@ impl PolicyStore {
     pub(crate) async fn finish_elevation(&self, pending_id: &str, result: ElevateReply) {
         let mut inner = self.inner.lock().await;
 
-        if let Some(tx) = inner.elevation_futures.remove(pending_id) {
+        if let Some(tx) = inner.pending.elevation_futures.remove(pending_id) {
             let _ = tx.send(result);
         }
     }
@@ -263,26 +260,31 @@ impl PolicyStore {
 
         {
             let mut inner = self.inner.lock().await;
-            if inner.pending_len() >= MAX_PENDING_APPROVALS {
+            if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
                 tracing::warn!(
-                    pending_count = inner.pending_len(),
+                    pending_count = inner.pending.pending_len(),
                     "elevation approval blocked (too many pending approvals)"
                 );
                 return None;
             }
-            inner.elevation_futures.insert(pending_id.clone(), tx);
-            inner.insert_pending(Pending::Elevation(PendingElevation {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                argv: argv.to_vec(),
-                cwd: cwd.map(PathBuf::from),
-                home: home.map(PathBuf::from),
-                project_root: project_root.map(PathBuf::from),
-                sandbox_session_id: sandbox_session_id.map(String::from),
-                package: package.map(String::from),
-            }));
+            inner
+                .pending
+                .elevation_futures
+                .insert(pending_id.clone(), tx);
+            inner
+                .pending
+                .insert_pending(Pending::Elevation(PendingElevation {
+                    id: pending_id.clone(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0.0, |d| d.as_secs_f64()),
+                    argv: argv.to_vec(),
+                    cwd: cwd.map(PathBuf::from),
+                    home: home.map(PathBuf::from),
+                    project_root: project_root.map(PathBuf::from),
+                    sandbox_session_id: sandbox_session_id.map(String::from),
+                    package: package.map(String::from),
+                }));
         }
 
         let detail = format!("id={pending_id} argv={argv:?}");
@@ -329,8 +331,8 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.elevation_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.elevation_futures.remove(pending_id);
                         drop(inner);
 
                         ElevateReply {
@@ -346,8 +348,8 @@ impl PolicyStore {
                     VerdictExit::ChannelClosed => ElevateReply::denied(),
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.take_pending(pending_id);
-                        inner.elevation_futures.remove(pending_id);
+                        inner.pending.take_pending(pending_id);
+                        inner.pending.elevation_futures.remove(pending_id);
                         drop(inner);
                         Self::audit("timeout", None, None, pending_id);
 
@@ -376,7 +378,6 @@ mod tests {
     use super::ELEVATION_PATH;
     use crate::{store::types::PolicyStore, wire::ElevationRequest};
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
-
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
@@ -440,6 +441,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
+                    .pending
                     .pending_keys()
                     .find(|k| k.starts_with("elev:"))
                     .cloned()
