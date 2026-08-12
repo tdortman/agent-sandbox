@@ -18,6 +18,17 @@ use agent_sandbox_core::{
 };
 use std::path::{Path, PathBuf};
 
+/// Verdict source for a finished pending decision. Denied verdicts report
+/// [`VerdictSource::User`]: the wire codec has no `Scope` encoding for
+/// `allowed = false`.
+fn decision_source(scope: ApprovalScope, action: DecisionAction) -> VerdictSource {
+    if action == DecisionAction::Approve {
+        VerdictSource::from(scope)
+    } else {
+        VerdictSource::User
+    }
+}
+
 impl PolicyStore {
     pub(crate) async fn apply_pending_decision(
         &self,
@@ -423,7 +434,7 @@ impl PolicyStore {
             .await;
 
         if result.scope_succeeded() {
-            let source = VerdictSource::from(scope);
+            let source = decision_source(scope, action);
 
             self.finish_filesystem(
                 &pending_id,
@@ -666,7 +677,7 @@ impl PolicyStore {
             .await;
 
         if result.scope_succeeded() {
-            let source = VerdictSource::from(scope);
+            let source = decision_source(scope, action);
 
             self.finish_resource(
                 &pending_id,
@@ -1238,6 +1249,87 @@ mod tests {
         assert!(
             reply.scope_succeeded(),
             "global ./.git approval should succeed via wire project_root, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_filesystem_deny_completes_pending_with_serializable_reply() {
+        // Regression: a scoped deny used to finish the pending waiter with
+        // `VerdictSource::Scope(scope)` on a denied verdict. That source has
+        // no wire encoding for `allowed = false`, so the policyd server
+        // dropped the reply and the sandboxed open hung until fsmon timed
+        // out. The deny verdict must reach the waiter and stay serializable.
+        let store = test_store("scoped-fs-deny");
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+
+        let pending_id = "fs-scoped-deny".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut inner = store.inner.lock().await;
+
+            inner
+                .pending
+                .insert_pending(Pending::Filesystem(PendingFilesystem {
+                    id: pending_id.clone(),
+                    created_at: 0.0,
+                    path: PathBuf::from("/etc/nextdns.conf"),
+                    access: FileAccess::Read,
+                    cwd: Some(project.clone()),
+                    home: Some(home.clone()),
+                    project_root: Some(project.clone()),
+                    sandbox_session_id: None,
+                    package: None,
+                }));
+
+            inner
+                .pending
+                .filesystem_futures
+                .insert(pending_id.clone(), vec![tx]);
+        }
+
+        let reply = store
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id: pending_id.clone(),
+                    scope: ApprovalScope::Project,
+                    target: None,
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new(&project, &home, &project),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: None,
+                        comment: None,
+                        package: None,
+                    },
+                    client_id: 1,
+                    approver_uid: None,
+                },
+                DecisionAction::Deny,
+            )
+            .await;
+
+        assert!(
+            reply.scope_succeeded(),
+            "scoped filesystem deny should succeed, got: {reply:?}"
+        );
+
+        let check = rx.await.expect("pending waiter must receive the verdict");
+
+        assert!(!check.allowed, "scoped deny must deny the pending open");
+
+        let line = serde_json::to_string(&RpcReply::FilesystemCheck(check))
+            .expect("deny verdict must be wire-serializable");
+
+        let decoded: RpcReply = serde_json::from_str(&line).expect("deny verdict must round-trip");
+
+        assert!(
+            matches!(decoded, RpcReply::FilesystemCheck(decoded) if !decoded.allowed),
+            "round-tripped deny verdict must stay denied"
         );
     }
 
