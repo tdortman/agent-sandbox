@@ -1,21 +1,15 @@
 //! Policy store: network scope application.
 
 use super::{
-    apply_session_rule,
+    ScopePersistFlags, apply_persistent_scope, apply_session_rule,
     decisions::DecisionAction,
     types::{PolicyDecisionState, PolicyStore},
 };
-
-use crate::{
-    error::PolicydError,
-    wire::{NetworkScopeOp, ScopeWire},
-};
-
+use crate::wire::{NetworkScopeOp, ScopeWire};
 use agent_sandbox_core::{
     ApprovalScope, NetworkRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeContext,
     ScopeTarget,
 };
-
 use std::path::{Path, PathBuf};
 
 impl PolicyStore {
@@ -100,35 +94,20 @@ impl PolicyStore {
                 drop(inner);
             }
 
-            ScopeTarget::Global { policy_path, home } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), false) {
-                    return PolicydError::from(err).into();
+            ScopeTarget::Global { .. }
+            | ScopeTarget::GlobalPackage { .. }
+            | ScopeTarget::Project { .. }
+            | ScopeTarget::ProjectPackage { .. } => {
+                if let Err(err) = apply_persistent_scope(
+                    target,
+                    home,
+                    ScopePersistFlags::new(false, true),
+                    Some("project policy saved"),
+                    Some("project package policy saved"),
+                    persist,
+                ) {
+                    return err.into();
                 }
-            }
-
-            ScopeTarget::GlobalPackage {
-                policy_path, home, ..
-            } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
-                    return PolicydError::from(err).into();
-                }
-            }
-
-            ScopeTarget::Project {
-                policy_path,
-                project_root: _,
-            } => {
-                if let Err(err) = persist(&policy_path, home, false) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project policy saved");
-            }
-
-            ScopeTarget::ProjectPackage { policy_path, .. } => {
-                if let Err(err) = persist(&policy_path, home, true) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project package policy saved");
             }
         }
 

@@ -1,16 +1,11 @@
 //! Policy store: sudo scope application.
 
 use super::{
-    apply_session_rule,
+    ScopePersistFlags, apply_persistent_scope, apply_session_rule,
     decisions::DecisionAction,
     types::{PolicyDecisionState, PolicyStore},
 };
-
-use crate::{
-    error::PolicydError,
-    wire::{ScopeWire, SudoScopeOp},
-};
-
+use crate::wire::{ScopeWire, SudoScopeOp};
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 use std::path::{Path, PathBuf};
 
@@ -108,35 +103,20 @@ impl PolicyStore {
                 drop(inner);
             }
 
-            ScopeTarget::Global { policy_path, home } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), false) {
-                    return PolicydError::from(err).into();
+            ScopeTarget::Global { .. }
+            | ScopeTarget::GlobalPackage { .. }
+            | ScopeTarget::Project { .. }
+            | ScopeTarget::ProjectPackage { .. } => {
+                if let Err(err) = apply_persistent_scope(
+                    target,
+                    home,
+                    ScopePersistFlags::new(false, true),
+                    Some("project sudo policy saved"),
+                    Some("project package sudo policy saved"),
+                    persist,
+                ) {
+                    return err.into();
                 }
-            }
-
-            ScopeTarget::GlobalPackage {
-                policy_path, home, ..
-            } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
-                    return PolicydError::from(err).into();
-                }
-            }
-
-            ScopeTarget::Project {
-                policy_path,
-                project_root: _,
-            } => {
-                if let Err(err) = persist(&policy_path, home, false) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project sudo policy saved");
-            }
-
-            ScopeTarget::ProjectPackage { policy_path, .. } => {
-                if let Err(err) = persist(&policy_path, home, true) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project package sudo policy saved");
             }
         }
 

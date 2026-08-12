@@ -1,22 +1,16 @@
 //! Policy store: filesystem scope application.
 
 use super::{
-    apply_session_rule,
+    ScopePersistFlags, apply_persistent_scope, apply_session_rule,
     decisions::DecisionAction,
     persist::PersistResourceRuleArgs,
     types::{PolicyDecisionState, PolicyStore},
 };
-
-use crate::{
-    error::PolicydError,
-    wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire},
-};
-
+use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, FilesystemRuleKey, ResourceAccess, ResourceKind,
     ResourceRuleKey, RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget, expand_policy_path,
 };
-
 use std::path::{Path, PathBuf};
 
 impl PolicyStore {
@@ -126,30 +120,20 @@ impl PolicyStore {
                 drop(inner);
             }
 
-            ScopeTarget::Global { policy_path, home }
-            | ScopeTarget::GlobalPackage {
-                policy_path, home, ..
-            } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
-                    return PolicydError::from(err).into();
+            ScopeTarget::Global { .. }
+            | ScopeTarget::GlobalPackage { .. }
+            | ScopeTarget::Project { .. }
+            | ScopeTarget::ProjectPackage { .. } => {
+                if let Err(err) = apply_persistent_scope(
+                    target,
+                    home,
+                    ScopePersistFlags::new(true, true),
+                    Some("project filesystem policy saved"),
+                    Some("project package filesystem policy saved"),
+                    persist,
+                ) {
+                    return err.into();
                 }
-            }
-
-            ScopeTarget::Project {
-                policy_path,
-                project_root: _,
-            } => {
-                if let Err(err) = persist(&policy_path, home, true) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project filesystem policy saved");
-            }
-
-            ScopeTarget::ProjectPackage { policy_path, .. } => {
-                if let Err(err) = persist(&policy_path, home, true) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project package filesystem policy saved");
             }
         }
 
@@ -243,6 +227,7 @@ impl PolicyStore {
 
         let policy_path = match scope_target {
             ScopeTarget::Ephemeral => None,
+
             ScopeTarget::Session { session_id } => {
                 let mut inner = self.inner.lock().await;
                 let PolicyDecisionState {
@@ -254,31 +239,22 @@ impl PolicyStore {
                 drop(inner);
                 None
             }
-            ScopeTarget::Global { policy_path, home } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), false) {
-                    return PolicydError::from(err).into();
+
+            ScopeTarget::Global { .. }
+            | ScopeTarget::GlobalPackage { .. }
+            | ScopeTarget::Project { .. }
+            | ScopeTarget::ProjectPackage { .. } => {
+                match apply_persistent_scope(
+                    scope_target,
+                    home,
+                    ScopePersistFlags::new(false, true),
+                    None,
+                    None,
+                    persist,
+                ) {
+                    Ok(path) => path,
+                    Err(err) => return err.into(),
                 }
-                Some(policy_path)
-            }
-            ScopeTarget::GlobalPackage {
-                policy_path, home, ..
-            } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
-                    return PolicydError::from(err).into();
-                }
-                Some(policy_path)
-            }
-            ScopeTarget::Project { policy_path, .. } => {
-                if let Err(err) = persist(&policy_path, home, false) {
-                    return PolicydError::from(err).into();
-                }
-                Some(policy_path)
-            }
-            ScopeTarget::ProjectPackage { policy_path, .. } => {
-                if let Err(err) = persist(&policy_path, home, true) {
-                    return PolicydError::from(err).into();
-                }
-                Some(policy_path)
             }
         };
 
@@ -370,35 +346,20 @@ impl PolicyStore {
                 drop(inner);
             }
 
-            ScopeTarget::Global { policy_path, home } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), false) {
-                    return PolicydError::from(err).into();
+            ScopeTarget::Global { .. }
+            | ScopeTarget::GlobalPackage { .. }
+            | ScopeTarget::Project { .. }
+            | ScopeTarget::ProjectPackage { .. } => {
+                if let Err(err) = apply_persistent_scope(
+                    target,
+                    home,
+                    ScopePersistFlags::new(false, true),
+                    Some("project resource policy saved"),
+                    Some("project package resource policy saved"),
+                    persist,
+                ) {
+                    return err.into();
                 }
-            }
-
-            ScopeTarget::GlobalPackage {
-                policy_path, home, ..
-            } => {
-                if let Err(err) = persist(&policy_path, Some(home.as_path()), true) {
-                    return PolicydError::from(err).into();
-                }
-            }
-
-            ScopeTarget::Project {
-                policy_path,
-                project_root: _,
-            } => {
-                if let Err(err) = persist(&policy_path, home, false) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project resource policy saved");
-            }
-
-            ScopeTarget::ProjectPackage { policy_path, .. } => {
-                if let Err(err) = persist(&policy_path, home, true) {
-                    return PolicydError::from(err).into();
-                }
-                tracing::info!(path = ?policy_path, "project package resource policy saved");
             }
         }
 
@@ -409,17 +370,14 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::{
         store::decisions::DecisionAction,
         wire::{FilesystemScopeOp, ScopeWire},
     };
-
     use agent_sandbox_core::{
         ApprovalScope, FileAccess, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
         SandboxPaths, Verdict, VerdictSource,
     };
-
     use std::{path::PathBuf, time::Duration};
 
     #[tokio::test]
