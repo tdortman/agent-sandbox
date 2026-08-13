@@ -1,6 +1,6 @@
 # agent-sandbox
 
-Run agent CLIs inside a bubblewrap jail on NixOS. Unknown operations wait for approval before executing.
+Run agent CLIs inside a bubblewrap jail on NixOS. Unknown operations block until approved, or deny outright when `agent-sandbox.policy.interactiveApproval = false`.
 
 ## What it gates
 
@@ -64,12 +64,18 @@ agent-sandbox.network.httpProxy.http10UpstreamOrigins = [
 
 ## Policy
 
-Policy files merge in this order, with denies taking precedence:
+The policy layers load in this order. Denies take precedence across all layers:
 
 1. NixOS declarative policy.
-2. `~/.config/agent-sandbox/policy.json`.
-3. `<project>/.agent-sandbox/policy.json`.
-4. Runtime decisions for the current request or session.
+2. Package base policy, set per package on the host (`--package-declarative`).
+3. Package home extension, `~/.config/agent-sandbox/packages/<package>.json`.
+4. User policy, `~/.config/agent-sandbox/policy.json`.
+5. Trusted project policy, `<project_root>/.agent-sandbox/policy.json`.
+6. Package project policy, `<project_root>/.agent-sandbox/packages/<package>.json`.
+7. Runtime decisions for the current request or session.
+
+The package layers apply only to sessions attributed to that package. Runtime decisions apply after the file layers. The global, global package, project, and project package scopes write their rule back to a policy file; the once and session scopes keep the decision in memory for the current request or
+session.
 
 Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields support [globset syntax](https://docs.rs/globset/0.4.19/globset/#syntax). Matching uses globset's `literal_separator` mode: `*` and `?` do not match `/`, use `**` for recursive path matching. Policy files are write-protected, including writes through hardlinks.
 
@@ -154,4 +160,4 @@ flowchart LR
     Relay --> Session["Host session bus"]
 ```
 
-The workspace separates shared policy types, policyd, network enforcement, filesystem monitoring, syscall brokering, and command-line tools.
+The workspace splits shared policy types, policyd, network enforcement, filesystem monitoring, syscall brokering, and command-line tools into crates under `crates/`.
