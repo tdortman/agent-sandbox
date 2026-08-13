@@ -194,6 +194,18 @@ let
   networkModuleSource = builtins.toFile "agent-sandbox-network.nix" (
     builtins.readFile ../../modules/nixos/agent-sandbox/network.nix
   );
+  networkWrapper = agentSandboxLib.mkWrapPackage pkgs {
+    package = pkgs.hello;
+    binary = "hello";
+    fsArmPkg = pkgs.hello;
+
+    network = {
+      netnsEnter = "/run/test/netns-enter";
+      netnsName = "agent-sandbox";
+    };
+
+    syscallArmPkg = pkgs.hello;
+  };
   proxyFirewallSource = builtins.toFile "agent-sandbox-proxy-firewall.sh" (
     builtins.readFile ../../modules/nixos/agent-sandbox/proxy-firewall.sh
   );
@@ -429,7 +441,44 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "proxy-mode netns rules must queue new IPv6 UDP flows"
   grep -F -q -- 'nft add element inet agent_sandbox proxy_uid' <<< "$netns_up" \
     || fail "netns up script must populate the proxy uid set at runtime"
-
+  # A nested launch (a sandboxed agent spawning another inside the sandbox
+  # network namespace) must not re-enter netns via the capability wrapper:
+  # NoNewPrivileges suppresses its file capabilities and it aborts with
+  # "failed to inherit capabilities" before its Rust setns body runs. The
+  # netns launcher compares the current namespace with the target and execs
+  # the inner directly when they already match, keeping the privileged enter
+  # path only for a genuinely different namespace.
+  netns_launcher=$(readlink -f ${networkWrapper}/bin/hello)
+  grep -F -q -- 'stat -c %i /run/netns/agent-sandbox' "$netns_launcher" \
+    || fail "netns launcher must read the target netns inode"
+  grep -F -q -- 'readlink /proc/self/ns/net' "$netns_launcher" \
+    || fail "netns launcher must read the current netns"
+  grep -F -q -- '== "net:[$_asbx_target]"' "$netns_launcher" \
+    || fail "netns launcher must compare current and target namespace identity"
+  grep -E -q -- 'exec /nix/store/.*-sandboxed-hello/bin/sandboxed-hello "\$@"' "$netns_launcher" \
+    || fail "netns launcher must bypass the wrapper and exec the inner directly when already in the namespace"
+  grep -E -q -- 'exec /run/test/netns-enter agent-sandbox /nix/store/.*-sandboxed-hello/bin/sandboxed-hello "\$@"' "$netns_launcher" \
+    || fail "netns launcher must keep the privileged enter path for a different namespace plus NoNewPrivileges"
+  grep -F -q -- 'NoNewPrivileges detected; joining namespace via systemd user service' "$netns_launcher" \
+    || fail "netns launcher must advertise the systemd user service escape when NoNewPrivileges is set from a different namespace"
+  grep -F -q -- 'systemd-run' "$netns_launcher" \
+    || fail "netns launcher must escape NoNewPrivileges through a systemd user transient service"
+  grep -F -q -- '--user --quiet --collect --pipe --wait --service-type=exec --expand-environment=no' "$netns_launcher" \
+    || fail "netns launcher must run the enter wrapper through a foreground, non-scope systemd service without expanding arguments"
+  grep -F -q -- '--setenv "PATH=$PATH"' "$netns_launcher" \
+    || fail "netns launcher must forward PATH into the systemd service"
+  grep -F -q -- '--working-directory "$PWD"' "$netns_launcher" \
+    || fail "netns launcher must forward the working directory into the systemd service"
+  grep -F -q -- '_asbx_sd_status=0' "$netns_launcher" \
+    || fail "netns launcher must initialise the systemd service status before the guarded call"
+  grep -E -q -- '^[[:space:]]*if .*systemd-run' "$netns_launcher" \
+    || fail "netns launcher must guard the systemd-run call against errexit before capturing its status"
+  grep -F -q -- '_asbx_sd_status=$?' "$netns_launcher" \
+    || fail "netns launcher must capture the systemd service exit status on failure"
+  grep -F -q -- 'exit "$_asbx_sd_status"' "$netns_launcher" \
+    || fail "netns launcher must propagate the systemd service exit status"
+  grep -F -q -- 'the launching process set NoNewPrivileges and the systemd user service fallback failed' "$netns_launcher" \
+    || fail "netns launcher must surface an actionable diagnostic when the systemd user service escape is unavailable"
   echo "PASS: direct and proxy network modes are wired"
   touch "$out"
 ''

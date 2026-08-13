@@ -453,10 +453,13 @@ in
           pkgs.writeShellApplication {
             name = sandboxedName;
 
+            runtimeInputs = [
+              pkgs.coreutils
+              pkgs.gawk
+            ];
+
             text = ''
-              set -euo pipefail
-              exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
-                ${lib.getExe dynamicInner} "$@"
+              ${netnsEnterPrefix (lib.getExe dynamicInner)}
             '';
           }
         else
@@ -573,10 +576,13 @@ in
           pkgs.writeShellApplication {
             name = sandboxedName;
 
+            runtimeInputs = [
+              pkgs.coreutils
+              pkgs.gawk
+            ];
+
             text = ''
-              set -euo pipefail
-              exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} \
-                ${lib.getExe jailedDrv} "$@"
+              ${netnsEnterPrefix (lib.getExe jailedDrv)}
             '';
           }
         else
@@ -586,6 +592,79 @@ in
           "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
         else
           "--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup";
+      # Skip the netns-enter capability wrapper when the caller is already
+      # inside the target network namespace. The NixOS wrapper backing
+      # netnsEnter uses file capabilities, which the kernel refuses to grant
+      # under NoNewPrivileges: a nested launch (a sandboxed agent spawning
+      # another one) already runs inside the sandbox netns, so its setns is a
+      # no-op yet the wrapper still aborts with "failed to inherit
+      # capabilities" before the Rust body runs. Compare namespace identity
+      # via the /proc/self/ns/net link and the /run/netns/<name> bind-mount
+      # inode (both are the nsfs inode) and exec the inner directly when they
+      # match; otherwise keep the privileged enter path.
+      netnsEnterPrefix = inner: ''
+        set -euo pipefail
+
+        _asbx_target="$(stat -c %i ${lib.escapeShellArg "/run/netns/${network.netnsName}"} 2>/dev/null || true)"
+        _asbx_current="$(readlink /proc/self/ns/net 2>/dev/null || true)"
+
+        # Bypass the enter wrapper only when the caller is already inside the
+        # target namespace AND holds no effective/ambient capabilities. The
+        # nested case (a sandboxed agent, whose NoNewPrivileges suppresses
+        # file capabilities) has both: setns is a no-op, so enter's remaining
+        # work is its capability drop, and with nothing in the sets there is
+        # nothing to drop. A privileged caller already in the namespace must
+        # NOT bypass: enter clears its elevated ambient+effective caps so
+        # bubblewrap runs unprivileged.
+        _asbx_eff="$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null || true)"
+        _asbx_amb="$(awk '/^CapAmb:/{print $2}' /proc/self/status 2>/dev/null || true)"
+
+        if [[ -n "$_asbx_target" && "$_asbx_current" == "net:[$_asbx_target]" && "$_asbx_eff" == "0000000000000000" && "$_asbx_amb" == "0000000000000000" ]]; then
+          exec ${inner} "$@"
+        fi
+
+        # Joining the namespace from elsewhere needs CAP_SYS_ADMIN for setns.
+        # NoNewPrivileges (inherited from an external launcher such as a
+        # terminal or agent host) one-way suppresses the wrapper's file
+        # capabilities, so a direct join aborts with the opaque NixOS wrapper
+        # error "failed to inherit capabilities". Escape NNP through a systemd
+        # user transient service: it runs as a child of the systemd user
+        # manager, which does not inherit the caller's NNP, so the wrapper's
+        # file capabilities apply again and the host-to-sandbox setns works.
+        # A service does not inherit the caller's environment or working
+        # directory, so forward them explicitly.
+        _asbx_nnp="$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null || true)"
+
+        if [[ "$_asbx_nnp" == "1" && -n "$_asbx_target" && "$_asbx_current" != "net:[$_asbx_target]" ]]; then
+          echo "agent-sandbox: NoNewPrivileges detected; joining namespace via systemd user service" >&2
+          _asbx_sd_args=(--user --quiet --collect --pipe --wait --service-type=exec --expand-environment=no)
+          while IFS= read -r -d $'\0' _asbx_line; do
+            case "$_asbx_line" in
+              *=*) ;;
+              *) continue ;;
+            esac
+            _asbx_name="''${_asbx_line%%=*}"
+            case "$_asbx_name" in
+              *[!A-Za-z0-9_]*|""|TMPDIR|TEMP|TMP) continue ;;
+            esac
+            _asbx_sd_args+=(--setenv "$_asbx_line")
+          done < <(env -0)
+          _asbx_sd_args+=(--setenv "PATH=$PATH")
+          _asbx_sd_args+=(--working-directory "$PWD")
+          _asbx_sd_status=0
+          if ${pkgs.systemd}/bin/systemd-run "''${_asbx_sd_args[@]}" -- ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} ${inner} "$@"; then
+            : # status already 0; the if guards systemd-run's exit against `set -e`
+          else
+            _asbx_sd_status=$?
+          fi
+          if [[ "$_asbx_sd_status" -ne 0 ]]; then
+            echo "agent-sandbox: cannot join network namespace ${lib.escapeShellArg network.netnsName}: the launching process set NoNewPrivileges and the systemd user service fallback failed. Launch the sandboxed agent without NoNewPrivileges, or ensure a systemd user session is running." >&2
+          fi
+          exit "$_asbx_sd_status"
+        fi
+
+        exec ${lib.escapeShellArg network.netnsEnter} ${lib.escapeShellArg network.netnsName} ${inner} "$@"
+      '';
       networkMode = if proxyMode then "proxy" else "direct";
       networkModeScript = lib.optionalString syscallGate ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE ${lib.escapeShellArg networkMode})
