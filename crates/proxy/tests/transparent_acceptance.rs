@@ -1,3 +1,7 @@
+//! End-to-end transparent proxy acceptance tests.
+//!
+//! Runs the proxy against a real listener and verifies interception, policy
+//! claiming, and relaying. Debug builds only, via the outer `cfg` gate.
 #![cfg(debug_assertions)]
 
 mod support;

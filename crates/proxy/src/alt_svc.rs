@@ -24,7 +24,9 @@ use tracing::debug;
 /// Minimal `Alt-Svc` rewrite surface shared by the rama (TCP) and `http`
 /// (h3) response types, which are distinct forked header-map types.
 pub trait AltSvcResponse {
+    /// Return the raw `alt-svc` header values present on the response.
     fn alt_svc_values(&self) -> Vec<Vec<u8>>;
+    /// Replace the `alt-svc` header(s); `None` removes them.
     fn rewrite_alt_svc(&mut self, rewritten: Option<Vec<u8>>);
 }
 

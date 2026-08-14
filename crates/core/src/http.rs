@@ -37,6 +37,7 @@ impl HttpMethod {
         Ok(Self(value.into()))
     }
 
+    /// Return the canonical method token.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -73,8 +74,11 @@ impl<'de> Deserialize<'de> for HttpMethod {
 /// Exact, any-of, or all-method matching.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpMethodMatcher {
+    /// Matches exactly the given method.
     Exact(HttpMethod),
+    /// Matches any of the given methods.
     AnyOf(Vec<HttpMethod>),
+    /// Matches every method.
     All,
 }
 
@@ -107,6 +111,7 @@ impl HttpMethodMatcher {
         }
     }
 
+    /// Return whether this matcher accepts `request`.
     #[must_use]
     pub fn matches(&self, request: &HttpMethod) -> bool {
         match self {
@@ -234,12 +239,14 @@ impl<'de> Deserialize<'de> for HttpMethodMatcher {
 /// HTTP scheme accepted by the transparent proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpScheme {
+    /// Plaintext `http`.
     Http,
+    /// Transport-layer-secured `https`.
     Https,
 }
 
 impl HttpScheme {
-    ///
+    /// Parse an HTTP scheme, ignoring ASCII case.
     /// # Errors
     ///
     /// Returns [`HttpParseError::UnsupportedScheme`] when `value` is not
@@ -252,6 +259,7 @@ impl HttpScheme {
         }
     }
 
+    /// Return the canonical scheme name (`"http"` or `"https"`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -260,6 +268,7 @@ impl HttpScheme {
         }
     }
 
+    /// Return the default port for this scheme (80 for HTTP, 443 for HTTPS).
     #[must_use]
     pub const fn default_port(self) -> u16 {
         match self {
@@ -292,12 +301,15 @@ impl<'de> Deserialize<'de> for HttpScheme {
 /// DNS name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpHost {
+    /// An IPv4/IPv6 literal authority.
     Ip(IpAddr),
+    /// A normalized DNS hostname authority.
     Dns(Box<str>),
 }
 
 impl HttpHost {
-    ///
+    /// Parse and trim a hostname, classifying it as an IP literal or a
+    /// normalized DNS name.
     /// # Errors
     ///
     /// Returns [`HttpParseError::InvalidAuthority`] when `host` is empty or
@@ -317,6 +329,7 @@ impl HttpHost {
         Ok(Self::Dns(normalized.into_boxed_str()))
     }
 
+    /// Return whether this host is an IPv6 literal.
     #[must_use]
     pub const fn is_ipv6(&self) -> bool {
         matches!(self, Self::Ip(IpAddr::V6(_)))
@@ -340,7 +353,7 @@ pub struct HttpAuthority {
 }
 
 impl HttpAuthority {
-    ///
+    /// Parse and canonicalize an authority into its host and effective port.
     /// # Errors
     ///
     /// Returns [`HttpParseError::InvalidAuthority`] for malformed authorities,
@@ -382,21 +395,25 @@ impl HttpAuthority {
         })
     }
 
+    /// Return the canonical host component.
     #[must_use]
     pub const fn host(&self) -> &HttpHost {
         &self.host
     }
 
+    /// Return the effective (non-`None`) port.
     #[must_use]
     pub const fn port(&self) -> NonZeroU16 {
         self.port
     }
 
+    /// Return the effective port as a plain `u16`.
     #[must_use]
     pub const fn port_number(&self) -> u16 {
         self.port.get()
     }
 
+    /// Return whether the port is the scheme's default port.
     #[must_use]
     pub const fn is_default_port(&self, scheme: HttpScheme) -> bool {
         self.port.get() == scheme.default_port()
@@ -422,7 +439,8 @@ impl HttpAuthority {
 pub struct NormalizedHttpPath(Box<str>);
 
 impl NormalizedHttpPath {
-    ///
+    /// Parse and normalize an absolute HTTP path, decoding percent escapes and
+    /// collapsing `.` and `..` segments.
     /// # Errors
     ///
     /// Returns [`HttpParseError::InvalidPath`] when `raw` is not an absolute
@@ -475,11 +493,13 @@ impl NormalizedHttpPath {
         Ok(Self(normalized.into_boxed_str()))
     }
 
+    /// Return the normalized path string.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Return whether this path matches `request` as a directory prefix.
     #[must_use]
     pub fn matches_prefix(&self, request: &Self) -> bool {
         if self.as_str() == "/" || self == request {
@@ -508,21 +528,26 @@ impl fmt::Display for NormalizedHttpPath {
 /// URL target, including the reserved `OPTIONS *` form.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpTarget {
+    /// A normalized request path.
     Path(NormalizedHttpPath),
+    /// The reserved `OPTIONS *` asterisk target.
     Asterisk,
 }
 
 /// Canonical scheme, authority, and path used by HTTP policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpUrl {
+    /// The URL scheme.
     pub scheme: HttpScheme,
+    /// The canonical authority (host and effective port).
     pub authority: HttpAuthority,
+    /// The request target: a normalized path or the `OPTIONS *` asterisk.
     pub target: HttpTarget,
     pattern: Option<Box<str>>,
 }
 
 impl HttpUrl {
-    ///
+    /// Parse a canonical absolute HTTP URL without a query or fragment.
     /// # Errors
     ///
     /// Returns [`HttpParseError::InvalidUrl`] when `raw` is malformed, or
@@ -577,7 +602,8 @@ impl HttpUrl {
         Self::parse_absolute_parts(raw, true)
     }
 
-    ///
+    /// Construct a canonical URL from its scheme, authority, and target
+    /// (a path, or `"*"` for the `OPTIONS *` asterisk).
     /// # Errors
     ///
     /// Returns an [`HttpParseError`] when the scheme, authority, or path target
@@ -639,6 +665,8 @@ impl HttpUrl {
         })
     }
 
+    /// Return the normalized path, or `None` for the `OPTIONS *` asterisk
+    /// target.
     #[must_use]
     pub const fn path(&self) -> Option<&NormalizedHttpPath> {
         match &self.target {
@@ -647,6 +675,7 @@ impl HttpUrl {
         }
     }
 
+    /// Return whether this URL covers every request covered by `other`.
     #[must_use]
     pub fn covers(&self, request: &Self) -> bool {
         match (&self.pattern, &request.pattern) {
@@ -666,6 +695,7 @@ impl HttpUrl {
         }
     }
 
+    /// Return whether this URL (including any glob pattern) matches `request`.
     #[must_use]
     pub fn matches(&self, request: &Self) -> bool {
         if let Some(pattern) = &self.pattern {
@@ -739,7 +769,8 @@ pub struct HttpSessionMetadata {
 }
 
 impl HttpSessionMetadata {
-    ///
+    /// Construct session metadata from optional kind, protocol, and target
+    /// fields, validating each present value.
     /// # Errors
     ///
     /// Returns [`HttpParseError::InvalidSessionMetadata`] when any present
@@ -756,6 +787,7 @@ impl HttpSessionMetadata {
         })
     }
 
+    /// Return the session protocol, if any.
     #[must_use]
     pub fn protocol(&self) -> Option<&str> {
         self.protocol.as_deref()
@@ -806,7 +838,9 @@ fn validate_session_value(value: Option<&str>) -> Result<Option<String>, HttpPar
 /// One observed HTTP request. Query strings are intentionally outside policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpRequest {
+    /// The HTTP method of the request.
     pub method: HttpMethod,
+    /// The canonical request URL.
     pub url: HttpUrl,
 
     /// Optional extended-session attribution carried for approval and UI use.
@@ -856,7 +890,7 @@ impl<'de> Deserialize<'de> for HttpRequest {
 }
 
 impl HttpRequest {
-    ///
+    /// Construct a request from its raw method, scheme, authority, and target.
     /// # Errors
     ///
     /// Returns an [`HttpParseError`] when `method` or any URL component is
@@ -872,7 +906,8 @@ impl HttpRequest {
         Self::validate(method, url, None)
     }
 
-    ///
+    /// Parse a request from a raw absolute URL (query strings allowed but
+    /// stripped from policy).
     /// # Errors
     ///
     /// Returns an [`HttpParseError`] when `method` or `raw_url` is malformed,
@@ -912,12 +947,15 @@ impl HttpRequest {
 /// Typed policy target used by approvals and persisted HTTP rules.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpRuleTarget {
+    /// Matcher for the rule's HTTP methods.
     pub method: HttpMethodMatcher,
+    /// The rule's canonical URL, including any glob pattern.
     pub url: HttpUrl,
 }
 
 impl HttpRuleTarget {
-    ///
+    /// Construct a policy target, enforcing that only the exact `OPTIONS`
+    /// method may target the `*` asterisk.
     /// # Errors
     ///
     /// Returns [`HttpParseError::AsteriskRequiresOptions`] when `url` is an
@@ -932,7 +970,8 @@ impl HttpRuleTarget {
         Ok(Self { method, url })
     }
 
-    ///
+    /// Build a typed target from a raw rule, parsing the method list and the
+    /// URL glob pattern.
     /// # Errors
     ///
     /// Returns an [`HttpParseError`] when the raw rule target is malformed or
@@ -943,6 +982,7 @@ impl HttpRuleTarget {
         Self::new(method, url)
     }
 
+    /// Return whether this target matches `request`.
     #[must_use]
     pub fn matches(&self, request: &HttpRequest) -> bool {
         self.method.matches(&request.method) && self.url.matches(&request.url)
@@ -995,10 +1035,13 @@ impl<'de> Deserialize<'de> for HttpRuleTarget {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRule {
+    /// The HTTP methods the rule matches. An empty list matches all methods.
     #[serde(default)]
     pub methods: Vec<String>,
 
+    /// The rule's URL, which may contain glob metacharacters.
     pub url: String,
+    /// Optional human-readable comment associated with the rule.
     pub comment: Option<String>,
 }
 
@@ -1026,6 +1069,7 @@ impl Serialize for HttpRule {
 }
 
 impl HttpRule {
+    /// Construct a raw rule from its parts, always attaching a comment.
     pub fn new(methods: Vec<String>, url: impl Into<String>, comment: impl Into<String>) -> Self {
         Self {
             methods,
@@ -1034,7 +1078,7 @@ impl HttpRule {
         }
     }
 
-    ///
+    /// Parse this rule into a typed, validated policy target.
     /// # Errors
     ///
     /// Returns an [`HttpParseError`] when this rule's method or URL is invalid.
@@ -1046,9 +1090,13 @@ impl HttpRule {
 /// Context dimensions that HTTP verdicts must never cross.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HttpContextKey {
+    /// The working directory at the time of the request, if known.
     pub cwd: Option<std::path::PathBuf>,
+    /// The user's home directory at the time of the request, if known.
     pub home: Option<std::path::PathBuf>,
+    /// The detected project root directory, if known.
     pub project_root: Option<std::path::PathBuf>,
+    /// The sandbox session identifier this request belongs to, if any.
     pub sandbox_session_id: Option<String>,
 }
 
@@ -1057,12 +1105,13 @@ pub struct HttpContextKey {
 pub struct PendingHttpId(uuid::Uuid);
 
 impl PendingHttpId {
+    /// Generate a fresh random (`UUIDv7`) pending request identifier.
     #[must_use]
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
     }
 
-    ///
+    /// Parse the canonical `http:<UUIDv7>` textual representation.
     /// # Errors
     ///
     /// Returns [`HttpParseError::InvalidPendingId`] when `value` does not use
@@ -1117,47 +1166,62 @@ impl<'de> Deserialize<'de> for PendingHttpId {
     }
 }
 
+/// Errors produced while parsing or validating HTTP request components.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum HttpParseError {
+    /// The method is not a recognized HTTP method.
     #[error("invalid HTTP method")]
     InvalidMethod,
 
+    /// The URL scheme is not `http` or `https`.
     #[error("unsupported HTTP URL scheme")]
     UnsupportedScheme,
 
+    /// The authority is empty or does not contain a valid host or port.
     #[error("invalid HTTP authority")]
     InvalidAuthority,
 
+    /// Userinfo (credentials) is present in the authority, which is forbidden.
     #[error("HTTP credentials are not allowed")]
     CredentialsNotAllowed,
 
+    /// The port is unparseable, zero, or out of range.
     #[error("invalid HTTP port")]
     InvalidPort,
 
+    /// The URL does not parse as a valid `http(s)` URL.
     #[error("invalid HTTP URL")]
     InvalidUrl,
 
+    /// The request path is missing or not an absolute path.
     #[error("invalid HTTP path")]
     InvalidPath,
 
+    /// A query string or fragment is present, which is forbidden in a target.
     #[error("query or fragment is not allowed in an HTTP policy target")]
     QueryOrFragmentNotAllowed,
 
+    /// A percent escape is truncated or uses non-hex digits.
     #[error("malformed percent escape in HTTP path")]
     MalformedEscape,
 
+    /// A percent-encoded separator, percent, control, or NUL occurs in a path.
     #[error("encoded path separator, percent, control, or NUL is not allowed")]
     EncodedForbiddenByte,
 
+    /// A literal non-ASCII or control byte occurs in a path.
     #[error("literal non-ASCII or control byte is not allowed in HTTP path")]
     InvalidPathByte,
 
+    /// The pending HTTP identifier value does not parse.
     #[error("invalid pending HTTP identifier")]
     InvalidPendingId,
 
+    /// The `OPTIONS *` asterisk target was used with a non-`OPTIONS` method.
     #[error("OPTIONS is required for the HTTP asterisk target")]
     AsteriskRequiresOptions,
 
+    /// Session metadata contains a value that cannot be serialized.
     #[error("session metadata contains an invalid value")]
     InvalidSessionMetadata,
 }

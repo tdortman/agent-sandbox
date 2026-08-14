@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlowProtocol {
+    /// TCP transport.
     Tcp,
+    /// UDP transport.
     Udp,
 }
 
 impl FlowProtocol {
+    /// The lower-case wire name of this protocol (`"tcp"` or `"udp"`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

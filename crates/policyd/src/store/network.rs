@@ -160,6 +160,9 @@ impl PolicyStore {
         }
     }
 
+    /// Request interactive approval for a network connection, prompting the
+    /// policy UI when needed. Returns the cached or policy-derived verdict
+    /// immediately when one already exists.
     pub async fn request_network_approval(&self, req: NetworkCheckRequest) -> CheckReply {
         self.request_network_approval_with_aliases(req, Vec::new())
             .await

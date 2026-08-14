@@ -24,6 +24,7 @@ pub use error::UiCliError;
 use nix::fcntl::{Flock, FlockArg, OFlag};
 use tracing::{info, warn};
 
+/// Return the D-Bus bus name string (`"session"` or `"system"`) for `bus`.
 #[must_use]
 pub const fn bus_name(bus: DbusBus) -> &'static str {
     match bus {
@@ -32,6 +33,8 @@ pub const fn bus_name(bus: DbusBus) -> &'static str {
     }
 }
 
+/// Return the D-Bus message type name (`"method_call"`, `"method_return"`,
+/// `"error"`, or `"signal"`) for `kind`.
 #[must_use]
 pub const fn message_kind_name(kind: DbusMessageKind) -> &'static str {
     match kind {
@@ -42,6 +45,8 @@ pub const fn message_kind_name(kind: DbusMessageKind) -> &'static str {
     }
 }
 
+/// Return `signature` unchanged, or the placeholder `"<empty>"` when it is
+/// empty.
 #[must_use]
 pub const fn signature_display(signature: &str) -> &str {
     if signature.is_empty() {

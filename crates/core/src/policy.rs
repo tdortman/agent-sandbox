@@ -14,21 +14,43 @@ use crate::{
     http::HttpRule,
 };
 
+/// Access mode for a filesystem path rule or request.
+///
+/// Level semantics follow Unix file access and are classified by fanotify /
+/// `open(2)` flag bits (see [`open_flags_to_file_access`]).
+///
+/// [`open_flags_to_file_access`]: fn@open_flags_to_file_access
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FileAccess {
     #[default]
+    /// Read access.
+    ///
+    /// When observed via fanotify, directory traversal is normalized to this
+    /// by [`normalize_directory_traverse_access`].
+    ///
+    /// [`normalize_directory_traverse_access`]: fn@normalize_directory_traverse_access
     Read,
 
+    /// Write access.
+    ///
+    /// Includes truncation and creation semantics, so `creat(2)` classifies
+    /// as write-equivalent even when the passed access flags are read-only.
     Write,
+
+    /// Read and write access.
     ReadWrite,
+
+    /// Execute access.
     Execute,
+    /// All access levels.
     All,
 }
 
 impl FileAccess {
+    /// Return the stable wire / policy-file name of this access level.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -155,13 +177,20 @@ pub fn open_flags_to_file_access(flags: i32) -> FileAccess {
     }
 }
 
+/// Identity of a filesystem rule: a path plus the access level it applies to.
+///
+/// Used as the hash key that deduplicates and aggregates [`FilesystemRule`]s
+/// (e.g. merging an observed access with a matching rule).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FilesystemRuleKey {
+    /// Path the rule applies to.
     pub path: PathBuf,
+    /// Access level the rule grants or denies.
     pub access: FileAccess,
 }
 
 impl FilesystemRuleKey {
+    /// Construct a new key from an explicit path and access level.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, access: FileAccess) -> Self {
         Self {
@@ -170,6 +199,8 @@ impl FilesystemRuleKey {
         }
     }
 
+    /// Derive the key from a [`FilesystemRule`], trimming trailing slashes from
+    /// its path so equivalent path spellings share one key.
     #[must_use]
     pub fn from_rule(rule: &FilesystemRule) -> Self {
         Self::new(
@@ -289,16 +320,28 @@ fn path_matches_rule(
     compiled_matches(compiled, &requested, require_directory_boundary)
 }
 
+/// One allow or deny rule for a filesystem path.
+///
+/// `path` may be absolute (`/foo`), home-relative (`~/foo`),
+/// project-relative (`./foo`), or a glob pattern. The rule matches
+/// when its path matches the requested path and its `access` covers the
+/// requested access.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FilesystemRule {
+    /// Path the rule applies to.
+    ///
+    /// May contain glob syntax; see [`contains_glob_syntax`].
     pub path: PathBuf,
+    /// Access level the rule grants or denies.
     pub access: FileAccess,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable annotation attached to the rule.
     pub comment: Option<String>,
 }
 
 impl FilesystemRule {
+    /// Construct a new rule from a path, access level, and comment.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, access: FileAccess, comment: impl Into<String>) -> Self {
         Self {
@@ -559,12 +602,19 @@ pub fn filesystem_approval_paths(path: &Path, home: Option<&Path>) -> Vec<PathBu
     result
 }
 
+/// The `filesystem` policy section: ordered lists of allow and deny
+/// [`FilesystemRule`]s.
+///
+/// When a request matches, rules are checked in order; a deny that matches
+/// (after allow rules) is authoritative.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilesystemSection {
     #[serde(default)]
+    /// Allow rules.
     pub allow: Vec<FilesystemRule>,
 
     #[serde(default)]
+    /// Deny rules.
     pub deny: Vec<FilesystemRule>,
 }
 
@@ -575,12 +625,14 @@ pub struct FilesystemSection {
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     #[default]
+    /// A Unix-domain socket accessed by `connect(2)` / `sendto(2)`.
     UnixSocket,
 
+    /// A device node opened by the broker.
     Device,
 }
-
 impl ResourceKind {
+    /// Return the stable wire / policy-file name of this resource kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -600,17 +652,26 @@ impl std::fmt::Display for ResourceKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SocketAccess {
     #[default]
+    /// `connect(2)` to the socket.
     Connect,
 
+    /// `sendto(2)`/`sendmsg(2)` on the socket.
     Send,
+
+    /// Both connecting and sending.
     All,
 }
 
 /// Access mode for a broker-opened device resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeviceAccess {
+    /// Open the device read-only.
     Read,
+
+    /// Open the device write-only.
     Write,
+
+    /// Open the device read-write.
     ReadWrite,
 }
 
@@ -620,7 +681,10 @@ pub enum DeviceAccess {
 /// `connect`, `send`, `all`, `open_read`, `open_write`, and `open_read_write`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceAccess {
+    /// Access to a Unix-domain socket resource.
     Socket(SocketAccess),
+
+    /// Access to a device node opened by the broker.
     Device(DeviceAccess),
 }
 
@@ -631,6 +695,7 @@ impl Default for ResourceAccess {
 }
 
 impl ResourceAccess {
+    /// Return the flat wire / policy-file name of this access.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -643,6 +708,7 @@ impl ResourceAccess {
         }
     }
 
+    /// Return the [`ResourceKind`] this access applies to.
     #[must_use]
     pub const fn kind(self) -> ResourceKind {
         match self {
@@ -738,14 +804,21 @@ impl std::fmt::Display for ResourceAccess {
     }
 }
 
+/// Identity of a resource rule: the resource kind, path, and access level.
+///
+/// Acts as the hash key that deduplicates and aggregates [`ResourceRule`]s.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceRuleKey {
+    /// Kind of resource the rule applies to.
     pub kind: ResourceKind,
+    /// Path of the resource the rule applies to.
     pub path: PathBuf,
+    /// Access level the rule grants or denies.
     pub access: ResourceAccess,
 }
 
 impl ResourceRuleKey {
+    /// Construct a new key from an explicit kind, path, and access level.
     #[must_use]
     pub fn new(kind: ResourceKind, path: impl Into<PathBuf>, access: ResourceAccess) -> Self {
         Self {
@@ -755,6 +828,8 @@ impl ResourceRuleKey {
         }
     }
 
+    /// Derive the key from a [`ResourceRule`], trimming trailing slashes from
+    /// its path so equivalent path spellings share one key.
     #[must_use]
     pub fn from_rule(rule: &ResourceRule) -> Self {
         Self::new(
@@ -765,17 +840,29 @@ impl ResourceRuleKey {
     }
 }
 
+/// One allow or deny rule for a capability-granting resource.
+///
+/// `path` may be absolute, home-relative (`~/foo`), project-relative
+/// (`./foo`), or a glob pattern. The rule matches when the resource kind and
+/// path match and `access` covers the requested access.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceRule {
+    /// Kind of resource the rule applies to.
     pub kind: ResourceKind,
+    /// Path of the resource the rule applies to.
+    ///
+    /// May contain glob syntax; see [`contains_glob_syntax`].
     pub path: PathBuf,
+    /// Access level the rule grants or denies.
     pub access: ResourceAccess,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable annotation attached to the rule.
     pub comment: Option<String>,
 }
 
 impl ResourceRule {
+    /// Construct a new rule from a kind, path, access level, and comment.
     #[must_use]
     pub fn new(
         kind: ResourceKind,
@@ -830,12 +917,16 @@ impl ResourceRule {
     }
 }
 
+/// The `resources` policy section: ordered lists of allow and deny
+/// [`ResourceRule`]s that gate Unix-domain-socket and device resources.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceSection {
     #[serde(default)]
+    /// Allow rules.
     pub allow: Vec<ResourceRule>,
 
     #[serde(default)]
+    /// Deny rules.
     pub deny: Vec<ResourceRule>,
 }
 
@@ -846,8 +937,10 @@ pub struct ResourceSection {
 #[serde(rename_all = "snake_case")]
 pub enum DbusBus {
     #[default]
+    /// The per-user session bus.
     Session,
 
+    /// The machine-wide system bus.
     System,
 }
 
@@ -858,10 +951,16 @@ pub enum DbusBus {
 #[serde(rename_all = "snake_case")]
 pub enum DbusMessageKind {
     #[default]
+    /// A method call from one peer to another.
     MethodCall,
 
+    /// The reply to a method call.
     MethodReturn,
+
+    /// An error reply to a method call.
     Error,
+
+    /// A broadcast signal emitted by a peer.
     Signal,
 }
 
@@ -869,28 +968,39 @@ pub enum DbusMessageKind {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DbusFdMetadata {
     #[serde(default)]
+    /// Kind of file descriptor (e.g. an fd name) attached to the message.
     pub kind: String,
 
     #[serde(default)]
+    /// Whether the descriptor grants read-only access.
     pub read_only: bool,
 }
 
 /// Structured identity of a D-Bus message.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DbusTarget {
+    /// Bus the message traverses.
     pub bus: DbusBus,
+    /// Destination service name of the message.
     pub destination: String,
+    /// Object path addressed by the message.
     pub object_path: String,
+    /// Interface the message targets.
     pub interface: String,
+    /// Method or signal name of the message.
     pub member: String,
+    /// Kind of D-Bus message.
     pub message_kind: DbusMessageKind,
+    /// D-Bus signature (type encoding) of the message body.
     pub signature: String,
 
     #[serde(default)]
+    /// Metadata for any file descriptors carried by the message.
     pub fd_metadata: Vec<DbusFdMetadata>,
 }
 
 impl DbusTarget {
+    /// Construct a target for a message on the session bus.
     #[must_use]
     pub fn session(
         destination: impl Into<String>,
@@ -917,13 +1027,16 @@ impl DbusTarget {
 /// Declarative D-Bus rule. Target string fields accept globset syntax.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DbusRule {
+    /// The message target this rule matches.
     pub target: DbusTarget,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable annotation attached to the rule.
     pub comment: Option<String>,
 }
 
 impl DbusRule {
+    /// Construct a new rule from a target and comment.
     #[must_use]
     pub fn new(target: DbusTarget, comment: impl Into<String>) -> Self {
         Self {
@@ -932,6 +1045,10 @@ impl DbusRule {
         }
     }
 
+    /// Whether this rule matches the given message target.
+    ///
+    /// The bus, message kind, and fd metadata must match exactly; the other
+    /// string fields match as globset patterns.
     #[must_use]
     pub fn matches(&self, target: &DbusTarget) -> bool {
         if self.target.bus != target.bus
@@ -955,87 +1072,120 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
     build_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
 }
 
+/// The `dbus` policy section: ordered lists of allow and deny [`DbusRule`]s
+/// that gate messages relayed over D-Bus.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DbusSection {
     #[serde(default)]
+    /// Allow rules.
     pub allow: Vec<DbusRule>,
 
     #[serde(default)]
+    /// Deny rules.
     pub deny: Vec<DbusRule>,
 }
 
+/// The complete on-disk policy document, organized into per-resource sections.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
     #[serde(default)]
+    /// Network section: direct and HTTP allow/deny rules.
     pub network: NetworkSection,
 
     #[serde(default)]
+    /// Sudo section: argv allow/deny rules.
     pub sudo: SudoSection,
 
     #[serde(default)]
+    /// Filesystem section: path allow/deny rules.
     pub filesystem: FilesystemSection,
 
     #[serde(default)]
+    /// Resources section: capability-granting resource allow/deny rules.
     pub resources: ResourceSection,
 
     #[serde(default)]
+    /// D-Bus section: message allow/deny rules.
     pub dbus: DbusSection,
 }
 
+/// Network rules for direct (host/port) connections.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectNetworkSection {
     #[serde(default)]
+    /// Allow rules.
     pub allow: Vec<NetworkRule>,
 
     #[serde(default)]
+    /// Deny rules.
     pub deny: Vec<NetworkRule>,
 }
 
+/// The `network` policy section, split into direct and HTTP rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkSection {
     #[serde(default)]
+    /// Direct host/port connection rules.
     pub direct: DirectNetworkSection,
 
     #[serde(default)]
+    /// HTTP request rules.
     pub http: HttpSection,
 }
 
+/// HTTP allow and deny rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpSection {
     #[serde(default)]
+    /// Allow rules.
     pub allow: Vec<HttpRule>,
 
     #[serde(default)]
+    /// Deny rules.
     pub deny: Vec<HttpRule>,
 }
 
+/// The `sudo` policy section: argv allow and deny rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SudoSection {
     #[serde(default)]
+    /// Allow rules.
     pub allow: Vec<SudoRule>,
 
     #[serde(default)]
+    /// Deny rules.
     pub deny: Vec<SudoRule>,
 }
 
+/// One allow or deny rule for a direct (host/port) connection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkRule {
+    /// Host name or IP the rule applies to.
     pub host: String,
+    /// Port the rule applies to.
     pub port: u16,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable annotation attached to the rule.
     pub comment: Option<String>,
 }
 
+/// One allow or deny rule for a `sudo` command.
+///
+/// The rule matches when the requested argv begins with `argv`, permitting
+/// deny/allow of a command with any arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SudoRule {
+    /// Command and (optionally) argument prefix to match against.
     pub argv: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable annotation attached to the rule.
     pub comment: Option<String>,
 }
 
 impl NetworkRule {
+    /// Construct a new rule from a host, port, and comment.
     pub fn new(host: impl Into<String>, port: u16, comment: impl Into<String>) -> Self {
         Self {
             host: host.into(),
@@ -1044,6 +1194,7 @@ impl NetworkRule {
         }
     }
 
+    /// Return the identity of this rule: host and port pair.
     #[must_use]
     pub fn key(&self) -> NetworkRuleKey {
         NetworkRuleKey::new(&self.host, self.port)
@@ -1051,6 +1202,7 @@ impl NetworkRule {
 }
 
 impl SudoRule {
+    /// Construct a new rule from an argv and comment.
     pub fn new(argv: Vec<String>, comment: impl Into<String>) -> Self {
         Self {
             argv,
@@ -1058,6 +1210,7 @@ impl SudoRule {
         }
     }
 
+    /// Return the argv as a stable key, or `None` when the argv is empty.
     #[must_use]
     pub fn key(&self) -> Option<Vec<String>> {
         if self.argv.is_empty() {
@@ -1067,11 +1220,15 @@ impl SudoRule {
         }
     }
 
+    /// Whether this rule matches the given argv (as a prefix).
     #[must_use]
     pub fn matches(&self, argv: &[String]) -> bool {
         !self.argv.is_empty() && argv.starts_with(&self.argv)
     }
 
+    /// Return every non-empty prefix of the given argv, longest first.
+    ///
+    /// Used to enumerate candidate `sudo` approval targets.
     #[must_use]
     pub fn approval_prefixes(argv: &[String]) -> Vec<Vec<String>> {
         let mut prefixes = Vec::with_capacity(argv.len());
@@ -1089,7 +1246,9 @@ impl SudoRule {
 /// object, which means one is a hardlink of the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InodeIdentity {
+    /// Inode number of the filesystem object.
     pub inode: u64,
+    /// Device number of the filesystem containing the object.
     pub device: u64,
 }
 

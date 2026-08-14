@@ -13,6 +13,11 @@ pub struct ProjectPolicyContext {
 }
 
 impl ProjectPolicyContext {
+    /// Build a policy context from optional home, cwd, and `project_root`
+    /// paths.
+    ///
+    /// Each provided path is canonicalized (when possible); uncanonicalizable
+    /// inputs are discarded.
     #[must_use]
     pub fn new(home: Option<&Path>, cwd: Option<&Path>, project_root: Option<&Path>) -> Self {
         Self {
@@ -22,6 +27,10 @@ impl ProjectPolicyContext {
         }
     }
 
+    /// The resolved home directory hint.
+    ///
+    /// Prefers the explicit `home`, falling back to inferring a home from the
+    /// project root, then the cwd.
     #[must_use]
     pub fn home_hint(&self) -> Option<String> {
         self.home

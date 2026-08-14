@@ -19,6 +19,9 @@ use crate::{
 
 const MAX_UI_SPAWN_THROTTLES: usize = 1024;
 
+/// Build the environment for a spawned policy UI: base HOME/USER vars plus the
+/// sandbox policy socket and any session/project context, forwarding UI
+/// backend configuration and graphical-session variables.
 #[must_use]
 pub fn ui_spawn_env(
     args: &PolicydArgs,
@@ -206,6 +209,10 @@ impl PolicyStore {
     }
 }
 
+/// Spawn the policy UI (throttled to the key built from uid, session and
+/// paths) when no matching UI is connected.
+///
+/// Child spawn and wait errors are logged and swallowed by the caller.
 pub fn maybe_spawn_ui<S: BuildHasher>(
     args: &PolicydArgs,
     ui_spawn_last: &mut HashMap<String, Instant, S>,

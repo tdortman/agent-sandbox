@@ -9,10 +9,14 @@ use hickory_proto::{
     },
 };
 
+/// An IP→hostname mapping extracted from a DNS response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsMapping {
+    /// The IP address (as a string) mapped by the DNS record.
     pub ip: String,
+    /// The hostname the record maps to.
     pub hostname: String,
+    /// The record's TTL in seconds.
     pub ttl: u32,
 }
 

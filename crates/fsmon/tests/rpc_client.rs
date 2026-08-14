@@ -1,3 +1,7 @@
+//! In-process RPC client tests for the filesystem monitor.
+//!
+//! Starts a monitor via `start_monitor` and exercises request/reply
+//! interactions over the daemon RPC wire format.
 use std::path::PathBuf;
 
 use agent_sandbox_core::{

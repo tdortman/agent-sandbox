@@ -1,3 +1,7 @@
+//! Black-box contract tests for the `agent-sandbox-dns-forwarder` binary.
+//!
+//! Exercises the CLI end to end via `CARGO_BIN_EXE_` to lock down argument
+//! handling and exit behaviour without binding a listening socket.
 use std::process::Command;
 
 fn run(args: &[&str]) -> std::process::Output {

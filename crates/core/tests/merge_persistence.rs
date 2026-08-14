@@ -1,3 +1,7 @@
+//! Policy merge and JSON persistence tests.
+//!
+//! Covers `merge_layers`, serialization, and round-trip load/store of the
+//! `agent_sandbox_core` policy type.
 use std::path::PathBuf;
 
 use agent_sandbox_core::{

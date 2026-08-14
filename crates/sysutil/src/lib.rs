@@ -1,4 +1,7 @@
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "unsafe syscall wrappers are reviewed in this crate"
+)]
 //! Safe wrappers over Linux syscall surfaces used by the agent-sandbox daemons.
 //!
 //! Every `unsafe` in the workspace that touches a raw syscall lives behind one
@@ -317,13 +320,17 @@ const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
 /// Permission event masks.
 pub const FAN_OPEN_PERM: u64 = libc::FAN_OPEN_PERM;
 
+/// Permission event mask for opening a file for executable execution.
 pub const FAN_OPEN_EXEC_PERM: u64 = libc::FAN_OPEN_EXEC_PERM;
+/// Permission event mask for file access (read/write/traverse).
 pub const FAN_ACCESS_PERM: u64 = libc::FAN_ACCESS_PERM;
 
 /// Pre-content access mask. Not exported by libc, matches the kernel UAPI.
 pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
+/// fanotify response value permitting the requested access.
 pub const FAN_ALLOW: u32 = 0x01;
+/// fanotify response value denying the requested access.
 pub const FAN_DENY: u32 = 0x02;
 
 /// Open a fanotify fd suitable for pre-content permission events.
@@ -416,6 +423,7 @@ pub struct FanotifyEventMetadata {
     /// Version of this struct.
     pub vers: u8,
 
+    /// Reserved, always zero as returned by the kernel.
     pub reserved: u8,
 
     /// Length of the event metadata (not including information records).
@@ -450,6 +458,8 @@ pub const fn fanotify_event(bytes: &[u8]) -> Option<FanotifyEventMetadata> {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), std::ptr::addr_of_mut!(meta).cast::<u8>(), n);
     }
 
+    // SAFETY: the bytes were boundary-checked and copied verbatim into the
+    // initialised `MaybeUninit`, so `assume_init` is valid.
     Some(unsafe { meta.assume_init() })
 }
 
@@ -457,7 +467,9 @@ pub const fn fanotify_event(bytes: &[u8]) -> Option<FanotifyEventMetadata> {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FanotifyResponse {
+    /// Fd of the event the response acknowledges.
     pub fd: i32,
+    /// `FAN_ALLOW` or `FAN_DENY` verdict for the permission event.
     pub response: u32,
 }
 

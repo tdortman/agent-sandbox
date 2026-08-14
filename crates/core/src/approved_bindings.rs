@@ -16,7 +16,10 @@ use crate::{
     hosts::normalize_host,
 };
 
+/// Default on-disk approved-bindings location:
+/// `/run/agent-sandbox/approved-bindings.json`.
 pub const APPROVED_BINDINGS_PATH: &str = "/run/agent-sandbox/approved-bindings.json";
+/// How long (in seconds) an approved binding is retained before it expires.
 pub const APPROVED_BINDINGS_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const FILE_VERSION: u32 = 1;
 const MAX_ALIASES_PER_IP: usize = 16;
@@ -36,12 +39,19 @@ struct LiveIpBindings {
     hosts: HashMap<String, Instant>,
 }
 
+/// Long-lived IP→hostname attribution table persisted to a JSON file.
+///
+/// Used only for UI display when the DNS cache has expired; policy resolution
+/// must not consult this table.
 pub struct ApprovedBindings {
     path: PathBuf,
     entries: HashMap<String, LiveIpBindings>,
 }
 
 impl ApprovedBindings {
+    /// Load approved bindings from `path`, merging any existing entries.
+    ///
+    /// A missing or unreadable file yields an empty table rather than an error.
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
 

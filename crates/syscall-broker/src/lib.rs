@@ -1,3 +1,10 @@
+//! Seccomp user-notification broker for the agent sandbox.
+//!
+//! This crate owns the kernel-facing side of syscall mediation: it defines
+//! the seccomp notification ioctls and their `repr(C)` structs, classifies
+//! notified syscalls into network / resource / filesystem targets, and
+//! reaches policyd through [`PersistentPolicyClient`] to decide whether each
+//! target is allowed.
 mod policy_client;
 
 use std::{
@@ -10,12 +17,20 @@ use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind,
 use agent_sandbox_syscall::policy::nr;
 pub use policy_client::PersistentPolicyClient;
 
+/// `SECCOMP_IOCTL_NOTIF_RECV` ioctl number: receive a seccomp user
+/// notification from the kernel.
 pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xC050_2100;
+/// `SECCOMP_IOCTL_NOTIF_SEND` ioctl number: send a seccomp user
+/// notification response to the kernel.
 pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
 
 /// `SECCOMP_IOW(2, __u64)` — not `IOWR` like SEND; argument is a single u64 id.
 pub const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl number: install a file descriptor into
+/// the tracee from the broker.
 pub const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
+/// `SECCOMP_ADDFD_FLAG_SEND` flag for the ADDFD ioctl: also send the
+/// installed descriptor to the tracee.
 pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 
 /// `struct seccomp_notif_addfd` passed to `SECCOMP_IOCTL_NOTIF_ADDFD`.
@@ -24,13 +39,23 @@ pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SeccompNotifAddfd {
+    /// Notification ID, matching the `id` of the received notification that
+    /// this ADDFD request extends.
     pub id: u64,
+    /// Flags for the ADDFD request; may include
+    /// [`SECCOMP_ADDFD_FLAG_SEND`].
     pub flags: u32,
+    /// File descriptor in the broker to install into the tracee.
     pub srcfd: u32,
+    /// File descriptor number the kernel assigns in the tracee for the
+    /// installed descriptor.
     pub newfd: u32,
+    /// Flags applied to the new descriptor in the tracee (e.g. `O_CLOEXEC`).
     pub newfd_flags: u32,
 }
 
+/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` flag on a notification response:
+/// continue running the tracee as if the syscall had not been intercepted.
 pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 
 // Layout of the tracee's `struct msghdr` for the SENDMSG and SENDMMSG
@@ -52,30 +77,55 @@ const _: () = {
     assert!(offset_of!(libc::msghdr, msg_namelen) == MSG_NAMELEN_OFFSET);
 };
 
+/// Kernel `struct seccomp_data` for a notified syscall.
+///
+/// Captures the syscall number, its architecture, the tracee's instruction
+/// pointer, and up to six arguments. Layout matches the Linux UAPI.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SeccompData {
+    /// Syscall number (`__NR_*` for the target architecture).
     pub nr: i32,
+    /// Architecture identifier from `SECCOMP_ARCH_*` (`AUDIT_ARCH_*`).
     pub arch: u32,
+    /// Instruction pointer in the tracee at the time of the notification.
     pub instruction_pointer: u64,
+    /// Up to six syscall arguments (`__AUDIT_ARCH_64BIT` passes the
+    /// full `x86_64` register set).
     pub args: [u64; 6],
 }
 
+/// `struct seccomp_notif` received from the kernel via
+/// [`SECCOMP_IOCTL_NOTIF_RECV`]: identifies a notified syscall and which
+/// tracee triggered it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SeccompNotif {
+    /// Notification ID, echoed back in the matching response.
     pub id: u64,
+    /// PID of the tracee that triggered the notification.
     pub pid: u32,
+    /// Notification flags, e.g. [`SECCOMP_USER_NOTIF_FLAG_CONTINUE`].
     pub flags: u32,
+    /// Syscall data (`nr`, `arch`, `instruction_pointer`, and `args`) for the
+    /// intercepted syscall.
     pub data: SeccompData,
 }
 
+/// `struct seccomp_notif_resp` sent to the kernel via
+/// [`SECCOMP_IOCTL_NOTIF_SEND`] to answer a notification.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SeccompNotifResp {
+    /// Notification ID this response answers (echoed from the notification).
     pub id: u64,
+    /// Value returned to the tracee when the syscall is answered with
+    /// success (`error == 0`).
     pub val: i64,
+    /// Errno-related value: a negative errno (e.g. `-EPERM`) reported to the
+    /// tracee as the syscall result.
     pub error: i32,
+    /// Response flags, e.g. [`SECCOMP_USER_NOTIF_FLAG_CONTINUE`].
     pub flags: u32,
 }
 
@@ -88,14 +138,25 @@ pub struct SeccompNotifResp {
 /// mediation remain unchanged in both modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum NetworkMode {
+    /// Direct mediation: network transport policy checks are performed
+    /// through the normal `Check` RPC, with no transparent proxy.
     Direct,
+    /// Proxy mediation: the transparent proxy owns only the configured
+    /// HTTP(S) service-port `AF_INET`/`AF_INET6` connect/send decisions;
+    /// other network destinations stay gated by seccomp user notification.
     Proxy,
 }
 
+/// A network endpoint target from a sandboxed syscall: host, port, and
+/// scheme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkTarget {
+    /// Hostname or IP address of the network destination.
     pub host: String,
+    /// Destination port.
     pub port: u16,
+    /// URL scheme of the request (e.g. `http` or `https`). Might be empty
+    /// for non-URL destinations.
     pub scheme: String,
 }
 
@@ -108,8 +169,11 @@ pub struct NetworkTarget {
 /// TOCTOU-racy).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceTarget {
+    /// Classifies what the target is: a Unix socket path or a device node.
     pub kind: ResourceKind,
+    /// Filesystem path of the Unix socket or device node.
     pub path: PathBuf,
+    /// Access mode (read/write/etc.) being requested.
     pub access: ResourceAccess,
 
     /// Captured raw bytes from the tracee's sockaddr (for `AF_UNIX`) or
@@ -131,6 +195,7 @@ pub struct ResourceTarget {
 /// and access pairs checked via policyd's `CheckFilesystem` RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemTarget {
+    /// Path/access pairs to check against policyd's filesystem policy.
     pub checks: Vec<(PathBuf, FileAccess)>,
 }
 
@@ -142,9 +207,14 @@ pub struct FilesystemTarget {
 /// further work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallTarget {
+    /// Network target, dispatched through the `Check` RPC.
     Network(NetworkTarget),
+    /// Resource target (Unix socket / device node), dispatched through
+    /// `CheckResource`.
     Resource(ResourceTarget),
+    /// Filesystem mutation target, dispatched through `CheckFilesystem`.
     Filesystem(FilesystemTarget),
+    /// Complete the syscall by returning this errno value to the tracee.
     Errno(i32),
 }
 /// Parsed `AF_UNIX` address: a filesystem path or a kernel abstract name.
@@ -155,7 +225,10 @@ pub enum SyscallTarget {
 /// round-trips and match verbatim in policyd's resource rule engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnixAddress {
+    /// Filesystem path of the Unix socket.
     Path(String),
+    /// Kernel abstract socket name, hex-encoded (used for non-printable
+    /// names).
     AbstractHex(String),
 }
 
@@ -164,8 +237,21 @@ pub enum UnixAddress {
 /// re-derive fields the high-level enum drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SockaddrTarget {
-    Inet { ip: IpAddr, port: u16 },
-    Unix { address: UnixAddress, raw: Vec<u8> },
+    /// Internet endpoint (`AF_INET`/`AF_INET6`): an IP address and port.
+    Inet {
+        /// IP address of the endpoint.
+        ip: IpAddr,
+        /// Port of the endpoint.
+        port: u16,
+    },
+    /// Unix-domain endpoint (`AF_UNIX`): a parsed address plus the raw
+    /// captured bytes.
+    Unix {
+        /// Parsed `AF_UNIX` address.
+        address: UnixAddress,
+        /// Raw captured sockaddr bytes.
+        raw: Vec<u8>,
+    },
 }
 
 /// Hex-encode a byte slice as lowercase ASCII, no `0x` prefix.
@@ -1290,7 +1376,7 @@ mod tests {
             parse_sockaddr(&bytes, bytes.len()),
             Some(SockaddrTarget::Inet {
                 ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                port: 53
+                port: 53,
             })
         );
     }
@@ -1306,7 +1392,7 @@ mod tests {
             parse_sockaddr(&bytes, bytes.len()),
             Some(SockaddrTarget::Inet {
                 ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                port: 0
+                port: 0,
             })
         );
     }
@@ -1963,7 +2049,7 @@ mod tests {
                 parse_msghdr_target(&bytes),
                 Some(MsghdrParts {
                     name: 0x1000,
-                    name_len: 16
+                    name_len: 16,
                 })
             );
         }

@@ -1,3 +1,7 @@
+//! Policy hostname matching and HTTP-rule behaviour tests.
+//!
+//! Covers `normalize_dns_name`, `policy_host_for_connect`, and HTTP rule
+//! matching against the `agent_sandbox_core` policy types.
 use std::path::Path;
 
 use agent_sandbox_core::{

@@ -1971,7 +1971,7 @@ mod tests {
         assert_eq!(
             parse_network_target(&result, "example.com"),
             Some(ApprovalTarget::NetworkHost {
-                host: "example.com".into()
+                host: "example.com".into(),
             })
         );
     }
@@ -2013,7 +2013,7 @@ mod tests {
                 Some(Path::new("/home/user/repo"))
             ),
             Some(ApprovalTarget::FilesystemPath {
-                path: "./config/.conf".into()
+                path: "./config/.conf".into(),
             })
         );
     }

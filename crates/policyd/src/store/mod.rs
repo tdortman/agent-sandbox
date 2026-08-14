@@ -149,6 +149,7 @@ pub(crate) const fn test_args(
 }
 
 impl PolicyStore {
+    /// Create a new [`PolicyStore`] from the given daemon arguments.
     #[must_use]
     pub fn new(args: PolicydArgs) -> Self {
         Self {
@@ -162,10 +163,12 @@ impl PolicyStore {
         }
     }
 
+    /// Enable the cgroup freezer (used across cgroup freeze requests).
     pub fn enable_cgroup_freezer(&mut self) {
         self.cgroup_freeze = freeze::CgroupFreezeManager::new();
     }
 
+    /// Return the daemon arguments the store was created with.
     pub const fn args(&self) -> &PolicydArgs {
         &self.args
     }

@@ -1,3 +1,9 @@
+//! seccomp user-notification broker daemon.
+//!
+//! Intercepts syscalls from a sandboxed process via seccomp's user
+//! notification mechanism, forwards them to policyd for a policy verdict, and
+//! issues the corresponding allow/deny response or `addfd` injection.
+
 pub(crate) mod decision;
 pub(crate) mod dispatch;
 use std::{
@@ -24,7 +30,7 @@ use tracing::{debug, info, warn};
     version,
     about = "Host-side seccomp user-notification broker for sandboxed agents",
     long_about = r"Runs OUTSIDE the sandbox (typically as the child of `agent-sandbox-syscall-arm`) and consumes the seccomp user-notification file descriptor the arm inherited from its parent.
-For each notification the broker asks policyd whether the target syscall is allowed, then writes a `SECCOMP_IOCTL_NOTIF_SEND` continue response with the chosen errno (or success). 
+For each notification the broker asks policyd whether the target syscall is allowed, then writes a `SECCOMP_IOCTL_NOTIF_SEND` continue response with the chosen errno (or success).
 Optionally supervises the sandbox child PID and exits when the child does, tearing the listener down with it.
 
 Spawned by policyd, not invoked by hand.
@@ -547,10 +553,9 @@ fn enhance_sendmsg_emulation(
         msg.msg_name = target.raw.as_ptr().cast::<libc::c_void>().cast_mut();
         msg.msg_namelen = u32::try_from(target.raw.len()).unwrap_or(u32::MAX);
     }
-
     // SAFETY: `msg` is a broker-owned msghdr with iovecs and a captured
     // sockaddr. All pointers are valid for the kernel call.
-    #[allow(unsafe_code)]
+    #[allow(unsafe_code, reason = "raw seccomp notification iovec construction")]
     let rc = match unsafe { sendmsg_raw(dup, &msg, flags) } {
         Ok(n) => n,
         Err(err) => {

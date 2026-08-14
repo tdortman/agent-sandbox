@@ -16,20 +16,29 @@ use tokio::{
 
 use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
 
+/// Errors returned by the policyd JSON-line RPC client.
+///
+/// Every variant is terminal for the connection: after any error the caller
+/// should treat the socket as unusable rather than retrying on it.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
+    /// The complete request/reply round-trip exceeded the configured timeout.
     #[error("policyd RPC timed out")]
     Timeout,
 
+    /// policyd closed the connection before sending a reply.
     #[error("policyd closed connection")]
     Closed,
 
+    /// policyd replied, but with a message that does not match the request.
     #[error("policyd returned an unexpected reply: {0}")]
     UnexpectedReply(&'static str),
 
+    /// The reply line could not be parsed as valid JSON.
     #[error("invalid JSON from policyd")]
     InvalidJson(#[from] serde_json::Error),
 
+    /// An underlying I/O error from the Unix socket.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

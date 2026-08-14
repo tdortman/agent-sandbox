@@ -1,3 +1,8 @@
+//! TCP (HTTP/1.x and HTTP/2) transparent proxy backend.
+//!
+//! Accepts downstream TCP connections, claims the intercepted flow with
+//! policyd, and relays approved requests through isolated upstream
+//! connections.
 mod doh;
 mod semantic;
 mod tls;
@@ -67,6 +72,7 @@ use crate::{
     },
 };
 
+/// The maximum number of concurrent in-flight policy checks per proxy.
 pub const MAX_ACTIVE_CHECKS: usize = 256;
 pub(crate) const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
@@ -201,10 +207,15 @@ impl FlowState {
 #[cfg(not(debug_assertions))]
 pub type DestinationResolver = fn(&TcpStream, u16) -> Result<SocketAddr, BoxError>;
 
+/// Debug-build destination resolver: a heap closure hosting the test hook.
 #[cfg(debug_assertions)]
 pub type DestinationResolver =
     Arc<dyn Fn(&TcpStream, u16) -> Result<SocketAddr, BoxError> + Send + Sync>;
 
+/// Test-only override that always resolves the destination to one value.
+///
+/// Debug builds use this to route intercepted connections to a fixture
+/// regardless of the kernel's original destination.
 #[cfg(debug_assertions)]
 #[must_use]
 pub fn destination_override(destination: SocketAddr) -> DestinationResolver {
@@ -365,19 +376,30 @@ fn policy_denied_response() -> Response {
     response
 }
 
+/// Configuration for the TCP listener backend.
 #[derive(Clone)]
 pub struct ListenConfig {
+    /// The TCP port to listen on (0 requests an ephemeral port).
     pub listen_port: u16,
+    /// Whether the listener uses transparent (`IP_TRANSPARENT`) interception.
     pub transparent: bool,
+    /// The certificate issuer serving downstream SNI names.
     pub issuer: CertificateIssuer,
+    /// Optional ECH key material shared with the HTTP/3 leg.
     pub ech: Option<DownstreamEch>,
+    /// The Alt-Svc store shared with the HTTP/3 leg.
     pub alt_svc: Arc<AltSvcStore>,
+    /// Upstream URL patterns forced to HTTP/1.x WebSocket upgrades.
     pub websocket_http11_urls: Arc<Vec<HttpUrl>>,
+    /// Upstream origins canonicalised for HTTP/1.0 relays.
     pub http10_upstream_origins: Arc<Vec<String>>,
+    /// Resolves the original destination of each accepted connection.
     pub destination_resolver: DestinationResolver,
+    /// Test-only: force TLS termination regardless of destination port.
     pub test_tls: bool,
 
     #[cfg(debug_assertions)]
+    /// Test-only: write the bound listener ports for the harness.
     pub write_bound_ports: Option<(PathBuf, Vec<u16>)>,
 }
 

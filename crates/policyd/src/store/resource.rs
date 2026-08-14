@@ -22,6 +22,9 @@ use super::{
 use crate::wire::ResourceCheckRequest;
 
 impl PolicyStore {
+    /// Evaluate a resource access request, returning an immediate verdict
+    /// when declarative rules or the verdict cache decide it, otherwise
+    /// routing it through interactive approval.
     pub async fn check_resource(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
         let ResourceCheckRequest {
             kind,
@@ -43,6 +46,8 @@ impl PolicyStore {
         .await
     }
 
+    /// Request interactive approval for a resource access, prompting the
+    /// policy UI if needed and waiting for the verdict.
     pub async fn request_resource_approval(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
         let ResourceCheckRequest {
             kind,

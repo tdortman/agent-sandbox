@@ -1,3 +1,7 @@
+//! Black-box contract tests for the `agent-sandbox-fs-arm` binary.
+//!
+//! Verifies the CLI help text describes the expected command and policy
+//! environment without arming a real fanotify watcher.
 use std::process::Command;
 
 #[test]

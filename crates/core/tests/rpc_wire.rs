@@ -1,3 +1,7 @@
+//! Wire-format round-trip tests for the daemon RPC message types.
+//!
+//! Verifies serialization/deserialization symmetry for the public request,
+//! reply, and push types exposed by `agent_sandbox_core`.
 use std::path::PathBuf;
 
 use agent_sandbox_core::{

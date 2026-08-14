@@ -539,14 +539,19 @@ fn approve_error(resp: &RpcReply) -> ApproveCliError {
     }
 }
 
+/// Errors produced by the approval CLI.
 #[derive(Debug, thiserror::Error)]
 pub enum ApproveCliError {
+    /// An error from the underlying RPC client.
     #[error(transparent)]
     Rpc(#[from] agent_sandbox_core::RpcClientError),
 
+    /// A JSON (de)serialization error.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// A policyd error or request/usage problem, with the message describing
+    /// it.
     #[error("{0}")]
     Policyd(String),
 }

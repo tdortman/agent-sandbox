@@ -19,40 +19,74 @@ pub enum ScopeTarget {
     /// `once`: in-memory only for this policyd process.
     Ephemeral,
 
+    /// `session`: persisted per-session in the session-scoped policy store.
+    ///
+    /// Validated against the active session id in the request context.
     Session {
+        /// The session to scope the target against.
         session_id: String,
     },
 
+    /// `project`: persisted in the project's trusted policy file.
+    ///
+    /// Stores the resolved policy file path and the project root it belongs to.
     Project {
+        /// Resolved policy file path.
         policy_path: PathBuf,
+        /// Project root the policy file belongs to.
         project_root: PathBuf,
     },
 
+    /// `project_package`: persisted in a package-scoped project policy file.
+    ///
+    /// Stores the policy file path, project root, and attributed package name.
     ProjectPackage {
+        /// Resolved policy file path.
         policy_path: PathBuf,
+        /// Project root the policy file belongs to.
         project_root: PathBuf,
+        /// Attributed package name.
         package: String,
     },
 
+    /// `global`: persisted in the user's global policy file under
+    /// `~/.config/agent-sandbox/policy.json`.
+    ///
+    /// Requires a known home directory.
     Global {
+        /// Resolved policy file path.
         policy_path: PathBuf,
+        /// Home directory the policy file lives under.
         home: PathBuf,
     },
 
+    /// `global_package`: persisted in a package-scoped global policy file,
+    /// e.g. `~/.config/agent-sandbox/packages/<package>.json`.
+    ///
+    /// Requires a known home directory and attributed package name.
     GlobalPackage {
+        /// Resolved policy file path.
         policy_path: PathBuf,
+        /// Home directory the policy file lives under.
         home: PathBuf,
+        /// Attributed package name.
         package: String,
     },
 }
 
 /// Inputs required to turn a wire-level scope into a [`ScopeTarget`].
 pub struct ScopeContext<'a> {
+    /// The wire-level scope being resolved.
     pub scope: ApprovalScope,
+    /// Requested session id, required for session scope.
     pub session_id: Option<&'a str>,
+    /// Home directory, required for global scopes.
     pub home: Option<&'a str>,
+    /// Project root, required for project scopes.
     pub project_root: Option<&'a str>,
+    /// Attributed package name, required for package scopes.
     pub package: Option<&'a str>,
+    /// Currently active session ids against which a session scope is validated.
     pub active_session_ids: &'a HashSet<String>,
 }
 
@@ -130,6 +164,8 @@ impl ScopeTarget {
         }
     }
 
+    /// Project root for a [`ScopeTarget::Project`]; `None` for all other
+    /// variants.
     #[must_use]
     pub fn project_root(&self) -> Option<&Path> {
         match self {

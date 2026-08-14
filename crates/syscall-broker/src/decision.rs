@@ -286,7 +286,7 @@ mod tests {
             )
             .await,
             ResponsePlan::DenyErrno {
-                errno: libc::ENOSYS
+                errno: libc::ENOSYS,
             }
         );
 
@@ -303,7 +303,7 @@ mod tests {
             )
             .await,
             ResponsePlan::DenyErrno {
-                errno: libc::EACCES
+                errno: libc::EACCES,
             }
         );
     }
@@ -355,7 +355,7 @@ mod tests {
             ResponsePlan::ResourcePolicyDenied {
                 target: target.clone(),
                 source: VerdictSource::Policy {
-                    comment: Some("blocked".into())
+                    comment: Some("blocked".into()),
                 },
                 error: Some("blocked".into()),
             }

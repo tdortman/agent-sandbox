@@ -1,3 +1,7 @@
+//! Black-box contract tests for the `agent-sandbox-syscall-arm` binary.
+//!
+//! Exercises the CLI end to end via `CARGO_BIN_EXE_` to lock down its
+//! argument handling and exit behaviour without holding a sandbox open.
 use std::process::Command;
 
 fn run(args: &[&str]) -> std::process::Output {

@@ -10,11 +10,17 @@ use crate::error::InvalidScopeError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalScope {
+    /// Require approval once for this invocation.
     Once,
+    /// Require approval for the duration of the current session.
     Session,
+    /// Require approval for the current project's package.
     ProjectPackage,
+    /// Require approval for the current project.
     Project,
+    /// Require approval for any package of the current platform user.
     GlobalPackage,
+    /// Require approval globally for the current platform user.
     Global,
 }
 
@@ -41,6 +47,7 @@ impl fmt::Display for ApprovalScope {
 }
 
 impl ApprovalScope {
+    /// Returns the `snake_case` wire label for this scope.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
