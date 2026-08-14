@@ -1,18 +1,17 @@
 //! Host CLI for pending policy approvals.
 
-use crate::ui::{bus_name, dbus_fd_display, message_kind_name, signature_display};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use agent_sandbox_core::{
     ApprovalScope, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingSummary,
     RequestContext, RpcReply, RpcRequest, SandboxPaths, contract_project_path, policy_rpc,
 };
-
 use clap::{Args, Parser, Subcommand};
 
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use crate::ui::{bus_name, dbus_fd_display, message_kind_name, signature_display};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -554,9 +553,10 @@ pub enum ApproveCliError {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
     use agent_sandbox_core::RpcRequest;
     use clap::CommandFactory;
+
+    use super::Cli;
 
     #[test]
     fn register_sandbox_builds_register_request() {

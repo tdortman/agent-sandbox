@@ -1,13 +1,13 @@
 //! `DoH` scenarios: ECH configuration rewriting and DNSSEC rejection.
 
-use crate::{
-    support::{IpVersion, TransparentHarness, loopback},
-    transparent_common::wait_for_release,
-};
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+};
+
+use crate::{
+    support::{IpVersion, TransparentHarness, loopback},
+    transparent_common::wait_for_release,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

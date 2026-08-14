@@ -1,9 +1,10 @@
 //! Alt-Svc scenarios: preservation, attribution, filtering, and clearing.
 
-use crate::support::{IpVersion, TransparentHarness, loopback};
-
 use std::time::Duration;
+
 use tokio::time::sleep;
+
+use crate::support::{IpVersion, TransparentHarness, loopback};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_alt_svc_preserved_and_attributed() {

@@ -1,18 +1,20 @@
 //! Trusted transparent-proxy session and flow registry.
 
-use super::{
-    state::ProxyCheckId,
-    types::{MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState},
-};
-use crate::{error::PolicydError, wire::NetworkCheckRequest};
+use std::time::{Duration, Instant};
+
 use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
     ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity, scheme_for,
     socket_owner::validate_socket_identity,
 };
-use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+use super::{
+    state::ProxyCheckId,
+    types::{MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState},
+};
+use crate::{error::PolicydError, wire::NetworkCheckRequest};
 
 const UNCLAIMED_TTL: Duration = Duration::from_secs(30);
 const MAX_PROXY_CANCEL_TOMBSTONES: usize = 4096;
@@ -818,14 +820,16 @@ fn prune_flows(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::store::types::{Pending, PolicyStore};
+    use std::{sync::Arc, time::Duration};
+
     use agent_sandbox_core::{
         FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
         SocketIdentity, SocketInode, VerdictSource,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
-    use std::{sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::store::types::{Pending, PolicyStore};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

@@ -5,14 +5,14 @@
 //! filesystem-specific request shapes: the event-loop check client and the
 //! one-shot monitor start.
 
-use agent_sandbox_core::{
-    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, PersistentRpcClient,
-    RequestContext, RpcClientError, RpcReply, RpcRequest,
-};
-
 use std::{
     path::{Path, PathBuf},
     time::Duration,
+};
+
+use agent_sandbox_core::{
+    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, PersistentRpcClient,
+    RequestContext, RpcClientError, RpcReply, RpcRequest,
 };
 
 /// Per-check RPC timeout.
@@ -109,19 +109,18 @@ pub async fn start_monitor(
 
 #[cfg(test)]
 mod tests {
-    use super::MonitorClient;
+    use std::path::Path;
 
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RequestContext, RpcMessage, RpcReply,
         VerdictSource,
     };
-
-    use std::path::Path;
-
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    use super::MonitorClient;
 
     #[tokio::test]
     async fn unexpected_reply_invalidates_connection_before_next_check() {

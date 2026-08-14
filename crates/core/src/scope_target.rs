@@ -4,13 +4,13 @@
 //! [`ScopeTarget::resolve`] so session/global/project requirements are enforced
 //! once, in one place.
 
-use crate::{
-    error::ScopeResolveError, merge_policy::trusted_project_policy_path, rpc::ApprovalScope,
-};
-
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+};
+
+use crate::{
+    error::ScopeResolveError, merge_policy::trusted_project_policy_path, rpc::ApprovalScope,
 };
 
 /// Where an approved/denied rule is stored after scope + context validation.

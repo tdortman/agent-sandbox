@@ -4,18 +4,16 @@
 //! `CheckFilesystem`, and dispatch must deny when any endpoint is denied.
 //! Re-validation must reject path swaps before CONTINUE.
 
-use agent_sandbox_core::FileAccess;
-
-use agent_sandbox_syscall::policy::nr;
-
-use agent_sandbox_syscall_broker::{
-    FilesystemTarget, SeccompData, SeccompNotif, SyscallTarget, revalidate_filesystem_mutation,
-    target_from_notification,
-};
-
 use std::{
     ffi::CString,
     path::{Path, PathBuf},
+};
+
+use agent_sandbox_core::FileAccess;
+use agent_sandbox_syscall::policy::nr;
+use agent_sandbox_syscall_broker::{
+    FilesystemTarget, SeccompData, SeccompNotif, SyscallTarget, revalidate_filesystem_mutation,
+    target_from_notification,
 };
 
 fn as_seccomp_nr(raw: i64) -> i32 {

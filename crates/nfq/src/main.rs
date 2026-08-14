@@ -15,16 +15,17 @@ mod policy;
 mod push;
 mod queue;
 
+use std::time::Duration;
+
+use clap::Parser;
+use tracing::{info, warn};
+
 use crate::{
     args::Cli,
     flow::{NfqState, handle_packet, mark_accepted_proxy_udp},
     push::spawn_push_socket_listener,
     queue::{open_queue, write_ready_marker_or_exit},
 };
-
-use clap::Parser;
-use std::time::Duration;
-use tracing::{info, warn};
 
 fn main() {
     tracing_subscriber::fmt()

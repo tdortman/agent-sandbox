@@ -1,8 +1,8 @@
+use std::path::PathBuf;
+
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, NetworkRule, Policy, atomic_write_policy, load_policy, merge_layers,
 };
-
-use std::path::PathBuf;
 
 #[test]
 fn merged_policy_persists_normalized_layers_and_home_paths() {

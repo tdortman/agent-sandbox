@@ -1,3 +1,11 @@
+use std::{
+    borrow::Cow,
+    fmt,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
+
 use super::{
     message::RpcMessage,
     proxy::{
@@ -5,19 +13,10 @@ use super::{
     },
     scope::ApprovalScope,
 };
-
 use crate::{
     error::{InvalidScopeError, ScopeResolveError},
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, Policy, ResourceAccess, ResourceKind},
-};
-
-use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
-
-use std::{
-    borrow::Cow,
-    fmt,
-    path::{Path, PathBuf},
 };
 
 /// Response envelope for pipelined proxy checks and cancellations.
@@ -1213,7 +1212,6 @@ mod tests {
     use super::{
         ApprovalScope, DbusCheckReply, DbusTarget, RpcReply, ScopeActionReply, VerdictSource,
     };
-
     use crate::policy::DbusMessageKind;
 
     #[test]

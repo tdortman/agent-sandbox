@@ -1,9 +1,10 @@
 //! Helpers shared by the transparent acceptance scenario families.
 
-use crate::support::TransparentHarness;
-
 use std::time::Duration;
+
 use tokio::time::sleep;
+
+use crate::support::TransparentHarness;
 
 /// Assert the single observed release matches the claimed connection
 /// identity and the fixed fake-policy token.

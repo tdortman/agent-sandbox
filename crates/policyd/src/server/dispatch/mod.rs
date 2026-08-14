@@ -7,9 +7,11 @@ pub use auth::SocketRole;
 mod check;
 mod context;
 mod handlers;
-use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
-use agent_sandbox_core::{RpcReply, RpcRequest};
 use std::sync::Arc;
+
+use agent_sandbox_core::{RpcReply, RpcRequest};
+
+use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
 
 pub async fn dispatch(
     store: &Arc<PolicyStore>,
@@ -29,17 +31,17 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::{SocketRole, dispatch};
-    use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
+    use std::{sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
         FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
         NormalizedPolicyHost, ProcessIdentity, RequestContext, RpcReply, RpcRequest,
         SocketIdentity, SocketInode,
     };
-
-    use std::{sync::Arc, time::Duration};
     use tokio::{net::UnixStream, sync::Mutex};
+
+    use super::{SocketRole, dispatch};
+    use crate::{error::PolicydError, server::peer::ClientPeer, store::PolicyStore};
 
     fn test_store(dir: &tempfile::TempDir) -> Arc<PolicyStore> {
         Arc::new(PolicyStore::new(crate::store::test_args(

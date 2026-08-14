@@ -7,15 +7,6 @@ mod error;
 mod options;
 mod push;
 
-use agent_sandbox_core::{
-    DbusBus, DbusMessageKind, DbusTarget, RequestContext, RpcConnection, RpcMessage, RpcReply,
-    RpcRequest, SandboxPaths, UiPush,
-};
-
-use clap::Parser;
-pub use error::UiCliError;
-use nix::fcntl::{Flock, FlockArg, OFlag};
-
 use std::{
     fs::{File, OpenOptions},
     future::Future,
@@ -24,6 +15,13 @@ use std::{
     time::Duration,
 };
 
+use agent_sandbox_core::{
+    DbusBus, DbusMessageKind, DbusTarget, RequestContext, RpcConnection, RpcMessage, RpcReply,
+    RpcRequest, SandboxPaths, UiPush,
+};
+use clap::Parser;
+pub use error::UiCliError;
+use nix::fcntl::{Flock, FlockArg, OFlag};
 use tracing::{info, warn};
 
 #[must_use]
@@ -339,8 +337,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -350,6 +346,8 @@ mod tests {
         sync::{Mutex, Notify, oneshot},
         time::timeout,
     };
+
+    use super::*;
 
     #[tokio::test]
     async fn queued_prompts_are_processed_serially() {

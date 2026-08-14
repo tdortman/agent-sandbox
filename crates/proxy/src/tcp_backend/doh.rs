@@ -1,7 +1,8 @@
-use crate::tcp_backend::PolicyDenied;
 use agent_sandbox_core::{EchRewrite, rewrite_ech_config};
 use rama_core::error::{BoxError, BoxErrorExt};
 use rama_http::{Body, HeaderValue, Request, Response, body::util::BodyExt};
+
+use crate::tcp_backend::PolicyDenied;
 
 pub fn is_doh_request(request: &Request) -> bool {
     let content_type = request
@@ -89,8 +90,9 @@ pub async fn rewrite_doh_response(
 
 #[cfg(test)]
 mod tests {
-    use super::is_doh_request;
     use rama_http::{Body, Request};
+
+    use super::is_doh_request;
 
     #[test]
     fn detects_doh_post_and_get_requests() {

@@ -13,6 +13,18 @@
 //! the original origin. An association at an alternative endpoint whose
 //! mapping is missing or expired is refused before any claim is made.
 
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+use bytes::Bytes;
+use h3::{
+    error::{Code, StreamError},
+    quic::StreamId,
+    server::RequestStream,
+};
+use h3_datagram::datagram_handler::HandleDatagramsExt;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
 use crate::{
     http3::{
         BoxError, Http3State, boxed,
@@ -29,19 +41,6 @@ use crate::{
     },
     policy::{FlowClaim, PolicySession},
 };
-
-use bytes::Bytes;
-
-use h3::{
-    error::{Code, StreamError},
-    quic::StreamId,
-    server::RequestStream,
-};
-
-use h3_datagram::datagram_handler::HandleDatagramsExt;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::mpsc;
-use tracing::{info, warn};
 
 pub(super) const MAX_WEBTRANSPORT_SESSIONS: usize = 64;
 pub(super) const MAX_INFORMATIONAL_RESPONSES: usize = 16;
@@ -650,8 +649,9 @@ async fn release_claim(policy: &PolicySession, claim: &FlowClaim) {
 
 #[cfg(test)]
 mod tests {
-    use super::upstream_destination_for;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::upstream_destination_for;
 
     fn address(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port)

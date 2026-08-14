@@ -21,7 +21,6 @@ pub mod nr {
         SYS_open as OPEN, SYS_openat as OPENAT, SYS_openat2 as OPENAT2, SYS_sendmmsg as SENDMMSG,
         SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO,
     };
-
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for
     /// the target.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

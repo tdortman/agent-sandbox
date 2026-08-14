@@ -16,14 +16,14 @@
 //! is read and written here. [`persist_session_paths`] exposes the write side
 //! to daemons.
 
-use crate::{merge_policy::ProjectPolicyContext, rpc::RequestContext};
-
-use serde::{Deserialize, Serialize};
-
 use std::{
     env,
     path::{Path, PathBuf},
 };
+
+use serde::{Deserialize, Serialize};
+
+use crate::{merge_policy::ProjectPolicyContext, rpc::RequestContext};
 
 /// Shared session context for policyd and enforcement daemons.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -627,12 +627,12 @@ pub fn is_descendant_of(ancestor: u32, pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
         ProcessIds, SandboxPaths, daemon_context, discover_git_project_root, wire_context,
     };
-
     use crate::SessionContext;
-    use std::path::Path;
 
     #[test]
     fn sandbox_paths_merged_with_prefers_explicit_values() {

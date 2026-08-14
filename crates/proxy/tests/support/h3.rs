@@ -1,5 +1,6 @@
-use super::*;
 use ::h3;
+
+use super::*;
 
 /// HTTP/3 origin used by the transparent harness.
 ///

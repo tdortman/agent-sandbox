@@ -1,15 +1,5 @@
 //! Policy store: ui.
 
-use super::{
-    types::{
-        CLIENT_ID, Pending, PendingFilesystem, PendingResource, PolicyStore, UiClient,
-        UiClientHandle, UiSessionContext,
-    },
-    ui_route::{UiRoute, paths_match},
-};
-use agent_sandbox_core::{
-    ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
-};
 use std::{
     collections::HashSet,
     future::Future,
@@ -18,6 +8,10 @@ use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
+
+use agent_sandbox_core::{
+    ResolvedRequestContext, RpcMessage, SessionContext, UiPush, attach_check_aliases,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::unix::OwnedWriteHalf,
@@ -25,6 +19,14 @@ use tokio::{
     time,
 };
 use uuid::Uuid;
+
+use super::{
+    types::{
+        CLIENT_ID, Pending, PendingFilesystem, PendingResource, PolicyStore, UiClient,
+        UiClientHandle, UiSessionContext,
+    },
+    ui_route::{UiRoute, paths_match},
+};
 
 const UI_SPAWN_WAIT: Duration = Duration::from_secs(3);
 const UI_SPAWN_POLL: Duration = Duration::from_millis(25);
@@ -559,16 +561,18 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::PolicyStore;
-    use crate::store::{
-        Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
-    };
-    use agent_sandbox_core::FileAccess;
     use std::{sync::Arc, time::Duration};
+
+    use agent_sandbox_core::FileAccess;
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,
         sync::{Mutex, oneshot},
+    };
+
+    use super::PolicyStore;
+    use crate::store::{
+        Pending, PendingFilesystem, PendingNetwork, UiSessionContext, types::UiClient,
     };
 
     fn test_store() -> PolicyStore {

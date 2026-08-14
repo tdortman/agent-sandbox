@@ -3,19 +3,17 @@ mod semantic;
 mod tls;
 pub(crate) mod upstream;
 
-use crate::{
-    alt_svc::{AltSvcStore, preserve_response_alt_svc},
-    cert::CertificateIssuer,
-    ech_state::DownstreamEch,
-    http3,
-    policy::{
-        FlowClaim, PolicySession, authority_for_policy, flow_key, normalize_authority,
-        reconcile_authorities,
-    },
-    semantic::{
-        BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
-    },
+#[cfg(debug_assertions)]
+use std::path::{Path, PathBuf};
+use std::{
+    error::Error,
+    fmt::{self, Display, Formatter},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
 };
+
 use agent_sandbox_core::{HttpCheckReply, HttpUrl};
 use doh::{is_doh_request, rewrite_doh_response};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -50,20 +48,24 @@ use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
 pub(crate) use semantic::SemanticRequestBody;
 use semantic::{bridge_response_body, semantic_http_version};
-#[cfg(debug_assertions)]
-use std::path::{Path, PathBuf};
-use std::{
-    error::Error,
-    fmt::{self, Display, Formatter},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
 use tls::{RustlsTlsService, TlsServerName, build_tcp_tls_config};
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 use upstream::UpstreamClients;
+
+use crate::{
+    alt_svc::{AltSvcStore, preserve_response_alt_svc},
+    cert::CertificateIssuer,
+    ech_state::DownstreamEch,
+    http3,
+    policy::{
+        FlowClaim, PolicySession, authority_for_policy, flow_key, normalize_authority,
+        reconcile_authorities,
+    },
+    semantic::{
+        BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
+    },
+};
 
 pub const MAX_ACTIVE_CHECKS: usize = 256;
 pub(crate) const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
@@ -969,19 +971,16 @@ fn blocked_http_request(request: &Request) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, Request,
-        ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
-        adapt_http10_response, adapt_response_version, blocked_http_request,
-        canonical_http10_origin, check_http_policy, force_websocket_http11,
-        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
-        request_head_clone,
+    use std::{
+        convert::Infallible,
+        net::{IpAddr, SocketAddr},
+        num::NonZeroU16,
+        path::PathBuf,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
     };
-    use crate::{
-        alt_svc::AltSvcStore,
-        policy::{FlowClaim, PolicySession, test_support::FakePolicy},
-        tcp_backend::upstream::UpstreamClients,
-    };
+
     use agent_sandbox_core::{
         AttributionToken, FlowProtocol, NetworkFlowKey, NormalizedPolicyHost, ProxyConnectionId,
     };
@@ -1000,19 +999,24 @@ mod tests {
         layer::{upgrade::mitm::HttpUpgradeMitmRelay, version_adapter::adapt_request_version},
     };
     use rama_net::proxy::IoForwardService;
-    use std::{
-        convert::Infallible,
-        net::{IpAddr, SocketAddr},
-        num::NonZeroU16,
-        path::PathBuf,
-        pin::Pin,
-        sync::Arc,
-        task::{Context, Poll},
-    };
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
         sync::{Notify, Semaphore},
         time::{Duration, timeout},
+    };
+
+    use super::{
+        Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, Request,
+        ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
+        adapt_http10_response, adapt_response_version, blocked_http_request,
+        canonical_http10_origin, check_http_policy, force_websocket_http11,
+        is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
+        request_head_clone,
+    };
+    use crate::{
+        alt_svc::AltSvcStore,
+        policy::{FlowClaim, PolicySession, test_support::FakePolicy},
+        tcp_backend::upstream::UpstreamClients,
     };
 
     struct TestIo {

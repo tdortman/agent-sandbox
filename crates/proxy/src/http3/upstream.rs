@@ -11,19 +11,6 @@
 //! ordinary TLS, where the SNI and certificate identity still bind to the
 //! policy target. An unverifiable advertised configuration fails closed.
 
-use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
-
-use agent_sandbox_core::AttributionToken;
-use bytes::Bytes;
-
-use h3::{
-    ConnectionState,
-    client::SendRequest,
-    quic::{OpenStreams as _, SendStream as _},
-};
-
-use rustls::pki_types::pem::PemObject;
-
 use std::{
     collections::HashMap,
     future::poll_fn,
@@ -33,6 +20,17 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
+use agent_sandbox_core::AttributionToken;
+use bytes::Bytes;
+use h3::{
+    ConnectionState,
+    client::SendRequest,
+    quic::{OpenStreams as _, SendStream as _},
+};
+use rustls::pki_types::pem::PemObject;
+
+use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
 
 pub(crate) enum IncomingWebTransportStream {
     Bidi(Box<h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>>),

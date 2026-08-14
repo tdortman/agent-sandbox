@@ -1,16 +1,3 @@
-use agent_sandbox_syscall::{build_filter, default_syscalls, syscalls_without_filesystem};
-use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
-use clap::Parser as _;
-
-use nix::{
-    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
-    sys::{
-        prctl::set_no_new_privs,
-        signal::{Signal, raise},
-    },
-    unistd::{ForkResult, Pid, execvp, pipe2},
-};
-
 use std::{
     env,
     ffi::{CStr, CString, OsString},
@@ -20,6 +7,18 @@ use std::{
         unix::ffi::OsStrExt,
     },
     process,
+};
+
+use agent_sandbox_syscall::{build_filter, default_syscalls, syscalls_without_filesystem};
+use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
+use clap::Parser as _;
+use nix::{
+    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+    sys::{
+        prctl::set_no_new_privs,
+        signal::{Signal, raise},
+    },
+    unistd::{ForkResult, Pid, execvp, pipe2},
 };
 
 const DEFAULT_POLICY_SOCKET: &str = "/run/agent-sandbox/policy.sock";

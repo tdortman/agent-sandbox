@@ -1,10 +1,9 @@
+use std::path::PathBuf;
+
 use agent_sandbox_core::{
     FileAccess, FilesystemMonitorReply, FilesystemRule, RequestContext, RpcReply,
 };
-
 use agent_sandbox_fsmon::start_monitor;
-use std::path::PathBuf;
-
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,

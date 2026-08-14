@@ -1,17 +1,17 @@
 //! HTTP/3 scenarios: QUIC policy flow, WebTransport, CONNECT-UDP,
 //! streaming, migration, and upstream ECH discovery.
 
-use crate::{
-    support::{Http3Client, IpVersion, TransparentHarness, loopback},
-    transparent_common::{assert_release_matches_claim, wait_for_release},
-};
-
-use bytes::Buf;
 use std::{collections::BTreeSet, sync::atomic::Ordering, time::Duration};
 
+use bytes::Buf;
 use tokio::{
     net::UdpSocket,
     time::{sleep, timeout},
+};
+
+use crate::{
+    support::{Http3Client, IpVersion, TransparentHarness, loopback},
+    transparent_common::{assert_release_matches_claim, wait_for_release},
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -104,9 +104,7 @@ async fn proxy_upstream_pool_reaches_standalone_origin() {
         .connect(
             "https",
             &authority,
-            Some(
-                &agent_sandbox_core::AttributionToken::from_bytes([0; 32]),
-            ),
+            Some(&agent_sandbox_core::AttributionToken::from_bytes([0; 32])),
         )
         .await
         .expect("upstream connect");

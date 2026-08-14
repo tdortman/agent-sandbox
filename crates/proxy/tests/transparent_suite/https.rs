@@ -1,30 +1,28 @@
 //! TLS termination and ECH scenarios: SNI routing, ALPN fallback, and
 //! downstream ECH decryption.
 
-use crate::{
-    support::{IpVersion, TransparentHarness, loopback},
-    transparent_common::{assert_release_matches_claim, wait_for_release},
-};
+use std::{sync::atomic::Ordering, time::Duration};
 
 use rama_core::{Service, extensions::ExtensionsRef, rt::Executor};
 use rama_http::{Body, Request, StatusCode, Version, body::util::BodyExt, conn::TargetHttpVersion};
 use rama_http_backend::client::HttpConnector;
-
 use rama_net::{
     address::{Host, HostWithPort},
     client::{ConnectorService, ConnectorTarget, EstablishedClientConnection},
 };
-
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{ServerVerifyMode, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
 use rustls::pki_types::pem::PemObject as _;
-use std::{sync::atomic::Ordering, time::Duration};
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     time::timeout,
+};
+
+use crate::{
+    support::{IpVersion, TransparentHarness, loopback},
+    transparent_common::{assert_release_matches_claim, wait_for_release},
 };
 
 #[test]

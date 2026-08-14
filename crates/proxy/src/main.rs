@@ -1,8 +1,8 @@
-use agent_sandbox_core::HttpUrl;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use agent_sandbox_core::HttpUrl;
 #[cfg(debug_assertions)]
 use agent_sandbox_proxy::tcp_backend::destination_override;
-
 use agent_sandbox_proxy::{
     alt_svc::AltSvcStore,
     cert::CertificateIssuer,
@@ -14,15 +14,11 @@ use agent_sandbox_proxy::{
         run_tcp_listener,
     },
 };
-
 use clap::Parser;
-
 use rama_core::{
     error::{BoxError, BoxErrorExt},
     rt::Executor,
 };
-
-use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Debug, Parser)]
@@ -286,8 +282,9 @@ fn load_listener_config(
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
     use clap::Parser;
+
+    use super::Args;
 
     #[test]
     fn args_disable_http3_by_default() {

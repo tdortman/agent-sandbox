@@ -1,13 +1,5 @@
 //! Auto-spawn agent-sandbox-ui via runuser when no policy UI is connected.
 
-use crate::{
-    store::{PolicyStore, PolicydArgs, evict_oldest},
-    wire::UiSpawnContext,
-};
-
-use agent_sandbox_core::graphical_env::{graphical_session_env, tool_path};
-use nix::unistd::User;
-
 use std::{
     collections::HashMap,
     future::Future,
@@ -15,6 +7,14 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
+};
+
+use agent_sandbox_core::graphical_env::{graphical_session_env, tool_path};
+use nix::unistd::User;
+
+use crate::{
+    store::{PolicyStore, PolicydArgs, evict_oldest},
+    wire::UiSpawnContext,
 };
 
 const MAX_UI_SPAWN_THROTTLES: usize = 1024;

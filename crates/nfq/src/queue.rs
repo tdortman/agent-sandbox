@@ -1,8 +1,8 @@
 //! NFQUEUE binding, copy range, and the systemd readiness marker.
 
-use nfq_updated::Queue;
-
 use std::path::{Path, PathBuf};
+
+use nfq_updated::Queue;
 
 /// Number of bytes to copy from each queued packet.
 /// `u16::MAX` ensures the full UDP DNS response payload is available

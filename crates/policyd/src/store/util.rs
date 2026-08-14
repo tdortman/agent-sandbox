@@ -1,8 +1,10 @@
 //! Audit logging and host pattern matching.
 
-use super::decisions::DecisionAction;
-use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths};
 use std::path::PathBuf;
+
+use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths};
+
+use super::decisions::DecisionAction;
 
 impl super::types::PolicyStore {
     pub(crate) fn audit(action: &str, host: Option<&str>, port: Option<u16>, detail: &str) {

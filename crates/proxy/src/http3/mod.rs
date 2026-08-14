@@ -25,14 +25,6 @@ mod socket;
 pub mod upstream;
 mod webtransport;
 
-use crate::{
-    alt_svc::AltSvcStore, cert::CertificateIssuer, ech_state::DownstreamEch, policy::PolicySession,
-};
-
-use agent_sandbox_core::ProxyConnectionId;
-use h3::error::Code;
-use socket::TransparentUdpSocket;
-
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -41,7 +33,14 @@ use std::{
     time::Duration,
 };
 
+use agent_sandbox_core::ProxyConnectionId;
+use h3::error::Code;
+use socket::TransparentUdpSocket;
 use tokio::sync::{Notify, Semaphore};
+
+use crate::{
+    alt_svc::AltSvcStore, cert::CertificateIssuer, ech_state::DownstreamEch, policy::PolicySession,
+};
 
 /// Owner of one locally-issued QUIC connection-ID route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -459,8 +458,9 @@ fn varint(code: Code) -> quinn::VarInt {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionIdOwner, ConnectionIdRegistry};
     use agent_sandbox_core::ProxyConnectionId;
+
+    use super::{ConnectionIdOwner, ConnectionIdRegistry};
 
     fn owner(stable_id: usize) -> ConnectionIdOwner {
         ConnectionIdOwner {

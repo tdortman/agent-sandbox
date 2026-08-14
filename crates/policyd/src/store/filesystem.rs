@@ -1,5 +1,21 @@
 //! Policy store: filesystem (fanotify monitor spawn and declarative checks).
 
+use std::{
+    io::BufRead,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+
+use agent_sandbox_core::{
+    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
+    InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
+    normalize_directory_traverse_access,
+};
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
 use super::{
     types::{
         MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
@@ -9,20 +25,6 @@ use super::{
     ui::VerdictExit,
 };
 use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest};
-use agent_sandbox_core::{
-    FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, FilesystemRuleKey,
-    InodeIdentity, ResolvedRequestContext, UiPush, VerdictSource, expand_policy_path,
-    normalize_directory_traverse_access,
-};
-use std::{
-    io::BufRead,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
-};
-use tokio::sync::oneshot;
-use uuid::Uuid;
 
 /// Timeout for waiting for the fsmon `ready` line.
 const FSMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -534,16 +536,18 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
-    use agent_sandbox_core::{
-        ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
-        SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
-    };
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    use agent_sandbox_core::{
+        ApprovalScope, FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext,
+        SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
+    };
+
+    use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(
@@ -970,8 +974,9 @@ mod tests {
 
     #[test]
     fn expand_static_allow_rules_canonicalizes_home_symlinks() {
-        use super::expand_static_allow_rules;
         use std::os::unix::fs::symlink;
+
+        use super::expand_static_allow_rules;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path();

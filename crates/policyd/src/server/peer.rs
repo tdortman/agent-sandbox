@@ -1,7 +1,6 @@
 //! Peer identity for incoming Unix socket RPC clients.
 
 use agent_sandbox_core::peer_cred_unix;
-
 use tokio::net::UnixStream;
 
 /// Peer process connected to policyd.

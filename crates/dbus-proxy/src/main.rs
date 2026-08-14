@@ -1,7 +1,8 @@
+use std::path::PathBuf;
+
 use agent_sandbox_core::{DbusBus, rpc::RequestContext};
 use agent_sandbox_dbus_proxy::{RelayConfig, run};
 use clap::Parser;
-use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-sandbox-dbus-proxy")]

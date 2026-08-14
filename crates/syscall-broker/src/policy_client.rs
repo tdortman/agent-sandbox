@@ -1,15 +1,15 @@
-use crate::{NetworkTarget, ResourceTarget};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
     ResourceCheckReply, RpcReply, RpcRequest, wire_context,
 };
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use crate::{NetworkTarget, ResourceTarget};
 
 fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestContext {
     // The broker is exec'd inside the bwrap jail and inherits the sandbox
@@ -149,18 +149,17 @@ impl PersistentPolicyClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistentPolicyClient, request_context};
+    use std::{path::Path, time::Duration};
 
     use agent_sandbox_core::{
         CheckReply, FileAccess, FilesystemCheckReply, RpcMessage, RpcReply, VerdictSource,
     };
-
-    use std::{path::Path, time::Duration};
-
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    use super::{PersistentPolicyClient, request_context};
 
     /// Restore process environment mutated by tests that exercise the
     /// sandbox-path resolution fallback.
@@ -177,9 +176,7 @@ mod tests {
             for (key, value) in entries {
                 // SAFETY: tests run single-threaded within this binary's
                 // test threads, and every key is restored on drop.
-                unsafe { std::env::set_var(key, value) }
-
-                ;
+                unsafe { std::env::set_var(key, value) };
             }
 
             Self(previous)

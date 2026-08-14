@@ -1,12 +1,13 @@
 //! UI push payloads (after `register_ui`).
 
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
 use crate::{
     http::{HttpRequest, PendingHttpId},
     policy::{DbusTarget, FileAccess, ResourceAccess, ResourceKind},
 };
-
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

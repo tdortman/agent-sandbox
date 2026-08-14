@@ -1,22 +1,21 @@
 //! TCP relay and cleartext HTTP scenarios: allow/deny, HTTP/1.0, pooling,
 //! policy and claim errors, and cancellation.
 
-use crate::{
-    support::{IpVersion, TransparentHarness, loopback},
-    transparent_common::{assert_release_matches_claim, wait_for_release},
-};
+use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
 
 use nix::{
     libc,
     sys::socket::{setsockopt, sockopt::Linger},
 };
-
-use std::{os::fd::AsFd, sync::atomic::Ordering, time::Duration};
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     time::{sleep, timeout},
+};
+
+use crate::{
+    support::{IpVersion, TransparentHarness, loopback},
+    transparent_common::{assert_release_matches_claim, wait_for_release},
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

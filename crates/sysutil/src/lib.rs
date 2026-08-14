@@ -5,16 +5,16 @@
 //! of the audited functions in this crate. Callers never write their own
 //! `unsafe` syscall code.
 
-use nix::{
-    sys::socket::{SockaddrStorage, getpeername},
-    unistd::Pid,
-};
-
 use std::{
     ffi::CStr,
     io::{self, Read, Seek, SeekFrom},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
+};
+
+use nix::{
+    sys::socket::{SockaddrStorage, getpeername},
+    unistd::Pid,
 };
 
 /// Open a pidfd referring to `pid` (Linux 5.3+ `pidfd_open(2)`).
@@ -122,7 +122,12 @@ pub fn ioctl<T>(fd: std::os::fd::RawFd, request: libc::c_ulong, arg: &mut T) -> 
 ///
 /// # Errors
 /// Returns the `fallback` error when `process_vm_readv` fails.
-pub fn read_tracee_bytes_with<F>(pid: u32, addr: u64, len: usize, fallback: F) -> io::Result<Vec<u8>>
+pub fn read_tracee_bytes_with<F>(
+    pid: u32,
+    addr: u64,
+    len: usize,
+    fallback: F,
+) -> io::Result<Vec<u8>>
 where
     F: FnOnce(u64, &mut [u8]) -> io::Result<()>,
 {
@@ -633,10 +638,8 @@ mod tests {
     fn read_proc_mem_reads_requested_bytes_from_a_file() {
         use std::io::Write;
 
-        let path = std::env::temp_dir().join(format!(
-            "agent-sandbox-sysutil-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("agent-sandbox-sysutil-{}", std::process::id()));
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)

@@ -1,11 +1,13 @@
 //! Policy store: sudo scope application.
 
+use std::path::{Path, PathBuf};
+
+use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
+
 use super::{
     ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction, types::PolicyStore,
 };
 use crate::wire::{ScopeWire, SudoScopeOp};
-use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
-use std::path::{Path, PathBuf};
 
 impl PolicyStore {
     pub(crate) async fn apply_sudo_scope(
@@ -102,11 +104,7 @@ impl PolicyStore {
             action,
             (None, None, &audit_detail),
             |scope, policy_path| {
-                RpcReply::ScopeAction(ScopeActionReply::ok_sudo(
-                    argv,
-                    scope,
-                    policy_path,
-                ))
+                RpcReply::ScopeAction(ScopeActionReply::ok_sudo(argv, scope, policy_path))
             },
         )
     }

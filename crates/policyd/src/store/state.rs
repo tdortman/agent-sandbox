@@ -9,6 +9,18 @@
 //! oneshot waiter maps, so a pending id, its futures, and its http
 //! waiters live and die together.
 
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
+
+use agent_sandbox_core::{
+    AttributionToken, CheckReply, DbusCheckReply, DbusTarget, ElevateReply, FilesystemCheckReply,
+    FilesystemRule, FilesystemRuleKey, HttpCheckReply, NetworkFlowKey, NetworkRuleKey,
+    PendingHttpId, ProxyRequestId, ProxySessionToken, ResourceCheckReply, ResourceRuleKey,
+};
+use tokio::sync::oneshot;
+
 use super::{
     decisions::DecisionAction,
     types::{
@@ -16,16 +28,6 @@ use super::{
         ProxySessionState, UiClient, UiSessionContext, VerdictEntry,
     },
 };
-use agent_sandbox_core::{
-    AttributionToken, CheckReply, DbusCheckReply, DbusTarget, ElevateReply, FilesystemCheckReply,
-    FilesystemRule, FilesystemRuleKey, HttpCheckReply, NetworkFlowKey, NetworkRuleKey,
-    PendingHttpId, ProxyRequestId, ProxySessionToken, ResourceCheckReply, ResourceRuleKey,
-};
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
-use tokio::sync::oneshot;
 
 /// One check on a trusted proxy session: which session, which request
 /// on that session. Named type instead of a tuple key so the pairing is

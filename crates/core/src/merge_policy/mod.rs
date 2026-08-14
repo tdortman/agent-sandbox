@@ -8,9 +8,6 @@ mod project;
 #[cfg(test)]
 mod tests;
 
-pub use io::{
-    atomic_write_policy, chown_policy_path, load_policy, resolve_policy_write_path,
-};
-
+pub use io::{atomic_write_policy, chown_policy_path, load_policy, resolve_policy_write_path};
 pub use merge::merge_layers;
 pub use project::{ProjectPolicyContext, trusted_project_policy_path};

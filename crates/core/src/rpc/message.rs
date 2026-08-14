@@ -1,9 +1,10 @@
 //! Wire envelope for replies and UI pushes.
 
-use super::{push::UiPush, reply::RpcReply};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+
+use super::{push::UiPush, reply::RpcReply};
 
 /// Outgoing RPC / UI push message.
 #[derive(Debug, Clone, Serialize, Deserialize)]

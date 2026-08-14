@@ -9,13 +9,18 @@
 //! The implementation follows rustls's own `aws-lc-rs` HPKE provider line
 //! for line, with ring's agreement, HKDF, and AEAD primitives substituted.
 
+use std::{
+    fmt,
+    io::{Error as IoError, ErrorKind},
+    sync::Arc,
+};
+
 use ring::{
     agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral},
     hkdf::Prk,
     hmac,
     rand::SystemRandom,
 };
-
 use rustls::{
     Error, OtherError,
     crypto::hpke::{
@@ -25,12 +30,6 @@ use rustls::{
         enums::{HpkeAead, HpkeKdf, HpkeKem},
         handshake::HpkeSymmetricCipherSuite,
     },
-};
-
-use std::{
-    fmt,
-    io::{Error as IoError, ErrorKind},
-    sync::Arc,
 };
 
 const NONCE_LEN: usize = 12;
@@ -475,12 +474,12 @@ fn unsupported() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{DHKEM_X25519_HKDF_SHA256_AES_128, KeySchedule, labeled_extract};
-
     use rustls::{
         crypto::hpke::{Hpke, HpkePrivateKey, HpkePublicKey},
         internal::msgs::enums::HpkeKem,
     };
+
+    use super::{DHKEM_X25519_HKDF_SHA256_AES_128, KeySchedule, labeled_extract};
 
     fn hex(value: &str) -> Vec<u8> {
         let value = value

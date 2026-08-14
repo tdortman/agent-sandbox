@@ -1,8 +1,8 @@
 //! Command-line arguments for the nfq daemon.
 
-use clap::Parser;
-
 use std::{net::IpAddr, path::PathBuf};
+
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(
