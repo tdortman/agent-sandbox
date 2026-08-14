@@ -25,10 +25,6 @@ mod types;
 mod ui;
 mod ui_route;
 mod util;
-use crate::error::PolicydError;
-use agent_sandbox_core::ScopeTarget;
-pub(crate) use decisions::DecisionAction;
-pub use freeze::cleanup_cgroup_freeze;
 #[cfg(test)]
 use std::time::Duration;
 use std::{
@@ -36,6 +32,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
+
+use agent_sandbox_core::ScopeTarget;
+pub(crate) use decisions::DecisionAction;
+pub use freeze::cleanup_cgroup_freeze;
 use types::MergedPolicyCache;
 pub(crate) use types::evict_oldest;
 pub use types::{
@@ -44,6 +44,8 @@ pub use types::{
     PendingKind, PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ProxyCheckId,
     ProxyFlowState, ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
 };
+
+use crate::error::PolicydError;
 
 /// Whether a persistent scope write invalidates the merged-policy cache.
 ///

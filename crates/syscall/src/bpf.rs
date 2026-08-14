@@ -8,9 +8,9 @@
 //! <https://docs.kernel.org/bpf/> for the seccomp BPF ABI the program
 //! implements.
 
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
-
 use std::collections::BTreeMap;
+
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 
 // `seccompiler::sock_filter` and `libc::sock_filter` are both `#[repr(C)]`
 // with the same field layout (code: u16, jt: u8, jf: u8, k: u32), so a
@@ -64,8 +64,9 @@ const fn target_arch() -> TargetArch {
 
 #[cfg(test)]
 mod tests {
-    use super::build_filter;
     use std::collections::BTreeSet;
+
+    use super::build_filter;
 
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
     const RET_ALLOW: u32 = 0x7FFF_0000;

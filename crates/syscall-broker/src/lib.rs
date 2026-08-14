@@ -1,13 +1,14 @@
 mod policy_client;
 
-use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess};
-use agent_sandbox_syscall::policy::nr;
-pub use policy_client::PersistentPolicyClient;
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
+
+use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess};
+use agent_sandbox_syscall::policy::nr;
+pub use policy_client::PersistentPolicyClient;
 
 pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xC050_2100;
 pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
@@ -747,7 +748,7 @@ fn tracee_fd_path(pid: u32, fd: u64) -> io::Result<PathBuf> {
 /// Indices are passed as integer literals and dereferenced inside the macro
 /// so the `notif` binding resolves under the macro's own hygiene.
 macro_rules! fs_two_path_target {
-    ($name:ident, $check:ident, cwd, $old_idx:expr, cwd, $new_idx:expr) => {
+    ($name:ident, $check:ident,cwd, $old_idx:expr,cwd, $new_idx:expr) => {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
             let old = read_resolved_path_arg(notif.pid, at_fdcwd_arg(), notif.data.args[$old_idx])?;
@@ -760,7 +761,7 @@ macro_rules! fs_two_path_target {
         }
     };
 
-    ($name:ident, $check:ident, arg($od:expr), $old_idx:expr, arg($nd:expr), $new_idx:expr) => {
+    ($name:ident, $check:ident,arg($od:expr), $old_idx:expr,arg($nd:expr), $new_idx:expr) => {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
             let old =
@@ -822,7 +823,7 @@ fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<Option<SyscallTarge
 /// Generate a single-path filesystem-mutation target extractor
 /// (`unlink`/`truncate`). See [`fs_two_path_target`] for the index hygiene.
 macro_rules! fs_path_target {
-    ($name:ident, $check:ident, cwd, $arg_idx:expr) => {
+    ($name:ident, $check:ident,cwd, $arg_idx:expr) => {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
             let path =
@@ -832,7 +833,7 @@ macro_rules! fs_path_target {
         }
     };
 
-    ($name:ident, $check:ident, arg($d:expr), $arg_idx:expr) => {
+    ($name:ident, $check:ident,arg($d:expr), $arg_idx:expr) => {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         fn $name(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
             let path =
@@ -1223,6 +1224,15 @@ fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> (i32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        net::{IpAddr, Ipv4Addr},
+        os::fd::AsRawFd,
+        path::{Path, PathBuf},
+    };
+
+    use agent_sandbox_syscall::policy::nr;
+
     use super::{
         FileAccess, FilesystemTarget, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID,
         SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
@@ -1233,13 +1243,6 @@ mod tests {
         read_resolved_path_arg, resolve_open_path, resolve_tracee_path,
         revalidate_filesystem_mutation, scheme_for_socket_type, target_from_notification,
         tracee_fd_path, tracee_open_dir_base,
-    };
-    use agent_sandbox_syscall::policy::nr;
-    use std::{
-        fs,
-        net::{IpAddr, Ipv4Addr},
-        os::fd::AsRawFd,
-        path::{Path, PathBuf},
     };
 
     #[test]

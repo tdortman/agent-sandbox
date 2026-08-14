@@ -1,16 +1,5 @@
 pub(crate) mod decision;
 pub(crate) mod dispatch;
-use agent_sandbox_core::{InodeIdentity, ResourceKind};
-use agent_sandbox_syscall::policy::nr;
-
-use agent_sandbox_syscall_broker::{
-    NetworkMode, PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-    SeccompNotif, normalize_path, recv_notification, send_addfd, send_response,
-};
-
-use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
-use clap::Parser;
-
 use std::{
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd, OwnedFd},
@@ -18,6 +7,14 @@ use std::{
     time::Duration,
 };
 
+use agent_sandbox_core::{InodeIdentity, ResourceKind};
+use agent_sandbox_syscall::policy::nr;
+use agent_sandbox_syscall_broker::{
+    NetworkMode, PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    SeccompNotif, normalize_path, recv_notification, send_addfd, send_response,
+};
+use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
+use clap::Parser;
 use tokio::time;
 use tracing::{debug, info, warn};
 
@@ -618,10 +615,12 @@ fn emulate_open_with_path(
 
 #[cfg(test)]
 mod tests {
-    use super::is_policy_socket_bypass;
+    use std::path::{Path, PathBuf};
+
     use agent_sandbox_core::{DeviceAccess, ResourceAccess, ResourceKind, SocketAccess};
     use agent_sandbox_syscall_broker::ResourceTarget;
-    use std::path::{Path, PathBuf};
+
+    use super::is_policy_socket_bypass;
 
     fn make_unix_target(path: &str) -> ResourceTarget {
         ResourceTarget {
@@ -778,8 +777,9 @@ mod tests {
 
     #[test]
     fn environment_defaults_are_declared_on_cli_arguments() {
-        use super::Cli;
         use clap::CommandFactory;
+
+        use super::Cli;
 
         let command = Cli::command();
 

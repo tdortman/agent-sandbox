@@ -1,6 +1,12 @@
 //! Registry of policy-approved HTTP/3 session identities, with the leases
 //! that pin one identity to each downstream stream.
 
+use std::collections::HashMap;
+
+use agent_sandbox_core::HttpRequest;
+use h3::quic::StreamId;
+use tokio::sync::Mutex;
+
 use crate::{
     http3::{
         BoxError,
@@ -8,11 +14,6 @@ use crate::{
     },
     semantic::SemanticRequest,
 };
-
-use agent_sandbox_core::HttpRequest;
-use h3::quic::StreamId;
-use std::collections::HashMap;
-use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub(super) struct SessionBinding {
@@ -143,15 +144,14 @@ pub(super) fn session_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionBinding, SessionRegistry, session_key};
+    use agent_sandbox_core::{AttributionToken, HttpRequest};
+    use h3::quic::StreamId;
 
+    use super::{SessionBinding, SessionRegistry, session_key};
     use crate::http3::{
         relay::semantic_request,
         session::{SessionKey, SessionProtocol},
     };
-
-    use agent_sandbox_core::{AttributionToken, HttpRequest};
-    use h3::quic::StreamId;
 
     fn semantic() -> crate::semantic::SemanticRequest {
         let request = http::Request::builder()

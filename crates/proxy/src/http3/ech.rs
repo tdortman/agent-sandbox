@@ -21,15 +21,6 @@
 //! the proxy's own configuration, so in the sandbox an origin advertising
 //! ECH fails closed rather than negotiating with its real configuration.
 
-use super::{BoxError, hpke::ECH_SUPPORTED_SUITES};
-
-use hickory_proto::{
-    op::{Message, MessageType, OpCode, Query, ResponseCode},
-    rr::{Name, RData, RecordType, rdata::svcb::SvcParamKey},
-};
-
-use rustls::{client::EchConfig, pki_types::EchConfigListBytes};
-
 use std::{
     collections::HashMap,
     io::ErrorKind,
@@ -39,7 +30,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hickory_proto::{
+    op::{Message, MessageType, OpCode, Query, ResponseCode},
+    rr::{Name, RData, RecordType, rdata::svcb::SvcParamKey},
+};
+use rustls::{client::EchConfig, pki_types::EchConfigListBytes};
 use tracing::warn;
+
+use super::{BoxError, hpke::ECH_SUPPORTED_SUITES};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_TTL_SECONDS: u32 = 60;
@@ -266,7 +264,7 @@ fn parse_resolv_conf(path: &Path) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_https_answer, parse_resolv_conf, verify_config};
+    use std::{net::Ipv4Addr, path::Path};
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
@@ -279,7 +277,7 @@ mod tests {
         },
     };
 
-    use std::{net::Ipv4Addr, path::Path};
+    use super::{parse_https_answer, parse_resolv_conf, verify_config};
 
     fn https_answer(ech: Option<&[u8]>) -> Message {
         let name = Name::from_ascii("example.test.").expect("valid name");

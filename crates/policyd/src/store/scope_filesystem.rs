@@ -1,15 +1,17 @@
 //! Policy store: filesystem scope application.
 
+use std::path::Path;
+
+use agent_sandbox_core::{
+    ApprovalScope, DbusTarget, FilesystemRuleKey, ResourceRuleKey, RpcReply, ScopeActionReply,
+    ScopeTarget, expand_policy_path,
+};
+
 use super::{
     ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction,
     persist::PersistResourceRuleArgs, types::PolicyStore,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
-use agent_sandbox_core::{
-    ApprovalScope, DbusTarget, FilesystemRuleKey, ResourceRuleKey, RpcReply, ScopeActionReply,
-    ScopeTarget, expand_policy_path,
-};
-use std::path::Path;
 
 impl PolicyStore {
     pub(crate) async fn apply_filesystem_scope(
@@ -327,16 +329,18 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use agent_sandbox_core::{
+        ApprovalScope, FileAccess, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
+        SandboxPaths, Verdict, VerdictSource,
+    };
+
     use super::*;
     use crate::{
         store::decisions::DecisionAction,
         wire::{FilesystemScopeOp, ScopeWire},
     };
-    use agent_sandbox_core::{
-        ApprovalScope, FileAccess, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
-        SandboxPaths, Verdict, VerdictSource,
-    };
-    use std::{path::PathBuf, time::Duration};
 
     #[tokio::test]
     async fn project_filesystem_persistence_invalidates_merged_cache() {

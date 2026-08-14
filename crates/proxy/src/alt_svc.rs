@@ -18,6 +18,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+
 use tracing::debug;
 
 /// Minimal `Alt-Svc` rewrite surface shared by the rama (TCP) and `http`
@@ -438,9 +439,11 @@ async fn resolve_host(host: &str) -> Vec<IpAddr> {
 /// Convenience for tests: a store with a fixed intercepted port list.
 #[cfg(test)]
 mod tests {
-    use super::{AltSvcStore, parse_authority};
     use std::{net::IpAddr, time::Duration};
+
     use tokio::time::sleep;
+
+    use super::{AltSvcStore, parse_authority};
 
     fn store() -> AltSvcStore {
         AltSvcStore::new(vec![443, 8443])

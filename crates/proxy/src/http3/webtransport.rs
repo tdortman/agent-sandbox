@@ -1,6 +1,20 @@
 //! WebTransport session handling for downstream HTTP/3 associations:
 //! preparation, approval, session association, and stream relay.
 
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+
+use agent_sandbox_core::HttpCheckReply;
+use bytes::{Buf, Bytes};
+use h3::{
+    error::Code,
+    quic::{BidiStream as _, RecvStream as _, SendStream as _, StreamId},
+    server::RequestStream,
+};
+use h3_datagram::datagram_handler::DatagramSender;
+use h3_quinn::datagram::SendDatagramHandler;
+use tokio::sync::{mpsc, watch};
+use tracing::warn;
+
 use crate::{
     http3::{
         BoxError, Http3State,
@@ -24,21 +38,6 @@ use crate::{
     policy::FlowClaim,
     semantic::SemanticRequest,
 };
-
-use agent_sandbox_core::HttpCheckReply;
-use bytes::{Buf, Bytes};
-
-use h3::{
-    error::Code,
-    quic::{BidiStream as _, RecvStream as _, SendStream as _, StreamId},
-    server::RequestStream,
-};
-
-use h3_datagram::datagram_handler::DatagramSender;
-use h3_quinn::datagram::SendDatagramHandler;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, watch};
-use tracing::warn;
 
 pub(super) struct WebTransportRoute {
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,

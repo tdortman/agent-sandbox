@@ -1,5 +1,13 @@
 //! Apply pending network or elevation decisions.
 
+use std::path::{Path, PathBuf};
+
+use agent_sandbox_core::{
+    ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
+    NetworkRuleKey, ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SocketAccess,
+    SudoRule, VerdictSource, host_pattern_matches,
+};
+
 use super::{
     super::types::{
         Pending, PendingDbus, PendingElevation, PendingFilesystem, PendingNetwork, PendingResource,
@@ -11,12 +19,6 @@ use crate::{
     error::PolicydError,
     wire::{NetworkScopeOp, PendingDecision, ResourceScopeOp, SudoScopeOp},
 };
-use agent_sandbox_core::{
-    ApprovalScope, ApprovalTarget, DbusRule, ElevateReply, FileAccess, FilesystemRule,
-    NetworkRuleKey, ResourceAccess, ResourceRule, RpcReply, ScopeActionReply, SocketAccess,
-    SudoRule, VerdictSource, host_pattern_matches,
-};
-use std::path::{Path, PathBuf};
 
 /// Verdict source for a finished pending decision. Denied verdicts report
 /// [`VerdictSource::User`]: the wire codec has no `Scope` encoding for
@@ -851,6 +853,19 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use agent_sandbox_core::{
+        ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
+        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
+        ScopeActionReply, SocketAccess, load_policy,
+    };
+    use tokio::{net::UnixStream, sync::Mutex};
+
     use super::DecisionAction;
     use crate::{
         store::{
@@ -860,17 +875,6 @@ mod tests {
         },
         wire::{PendingDecision, ScopeWire},
     };
-    use agent_sandbox_core::{
-        ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
-        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
-        ScopeActionReply, SocketAccess, load_policy,
-    };
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
-    };
-    use tokio::{net::UnixStream, sync::Mutex};
 
     #[test]
     fn network_target_accepts_parent_domain_patterns() {

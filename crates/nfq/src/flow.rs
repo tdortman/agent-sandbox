@@ -1,14 +1,6 @@
 //! Flow handling: policy-boundary classification, the approved-flow fast
 //! path, proxy flow registration, and the per-packet verdict decision.
 
-use crate::{args::Cli, attribution, owner, packet, policy, policy::TransportCheck};
-use agent_sandbox_core::{
-    APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
-    FlowContext, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost, OwnerSnapshot,
-    SandboxPaths, SocketIdentity, is_http_service_port, lookup_dns_cache, mappings_from_response,
-    sandbox_session_id_from_pid,
-};
-use nfq_updated::{Message, Verdict};
 use std::{
     collections::HashMap,
     net::IpAddr,
@@ -16,7 +8,17 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+use agent_sandbox_core::{
+    APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
+    FlowContext, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost, OwnerSnapshot,
+    SandboxPaths, SocketIdentity, is_http_service_port, lookup_dns_cache, mappings_from_response,
+    sandbox_session_id_from_pid,
+};
+use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
+
+use crate::{args::Cli, attribution, owner, packet, policy, policy::TransportCheck};
 
 /// Packet mark used by the transparent proxy's local routing table.
 const PROXY_MARK: u32 = 51820;
@@ -508,18 +510,20 @@ pub fn handle_packet(
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
     use agent_sandbox_core::FlowProtocol;
     use clap::Parser;
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType, rdata::A},
     };
-    use std::{
-        net::{IpAddr, Ipv4Addr},
-        path::{Path, PathBuf},
-        time::Duration,
-    };
+
+    use super::*;
 
     pub const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
 

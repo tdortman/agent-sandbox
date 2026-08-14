@@ -1,5 +1,12 @@
 //! Typed HTTP policy evaluation, pending requests, and cancellation.
 
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use agent_sandbox_core::{
+    ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
+    PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
+};
+
 use super::{
     state::ProxyCheckId,
     types::{
@@ -9,11 +16,6 @@ use super::{
     ui::VerdictExit,
 };
 use crate::error::PolicydError;
-use agent_sandbox_core::{
-    ApprovalScope, HttpCheckReply, HttpContextKey, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
-    PendingHttpId, ResolvedRequestContext, UiPush, Verdict, VerdictSource,
-};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HTTP_VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -528,7 +530,8 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{PendingResult, PolicyStore};
+    use std::time::Duration;
+
     use agent_sandbox_core::{
         ApprovalScope, AttributionToken, FlowContext, FlowProtocol, FlowRegistration,
         HttpCheckReply, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRule, HttpRuleTarget,
@@ -536,7 +539,8 @@ mod tests {
         ProxyConnectionId, ProxyRequestId, ProxySessionToken, ResolvedRequestContext, SandboxPaths,
         SocketIdentity, SocketInode, Verdict, VerdictSource, atomic_write_policy,
     };
-    use std::time::Duration;
+
+    use super::super::types::{PendingResult, PolicyStore};
 
     #[tokio::test]
     async fn documented_network_http_rule_allows_without_prompt() {

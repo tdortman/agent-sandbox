@@ -1,12 +1,13 @@
 //! Resolve request context from an incoming RPC.
 
+use std::sync::Arc;
+
+use agent_sandbox_core::{RequestContext, ResolvedRequestContext};
+
 use crate::{
     server::{dispatch::SocketRole, peer::ClientPeer},
     store::{PolicyStore, TrustedPeer},
 };
-
-use agent_sandbox_core::{RequestContext, ResolvedRequestContext};
-use std::sync::Arc;
 
 pub(super) fn resolve_request_context(
     store: &Arc<PolicyStore>,
@@ -40,21 +41,20 @@ pub(super) fn resolve_request_context(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_request_context;
-
-    use crate::{
-        server::{dispatch::SocketRole, peer::ClientPeer},
-        store::PolicyStore,
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
     };
 
     use agent_sandbox_core::{
         FileAccess, ProcessIds, RequestContext, ResolvedRequestContext, RpcRequest, home_from_uid,
     };
 
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
+    use super::resolve_request_context;
+    use crate::{
+        server::{dispatch::SocketRole, peer::ClientPeer},
+        store::PolicyStore,
     };
 
     fn test_store(dir: &tempfile::TempDir) -> Arc<PolicyStore> {

@@ -1,10 +1,10 @@
 //! HTTP/3 extended-session validation and wire helpers.
 
-use agent_sandbox_core::{AttributionToken, HttpSessionMetadata};
+use std::fmt;
 
+use agent_sandbox_core::{AttributionToken, HttpSessionMetadata};
 use bytes::Bytes;
 use h3::{ext::Protocol, quic::StreamId};
-use std::fmt;
 
 const MAX_CAPSULE_BYTES: usize = 1024 * 1024;
 const MAX_CONNECT_UDP_PAYLOAD_BYTES: usize = 65_527;

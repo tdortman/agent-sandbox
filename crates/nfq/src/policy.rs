@@ -1,15 +1,15 @@
 //! Policy RPC client for NFQUEUE, calls policyd's `Check` endpoint.
 
-use crate::{flow::NfqState, packet, packet::TransportProtocol};
+use std::{net::IpAddr, time::Duration};
 
 use agent_sandbox_core::{
     FlowRegistration, RequestContext, RpcReply, RpcRequest, attach_check_aliases, daemon_context,
     persist_session_paths, policy_rpc,
 };
-
 use nfq_updated::Verdict;
-use std::{net::IpAddr, time::Duration};
 use tracing::{debug, info, warn};
+
+use crate::{flow::NfqState, packet, packet::TransportProtocol};
 
 /// Inputs for a single policy check, grouped to keep the call signature small.
 pub struct CheckDestinationArgs<'a> {
@@ -247,17 +247,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::flow::{
-        handle_packet_payload_with_registration,
-        tests::{DNS_IP, build_udp_data_packet, state_for_tests},
-    };
-
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         os::unix::process::ExitStatusExt,
         time::Duration,
+    };
+
+    use super::*;
+    use crate::flow::{
+        handle_packet_payload_with_registration,
+        tests::{DNS_IP, build_udp_data_packet, state_for_tests},
     };
 
     #[test]

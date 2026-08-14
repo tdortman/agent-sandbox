@@ -2,6 +2,21 @@
 //! building, policy authorization, upstream session opening, and body and
 //! response relay.
 
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest};
+use bytes::{Buf, Bytes};
+use h3::{
+    ConnectionState,
+    error::{Code, StreamError},
+    quic::StreamId,
+    server::RequestStream,
+};
+use h3_datagram::datagram_handler::DatagramSender;
+use h3_quinn::datagram::SendDatagramHandler;
+use tokio::sync::{mpsc, oneshot};
+use tracing::info;
+
 use crate::{
     alt_svc::AltSvcStore,
     http3::{
@@ -23,19 +38,6 @@ use crate::{
         semantic_request_headers,
     },
 };
-use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest};
-use bytes::{Buf, Bytes};
-use h3::{
-    ConnectionState,
-    error::{Code, StreamError},
-    quic::StreamId,
-    server::RequestStream,
-};
-use h3_datagram::datagram_handler::DatagramSender;
-use h3_quinn::datagram::SendDatagramHandler;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, oneshot};
-use tracing::info;
 
 pub(super) type UpstreamRequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -1190,6 +1192,8 @@ pub(super) const fn map_stream_error(error: &StreamError) -> Code {
 
 #[cfg(test)]
 mod tests {
+    use agent_sandbox_core::AttributionToken;
+
     use super::{
         body_task_result, build_upstream_request, has_capsule_protocol, require_capsule_protocol,
         semantic_request, session_open_error, upstream_headers,
@@ -1198,7 +1202,6 @@ mod tests {
         BoxError,
         session::{SessionKey, SessionProtocol},
     };
-    use agent_sandbox_core::AttributionToken;
 
     fn request(uri: &str, host: Option<&str>) -> http::Request<()> {
         let mut builder = http::Request::builder().uri(uri);

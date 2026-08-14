@@ -1,35 +1,3 @@
-use super::{
-    FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
-    is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
-};
-
-use crate::semantic::SemanticRequest;
-use agent_sandbox_core::HttpRequest;
-
-use rama_core::{
-    Layer, Service,
-    bytes::Bytes,
-    error::{BoxError, BoxErrorExt},
-    extensions::ExtensionsRef,
-    rt::Executor,
-    service::BoxService,
-};
-
-use rama_dns::client::DnsConnectorLayer;
-
-use rama_http::{
-    Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
-};
-
-use rama_http_backend::client::{
-    BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnector, HttpPooledConnectorConfig,
-};
-
-use rama_net::client::{EstablishedClientConnection, pool::MultiplexedConnection};
-use rama_tcp::client::service::TcpConnector;
-use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
-use rama_tls_rustls::client::TlsConnector;
-
 use std::{
     pin::Pin,
     sync::{
@@ -38,6 +6,33 @@ use std::{
     },
     task::{Context, Poll},
 };
+
+use agent_sandbox_core::HttpRequest;
+use rama_core::{
+    Layer, Service,
+    bytes::Bytes,
+    error::{BoxError, BoxErrorExt},
+    extensions::ExtensionsRef,
+    rt::Executor,
+    service::BoxService,
+};
+use rama_dns::client::DnsConnectorLayer;
+use rama_http::{
+    Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
+};
+use rama_http_backend::client::{
+    BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnector, HttpPooledConnectorConfig,
+};
+use rama_net::client::{EstablishedClientConnection, pool::MultiplexedConnection};
+use rama_tcp::client::service::TcpConnector;
+use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
+use rama_tls_rustls::client::TlsConnector;
+
+use super::{
+    FlowState, SemanticRequestBody, canonical_http10_origin, force_websocket_http11,
+    is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
+};
+use crate::semantic::SemanticRequest;
 
 /// The connection type the pooled upstream client establishes.
 type UpstreamConnection = EstablishedClientConnection<
@@ -404,17 +399,17 @@ pub async fn send_upstream_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
-        is_protocol_negotiation_failure, select_upstream_version,
-    };
-
-    use rama_http::{Body, Version};
-
     use std::{
         pin::Pin,
         sync::{Arc, Mutex, atomic::AtomicBool},
         task::{Context, Poll, Waker},
+    };
+
+    use rama_http::{Body, Version};
+
+    use super::{
+        ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
+        is_protocol_negotiation_failure, select_upstream_version,
     };
 
     #[test]

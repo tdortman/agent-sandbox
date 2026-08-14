@@ -1,7 +1,5 @@
 //! JSON-line policyd client helpers.
 
-use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
-
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -15,6 +13,8 @@ use tokio::{
     },
     time,
 };
+
+use crate::rpc::{RpcMessage, RpcReply, RpcRequest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
@@ -194,15 +194,16 @@ pub async fn policy_rpc(
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistentRpcClient, RpcClientError};
-    use crate::{RequestContext, RpcReply, RpcRequest};
     use std::time::Duration;
-    use tempfile::tempdir;
 
+    use tempfile::tempdir;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    use super::{PersistentRpcClient, RpcClientError};
+    use crate::{RequestContext, RpcReply, RpcRequest};
 
     fn request() -> RpcRequest {
         RpcRequest::Check {

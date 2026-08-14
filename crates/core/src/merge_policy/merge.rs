@@ -1,6 +1,8 @@
 //! Merge policy layers with deny-wins semantics. A deny rule for a key is final
 //! even if a later layer allowed it.
 
+use std::collections::BTreeMap;
+
 use crate::{
     hosts::{host_pattern_has_glob, host_pattern_matches},
     http::{HttpMethodMatcher, HttpRule, HttpRuleTarget, HttpUrl},
@@ -10,8 +12,6 @@ use crate::{
         ResourceRuleKey, ResourceSection, SudoRule, SudoSection,
     },
 };
-
-use std::collections::BTreeMap;
 
 #[must_use]
 pub fn merge_layers(layers: &[Policy]) -> Policy {
@@ -251,7 +251,6 @@ fn merge_resources(layers: &[Policy]) -> ResourceSection {
 #[cfg(test)]
 mod tests {
     use super::merge_layers;
-
     use crate::policy::{
         DeviceAccess, FileAccess, FilesystemRule, FilesystemSection, Policy, ResourceAccess,
         ResourceKind, ResourceRule, ResourceSection,

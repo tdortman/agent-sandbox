@@ -1,14 +1,14 @@
 //! Shared IP→hostname cache populated by the DNS forwarder.
 
-use crate::hosts::normalize_host;
-
-use serde::{Deserialize, Serialize};
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use serde::{Deserialize, Serialize};
+
+use crate::hosts::normalize_host;
 
 pub(crate) fn unix_now() -> f64 {
     SystemTime::now()
@@ -230,8 +230,9 @@ pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheFile, DnsCache, unix_now};
     use std::time::Duration;
+
+    use super::{CacheFile, DnsCache, unix_now};
 
     #[test]
     fn persisted_cache_uses_wall_clock_expiry() {

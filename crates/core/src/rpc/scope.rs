@@ -1,9 +1,10 @@
 //! Approval scope for network and sudo rules.
 
-use crate::error::InvalidScopeError;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+
+use crate::error::InvalidScopeError;
 
 /// Approval scope for network and sudo rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

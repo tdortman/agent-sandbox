@@ -1,11 +1,11 @@
 //! HTTP Datagram routing for downstream HTTP/3 streams.
 
-use bytes::Bytes;
+use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
 use h3::quic::StreamId;
 use h3_datagram::datagram_handler::{DatagramReader, DatagramSender};
 use h3_quinn::datagram::{RecvDatagramHandler, SendDatagramHandler};
-use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, mpsc};
 
 pub(super) type RoutedDatagram = Result<Bytes, String>;
@@ -80,11 +80,13 @@ impl DatagramRouter {
 
 #[cfg(test)]
 mod tests {
-    use super::DatagramRouter;
+    use std::{collections::HashMap, sync::Arc};
+
     use bytes::Bytes;
     use h3::quic::StreamId;
-    use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
+
+    use super::DatagramRouter;
 
     fn stream(value: u64) -> StreamId {
         StreamId::try_from(value).expect("stream id")

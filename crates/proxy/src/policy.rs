@@ -1,12 +1,3 @@
-use agent_sandbox_core::{
-    AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
-    NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxyReply, ProxyReplyBody,
-    ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
-    RpcRequest, policy_rpc,
-};
-
-use rama_core::error::{BoxError, BoxErrorExt};
-
 use std::{
     env, fs,
     io::ErrorKind,
@@ -18,6 +9,13 @@ use std::{
     time::Duration,
 };
 
+use agent_sandbox_core::{
+    AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
+    NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxyReply, ProxyReplyBody,
+    ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
+    RpcRequest, policy_rpc,
+};
+use rama_core::error::{BoxError, BoxErrorExt};
 use tokio::sync::{Notify, Semaphore};
 
 /// One claimed intercepted flow and the stable connection identity that owns
@@ -592,13 +590,12 @@ pub fn reconcile_authorities(
 /// test can hold a decision pending while it exercises the shutdown path.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::{path::PathBuf, sync::Arc};
+
     use agent_sandbox_core::{
         HttpCheckReply, HttpRequest, ProxyReply, ProxyRequestId, ProxySessionReply,
         ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
     };
-
-    use std::{path::PathBuf, sync::Arc};
-
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
@@ -724,20 +721,19 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
-        reconcile_authorities,
-    };
-
-    use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
+    use std::{sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
         AttributionToken, ErrorReply, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody,
         ProxyRequestId, RpcReply,
     };
-
-    use std::{sync::Arc, time::Duration};
     use tokio::sync::{Notify, Semaphore};
+
+    use super::{
+        PolicyError, PolicySession, decode_http_check_reply, normalize_authority,
+        reconcile_authorities,
+    };
+    use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
 
     #[test]
     fn accepts_matching_pipelined_http_reply() -> Result<(), Box<dyn std::error::Error>> {

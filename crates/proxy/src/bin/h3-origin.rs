@@ -8,14 +8,6 @@
 //! exists before sending the rest. This gives deterministic streaming
 //! tests a way to observe partial responses.
 
-use agent_sandbox_proxy::http3::CapsuleDecoder;
-
-use bytes::{Buf, Bytes};
-use clap::Parser;
-use h3::quic::{SendStream as _, SendStreamUnframed as _};
-use h3_datagram::datagram_handler::HandleDatagramsExt;
-use rustls::pki_types::pem::PemObject;
-
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -29,6 +21,12 @@ use std::{
     time::Duration,
 };
 
+use agent_sandbox_proxy::http3::CapsuleDecoder;
+use bytes::{Buf, Bytes};
+use clap::Parser;
+use h3::quic::{SendStream as _, SendStreamUnframed as _};
+use h3_datagram::datagram_handler::HandleDatagramsExt;
+use rustls::pki_types::pem::PemObject;
 use tokio::io::unix::AsyncFd;
 
 #[derive(Debug)]
@@ -691,8 +689,9 @@ fn log_line(log: &Arc<std::sync::Mutex<std::fs::File>>, line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::read_alt_svc;
     use std::io::Write as _;
+
+    use super::read_alt_svc;
 
     fn alt_svc_file(contents: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().expect("temp file");

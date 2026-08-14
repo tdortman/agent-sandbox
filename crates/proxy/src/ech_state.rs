@@ -1,9 +1,5 @@
 //! Persistent ECH key material and DNS configuration for the transparent proxy.
 
-use crate::http3::BoxError;
-
-use ring::rand::SecureRandom as _;
-
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -15,7 +11,10 @@ use std::{
     },
 };
 
+use ring::rand::SecureRandom as _;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
+
+use crate::http3::BoxError;
 
 /// Directory containing the proxy's persistent ECH key and configuration.
 pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";

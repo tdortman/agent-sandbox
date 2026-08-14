@@ -1,13 +1,15 @@
 //! Policy store: network scope application.
 
+use std::path::Path;
+
+use agent_sandbox_core::{
+    ApprovalScope, NetworkRuleKey, RpcReply, ScopeActionReply, ScopeContext, ScopeTarget,
+};
+
 use super::{
     ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction, types::PolicyStore,
 };
 use crate::wire::{NetworkScopeOp, ScopeWire};
-use agent_sandbox_core::{
-    ApprovalScope, NetworkRuleKey, RpcReply, ScopeActionReply, ScopeContext, ScopeTarget,
-};
-use std::path::Path;
 
 impl PolicyStore {
     pub(crate) async fn apply_network_scope(

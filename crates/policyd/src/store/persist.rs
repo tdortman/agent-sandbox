@@ -1,16 +1,18 @@
 //! Policy store persistence.
 
-use super::types::PolicyStore;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::Path,
+};
+
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, HttpMethodMatcher,
     HttpRule, HttpRuleTarget, NetworkRule, NetworkSortKey, ResourceAccess, ResourceKind,
     ResourceRule, ResourceRuleKey, SudoRule, atomic_write_policy, contract_home_path, load_policy,
     normalize_host, trusted_project_policy_path,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    path::Path,
-};
+
+use super::types::PolicyStore;
 
 /// Arguments for [`PolicyStore::persist_resource_rule`], grouped to keep the
 /// function signature under clippy's argument-count threshold.
@@ -476,11 +478,12 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use agent_sandbox_core::{
         DbusMessageKind, DbusTarget, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl,
         Policy, ResourceAccess, ResourceKind, SocketAccess, atomic_write_policy,
     };
+
+    use super::*;
 
     fn target(method: &str) -> HttpRuleTarget {
         HttpRuleTarget::new(

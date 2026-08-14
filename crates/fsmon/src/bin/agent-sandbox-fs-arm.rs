@@ -3,17 +3,16 @@
 //! Connects to policyd, sends `StartFilesystemMonitor { ctx, static_allow }`,
 //! before the command is accepted but not required.
 
-use agent_sandbox_core::{FilesystemRule, ProcessIds, wire_context};
-
-use agent_sandbox_fsmon::start_monitor;
-use clap::Parser as _;
-
 use std::{
     ffi::{CStr, CString, OsString},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process,
 };
+
+use agent_sandbox_core::{FilesystemRule, ProcessIds, wire_context};
+use agent_sandbox_fsmon::start_monitor;
+use clap::Parser as _;
 
 #[derive(clap::Parser, Debug)]
 #[command(

@@ -1,9 +1,9 @@
+use std::path::Path;
+
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, HttpRequest, HttpRule, NetworkRule, SudoRule, normalize_dns_name,
     policy_host_for_connect,
 };
-
-use std::path::Path;
 
 #[test]
 fn host_normalization_flows_into_http_and_direct_policy_keys() {

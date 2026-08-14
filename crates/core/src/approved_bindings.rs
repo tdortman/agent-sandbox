@@ -3,17 +3,17 @@
 //! Used only for UI display when the DNS cache has expired. Policy resolution
 //! must not consult this table.
 
-use crate::{
-    dns_cache::{evict_oldest, unix_now, write_json_atomic},
-    hosts::normalize_host,
-};
-
-use serde::{Deserialize, Serialize};
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    dns_cache::{evict_oldest, unix_now, write_json_atomic},
+    hosts::normalize_host,
 };
 
 pub const APPROVED_BINDINGS_PATH: &str = "/run/agent-sandbox/approved-bindings.json";

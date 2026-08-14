@@ -1,5 +1,12 @@
 //! RPC request handlers after context resolution.
 
+use std::{path::PathBuf, sync::Arc};
+
+use agent_sandbox_core::{
+    ApprovalScope, RegisterUiReply, RequestContext, ResolvedRequestContext, RpcReply, RpcRequest,
+    SimpleOkReply, split_check_aliases,
+};
+
 use crate::{
     error::PolicydError,
     server::{
@@ -13,13 +20,6 @@ use crate::{
     store::{DecisionAction, PolicyStore, TrustedPeer, UiClientHandle},
     wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire},
 };
-
-use agent_sandbox_core::{
-    ApprovalScope, RegisterUiReply, RequestContext, ResolvedRequestContext, RpcReply, RpcRequest,
-    SimpleOkReply, split_check_aliases,
-};
-
-use std::{path::PathBuf, sync::Arc};
 
 pub async fn handle(
     store: &Arc<PolicyStore>,
@@ -474,16 +474,16 @@ async fn handle_approve_host(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{sync::Arc, time::Duration};
 
+    use agent_sandbox_core::{ProcessIds, SandboxPaths};
+    use tokio::{net::UnixStream, sync::Mutex};
+
+    use super::*;
     use crate::{
         error::PolicydError,
         store::{PolicyStore, TrustedPeer},
     };
-
-    use agent_sandbox_core::{ProcessIds, SandboxPaths};
-    use std::{sync::Arc, time::Duration};
-    use tokio::{net::UnixStream, sync::Mutex};
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

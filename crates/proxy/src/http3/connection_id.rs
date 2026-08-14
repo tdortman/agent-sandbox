@@ -1,14 +1,15 @@
 //! Tracks the authenticated locally-issued QUIC connection-ID set for one
 //! policy-owned downstream association.
 
+use std::{collections::HashMap, sync::Arc};
+
+use h3::error::Code;
+use tracing::info;
+
 use crate::{
     http3::{BoxError, ConnectionIdOwner, boxed_owned, varint},
     policy::FlowClaim,
 };
-
-use h3::error::Code;
-use std::{collections::HashMap, sync::Arc};
-use tracing::info;
 
 /// Tracks the authenticated locally-issued CID set for one policy-owned
 /// downstream association. Quinn itself rejects unknown CIDs before they can
@@ -153,10 +154,12 @@ impl Drop for ConnectionIdBindings {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use agent_sandbox_core::ProxyConnectionId;
+
     use super::ConnectionIdBindings;
     use crate::http3::{ConnectionIdOwner, ConnectionIdRegistry};
-    use agent_sandbox_core::ProxyConnectionId;
-    use std::{collections::HashMap, sync::Arc};
 
     fn owner() -> ConnectionIdOwner {
         ConnectionIdOwner {

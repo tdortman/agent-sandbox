@@ -1,5 +1,3 @@
-use super::options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator};
-use agent_sandbox_core::{graphical_session_env, tool_path};
 use std::{
     collections::HashMap,
     io::{BufRead, Write},
@@ -7,7 +5,11 @@ use std::{
     process::{Command, Stdio},
     sync::LazyLock,
 };
+
+use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
+
+use super::options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator};
 
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_RESULT_BYTES: usize = 16 * 1024;
@@ -449,14 +451,16 @@ fn zenity_input(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, io::Write as _, os::unix::fs::PermissionsExt};
+
+    use agent_sandbox_core::ApprovalScope;
+    use tempfile::{NamedTempFile, TempPath};
+
     use super::{
         ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
         parse_review_result, qt_dialog_review,
     };
     use crate::ui::options::{ApprovalFormContext, ReviewValidator, scope_only_options};
-    use agent_sandbox_core::ApprovalScope;
-    use std::{collections::HashMap, io::Write as _, os::unix::fs::PermissionsExt};
-    use tempfile::{NamedTempFile, TempPath};
 
     struct EofReviewHelper {
         executable: TempPath,

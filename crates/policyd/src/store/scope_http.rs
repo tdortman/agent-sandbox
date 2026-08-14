@@ -1,15 +1,16 @@
 //! Typed HTTP session/project/global scope mutations.
 
+use agent_sandbox_core::{
+    ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
+    ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
+};
+
 use super::{
     decisions::DecisionAction,
     http::{http_context, target_for_request},
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
 use crate::{error::PolicydError, wire::ScopeWire};
-use agent_sandbox_core::{
-    ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
-    ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
-};
 
 fn context_for_pending(pending: &PendingHttp, ids: ProcessIds) -> ResolvedRequestContext {
     ResolvedRequestContext::new(
@@ -320,12 +321,14 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{path::PathBuf, time::Duration};
+
     use agent_sandbox_core::{
         HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRuleTarget, HttpUrl, PendingHttpId,
         ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, load_policy,
     };
-    use std::{path::PathBuf, time::Duration};
+
+    use super::*;
 
     #[test]
     fn pending_http_scope_rebuilds_request_context() {

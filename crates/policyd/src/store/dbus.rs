@@ -1,6 +1,7 @@
+use agent_sandbox_core::{ApprovalScope, DbusCheckReply, Verdict, VerdictSource};
+
 use super::PolicyStore;
 use crate::wire::DbusCheckRequest;
-use agent_sandbox_core::{ApprovalScope, DbusCheckReply, Verdict, VerdictSource};
 
 impl PolicyStore {
     /// Check a D-Bus target against declarative rules, then route unknown

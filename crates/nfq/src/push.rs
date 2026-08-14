@@ -4,11 +4,12 @@
 //! them into the in-memory cache. The socket is optional: if it does not
 //! exist or cannot be bound, the daemon falls back to the on-disk cache.
 
-use crate::flow::NfqState;
+use std::{path::Path, sync::Arc};
 
 use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache};
-use std::{path::Path, sync::Arc};
 use tracing::{debug, info, warn};
+
+use crate::flow::NfqState;
 
 /// Background thread that consumes `{"ip","host","ttl"}` lines from the DNS
 /// forwarder's push socket and inserts them into the in-memory cache. The
@@ -112,8 +113,9 @@ fn recv_datagram_with_creds(
     sock: &std::os::unix::net::UnixDatagram,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, UnixPeerCred)> {
-    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
     use std::{io::IoSliceMut, os::unix::io::AsRawFd};
+
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 
     let mut cmsg = [0u8; 128];
     let mut iov = [IoSliceMut::new(buf)];

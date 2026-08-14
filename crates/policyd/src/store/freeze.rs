@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
 use tracing::warn;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -334,8 +335,9 @@ fn thaw_stale_registry(registry: &Path) -> Result<(), CgroupFreezeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     fn manager_for(path: &Path, registry: &Path, count: usize) -> CgroupFreezeManager {
         CgroupFreezeManager {

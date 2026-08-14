@@ -2,12 +2,13 @@
 //!
 //! This module deliberately does not depend on Rama, quinn, or socket types.
 
+use std::fmt;
+
 use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
     HttpSessionMetadata as CoreHttpSessionMetadata,
 };
 use http::HeaderMap;
-use std::fmt;
 
 /// Whether a header must not be forwarded end to end.
 ///

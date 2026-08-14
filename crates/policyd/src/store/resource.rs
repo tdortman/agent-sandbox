@@ -1,5 +1,17 @@
 //! Policy store: resource gate (declarative approval flow).
 
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use agent_sandbox_core::{
+    DbusCheckReply, DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
+    ResourceKind, ResourceRuleKey, UiPush, VerdictSource,
+};
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
 use super::{
     types::{
         MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingContext, PendingResource,
@@ -8,16 +20,6 @@ use super::{
     ui::VerdictExit,
 };
 use crate::wire::ResourceCheckRequest;
-use agent_sandbox_core::{
-    DbusCheckReply, DbusTarget, ResolvedRequestContext, ResourceAccess, ResourceCheckReply,
-    ResourceKind, ResourceRuleKey, UiPush, VerdictSource,
-};
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-use tokio::sync::oneshot;
-use uuid::Uuid;
 
 impl PolicyStore {
     pub async fn check_resource(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
@@ -579,21 +581,23 @@ impl PolicyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::PolicyStore;
-    use crate::{
-        store::{UiSessionContext, types::UiClient},
-        wire::ResourceCheckRequest,
-    };
-    use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, ProcessIds, ResolvedRequestContext, ResourceAccess,
-        ResourceKind, SandboxPaths, SocketAccess, VerdictSource,
-    };
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    use agent_sandbox_core::{
+        DbusMessageKind, DbusTarget, ProcessIds, ResolvedRequestContext, ResourceAccess,
+        ResourceKind, SandboxPaths, SocketAccess, VerdictSource,
+    };
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
+
+    use super::PolicyStore;
+    use crate::{
+        store::{UiSessionContext, types::UiClient},
+        wire::ResourceCheckRequest,
+    };
 
     fn test_store() -> PolicyStore {
         PolicyStore::new(crate::store::test_args(

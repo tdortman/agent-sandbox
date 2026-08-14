@@ -1,25 +1,6 @@
 //! Root fanotify monitor: setns into the sandbox mount namespace,
 //! mark each mountpoint, then event-loop handling permission events.
 
-use agent_sandbox_core::{
-    FileAccess, ProcessIds, normalize_directory_traverse_access, open_flags_to_file_access,
-    wire_context,
-};
-
-use agent_sandbox_fsmon::MonitorClient;
-
-use agent_sandbox_sysutil::{
-    FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
-};
-
-use clap::Parser;
-
-use nix::{
-    dir::Dir,
-    fcntl::{AtFlags, OFlag, openat, readlinkat},
-    sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
-};
-
 use std::{
     ffi::CString,
     fs,
@@ -36,6 +17,21 @@ use std::{
     },
     path::{Path, PathBuf},
     process,
+};
+
+use agent_sandbox_core::{
+    FileAccess, ProcessIds, normalize_directory_traverse_access, open_flags_to_file_access,
+    wire_context,
+};
+use agent_sandbox_fsmon::MonitorClient;
+use agent_sandbox_sysutil::{
+    FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
+};
+use clap::Parser;
+use nix::{
+    dir::Dir,
+    fcntl::{AtFlags, OFlag, openat, readlinkat},
+    sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
 };
 
 #[derive(Parser, Debug)]
@@ -1043,8 +1039,9 @@ fn respond(fan_fd: impl AsFd, event_fd: &OwnedFd, response: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{fs::File, io::Write};
+
+    use super::*;
 
     fn test_host_proc() -> HostProc {
         HostProc::open().expect("open host proc")

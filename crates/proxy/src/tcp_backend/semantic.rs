@@ -1,10 +1,8 @@
-use crate::{
-    semantic::{
-        BoundedRequestBody, HttpVersion as SemanticHttpVersion, ResponseEvent, ResponseHead,
-        ResponseSequence, SemanticHeaders, TerminalError, is_hop_by_hop_header,
-    },
-    tcp_backend::is_websocket_upgrade_response,
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
 };
+
 use rama_core::{
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
@@ -13,9 +11,13 @@ use rama_http::{
     Body, HeaderMap, Response, Version,
     body::{Frame, StreamingBody},
 };
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
+
+use crate::{
+    semantic::{
+        BoundedRequestBody, HttpVersion as SemanticHttpVersion, ResponseEvent, ResponseHead,
+        ResponseSequence, SemanticHeaders, TerminalError, is_hop_by_hop_header,
+    },
+    tcp_backend::is_websocket_upgrade_response,
 };
 
 const SEMANTIC_BODY_CHUNK_BYTES: usize = 16 * 1024;
@@ -292,11 +294,12 @@ pub fn semantic_http_version(version: Version) -> Result<SemanticHttpVersion, Bo
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticRequestBody, bridge_response_body, semantic_response_headers};
-    use crate::semantic::{BoundedRequestBody, semantic_request_headers};
     use rama_http::{
         Body, HeaderMap, HeaderValue, Request, Response, StatusCode, body::util::BodyExt,
     };
+
+    use super::{SemanticRequestBody, bridge_response_body, semantic_response_headers};
+    use crate::semantic::{BoundedRequestBody, semantic_request_headers};
 
     #[test]
     fn semantic_headers_preserve_opaque_values() {
