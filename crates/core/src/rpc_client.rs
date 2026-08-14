@@ -41,6 +41,10 @@ pub enum RpcClientError {
     /// An underlying I/O error from the Unix socket.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// The connected peer is not a trusted policyd process.
+    #[error("policyd socket listener is untrusted")]
+    UntrustedPeer,
 }
 
 /// Connected policyd session (typestate: socket is open).
@@ -55,7 +59,34 @@ impl RpcConnection {
     /// # Errors
     /// Returns [`RpcClientError::Io`] if the socket cannot be opened.
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, RpcClientError> {
+        Self::connect_inner(socket_path, false).await
+    }
+
+    /// Connect to a policyd Unix socket and reject a listener that runs as
+    /// our own uid.
+    ///
+    /// Jail-side policy clients use this so a sandbox-resident impostor
+    /// listener (which would answer policy requests itself) is rejected at
+    /// connect time, before any request is issued.
+    ///
+    /// # Errors
+    /// Returns [`RpcClientError::UntrustedPeer`] when the listener runs as
+    /// the connecting uid, or [`RpcClientError::Io`] if the socket cannot be
+    /// opened.
+    pub async fn connect_trusted(socket_path: impl AsRef<Path>) -> Result<Self, RpcClientError> {
+        Self::connect_inner(socket_path, true).await
+    }
+
+    async fn connect_inner(
+        socket_path: impl AsRef<Path>,
+        require_trusted_peer: bool,
+    ) -> Result<Self, RpcClientError> {
         let stream = UnixStream::connect(socket_path).await?;
+
+        if require_trusted_peer && !peer_is_trusted_non_local(&stream) {
+            return Err(RpcClientError::UntrustedPeer);
+        }
+
         let (reader, writer) = stream.into_split();
 
         Ok(Self {
@@ -114,6 +145,20 @@ impl RpcConnection {
     }
 }
 
+/// Whether the listener on a connected Unix socket runs as a host process
+/// other than our own uid.
+///
+/// policyd runs outside the sandbox as a host identity that never equals the
+/// sandbox user; a listener answering on the sandbox uid is an impostor
+/// planted to answer policy requests itself. A peer-credential read failure
+/// is treated as untrusted so the client fails closed.
+fn peer_is_trusted_non_local(stream: &UnixStream) -> bool {
+    match nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials) {
+        Ok(creds) => creds.uid() != nix::unistd::geteuid().as_raw(),
+        Err(_) => false,
+    }
+}
+
 /// Persistent sequential policyd client.
 ///
 /// A request uses the current connection, establishing it lazily on the first
@@ -125,15 +170,32 @@ impl RpcConnection {
 pub struct PersistentRpcClient {
     socket_path: PathBuf,
     connection: Option<RpcConnection>,
+    require_trusted_peer: bool,
 }
 
 impl PersistentRpcClient {
     /// Create a disconnected client that will connect to `socket_path` lazily.
-    #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
             connection: None,
+            require_trusted_peer: false,
+        }
+    }
+
+    /// Create a lazy client that rejects a policy socket whose listener runs
+    /// as the connecting uid.
+    ///
+    /// Jail-side enforcement processes (the syscall broker, fs-arm, D-Bus
+    /// proxy) use this so a sandbox-resident impostor listener is never used
+    /// as the policy authority. The rejection happens on the timed persistent
+    /// connection, so a briefly absent policyd still retries lazily instead of
+    /// aborting at startup.
+    #[must_use]
+    pub fn new_trusted(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            require_trusted_peer: true,
+            ..Self::new(socket_path)
         }
     }
 
@@ -157,7 +219,12 @@ impl PersistentRpcClient {
     ) -> Result<RpcReply, RpcClientError> {
         let result = time::timeout(timeout, async {
             if self.connection.is_none() {
-                self.connection = Some(RpcConnection::connect(&self.socket_path).await?);
+                let connection = if self.require_trusted_peer {
+                    RpcConnection::connect_trusted(&self.socket_path).await?
+                } else {
+                    RpcConnection::connect(&self.socket_path).await?
+                };
+                self.connection = Some(connection);
             }
             let Some(connection) = self.connection.as_mut() else {
                 return Err(RpcClientError::Closed);
@@ -335,6 +402,29 @@ mod tests {
         assert!(matches!(
             client.request(request(), Duration::from_secs(1)).await,
             Err(RpcClientError::Closed)
+        ));
+
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn trusted_client_rejects_same_uid_listener() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        // The listener runs as this test process's uid, which is the same euid
+        // the connecting client sees. To a trusted client that is an impostor
+        // listener, so the connect must be rejected.
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+
+        let mut client = PersistentRpcClient::new_trusted(socket);
+
+        assert!(matches!(
+            client.request(request(), Duration::from_secs(1)).await,
+            Err(RpcClientError::UntrustedPeer)
         ));
 
         server.await.expect("server task");
