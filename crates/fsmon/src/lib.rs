@@ -91,7 +91,37 @@ pub async fn start_monitor(
     ctx: RequestContext,
     static_allow: Vec<FilesystemRule>,
 ) -> Result<FilesystemMonitorReply, RpcClientError> {
-    let reply = PersistentRpcClient::new(socket_path)
+    start_monitor_inner(socket_path, ctx, static_allow, false).await
+}
+
+/// Start a filesystem monitor over a peer-validated policy socket.
+///
+/// Used by `agent-sandbox-fs-arm`, which runs inside the sandbox and must not
+/// accept a sandbox-resident impostor listener.
+///
+/// # Errors
+/// Returns any core RPC error, or [`RpcClientError::UnexpectedReply`] if
+/// policyd does not answer with a `FilesystemMonitor` reply.
+pub async fn start_monitor_trusted(
+    socket_path: &Path,
+    ctx: RequestContext,
+    static_allow: Vec<FilesystemRule>,
+) -> Result<FilesystemMonitorReply, RpcClientError> {
+    start_monitor_inner(socket_path, ctx, static_allow, true).await
+}
+
+async fn start_monitor_inner(
+    socket_path: &Path,
+    ctx: RequestContext,
+    static_allow: Vec<FilesystemRule>,
+    require_trusted_peer: bool,
+) -> Result<FilesystemMonitorReply, RpcClientError> {
+    let mut client = if require_trusted_peer {
+        PersistentRpcClient::new_trusted(socket_path)
+    } else {
+        PersistentRpcClient::new(socket_path)
+    };
+    let reply = client
         .request(
             RpcRequest::StartFilesystemMonitor { ctx, static_allow },
             START_TIMEOUT,

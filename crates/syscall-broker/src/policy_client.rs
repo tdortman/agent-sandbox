@@ -30,10 +30,19 @@ pub struct PersistentPolicyClient {
 
 impl PersistentPolicyClient {
     /// Connect to the policyd RPC server reachable at `socket_path`.
-    #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             client: PersistentRpcClient::new(socket_path),
+        }
+    }
+
+    /// Connect to the policyd RPC server reachable at `socket_path`, rejecting
+    /// a listener that runs as the connecting uid (a sandbox-resident
+    /// impostor). Used by the broker's production path.
+    #[must_use]
+    pub fn new_trusted(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            client: PersistentRpcClient::new_trusted(socket_path),
         }
     }
 

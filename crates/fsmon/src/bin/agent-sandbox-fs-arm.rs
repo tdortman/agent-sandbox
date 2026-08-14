@@ -11,7 +11,7 @@ use std::{
 };
 
 use agent_sandbox_core::{FilesystemRule, ProcessIds, wire_context};
-use agent_sandbox_fsmon::start_monitor;
+use agent_sandbox_fsmon::start_monitor_trusted;
 use clap::Parser as _;
 
 #[derive(clap::Parser, Debug)]
@@ -98,7 +98,11 @@ fn main() {
         .expect("tokio runtime");
 
     let reply = runtime
-        .block_on(start_monitor(Path::new(&socket_path), ctx, static_allow))
+        .block_on(start_monitor_trusted(
+            Path::new(&socket_path),
+            ctx,
+            static_allow,
+        ))
         .unwrap_or_else(|e| {
             eprintln!("agent-sandbox-fs-arm: failed to start filesystem monitor: {e}");
             process::exit(1);

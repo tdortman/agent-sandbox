@@ -235,7 +235,7 @@ async fn handle_client(
         .map(ToString::to_string)
         .ok_or_else(|| RelayError::Message("upstream has no unique name".into()))?;
 
-    let mut policy = PersistentRpcClient::new(config.policy_socket.clone());
+    let mut policy = PersistentRpcClient::new_trusted(config.policy_socket.clone());
     let mut serials = SerialMap::new();
 
     relay_loop(

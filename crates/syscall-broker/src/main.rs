@@ -117,7 +117,7 @@ async fn main() -> std::io::Result<()> {
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
-    let mut policy_client = PersistentPolicyClient::new(cli.policy_socket.clone());
+    let mut policy_client = PersistentPolicyClient::new_trusted(cli.policy_socket.clone());
 
     // Don't SIGCONT the child until the broker is inside its notification
     // loop and ready to receive. The child traps from the first openat onward
