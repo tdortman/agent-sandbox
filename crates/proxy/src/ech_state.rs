@@ -30,7 +30,9 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The private key is persisted separately from the public `ECHConfigList`;
 /// the configuration is regenerated from the key whenever the proxy starts.
 pub struct EchState {
+    /// The RFC 9849 `ECHConfigList` advertised to clients.
     pub config_list: Vec<u8>,
+    /// The matching X25519 private key.
     pub private_key: [u8; 32],
 }
 
@@ -41,7 +43,9 @@ pub struct EchState {
 /// HTTP/3 legs, so both terminate ECH with identical key material.
 #[derive(Clone)]
 pub struct DownstreamEch {
+    /// The client-facing ECH configuration list.
     pub config_list: Arc<Vec<u8>>,
+    /// The matching X25519 private key.
     pub private_key: [u8; 32],
 }
 

@@ -19,7 +19,9 @@ use crate::{ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode}
 /// Transport protocol used by a procfs socket table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SocketProtocol {
+    /// Transmission Control Protocol.
     Tcp,
+    /// User Datagram Protocol.
     Udp,
 }
 
@@ -88,26 +90,37 @@ impl OwnerSnapshot {
         self.identity
     }
 
+    /// The PID of the owning process.
+    ///
+    /// The value is non-zero because the owning process must exist to own the
+    /// captured socket and PID 1 cannot be resolved as a socket owner.
     #[must_use]
     pub const fn pid(self) -> NonZeroU32 {
         self.identity.pid()
     }
 
+    /// The owning process PID as a plain `u32`.
     #[must_use]
     pub const fn pid_value(self) -> u32 {
         self.identity.pid().get()
     }
 
+    /// The UID of the owning process.
     #[must_use]
     pub const fn uid(self) -> u32 {
         self.identity.uid()
     }
 
+    /// The process start-time ticks captured from the owner at resolution time.
+    ///
+    /// Comparing against the live `/proc/<pid>/stat` value revalidates that the
+    /// process has not been replaced by an unrelated one reusing the same PID.
     #[must_use]
     pub const fn process_start_time_ticks(self) -> ProcessStartTimeTicks {
         self.identity.process_start_time_ticks()
     }
 
+    /// The socket inode captured by this snapshot.
     #[must_use]
     pub const fn socket_inode(self) -> SocketInode {
         self.identity.socket_inode()
@@ -120,8 +133,11 @@ impl OwnerSnapshot {
 /// retry them differently, but both must be treated as a failed attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OwnerResolution<T = OwnerSnapshot> {
+    /// Exactly one owner matched the tuple.
     Unique(T),
+    /// No process owned the tuple.
     Missing,
+    /// More than one process could own the tuple.
     Ambiguous,
 }
 

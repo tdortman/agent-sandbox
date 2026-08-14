@@ -9,6 +9,7 @@ use crate::{
 };
 
 impl PolicyStore {
+    /// Approve a network host directly (without a pending approval id).
     pub async fn approve_host(&self, req: HostApproveRequest) -> RpcReply {
         let HostApproveRequest {
             host,

@@ -24,16 +24,26 @@ const HELLO: &str = "Hello";
 
 const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
 
+/// Configuration for the D-Bus relay listener.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
+    /// Unix socket path the relay listens on.
     pub listen: PathBuf,
+    /// Upstream D-Bus address to relay to.
     pub upstream_address: String,
+    /// Socket path of the policy daemon RPC endpoint.
     pub policy_socket: PathBuf,
+    /// Which bus (session/system) the relay handles.
     pub bus: DbusBus,
+    /// Request context attributed to the relay's own policy checks.
     pub context: RequestContext,
 }
 
 impl RelayConfig {
+    /// Create a `RelayConfig`.
+    ///
+    /// Uses the session bus and a default [`RequestContext`]; override
+    /// `bus` and `context` as needed.
     #[must_use]
     pub fn new(
         listen: impl Into<PathBuf>,
@@ -50,6 +60,7 @@ impl RelayConfig {
     }
 }
 
+/// Handles assignment and tracking of upstream D-Bus serials per client.
 pub struct SerialMap {
     next: NonZeroU32,
     replies: HashMap<NonZeroU32, NonZeroU32>,
@@ -62,6 +73,7 @@ impl Default for SerialMap {
 }
 
 impl SerialMap {
+    /// Create an empty serial map.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -79,6 +91,7 @@ impl SerialMap {
         serial
     }
 
+    /// Allocate an upstream serial and record the client serial it answers.
     #[must_use]
     pub fn allocate(&mut self, client_serial: NonZeroU32) -> NonZeroU32 {
         let serial = self.next_serial();
@@ -86,11 +99,13 @@ impl SerialMap {
         serial
     }
 
+    /// Allocate an upstream serial without tracking a reply.
     #[must_use]
     pub fn allocate_untracked(&mut self) -> NonZeroU32 {
         self.next_serial()
     }
 
+    /// Claim and remove the client serial registered for an upstream serial.
     pub fn take(&mut self, upstream_serial: NonZeroU32) -> Option<NonZeroU32> {
         self.replies.remove(&upstream_serial)
     }
@@ -169,13 +184,17 @@ pub async fn run(config: RelayConfig) -> Result<(), RelayError> {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors returned by the relay.
 pub enum RelayError {
+    /// An I/O error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A D-Bus error occurred.
     #[error("D-Bus error: {0}")]
     Dbus(#[from] zbus::Error),
 
+    /// A D-Bus message was invalid.
     #[error("invalid D-Bus message: {0}")]
     Message(String),
 }
@@ -418,15 +437,15 @@ fn rewrite_message(
     )?)
 }
 
-#[allow(unsafe_code)]
+#[allow(unsafe_code, reason = "zbus build_raw_body requires raw message bytes")]
 fn build_raw_body(
     builder: MessageBuilder<'_>,
     body: &[u8],
     signature: &zvariant::Signature,
     fds: Vec<zvariant::OwnedFd>,
 ) -> Result<Message, zbus::Error> {
-    // The bytes and signature originate from a validated zbus message; cloned
-    // FDs preserve the exact indices referenced by the body.
+    // SAFETY: the bytes and signature originate from a validated zbus
+    // message, and cloned FDs preserve the indices referenced by the body.
     Ok(unsafe { builder.build_raw_body(body, signature, fds)? })
 }
 

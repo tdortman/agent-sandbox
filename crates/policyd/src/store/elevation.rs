@@ -167,6 +167,9 @@ impl PolicyStore {
         }
     }
 
+    /// Handles an elevation request: applies the sudo policy (allowing or
+    /// denying outright), otherwise registers it as pending and awaits the
+    /// UI verdict.
     pub async fn request_elevation(&self, req: ElevationRequest) -> ElevateReply {
         let ElevationRequest { argv, ctx } = req;
         let argv: Vec<String> = argv.into_iter().collect();

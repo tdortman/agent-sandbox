@@ -1,3 +1,7 @@
+//! In-process RPC round-trip tests for the policy daemon.
+//!
+//! Spins up a `PolicyServer` and drives request/reply exchanges over the daemon
+//! Unix-socket RPC wire format.
 use std::{path::Path, sync::Arc, time::Duration};
 
 use agent_sandbox_core::RpcReply;

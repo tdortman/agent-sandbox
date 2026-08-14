@@ -1,3 +1,8 @@
+//! Policy client logic for the transparent proxy.
+//!
+//! Builds flow claims and authority keys, stores per-claim policy session
+//! state, and communicates with policyd to obtain verdicts for intercepted
+//! traffic.
 use std::{
     env, fs,
     io::ErrorKind,
@@ -23,12 +28,20 @@ use tokio::sync::{Notify, Semaphore};
 /// association, so policyd can reject unknown identifiers.
 #[derive(Debug, Clone)]
 pub struct FlowClaim {
+    /// The attribution token bound to the claimed flow.
     pub attribution_token: AttributionToken,
+    /// The stable connection identifier owning this claim.
     pub connection_id: ProxyConnectionId,
+    /// The claimed intercepted network flow.
     pub flow: NetworkFlowKey,
+    /// The normalized policy host assigned to the flow.
     pub policy_host: NormalizedPolicyHost,
 }
 
+/// A long-lived policy session bound to one policyd instance.
+///
+/// The session carries a stable token and serializes policy RPCs over a Unix
+/// socket. Each proxy holds one session; drops remove the readiness marker.
 pub struct PolicySession {
     /// The session lease: policyd closes the proxy session when this
     /// connection ends, so it must outlive the session even though RPC
@@ -48,10 +61,12 @@ pub struct PolicySession {
 pub struct PendingPolicyCheck {
     policy: Arc<PolicySession>,
     request_id: ProxyRequestId,
+
     armed: bool,
 }
 
 impl PendingPolicyCheck {
+    /// Create an armed pending check for the given policy session and request.
     #[must_use]
     pub const fn new(policy: Arc<PolicySession>, request_id: ProxyRequestId) -> Self {
         Self {
@@ -61,6 +76,7 @@ impl PendingPolicyCheck {
         }
     }
 
+    /// Disarm the pending check so dropping it does not send a cancellation.
     pub const fn disarm(&mut self) {
         self.armed = false;
     }
@@ -437,7 +453,6 @@ fn mark_session_ready(path: &Path) -> Result<(), PolicyError> {
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).map_err(|error| {
         PolicyError::Rpc(format!("set proxy readiness marker permissions: {error}"))
     })?;
-
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
 
@@ -449,20 +464,26 @@ fn mark_session_ready(path: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// A failure interacting with the policyd service.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
+    /// The policy RPC failed.
     #[error("policy RPC failed: {0}")]
     Rpc(String),
 
+    /// Policyd returned an unexpected reply for the named operation.
     #[error("policyd returned an unexpected reply for {0}")]
     UnexpectedReply(&'static str),
 
+    /// The proxy is shutting down.
     #[error("proxy shutting down")]
     Shutdown,
 
+    /// Too many policy checks are active concurrently.
     #[error("too many active policy checks")]
     TooManyActiveChecks,
 
+    /// The request carries conflicting HTTP authorities.
     #[error("conflicting HTTP authorities")]
     AuthorityConflict,
 }

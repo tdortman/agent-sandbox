@@ -16,12 +16,18 @@ pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error>
 
 use crate::dns_cache::lookup_dns_cache;
 
+/// Whether `host` (after trimming and optional IPv6 bracket stripping) parses
+/// as an [`std::net::IpAddr`] literal.
 #[must_use]
 pub fn is_ip_literal(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     host.parse::<IpAddr>().is_ok()
 }
 
+/// Canonicalize a hostname or IP literal for policy matching.
+///
+/// Trims surrounding whitespace and IPv6 brackets, lowercases, and strips a
+/// single trailing dot.
 #[must_use]
 pub fn normalize_host(host: &str) -> String {
     let host = host.trim();
@@ -35,15 +41,19 @@ pub fn normalize_host(host: &str) -> String {
 /// Error returned when a DNS name cannot be canonicalized safely.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum DnsNameError {
+    /// The name is empty after trimming.
     #[error("DNS name is empty")]
     Empty,
 
+    /// The name is not a valid IDNA name.
     #[error("DNS name is not a valid IDNA name")]
     Invalid,
 
+    /// The name exceeds the 253-byte DNS wire limit.
     #[error("DNS name exceeds the 253-byte wire limit")]
     TooLong,
 
+    /// A single label exceeds the 63-byte DNS wire limit.
     #[error("DNS label exceeds the 63-byte wire limit")]
     LabelTooLong,
 }
@@ -90,13 +100,17 @@ pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
     Ok(name.to_ascii().trim_end_matches('.').to_ascii_lowercase())
 }
 
+/// Orderable key identifying a network rule by normalized host and port.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetworkRuleKey {
+    /// Normalized hostname or IP literal.
     pub host: String,
+    /// Port number.
     pub port: u16,
 }
 
 impl NetworkRuleKey {
+    /// Build a rule key, normalizing `host` for consistent matching.
     #[must_use]
     pub fn new(host: impl AsRef<str>, port: u16) -> Self {
         Self {
@@ -106,14 +120,22 @@ impl NetworkRuleKey {
     }
 }
 
+/// Sortable decomposition of a hostname into its registrable domain and
+/// separate subdomain labels, used to order rules most-specific-first.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NetworkSortKey {
+    /// Registrable domain (last two non-empty labels), or the whole host when
+    /// it is an IP literal or short name.
     pub domain: String,
+    /// Subdomain labels from most to least specific (excluding the domain).
     pub subdomains: Vec<String>,
+    /// Port number.
     pub port: u16,
 }
 
 impl NetworkSortKey {
+    /// Split a normalized host into its domain and subdomain parts for a port.
+    /// IP literals and single-label hosts keep the whole host as `domain`.
     #[must_use]
     pub fn new(host: &str, port: u16) -> Self {
         let host = normalize_host(host);
@@ -159,6 +181,8 @@ pub struct HostResolution {
 }
 
 impl HostResolution {
+    /// Build a resolution from a normalized policy host and the raw connect
+    /// target.
     #[must_use]
     pub fn new(policy_host: impl Into<String>, connect_host: impl Into<String>) -> Self {
         Self {
@@ -229,6 +253,9 @@ pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     false
 }
 
+/// Whether `pattern` contains any glob metacharacters (`*`, `?`, `[`, `{`,
+/// or `\`).
+/// Used to decide when a pattern can be matched as a plain suffix or literal.
 #[must_use]
 pub(crate) fn host_pattern_has_glob(pattern: &str) -> bool {
     pattern.contains(['*', '?', '[', '{', '\\'])

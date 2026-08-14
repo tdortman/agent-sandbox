@@ -192,6 +192,11 @@ impl PolicyStore {
         })
     }
 
+    /// Compute the policy/session allow-or-deny verdict for a network
+    /// `host:port` request, without consuming a one-time approval.
+    ///
+    /// Returns `None` when neither a deny rule nor an approved allow covers
+    /// the request (so the caller should prompt for approval).
     pub async fn allow_verdict(
         &self,
         host: &str,

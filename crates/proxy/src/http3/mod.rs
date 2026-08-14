@@ -133,12 +133,19 @@ impl ConnectionIdRegistry {
 /// requested listeners and the debug overrides stay in the small
 /// [`Http3Config`].
 pub struct Http3State {
+    /// The policy session that decides every intercepted request.
     pub policy: Arc<PolicySession>,
+    /// The certificate issuer serving downstream SNI names.
     pub issuer: CertificateIssuer,
+    /// Signals the backend to shut down.
     pub shutdown: Arc<Notify>,
+    /// Bounds the number of concurrency-limited policy checks.
     pub active_checks: Arc<Semaphore>,
+    /// The upstream HTTP/3 connection pool.
     pub upstream: Arc<upstream::UpstreamPool>,
+    /// The intercepted UDP destination port.
     pub destination_port: u16,
+    /// The Alt-Svc store shared between the HTTP/3 and TCP legs.
     pub alt_svc: Arc<AltSvcStore>,
     pub(crate) connection_ids: Arc<ConnectionIdRegistry>,
 
@@ -149,9 +156,13 @@ pub struct Http3State {
 /// The small HTTP/3 backend configuration that does not survive into the
 /// shared state: the requested listeners and the debug-only overrides.
 pub struct Http3Config {
+    /// The UDP port to listen on (0 requests an ephemeral port).
     pub listen_port: u16,
+    /// Additional UDP ports advertised as `Alt-Svc` alternatives.
     pub alt_ports: Vec<u16>,
+    /// Test-only: a fixed destination to route associations to.
     pub test_destination: Option<SocketAddr>,
+    /// Test-only: a fixed DNS address for ECH configuration.
     pub test_ech_dns: Option<SocketAddr>,
 }
 
@@ -398,7 +409,9 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
 
 /// Issues a leaf certificate from the sandbox CA for each client's SNI.
 pub struct SandboxCertResolver {
+    /// The certificate issuer used to mint leaf certificates.
     pub issuer: CertificateIssuer,
+    /// The server name used when a client sends no SNI.
     pub fallback_name: String,
 }
 

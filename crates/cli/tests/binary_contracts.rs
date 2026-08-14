@@ -1,3 +1,7 @@
+//! Black-box contract tests for the CLI binaries.
+//!
+//! Exercises the binaries end to end via `CARGO_BIN_EXE_` to lock down
+//! argument handling and exit behaviour without a running daemon.
 use std::process::Command;
 
 fn run(binary: &str, args: &[&str]) -> std::process::Output {

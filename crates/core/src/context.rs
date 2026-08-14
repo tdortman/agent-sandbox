@@ -28,8 +28,11 @@ use crate::{merge_policy::ProjectPolicyContext, rpc::RequestContext};
 /// Shared session context for policyd and enforcement daemons.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionContext {
+    /// Process working directory, if known.
     pub cwd: Option<PathBuf>,
+    /// User home directory, if known.
     pub home: Option<PathBuf>,
+    /// Git project root, if known.
     pub project_root: Option<PathBuf>,
 }
 
@@ -84,6 +87,7 @@ pub struct SandboxPaths {
 }
 
 impl SandboxPaths {
+    /// Construct [`SandboxPaths`] from all three paths directly.
     #[must_use]
     pub fn new(
         cwd: impl Into<PathBuf>,
@@ -97,6 +101,8 @@ impl SandboxPaths {
         }
     }
 
+    /// Construct [`SandboxPaths`] from optional values, defaulting to empty
+    /// paths where a value is absent.
     #[must_use]
     pub fn from_wire(
         cwd: Option<PathBuf>,
@@ -110,6 +116,8 @@ impl SandboxPaths {
         }
     }
 
+    /// Merge in optional values, keeping this instance's values where an input
+    /// is `None`. Used to layer peer, file, and env sources.
     #[must_use]
     pub fn merged_with(
         &self,
@@ -124,31 +132,37 @@ impl SandboxPaths {
         )
     }
 
+    /// Cwd, or `None` if the stored path is empty.
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
         non_empty_path(&self.cwd)
     }
 
+    /// Home directory, or `None` if the stored path is empty.
     #[must_use]
     pub fn home(&self) -> Option<&Path> {
         non_empty_path(&self.home)
     }
 
+    /// `project_root`, or `None` if the stored path is empty.
     #[must_use]
     pub fn project_root(&self) -> Option<&Path> {
         non_empty_path(&self.project_root)
     }
 
+    /// Owned copy of the cwd, or `None` if empty.
     #[must_use]
     pub fn cwd_path(&self) -> Option<PathBuf> {
         self.cwd().map(Path::to_path_buf)
     }
 
+    /// Owned copy of the home directory, or `None` if empty.
     #[must_use]
     pub fn home_path(&self) -> Option<PathBuf> {
         self.home().map(Path::to_path_buf)
     }
 
+    /// Owned copy of the `project_root`, or `None` if empty.
     #[must_use]
     pub fn project_root_path(&self) -> Option<PathBuf> {
         self.project_root().map(Path::to_path_buf)
@@ -168,16 +182,20 @@ impl From<&SandboxPaths> for SessionContext {
 /// `pid` / `uid` from the wire or peer cred. `0` means unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessIds {
+    /// Process id, or `0` when unknown.
     pub pid: u32,
+    /// User id, or `0` when unknown.
     pub uid: u32,
 }
 
 impl ProcessIds {
+    /// Construct from a pid and uid directly.
     #[must_use]
     pub const fn new(pid: u32, uid: u32) -> Self {
         Self { pid, uid }
     }
 
+    /// Construct from optional pid and uid, treating `None` as `0`.
     #[must_use]
     pub const fn from_options(pid: Option<u32>, uid: Option<u32>) -> Self {
         Self {
@@ -192,11 +210,13 @@ impl ProcessIds {
         }
     }
 
+    /// Pid as `Some` when known (`> 0`), else `None`.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         (self.pid > 0).then_some(self.pid)
     }
 
+    /// Uid as `Some` when known (`> 0`), else `None`.
     #[must_use]
     pub fn uid(&self) -> Option<u32> {
         (self.uid > 0).then_some(self.uid)
@@ -211,13 +231,18 @@ impl ProcessIds {
 /// session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedRequestContext {
+    /// Resolved cwd, home, and project root.
     pub paths: SandboxPaths,
+    /// Process id and user id from wire or peer cred.
     pub ids: ProcessIds,
+    /// Sandbox session this request belongs to, if any.
     pub sandbox_session_id: Option<String>,
+    /// Server-derived package attribution, if validated against the session.
     pub package: Option<String>,
 }
 
 impl ResolvedRequestContext {
+    /// Build a resolved context without package attribution.
     #[must_use]
     pub const fn new(
         paths: SandboxPaths,
@@ -233,6 +258,11 @@ impl ResolvedRequestContext {
     }
 }
 
+/// Read the environment of a process from `/proc/<pid>/environ` as a map.
+///
+/// Returns an empty map if the file cannot be read. Malformed (non-null
+/// separated) entries and entries without `=` are skipped.
+/// Values and keys are decoded lossily as UTF-8.
 #[must_use]
 pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {
     let path = format!("/proc/{pid}/environ");
@@ -281,6 +311,9 @@ fn proc_uid(pid: u32) -> Option<u32> {
     None
 }
 
+/// Look up the home directory for a user id from the system passwd database.
+///
+/// Returns `None` when `uid` is `None` or no matching user is found.
 #[must_use]
 pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
     let uid = uid?;
@@ -294,8 +327,11 @@ pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
 /// Process credentials for an RPC peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCredentials {
+    /// Process id of the peer, when the platform reports one.
     pub pid: u32,
+    /// Real user id of the peer.
     pub uid: u32,
+    /// Real group id of the peer, or `-1` when it does not fit in an `i32`.
     pub gid: i32,
 }
 
@@ -303,8 +339,11 @@ pub struct PeerCredentials {
 /// `/proc`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcContext {
+    /// Current working directory claim from the process environment.
     pub cwd: Option<PathBuf>,
+    /// Home directory claim.
     pub home: Option<PathBuf>,
+    /// Discovered repository root, when inside a git work tree.
     pub project_root: Option<PathBuf>,
 }
 
@@ -553,6 +592,10 @@ pub fn is_path_descendant(child: &Path, ancestor: &Path) -> bool {
     child == ancestor || child.starts_with(&ancestor)
 }
 
+/// Read the `AGENT_SANDBOX_SESSION_ID` from a process's `/proc/<pid>/environ`.
+///
+/// Returns `None` when the pid is `0`, the variable is absent, or its value
+/// is empty.
 #[must_use]
 pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
     if pid == 0 {

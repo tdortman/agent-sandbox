@@ -1,3 +1,7 @@
+//! Entry point for the terminal UI.
+//!
+//! Sets up tracing output on stderr then delegates to
+//! `agent_sandbox_cli::ui`, which renders pending-approval prompts.
 #[tokio::main]
 async fn main() -> Result<(), agent_sandbox_cli::ui::UiCliError> {
     tracing_subscriber::fmt()

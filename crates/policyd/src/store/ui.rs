@@ -273,10 +273,14 @@ impl PolicyStore {
         session_id
     }
 
+    /// End a policy UI session for the given client, removing it and
+    /// re-routing any pending requests that were orphaned.
     pub async fn end_ui_session(&self, client_id: u64) {
         self.remove_ui_client(client_id, true).await;
     }
 
+    /// Try to reserve a connection slot for the peer's UID, returning `false`
+    /// once the per-UID connection limit is reached.
     pub async fn try_acquire_connection(&self, peer: crate::server::peer::ClientPeer) -> bool {
         if peer.uid == 0 {
             return true;
@@ -294,6 +298,7 @@ impl PolicyStore {
         true
     }
 
+    /// Release a previously reserved connection slot for the peer's UID.
     pub async fn release_connection(&self, peer: crate::server::peer::ClientPeer) {
         if peer.uid == 0 {
             return;
@@ -476,6 +481,8 @@ impl PolicyStore {
         self.notify_ui(&route, &push).await
     }
 
+    /// Create a new UI client handle backed by `writer`, assigning it a fresh
+    /// client id.
     pub fn new_client_handle(writer: std::sync::Arc<Mutex<OwnedWriteHalf>>) -> UiClientHandle {
         UiClientHandle {
             id: CLIENT_ID.fetch_add(1, Ordering::Relaxed),
@@ -483,6 +490,7 @@ impl PolicyStore {
         }
     }
 
+    /// Return the session context recorded for `session_id`, if any.
     pub async fn ui_context_for_session(&self, session_id: &str) -> Option<SessionContext> {
         self.inner
             .lock()
@@ -543,6 +551,7 @@ impl PolicyStore {
         false
     }
 
+    /// Push every pending request to its matching policy UI again.
     pub async fn flush_pending_to_ui(&self) {
         let pending: Vec<Pending> = self
             .inner

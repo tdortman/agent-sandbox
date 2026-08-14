@@ -43,17 +43,25 @@ pub const MAX_RPC_LINE_BYTES: usize = 1 << 20;
 /// Hard cap on registered proxy flow identities.
 pub const MAX_PROXY_FLOWS: usize = 65_536;
 
+/// A process trusted as a policy connection peer, identified by pid and uid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedPeer {
+    /// Pid of the trusted peer process.
     pub pid: u32,
+    /// Uid of the trusted peer.
     pub uid: u32,
 }
 
+/// Registration of a sandbox session against the policy store.
 #[derive(Debug, Clone)]
 pub struct SandboxSessionRegistration {
+    /// Root pid of the sandbox session.
     pub root_pid: u32,
+    /// Uid that owns the sandbox session.
     pub owner_uid: u32,
+    /// Project root directory of the session.
     pub project_root: PathBuf,
+    /// Optional package the session is attributed to.
     pub package: Option<String>,
 
     /// PID of the launcher (wrapper) process that pre-registered the
@@ -65,25 +73,34 @@ pub struct SandboxSessionRegistration {
 /// Exact HTTP request and context used for pending approval deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HttpPendingKey {
+    /// HTTP request captured for deduplication.
     pub request: HttpRequest,
+    /// Context key identifying the request origin.
     pub context: HttpContextKey,
 }
 
 /// HTTP scope rule and context used for session/project/global state.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HttpScopeKey {
+    /// HTTP rule target for the scope.
     pub target: HttpRuleTarget,
+    /// Context key identifying the request origin.
     pub context: HttpContextKey,
 }
 
 /// A cached verdict: whether it was allowed, from which source, and when.
 #[derive(Debug, Clone)]
 pub struct VerdictEntry {
+    /// Whether the verdict allowed the request.
     pub allowed: bool,
+    /// Source the verdict derived from.
     pub source: VerdictSource,
+    /// When the verdict was recorded.
     pub time: Instant,
 }
 
+/// Evict oldest map entries (by the caller-supplied timestamp) until the map
+/// fits within `max_entries`.
 pub fn evict_oldest<K, V, S>(
     map: &mut HashMap<K, V, S>,
     max_entries: usize,
@@ -105,25 +122,38 @@ pub fn evict_oldest<K, V, S>(
     }
 }
 
+/// Enforce the verdict-cache entry cap, evicting oldest verdict entries.
 pub fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
     map: &mut HashMap<K, VerdictEntry>,
 ) {
     evict_oldest(map, MAX_VERDICT_CACHE_ENTRIES, |entry| entry.time);
 }
 
+/// Monotonic source of client ids across the store.
 pub static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Process startup and policy arguments for the policy daemon.
 #[derive(Debug, Clone)]
 pub struct PolicydArgs {
+    /// Path of the host policy RPC socket.
     pub host_socket: PathBuf,
+    /// Path of the sandbox policy RPC socket.
     pub sandbox_socket: PathBuf,
+    /// Optional proxy RPC socket path.
     pub proxy_socket: Option<PathBuf>,
+    /// Optional gid authorized to use the proxy socket.
     pub proxy_gid: Option<u32>,
+    /// Path of the declarative base policy file.
     pub declarative: PathBuf,
+    /// Path to write exported JSON policy state.
     pub export_json: PathBuf,
+    /// Optional path to write exported Nix policy state.
     pub export_nix: Option<PathBuf>,
+    /// Timeout applied to untrusted approval requests.
     pub approval_timeout: Duration,
+    /// Whether approvals may prompt interactively.
     pub interactive_approval: bool,
+    /// Optional command used to spawn the approval UI.
     pub ui_spawn_cmd: Option<PathBuf>,
 
     /// Per-package declarative base policy files, keyed by package name.
@@ -144,92 +174,157 @@ pub(super) struct PendingResult<I, T> {
     pub(super) rx: oneshot::Receiver<T>,
 }
 
+/// A pending elevation approval request.
 #[derive(Debug, Clone)]
 pub struct PendingElevation {
+    /// Stable id identifying this pending request.
     pub id: String,
+    /// Creation timestamp (epoch seconds, fractional).
     pub created_at: f64,
+    /// Commandline arguments to elevate.
     pub argv: Vec<String>,
+    /// Optional current working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+    /// Optional package attribution.
     pub package: Option<String>,
 }
 
+/// A pending network approval request.
 #[derive(Debug, Clone)]
 pub struct PendingNetwork {
+    /// Stable id identifying this pending request.
     pub id: String,
+    /// Creation timestamp (epoch seconds, fractional).
     pub created_at: f64,
+    /// Target host.
     pub host: String,
+    /// Target port.
     pub port: u16,
+    /// URL scheme.
     pub scheme: String,
+    /// Full request URL.
     pub url: String,
+    /// Host aliases supplied for attribution.
     pub aliases: Vec<String>,
+    /// Optional current working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+    /// Optional package attribution.
     pub package: Option<String>,
 }
 
+/// A pending HTTP approval request.
 #[derive(Debug, Clone)]
 pub struct PendingHttp {
     /// Wire/display identifier. The typed ID is retained in `pending_id`.
     pub id: String,
 
+    /// Typed id retained for matching against the wire.
     pub pending_id: PendingHttpId,
+    /// Creation timestamp (epoch seconds, fractional).
     pub created_at: f64,
+    /// HTTP request awaiting approval.
     pub request: HttpRequest,
+    /// Context key identifying the request origin.
     pub context: HttpContextKey,
+    /// Optional package attribution.
     pub package: Option<String>,
 }
 
+/// A pending filesystem approval request.
 #[derive(Debug, Clone)]
 pub struct PendingFilesystem {
+    /// Stable id identifying this pending request.
     pub id: String,
+    /// Creation timestamp (epoch seconds, fractional).
     pub created_at: f64,
+    /// Filesystem path being accessed.
     pub path: PathBuf,
+    /// Access mode requested.
     pub access: FileAccess,
+    /// Optional current working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+    /// Optional package attribution.
     pub package: Option<String>,
 }
 
+/// A pending resource approval request.
 #[derive(Debug, Clone)]
 pub struct PendingResource {
+    /// Stable id identifying this pending request.
     pub id: String,
+    /// Creation timestamp (epoch seconds, fractional).
     pub created_at: f64,
+    /// Resource kind being requested.
     pub kind: ResourceKind,
+    /// Resource path being accessed.
     pub path: PathBuf,
+    /// Access mode requested.
     pub access: ResourceAccess,
+    /// Optional current working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+    /// Optional package attribution.
     pub package: Option<String>,
 }
 
+/// A pending D-Bus approval request.
 #[derive(Debug, Clone)]
 pub struct PendingDbus {
+    /// Stable id identifying this pending request.
     pub id: String,
+    /// Creation timestamp (epoch seconds, fractional).
     pub created_at: f64,
+    /// D-Bus target being addressed.
     pub target: DbusTarget,
+    /// Optional current working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+    /// Optional package attribution.
     pub package: Option<String>,
 }
 
+/// Kind of a pending approval request, mirroring the [`Pending`] variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
+    /// Elevation approval request.
     Elevation,
+    /// Network approval request.
     Network,
+    /// HTTP approval request.
     Http,
+    /// Filesystem approval request.
     Filesystem,
+    /// Resource approval request.
     Resource,
+    /// D-Bus approval request.
     Dbus,
 }
 
@@ -247,15 +342,22 @@ pub(super) struct PendingContext<'a> {
 /// The variant determines which fields are meaningful:
 #[derive(Debug, Clone)]
 pub enum Pending {
+    /// Elevation approval pending.
     Elevation(PendingElevation),
+    /// Network approval pending.
     Network(PendingNetwork),
+    /// HTTP approval pending.
     Http(PendingHttp),
+    /// Filesystem approval pending.
     Filesystem(PendingFilesystem),
+    /// Resource approval pending.
     Resource(PendingResource),
+    /// D-Bus approval pending.
     Dbus(PendingDbus),
 }
 
 impl Pending {
+    /// Return the kind of this pending request.
     #[must_use]
     pub const fn kind(&self) -> PendingKind {
         match self {
@@ -268,6 +370,7 @@ impl Pending {
         }
     }
 
+    /// Return the stable id identifying this pending request.
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
@@ -280,6 +383,7 @@ impl Pending {
         }
     }
 
+    /// Return the creation timestamp (epoch seconds, fractional).
     #[must_use]
     pub const fn created_at(&self) -> f64 {
         match self {
@@ -292,6 +396,7 @@ impl Pending {
         }
     }
 
+    /// Return the optional current working directory.
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
         match self {
@@ -304,6 +409,7 @@ impl Pending {
         }
     }
 
+    /// Return the optional home directory.
     #[must_use]
     pub fn home(&self) -> Option<&Path> {
         match self {
@@ -316,6 +422,7 @@ impl Pending {
         }
     }
 
+    /// Return the optional project root directory.
     #[must_use]
     pub fn project_root(&self) -> Option<&Path> {
         match self {
@@ -328,6 +435,7 @@ impl Pending {
         }
     }
 
+    /// Return the optional sandbox session id.
     #[must_use]
     pub fn sandbox_session_id(&self) -> Option<&str> {
         match self {
@@ -341,27 +449,40 @@ impl Pending {
     }
 }
 
+/// Display context describing a connected UI approval session.
 #[derive(Debug, Clone, Default)]
 pub struct UiSessionContext {
+    /// Optional current working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+    /// Optional uid owning the UI session.
     pub owner_uid: Option<u32>,
+    /// Client id of the connected UI.
     pub client_id: u64,
 }
 
+/// Handle to a connected UI approval client.
 #[derive(Clone)]
 pub struct UiClientHandle {
+    /// Client id of the UI.
     pub id: u64,
     pub(crate) writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
 }
 
+/// A live UI approval client connection.
 pub struct UiClient {
+    /// Session id the UI is bound to.
     pub session_id: String,
+    /// Writer half to push messages to the client.
     pub writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
 }
 
+/// The policy daemon's central state and decision engine.
 pub struct PolicyStore {
     pub(crate) args: PolicydArgs,
     pub(crate) inner: Mutex<PolicyDecisionState>,
@@ -383,36 +504,54 @@ pub struct PolicyStore {
 /// LRU-ish cache of merged policies keyed by context paths and source mtimes.
 #[derive(Debug, Default)]
 pub struct MergedPolicyCache {
+    /// Current merged-policy cache entries, keyed by context and source mtime.
     pub entries: HashMap<MergedCacheKey, agent_sandbox_core::Policy>,
     order: std::collections::VecDeque<MergedCacheKey>,
 }
 
+/// Cache key identifying a merged policy: context paths, package, and the
+/// modification times of the contributing policy sources.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MergedCacheKey {
+    /// Optional home directory.
     pub home: Option<PathBuf>,
+    /// Optional project root directory.
     pub project_root: Option<PathBuf>,
+    /// Mtime of the declarative policy source.
     pub declarative_mtime: Option<MtimeKey>,
+    /// Mtime of the home policy source.
     pub home_policy_mtime: Option<MtimeKey>,
+    /// Mtime of the project policy source.
     pub project_policy_mtime: Option<MtimeKey>,
+    /// Optional package attribution.
     pub package: Option<String>,
+    /// Mtime of the package declarative base source.
     pub package_base_mtime: Option<MtimeKey>,
+    /// Mtime of the package-home policy source.
     pub package_home_mtime: Option<MtimeKey>,
+    /// Mtime of the package-project policy source.
     pub package_project_mtime: Option<MtimeKey>,
 }
 
+/// A filesystem modification time key (seconds + nanoseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MtimeKey {
+    /// Whole seconds of the mtime.
     pub secs: u64,
+    /// Nanosecond fraction of the mtime.
     pub nanos: u32,
 }
 
 impl MergedPolicyCache {
+    /// Maximum number of merged-policy cache entries retained.
     pub const MAX_ENTRIES: usize = 32;
 
+    /// Look up a merged policy by cache key, if present.
     pub fn get(&self, key: &MergedCacheKey) -> Option<agent_sandbox_core::Policy> {
         self.entries.get(key).cloned()
     }
 
+    /// Insert or replace a merged policy, evicting oldest entries as needed.
     pub fn insert(&mut self, key: MergedCacheKey, policy: agent_sandbox_core::Policy) {
         if let Some(existing) = self.entries.get_mut(&key) {
             *existing = policy;
@@ -430,26 +569,41 @@ impl MergedPolicyCache {
     }
 }
 
+/// State for an established proxy session.
 #[derive(Debug)]
 pub struct ProxySessionState {
+    /// Session token authorizing proxy use.
     pub token: ProxySessionToken,
+    /// Identifier of the connection mapped to this session.
     pub connection_id: u64,
+    /// When the session was opened.
     pub opened_at: Instant,
 }
 
+/// State tracking a registered proxy flow.
 #[derive(Debug)]
 pub struct ProxyFlowState {
+    /// Flow registration credentials.
     pub registration: FlowRegistration,
+    /// Socket identity of the flow owner.
     pub owner: SocketIdentity,
+    /// Resolved request context for attribution.
     pub context: ResolvedRequestContext,
+    /// Optional attribution token.
     pub attribution_token: Option<AttributionToken>,
+    /// Optional mapped connection id.
     pub connection_id: Option<ProxyConnectionId>,
+    /// When the flow was claimed.
     pub claimed_at: Option<Instant>,
+    /// Time of the last check against the flow.
     pub last_check: Instant,
 }
 
+/// Outstanding proxy cancellation signal.
 pub enum ProxyCancellation {
+    /// Cancellation is still pending; sender fires on completion.
     Active(oneshot::Sender<()>),
+    /// The proxy was canceled.
     Canceled,
 }
 
@@ -460,8 +614,11 @@ pub use super::state::{HttpWaiter, NetworkWaiter, PolicyDecisionState, ProxyChec
 /// Fingerprint entry for one concrete deny rule path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyFingerprint {
+    /// Canonical denied path.
     pub path: PathBuf,
+    /// Access level the deny rule covers.
     pub access: FileAccess,
+    /// Optional mtime of the denied path.
     pub mtime: Option<std::time::SystemTime>,
 }
 
@@ -472,7 +629,9 @@ pub struct DenyFingerprint {
 /// The canonical paths and access levels are stored for matching.
 #[derive(Debug, Clone, Default)]
 pub struct DenyInodeCache {
+    /// Inode→denied-entry map for hardlink defense.
     pub inodes: HashMap<agent_sandbox_core::InodeIdentity, Vec<DenyCacheEntry>>,
+    /// Fingerprints of the deny rules backing the cache.
     pub fingerprint: Vec<DenyFingerprint>,
 }
 
@@ -480,6 +639,8 @@ pub struct DenyInodeCache {
 /// denied file and the access level the deny rule covers.
 #[derive(Debug, Clone)]
 pub struct DenyCacheEntry {
+    /// Canonical path of the denied file.
     pub path: PathBuf,
+    /// Access level the deny rule covers.
     pub access: FileAccess,
 }

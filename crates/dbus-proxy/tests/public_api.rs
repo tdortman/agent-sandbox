@@ -1,3 +1,7 @@
+//! Public-API behaviour tests for the D-Bus relay library.
+//!
+//! Exercises serial allocation, target extraction, and relay configuration
+//! construction against the `agent_sandbox_dbus_proxy` interface.
 use std::{num::NonZeroU32, path::PathBuf};
 
 use agent_sandbox_core::{DbusBus, DbusMessageKind};

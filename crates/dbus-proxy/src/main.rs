@@ -1,3 +1,8 @@
+//! Entry point for the D-Bus relay daemon.
+//!
+//! Parses relay configuration from the command line, then runs the
+//! `agent-sandbox-dbus-proxy` library relay against the configured listener
+//! and policy socket.
 use std::path::PathBuf;
 
 use agent_sandbox_core::{DbusBus, rpc::RequestContext};

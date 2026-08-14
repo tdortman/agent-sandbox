@@ -31,6 +31,11 @@ const fn policy_rule_count(policy: &Policy) -> usize {
 }
 
 #[must_use]
+/// Load the merged policy for a path, applying all layered policy files.
+///
+/// Reads the default system policy and any per-user/per-project policy under
+/// `home`/`project_root`, merges them with deny-wins semantics, and expands
+/// `~` paths against `home`. Returns the default empty policy on error.
 pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
     let Ok(Some(mut policy)) = load_policy_inner(path, project_root) else {
         return Policy::default();
@@ -276,6 +281,9 @@ fn policy_chown_paths(target: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Recursively change ownership of a policy path's files to `uid`.
+///
+/// Best-effort: ownership errors are ignored.
 pub fn chown_policy_path(path: &Path, uid: u32) {
     if uid == 0 {
         return;
@@ -335,6 +343,11 @@ pub fn atomic_write_policy(
     Ok(())
 }
 
+/// Serialize `policy` to compact JSON.
+///
+/// # Errors
+///
+/// Returns an error if the policy cannot be serialized.
 pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
     let mut json = String::new();
     json.push_str("{\n  \"network\": {\n    \"direct\": {\n");

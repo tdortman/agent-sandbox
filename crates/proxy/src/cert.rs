@@ -1,3 +1,7 @@
+//! On-the-fly TLS certificate issuance and caching for intercepted hosts.
+//!
+//! Issues self-signed certificates for claimed hostnames so the transparent
+//! proxy can terminate TLS on behalf of the sandboxed client.
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -7,21 +11,31 @@ use rama_tls_rustls::dep::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem
 use rcgen::{CertificateParams, Issuer, KeyPair};
 use thiserror::Error;
 
+/// Failure loading the interception CA or issuing a leaf certificate.
 #[derive(Debug, Error)]
 pub enum CertificateError {
+    /// The CA certificate or signing operation was invalid.
+
     #[error("invalid CA certificate: {0}")]
     Certificate(#[from] rcgen::Error),
+
+    /// The CA private key is invalid.
 
     #[error("invalid CA private key: {0}")]
     Key(rcgen::Error),
 
+    /// The CA certificate PEM does not contain a certificate.
+
     #[error("CA certificate PEM does not contain a certificate")]
     MissingCertificate,
+
+    /// The issued private key is not a supported DER key.
 
     #[error("issued private key is not a supported DER key")]
     IssuedKey,
 }
 
+/// Issues and caches leaf certificates signed by a loaded interception CA.
 #[derive(Clone)]
 pub struct CertificateIssuer {
     ca_issuer: Arc<Issuer<'static, KeyPair>>,
@@ -29,9 +43,12 @@ pub struct CertificateIssuer {
     cache: Arc<Mutex<HashMap<String, Arc<IssuedCertificate>>>>,
 }
 
+/// A leaf certificate chain and matching private key issued for one SNI name.
 #[derive(Clone)]
 pub struct IssuedCertificate {
+    /// The leaf certificate followed by the CA certificate.
     pub certificate_chain: Vec<CertificateDer<'static>>,
+    /// The leaf private key.
     pub private_key: Arc<PrivateKeyDer<'static>>,
 }
 

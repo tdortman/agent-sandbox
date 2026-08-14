@@ -7,6 +7,8 @@ use agent_sandbox_core::{PendingSummary, Policy, ResolvedRequestContext, StatusR
 use super::types::{Pending, PolicyStore};
 
 impl PolicyStore {
+    /// Produce a [`StatusReply`] summarizing pending approvals and the merged
+    /// policy.
     pub async fn status(self: &Arc<Self>, ctx: ResolvedRequestContext) -> StatusReply {
         let pending = self.pending_summaries().await;
         let merged = self.merged_for_async(&ctx).await;

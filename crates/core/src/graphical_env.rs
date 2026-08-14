@@ -33,6 +33,10 @@ const ENV_INHERIT: &[&str] = &[
 ];
 
 #[must_use]
+/// Locate a graphical tool's executable path.
+///
+/// If `env_key` names an existing, executable file on disk, its value is used
+/// directly; otherwise the `binary` name is resolved via `$PATH`.
 pub fn tool_path(env_key: &str, binary: &str) -> Option<String> {
     if let Ok(explicit) = std::env::var(env_key) {
         let path = Path::new(&explicit);
@@ -54,6 +58,12 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
+/// Extract relevant environment variables from a running Plasma desktop
+/// process owned by `uid`.
+///
+/// Scans `/proc` for a `plasmashell` or `KWin` process running as `uid` and
+/// returns the subset of its environment listed in [`ENV_INHERIT`]. Returns an
+/// empty map when no matching desktop process is found.
 pub fn inherit_plasma_env(uid: u32) -> HashMap<String, String> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return HashMap::new();
@@ -110,6 +120,10 @@ fn kde_session_defaults() -> HashMap<String, String> {
 }
 
 #[must_use]
+/// Resolve the X11 `DISPLAY` for an active session belonging to `uid`.
+///
+/// Uses `loginctl` to list sessions and returns the display of the first
+/// active one, formatted as a `:N` value where the display is numeric.
 pub fn x11_display_for_uid(uid: u32) -> Option<String> {
     let loginctl = tool_path("AGENT_SANDBOX_LOGINCTL", "loginctl")?;
 
@@ -165,6 +179,11 @@ pub fn x11_display_for_uid(uid: u32) -> Option<String> {
 }
 
 #[must_use]
+/// Read the KDE color scheme name from the user's `kdeglobals` config.
+///
+/// Checks `~/.config/kdeglobals` and `~/.config/kdedefaults/kdeglobals` for a
+/// `[General]` section's `ColorScheme=` key. Returns `None` if `home` is not
+/// given or no scheme is found.
 pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
     let home = home?;
 
@@ -205,6 +224,11 @@ pub fn kde_color_scheme_from_config(home: Option<&Path>) -> Option<String> {
 }
 
 #[must_use]
+/// Build the environment for a GUI dialog spawned as `uid`.
+///
+/// Starts from KDE session defaults, overlays the live Plasma process's
+/// inherited variables, and, if no color scheme was inherited, fills in one
+/// from the user's config.
 pub fn graphical_session_env(uid: u32, home: Option<&Path>) -> HashMap<String, String> {
     let mut env = kde_session_defaults();
     env.extend(inherit_plasma_env(uid));

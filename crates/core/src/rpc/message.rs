@@ -10,7 +10,9 @@ use super::{push::UiPush, reply::RpcReply};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RpcMessage {
+    /// A reply to an in-flight RPC request.
     Reply(RpcReply),
+    /// A UI push sent unsolicited to clients.
     UiPush(UiPush),
 }
 

@@ -29,6 +29,7 @@ pub struct PersistentPolicyClient {
 }
 
 impl PersistentPolicyClient {
+    /// Connect to the policyd RPC server reachable at `socket_path`.
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -47,6 +48,11 @@ impl PersistentPolicyClient {
         self.client.invalidate();
     }
 
+    /// Ask policyd whether the network `target` is allowed for the given
+    /// sandbox session and pid.
+    ///
+    /// Returns `true` when policyd allows the request; a policy denial,
+    /// a mismatched reply, or an RPC failure all return `false`.
     pub async fn check_target(
         &mut self,
         target: &NetworkTarget,
@@ -165,7 +171,10 @@ mod tests {
     /// sandbox-path resolution fallback.
     struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024; test-only.
+    #[allow(
+        unsafe_code,
+        reason = "std::env::set_var is unsafe in edition 2024; test-only"
+    )]
     impl EnvGuard {
         fn set(entries: &[(&'static str, &str)]) -> Self {
             let previous = entries
@@ -183,13 +192,18 @@ mod tests {
         }
     }
 
-    #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024; test-only.
+    #[allow(
+        unsafe_code,
+        reason = "std::env::remove_var is unsafe in edition 2024; test-only"
+    )]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             for (key, value) in &self.0 {
-                // SAFETY: restoring the values captured in `set`.
                 match value {
+                    // SAFETY: restoring the values captured in `set`; tests run
+                    // single-threaded and every key is restored on drop.
                     Some(value) => unsafe { std::env::set_var(key, value) },
+                    // SAFETY: as above; the key was captured by `set`.
                     None => unsafe { std::env::remove_var(key) },
                 }
             }

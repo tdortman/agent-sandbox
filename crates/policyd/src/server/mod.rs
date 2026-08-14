@@ -12,11 +12,18 @@ use tokio::net::UnixListener;
 
 use crate::store::PolicyStore;
 
+/// JSON-line RPC server exposing the policy store over Unix domain sockets.
+///
+/// Binds the host, sandbox and (optionally) proxy sockets and serves accepted
+/// connections until the returned future completes.
 pub struct PolicyServer {
     store: Arc<PolicyStore>,
 }
 
 impl PolicyServer {
+    /// Construct a policy server around the given store.
+    ///
+    /// The caller is responsible for invoking [`PolicyServer::run`].
     pub const fn new(store: Arc<PolicyStore>) -> Self {
         Self { store }
     }

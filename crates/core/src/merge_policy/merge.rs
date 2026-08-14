@@ -13,6 +13,11 @@ use crate::{
     },
 };
 
+/// Merge `layers` into a single policy with deny-wins semantics.
+///
+/// Rules from earlier layers are overridden by later layers, except that a
+/// deny rule for a key is final and cannot be re-allowed by a later layer.
+/// Returns the merged policy.
 #[must_use]
 pub fn merge_layers(layers: &[Policy]) -> Policy {
     if layers.is_empty() {

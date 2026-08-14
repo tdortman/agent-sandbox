@@ -163,6 +163,13 @@ impl PolicyStore {
         Ok(())
     }
 
+    /// Resolve an incoming RPC [`MergeContext`] into a fully attributed
+    /// [`ResolvedRequestContext`]. For a caller that has not been sanitized
+    /// upstream this is the policy entry point: when a `peer` is present the
+    /// context is re-resolved from the verified `peer` (see
+    /// [`Self::resolve_from_peer`]); without a peer the incoming paths are
+    /// treated as trusted and only missing fields are enriched from the wire
+    /// ids and session id.
     pub fn resolve_context_with_peer(
         &self,
         ctx: &MergeContext,

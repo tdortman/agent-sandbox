@@ -125,14 +125,18 @@ fn ensure_nl(s: &str) -> String {
     }
 }
 
+/// Errors produced by the elevation CLI.
 #[derive(Debug, thiserror::Error)]
 pub enum ElevateCliError {
+    /// The command line arguments were invalid usage.
     #[error("usage")]
     Usage,
 
+    /// The policyd daemon returned an error or unexpected reply.
     #[error("policyd error")]
     Policyd,
 
+    /// An error from the underlying RPC client.
     #[error(transparent)]
     Rpc(#[from] agent_sandbox_core::RpcClientError),
 }

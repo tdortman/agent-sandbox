@@ -4,13 +4,7 @@
             "initialization_options": {
                 "check": {
                     "command": "clippy",
-                    "extraArgs": [
-                        "--",
-                        "-W",
-                        "clippy::pedantic",
-                        "-W",
-                        "clippy::nursery",
-                    ],
+                    "extraArgs": [],
                 },
             },
         },

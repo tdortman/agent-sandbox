@@ -61,13 +61,18 @@ pub fn semantic_request_headers(headers: &HeaderMap) -> Result<SemanticHeaders, 
 /// HTTP versions supported by the semantic proxy contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpVersion {
+    /// HTTP/1.0.
     Http10,
+    /// HTTP/1.1.
     Http11,
+    /// HTTP/2.
     Http2,
+    /// HTTP/3.
     Http3,
 }
 
 impl HttpVersion {
+    /// The wire-format version string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -116,21 +121,25 @@ impl SemanticHeader {
         })
     }
 
+    /// The lowercase header name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// The raw header value.
     #[must_use]
     pub fn value(&self) -> &[u8] {
         &self.value
     }
 }
 
+/// An ordered collection of validated end-to-end semantic headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticHeaders(Vec<SemanticHeader>);
 
 impl SemanticHeaders {
+    /// Create an empty header collection.
     #[must_use]
     pub const fn new() -> Self {
         Self(Vec::new())
@@ -146,6 +155,7 @@ impl SemanticHeaders {
         Ok(())
     }
 
+    /// The headers as a slice, in insertion order.
     #[must_use]
     pub fn as_slice(&self) -> &[SemanticHeader] {
         &self.0
@@ -170,6 +180,7 @@ impl RawQuery {
         Ok(Self(value.into()))
     }
 
+    /// The query string without its leading `?`.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -185,8 +196,11 @@ pub type SessionMetadata = CoreHttpSessionMetadata;
 /// Terminal state for a streamed request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestTerminal {
+    /// The request body stream completed normally.
     Complete,
+    /// The request was cancelled.
     Cancellation,
+    /// The request body failed terminally.
     Error(TerminalError),
 }
 
@@ -204,6 +218,7 @@ pub struct BoundedRequestBody {
 }
 
 impl BoundedRequestBody {
+    /// Create an empty request body validator.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -213,6 +228,7 @@ impl BoundedRequestBody {
         }
     }
 
+    /// Create an empty request body validator.
     #[must_use]
     pub const fn empty() -> Self {
         Self::new()
@@ -290,13 +306,21 @@ pub struct SemanticRequest {
 
 /// Input values for one semantic HTTP request.
 pub struct SemanticRequestParts<'a> {
+    /// The request method.
     pub method: &'a str,
+    /// The URI scheme.
     pub scheme: &'a str,
+    /// The request authority.
     pub authority: &'a str,
+    /// The request path.
     pub path: &'a str,
+    /// The raw (unparsed) query, without a leading `?`.
     pub raw_query: Option<&'a str>,
+    /// The validated end-to-end request headers.
     pub headers: SemanticHeaders,
+    /// Optional session attribution.
     pub session: Option<SessionMetadata>,
+    /// The request body state.
     pub body: BoundedRequestBody,
 }
 
@@ -345,6 +369,8 @@ impl SemanticRequest {
         Ok(request)
     }
 
+    /// The raw path and query as forwarded to the upstream, preserving the
+    /// original un-normalized path.
     #[must_use]
     pub fn forwarding_target(&self) -> String {
         self.raw_query.as_ref().map_or_else(
@@ -353,32 +379,38 @@ impl SemanticRequest {
         )
     }
 
+    /// The request method.
     #[must_use]
     pub const fn method(&self) -> &HttpMethod {
         &self.method
     }
 
+    /// The canonical request authority.
     #[must_use]
     pub fn authority(&self) -> &str {
         &self.authority
     }
 
+    /// The validated end-to-end request headers.
     #[must_use]
     pub const fn headers(&self) -> &SemanticHeaders {
         &self.headers
     }
 
+    /// The optional session attribution.
     #[must_use]
     pub const fn session(&self) -> Option<&SessionMetadata> {
         self.session.as_ref()
     }
 
+    /// Consume the request and return its body state.
     #[must_use]
     pub fn into_body(self) -> BoundedRequestBody {
         self.body
     }
 }
 
+/// The normalized request path, or the asterisk-form OPTIONS target.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticPath(SemanticPathValue);
 
@@ -402,6 +434,7 @@ impl SemanticPath {
         Ok(Self(SemanticPathValue::Path(normalized.as_str().into())))
     }
 
+    /// The path as a string: normalized, or `*` for asterisk-form.
     #[must_use]
     pub fn as_str(&self) -> &str {
         match &self.0 {
@@ -414,11 +447,17 @@ impl SemanticPath {
 /// Ordered response events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseEvent {
+    /// The final response head.
     Final(ResponseHead),
+    /// One body chunk.
     BodyChunk(Vec<u8>),
+    /// Trailing response headers.
     Trailers(SemanticHeaders),
+    /// The body stream ended cleanly.
     Complete,
+    /// The response was cancelled before completion.
     Cancelled,
+    /// A typed terminal failure.
     Error(TerminalError),
 }
 
@@ -440,12 +479,14 @@ impl ResponseHead {
         Ok(Self { status, headers })
     }
 
+    /// The final HTTP status.
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
     }
 
     #[must_use]
+    /// The response headers.
     pub const fn headers(&self) -> &SemanticHeaders {
         &self.headers
     }
@@ -454,12 +495,15 @@ impl ResponseHead {
 /// Typed terminal failures shared by all protocol backends.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TerminalError {
+    /// The request was cancelled.
     #[error("request cancelled")]
     Cancellation,
 
+    /// A transport-level failure.
     #[error("transport failure: {0}")]
     Transport(Box<str>),
 
+    /// A protocol violation.
     #[error("protocol violation: {0}")]
     ProtocolViolation(Box<str>),
 }
@@ -475,6 +519,7 @@ pub enum TerminalError {
 /// a peer from forcing a single oversized allocation.
 const MAX_BODY_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// Tracks the validation state of a streamed response event sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseSequence {
     final_seen: bool,
@@ -483,6 +528,8 @@ pub struct ResponseSequence {
 }
 
 impl ResponseSequence {
+    /// Create an empty response sequence validator.
+    /// A response may only start with a final head or a terminal event.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -546,56 +593,74 @@ impl Default for ResponseSequence {
     }
 }
 
+/// Header validation failure for a semantic header value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HeaderError {
+    /// The header name is empty or contains an invalid character.
     #[error("invalid header name")]
     InvalidName,
 
+    /// The header value contains an invalid byte.
     #[error("invalid header value")]
     InvalidValue,
 }
 
+/// Validation failure for a semantic value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ValueError {
+    /// The raw query contains a fragment or control byte.
     #[error("invalid raw query")]
     InvalidQuery,
 }
 
+/// Body stream validation failure.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BodyError {
+    /// The body chunk exceeds the configured limit.
     #[error("body chunk exceeds the configured limit")]
     ChunkTooLarge,
 
+    /// The body is already terminal.
     #[error("body is already terminal")]
     AfterTerminal,
 
+    /// Request trailers are already set.
     #[error("request trailers are already set")]
     TrailersAlreadySet,
 }
 
+/// Failure constructing a semantic HTTP request.
 #[derive(Debug, thiserror::Error)]
 pub enum SemanticRequestError {
+    /// A request value failed to parse.
     #[error(transparent)]
     Parse(#[from] HttpParseError),
 
+    /// The raw query is invalid.
     #[error(transparent)]
     Query(#[from] ValueError),
 
+    /// The asterisk request target is only valid for `OPTIONS`.
     #[error("OPTIONS is required for the asterisk request target")]
     AsteriskRequiresOptions,
 }
 
+/// Response event sequence validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EventError {
+    /// A response event occurs after a terminal event.
     #[error("response event occurs after a terminal event")]
     AfterTerminal,
 
+    /// A response event is out of order.
     #[error("response event is out of order")]
     InvalidOrdering,
 
+    /// A response body chunk exceeds the configured limit.
     #[error("response body chunk exceeds the configured limit")]
     BufferFull,
 
+    /// The final status is in the 1xx range.
     #[error("final status is in the 1xx range")]
     InvalidFinalStatus,
 }

@@ -46,7 +46,9 @@ pub(crate) fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
     }
 }
 
+/// Default on-disk DNS cache location: `/run/agent-sandbox/dns-cache.json`.
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
+/// Default maximum TTL (in seconds) for cached hostname entries.
 pub const DEFAULT_MAX_TTL: u32 = 600;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +68,11 @@ struct LiveCacheEntry {
     expires: Instant,
 }
 
+/// In-memory IP→hostname cache, optionally persisted to a JSON file.
+///
+/// Entries expire after at most `max_ttl` seconds. When a path is configured
+/// the cache persists on writes (via [`remember`](Self::remember)) and can be
+/// reloaded from disk with [`reload`](Self::reload).
 pub struct DnsCache {
     path: Option<PathBuf>,
     max_ttl: u32,
@@ -73,6 +80,10 @@ pub struct DnsCache {
 }
 
 impl DnsCache {
+    /// Create an empty cache with the given persistence path and max TTL.
+    ///
+    /// `path` of `None` disables persistence; `max_ttl` is clamped to at least
+    /// one second.
     pub fn new(path: Option<impl AsRef<Path>>, max_ttl: u32) -> Self {
         Self {
             path: path.map(|p| p.as_ref().to_path_buf()),
@@ -86,6 +97,10 @@ impl DnsCache {
         self.insert_entry(ip, hostname, ttl);
     }
 
+    /// Remember a hostname mapping and persist it to disk when a path is set.
+    ///
+    /// Persistence failures are silently ignored: the in-memory entry still
+    /// serves lookups until it expires.
     pub fn remember(&mut self, ip: &str, hostname: &str, ttl: u32) {
         self.insert_entry(ip, hostname, ttl);
 
@@ -118,6 +133,9 @@ impl DnsCache {
         self.entries.retain(|_, entry| entry.expires > now);
     }
 
+    /// Look up the hostname mapped to `ip`, if any.
+    ///
+    /// Returns `None` when `ip` is unknown or its entry has expired.
     #[must_use]
     pub fn lookup(&self, ip: &str) -> Option<String> {
         let entry = self.entries.get(ip)?;
@@ -213,6 +231,9 @@ impl DnsCache {
     }
 }
 
+/// One-shot lookup: load the DNS cache (from `cache_path`, the
+/// `AGENT_SANDBOX_DNS_CACHE` environment variable, or the default path) and
+/// return the remembered hostname for `ip`, if any.
 pub fn lookup_dns_cache(ip: &str, cache_path: Option<&Path>) -> Option<String> {
     let path = cache_path
         .map(std::path::Path::to_path_buf)

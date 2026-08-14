@@ -23,6 +23,7 @@ use crate::{
 pub struct SocketInode(NonZeroU64);
 
 impl SocketInode {
+    /// Constructs a [`SocketInode`], rejecting a zero inode value.
     ///
     /// # Errors
     ///
@@ -33,6 +34,7 @@ impl SocketInode {
             .ok_or_else(|| "socket inode must be non-zero".to_owned())
     }
 
+    /// Returns the raw inode number.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
@@ -53,6 +55,7 @@ impl TryFrom<u64> for SocketInode {
 pub struct ProcessStartTimeTicks(NonZeroU64);
 
 impl ProcessStartTimeTicks {
+    /// Constructs [`ProcessStartTimeTicks`], rejecting a zero tick count.
     ///
     /// # Errors
     ///
@@ -63,6 +66,7 @@ impl ProcessStartTimeTicks {
             .ok_or_else(|| "process start time ticks must be non-zero".to_owned())
     }
 
+    /// Returns the raw tick count.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
@@ -89,6 +93,8 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    /// Constructs a [`ProcessIdentity`] from raw values, rejecting a zero `pid`
+    /// or `start_time`.
     ///
     /// # Errors
     ///
@@ -104,6 +110,7 @@ impl ProcessIdentity {
         })
     }
 
+    /// Assembles a [`ProcessIdentity`] from already-validated parts.
     #[must_use]
     pub const fn from_parts(pid: NonZeroU32, uid: u32, start_time: ProcessStartTimeTicks) -> Self {
         Self {
@@ -113,16 +120,20 @@ impl ProcessIdentity {
         }
     }
 
+    /// Returns the process ID.
     #[must_use]
     pub const fn pid(self) -> NonZeroU32 {
         self.pid
     }
 
+    /// Returns the user ID.
     #[must_use]
     pub const fn uid(self) -> u32 {
         self.uid
     }
 
+    /// Returns the `/proc` process start-time tick count used to disambiguate
+    /// recycled PIDs.
     #[must_use]
     pub const fn process_start_time_ticks(self) -> ProcessStartTimeTicks {
         self.start_time
@@ -137,26 +148,32 @@ pub struct SocketIdentity {
 }
 
 impl SocketIdentity {
+    /// Assembles a [`SocketIdentity`] from an owning process and a socket
+    /// inode.
     #[must_use]
     pub const fn new(process: ProcessIdentity, inode: SocketInode) -> Self {
         Self { process, inode }
     }
 
+    /// Returns the owning process ID.
     #[must_use]
     pub const fn pid(self) -> NonZeroU32 {
         self.process.pid()
     }
 
+    /// Returns the owning user ID.
     #[must_use]
     pub const fn uid(self) -> u32 {
         self.process.uid()
     }
 
+    /// Returns the owning process's start-time tick count.
     #[must_use]
     pub const fn process_start_time_ticks(self) -> ProcessStartTimeTicks {
         self.process.process_start_time_ticks()
     }
 
+    /// Returns the socket inode.
     #[must_use]
     pub const fn socket_inode(self) -> SocketInode {
         self.inode
@@ -221,11 +238,14 @@ impl<'de> Deserialize<'de> for SocketIdentity {
 pub struct ProxyConnectionId(Uuid);
 
 impl ProxyConnectionId {
+    /// Generates a new random [`ProxyConnectionId`].
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
+    /// Parses a [`ProxyConnectionId`] from its canonical lowercase hyphenated
+    /// `UUIDv4` representation.
     ///
     /// # Errors
     ///
@@ -248,6 +268,7 @@ impl ProxyConnectionId {
         Ok(Self(uuid))
     }
 
+    /// Returns the underlying [`Uuid`].
     #[must_use]
     pub const fn uuid(self) -> Uuid {
         self.0
@@ -284,17 +305,19 @@ impl<'de> Deserialize<'de> for ProxyConnectionId {
         Self::parse(&value).map_err(D::Error::custom)
     }
 }
-
 /// Canonical lowercase hyphenated `UUIDv7` request identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProxyRequestId(Uuid);
 
 impl ProxyRequestId {
+    /// Generates a new time-ordered [`ProxyRequestId`].
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
 
+    /// Parses a [`ProxyRequestId`] from its canonical lowercase hyphenated
+    /// `UUIDv7` representation.
     ///
     /// # Errors
     ///
@@ -316,6 +339,7 @@ impl ProxyRequestId {
         Ok(Self(uuid))
     }
 
+    /// Returns the underlying [`Uuid`].
     #[must_use]
     pub const fn uuid(self) -> Uuid {
         self.0
@@ -385,10 +409,14 @@ fn decode_token(value: &str) -> Result<[u8; 32], String> {
 
 macro_rules! capability_token {
     ($name:ident) => {
+        /// A 256-bit capability token transmitted as 64 lowercase hexadecimal
+        /// characters. Derived types differ by purpose (e.g. session vs.
+        /// attribution).
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name([u8; 32]);
 
         impl $name {
+            /// Generates a new random capability token.
             ///
             /// # Errors
             ///
@@ -399,6 +427,7 @@ macro_rules! capability_token {
                 Ok(Self(bytes))
             }
 
+            /// Generates a new random capability token.
             ///
             /// # Panics
             ///
@@ -410,6 +439,8 @@ macro_rules! capability_token {
                 )
             }
 
+            /// Parses a capability token from its 64-character lowercase
+            /// hexadecimal representation.
             ///
             /// # Errors
             ///
@@ -419,11 +450,13 @@ macro_rules! capability_token {
                 decode_token(value).map(Self)
             }
 
+            /// Returns the 32 raw token bytes.
             #[must_use]
             pub const fn as_bytes(&self) -> &[u8; 32] {
                 &self.0
             }
 
+            /// Constructs a token directly from its 32 raw bytes.
             #[must_use]
             pub const fn from_bytes(bytes: [u8; 32]) -> Self {
                 Self(bytes)
@@ -473,14 +506,20 @@ capability_token!(AttributionToken);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkFlowKey {
+    /// Transport protocol of the flow.
     pub protocol: FlowProtocol,
+    /// Source IP address.
     pub source_ip: IpAddr,
+    /// Source port.
     pub source_port: NonZeroU16,
+    /// Destination IP address.
     pub destination_ip: IpAddr,
+    /// Destination port.
     pub destination_port: NonZeroU16,
 }
 
 impl NetworkFlowKey {
+    /// Assembles a [`NetworkFlowKey`] from already-validated parts.
     #[must_use]
     pub const fn new(
         protocol: FlowProtocol,
@@ -498,6 +537,7 @@ impl NetworkFlowKey {
         }
     }
 
+    /// Assembles a [`NetworkFlowKey`], rejecting zero endpoint ports.
     ///
     /// # Errors
     ///
@@ -524,26 +564,31 @@ impl NetworkFlowKey {
         ))
     }
 
+    /// Returns the flow protocol.
     #[must_use]
     pub const fn protocol(&self) -> FlowProtocol {
         self.protocol
     }
 
+    /// Returns the source IP address.
     #[must_use]
     pub const fn source_ip(&self) -> IpAddr {
         self.source_ip
     }
 
+    /// Returns the source port.
     #[must_use]
     pub const fn source_port(&self) -> NonZeroU16 {
         self.source_port
     }
 
+    /// Returns the destination IP address.
     #[must_use]
     pub const fn destination_ip(&self) -> IpAddr {
         self.destination_ip
     }
 
+    /// Returns the destination port.
     #[must_use]
     pub const fn destination_port(&self) -> NonZeroU16 {
         self.destination_port
@@ -554,13 +599,18 @@ impl NetworkFlowKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkFlowSelector {
+    /// Transport protocol of the flow.
     pub protocol: FlowProtocol,
+    /// Source IP address.
     pub source_ip: IpAddr,
+    /// Source port.
     pub source_port: NonZeroU16,
+    /// Destination port.
     pub destination_port: NonZeroU16,
 }
 
 impl NetworkFlowSelector {
+    /// Assembles a [`NetworkFlowSelector`] from its parts.
     #[must_use]
     pub const fn new(
         protocol: FlowProtocol,
@@ -576,21 +626,25 @@ impl NetworkFlowSelector {
         }
     }
 
+    /// Returns the flow protocol.
     #[must_use]
     pub const fn protocol(&self) -> FlowProtocol {
         self.protocol
     }
 
+    /// Returns the source IP address.
     #[must_use]
     pub const fn source_ip(&self) -> IpAddr {
         self.source_ip
     }
 
+    /// Returns the source port.
     #[must_use]
     pub const fn source_port(&self) -> NonZeroU16 {
         self.source_port
     }
 
+    /// Returns the destination port.
     #[must_use]
     pub const fn destination_port(&self) -> NonZeroU16 {
         self.destination_port
@@ -608,6 +662,8 @@ enum NormalizedPolicyHostValue {
 }
 
 impl NormalizedPolicyHost {
+    /// Parses and normalizes a policy host, accepting either a bracketed or
+    /// bare IP literal or a DNS hostname.
     ///
     /// # Errors
     ///
@@ -669,6 +725,8 @@ impl NormalizedPolicyHost {
         Ok(Self(NormalizedPolicyHostValue::Dns(dns.into_boxed_str())))
     }
 
+    /// Returns the DNS hostname when this host is a DNS name, or `None` when it
+    /// is an IP literal.
     #[must_use]
     pub fn dns_name(&self) -> Option<&str> {
         match &self.0 {
@@ -677,6 +735,8 @@ impl NormalizedPolicyHost {
         }
     }
 
+    /// Returns the IP address when this host is an IP literal, or `None` when
+    /// it is a DNS name.
     #[must_use]
     pub const fn ip(&self) -> Option<IpAddr> {
         match &self.0 {
@@ -685,6 +745,7 @@ impl NormalizedPolicyHost {
         }
     }
 
+    /// Returns `true` when this host is an IP literal.
     #[must_use]
     pub const fn is_ip(&self) -> bool {
         self.ip().is_some()
@@ -751,6 +812,8 @@ pub struct FlowContext {
 }
 
 impl FlowContext {
+    /// Assembles a [`FlowContext`] from sandbox paths and an optional sandbox
+    /// session ID.
     #[must_use]
     pub const fn new(paths: SandboxPaths, sandbox_session_id: Option<String>) -> Self {
         Self {
@@ -759,21 +822,25 @@ impl FlowContext {
         }
     }
 
+    /// Returns the sandbox paths for this flow.
     #[must_use]
     pub const fn paths(&self) -> &SandboxPaths {
         &self.paths
     }
 
+    /// Returns the sandbox session ID, if any.
     #[must_use]
     pub fn sandbox_session_id(&self) -> Option<&str> {
         self.sandbox_session_id.as_deref()
     }
 
+    /// Returns an owned clone of the sandbox session ID, if any.
     #[must_use]
     pub fn sandbox_session_id_owned(&self) -> Option<String> {
         self.sandbox_session_id.clone()
     }
 
+    /// Consumes the context, returning its paths and optional session ID.
     #[must_use]
     pub fn into_parts(self) -> (SandboxPaths, Option<String>) {
         (self.paths, self.sandbox_session_id)
@@ -825,13 +892,18 @@ impl<'de> Deserialize<'de> for FlowContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlowRegistration {
+    /// The network flow being registered.
     pub flow: NetworkFlowKey,
+    /// The identity of the process and socket that owns the flow.
     pub owner: SocketIdentity,
+    /// The normalized policy host that approved the flow.
     pub policy_host: NormalizedPolicyHost,
+    /// Sandbox paths and session identity associated with the flow.
     pub ctx: FlowContext,
 }
 
 impl FlowRegistration {
+    /// Assembles a [`FlowRegistration`] from its parts.
     #[must_use]
     pub const fn new(
         flow: NetworkFlowKey,
@@ -847,21 +919,25 @@ impl FlowRegistration {
         }
     }
 
+    /// Returns the registered network flow.
     #[must_use]
     pub const fn flow(&self) -> &NetworkFlowKey {
         &self.flow
     }
 
+    /// Returns the owning process and socket identity.
     #[must_use]
     pub const fn owner(&self) -> SocketIdentity {
         self.owner
     }
 
+    /// Returns the normalized policy host.
     #[must_use]
     pub const fn policy_host(&self) -> &NormalizedPolicyHost {
         &self.policy_host
     }
 
+    /// Returns the flow's sandbox context.
     #[must_use]
     pub const fn context(&self) -> &FlowContext {
         &self.ctx
@@ -872,7 +948,9 @@ impl FlowRegistration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpCheckRequest {
+    /// The outgoing HTTP request to be checked.
     pub request: HttpRequest,
+    /// The attribution token binding this request to a registered session.
     pub attribution_token: AttributionToken,
 }
 
@@ -880,12 +958,16 @@ pub struct HttpCheckRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpApprovalRequest {
+    /// The rule target the approval applies to.
     pub target: HttpRuleTarget,
+    /// The approval scope for the request.
     pub scope: crate::ApprovalScope,
 
+    /// The sandbox session ID, if any.
     #[serde(default)]
     pub session_id: Option<String>,
 
+    /// The request context used to evaluate the approval.
     #[serde(default)]
     pub ctx: RequestContext,
 }

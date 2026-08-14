@@ -1,3 +1,10 @@
+//! Seccomp-BPF arming CLI used with an external sandbox loader.
+//!
+//! Loads a syscall allow-list filter (optionally including filesystem
+//! syscalls) into the calling thread, then `exec`s a child command. Intended
+//! for runtime environments the loader cannot prepare itself (e.g. a foreign
+//! architecture or nested sandbox), where the filter is armed in a non-Rust
+//! process and a command is launched under it.
 use std::{
     env,
     ffi::{CStr, CString, OsString},

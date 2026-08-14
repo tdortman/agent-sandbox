@@ -194,6 +194,8 @@ impl PolicyStore {
         }
     }
 
+    /// Check a filesystem access request against static allow sources and,
+    /// if not already allowed, route it to an interactive approval.
     pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
         let FilesystemCheckRequest { path, access, ctx } = req;
         let access = normalize_directory_traverse_access(&path, access);
@@ -206,6 +208,8 @@ impl PolicyStore {
             .await
     }
 
+    /// Request interactive approval for a filesystem access, deduplicating
+    /// concurrent requests for the same path and awaiting the user verdict.
     pub async fn request_filesystem_approval(
         &self,
         req: FilesystemCheckRequest,

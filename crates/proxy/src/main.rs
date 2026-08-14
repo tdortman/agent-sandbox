@@ -1,3 +1,7 @@
+//! Entry point for the transparent HTTP proxy daemon.
+//!
+//! Parses proxy configuration, builds the certificate/ECH/Alt-Svc state, and
+//! runs the TCP and HTTP/3 backends, claiming intercepted flows with policyd.
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use agent_sandbox_core::HttpUrl;
