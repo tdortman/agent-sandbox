@@ -19,6 +19,9 @@ const FILESYSTEM_MUTATION_SYSCALLS: &[&str] = &[
     "unlinkat",
     "truncate",
     "ftruncate",
+    "mkdir",
+    "mkdirat",
+    "rmdir",
 ];
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -35,6 +38,9 @@ fn expected_mutation_numbers() -> BTreeSet<i64> {
         nr::UNLINKAT,
         nr::TRUNCATE,
         nr::FTRUNCATE,
+        nr::MKDIR,
+        nr::MKDIRAT,
+        nr::RMDIR,
     ])
 }
 

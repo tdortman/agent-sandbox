@@ -50,6 +50,127 @@ pub fn pidfd_getfd(pidfd: impl AsFd, fd: i32) -> io::Result<OwnedFd> {
     fd_from_syscall(raw)
 }
 
+/// Rename a path relative to two trusted directory descriptors.
+///
+/// # Errors
+/// Returns the kernel error from `renameat2(2)`.
+pub fn renameat(
+    old_dir: impl AsFd,
+    old: &CStr,
+    new_dir: impl AsFd,
+    new: &CStr,
+    flags: u32,
+) -> io::Result<()> {
+    // SAFETY: descriptors and NUL-terminated paths remain live for the call.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            old_dir.as_fd().as_raw_fd(),
+            old.as_ptr(),
+            new_dir.as_fd().as_raw_fd(),
+            new.as_ptr(),
+            flags,
+        )
+    })
+}
+/// Create a hard link relative to trusted directory descriptors.
+///
+/// # Errors
+/// Returns the kernel error from `linkat(2)`.
+pub fn linkat(
+    old_dir: impl AsFd,
+    old: &CStr,
+    new_dir: impl AsFd,
+    new: &CStr,
+    flags: i32,
+) -> io::Result<()> {
+    // SAFETY: descriptors and NUL-terminated paths remain live for the call.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_linkat,
+            old_dir.as_fd().as_raw_fd(),
+            old.as_ptr(),
+            new_dir.as_fd().as_raw_fd(),
+            new.as_ptr(),
+            flags,
+        )
+    })
+}
+
+/// Create a symbolic link relative to a trusted directory descriptor.
+///
+/// # Errors
+/// Returns the kernel error from `symlinkat(2)`.
+pub fn symlinkat(target: &CStr, new_dir: impl AsFd, new: &CStr) -> io::Result<()> {
+    // SAFETY: the descriptor and NUL-terminated paths remain live for the call.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_symlinkat,
+            target.as_ptr(),
+            new_dir.as_fd().as_raw_fd(),
+            new.as_ptr(),
+        )
+    })
+}
+
+/// Remove a directory entry relative to a trusted directory descriptor.
+///
+/// # Errors
+/// Returns the kernel error from `unlinkat(2)`.
+pub fn unlinkat(dir: impl AsFd, path: &CStr, flags: i32) -> io::Result<()> {
+    // SAFETY: the descriptor and NUL-terminated path remain live for the call.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_unlinkat,
+            dir.as_fd().as_raw_fd(),
+            path.as_ptr(),
+            flags,
+        )
+    })
+}
+
+/// Truncate a file referred to by a path.
+///
+/// # Errors
+/// Returns the kernel error from `truncate(2)`.
+pub fn truncate(path: &CStr, length: libc::off_t) -> io::Result<()> {
+    // SAFETY: the NUL-terminated path remains live for the call.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_truncate, path.as_ptr(), length) })
+}
+
+/// Truncate an open file descriptor.
+///
+/// # Errors
+/// Returns the kernel error from `ftruncate(2)`.
+pub fn ftruncate(fd: impl AsFd, length: libc::off_t) -> io::Result<()> {
+    // SAFETY: the descriptor remains live for the call.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_ftruncate, fd.as_fd().as_raw_fd(), length) })
+}
+
+/// Create a directory relative to a trusted directory descriptor.
+///
+/// # Errors
+/// Returns the kernel error from `mkdirat(2)`.
+pub fn mkdirat(dir: impl AsFd, path: &CStr, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: the descriptor and NUL-terminated path remain live for the call.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_mkdirat,
+            dir.as_fd().as_raw_fd(),
+            path.as_ptr(),
+            mode,
+        )
+    })
+}
+
+fn syscall_ok(result: libc::c_long) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn tracee_process_id(thread_id: u32) -> io::Result<u32> {
     let status = std::fs::read_to_string(format!("/proc/{thread_id}/status"))?;
 

@@ -18,7 +18,8 @@ pub mod nr {
     pub use libc::{
         SYS_connect as CONNECT, SYS_creat as CREAT, SYS_io_uring_enter as IO_URING_ENTER,
         SYS_io_uring_register as IO_URING_REGISTER, SYS_io_uring_setup as IO_URING_SETUP,
-        SYS_open as OPEN, SYS_openat as OPENAT, SYS_openat2 as OPENAT2, SYS_sendmmsg as SENDMMSG,
+        SYS_mkdir as MKDIR, SYS_mkdirat as MKDIRAT, SYS_open as OPEN, SYS_openat as OPENAT,
+        SYS_openat2 as OPENAT2, SYS_rmdir as RMDIR, SYS_sendmmsg as SENDMMSG,
         SYS_sendmsg as SENDMSG, SYS_sendto as SENDTO,
     };
     /// Filesystem mutation syscalls, re-exported when `libc` defines them for
@@ -51,20 +52,21 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
 /// `creat`) are routed to policyd via the `CheckResource` RPC and emulated
 /// with the broker's own privileges, so the tracee cannot open the device
 /// directly. Filesystem mutation syscalls (`rename*`, `link*`, `symlink*`,
-/// `unlink*`, `truncate`, `ftruncate`) are routed to policyd via the
-/// `CheckFilesystem` RPC and continued on approval (not emulated). `sendmsg`
-/// is now trapped because the arm no longer uses `sendmsg(SCM_RIGHTS)` to
-/// pass the listener fd. It uses a `pipe2` handoff instead, so the bootstrap
-/// deadlock that previously excluded `sendmsg` no longer applies. `io_uring_*`
-/// syscalls are trapped so the broker can return `ENOSYS`; allowing rings would
-/// let `IORING_OP_OPENAT` execute in-kernel outside seccomp user notification.
+/// `unlink*`, `truncate`, `ftruncate`, `mkdir*`, `rmdir`) are routed to policyd
+/// via the `CheckFilesystem` RPC and emulated by the broker or denied. Never
+/// continue a mutation syscall after policy approval. `sendmsg` is now trapped
+/// because the arm no longer uses `sendmsg(SCM_RIGHTS)` to pass the listener
+/// fd. It uses a `pipe2` handoff instead, so the bootstrap deadlock that
+/// previously excluded `sendmsg` no longer applies. `io_uring_*` syscalls are
+/// trapped so the broker can return `ENOSYS`; allowing rings would let
+/// `IORING_OP_OPENAT` execute in-kernel outside seccomp user notification.
 /// Never trap high-frequency I/O (`write`, `writev`, `sendfile`) or
 /// thread/namespace syscalls (`clone3`, `unshare`). The broker is
-/// single-threaded, so trapping them serializes every I/O call and thread spawn
-/// and starves the sandboxed process until its runtime aborts. `SOCKET` is
-/// excluded because the broker duplicates tracee socket fds via `pidfd_getfd`
-/// to emulate connect/send. Trapping `socket` would deadlock that emulation
-/// path. `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
+/// single-threaded, so trapping them serializes every I/O call and thread
+/// spawn and starves the sandboxed process until its runtime aborts. `SOCKET`
+/// is excluded because the broker duplicates tracee socket fds via
+/// `pidfd_getfd` to emulate connect/send. Trapping `socket` would deadlock that
+/// emulation path. `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
 #[must_use]
 pub fn default_syscalls() -> BTreeSet<i64> {
     syscalls(true)
@@ -105,13 +107,13 @@ fn syscalls(include_filesystem: bool) -> BTreeSet<i64> {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn push_filesystem_mutation_syscalls(syscalls: &mut BTreeSet<i64>) {
     use nr::{
-        FTRUNCATE, LINK, LINKAT, RENAME, RENAMEAT, RENAMEAT2, SYMLINK, SYMLINKAT, TRUNCATE, UNLINK,
-        UNLINKAT,
+        FTRUNCATE, LINK, LINKAT, MKDIR, MKDIRAT, RENAME, RENAMEAT, RENAMEAT2, RMDIR, SYMLINK,
+        SYMLINKAT, TRUNCATE, UNLINK, UNLINKAT,
     };
 
     for nr in [
         RENAME, RENAMEAT, RENAMEAT2, LINK, LINKAT, SYMLINK, SYMLINKAT, UNLINK, UNLINKAT, TRUNCATE,
-        FTRUNCATE,
+        FTRUNCATE, MKDIR, MKDIRAT, RMDIR,
     ] {
         syscalls.insert(nr);
     }
@@ -160,6 +162,9 @@ mod tests {
         assert!(syscalls.contains(&nr::UNLINKAT));
         assert!(syscalls.contains(&nr::TRUNCATE));
         assert!(syscalls.contains(&nr::FTRUNCATE));
+        assert!(syscalls.contains(&nr::MKDIR));
+        assert!(syscalls.contains(&nr::MKDIRAT));
+        assert!(syscalls.contains(&nr::RMDIR));
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -191,6 +196,9 @@ mod tests {
         assert!(syscalls.contains(&nr::UNLINKAT));
         assert!(syscalls.contains(&nr::TRUNCATE));
         assert!(syscalls.contains(&nr::FTRUNCATE));
+        assert!(syscalls.contains(&nr::MKDIR));
+        assert!(syscalls.contains(&nr::MKDIRAT));
+        assert!(syscalls.contains(&nr::RMDIR));
     }
 
     /// Regression: high-frequency I/O and thread/namespace syscalls must
@@ -226,6 +234,9 @@ mod tests {
             nr::UNLINKAT,
             nr::TRUNCATE,
             nr::FTRUNCATE,
+            nr::MKDIR,
+            nr::MKDIRAT,
+            nr::RMDIR,
         ] {
             assert!(
                 !syscalls.contains(&nr),
@@ -263,6 +274,9 @@ mod tests {
             nr::UNLINKAT,
             nr::TRUNCATE,
             nr::FTRUNCATE,
+            nr::MKDIR,
+            nr::MKDIRAT,
+            nr::RMDIR,
         ] {
             assert!(
                 syscalls.contains(&nr),

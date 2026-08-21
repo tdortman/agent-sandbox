@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::Path, time::Duration};
 use agent_sandbox_core::{FlowProtocol, ResourceKind, is_http_service_port};
 use agent_sandbox_syscall_broker::{
     NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
-    SyscallTarget, notification_arch_valid, revalidate_filesystem_mutation, send_response,
+    SyscallTarget, notification_arch_valid, send_response,
 };
 use tracing::{debug, info, warn};
 
@@ -204,17 +204,16 @@ fn execute_response_plan(
             }
         }
 
-        ResponsePlan::RevalidateFilesystemThenContinue { target } => {
-            if let Err(err) = revalidate_filesystem_mutation(notif, &target) {
-                warn!(error = %err, target = ?target, "filesystem dispatch failed");
-                respond_denied(listener_fd, notif);
-            } else {
+        ResponsePlan::EmulateFilesystem { target } => {
+            if let Err(err) = super::emulate_filesystem_mutation(listener_fd, notif, &target) {
+                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+                warn!(error = %err, target = ?target, "filesystem mutation emulation failed");
                 super::log_notification_response(send_response(
                     listener_fd,
                     notif.id,
                     0,
+                    -errno,
                     0,
-                    SECCOMP_USER_NOTIF_FLAG_CONTINUE,
                 ));
             }
         }
@@ -228,7 +227,6 @@ mod tests {
     use agent_sandbox_syscall_broker::NetworkTarget;
 
     use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
-
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
         NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
             host: host.to_owned(),

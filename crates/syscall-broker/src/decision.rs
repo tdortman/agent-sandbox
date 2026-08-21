@@ -46,7 +46,7 @@ pub fn normalize(notif: &SeccompNotif) -> Result<NormalizedNotification, io::Err
 }
 
 /// Semantic actions emitted by policy routing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ResponsePlan {
     Continue,
 
@@ -58,7 +58,7 @@ pub enum ResponsePlan {
         target: ResourceTarget,
     },
 
-    RevalidateFilesystemThenContinue {
+    EmulateFilesystem {
         target: FilesystemTarget,
     },
 
@@ -96,8 +96,8 @@ impl ResponsePlan {
         Self::EmulateResource { target }
     }
 
-    pub const fn revalidate_filesystem(target: FilesystemTarget) -> Self {
-        Self::RevalidateFilesystemThenContinue { target }
+    pub const fn emulate_filesystem(target: FilesystemTarget) -> Self {
+        Self::EmulateFilesystem { target }
     }
 }
 
@@ -165,7 +165,7 @@ pub async fn decide(
                     return plan;
                 }
             }
-            ResponsePlan::revalidate_filesystem(target)
+            ResponsePlan::emulate_filesystem(target)
         }
     }
 }
@@ -233,13 +233,15 @@ pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, path::Path, time::Duration};
+    use std::{io, os::fd::OwnedFd, path::Path, time::Duration};
 
     use agent_sandbox_core::{
         DeviceAccess, FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply,
         ResourceKind, VerdictSource,
     };
-    use agent_sandbox_syscall_broker::{FilesystemTarget, PersistentPolicyClient, ResourceTarget};
+    use agent_sandbox_syscall_broker::{
+        FilesystemMutation, FilesystemTarget, PersistentPolicyClient, ResourceTarget,
+    };
 
     use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
 
@@ -257,6 +259,10 @@ mod tests {
     fn filesystem_target() -> FilesystemTarget {
         FilesystemTarget {
             checks: vec![("/tmp/example".into(), FileAccess::Write)],
+            operation: FilesystemMutation::Ftruncate {
+                fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("dev null exists")),
+                len: 0,
+            },
         }
     }
 
@@ -264,7 +270,7 @@ mod tests {
     async fn decision_routes_policy_independent_facts() {
         let mut client = PersistentPolicyClient::new("/tmp/agent-sandbox-test-policy.sock");
 
-        assert_eq!(
+        assert!(matches!(
             decide(
                 &mut client,
                 None,
@@ -274,9 +280,9 @@ mod tests {
             )
             .await,
             ResponsePlan::Continue
-        );
+        ));
 
-        assert_eq!(
+        assert!(matches!(
             decide(
                 &mut client,
                 None,
@@ -286,11 +292,11 @@ mod tests {
             )
             .await,
             ResponsePlan::DenyErrno {
-                errno: libc::ENOSYS,
+                errno: libc::ENOSYS
             }
-        );
+        ));
 
-        assert_eq!(
+        assert!(matches!(
             decide(
                 &mut client,
                 None,
@@ -303,18 +309,23 @@ mod tests {
             )
             .await,
             ResponsePlan::DenyErrno {
-                errno: libc::EACCES,
+                errno: libc::EACCES
             }
-        );
+        ));
     }
 
     #[test]
     fn network_verdict_maps_to_plan() {
-        assert_eq!(ResponsePlan::plan_network(true), ResponsePlan::Continue);
-
-        assert_eq!(ResponsePlan::plan_network(false), ResponsePlan::DenyErrno {
-            errno: libc::EACCES,
-        });
+        assert!(matches!(
+            ResponsePlan::plan_network(true),
+            ResponsePlan::Continue
+        ));
+        assert!(matches!(
+            ResponsePlan::plan_network(false),
+            ResponsePlan::DenyErrno {
+                errno: libc::EACCES
+            }
+        ));
     }
 
     #[test]
@@ -331,12 +342,10 @@ mod tests {
             error: None,
         };
 
-        assert_eq!(
+        assert!(matches!(
             resource_plan(target.clone(), Ok(allowed)),
-            ResponsePlan::EmulateResource {
-                target: target.clone(),
-            }
-        );
+            ResponsePlan::EmulateResource { .. }
+        ));
 
         let denied = ResourceCheckReply {
             ok: true,
@@ -350,16 +359,10 @@ mod tests {
             error: Some("blocked".into()),
         };
 
-        assert_eq!(
+        assert!(matches!(
             resource_plan(target.clone(), Ok(denied)),
-            ResponsePlan::ResourcePolicyDenied {
-                target: target.clone(),
-                source: VerdictSource::Policy {
-                    comment: Some("blocked".into()),
-                },
-                error: Some("blocked".into()),
-            }
-        );
+            ResponsePlan::ResourcePolicyDenied { .. }
+        ));
 
         assert!(matches!(
             resource_plan(

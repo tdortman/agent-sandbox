@@ -7,6 +7,7 @@
 pub(crate) mod decision;
 pub(crate) mod dispatch;
 use std::{
+    ffi::CString,
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
@@ -16,10 +17,14 @@ use std::{
 use agent_sandbox_core::{InodeIdentity, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    NetworkMode, PersistentPolicyClient, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-    SeccompNotif, normalize_path, recv_notification, send_addfd, send_response,
+    FilesystemMutation, FilesystemTarget, NetworkMode, PersistentPolicyClient, ResourceTarget,
+    SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, normalize_path, recv_notification, send_addfd,
+    send_response,
 };
-use agent_sandbox_sysutil::{connect_raw, sendmsg_raw, sendto_raw, set_raw_fd_nonblocking};
+use agent_sandbox_sysutil::{
+    connect_raw, ftruncate, linkat, mkdirat, renameat, sendmsg_raw, sendto_raw,
+    set_raw_fd_nonblocking, symlinkat, truncate, unlinkat,
+};
 use clap::Parser;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -259,20 +264,7 @@ fn is_policy_socket_bypass(target: &ResourceTarget, policy_socket: &Path) -> boo
         _ => normalize_path(&target.path) == normalize_path(policy_socket),
     }
 }
-
-/// Emulate a policy-allowed resource syscall on behalf of the tracee. Never
-/// calls a continue response: the broker completes the syscall itself and
-/// injects the result, so the tracee never touches the gated resource directly.
-///
-/// For Unix-socket `connect`/`sendto`/`sendmsg`/`sendmmsg`: duplicate the
-/// tracee's socket fd via `pidfd_getfd`, perform the syscall in the broker's
-/// own fd table, and inject the return value with a response. For device
-/// `open*`: open the device in the broker and install the fd into the tracee
-/// with `send_addfd`.
-///
-/// # Errors
-///
-/// Returns an error if any fd duplication, syscall, or ioctls fail.
+/// Emulate a policy-allowed resource syscall without continuing it.
 fn emulate_resource(
     listener_fd: i32,
     notif: &SeccompNotif,
@@ -282,6 +274,89 @@ fn emulate_resource(
         ResourceKind::UnixSocket => emulate_unix_socket(listener_fd, notif, target),
         ResourceKind::Device => emulate_device_open(listener_fd, notif, target),
     }
+}
+
+fn emulate_filesystem_mutation(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    target: &FilesystemTarget,
+) -> std::io::Result<()> {
+    fn cstring(bytes: &[u8]) -> std::io::Result<CString> {
+        CString::new(bytes).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+    fn path_at(dir: &OwnedFd, path: &[u8]) -> Vec<u8> {
+        if path.starts_with(b"/") {
+            return path.to_vec();
+        }
+        let mut resolved = format!("/proc/self/fd/{}", dir.as_raw_fd()).into_bytes();
+        resolved.push(b'/');
+        resolved.extend_from_slice(path);
+        resolved
+    }
+
+    let result = match &target.operation {
+        FilesystemMutation::Rename {
+            old_dir,
+            old,
+            new_dir,
+            new,
+            flags,
+        } => {
+            let old = cstring(old)?;
+            let new = cstring(new)?;
+            renameat(old_dir, &old, new_dir, &new, *flags)
+        }
+        FilesystemMutation::Link {
+            old_dir,
+            old,
+            new_dir,
+            new,
+            flags,
+        } => {
+            let old = cstring(old)?;
+            let new = cstring(new)?;
+            linkat(old_dir, &old, new_dir, &new, flags.cast_signed())
+        }
+        FilesystemMutation::Symlink {
+            target,
+            link_dir,
+            link,
+        } => {
+            let target = cstring(target)?;
+            let link = cstring(link)?;
+            symlinkat(&target, link_dir, &link)
+        }
+        FilesystemMutation::Unlink { dir, path, flags } => {
+            let path = cstring(path)?;
+            unlinkat(dir, &path, flags.cast_signed())
+        }
+        FilesystemMutation::Truncate { dir, path, len } => {
+            let path = cstring(&path_at(dir, path))?;
+            truncate(&path, *len as libc::off_t)
+        }
+        FilesystemMutation::Ftruncate { fd, len } => ftruncate(fd, *len as libc::off_t),
+        FilesystemMutation::Mkdir { dir, path, mode } => {
+            let path = cstring(path)?;
+            mkdirat(dir, &path, *mode as libc::mode_t)
+        }
+        FilesystemMutation::Rmdir { dir, path } => {
+            let path = cstring(path)?;
+            unlinkat(dir, &path, libc::AT_REMOVEDIR)
+        }
+    };
+    let (val, error) = match result {
+        Ok(()) => (0, 0),
+        Err(err) => {
+            debug!(
+                error = %err,
+                operation = ?target.operation,
+                pid = notif.pid,
+                "filesystem mutation syscall failed"
+            );
+            (0, -err.raw_os_error().unwrap_or(libc::EACCES))
+        }
+    };
+    send_response(listener_fd, notif.id, val, error, 0)
 }
 
 /// Emulate a `connect`/`sendto`/`sendmsg`/`sendmmsg` on a Unix-domain socket
@@ -299,7 +374,6 @@ fn emulate_unix_socket(
 ) -> std::io::Result<()> {
     let nr_val = i64::from(notif.data.nr);
     let sockfd = i32::try_from(notif.data.args[0]).unwrap_or(-1);
-
     if sockfd < 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
