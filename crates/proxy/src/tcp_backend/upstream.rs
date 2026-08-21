@@ -23,7 +23,10 @@ use rama_http::{
 use rama_http_backend::client::{
     BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnector, HttpPooledConnectorConfig,
 };
-use rama_net::client::{EstablishedClientConnection, pool::MultiplexedConnection};
+use rama_net::{
+    address::{Host, HostWithPort},
+    client::{ConnectorTarget, EstablishedClientConnection, pool::MultiplexedConnection},
+};
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
 use rama_tls_rustls::client::TlsConnector;
@@ -33,6 +36,15 @@ use super::{
     is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure, request_head_clone,
 };
 use crate::semantic::SemanticRequest;
+
+/// Bind transport dialing to the destination claimed by policyd.
+///
+/// The HTTP authority remains the policy-approved hostname for Host, TLS
+/// identity, and pool attribution; `ConnectorTarget` makes the transport
+/// connector use this immutable concrete address instead of resolving it.
+fn claimed_connector_target(destination: std::net::SocketAddr) -> ConnectorTarget {
+    ConnectorTarget(HostWithPort::new(Host::from(destination.ip()), destination.port()))
+}
 
 /// The connection type the pooled upstream client establishes.
 type UpstreamConnection = EstablishedClientConnection<
@@ -293,6 +305,7 @@ pub async fn send_upstream_request(
         canonical_http10_origin(&format!("{}://{upstream_authority}", upstream_url.scheme()))?;
 
     let target = semantic_request.forwarding_target();
+    let semantic_body = semantic_request.into_body();
 
     let websocket_http11 = websocket
         && state
@@ -300,8 +313,11 @@ pub async fn send_upstream_request(
             .iter()
             .any(|pattern| pattern.matches(&normalized.url));
 
-    let semantic_body = semantic_request.into_body();
-
+    let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
+    *request.uri_mut() = uri.parse()?;
+    request
+        .extensions()
+        .insert(claimed_connector_target(state.destination));
     let requested_http10 = downstream_version == Version::HTTP_10
         || state.http10_upstream_origins.contains(&upstream_origin);
 
@@ -311,9 +327,6 @@ pub async fn send_upstream_request(
         upstream_url.scheme() == "https",
         websocket_http11,
     );
-
-    let uri = format!("{}://{upstream_authority}{target}", upstream_url.scheme());
-    *request.uri_mut() = uri.parse()?;
 
     request
         .headers_mut()
@@ -407,9 +420,15 @@ mod tests {
 
     use rama_http::{Body, Version};
 
+    use rama_net::{
+        address::{Host, HostWithPort},
+        client::ConnectorTarget,
+    };
+
     use super::{
-        ReplayBody, ReplayBodyState, StreamingBody, is_h2_protocol_negotiation_failure,
-        is_protocol_negotiation_failure, select_upstream_version,
+        ReplayBody, ReplayBodyState, StreamingBody, claimed_connector_target,
+        is_h2_protocol_negotiation_failure, is_protocol_negotiation_failure,
+        select_upstream_version,
     };
 
     #[test]
@@ -418,6 +437,7 @@ mod tests {
             body: Mutex::new(None),
             started: AtomicBool::new(false),
         });
+
 
         let mut body = ReplayBody {
             state: state.clone(),
@@ -433,6 +453,19 @@ mod tests {
 
         drop(body);
         assert!(state.body.lock().expect("replay body lock").is_some());
+    }
+    #[test]
+    fn claimed_target_binds_concrete_destination() {
+        let target = claimed_connector_target("192.0.2.10:443".parse().expect("socket address"));
+        assert_eq!(
+            target,
+            ConnectorTarget(HostWithPort::new(
+                Host::from(std::net::IpAddr::V4(
+                    "192.0.2.10".parse().expect("ip address"),
+                )),
+                443,
+            ))
+        );
     }
 
     #[test]
