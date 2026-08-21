@@ -27,6 +27,16 @@ use agent_sandbox_fsmon::MonitorClient;
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
 };
+fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
+    let response = FanotifyResponse {
+        fd: event_fd.as_raw_fd(),
+        response: verdict,
+    };
+    let bytes = fanotify_response_bytes(&response);
+    if let Err(error) = nix::unistd::write(fan_fd, bytes) {
+        tracing::warn!(%error, "failed to send fanotify response");
+    }
+}
 use clap::Parser;
 use nix::{
     dir::Dir,
@@ -693,40 +703,26 @@ fn mark_mountpoints(
     }
 }
 
-/// Returns true when `child` is `ancestor` or a descendant of `ancestor`.
-fn is_descendant_of(host_proc: &HostProc, child: i32, ancestor: i32) -> bool {
-    if child <= 0 || ancestor <= 0 {
-        return false;
+/// Immutable cgroup identity captured from the sandbox root before `setns`.
+///
+/// A process remains in its cgroup after daemonisation/reparenting, while its
+/// `PPid` ancestry can immediately point at an unrelated host process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SandboxCgroup(String);
+
+impl SandboxCgroup {
+    fn read(host_proc: &HostProc, pid: i32) -> Option<Self> {
+        let content = host_proc.read_to_string(pid, "cgroup").ok()?;
+        let path = content.lines().find_map(|line| {
+            let (hierarchy, path) = line.split_once("::")?;
+            (hierarchy == "0" && !path.is_empty()).then(|| path.to_string())
+        })?;
+        Some(Self(path))
     }
 
-    let mut pid = child;
-
-    for _ in 0..256 {
-        if pid == ancestor {
-            return true;
-        }
-
-        if pid <= 1 {
-            return false;
-        }
-
-        let Some(parent) = parent_pid(host_proc, pid) else {
-            return false;
-        };
-
-        pid = parent;
+    fn contains(&self, host_proc: &HostProc, pid: i32) -> Option<bool> {
+        Some(Self::read(host_proc, pid)?.0 == self.0)
     }
-
-    false
-}
-
-fn parent_pid(host_proc: &HostProc, pid: i32) -> Option<i32> {
-    let stat = host_proc.read_to_string(pid, "stat").ok()?;
-    let end = stat.rfind(')')?;
-    let after = stat[end + 1..].trim_start();
-    let mut fields = after.split_whitespace();
-    fields.next()?; // state
-    fields.next()?.parse().ok()
 }
 
 /// Event loop: read fanotify events and forward to policyd for allow/deny
@@ -734,7 +730,7 @@ fn parent_pid(host_proc: &HostProc, pid: i32) -> Option<i32> {
 fn run_event_loop(
     fan_fd: &std::os::fd::OwnedFd,
     self_pid: i32,
-    target_pid: i32,
+    sandbox_cgroup: &SandboxCgroup,
     saw_pre_access_mark: bool,
     host_proc: &HostProc,
     ctx: &agent_sandbox_core::RequestContext,
@@ -791,7 +787,7 @@ fn run_event_loop(
                     &meta,
                     &event_fd,
                     self_pid,
-                    target_pid,
+                    sandbox_cgroup,
                     saw_pre_access_mark,
                     host_proc,
                 ) {
@@ -952,7 +948,7 @@ fn main() {
     );
 
     // Before signaling ready, require that at least one marked mount covers --home.
-    if let Some(ref home) = cli.home
+    if let Some(home) = &cli.home
         && !home_covered
     {
         eprintln!(
@@ -975,10 +971,15 @@ fn main() {
         process::exit(1);
     });
 
+    let sandbox_cgroup = SandboxCgroup::read(&host_proc, target_pid).unwrap_or_else(|| {
+        eprintln!("agent-sandbox-fsmon: cannot read target cgroup membership");
+        process::exit(1);
+    });
+
     run_event_loop(
         &fan_fd,
         self_pid,
-        target_pid,
+        &sandbox_cgroup,
         saw_pre_access_mark,
         &host_proc,
         &ctx,
@@ -993,7 +994,7 @@ fn try_fast_path_allow(
     meta: &FanotifyEventMetadata,
     event_fd: &OwnedFd,
     self_pid: i32,
-    target_pid: i32,
+    sandbox_cgroup: &SandboxCgroup,
     saw_pre_access_mark: bool,
     host_proc: &HostProc,
 ) -> bool {
@@ -1003,10 +1004,16 @@ fn try_fast_path_allow(
     }
 
     let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
-
-    if !is_descendant_of(host_proc, process_pid, target_pid) {
-        respond(fan_fd, event_fd, FAN_ALLOW);
-        return true;
+    match sandbox_cgroup.contains(host_proc, process_pid) {
+        Some(true) => {}
+        Some(false) => {
+            respond(fan_fd, event_fd, FAN_ALLOW);
+            return true;
+        }
+        None => {
+            respond(fan_fd, event_fd, FAN_DENY);
+            return true;
+        }
     }
 
     if saw_pre_access_mark
@@ -1023,18 +1030,6 @@ fn try_fast_path_allow(
     }
 
     false
-}
-
-/// Write a `FAN_ALLOW` or `FAN_DENY` response and close the event fd.
-fn respond(fan_fd: impl AsFd, event_fd: &OwnedFd, response: u32) {
-    let resp = FanotifyResponse {
-        fd: event_fd.as_raw_fd(),
-        response,
-    };
-
-    let resp_bytes = fanotify_response_bytes(&resp);
-    let _ = nix::unistd::write(fan_fd.as_fd(), resp_bytes);
-    // event_fd dropped here, closing the fd
 }
 
 #[cfg(test)]
@@ -1326,19 +1321,10 @@ mod tests {
     }
 
     #[test]
-    fn parent_pid_reads_ppid_from_proc_stat() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
-        let parent = parent_pid(&host_proc, pid).expect("parent pid");
-        assert!(parent > 0);
-        assert_ne!(parent, pid);
-    }
-
-    #[test]
-    fn is_descendant_of_current_process() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
-        assert!(is_descendant_of(&host_proc, pid, pid));
+    fn cgroup_membership_is_stable_identity_not_parent_ancestry() {
+        let session = SandboxCgroup("/sandbox/session.scope".to_string());
+        assert_eq!(session.0, "/sandbox/session.scope");
+        assert_ne!(session.0, "/");
     }
 
     #[test]
