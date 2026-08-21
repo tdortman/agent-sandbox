@@ -135,49 +135,32 @@ impl PolicyStore {
         sandbox_session_id: Option<&str>,
         approver_uid: Option<u32>,
     ) -> bool {
-        // Host-scoped pendings (no sandbox session) may be resolved by any
-        // connection on the host control socket. That socket is local and
-        // sensitive ops bind to SO_PEERCRED; the sandbox socket cannot issue
-        // Approve/Deny (see auth.rs).
-        let Some(pending_session) = sandbox_session_id else {
-            return true;
-        };
-
-        // Registered UI for this exact sandbox session (UiFd after RegisterUi).
         let inner = self.inner.lock().await;
-
         let ui_authorized = inner
             .ui_clients
             .get(&client_id)
             .and_then(|client| inner.ui_context_by_session.get(&client.session_id))
             .is_some_and(|ctx| {
                 ctx.client_id == client_id
-                    && ctx.sandbox_session_id.as_deref() == Some(pending_session)
+                    && ctx.sandbox_session_id.as_deref() == sandbox_session_id
+                    && approver_uid.is_none_or(|uid| uid > 0 && ctx.owner_uid == Some(uid))
             });
-
         drop(inner);
 
         if ui_authorized {
             return true;
         }
 
-        // Host-side CLI (`agent-sandbox-approve`) and auto-spawned UI: the
-        // sandbox socket cannot reach the host socket, so matching session
-        // owner uid is sufficient. Blocks cross-user approval and a
-        // registered UI for a different sandbox session.
-        let Some(uid) = approver_uid.filter(|&u| u > 0) else {
+        let (Some(uid), Some(session)) = (approver_uid.filter(|uid| *uid > 0), sandbox_session_id)
+        else {
             return false;
         };
 
-        self.sandbox_sessions
-            .read()
-            .ok()
-            .and_then(|sessions| {
-                sessions
-                    .get(pending_session)
-                    .map(|reg| reg.owner_uid == uid)
-            })
-            .unwrap_or(false)
+        self.sandbox_sessions.read().is_ok_and(|sessions| {
+            sessions
+                .get(session)
+                .is_some_and(|registration| registration.owner_uid == uid)
+        })
     }
 
     pub(crate) async fn take_pending_decision(

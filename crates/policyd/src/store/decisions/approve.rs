@@ -1191,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_git_approval_works_when_pending_lacks_project_root() {
-        let store = test_store("global-git-wire-root");
+        let store = test_store("global-git-wire-root").await;
 
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-global-git-wire-{}",
@@ -1263,7 +1263,7 @@ mod tests {
         // no wire encoding for `allowed = false`, so the policyd server
         // dropped the reply and the sandboxed open hung until fsmon timed
         // out. The deny verdict must reach the waiter and stay serializable.
-        let store = test_store("scoped-fs-deny");
+        let store = test_store("scoped-fs-deny").await;
 
         let dir = tempfile::tempdir().expect("create tempdir");
         let home = dir.path().join("home");
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_filesystem_git_dir_persists_project_relative_path() {
-        let store = test_store("global-git-dir");
+        let store = test_store("global-git-dir").await;
 
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-global-git-{}",
@@ -1429,7 +1429,7 @@ mod tests {
         // A non-once approval for a resource prompt whose target is the glob
         // /dev/fd/* under Global scope must persist an allow rule to the
         // global policy.json rather than silently doing nothing.
-        let store = test_store("global-devfd");
+        let store = test_store("global-devfd").await;
 
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-global-devfd-{}",
@@ -1507,7 +1507,7 @@ mod tests {
         );
     }
 
-    fn test_store(name: &str) -> PolicyStore {
+    async fn test_store(name: &str) -> PolicyStore {
         let dir = std::env::temp_dir().join(format!(
             "agent-sandbox-fs-session-{name}-{}",
             std::process::id()
@@ -1516,14 +1516,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test store dir");
 
-        PolicyStore::new(crate::store::test_args(
+        let store = PolicyStore::new(crate::store::test_args(
             dir.join("policy.sock"),
             dir.join("sandbox-policy.sock"),
             dir.join("declarative.json"),
             dir.join("exported-policy.json"),
             Duration::from_mins(1),
             true,
-        ))
+        ));
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "test-ui".into(),
+                writer: writer(),
+            });
+            inner
+                .ui_context_by_session
+                .insert("test-ui".into(), UiSessionContext {
+                    owner_uid: Some(1000),
+                    client_id: 1,
+                    ..UiSessionContext::default()
+                });
+        }
+
+        store
     }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {
@@ -1549,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn dbus_once_approval_caches_typed_target() {
-        let store = test_store("dbus-once");
+        let store = test_store("dbus-once").await;
 
         let target = DbusTarget::session(
             "org.example.Service",
@@ -1619,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn dbus_global_approval_with_comment_persists_edited_target() {
-        let store = test_store("dbus-global-comment");
+        let store = test_store("dbus-global-comment").await;
 
         let home = std::env::temp_dir().join(format!(
             "agent-sandbox-home-dbus-comment-{}",
@@ -1790,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_session_approval_binds_to_submitting_session() {
-        let store = test_store("ui-session");
+        let store = test_store("ui-session").await;
         add_ui_sessions(&store).await;
         approve_filesystem_session(&store, pending_filesystem(), "ui-session").await;
 
@@ -1817,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_session_approval_keeps_standalone_session() {
-        let store = test_store("standalone");
+        let store = test_store("standalone").await;
         add_ui_sessions(&store).await;
         approve_filesystem_session(&store, pending_filesystem(), "ui-session").await;
 
@@ -1844,7 +1861,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_session_pending_rejects_foreign_host_uid() {
-        let store = test_store("sandbox-session-direct-approval");
+        let store = test_store("sandbox-session-direct-approval").await;
 
         store.sandbox_sessions.write().unwrap().insert(
             "sandbox-a".into(),
@@ -1905,7 +1922,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_connection_approve_rejects_foreign_sandbox_ui() {
-        let store = test_store("cross-connection-approve");
+        let store = test_store("cross-connection-approve").await;
 
         {
             let mut inner = store.inner.lock().await;
@@ -1966,7 +1983,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_session_pending_allows_matching_uifd_approval() {
-        let store = test_store("sandbox-session-uifd-approval");
+        let store = test_store("sandbox-session-uifd-approval").await;
 
         {
             let mut inner = store.inner.lock().await;
@@ -2019,7 +2036,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_session_pending_allows_host_owner_cli_approval() {
-        let store = test_store("sandbox-session-host-cli-approval");
+        let store = test_store("sandbox-session-host-cli-approval").await;
 
         store.sandbox_sessions.write().unwrap().insert(
             "sandbox-a".into(),
@@ -2072,7 +2089,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_network_rules_do_not_cross_sandbox_sessions_in_same_project() {
-        let store = test_store("sandbox-session-isolation");
+        let store = test_store("sandbox-session-isolation").await;
 
         {
             let mut inner = store.inner.lock().await;
