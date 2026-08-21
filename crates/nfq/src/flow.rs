@@ -321,26 +321,12 @@ fn register_proxy_flow(
 /// Seam for unit testing: inject a mock `check` to verify policy is consulted.
 /// Returns the verdict and the parsed packet metadata, so callers can apply
 /// side effects (such as the proxy nfmark) without re-parsing the payload.
-pub fn handle_packet_payload_with_registration<F>(
+pub fn handle_packet_payload_with_registration(
     state: &NfqState,
-    policy_socket: &str,
-    timeout: Duration,
     payload: &[u8],
-    check: &mut F,
+    check: &mut dyn FnMut(policy::CheckDestinationArgs<'_>) -> std::io::Result<bool>,
     register: Option<&mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>>,
-) -> (Verdict, Option<packet::PacketMeta>)
-where
-    F: FnMut(
-        &str,
-        &str,
-        &str,
-        u16,
-        packet::TransportProtocol,
-        Option<u32>,
-        &[String],
-        Duration,
-    ) -> std::io::Result<bool>,
-{
+) -> (Verdict, Option<packet::PacketMeta>) {
     // Try IPv4 first, then IPv6.
     let meta = packet::parse_ipv4(payload).or_else(|| packet::parse_ipv6(payload));
 
@@ -434,15 +420,8 @@ where
         return (verdict, Some(meta));
     }
 
-    let allowed = match policy::transport_check(
-        state,
-        policy_socket,
-        timeout,
-        meta,
-        src_pid,
-        session_id.as_deref(),
-        check,
-    ) {
+    let allowed = match policy::transport_check(state, meta, src_pid, session_id.as_deref(), check)
+    {
         TransportCheck::Rejected(verdict) => return (verdict, Some(meta)),
         TransportCheck::Allowed(destination) => destination,
     };
@@ -468,26 +447,8 @@ pub fn handle_packet(
 ) -> (Verdict, Option<packet::PacketMeta>) {
     let payload = message.get_payload();
 
-    let mut check = |socket: &str,
-                     hostname: &str,
-                     dst_ip: &str,
-                     dst_port: u16,
-                     protocol: packet::TransportProtocol,
-                     src_pid: Option<u32>,
-                     aliases: &[String],
-                     to: Duration| {
-        runtime.block_on(policy::check_destination(
-            socket,
-            policy::CheckDestinationArgs {
-                hostname,
-                dst_ip,
-                dst_port,
-                protocol,
-                src_pid,
-                aliases,
-            },
-            to,
-        ))
+    let mut check = |args: policy::CheckDestinationArgs<'_>| {
+        runtime.block_on(policy::check_destination(policy_socket, args, timeout))
     };
 
     let mut register = |registration: FlowRegistration| {
@@ -498,14 +459,7 @@ pub fn handle_packet(
         ))
     };
 
-    handle_packet_payload_with_registration(
-        state,
-        policy_socket,
-        timeout,
-        payload,
-        &mut check,
-        Some(&mut register),
-    )
+    handle_packet_payload_with_registration(state, payload, &mut check, Some(&mut register))
 }
 
 #[cfg(test)]
@@ -601,26 +555,12 @@ pub mod tests {
         let pkt = build_loopback_tcp_syn_packet();
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -666,14 +606,7 @@ pub mod tests {
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         let check_count = std::cell::Cell::new(0_u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(true)
         };
@@ -693,8 +626,6 @@ pub mod tests {
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -752,14 +683,7 @@ pub mod tests {
         packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
         let check_count = std::cell::Cell::new(0_u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(false)
         };
@@ -779,8 +703,6 @@ pub mod tests {
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -833,14 +755,7 @@ pub mod tests {
         );
 
         let check_count = std::cell::Cell::new(0_u32);
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(true)
         };
@@ -853,8 +768,6 @@ pub mod tests {
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -899,14 +812,7 @@ pub mod tests {
         let check_count = std::cell::Cell::new(0_u32);
         let registration_count = std::cell::Cell::new(0_u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(true)
         };
@@ -919,8 +825,6 @@ pub mod tests {
         // First packet of the flow: registration without a transport check.
         let (first, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -933,8 +837,6 @@ pub mod tests {
         // QUIC opening burst: the same flow skips both callbacks on the fast path.
         let (second, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -975,14 +877,7 @@ pub mod tests {
         let check_count = std::cell::Cell::new(0_u32);
         let registration_count = std::cell::Cell::new(0_u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(false)
         };
@@ -994,8 +889,6 @@ pub mod tests {
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -1065,20 +958,12 @@ pub mod tests {
         );
         packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| Ok(true);
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| Ok(true);
+
         let mut register = |_: FlowRegistration| Ok(true);
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -1107,14 +992,7 @@ pub mod tests {
         let packet = build_loopback_tcp_syn_packet();
         let check_count = std::cell::Cell::new(0_u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(false)
         };
@@ -1128,8 +1006,6 @@ pub mod tests {
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -1163,26 +1039,12 @@ pub mod tests {
         let pkt = build_ipv6_loopback_tcp_syn_packet();
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -1207,14 +1069,7 @@ pub mod tests {
         let packet = build_ipv6_loopback_tcp_syn_packet();
         let check_count = std::cell::Cell::new(0_u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
             Ok(false)
         };
@@ -1228,8 +1083,6 @@ pub mod tests {
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
-            "",
-            Duration::from_secs(1),
             &packet,
             &mut check,
             Some(&mut register),
@@ -1263,40 +1116,19 @@ pub mod tests {
         let pkt = build_udp_data_packet(443);
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
         // First check: policy consulted.
-        let (v1, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v1, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v1, Verdict::Accept);
         assert_eq!(call_count.get(), 1);
 
         // Second check: policy consulted again (no NFQ-side verdict cache).
-        let (v2, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v2, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v2, Verdict::Accept);
         assert_eq!(call_count.get(), 2);
@@ -1686,26 +1518,12 @@ pub mod tests {
         let pkt = build_dns_response_packet([10, 0, 0, 2]);
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -1732,26 +1550,12 @@ pub mod tests {
         let pkt = build_dns_response_packet([169, 254, 100, 1]);
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -1778,26 +1582,12 @@ pub mod tests {
         let pkt = build_dns_query_packet([8, 8, 8, 8]);
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -1814,26 +1604,12 @@ pub mod tests {
         let pkt = build_dns_query_packet([169, 254, 100, 1]);
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -1850,26 +1626,12 @@ pub mod tests {
         let pkt = build_dns_query_packet([127, 0, 0, 1]);
         let call_count = std::cell::Cell::new(0u32);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| {
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 

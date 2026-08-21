@@ -165,27 +165,13 @@ pub enum TransportCheck {
 ///
 /// Approved destinations are recorded in the on-disk bindings cache so later
 /// packets resolve faster.
-pub fn transport_check<F>(
+pub fn transport_check(
     state: &NfqState,
-    policy_socket: &str,
-    timeout: Duration,
     meta: packet::PacketMeta,
     src_pid: Option<u32>,
     session_id: Option<&str>,
-    check: &mut F,
-) -> TransportCheck
-where
-    F: FnMut(
-        &str,
-        &str,
-        &str,
-        u16,
-        packet::TransportProtocol,
-        Option<u32>,
-        &[String],
-        Duration,
-    ) -> std::io::Result<bool>,
-{
+    check: &mut dyn FnMut(CheckDestinationArgs<'_>) -> std::io::Result<bool>,
+) -> TransportCheck {
     let dst_ip = meta.dst_ip.to_string();
     let hostname = state.resolve_host_for_session(&dst_ip, session_id);
 
@@ -195,16 +181,14 @@ where
         .map(|bindings| bindings.aliases(&dst_ip))
         .unwrap_or_default();
 
-    let result = check(
-        policy_socket,
-        &hostname,
-        &dst_ip,
-        meta.dst_port,
-        meta.protocol,
+    let result = check(CheckDestinationArgs {
+        hostname: &hostname,
+        dst_ip: &dst_ip,
+        dst_port: meta.dst_port,
+        protocol: meta.protocol,
         src_pid,
-        &aliases,
-        timeout,
-    );
+        aliases: &aliases,
+    });
 
     let allowed = result.unwrap_or_else(|err| {
         warn!(
@@ -250,7 +234,6 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         os::unix::process::ExitStatusExt,
-        time::Duration,
     };
 
     use super::*;
@@ -382,26 +365,12 @@ mod tests {
         let pkt = build_udp_data_packet(443);
         let aliases_seen = std::cell::RefCell::new(Vec::<String>::new());
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         aliases: &[String],
-                         _: Duration| {
-            *aliases_seen.borrow_mut() = aliases.to_vec();
+        let mut check = |args: CheckDestinationArgs<'_>| {
+            *aliases_seen.borrow_mut() = args.aliases.to_vec();
             Ok(true)
         };
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -424,23 +393,9 @@ mod tests {
 
         let pkt = build_udp_data_packet(443);
 
-        let mut check = |_: &str,
-                         _: &str,
-                         _: &str,
-                         _: u16,
-                         _: packet::TransportProtocol,
-                         _: Option<u32>,
-                         _: &[String],
-                         _: Duration| Ok(true);
+        let mut check = |_: CheckDestinationArgs<'_>| Ok(true);
 
-        let (v, _) = handle_packet_payload_with_registration(
-            &state,
-            "",
-            Duration::from_secs(1),
-            &pkt,
-            &mut check,
-            None,
-        );
+        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
