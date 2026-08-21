@@ -3,7 +3,6 @@
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use agent_sandbox_core::HttpCheckReply;
 use bytes::{Buf, Bytes};
 use h3::{
     error::Code,
@@ -27,9 +26,9 @@ use crate::{
         connection_id::ConnectionIdBindings,
         datagram::{DatagramRelay, DatagramRouter, DatagramRouterState, RoutedDatagram},
         relay::{
-            SessionOpen, SessionOpenContext, UpstreamRequestStream, build_upstream_request,
-            map_stream_error, open_session_request, relay_request_body, semantic_request,
-            serve_request, wait_for_downstream_settings,
+            SessionOpen, SessionOpenContext, UpstreamRequestStream, authorize_request,
+            build_upstream_request, map_stream_error, open_session_request, relay_request_body,
+            semantic_request, serve_request, wait_for_downstream_settings,
         },
         session::{self, SessionProtocol},
         session_registry::{SessionBinding, SessionRegistry, session_key},
@@ -673,33 +672,17 @@ async fn approve_webtransport_request(
         return Err(error);
     }
 
-    if let Some(normalized) = sessions
-        .approved(
-            &semantic,
-            SessionProtocol::WebTransport,
-            claim.attribution_token.clone(),
-        )
-        .await
-    {
-        return Ok((semantic, normalized, stream));
-    }
-
-    let check = state
-        .policy
-        .check_http_cancellable(
-            claim.attribution_token.clone(),
-            semantic.policy_request()?,
-            &state.active_checks,
-            &state.shutdown,
-        )
-        .await?;
-
-    let HttpCheckReply {
-        ok: true,
-        allowed: true,
-        request: Some(normalized),
-        ..
-    } = check
+    // Same authorisation tail as plain HTTP/3 requests: session reuse first,
+    // then a cancellable policy check. Only the denial shaping differs.
+    let Some(normalized) = authorize_request(
+        request,
+        &semantic,
+        state,
+        claim,
+        sessions,
+        Some(SessionProtocol::WebTransport),
+    )
+    .await?
     else {
         stream.stop_sending(Code::H3_REQUEST_REJECTED);
         stream.stop_stream(Code::H3_REQUEST_REJECTED);

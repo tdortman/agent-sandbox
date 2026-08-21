@@ -13,12 +13,50 @@ use rama_http::{
 };
 
 use crate::{
+    policy::{normalize_authority, reconcile_authorities},
     semantic::{
         BoundedRequestBody, HttpVersion as SemanticHttpVersion, ResponseEvent, ResponseHead,
         ResponseSequence, SemanticHeaders, TerminalError, is_hop_by_hop_header,
     },
     tcp_backend::is_websocket_upgrade_response,
 };
+
+/// Resolve the single policy authority for one downstream request from its
+/// authority candidates: the `Host` header wins, then the URI authority, then
+/// the TLS server name; an HTTP/1.0 request without any of them falls back to
+/// the original destination. Every pair of present candidates must agree on
+/// the fallback port.
+///
+/// # Errors
+///
+/// Returns an error when candidates conflict or no candidate exists.
+pub fn resolve_request_authority(
+    header_host: Option<String>,
+    uri_host: Option<String>,
+    tls_host: Option<String>,
+    ip_fallback: Option<String>,
+    fallback_port: u16,
+) -> Result<String, BoxError> {
+    if let (Some(header), Some(uri)) = (&header_host, &uri_host) {
+        reconcile_authorities(&[header, uri], fallback_port)
+            .map_err(|error| error.into_boxed("HTTP request has conflicting origin authorities"))?;
+    }
+
+    if let Some(tls) = tls_host.as_deref()
+        && let Some(request_host) = header_host.as_deref().or(uri_host.as_deref())
+    {
+        reconcile_authorities(&[tls, request_host], fallback_port)
+            .map_err(|error| error.into_boxed("HTTP request conflicts with TLS server identity"))?;
+    }
+
+    let host = header_host
+        .or(uri_host)
+        .or(tls_host)
+        .or(ip_fallback)
+        .ok_or_else(|| BoxError::from_static_str("HTTP request has no authority"))?;
+
+    normalize_authority(&host, fallback_port).map_err(BoxError::from)
+}
 
 const SEMANTIC_BODY_CHUNK_BYTES: usize = 16 * 1024;
 
@@ -481,5 +519,70 @@ mod tests {
         );
 
         assert!(response.body_mut().frame().await.is_none());
+    }
+
+    mod authority {
+        use rama_core::error::BoxError;
+
+        use super::super::resolve_request_authority;
+
+        fn resolved(
+            header: Option<&str>,
+            uri: Option<&str>,
+            tls: Option<&str>,
+            ip_fallback: Option<&str>,
+        ) -> Result<String, BoxError> {
+            resolve_request_authority(
+                header.map(str::to_owned),
+                uri.map(str::to_owned),
+                tls.map(str::to_owned),
+                ip_fallback.map(str::to_owned),
+                8443,
+            )
+        }
+
+        #[test]
+        fn earlier_candidates_win_when_candidates_agree() -> Result<(), BoxError> {
+            assert_eq!(
+                resolved(
+                    Some("a.test:8080"),
+                    Some("a.test:8080"),
+                    Some("a.test:8080"),
+                    None
+                )?,
+                "a.test:8080"
+            );
+            assert_eq!(
+                resolved(None, Some("a.test:8080"), Some("a.test:8080"), None)?,
+                "a.test:8080"
+            );
+            assert_eq!(
+                resolved(None, None, Some("a.test:8080"), None)?,
+                "a.test:8080"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn conflicting_candidates_are_rejected() {
+            assert!(resolved(Some("a.test:80"), Some("b.test:80"), None, None).is_err());
+            assert!(resolved(Some("a.test:80"), None, Some("b.test"), None).is_err());
+        }
+
+        #[test]
+        fn http_1_0_falls_back_to_the_original_destination() -> Result<(), BoxError> {
+            assert_eq!(
+                resolved(None, None, None, Some("93.184.216.34:443"))?,
+                "93.184.216.34:443"
+            );
+            assert!(resolved(None, None, None, None).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn portless_authorities_take_the_fallback_port() -> Result<(), BoxError> {
+            assert_eq!(resolved(Some("a.test"), None, None, None)?, "a.test:8443");
+            Ok(())
+        }
     }
 }

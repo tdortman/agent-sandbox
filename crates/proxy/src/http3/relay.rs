@@ -345,7 +345,7 @@ pub(super) async fn serve_request(
     relay_request(stream, semantic, normalized, relay_context, datagrams).await
 }
 
-async fn authorize_request(
+pub(super) async fn authorize_request(
     request: &http::Request<()>,
     semantic: &SemanticRequest,
     state: &Http3State,

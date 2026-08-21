@@ -52,7 +52,7 @@ use rama_net::{
 use rama_tcp::{TcpStream, server::TcpListener};
 use rama_tls::server::TlsPeekRouter;
 pub(crate) use semantic::SemanticRequestBody;
-use semantic::{bridge_response_body, semantic_http_version};
+use semantic::{bridge_response_body, resolve_request_authority, semantic_http_version};
 use tls::{RustlsTlsService, TlsServerName, build_tcp_tls_config};
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
@@ -63,10 +63,7 @@ use crate::{
     cert::CertificateIssuer,
     ech_state::DownstreamEch,
     http3,
-    policy::{
-        FlowClaim, PolicySession, authority_for_policy, flow_key, normalize_authority,
-        reconcile_authorities,
-    },
+    policy::{FlowClaim, PolicySession, authority_for_policy, flow_key},
     semantic::{
         BoundedRequestBody, SemanticRequest, SemanticRequestParts, semantic_request_headers,
     },
@@ -613,44 +610,33 @@ async fn check_http_policy(
 
     let uri_host = request.uri().authority().map(|value| value.to_string());
 
-    if let (Some(header_host), Some(uri_host)) = (&header_host, &uri_host) {
-        reconcile_authorities(&[header_host, uri_host], state.authority_fallback_port())
-            .map_err(|error| error.into_boxed("HTTP request has conflicting origin authorities"))?;
-    }
-
     let tls_host = request
         .extensions()
         .get_ref::<TlsServerName>()
         .map(|name| name.0.clone());
 
-    if let Some(tls_host) = tls_host.as_deref()
-        && let Some(request_host) = header_host.as_deref().or(uri_host.as_deref())
-    {
-        reconcile_authorities(&[tls_host, request_host], state.authority_fallback_port())
-            .map_err(|error| error.into_boxed("HTTP request conflicts with TLS server identity"))?;
-    }
+    let ip_fallback = (request.version() == Version::HTTP_10).then(|| {
+        authority_for_policy(
+            &state.destination.ip().to_string(),
+            state.destination.port(),
+        )
+    });
 
-    let host = header_host
-        .or(uri_host)
-        .or(tls_host)
-        .or_else(|| {
-            (request.version() == Version::HTTP_10).then(|| {
-                authority_for_policy(
-                    &state.destination.ip().to_string(),
-                    state.destination.port(),
-                )
-            })
-        })
-        .ok_or_else(|| BoxError::from_static_str("HTTP request has no authority"))?;
-
-    let scheme = if state.tls { "https" } else { "http" };
-    let authority = normalize_authority(&host, state.authority_fallback_port())?;
+    let authority = resolve_request_authority(
+        header_host,
+        uri_host,
+        tls_host,
+        ip_fallback,
+        state.authority_fallback_port(),
+    )?;
     let target = request_target(request);
 
     let path = target
         .split_once('?')
         .map_or(target.as_str(), |(path, _)| path)
         .to_owned();
+
+    let scheme = if state.tls { "https" } else { "http" };
 
     let raw_query = request.uri().query().map(|query| query.to_string());
     semantic_http_version(request.version())?;
