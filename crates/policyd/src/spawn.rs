@@ -209,8 +209,8 @@ impl PolicyStore {
     }
 }
 
-/// Spawn the policy UI (throttled to the key built from uid, session and
-/// paths) when no matching UI is connected.
+/// Spawn the policy UI (throttled to the key built from uid, session and paths)
+/// when no matching UI is connected.
 ///
 /// Child spawn and wait errors are logged and swallowed by the caller.
 pub fn maybe_spawn_ui<S: BuildHasher>(
@@ -269,12 +269,7 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
         return;
     };
 
-    let UiSpawnCmd {
-        mut command,
-        log_path: ui_log_path,
-        env,
-    } = build_ui_spawn_command_env(&runuser, args, &cmd, &user, uid, spawn);
-
+    let mut command = build_ui_spawn_command(&runuser, args, &cmd, &user, uid, spawn);
     let spawn_result = command.spawn();
 
     let Ok(mut child) = spawn_result else {
@@ -293,60 +288,55 @@ pub fn maybe_spawn_ui<S: BuildHasher>(
             tracing::warn!(
                 uid,
                 exit_code = ?status.code(),
-                log_path = %ui_log_path.display(),
                 "policy UI spawn exited early"
             );
-            return;
         }
 
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::info!(uid, user = %user.name, "spawned policy UI");
+
+            if let Some(notify) = tool_path("AGENT_SANDBOX_NOTIFY_SEND", "notify-send") {
+                let env = ui_spawn_env(
+                    args,
+                    &user,
+                    uid,
+                    spawn.home,
+                    spawn.cwd,
+                    spawn.project_root,
+                    spawn.sandbox_session_id,
+                );
+                let _ = Command::new(&runuser)
+                    .args([
+                        "-p",
+                        "-u",
+                        &user.name,
+                        "--",
+                        &notify,
+                        "agent-sandbox",
+                        "Approval needed. Respond to the policy prompt.",
+                    ])
+                    .envs(env)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
 
         Err(err) => {
             tracing::warn!(uid, error = %err, "policy UI spawn wait failed");
-            return;
         }
     }
-
-    tracing::info!(
-        uid,
-        user = %user.name,
-        log_path = %ui_log_path.display(),
-        "spawned policy UI"
-    );
-
-    if let Some(notify) = tool_path("AGENT_SANDBOX_NOTIFY_SEND", "notify-send") {
-        let _ = Command::new(&runuser)
-            .args([
-                "-p",
-                "-u",
-                &user.name,
-                "--",
-                &notify,
-                "agent-sandbox",
-                "Approval needed. Respond to the policy prompt.",
-            ])
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
 }
 
-struct UiSpawnCmd {
-    command: std::process::Command,
-    log_path: PathBuf,
-    env: HashMap<String, String>,
-}
-
-fn build_ui_spawn_command_env(
+fn build_ui_spawn_command(
     runuser: &str,
     args: &PolicydArgs,
     cmd: &str,
     user: &User,
     uid: u32,
     spawn: &UiSpawnContext<'_>,
-) -> UiSpawnCmd {
+) -> std::process::Command {
     let env = ui_spawn_env(
         args,
         user,
@@ -356,14 +346,6 @@ fn build_ui_spawn_command_env(
         spawn.project_root,
         spawn.sandbox_session_id,
     );
-
-    let ui_log_path = PathBuf::from(format!("/run/user/{uid}/agent-sandbox-ui.log"));
-
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&ui_log_path)
-        .map_or_else(|_| Stdio::null(), Stdio::from);
 
     let mut command = std::process::Command::new(runuser);
 
@@ -387,10 +369,11 @@ fn build_ui_spawn_command_env(
     }
 
     command
-        .envs(&env)
+        .env_clear()
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr);
+        .stderr(Stdio::null());
 
     #[cfg(unix)]
     {
@@ -398,9 +381,51 @@ fn build_ui_spawn_command_env(
         command.process_group(0);
     }
 
-    UiSpawnCmd {
-        command,
-        log_path: ui_log_path,
-        env,
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_command_clears_environment_and_discards_stderr() {
+        let args = PolicydArgs {
+            host_socket: "/run/agent-sandbox/policy.sock".into(),
+            sandbox_socket: "/run/agent-sandbox/sandbox-policy.sock".into(),
+            proxy_socket: None,
+            proxy_gid: None,
+            declarative: "/etc/agent-sandbox/policy.json".into(),
+            export_json: "/run/agent-sandbox/policy-state.json".into(),
+            export_nix: None,
+            approval_timeout: Duration::from_secs(30),
+            interactive_approval: true,
+            ui_spawn_cmd: Some("/bin/agent-sandbox-ui".into()),
+            package_declarative: Vec::new(),
+            fs_monitor_cmd: None,
+            syscall_broker_cmd: None,
+        };
+        let user = User::from_uid(nix::unistd::Uid::current())
+            .expect("uid lookup")
+            .expect("current user");
+        let spawn = UiSpawnContext {
+            has_matching_ui: false,
+            uid: Some(user.uid.as_raw()),
+            home: Some(Path::new("/tmp")),
+            cwd: None,
+            project_root: None,
+            sandbox_session_id: None,
+        };
+        let command = build_ui_spawn_command(
+            "/run/current-system/sw/bin/runuser",
+            &args,
+            "/bin/agent-sandbox-ui",
+            &user,
+            user.uid.as_raw(),
+            &spawn,
+        );
+        let debug = format!("{command:?}");
+        assert!(!debug.contains("agent-sandbox-ui.log"));
+        assert!(debug.contains("runuser"));
     }
 }
