@@ -9,8 +9,8 @@ use std::{
 
 use agent_sandbox_core::{
     AttributionToken, DbusTarget, FileAccess, FlowRegistration, HttpContextKey, HttpRequest,
-    HttpRuleTarget, PendingHttpId, ProxyConnectionId, ProxySessionToken, ResolvedRequestContext,
-    ResourceAccess, ResourceKind, SocketIdentity, VerdictSource,
+    HttpRuleTarget, PendingHttpId, PendingSummary, ProxyConnectionId, ProxySessionToken,
+    ResolvedRequestContext, ResourceAccess, ResourceKind, SocketIdentity, VerdictSource,
 };
 use tokio::{
     net::unix::OwnedWriteHalf,
@@ -443,6 +443,67 @@ impl Pending {
             Self::Filesystem(p) => p.sandbox_session_id.as_deref(),
             Self::Resource(p) => p.sandbox_session_id.as_deref(),
             Self::Dbus(p) => p.sandbox_session_id.as_deref(),
+        }
+    }
+}
+
+/// The single `Pending` → `PendingSummary` conversion: the status RPC and the
+/// tests both render through this impl so the six-arm mapping lives once.
+impl From<&Pending> for PendingSummary {
+    fn from(pending: &Pending) -> Self {
+        match pending {
+            Pending::Network(net) => Self::Network {
+                id: net.id.clone(),
+                host: Some(net.host.clone()),
+                port: Some(net.port),
+                scheme: Some(net.scheme.clone()),
+                url: Some(net.url.clone()),
+                cwd: net.cwd.clone(),
+                home: net.home.clone(),
+                package: net.package.clone(),
+            },
+            Pending::Http(http) => Self::Http {
+                id: http.pending_id,
+                request: http.request.clone(),
+                cwd: http.context.cwd.clone(),
+                home: http.context.home.clone(),
+                project_root: http.context.project_root.clone(),
+                sandbox_session_id: http.context.sandbox_session_id.clone(),
+                package: http.package.clone(),
+            },
+            Pending::Elevation(elev) => Self::Elevation {
+                id: elev.id.clone(),
+                argv: Some(elev.argv.clone()),
+                cwd: elev.cwd.clone(),
+                home: elev.home.clone(),
+                package: elev.package.clone(),
+            },
+            Pending::Filesystem(fs) => Self::Filesystem {
+                id: fs.id.clone(),
+                path: Some(fs.path.clone()),
+                access: Some(fs.access),
+                cwd: fs.cwd.clone(),
+                home: fs.home.clone(),
+                package: fs.package.clone(),
+            },
+            Pending::Resource(res) => Self::Resource {
+                id: res.id.clone(),
+                resource_kind: res.kind,
+                path: Some(res.path.clone()),
+                access: Some(res.access),
+                cwd: res.cwd.clone(),
+                home: res.home.clone(),
+                package: res.package.clone(),
+            },
+            Pending::Dbus(dbus) => Self::Dbus {
+                id: dbus.id.clone(),
+                target: dbus.target.clone(),
+                cwd: dbus.cwd.clone(),
+                home: dbus.home.clone(),
+                project_root: dbus.project_root.clone(),
+                sandbox_session_id: dbus.sandbox_session_id.clone(),
+                package: dbus.package.clone(),
+            },
         }
     }
 }
