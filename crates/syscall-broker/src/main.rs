@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use agent_sandbox_core::{InodeIdentity, ResourceKind};
+use agent_sandbox_core::{InodeIdentity, NetworkOwnership, ResourceKind};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
     FilesystemMutation, FilesystemTarget, NetworkMode, PersistentPolicyClient, ResourceTarget,
@@ -190,7 +190,10 @@ async fn main() -> std::io::Result<()> {
             &notif,
             timeout,
             dispatch::NetworkPolicyBypass {
-                mode: network_mode,
+                ownership: NetworkOwnership {
+                    proxy_mode: network_mode == NetworkMode::Proxy,
+                    udp_proxy_ports: Vec::new(),
+                },
                 dns_endpoint,
             },
         )

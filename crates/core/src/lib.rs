@@ -67,4 +67,4 @@ pub use scope_target::{ScopeContext, ScopeTarget};
 pub use socket_owner::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };
-pub use transport::{is_http_service_port, scheme_for};
+pub use transport::{FlowOwner, NetworkOwnership, is_http_service_port, scheme_for};

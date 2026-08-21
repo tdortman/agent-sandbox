@@ -11,9 +11,9 @@ use std::{
 
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
-    FlowContext, FlowRegistration, NetworkFlowKey, NormalizedPolicyHost, OwnerSnapshot,
-    SandboxPaths, SocketIdentity, is_http_service_port, lookup_dns_cache, mappings_from_response,
-    sandbox_session_id_from_pid,
+    FlowContext, FlowOwner, FlowRegistration, NetworkFlowKey, NetworkOwnership,
+    NormalizedPolicyHost, OwnerSnapshot, SandboxPaths, SocketIdentity, lookup_dns_cache,
+    mappings_from_response, sandbox_session_id_from_pid,
 };
 use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
@@ -46,8 +46,7 @@ pub struct NfqState {
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
     pub(crate) nft_binary: String,
-    proxy_mode: bool,
-    udp_proxy_ports: Vec<u16>,
+    ownership: NetworkOwnership,
 }
 
 impl NfqState {
@@ -76,12 +75,14 @@ impl NfqState {
             ))),
             dns_server_ip: cli.dns_server_ip,
             nft_binary: cli.nft_binary.clone(),
-            proxy_mode: cli.proxy_mode,
-            udp_proxy_ports: cli
-                .udp_proxy_ports
-                .split(',')
-                .filter_map(|port| port.trim().parse::<u16>().ok())
-                .collect(),
+            ownership: NetworkOwnership {
+                proxy_mode: cli.proxy_mode,
+                udp_proxy_ports: cli
+                    .udp_proxy_ports
+                    .split(',')
+                    .filter_map(|port| port.trim().parse::<u16>().ok())
+                    .collect(),
+            },
         }
     }
 
@@ -149,7 +150,11 @@ pub fn mark_accepted_proxy_udp(
     verdict: Verdict,
     meta: Option<packet::PacketMeta>,
 ) {
-    if verdict != Verdict::Accept || !state.proxy_mode {
+    if verdict != Verdict::Accept {
+        return;
+    }
+
+    if !state.ownership.proxy_mode {
         return;
     }
 
@@ -162,20 +167,15 @@ pub fn mark_accepted_proxy_udp(
         && meta.src_ip == state.dns_server_ip
         && meta.src_port == 53;
 
-    if meta.protocol == packet::TransportProtocol::Udp
-        && !meta.dst_ip.is_loopback()
-        && state.udp_proxy_port(meta.dst_port)
-        && !dns_response
+    if !dns_response
+        && matches!(
+            state
+                .ownership
+                .flow_owner(packet::TransportProtocol::Udp, meta.dst_ip, meta.dst_port),
+            FlowOwner::ProxyBackend
+        )
     {
         message.set_nfmark(PROXY_MARK);
-    }
-}
-
-impl NfqState {
-    /// Whether this UDP port's flows are registered for the transparent
-    /// HTTP/3 proxy.
-    fn udp_proxy_port(&self, port: u16) -> bool {
-        self.udp_proxy_ports.contains(&port)
     }
 }
 
@@ -389,25 +389,21 @@ pub fn handle_packet_payload_with_registration(
 
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
 
-    let tcp_proxy_flow = state.proxy_mode
-        && !meta.dst_ip.is_loopback()
-        && is_http_service_port(meta.protocol, meta.dst_port);
-
-    let udp_proxy_flow = state.proxy_mode
-        && !meta.dst_ip.is_loopback()
-        && meta.protocol == packet::TransportProtocol::Udp
-        && state.udp_proxy_port(meta.dst_port);
+    let proxy_flow = matches!(
+        state
+            .ownership
+            .flow_owner(meta.protocol, meta.dst_ip, meta.dst_port),
+        FlowOwner::ProxyBackend
+    );
 
     // QUIC sends its opening burst of datagrams before the first packet's
     // verdict can confirm the flow, so already-registered flows skip the
     // verdict RPCs entirely.
-    if (tcp_proxy_flow || udp_proxy_flow)
-        && is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity))
-    {
+    if proxy_flow && is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity)) {
         return (Verdict::Accept, Some(meta));
     }
 
-    if tcp_proxy_flow || udp_proxy_flow {
+    if proxy_flow {
         let Some(register) = register else {
             warn!("proxy mode has no registration RPC handler");
             return (Verdict::Drop, Some(meta));
@@ -514,18 +510,11 @@ pub mod tests {
             cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
-            proxy_mode: false,
-            udp_proxy_ports: vec![443],
+            ownership: NetworkOwnership {
+                proxy_mode: false,
+                udp_proxy_ports: vec![443],
+            },
         }
-    }
-
-    #[test]
-    fn proxy_flow_ports_match_routed_protocols() {
-        for port in [80, 443, 8008, 8080, 8443] {
-            assert!(is_http_service_port(FlowProtocol::Tcp, port));
-        }
-
-        assert!(!is_http_service_port(FlowProtocol::Tcp, 853));
     }
 
     #[test]
@@ -536,10 +525,23 @@ pub mod tests {
             "--udp-proxy-ports",
             "443,4444",
         ]));
-        assert!(state.udp_proxy_port(443));
-        assert!(state.udp_proxy_port(4444));
-        assert!(!state.udp_proxy_port(8443));
-        assert!(!state.udp_proxy_port(80));
+
+        assert_eq!(
+            state.ownership.flow_owner(
+                packet::TransportProtocol::Udp,
+                "93.184.216.34".parse().expect("public IP"),
+                4444
+            ),
+            FlowOwner::ProxyBackend
+        );
+        assert_eq!(
+            state.ownership.flow_owner(
+                packet::TransportProtocol::Udp,
+                "93.184.216.34".parse().expect("public IP"),
+                8443
+            ),
+            FlowOwner::DirectPolicy
+        );
     }
 
     #[test]
@@ -581,7 +583,7 @@ pub mod tests {
         let (_server, _) = listener.accept().expect("accept client");
         let client_addr = client.local_addr().expect("client address");
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
 
         state
             .dns_cache
@@ -660,7 +662,7 @@ pub mod tests {
 
         let client_addr = socket.local_addr().expect("socket address");
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
 
         state
             .dns_cache
@@ -732,7 +734,7 @@ pub mod tests {
         let source_ip = Ipv4Addr::new(192, 0, 2, 1);
         let source_port: u16 = 49152;
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
 
         state
             .dns_cache
@@ -788,7 +790,7 @@ pub mod tests {
 
         let client_addr = socket.local_addr().expect("socket address");
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
         state.nft_binary = "true".to_string();
 
         state
@@ -853,7 +855,7 @@ pub mod tests {
 
         let client_addr = socket.local_addr().expect("socket address");
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
 
         state
             .dns_cache
@@ -921,7 +923,7 @@ pub mod tests {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
         let client_addr = socket.local_addr().expect("socket address");
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
 
         {
             let mut flows = state.approved_flows.lock().expect("lock approved flows");
@@ -980,7 +982,7 @@ pub mod tests {
     fn proxy_mode_checks_loopback_transport_without_proxy_registration() {
         let state = {
             let mut state = state_for_tests();
-            state.proxy_mode = true;
+            state.ownership.proxy_mode = true;
             state
                 .dns_cache
                 .lock()
@@ -1058,7 +1060,7 @@ pub mod tests {
     #[test]
     fn proxy_mode_checks_ipv6_loopback_transport_without_proxy_registration() {
         let mut state = state_for_tests();
-        state.proxy_mode = true;
+        state.ownership.proxy_mode = true;
 
         state
             .dns_cache

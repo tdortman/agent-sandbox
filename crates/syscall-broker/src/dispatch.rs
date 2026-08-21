@@ -1,17 +1,16 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
-use agent_sandbox_core::{FlowProtocol, ResourceKind, is_http_service_port};
+use agent_sandbox_core::{NetworkOwnership, ResourceKind};
 use agent_sandbox_syscall_broker::{
-    NetworkMode, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
-    SyscallTarget, notification_arch_valid, send_response,
+    PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget,
+    notification_arch_valid, send_response,
 };
 use tracing::{debug, info, warn};
 
 use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
 
 fn should_bypass_network_policy(
-    network_mode: NetworkMode,
-    dns_endpoint: Option<SocketAddr>,
+    network_policy: &NetworkPolicyBypass,
     facts: &NormalizedNotification,
 ) -> bool {
     let NormalizedNotification::Target {
@@ -21,35 +20,17 @@ fn should_bypass_network_policy(
         return false;
     };
 
-    let is_configured_dns = dns_endpoint.is_some_and(|endpoint| {
-        endpoint.port() == target.port && target.host.parse() == Ok(endpoint.ip())
-    });
-
-    if is_configured_dns {
-        return true;
-    }
-
-    if network_mode != NetworkMode::Proxy {
-        return false;
-    }
-
-    // The proxy backend owns the registered HTTP(S) service ports, so the
-    // syscall gate must not double-gate them.
-    if target.scheme == "tcp" && is_http_service_port(FlowProtocol::Tcp, target.port) {
-        return true;
-    }
-
-    // In proxy mode the nfq base table queues new UDP flows (except DNS to
-    // the forwarder) for a transport check: one deduped prompt per host:port,
-    // then established flows pass via the conntrack rule. UDP policy lives
-    // at the packet filter, so the syscall gate must not double-gate every
-    // sendto/connect with a per-syscall prompt.
-    target.scheme == "udp"
+    network_policy.ownership.syscall_gate_skips(
+        &target.scheme,
+        &target.host,
+        target.port,
+        network_policy.dns_endpoint,
+    )
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkPolicyBypass {
-    pub mode: NetworkMode,
+    pub ownership: NetworkOwnership,
     pub dns_endpoint: Option<SocketAddr>,
 }
 
@@ -110,8 +91,7 @@ pub async fn dispatch_notification_with_mode(
         // every other notification; routing this infrastructure connection
         // back through the resource policy would deadlock the gate.
         ResponsePlan::Continue
-    } else if should_bypass_network_policy(network_policy.mode, network_policy.dns_endpoint, &facts)
-    {
+    } else if should_bypass_network_policy(&network_policy, &facts) {
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // also delegates only its transparent service ports.
         ResponsePlan::Continue
@@ -224,9 +204,22 @@ fn execute_response_plan(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    use agent_sandbox_core::NetworkOwnership;
     use agent_sandbox_syscall_broker::NetworkTarget;
 
-    use super::{NetworkMode, NormalizedNotification, SyscallTarget, should_bypass_network_policy};
+    use super::{
+        NetworkPolicyBypass, NormalizedNotification, SyscallTarget, should_bypass_network_policy,
+    };
+
+    fn bypass(proxy_mode: bool, dns_endpoint: Option<SocketAddr>) -> NetworkPolicyBypass {
+        NetworkPolicyBypass {
+            ownership: NetworkOwnership {
+                proxy_mode,
+                udp_proxy_ports: Vec::new(),
+            },
+            dns_endpoint,
+        }
+    }
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
         NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
             host: host.to_owned(),
@@ -240,14 +233,12 @@ mod tests {
         let dns_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1)), 53);
 
         assert!(should_bypass_network_policy(
-            NetworkMode::Direct,
-            Some(dns_endpoint),
+            &bypass(false, Some(dns_endpoint)),
             &target("udp", "169.254.100.1", 53)
         ));
 
         assert!(should_bypass_network_policy(
-            NetworkMode::Proxy,
-            Some(dns_endpoint),
+            &bypass(true, Some(dns_endpoint)),
             &target("tcp", "169.254.100.1", 53)
         ));
     }
@@ -257,20 +248,17 @@ mod tests {
         let dns_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1)), 53);
 
         assert!(!should_bypass_network_policy(
-            NetworkMode::Direct,
-            Some(dns_endpoint),
+            &bypass(false, Some(dns_endpoint)),
             &target("udp", "169.254.100.2", 53)
         ));
 
         assert!(!should_bypass_network_policy(
-            NetworkMode::Direct,
-            Some(dns_endpoint),
+            &bypass(false, Some(dns_endpoint)),
             &target("udp", "169.254.100.1", 5353)
         ));
 
         assert!(!should_bypass_network_policy(
-            NetworkMode::Direct,
-            None,
+            &bypass(false, None),
             &target("udp", "169.254.100.1", 53)
         ));
     }
@@ -278,20 +266,17 @@ mod tests {
     #[test]
     fn proxy_mode_bypasses_tcp_proxy_ports_and_all_udp() {
         assert!(should_bypass_network_policy(
-            NetworkMode::Proxy,
-            None,
+            &bypass(true, None),
             &target("tcp", "192.0.2.10", 443)
         ));
 
         assert!(should_bypass_network_policy(
-            NetworkMode::Proxy,
-            None,
+            &bypass(true, None),
             &target("tcp", "192.0.2.10", 80)
         ));
 
         assert!(!should_bypass_network_policy(
-            NetworkMode::Proxy,
-            None,
+            &bypass(true, None),
             &target("tcp", "192.0.2.10", 853)
         ));
 
@@ -300,8 +285,7 @@ mod tests {
         // the syscall gate must not add a per-sendto prompt on top.
         for port in [53, 80, 443, 853, 4444, 5353] {
             assert!(should_bypass_network_policy(
-                NetworkMode::Proxy,
-                None,
+                &bypass(true, None),
                 &target("udp", "192.0.2.10", port)
             ));
         }
@@ -309,20 +293,17 @@ mod tests {
         // Direct mode keeps UDP transport checks: there the packet filter
         // queues every UDP datagram for policy.
         assert!(!should_bypass_network_policy(
-            NetworkMode::Direct,
-            None,
+            &bypass(false, None),
             &target("tcp", "192.0.2.10", 443)
         ));
 
         assert!(!should_bypass_network_policy(
-            NetworkMode::Direct,
-            None,
+            &bypass(false, None),
             &target("udp", "192.0.2.10", 4444)
         ));
 
         assert!(!should_bypass_network_policy(
-            NetworkMode::Proxy,
-            None,
+            &bypass(true, None),
             &NormalizedNotification::continue_()
         ));
     }
