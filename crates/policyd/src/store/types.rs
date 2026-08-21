@@ -337,22 +337,20 @@ pub(super) struct PendingContext<'a> {
     pub(super) package: Option<&'a str>,
 }
 
-/// Discriminated union of pending approval requests.
-///
-/// The variant determines which fields are meaningful:
-#[derive(Debug, Clone)]
+/// Pending approval awaiting a policy decision.
+#[derive(Clone)]
 pub enum Pending {
-    /// Elevation approval pending.
+    /// Privileged command request.
     Elevation(PendingElevation),
-    /// Network approval pending.
+    /// Network connection request.
     Network(PendingNetwork),
-    /// HTTP approval pending.
+    /// HTTP request.
     Http(PendingHttp),
-    /// Filesystem approval pending.
+    /// Filesystem access request.
     Filesystem(PendingFilesystem),
-    /// Resource approval pending.
+    /// Named resource request.
     Resource(PendingResource),
-    /// D-Bus approval pending.
+    /// Session-bus request.
     Dbus(PendingDbus),
 }
 

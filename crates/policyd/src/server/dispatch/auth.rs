@@ -27,6 +27,9 @@ pub enum SocketRole {
 ///
 /// The privileged NFQ daemon also uses the sandbox socket for flow
 /// registration; dispatch separately restricts that request to root peers.
+/// Whether the request is an operation permitted from the sandbox socket.
+///
+/// This is a positive allowlist: control requests are intentionally absent.
 #[must_use]
 pub const fn is_sandbox_request(req: &RpcRequest) -> bool {
     matches!(
