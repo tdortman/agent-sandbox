@@ -8,8 +8,10 @@ use agent_sandbox_core::{
 };
 
 use super::{
-    ScopePersistFlags, apply_persistent_scope, decisions::DecisionAction,
-    persist::PersistResourceRuleArgs, types::PolicyStore,
+    decisions::DecisionAction,
+    persist::PersistResourceRuleArgs,
+    scope_apply::{ScopeLadder, ScopePersistFlags},
+    types::PolicyStore,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 
@@ -38,67 +40,54 @@ impl PolicyStore {
         let home = paths.home();
         let project_root = paths.project_root();
 
-        let target = match self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
-                home,
-                project_root,
-                package.as_deref(),
-            )
-            .await
-        {
-            Ok(target) => target,
-            Err(reply) => return *reply,
-        };
+        let key = FilesystemRuleKey::new(expand_policy_path(&path, home, project_root), access);
 
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
 
-        let persist =
-            |policy_path: &Path, home: Option<&Path>, invalidate: bool| -> std::io::Result<()> {
-                Self::persist_filesystem_rule(
-                    policy_path,
-                    &path,
-                    access,
-                    scope_label,
-                    matches!(action, DecisionAction::Approve),
-                    home,
-                    owner_uid,
-                )?;
+        let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
+            Self::persist_filesystem_rule(
+                policy_path,
+                &path,
+                access,
+                scope_label,
+                matches!(action, DecisionAction::Approve),
+                home,
+                owner_uid,
+            )
+        };
 
-                if invalidate {
-                    self.invalidate_merged_policy_cache();
-                }
+        if let Err(err) = self
+            .apply_scope_ladder(
+                ScopeLadder {
+                    scope,
+                    session_id: session_id.as_deref(),
+                    package: package.as_deref(),
+                    paths: &paths,
+                    flags: ScopePersistFlags::new(true, true),
+                    project_log: Some("project filesystem policy saved"),
+                    project_package_log: Some("project package filesystem policy saved"),
+                },
+                |inner, target| {
+                    match target {
+                        ScopeTarget::Ephemeral => {}
 
-                Ok(())
-            };
+                        ScopeTarget::Session { session_id } => {
+                            inner.session.filesystem().apply(action, session_id, &key);
+                        }
 
-        match target {
-            ScopeTarget::Ephemeral => {}
+                        ScopeTarget::Global { .. }
+                        | ScopeTarget::GlobalPackage { .. }
+                        | ScopeTarget::Project { .. }
+                        | ScopeTarget::ProjectPackage { .. } => {}
+                    }
 
-            ScopeTarget::Session { session_id } => {
-                let resolved_path = expand_policy_path(&path, home, project_root);
-                let key = FilesystemRuleKey::new(resolved_path, access);
-                let mut inner = self.inner.lock().await;
-                inner.session.filesystem().apply(action, &session_id, &key);
-                drop(inner);
-            }
-
-            ScopeTarget::Global { .. }
-            | ScopeTarget::GlobalPackage { .. }
-            | ScopeTarget::Project { .. }
-            | ScopeTarget::ProjectPackage { .. } => {
-                if let Err(err) = apply_persistent_scope(
-                    target,
-                    home,
-                    ScopePersistFlags::new(true, true),
-                    Some("project filesystem policy saved"),
-                    Some("project package filesystem policy saved"),
-                    persist,
-                ) {
-                    return err.into();
-                }
-            }
+                    Ok(())
+                },
+                &mut persist,
+            )
+            .await
+        {
+            return err.into();
         }
 
         let scope_label = scope.as_str();
@@ -139,68 +128,53 @@ impl PolicyStore {
             package,
         } = wire;
 
-        let home = paths.home();
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
-        let project_root = paths.project_root();
 
-        let scope_target = match self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
+        let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
+            Self::persist_dbus_rule(
+                policy_path,
+                &target,
+                scope_label,
+                action == DecisionAction::Approve,
                 home,
-                project_root,
-                package.as_deref(),
+                owner_uid,
             )
-            .await
-        {
-            Ok(target) => target,
-            Err(reply) => return *reply,
         };
 
-        let persist =
-            |policy_path: &Path, home: Option<&Path>, invalidate: bool| -> std::io::Result<()> {
-                Self::persist_dbus_rule(
-                    policy_path,
-                    &target,
-                    scope_label,
-                    action == DecisionAction::Approve,
-                    home,
-                    owner_uid,
-                )?;
+        let applied = self
+            .apply_scope_ladder(
+                ScopeLadder {
+                    scope,
+                    session_id: session_id.as_deref(),
+                    package: package.as_deref(),
+                    paths: &paths,
+                    flags: ScopePersistFlags::new(false, true),
+                    project_log: None,
+                    project_package_log: None,
+                },
+                |inner, scope_target| {
+                    match scope_target {
+                        ScopeTarget::Ephemeral => {}
 
-                if invalidate {
-                    self.invalidate_merged_policy_cache();
-                }
+                        ScopeTarget::Session { session_id } => {
+                            inner.session.dbus().apply(action, session_id, &target);
+                        }
 
-                Ok(())
-            };
+                        ScopeTarget::Global { .. }
+                        | ScopeTarget::GlobalPackage { .. }
+                        | ScopeTarget::Project { .. }
+                        | ScopeTarget::ProjectPackage { .. } => {}
+                    }
 
-        let policy_path = match scope_target {
-            ScopeTarget::Ephemeral => None,
+                    Ok(())
+                },
+                &mut persist,
+            )
+            .await;
 
-            ScopeTarget::Session { session_id } => {
-                let mut inner = self.inner.lock().await;
-                inner.session.dbus().apply(action, &session_id, &target);
-                drop(inner);
-                None
-            }
-
-            ScopeTarget::Global { .. }
-            | ScopeTarget::GlobalPackage { .. }
-            | ScopeTarget::Project { .. }
-            | ScopeTarget::ProjectPackage { .. } => {
-                match apply_persistent_scope(
-                    scope_target,
-                    home,
-                    ScopePersistFlags::new(false, true),
-                    None,
-                    None,
-                    persist,
-                ) {
-                    Ok(path) => path,
-                    Err(err) => return err.into(),
-                }
-            }
+        let policy_path = match applied {
+            Ok(applied) => applied.policy_path,
+            Err(err) => return err.into(),
         };
 
         let _ = self.export_policy_files(paths);
@@ -237,70 +211,55 @@ impl PolicyStore {
             package,
         } = wire;
 
-        let home = paths.home();
-        let project_root = paths.project_root();
+        let key = ResourceRuleKey::new(kind, &path, access);
 
-        let target = match self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
+        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
+
+        let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
+            Self::persist_resource_rule(&PersistResourceRuleArgs {
+                path: policy_path,
+                kind,
+                rule_path: &path,
+                access,
+                label: scope_label,
+                allow_rule: matches!(action, DecisionAction::Approve),
                 home,
-                project_root,
-                package.as_deref(),
+                owner_uid,
+            })
+        };
+
+        if let Err(err) = self
+            .apply_scope_ladder(
+                ScopeLadder {
+                    scope,
+                    session_id: session_id.as_deref(),
+                    package: package.as_deref(),
+                    paths: &paths,
+                    flags: ScopePersistFlags::new(false, true),
+                    project_log: Some("project resource policy saved"),
+                    project_package_log: Some("project package resource policy saved"),
+                },
+                |inner, target| {
+                    match target {
+                        ScopeTarget::Ephemeral => {}
+
+                        ScopeTarget::Session { session_id } => {
+                            inner.session.resource().apply(action, session_id, &key);
+                        }
+
+                        ScopeTarget::Global { .. }
+                        | ScopeTarget::GlobalPackage { .. }
+                        | ScopeTarget::Project { .. }
+                        | ScopeTarget::ProjectPackage { .. } => {}
+                    }
+
+                    Ok(())
+                },
+                &mut persist,
             )
             .await
         {
-            Ok(target) => target,
-            Err(reply) => return *reply,
-        };
-
-        let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
-        let key = ResourceRuleKey::new(kind, &path, access);
-
-        let persist =
-            |policy_path: &Path, home: Option<&Path>, invalidate: bool| -> std::io::Result<()> {
-                Self::persist_resource_rule(&PersistResourceRuleArgs {
-                    path: policy_path,
-                    kind,
-                    rule_path: &path,
-                    access,
-                    label: scope_label,
-                    allow_rule: matches!(action, DecisionAction::Approve),
-                    home,
-                    owner_uid,
-                })?;
-
-                if invalidate {
-                    self.invalidate_merged_policy_cache();
-                }
-
-                Ok(())
-            };
-
-        match target {
-            ScopeTarget::Ephemeral => {}
-
-            ScopeTarget::Session { session_id } => {
-                let mut inner = self.inner.lock().await;
-                inner.session.resource().apply(action, &session_id, &key);
-                drop(inner);
-            }
-
-            ScopeTarget::Global { .. }
-            | ScopeTarget::GlobalPackage { .. }
-            | ScopeTarget::Project { .. }
-            | ScopeTarget::ProjectPackage { .. } => {
-                if let Err(err) = apply_persistent_scope(
-                    target,
-                    home,
-                    ScopePersistFlags::new(false, true),
-                    Some("project resource policy saved"),
-                    Some("project package resource policy saved"),
-                    persist,
-                ) {
-                    return err.into();
-                }
-            }
+            return err.into();
         }
 
         let scope_label = scope.as_str();
@@ -332,14 +291,14 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     use agent_sandbox_core::{
-        ApprovalScope, FileAccess, Policy, ProcessIds, ResolvedRequestContext, RpcReply,
-        SandboxPaths, Verdict, VerdictSource,
+        ApprovalScope, DbusTarget, FileAccess, Policy, ProcessIds, ResolvedRequestContext,
+        ResourceAccess, ResourceKind, RpcReply, SandboxPaths, Verdict, VerdictSource, load_policy,
     };
 
     use super::*;
     use crate::{
         store::decisions::DecisionAction,
-        wire::{FilesystemScopeOp, ScopeWire},
+        wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire},
     };
 
     #[tokio::test]
@@ -741,6 +700,288 @@ mod tests {
         assert!(
             !project.join(".agent-sandbox/packages/omp.json").exists(),
             "no package project file may be written without attribution"
+        );
+    }
+
+    fn ui_writer() -> std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            tokio::net::UnixStream::pair()
+                .expect("unix stream pair")
+                .0
+                .into_split()
+                .1,
+        ))
+    }
+
+    /// Session-scope approvals validate the session against the registered
+    /// UI clients, so a test session exists only once a UI client carries it.
+    fn register_ui_session(store: &PolicyStore, id: &str) {
+        store
+            .inner
+            .try_lock()
+            .expect("the decision state lock is only held by this test")
+            .ui_clients
+            .insert(1, crate::store::types::UiClient {
+                session_id: id.to_string(),
+                writer: ui_writer(),
+            });
+    }
+
+    #[tokio::test]
+    async fn once_filesystem_scope_applies_nothing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let store = package_store(&dir);
+        let omp = package_ctx(&home, &project, Some("omp"));
+
+        let reply = store
+            .apply_filesystem_scope(
+                FilesystemScopeOp {
+                    path: PathBuf::from("/once/file"),
+                    access: FileAccess::Read,
+                    scope: ApprovalScope::Once,
+                    wire: ScopeWire::from_resolved(&omp, None),
+                },
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(matches!(reply, RpcReply::ScopeAction(_)));
+
+        let inner = store.inner.lock().await;
+
+        assert!(
+            inner.session.session_filesystem_allow.is_empty(),
+            "the filesystem ephemeral arm is a deliberate no-op"
+        );
+
+        assert!(
+            !project.join(".agent-sandbox/policy.json").exists()
+                && !home.join(".config/agent-sandbox/policy.json").exists(),
+            "a once filesystem approval must not persist anything"
+        );
+
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn session_filesystem_deny_wins_over_approve() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let store = package_store(&dir);
+        register_ui_session(&store, "sandbox-a");
+        let omp = package_ctx(&home, &project, None);
+        let omp_with_session = ResolvedRequestContext {
+            sandbox_session_id: Some("sandbox-a".into()),
+            ..omp
+        };
+
+        for action in [DecisionAction::Approve, DecisionAction::Deny] {
+            let reply = store
+                .apply_filesystem_scope(
+                    FilesystemScopeOp {
+                        path: PathBuf::from("/guarded/file"),
+                        access: FileAccess::ReadWrite,
+                        scope: ApprovalScope::Session,
+                        wire: ScopeWire::from_resolved(
+                            &omp_with_session,
+                            omp_with_session.sandbox_session_id.clone(),
+                        ),
+                    },
+                    action,
+                )
+                .await;
+
+            assert!(matches!(reply, RpcReply::ScopeAction(_)));
+        }
+
+        let inner = store.inner.lock().await;
+        let key = FilesystemRuleKey::new(PathBuf::from("/guarded/file"), FileAccess::ReadWrite);
+
+        assert!(
+            !inner
+                .session
+                .session_filesystem_allow
+                .get("sandbox-a")
+                .is_some_and(|bucket| bucket.contains(&key)),
+            "the later deny must remove the earlier session allow"
+        );
+
+        assert!(
+            inner
+                .session
+                .session_filesystem_deny
+                .get("sandbox-a")
+                .is_some_and(|bucket| bucket.contains(&key)),
+            "the deny must land in the filesystem deny bucket"
+        );
+
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn dbus_session_scope_applies_to_the_dbus_bucket() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let store = package_store(&dir);
+        register_ui_session(&store, "sandbox-a");
+        let omp = package_ctx(&home, &project, None);
+        let omp_with_session = ResolvedRequestContext {
+            sandbox_session_id: Some("sandbox-a".into()),
+            ..omp
+        };
+        let target = DbusTarget::default();
+
+        let reply = store
+            .apply_dbus_scope(
+                target.clone(),
+                ApprovalScope::Session,
+                ScopeWire::from_resolved(
+                    &omp_with_session,
+                    omp_with_session.sandbox_session_id.clone(),
+                ),
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(matches!(reply, RpcReply::ScopeAction(_)));
+
+        let inner = store.inner.lock().await;
+
+        assert!(
+            inner
+                .session
+                .session_dbus_allow
+                .get("sandbox-a")
+                .is_some_and(|bucket| bucket.contains(&target)),
+            "the session approval must land in the dbus allow bucket"
+        );
+
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn dbus_global_package_persists_home_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let store = package_store(&dir);
+        let omp = package_ctx(&home, &project, Some("omp"));
+        let target = DbusTarget::default();
+
+        let reply = store
+            .apply_dbus_scope(
+                target,
+                ApprovalScope::GlobalPackage,
+                ScopeWire::from_resolved(&omp, None),
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(matches!(reply, RpcReply::ScopeAction(_)));
+
+        let ext = home.join(".config/agent-sandbox/packages/omp.json");
+        let policy: Policy = load_policy(&ext, Some(&home), None);
+
+        assert_eq!(
+            policy.dbus.allow.len(),
+            1,
+            "the global package approval must persist one dbus rule to the home extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_session_scope_applies_to_the_resource_bucket() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let store = package_store(&dir);
+        register_ui_session(&store, "sandbox-a");
+        let omp = package_ctx(&home, &project, None);
+        let omp_with_session = ResolvedRequestContext {
+            sandbox_session_id: Some("sandbox-a".into()),
+            ..omp
+        };
+
+        let reply = store
+            .apply_resource_scope(
+                ResourceScopeOp {
+                    kind: ResourceKind::UnixSocket,
+                    path: PathBuf::from("/run/user/1000/bus"),
+                    access: ResourceAccess::default(),
+                    scope: ApprovalScope::Session,
+                    wire: ScopeWire::from_resolved(
+                        &omp_with_session,
+                        omp_with_session.sandbox_session_id.clone(),
+                    ),
+                },
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(matches!(reply, RpcReply::ScopeAction(_)));
+
+        let inner = store.inner.lock().await;
+        let key = ResourceRuleKey::new(
+            ResourceKind::UnixSocket,
+            "/run/user/1000/bus",
+            ResourceAccess::default(),
+        );
+
+        assert!(
+            inner
+                .session
+                .session_resource_allow
+                .get("sandbox-a")
+                .is_some_and(|bucket| bucket.contains(&key)),
+            "the session approval must land in the resource allow bucket"
+        );
+
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn resource_global_persists_user_policy() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let store = package_store(&dir);
+        let omp = package_ctx(&home, &project, None);
+
+        let reply = store
+            .apply_resource_scope(
+                ResourceScopeOp {
+                    kind: ResourceKind::UnixSocket,
+                    path: PathBuf::from("/run/user/1000/bus"),
+                    access: ResourceAccess::default(),
+                    scope: ApprovalScope::Global,
+                    wire: ScopeWire::from_resolved(&omp, None),
+                },
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(matches!(reply, RpcReply::ScopeAction(_)));
+
+        let policy: Policy = load_policy(
+            &home.join(".config/agent-sandbox/policy.json"),
+            Some(&home),
+            None,
+        );
+
+        assert_eq!(
+            policy.resources.allow.len(),
+            1,
+            "the global approval must persist one resource rule to the user policy"
         );
     }
 }

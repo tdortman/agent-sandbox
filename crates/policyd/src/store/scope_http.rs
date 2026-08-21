@@ -1,5 +1,7 @@
 //! Typed HTTP session/project/global scope mutations.
 
+use std::path::Path;
+
 use agent_sandbox_core::{
     ApprovalScope, HttpContextKey, HttpMethod, HttpMethodMatcher, HttpRequest, HttpRuleTarget,
     ProcessIds, ResolvedRequestContext, SandboxPaths, ScopeActionReply, ScopeTarget, VerdictSource,
@@ -8,6 +10,7 @@ use agent_sandbox_core::{
 use super::{
     decisions::DecisionAction,
     http::{http_context, target_for_request},
+    scope_apply::{ScopeApplyError, ScopeLadder, ScopePersistFlags},
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
 use crate::{error::PolicydError, wire::ScopeWire};
@@ -138,20 +141,48 @@ impl PolicyStore {
             return Err(PolicydError::InvalidDecisionTarget);
         }
 
-        let scope_target = self
-            .resolve_scope_target(
-                scope,
-                session_id.as_deref(),
-                ctx.paths.home_path().as_deref(),
-                ctx.paths.project_root_path().as_deref(),
-                ctx.package.as_deref(),
+        let context = http_context(&ctx);
+        // HTTP invalidation is broader than the ladder's merged-policy flag:
+        // every persistent write also drops the HTTP verdict cache, so this
+        // caller clears both caches itself after the ladder's write and the
+        // ladder's own invalidation stays off.
+        let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
+            Self::persist_http_rule(
+                policy_path,
+                &target,
+                comment.unwrap_or_else(|| scope.as_str()),
+                allowed,
+                home,
+                ctx.ids.uid(),
+            )
+        };
+
+        let applied = self
+            .apply_scope_ladder(
+                ScopeLadder {
+                    scope,
+                    session_id: session_id.as_deref(),
+                    package: ctx.package.as_deref(),
+                    paths: &ctx.paths,
+                    flags: ScopePersistFlags::new(false, false),
+                    project_log: None,
+                    project_package_log: None,
+                },
+                |inner, scope_target| {
+                    Self::clear_http_verdict_cache_locked(inner);
+                    apply_http_memory_locked(inner, &target, scope_target, &context, allowed)
+                },
+                &mut persist,
             )
             .await
-            .map_err(|reply| PolicydError::Proxy(format!("invalid HTTP scope: {reply:?}")))?;
+            .map_err(|err| match err {
+                ScopeApplyError::Resolve(reply) => {
+                    PolicydError::Proxy(format!("invalid HTTP scope: {reply:?}"))
+                }
+                ScopeApplyError::Memory(err) | ScopeApplyError::Persist(err) => err,
+            })?;
 
-        let context = http_context(&ctx);
-
-        let scope_path = match &scope_target {
+        let scope_path = match &applied.target {
             ScopeTarget::Global { policy_path, .. }
             | ScopeTarget::GlobalPackage { policy_path, .. }
             | ScopeTarget::Project { policy_path, .. }
@@ -159,24 +190,7 @@ impl PolicyStore {
             ScopeTarget::Session { .. } | ScopeTarget::Ephemeral => None,
         };
 
-        {
-            let mut inner = self.inner.lock().await;
-            Self::clear_http_verdict_cache_locked(&mut inner);
-            apply_http_memory_locked(&mut inner, &target, &scope_target, &context, allowed)?;
-        }
-
-        let home = ctx.paths.home_path();
-
-        if let Some(policy_path) = &scope_path {
-            Self::persist_http_rule(
-                policy_path,
-                &target,
-                comment.unwrap_or_else(|| scope.as_str()),
-                allowed,
-                home.as_deref(),
-                ctx.ids.uid(),
-            )?;
-
+        if scope_path.is_some() {
             self.merged_cache
                 .lock()
                 .map(|mut cache| cache.entries.clear())
@@ -663,6 +677,114 @@ mod tests {
         assert!(
             found,
             "project_package HTTP approval missing from {policy_path:?}"
+        );
+    }
+    fn direct_target() -> HttpRuleTarget {
+        HttpRuleTarget {
+            url: HttpUrl::parse("https://example.com/api").expect("valid URL"),
+            method: HttpMethodMatcher::Exact(HttpMethod::parse("GET").expect("valid method")),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_session_scope_applies_to_the_http_bucket() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ));
+
+        store
+            .inner
+            .try_lock()
+            .expect("the decision state lock is only held by this test")
+            .ui_clients
+            .insert(1, crate::store::types::UiClient {
+                session_id: "sandbox-a".to_string(),
+                writer: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    tokio::net::UnixStream::pair()
+                        .expect("unix stream pair")
+                        .0
+                        .into_split()
+                        .1,
+                )),
+            });
+
+        let ctx = ResolvedRequestContext::new(
+            SandboxPaths::new(&home, &home, &home),
+            ProcessIds::default(),
+            Some("sandbox-a".into()),
+        );
+
+        let reply = store
+            .approve_http(
+                direct_target(),
+                ApprovalScope::Session,
+                Some("sandbox-a".into()),
+                ctx,
+            )
+            .await
+            .expect("session approval must resolve");
+
+        assert!(
+            matches!(reply, ScopeActionReply::Http(_)),
+            "the direct approval must return an http scope action reply"
+        );
+
+        let inner = store.inner.lock().await;
+
+        assert_eq!(
+            inner
+                .session
+                .http_session_allow
+                .get("sandbox-a")
+                .map(std::collections::HashSet::len),
+            Some(1),
+            "the session approval must land in the http session allow bucket"
+        );
+
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn direct_global_package_persists_home_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            dir.path().join("export.json"),
+            Duration::from_secs(30),
+            true,
+        ));
+
+        let ctx = ResolvedRequestContext {
+            package: Some("omp".into()),
+            ..ResolvedRequestContext::new(
+                SandboxPaths::new(&home, &home, &home),
+                ProcessIds::default(),
+                None,
+            )
+        };
+
+        store
+            .approve_http(direct_target(), ApprovalScope::GlobalPackage, None, ctx)
+            .await
+            .expect("global package approval must resolve");
+
+        let ext = home.join(".config/agent-sandbox/packages/omp.json");
+
+        assert!(
+            ext.exists(),
+            "the global package approval must persist to the home extension file"
         );
     }
 }
