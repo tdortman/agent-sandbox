@@ -27,6 +27,7 @@ use hickory_proto::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::Semaphore,
 };
 use tracing::{debug, info, warn};
 
@@ -108,6 +109,10 @@ struct Args {
     #[arg(long)]
     suppress_https_svcb: bool,
 }
+const MAX_ADMITTED_WORK: usize = 256;
+const TCP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TCP_MAX_REQUESTS: usize = 128;
 
 #[derive(Clone)]
 struct DnsForwarder {
@@ -122,6 +127,7 @@ struct DnsForwarder {
     ech_config_list: Option<Vec<u8>>,
     forward_target: SocketAddr,
     forward_timeout: Duration,
+    admission: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -159,7 +165,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let push_socket = Arc::new(UnixDatagram::unbound()?);
-
     let forwarder = DnsForwarder {
         cache,
         max_ttl: args.max_ttl,
@@ -172,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ech_config_list,
         forward_target: args.forward_target,
         forward_timeout: Duration::from_millis(args.forward_timeout_ms),
+        admission: Arc::new(Semaphore::new(MAX_ADMITTED_WORK)),
     };
 
     let bind = format!("{}:{}", args.listen_host, args.listen_port);
@@ -184,10 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forward = %args.forward_target,
         "dns forwarder listening"
     );
-
     let udp = Arc::new(udp);
     let udp_forwarder = forwarder.clone();
-
     let udp_task = tokio::spawn(async move {
         let mut buf = vec![0_u8; 65_535];
         loop {
@@ -197,7 +201,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data = buf[..len].to_vec();
             let sock = Arc::clone(&udp);
             let forwarder = udp_forwarder.clone();
+            let Ok(permit) = forwarder.admission.clone().try_acquire_owned() else {
+                debug!(%peer, "dns work admission full; dropping udp request");
+                continue;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(err) = forwarder.handle_udp(data, peer, sock).await {
                     warn!(%peer, error = %err, "dns udp error");
                 }
@@ -213,7 +222,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             let forwarder = tcp_forwarder.clone();
+            let Ok(permit) = forwarder.admission.clone().try_acquire_owned() else {
+                debug!(%peer, "dns work admission full; rejecting tcp connection");
+                drop(stream);
+                continue;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(err) = forwarder.handle_tcp(stream, peer).await {
                     warn!(%peer, error = %err, "dns tcp error");
                 }
@@ -264,18 +279,21 @@ impl DnsForwarder {
     }
 
     async fn handle_tcp(&self, mut stream: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
-        loop {
-            let len = match stream.read_u16().await {
-                Ok(0) => continue,
-                Ok(n) => n,
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(err),
+        for _ in 0..TCP_MAX_REQUESTS {
+            let len = match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_u16()).await {
+                Ok(Ok(0)) => continue,
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Ok(()),
             };
 
             let mut data = vec![0_u8; usize::from(len)];
-
-            if stream.read_exact(&mut data).await.is_err() {
-                break;
+            match tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut data)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Ok(()),
             }
 
             let resp = match self.forward_tcp(&data).await {
@@ -309,7 +327,6 @@ impl DnsForwarder {
             stream.write_u16(resp_len).await?;
             stream.write_all(&resp).await?;
         }
-
         Ok(())
     }
 
@@ -559,7 +576,22 @@ mod tests {
             cache_client_ip: None,
             forward_target,
             forward_timeout: Duration::from_secs(2),
+            admission: Arc::new(Semaphore::new(MAX_ADMITTED_WORK)),
         }
+    }
+    #[tokio::test]
+    async fn stalled_tcp_length_read_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("accept");
+            forwarder.handle_tcp(stream, peer).await
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        drop(client);
+        let result = tokio::time::timeout(Duration::from_secs(1), server).await;
+        assert!(result.is_ok(), "closed stalled connection must be reaped");
     }
 
     fn upstream_txt_response() -> Vec<u8> {

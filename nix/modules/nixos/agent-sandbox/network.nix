@@ -682,9 +682,12 @@ lib.mkIf policyEnabled (
             );
 
             KillMode = "control-group";
+            LimitNOFILE = 2048;
+            MemoryMax = "256M";
             Restart = "on-failure";
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryPreserve = "yes";
+            TasksMax = 512;
           };
 
           bindsTo = [ "agent-sandbox-netns.service" ];
