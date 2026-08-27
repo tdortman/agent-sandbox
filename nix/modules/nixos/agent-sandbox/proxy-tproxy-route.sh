@@ -105,6 +105,7 @@ fail_closed() {
    chain output {
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
+     ct status dnat return
      tcp dport { $ports } reject with tcp reset
      tcp dport 853 reject with tcp reset
      $udp_reject
@@ -151,6 +152,7 @@ nft -f - <<EOF
    chain output {
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
+     ct status dnat return
     tcp dport 853 reject with tcp reset
     $(reject_rule)
     tcp dport { $ports } counter meta mark set $mark queue num $queue_number

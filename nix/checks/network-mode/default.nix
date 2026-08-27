@@ -159,6 +159,63 @@ let
       ];
     };
   };
+  loopbackContract =
+    let
+      firewall = loopbackSystem.config.networking.firewall.interfaces.asbx-host;
+      policy = builtins.fromJSON loopbackSystem.config.environment.etc."agent-sandbox/policy.json".text;
+    in
+    assert
+      policy.network.direct.allow == [
+        {
+          host = "127.0.0.1";
+          port = 24680;
+        }
+        {
+          host = "169.254.100.1";
+          port = 24680;
+        }
+        {
+          host = "::1";
+          port = 24680;
+        }
+        {
+          host = "fd00:dead:beef::1";
+          port = 24680;
+        }
+        {
+          host = "fd00:dead:beef::2";
+          port = 24680;
+        }
+        {
+          host = "127.0.0.1";
+          port = 24682;
+        }
+        {
+          host = "169.254.100.1";
+          port = 24682;
+        }
+        {
+          host = "::1";
+          port = 24682;
+        }
+        {
+          host = "fd00:dead:beef::1";
+          port = 24682;
+        }
+        {
+          host = "fd00:dead:beef::2";
+          port = 24682;
+        }
+      ];
+    assert lib.elem 24680 firewall.allowedTCPPorts;
+    assert lib.elem 24682 firewall.allowedUDPPorts;
+    true;
+  loopbackSystem = mkNixosSystem {
+    agent-sandbox.network.loopback = {
+      tcpPorts = [ 24680 ];
+      udpPorts = [ 24682 ];
+    };
+  };
   mkNixosSystem =
     extraModule:
     inputs.nixpkgs.lib.nixosSystem {
@@ -329,6 +386,7 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   fail() { echo "FAIL: $*" >&2; exit 1; }
   test "${if declarativeHttpContract then "ok" else "failed"}" = ok
   test "${if echStateOrdering then "ok" else "failed"}" = ok
+  test "${if loopbackContract then "ok" else "failed"}" = ok
 
 
   static_direct=${script staticDirect}
@@ -350,6 +408,8 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "proxy firewall service must remove its rules on stop"
   grep -F -q -- 'meta skuid $proxy_uid return' ${proxyTproxyRouteSource} \
     || fail "TPROXY route must exclude proxy-owned output"
+  grep -F -q -- 'ct status dnat return' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must preserve earlier loopback DNAT"
   grep -F -q -- 'ip route replace local 0.0.0.0/0 dev lo table "$route_table"' ${proxyTproxyRouteSource} \
     || fail "TPROXY route must preserve the UDP local route table"
   if grep -F -q -- 'oifname "lo" accept' ${proxyFirewallSource}; then
@@ -441,6 +501,69 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "proxy-mode netns rules must queue new IPv6 UDP flows"
   grep -F -q -- 'nft add element inet agent_sandbox proxy_uid' <<< "$netns_up" \
     || fail "netns up script must populate the proxy uid set at runtime"
+
+  loopback_netns_launcher=$(cat ${
+    loopbackSystem.config.systemd.services."agent-sandbox-netns".serviceConfig.ExecStart
+  })
+  loopback_up_path=$(sed -n 's#.*exec /nix/store/[^ ]*/bin/bash \(/nix/store/[^ ]*\.sh\).*#\1#p' <<< "$loopback_netns_launcher")
+  loopback_up=$(cat "$loopback_up_path")
+  grep -F -q -- 'ip daddr 127.0.0.2 tcp dport { 24680 } dnat to 169.254.100.1' <<< "$loopback_up" \
+    || fail "sandbox handoff address must DNAT configured TCP ports"
+  grep -F -q -- 'ip daddr 127.0.0.2 udp dport { 24682 } dnat to 169.254.100.1' <<< "$loopback_up" \
+    || fail "sandbox handoff address must DNAT configured UDP ports"
+  grep -F -q -- 'ip saddr 169.254.100.1 ip daddr 169.254.100.2 tcp dport { 24680 } dnat to 127.0.0.1' <<< "$loopback_up" \
+    || fail "host TCP traffic must DNAT to sandbox localhost"
+  grep -F -q -- 'ip saddr 169.254.100.1 ip daddr 169.254.100.2 udp dport { 24682 } dnat to 127.0.0.1' <<< "$loopback_up" \
+    || fail "host UDP traffic must DNAT to sandbox localhost"
+  grep -F -q -- 'net.ipv4.conf.$NS_IF.route_localnet=1' <<< "$loopback_up" \
+    || fail "sandbox veth must accept routed loopback destinations"
+  grep -F -q -- 'ip6 daddr ::2 tcp dport { 24680 } dnat to fd00:dead:beef::1' <<< "$loopback_up" \
+    || fail "sandbox IPv6 handoff address must DNAT configured TCP ports"
+  grep -F -q -- 'ip6 daddr ::2 udp dport { 24682 } dnat to fd00:dead:beef::1' <<< "$loopback_up" \
+    || fail "sandbox IPv6 handoff address must DNAT configured UDP ports"
+  if grep -F -q -- 'ip6 daddr fd00:dead:beef::2 tcp dport { 24680 } dnat to ::1' <<< "$loopback_up"; then
+    fail "IPv6 handoff packets must keep their routable destination for socket lookup"
+  fi
+  grep -F -q -- 'ip -6 route replace local ::2/128 dev lo' <<< "$loopback_up" \
+    || fail "sandbox must route its IPv6 handoff address locally"
+
+  host_nat_launcher=$(grep -o '/nix/store/[^" ]*/bin/agent-sandbox-host-nat' <<< "$loopback_up" | head -n1)
+  host_nat_path=$(sed -n 's#.*exec /nix/store/[^ ]*/bin/bash \(/nix/store/[^ ]*\.sh\).*#\1#p' "$host_nat_launcher")
+  host_nat=$(cat "$host_nat_path")
+  grep -F -q -- 'iifname "asbx-host" ip saddr 169.254.100.2 ip daddr 169.254.100.1 tcp dport { 24680 } dnat to 127.0.0.1' <<< "$host_nat" \
+    || fail "host veth must DNAT configured TCP ports to host localhost"
+  grep -F -q -- 'iifname "asbx-host" ip saddr 169.254.100.2 ip daddr 169.254.100.1 udp dport { 24682 } dnat to 127.0.0.1' <<< "$host_nat" \
+    || fail "host veth must DNAT configured UDP ports to host localhost"
+  grep -F -q -- 'ip daddr 127.0.0.2 tcp dport { 24680 } dnat to 169.254.100.2' <<< "$host_nat" \
+    || fail "host handoff address must DNAT configured TCP ports"
+  if grep -F -q -- 'ip6 daddr fd00:dead:beef::1 tcp dport { 24680 } dnat to ::1' <<< "$host_nat"; then
+    fail "IPv6 handoff packets must keep their routable destination for socket lookup"
+  fi
+  grep -F -q -- 'ip6 daddr ::2 tcp dport { 24680 } dnat to fd00:dead:beef::2' <<< "$host_nat" \
+    || fail "host IPv6 handoff address must DNAT configured TCP ports"
+  grep -F -q -- 'ip -6 route replace local "''${LOOPBACK_HANDOFF_IP6}/128" dev lo' <<< "$host_nat" \
+    || fail "host must route its IPv6 handoff address locally"
+  grep -F -q -- 'ENABLE_LOOPBACK="1"' <<< "$host_nat" \
+    || fail "host veth must enable routed loopback destinations"
+
+  loopback_bpf_launcher=${loopbackSystem.config.systemd.services.agent-sandbox-loopback.serviceConfig.ExecStart}
+  loopback_bpf=$(cat "$(sed -n 's#.*exec /nix/store/[^ ]*/bin/bash \(/nix/store/[^ ]*\.sh\).*#\1#p' "$loopback_bpf_launcher")")
+  grep -F -q -- 'value hex "''${host_endpoint[@]}"' <<< "$loopback_bpf" \
+    || fail "shared localhost must pass host endpoint bytes as separate arguments"
+  grep -F -q -- 'value hex "''${sandbox_endpoint[@]}"' <<< "$loopback_bpf" \
+    || fail "shared localhost must pass sandbox endpoint bytes as separate arguments"
+  grep -F -q -- 'bpftool cgroup attach "$cgroup" cgroup_inet4_connect' <<< "$loopback_bpf" \
+    || fail "shared localhost must attach its connect hook"
+  grep -F -q -- 'bpftool cgroup attach "$cgroup" cgroup_udp4_sendmsg' <<< "$loopback_bpf" \
+    || fail "shared localhost must attach its UDP send hook"
+  grep -F -q -- 'bpftool cgroup attach "$cgroup" cgroup_inet6_connect' <<< "$loopback_bpf" \
+    || fail "shared localhost must attach its IPv6 connect hook"
+  grep -F -q -- 'bpftool cgroup attach "$cgroup" cgroup_udp6_sendmsg' <<< "$loopback_bpf" \
+    || fail "shared localhost must attach its IPv6 UDP send hook"
+  grep -F -q -- 'bpftool cgroup attach "$cgroup" cgroup_inet6_bind' <<< "$loopback_bpf" \
+    || fail "shared localhost must attach its IPv6 bind hook"
+  grep -F -q -- 'bpftool cgroup attach "$cgroup" cgroup_inet6_getsockname' <<< "$loopback_bpf" \
+    || fail "shared localhost must restore IPv6 localhost from getsockname"
   # A nested launch (a sandboxed agent spawning another inside the sandbox
   # network namespace) must not re-enter netns via the capability wrapper:
   # NoNewPrivileges suppresses its file capabilities and it aborts with

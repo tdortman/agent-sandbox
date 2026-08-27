@@ -30,6 +30,8 @@ ip netns exec "$NETNS" ip link set "$NS_IF" up
 ip netns exec "$NETNS" ip route replace default via "$HOST_IP"
 ip netns exec "$NETNS" ip -6 route replace default via "$HOST_IP6"
 
+@loopbackRoutingSetup@
+
 ip netns exec "$NETNS" nft -f - <<EOF
 @nftRules@
 EOF

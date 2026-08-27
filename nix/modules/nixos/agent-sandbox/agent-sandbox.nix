@@ -784,6 +784,30 @@ in
         };
       };
 
+      loopback = {
+        tcpPorts = lib.mkOption {
+          type = lib.types.listOf lib.types.port;
+          default = [ ];
+
+          description = ''
+            TCP localhost ports shared between the host and sandbox over IPv4
+            and IPv6. Connections use a listener in the caller's network
+            namespace when one exists, then fall through to the other namespace.
+          '';
+        };
+
+        udpPorts = lib.mkOption {
+          type = lib.types.listOf lib.types.port;
+          default = [ ];
+
+          description = ''
+            UDP localhost ports shared between the host and sandbox over IPv4
+            and IPv6. Datagrams use a listener in the caller's network namespace
+            when one exists, then fall through to the other namespace.
+          '';
+        };
+      };
+
       netnsIp = lib.mkOption {
         type = lib.types.str;
         default = "169.254.100.2";

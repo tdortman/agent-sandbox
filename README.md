@@ -54,6 +54,19 @@ agent-sandbox.network.httpProxy.http3 = {
 };
 ```
 
+## Share localhost ports
+
+Select the localhost ports that should be visible from both network namespaces:
+
+```nix
+agent-sandbox.network.loopback = {
+  tcpPorts = [ 3080 49600 ];
+  udpPorts = [ 5354 ];
+};
+```
+
+Applications and clients keep using `127.0.0.1` or `::1` on either side. A listener in the client's own namespace wins; otherwise the connection or datagram reaches the listener in the other namespace. No process binds the configured ports, so a host and sandbox service can both use the same port.
+
 To let the proxy select HTTP/1.0 for an upstream origin, add its validated canonical origin:
 
 ```nix

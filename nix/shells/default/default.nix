@@ -10,7 +10,9 @@ pkgs.mkShell {
     + ":"
     + "${pkgs.qt6.qtbase.out}/include/QtGui"
     + ":"
-    + "${pkgs.qt6.qtbase.out}/include/QtCore";
+    + "${pkgs.qt6.qtbase.out}/include/QtCore"
+    + ":"
+    + "${pkgs.libbpf.out}/include";
 
   nativeBuildInputs = with pkgs; [
     cargo-nextest

@@ -10,6 +10,12 @@ let
     inherit lib;
     inherit (flake) jail-nix;
   };
+  cPortMatch =
+    ports:
+    if ports == [ ] then
+      "0"
+    else
+      lib.concatMapStringsSep " || " (port: "port == ${toString port}") ports;
   cfg = config.agent-sandbox.network;
   dbusRuleJson =
     rule:
@@ -45,6 +51,7 @@ let
     name = "agent-sandbox-host-nat";
 
     runtimeInputs = [
+      pkgs.iproute2
       pkgs.nftables
       pkgs.procps # sysctl
     ];
@@ -52,7 +59,45 @@ let
     script = hostNatScript;
   };
   hostNatScript = pkgs.replaceVars ./netns/host-nat.sh {
-    inherit dnsTargetHost;
+    inherit dnsTargetHost loopbackHandoffIp6;
+    enableLoopback = if loopbackEnabled then "1" else "0";
+
+    hostLoopbackOutputRule = lib.escapeShellArg (
+      loopbackProtocolRules (
+        protocol: ports:
+        "ip daddr 127.0.0.2 ${protocol} dport { ${portSet ports} } dnat to ${runtime.network.netnsIp}"
+      )
+    );
+
+    hostLoopbackOutputRule6 = lib.escapeShellArg (
+      loopbackProtocolRules (
+        protocol: ports:
+        "ip6 daddr ${loopbackHandoffIp6} ${protocol} dport { ${portSet ports} } dnat to ${runtime.network.netnsIp6}"
+      )
+    );
+
+    hostLoopbackPostroutingRule = lib.escapeShellArg (
+      loopbackProtocolRules (
+        protocol: ports:
+        "ip saddr 127.0.0.0/8 ip daddr ${runtime.network.netnsIp} ${protocol} dport { ${portSet ports} } snat to ${runtime.hostIp}"
+      )
+    );
+
+    hostLoopbackPostroutingRule6 = lib.escapeShellArg (
+      loopbackProtocolRules (
+        protocol: ports:
+        "ip6 daddr ${runtime.network.netnsIp6} ${protocol} dport { ${portSet ports} } snat to ${runtime.hostIp6}"
+      )
+    );
+
+    hostLoopbackPreroutingRule = lib.escapeShellArg (
+      loopbackProtocolRules (
+        protocol: ports:
+        ''iifname "${runtime.network.vethHost}" ip saddr ${runtime.network.netnsIp} ip daddr ${runtime.hostIp} ${protocol} dport { ${portSet ports} } dnat to 127.0.0.1''
+      )
+    );
+
+    hostLoopbackPreroutingRule6 = lib.escapeShellArg "";
     vethHost = runtime.network.vethHost;
   };
   httpRuleJson =
@@ -70,6 +115,82 @@ let
     // lib.optionalAttrs (rule.comment != null) {
       inherit (rule) comment;
     };
+  loopbackBpfObject =
+    pkgs.runCommand "agent-sandbox-loopback-bpf.o"
+      {
+        nativeBuildInputs = [
+          pkgs.libbpf
+          pkgs.linuxHeaders
+          pkgs.llvmPackages.clang-unwrapped
+        ];
+      }
+      ''
+        ${pkgs.llvmPackages.clang-unwrapped}/bin/clang -O2 -g -target bpf \
+          -DTCP_PORT_MATCH='(${cPortMatch loopbackTcpPorts})' \
+          -DUDP_PORT_MATCH='(${cPortMatch loopbackUdpPorts})' \
+          -I${pkgs.libbpf}/include \
+          -I${pkgs.linuxHeaders}/include \
+          -c ${./loopback/redirect.bpf.c} \
+          -o "$out"
+      '';
+  loopbackBpfPkg = mkNetnsLauncher {
+    name = "agent-sandbox-loopback-bpf";
+
+    runtimeInputs = [
+      pkgs.bpftools
+      pkgs.coreutils
+      pkgs.iproute2
+    ];
+
+    script = loopbackBpfScript;
+  };
+  loopbackBpfScript = pkgs.replaceVars ./loopback/bpf.sh {
+    inherit (runtime) hostIp6;
+    inherit (runtime.network) netnsIp6;
+    bpfObject = loopbackBpfObject;
+    helperBin = "${loopbackHelperPkg}/bin/agent-sandbox-netns-helper";
+    netnsName = runtime.network.netnsName;
+  };
+  loopbackEnabled = loopbackPorts != [ ];
+  loopbackHandoffIp6 = "::2";
+  loopbackHelperPkg = pkgs.stdenv.mkDerivation {
+    pname = "agent-sandbox-netns-helper";
+    version = "1";
+    src = ./loopback/netns-helper.c;
+
+    buildPhase = ''
+      runHook preBuild
+      $CC -O2 "$src" -o agent-sandbox-netns-helper
+      runHook postBuild
+    '';
+
+    dontUnpack = true;
+
+    installPhase = ''
+      runHook preInstall
+      install -Dm755 agent-sandbox-netns-helper "$out/bin/agent-sandbox-netns-helper"
+      runHook postInstall
+    '';
+  };
+  loopbackPolicyRules = lib.concatMap (
+    port:
+    map (host: { inherit host port; }) [
+      "127.0.0.1"
+      runtime.hostIp
+      "::1"
+      runtime.hostIp6
+      runtime.network.netnsIp6
+    ]
+  ) loopbackPorts;
+  loopbackPorts = lib.unique (loopbackTcpPorts ++ loopbackUdpPorts);
+  loopbackProtocolRules =
+    rule:
+    lib.concatStringsSep "\n" (
+      lib.optional (loopbackTcpPorts != [ ]) (rule "tcp" loopbackTcpPorts)
+      ++ lib.optional (loopbackUdpPorts != [ ]) (rule "udp" loopbackUdpPorts)
+    );
+  loopbackTcpPorts = lib.unique cfg.loopback.tcpPorts;
+  loopbackUdpPorts = lib.unique cfg.loopback.udpPorts;
   mkNetnsLauncher =
     {
       name,
@@ -89,6 +210,10 @@ let
     script = netnsDownScript;
   };
   netnsDownScript = pkgs.replaceVars ./netns/down.sh {
+    loopbackRoutingCleanup = lib.optionalString loopbackEnabled ''
+      ip -6 route del local ${loopbackHandoffIp6}/128 dev lo 2>/dev/null || true
+    '';
+
     netnsName = runtime.network.netnsName;
     vethHost = runtime.network.vethHost;
   };
@@ -100,6 +225,7 @@ let
       pkgs.coreutils
       pkgs.iproute2
       pkgs.nftables
+      pkgs.procps # sysctl
     ];
 
     script = netnsUpScript;
@@ -110,6 +236,13 @@ let
     hostIp6Cidr = "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}";
     hostIpCidr = "${runtime.hostIp}/30";
     hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
+
+    loopbackRoutingSetup = lib.optionalString loopbackEnabled ''
+      ip netns exec "$NETNS" sysctl -w net.ipv4.conf.all.route_localnet=1
+      ip netns exec "$NETNS" sysctl -w "net.ipv4.conf.$NS_IF.route_localnet=1"
+      ip netns exec "$NETNS" ip -6 route replace local ${loopbackHandoffIp6}/128 dev lo
+    '';
+
     netnsIp = runtime.network.netnsIp;
     netnsIp6Cidr = "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}";
     netnsName = runtime.network.netnsName;
@@ -249,6 +382,47 @@ let
         ''}
       }
     }
+    ${lib.optionalString loopbackEnabled ''
+      table ip agent_sandbox_loopback {
+        chain output {
+          type nat hook output priority -190; policy accept;
+          ${loopbackProtocolRules (
+            protocol: ports:
+            "ip daddr 127.0.0.2 ${protocol} dport { ${portSet ports} } dnat to ${runtime.hostIp}"
+          )}
+        }
+        chain postrouting {
+          type nat hook postrouting priority srcnat; policy accept;
+          ${loopbackProtocolRules (
+            protocol: ports:
+            "ip saddr 127.0.0.0/8 ip daddr ${runtime.hostIp} ${protocol} dport { ${portSet ports} } snat to ${runtime.network.netnsIp}"
+          )}
+        }
+        chain prerouting {
+          type nat hook prerouting priority dstnat; policy accept;
+          ${loopbackProtocolRules (
+            protocol: ports:
+            ''iifname "${runtime.network.vethNetns}" ip saddr ${runtime.hostIp} ip daddr ${runtime.network.netnsIp} ${protocol} dport { ${portSet ports} } dnat to 127.0.0.1''
+          )}
+        }
+      }
+      table ip6 agent_sandbox_loopback {
+        chain output {
+          type nat hook output priority -190; policy accept;
+          ${loopbackProtocolRules (
+            protocol: ports:
+            "ip6 daddr ${loopbackHandoffIp6} ${protocol} dport { ${portSet ports} } dnat to ${runtime.hostIp6}"
+          )}
+        }
+        chain postrouting {
+          type nat hook postrouting priority srcnat; policy accept;
+          ${loopbackProtocolRules (
+            protocol: ports:
+            "ip6 daddr ${runtime.hostIp6} ${protocol} dport { ${portSet ports} } snat to ${runtime.network.netnsIp6}"
+          )}
+        }
+      }
+    ''}
   '';
   # Inside the jail we cannot use nss-resolve (no /run/systemd/resolve). Plain DNS only.
   nsswitchConfText = ''
@@ -289,6 +463,7 @@ let
     || rootCfg.policy.sudo.declarativeAllow != [ ]
     || rootCfg.policy.sudo.declarativeDeny != [ ]
     || lib.any packageHasPolicy rootCfg.packages;
+  portSet = ports: lib.concatStringsSep ", " (map toString ports);
   proxyBundlePath = "/run/agent-sandbox/proxy-ca-bundle.pem";
   proxyCaCertificate = cfg.httpProxy.caCertificateFile;
   proxyCaPrivateKey = cfg.httpProxy.caPrivateKeyFile;
@@ -424,7 +599,7 @@ lib.mkIf policyEnabled (
         {
           network = {
             direct = {
-              allow = map (r: { inherit (r) host port; }) cfg.declarativeAllow;
+              allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
               deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
             };
 
@@ -618,8 +793,8 @@ lib.mkIf policyEnabled (
       # Runtime nft INPUT accepts are not enough when the host firewall has its own
       # later input chains. Open bridge ports declaratively on the veth interface.
       networking.firewall.interfaces.${runtime.network.vethHost} = {
-        allowedTCPPorts = lib.mkAfter [ 53 ];
-        allowedUDPPorts = lib.mkAfter [ 53 ];
+        allowedTCPPorts = lib.mkAfter ([ 53 ] ++ loopbackTcpPorts);
+        allowedUDPPorts = lib.mkAfter ([ 53 ] ++ loopbackUdpPorts);
       };
 
       security.wrappers.agent-sandbox-enter = {
@@ -1050,6 +1225,23 @@ lib.mkIf policyEnabled (
           group = proxyGroup;
           home = "/var/empty";
           isSystemUser = true;
+        };
+      };
+    })
+
+    (lib.mkIf (cfg.enable && loopbackEnabled) {
+      systemd.services.agent-sandbox-loopback = {
+        description = "Share selected localhost ports with the agent-sandbox network namespace";
+        before = [ "multi-user.target" ];
+        after = [ "agent-sandbox-netns.service" ];
+        requires = [ "agent-sandbox-netns.service" ];
+        wantedBy = [ "multi-user.target" ];
+
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf";
+          ExecStop = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf cleanup";
+          RemainAfterExit = true;
         };
       };
     })
