@@ -263,6 +263,22 @@ let
 
     syscallArmPkg = pkgs.hello;
   };
+  policyWrapper = agentSandboxLib.mkWrapPackage pkgs {
+    package = pkgs.hello;
+    binary = "hello";
+    fsArmPkg = pkgs.hello;
+
+    network = {
+      netnsEnter = "/run/test/netns-enter";
+      netnsName = "agent-sandbox";
+    };
+
+    packageName = "hello";
+    policyContext = true;
+    policyPkg = pkgs.hello;
+    policySocket = "/run/test/policy.sock";
+    sandboxPolicySocket = "/run/test/sandbox-policy.sock";
+  };
   proxyFirewallSource = builtins.toFile "agent-sandbox-proxy-firewall.sh" (
     builtins.readFile ../../modules/nixos/agent-sandbox/proxy-firewall.sh
   );
@@ -290,7 +306,14 @@ let
   script = wrapper: ''
     $(
       _script=$(readlink -f ${wrapper}/bin/hello)
-      while _next=$(sed -n 's#.*-- \(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) .*#\1#p' "$_script") && test -n "$_next"; do
+      while
+        _next=$(
+          sed -n \
+            -e 's#^[[:space:]]*exec \(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) "\$@"#\1#p' \
+            -e 's#.*-- \(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) .*#\1#p' \
+            "$_script" | head -n 1
+        ) && test -n "$_next"
+      do
         _script=$(readlink -f "$_next")
       done
       printf '%s' "$_script"
@@ -299,6 +322,15 @@ let
   staticDirect = mkWrapper {
     dynamic = false;
     proxy = false;
+  };
+  staticPolicyWrapper = agentSandboxLib.mkWrapPackage pkgs {
+    package = pkgs.hello;
+    binary = "hello";
+    packageName = "hello";
+    policyContext = true;
+    policyPkg = pkgs.hello;
+    policySocket = "/run/test/policy.sock";
+    sandboxPolicySocket = "/run/test/sandbox-policy.sock";
   };
   staticProxy = mkWrapper {
     dynamic = false;
@@ -393,6 +425,8 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   static_proxy=${script staticProxy}
   dynamic_direct=${script dynamicDirect}
   dynamic_proxy=${script dynamicProxy}
+  policy_wrapper=${script policyWrapper}
+  static_policy_wrapper=${script staticPolicyWrapper}
   if grep -E -q -- '"(ssl_insecure|upstream_cert)=[^"]*"' ${networkModuleSource}; then
     fail "proxy service must not override wrapper-owned TLS options"
   fi
@@ -433,6 +467,15 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
     || fail "dynamic direct wrapper does not set direct network mode"
   grep -F -q -- 'RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_NETWORK_MODE proxy)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not set proxy network mode"
+  for wrapper in "$static_policy_wrapper" "$policy_wrapper"; do
+    grep -F -q -- 'if [[ -n "''${_agent_sandbox_session_id:-}" && -S /run/test/policy.sock ]]; then' "$wrapper" \
+      || fail "wrapper must gate registration on the visible host policy socket"
+    registration_block=$(sed -n '/if \[\[ -n .*_agent_sandbox_session_id/,/^ *fi$/p' "$wrapper")
+    registration_trace=$(AGENT_SANDBOX_SESSION_ID=outer-session bash -x -c "_agent_sandbox_session_id=outer-session; $registration_block" 2>&1)
+    if grep -F -q -- 'agent-sandbox-approve' <<<"$registration_trace"; then
+      fail "nested wrapper attempted host-side sandbox registration"
+    fi
+  done
   grep -F -q -- '--setenv AGENT_SANDBOX_UDP_PROXY_PORTS 443' "$static_direct" \
     || fail "static direct wrapper does not set the default HTTP/3 UDP proxy ports"
   grep -F -q -- '--setenv AGENT_SANDBOX_UDP_PROXY_PORTS 443' "$static_proxy" \

@@ -311,7 +311,7 @@ in
     }:
     compose [
       (add-runtime ''
-        if [[ -n "''${_agent_sandbox_session_id:-}" ]]; then
+        if [[ -n "''${_agent_sandbox_session_id:-}" && -S ${lib.escapeShellArg policySocket} ]]; then
           export AGENT_SANDBOX_SESSION_ID="$_agent_sandbox_session_id"
           ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" >/dev/null 2>&1 || true
         fi

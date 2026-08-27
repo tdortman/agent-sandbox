@@ -867,7 +867,7 @@ in
       registerSandboxScript =
         lib.optionalString (policyContext && policySocket != null && policyPkg != null)
           ''
-            if [[ -n "''${_agent_sandbox_session_id:-}" ]]; then
+            if [[ -n "''${_agent_sandbox_session_id:-}" && -S ${lib.escapeShellArg policySocket} ]]; then
               ${registerCommand} --socket ${lib.escapeShellArg policySocket} register-sandbox "$_agent_sandbox_session_id" --package ${lib.escapeShellArg packageName} --launcher-pid "$$" >/dev/null 2>&1 || true
             fi
           '';
