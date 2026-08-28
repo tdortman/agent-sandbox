@@ -636,6 +636,7 @@ let
 
       readwriteDirs = [ "~/sandbox-readwrite" ];
       readwriteFiles = [ "/var/lib/agent-sandbox-test/readwrite-file" ];
+      unsafeAliasPrefix = "unwrapped-";
     })
 
     (mkBash "sandbox-static-options-bash" {
@@ -668,6 +669,11 @@ let
 
       extraPkgs = commonExtraPkgs;
     }
+
+    (mkBash "sandbox-wrapping-bash" {
+      extraPkgs = commonExtraPkgs;
+      replaceOriginalBinary = false;
+    })
   ];
   sudoApprovePackages = [
     (mkBash "sandbox-sudo-approve-bash" {
@@ -1318,7 +1324,6 @@ let
             readwriteDirs = [ "/var/lib/agent-sandbox-test/global-readwrite-dir" ];
             readwriteFiles = [ "/var/lib/agent-sandbox-test/global-readwrite-file" ];
             sudoPolicy = "deny";
-            wrapping.unsafeAliasPrefix = "unwrapped-";
           };
         };
 
@@ -1355,18 +1360,6 @@ let
           };
         };
 
-      wrapping =
-        _:
-        baseNode
-        // {
-          imports = [ module ];
-
-          agent-sandbox = {
-            enable = true;
-            packages = wrappingPackages;
-            wrapping.replaceOriginalBinary = false;
-          };
-        };
     };
 
     testScript = ''
@@ -1401,7 +1394,7 @@ let
           "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
       )
 
-      for node in [static, wrapping, dynamic, package, resource, dbus, direct, proxy, sudo_deny, sudo_approve, approval, resource_approval]:
+      for node in [static, dynamic, package, resource, dbus, direct, proxy, sudo_deny, sudo_approve, approval, resource_approval]:
           node.wait_for_unit("multi-user.target")
 
       # Static bubblewrap mounts: read-only directory/file, writable directory,
@@ -1459,8 +1452,8 @@ let
       sandbox_exec(static, "sandbox-static-curl", "--version")
       assert sandbox_command(static, [ "sandbox-inferred-binary" ]).strip() == "inferred-binary"
       sandbox_shell(static, "unwrapped-sandbox-static-bash", "printf custom-prefix")
-      sandbox_shell(wrapping, "sandbox-wrapping-bash", "printf original")
-      sandbox_shell(wrapping, "sandboxed-sandbox-wrapping-bash", "printf no-replacement")
+      sandbox_shell(static, "sandbox-wrapping-bash", "printf original")
+      sandbox_shell(static, "sandboxed-sandbox-wrapping-bash", "printf no-replacement")
 
       # Dynamic filesystem approval: static store access remains available,
       # unlisted host files are denied, and configured masks hide contents.
@@ -1905,10 +1898,5 @@ let
       )
     '';
   });
-  wrappingPackages = [
-    (mkBash "sandbox-wrapping-bash" {
-      extraPkgs = commonExtraPkgs;
-    })
-  ];
 in
 vmTest

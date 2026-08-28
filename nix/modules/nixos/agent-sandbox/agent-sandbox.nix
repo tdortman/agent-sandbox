@@ -437,9 +437,21 @@ let
       description = "Per-package declarative policy; declaring a rule removes the approval prompt for this package only.";
     };
 
+    replaceOriginalBinary = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Install the sandbox launcher as the original program name.";
+    };
+
     runtimeReadonlyDirs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = agentSandboxLib.defaultRuntimeReadonlyDirs;
+    };
+
+    unsafeAliasPrefix = lib.mkOption {
+      type = lib.types.str;
+      default = "unsafe-";
+      description = "Prefix for the unwrapped executable when replaceOriginalBinary is true.";
     };
   };
   packagePolicyJson =
@@ -568,7 +580,6 @@ let
         "policy"
       ]
       // {
-        inherit (cfg.wrapping) replaceOriginalBinary unsafeAliasPrefix;
         inherit runtime;
 
         inherit (runtime)
@@ -1027,19 +1038,6 @@ in
       '';
     };
 
-    wrapping = {
-      replaceOriginalBinary = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Install the sandbox launcher as the original program name (jail.nix-style).";
-      };
-
-      unsafeAliasPrefix = lib.mkOption {
-        type = lib.types.str;
-        default = "unsafe-";
-        description = "Prefix for the unwrapped executable when replaceOriginalBinary is true.";
-      };
-    };
   }
   // mountOptions;
 
