@@ -1,5 +1,5 @@
 // Standalone Qt dialog helper for agent-sandbox policy prompts.
-// No KDE or GTK dependencies, just Qt Widgets.
+// The binary links only Qt Widgets; Nix supplies matching KDE theme plugins.
 #include <getopt.h>
 #include <cstdio>
 #include <cstdlib>
