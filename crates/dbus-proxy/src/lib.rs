@@ -1,6 +1,6 @@
 //! Unix-socket D-Bus relay with policy checks.
 
-use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use agent_sandbox_core::{
     policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusTarget},
@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use zbus::{
     Connection, Guid, MessageStream,
     connection::Builder,
-    message::{Builder as MessageBuilder, Flags, Message, Type},
+    message::{Builder as MessageBuilder, Message, Type},
 };
 use zvariant::Fd;
 
@@ -57,57 +57,6 @@ impl RelayConfig {
             bus: DbusBus::Session,
             context: RequestContext::default(),
         }
-    }
-}
-
-/// Handles assignment and tracking of upstream D-Bus serials per client.
-pub struct SerialMap {
-    next: NonZeroU32,
-    replies: HashMap<NonZeroU32, NonZeroU32>,
-}
-
-impl Default for SerialMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SerialMap {
-    /// Create an empty serial map.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            next: NonZeroU32::MIN,
-            replies: HashMap::new(),
-        }
-    }
-
-    fn next_serial(&mut self) -> NonZeroU32 {
-        let serial = self.next;
-
-        self.next = NonZeroU32::new(serial.get().wrapping_add(1))
-            .unwrap_or_else(|| NonZeroU32::new(1).expect("constant is non-zero"));
-
-        serial
-    }
-
-    /// Allocate an upstream serial and record the client serial it answers.
-    #[must_use]
-    pub fn allocate(&mut self, client_serial: NonZeroU32) -> NonZeroU32 {
-        let serial = self.next_serial();
-        self.replies.insert(serial, client_serial);
-        serial
-    }
-
-    /// Allocate an upstream serial without tracking a reply.
-    #[must_use]
-    pub fn allocate_untracked(&mut self) -> NonZeroU32 {
-        self.next_serial()
-    }
-
-    /// Claim and remove the client serial registered for an upstream serial.
-    pub fn take(&mut self, upstream_serial: NonZeroU32) -> Option<NonZeroU32> {
-        self.replies.remove(&upstream_serial)
     }
 }
 
@@ -236,7 +185,6 @@ async fn handle_client(
         .ok_or_else(|| RelayError::Message("upstream has no unique name".into()))?;
 
     let mut policy = PersistentRpcClient::new_trusted(config.policy_socket.clone());
-    let mut serials = SerialMap::new();
 
     relay_loop(
         RelayChannels {
@@ -248,7 +196,6 @@ async fn handle_client(
         upstream_name,
         &mut policy,
         &config,
-        &mut serials,
     )
     .await
 }
@@ -258,7 +205,6 @@ async fn relay_loop(
     upstream_name: String,
     policy: &mut PersistentRpcClient,
     config: &RelayConfig,
-    serials: &mut SerialMap,
 ) -> Result<(), RelayError> {
     let RelayChannels {
         mut client_stream,
@@ -294,38 +240,22 @@ async fn relay_loop(
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
                 }
-                let original_serial = client_message.header().primary().serial_num();
-                let expects_reply = !client_message
-                    .header()
-                    .primary()
-                    .flags()
-                    .contains(Flags::NoReplyExpected);
-                let upstream_serial = if client_message.message_type() == Type::MethodCall
-                    && expects_reply
-                {
-                    serials.allocate(original_serial)
-                } else {
-                    serials.allocate_untracked()
-                };
-                let forwarded = rewrite_message(&client_message, upstream_serial, None)?;
+                let serial = client_message.header().primary().serial_num();
+                let forwarded = rewrite_message(&client_message, serial, None)?;
                 upstream_connection.send(&forwarded).await?;
             }
             upstream_message = upstream_stream.next() => {
                 let Some(upstream_message) = upstream_message else { return Ok(()); };
                 let upstream_message = upstream_message?;
-                let reply_serial = upstream_message.header().reply_serial();
-                let mapped_reply = reply_serial.and_then(|serial| serials.take(serial));
                 if matches!(
                     upstream_message.message_type(),
                     Type::MethodReturn | Type::Error
                 ) {
-                    let Some(mapped_reply) = mapped_reply else {
-                        continue;
-                    };
-                    let serial = serials.allocate_untracked();
-                    let forwarded =
-                        rewrite_message(&upstream_message, serial, Some(mapped_reply))?;
-                    client_connection.send(&forwarded).await?;
+                    // Forward verbatim: rebuilding a reply parsed from the
+                    // wire corrupted the token in GetSecret replies, and the
+                    // client serial kept on the way upstream makes reply
+                    // matching work without rewriting.
+                    client_connection.send(&upstream_message).await?;
                     continue;
                 }
                 if upstream_message.message_type() == Type::MethodCall {
@@ -341,9 +271,7 @@ async fn relay_loop(
                 {
                     continue;
                 }
-                let serial = serials.allocate_untracked();
-                let forwarded = rewrite_message(&upstream_message, serial, None)?;
-                client_connection.send(&forwarded).await?;
+                client_connection.send(&upstream_message).await?;
             }
         }
     }
@@ -453,18 +381,64 @@ fn build_raw_body(
 mod tests {
     use std::num::NonZeroU32;
 
-    use zbus::{message::Message, zvariant::Endian};
+    use zbus::{
+        message::Message,
+        zvariant::{Endian, ObjectPath},
+    };
 
-    use super::{DbusBus, SerialMap, is_forbidden_bus_control, target_from_message};
+    use super::{DbusBus, is_forbidden_bus_control, rewrite_message, target_from_message};
 
     #[test]
-    fn serial_map_correlates_and_removes_replies() {
-        let mut map = SerialMap::new();
-        let client = NonZeroU32::new(41).expect("non-zero");
-        let upstream = map.allocate(client);
-        assert_eq!(upstream.get(), 1);
-        assert_eq!(map.take(upstream), Some(client));
-        assert_eq!(map.take(upstream), None);
+    fn rewrite_preserves_get_secret_reply_body() {
+        let session: ObjectPath = "/org/freedesktop/secrets/session/1"
+            .try_into()
+            .expect("session path");
+
+        let call = Message::method_call(
+            "/org/freedesktop/secrets/collection/kdewallet/9",
+            "GetSecret",
+        )
+        .expect("builder")
+        .destination("org.freedesktop.secrets")
+        .expect("destination")
+        .interface("org.freedesktop.Secret.Item")
+        .expect("interface")
+        .serial(NonZeroU32::new(7).expect("non-zero"))
+        .endian(Endian::Little)
+        .build(&(session.clone(),))
+        .expect("message");
+
+        let token: Vec<u8> = b"gho_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_vec();
+        assert_eq!(token.len(), 40);
+
+        let reply = Message::method_return(&call.header())
+            .expect("builder")
+            .build(&(
+                session.clone(),
+                Vec::<u8>::new(),
+                token.clone(),
+                "text/plain; charset=utf8".to_string(),
+            ))
+            .expect("reply");
+
+        let rewritten = rewrite_message(
+            &reply,
+            NonZeroU32::new(99).expect("non-zero"),
+            Some(NonZeroU32::new(7).expect("non-zero")),
+        )
+        .expect("rewrite");
+
+        let body = rewritten.body();
+        let (r_session, _parameters, r_value, r_content_type): (
+            ObjectPath,
+            Vec<u8>,
+            Vec<u8>,
+            String,
+        ) = body.deserialize().expect("deserialize reply body");
+
+        assert_eq!(r_session, session);
+        assert_eq!(r_value, token);
+        assert_eq!(r_content_type, "text/plain; charset=utf8");
     }
 
     #[test]

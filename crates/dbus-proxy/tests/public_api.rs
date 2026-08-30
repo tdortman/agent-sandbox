@@ -1,11 +1,11 @@
 //! Public-API behaviour tests for the D-Bus relay library.
 //!
-//! Exercises serial allocation, target extraction, and relay configuration
-//! construction against the `agent_sandbox_dbus_proxy` interface.
-use std::{num::NonZeroU32, path::PathBuf};
+//! Exercises target extraction and relay configuration construction against
+//! the `agent_sandbox_dbus_proxy` interface.
+use std::path::PathBuf;
 
 use agent_sandbox_core::{DbusBus, DbusMessageKind};
-use agent_sandbox_dbus_proxy::{RelayConfig, SerialMap, target_from_message};
+use agent_sandbox_dbus_proxy::{RelayConfig, target_from_message};
 use zbus::message::Message;
 
 #[test]
@@ -15,15 +15,6 @@ fn relay_config_new_preserves_socket_endpoints_and_defaults() {
     assert_eq!(config.upstream_address, "unix:path=/tmp/bus");
     assert_eq!(config.policy_socket, PathBuf::from("/tmp/policy.sock"));
     assert_eq!(config.bus, DbusBus::Session);
-}
-
-#[test]
-fn serial_map_round_trips_reply_serials_through_public_api() {
-    let mut map = SerialMap::new();
-    let client_serial = NonZeroU32::new(7).expect("non-zero serial");
-    let upstream_serial = map.allocate(client_serial);
-    assert_eq!(map.take(upstream_serial), Some(client_serial));
-    assert_eq!(map.take(upstream_serial), None);
 }
 
 #[test]
