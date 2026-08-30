@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Publish the built package to the Cachix binary cache when pushing to
+# main. Skip with `git push --no-verify`.
+CACHE_NAME="agent-sandbox"
+
+push_to_main=""
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    if [[ "$remote_ref" == "refs/heads/main" ]]; then
+        push_to_main="main"
+    fi
+done
+
+[[ -n "$push_to_main" ]] || exit 0
+
+if ! command -v nix >/dev/null 2>&1 || ! command -v cachix >/dev/null 2>&1; then
+    echo "pre-push: nix or cachix missing, skipping binary cache push" >&2
+    exit 0
+fi
+
+echo "pre-push: building and pushing to cachix $CACHE_NAME ..." >&2
+out="$(nix build .# --no-link --print-out-paths)"
+cachix push "$CACHE_NAME" "$out"

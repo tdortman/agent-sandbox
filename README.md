@@ -28,6 +28,8 @@ nixConfig = {
 
 Or run `nix run nixpkgs#cachix use agent-sandbox`.
 
+Pushes to `main` build the package and publish it to the cache through a pre-push hook. Enable it with `git config core.hooksPath .githooks`; skip a push with `git push --no-verify`.
+
 ## Quick start
 
 ```nix
