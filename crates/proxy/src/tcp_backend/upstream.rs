@@ -43,7 +43,10 @@ use crate::semantic::SemanticRequest;
 /// identity, and pool attribution; `ConnectorTarget` makes the transport
 /// connector use this immutable concrete address instead of resolving it.
 fn claimed_connector_target(destination: std::net::SocketAddr) -> ConnectorTarget {
-    ConnectorTarget(HostWithPort::new(Host::from(destination.ip()), destination.port()))
+    ConnectorTarget(HostWithPort::new(
+        Host::from(destination.ip()),
+        destination.port(),
+    ))
 }
 
 /// The connection type the pooled upstream client establishes.
@@ -419,7 +422,6 @@ mod tests {
     };
 
     use rama_http::{Body, Version};
-
     use rama_net::{
         address::{Host, HostWithPort},
         client::ConnectorTarget,
@@ -437,7 +439,6 @@ mod tests {
             body: Mutex::new(None),
             started: AtomicBool::new(false),
         });
-
 
         let mut body = ReplayBody {
             state: state.clone(),
