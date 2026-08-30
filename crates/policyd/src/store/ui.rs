@@ -510,7 +510,7 @@ impl PolicyStore {
         if targets.is_empty() {
             tracing::warn!(
                 kind = ?payload,
-                "policy push dropped: no matching policy UI for route"
+                "policy push has no matching policy UI; rerouting pending request"
             );
 
             return false;

@@ -179,7 +179,9 @@ mod tests {
     use std::time::Duration;
 
     use agent_sandbox_core::{
-        ApprovalScope, RequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, UiPush,
+        ApprovalScope, DbusMessageKind, DbusTarget, ProcessIds, RequestContext,
+        ResolvedRequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, SandboxPaths,
+        UiPush,
     };
 
     use super::*;
@@ -470,6 +472,115 @@ mod tests {
             "expected network push, got: {pushed:?}"
         );
 
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn late_ui_registration_flushes_pending_dbus_push() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let store = Arc::new(PolicyStore::new(args.clone()));
+        let server = PolicyServer::new(store.clone());
+
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let approval_store = store.clone();
+        let approval_task = tokio::spawn(async move {
+            approval_store
+                .request_dbus_approval(
+                    DbusTarget::session(
+                        "org.freedesktop.secrets",
+                        "/org/freedesktop/secrets",
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        DbusMessageKind::MethodCall,
+                        "ss",
+                        Vec::new(),
+                    ),
+                    ResolvedRequestContext {
+                        paths: SandboxPaths::from_wire(
+                            Some("/workspace".into()),
+                            Some("/home/user".into()),
+                            Some("/workspace".into()),
+                        ),
+                        ids: ProcessIds::from_options(None, Some(1000)),
+                        sandbox_session_id: Some("s1".into()),
+                        package: None,
+                    },
+                )
+                .await
+        });
+
+        for _ in 0..100 {
+            if !store.pending_summaries().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(store.pending_summaries().await.len(), 1);
+
+        let mut ui_conn = RpcConnection::connect(&args.host_socket)
+            .await
+            .expect("connect host socket");
+        let reply = ui_conn
+            .request(RpcRequest::RegisterUi {
+                ui_client: Some("standalone".into()),
+                ctx: RequestContext {
+                    cwd: Some("/workspace".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/workspace".into()),
+                    sandbox_session_id: Some("s1".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("RegisterUi");
+        let RpcReply::RegisterUi(registered) = reply else {
+            panic!("expected successful UI registration, got: {reply:?}");
+        };
+        assert!(registered.ok);
+
+        let pushed = tokio::time::timeout(Duration::from_secs(1), ui_conn.read_message())
+            .await
+            .expect("D-Bus push timeout")
+            .expect("read D-Bus push");
+
+        assert!(
+            matches!(
+                pushed,
+                RpcMessage::UiPush(UiPush::DbusRequest { ref target, .. })
+                    if target.destination == "org.freedesktop.secrets"
+            ),
+            "expected D-Bus push, got: {pushed:?}"
+        );
+
+        let RpcMessage::UiPush(UiPush::DbusRequest { id, .. }) = pushed else {
+            unreachable!();
+        };
+        let reply = send_and_recv(&args.host_socket, RpcRequest::Approve {
+            id,
+            scope: ApprovalScope::Once,
+            session_id: Some(registered.session_id),
+            target: None,
+            comment: None,
+            ctx: RequestContext {
+                cwd: Some("/workspace".into()),
+                home: Some("/home/user".into()),
+                project_root: Some("/workspace".into()),
+                sandbox_session_id: Some("s1".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("approve pending D-Bus request");
+        assert!(reply.scope_succeeded(), "approval failed: {reply:?}");
+
+        let verdict = approval_task.await.expect("D-Bus approval task");
+        assert!(verdict.allowed);
         server_task.abort();
     }
 

@@ -132,17 +132,27 @@ impl PolicyStore {
     async fn approval_client_authorized(
         &self,
         client_id: u64,
+        ui_session_id: Option<&str>,
         sandbox_session_id: Option<&str>,
         approver_uid: Option<u32>,
     ) -> bool {
         let inner = self.inner.lock().await;
-        let ui_authorized = inner
+        let ui_session_id = inner
             .ui_clients
             .get(&client_id)
-            .and_then(|client| inner.ui_context_by_session.get(&client.session_id))
+            .map(|client| client.session_id.as_str())
+            .or(ui_session_id);
+        let ui_authorized = ui_session_id
+            .and_then(|session_id| {
+                let ctx = inner.ui_context_by_session.get(session_id)?;
+                inner
+                    .ui_clients
+                    .get(&ctx.client_id)
+                    .filter(|client| client.session_id == session_id)
+                    .map(|_| ctx)
+            })
             .is_some_and(|ctx| {
-                ctx.client_id == client_id
-                    && ctx.sandbox_session_id.as_deref() == sandbox_session_id
+                ctx.sandbox_session_id.as_deref() == sandbox_session_id
                     && approver_uid.is_none_or(|uid| uid > 0 && ctx.owner_uid == Some(uid))
             });
         drop(inner);
@@ -187,7 +197,12 @@ impl PolicyStore {
         })?;
 
         if !self
-            .approval_client_authorized(client_id, pending.sandbox_session_id(), approver_uid)
+            .approval_client_authorized(
+                client_id,
+                wire.session_id.as_deref(),
+                pending.sandbox_session_id(),
+                approver_uid,
+            )
             .await
         {
             let mut inner = self.inner.lock().await;
