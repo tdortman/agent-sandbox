@@ -13,6 +13,21 @@ Run agent CLIs inside a bubblewrap jail on NixOS. Unknown operations block until
 | Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |
 | D-Bus      | Filtered session-bus access through a per-sandbox relay.                                                                                        |
 
+## Binary cache
+
+Prebuilt store paths are published to Cachix. Direct users of this flake pick the cache up from `nixConfig` after the trust prompt. Flakes consumed as an input do not propagate `nixConfig`, so add the settings to the consuming flake:
+
+```nix
+nixConfig = {
+  extra-substituters = [ "https://agent-sandbox.cachix.org" ];
+  extra-trusted-public-keys = [
+    "agent-sandbox.cachix.org-1:x7WgdtZjoPgbKdyk5oxP2QvN7B3SfuHmGvXKJ8xtTu0="
+  ];
+};
+```
+
+Or run `nix run nixpkgs#cachix use agent-sandbox`.
+
 ## Quick start
 
 ```nix

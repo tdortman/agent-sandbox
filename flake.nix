@@ -87,4 +87,12 @@
       url = "github:numtide/treefmt-nix";
     };
   };
+
+  nixConfig = {
+    extra-substituters = [ "https://agent-sandbox.cachix.org" ];
+
+    extra-trusted-public-keys = [
+      "agent-sandbox.cachix.org-1:x7WgdtZjoPgbKdyk5oxP2QvN7B3SfuHmGvXKJ8xtTu0="
+    ];
+  };
 }
