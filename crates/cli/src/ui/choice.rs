@@ -67,7 +67,7 @@ pub async fn resolve_choice(
                 PromptAction::Allow => "approval",
                 PromptAction::Deny => "deny",
             };
-            eprintln!("agent-sandbox: {verb} failed ({})", e.error);
+            return Err(UiCliError::Register(format!("{verb} failed ({})", e.error)));
         }
 
         RpcReply::ScopeAction(s) if s.path().is_some() => {
