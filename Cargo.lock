@@ -112,6 +112,7 @@ name = "agent-sandbox-policyd"
 version = "0.52.1"
 dependencies = [
  "agent-sandbox-core",
+ "agent-sandbox-sysutil",
  "clap",
  "nix",
  "serde_json",

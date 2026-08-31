@@ -1,21 +1,26 @@
 //! Per-connection read loop and reply framing.
 
-use std::sync::Arc;
+use std::{io::IoSliceMut, os::fd::AsRawFd, sync::Arc};
 
 use agent_sandbox_core::{
     CONTEXT_ADAPTER_PROTOCOL_MAJOR, ContextAdapterErrorCode, ContextAdapterMessage,
     ContextAdapterRequest, ProxyReply, ProxyRequestId, ReleasableHandle, RpcMessage, RpcReply,
     RpcRequest, parse_rpc_request,
 };
+use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixStream, unix::OwnedWriteHalf},
+    io::AsyncWriteExt,
+    net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::Mutex,
 };
 
 use super::dispatch::SocketRole;
 use crate::{
     error::PolicydError,
+    project_context::ReceivedFd,
     server::peer::ClientPeer,
     store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, TrustedPeer, UiClientHandle},
 };
@@ -34,10 +39,10 @@ pub async fn handle_client(
         return Ok(());
     }
 
-    let (reader, writer) = stream.into_split();
+    let (reader_half, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let client = PolicyStore::new_client_handle(writer.clone());
-    let mut reader = BufReader::new(reader);
+    let mut reader = FrameReader::default();
     let mut read_error = None;
 
     let active_checks: Arc<Mutex<Vec<ProxyCheckId>>> = Arc::new(Mutex::new(Vec::new()));
@@ -47,8 +52,8 @@ pub async fn handle_client(
     let mut context_adapter = false;
 
     loop {
-        let line = match read_line_limited(&mut reader, MAX_RPC_LINE_BYTES).await {
-            Ok(Some(line)) => line,
+        let frame = match reader.read(&reader_half, MAX_RPC_LINE_BYTES).await {
+            Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
                 reply(writer.clone(), &PolicydError::RpcLineTooLarge.into()).await;
@@ -59,6 +64,7 @@ pub async fn handle_client(
                 break;
             }
         };
+        let ReceivedFrame { line, fds } = frame;
 
         if role == SocketRole::Proxy && (proxy_session_owner || proxy_single_request) {
             break;
@@ -81,18 +87,24 @@ pub async fn handle_client(
                     continue;
                 }
             };
-            let message = dispatch_context_adapter(&store, client.id, request, true, peer, role);
+            let message =
+                dispatch_context_adapter(&store, client.id, request, fds, true, peer, role);
             reply_context_adapter(writer.clone(), &message).await;
             continue;
         }
 
         if let Ok(request) = serde_json::from_str::<ContextAdapterRequest>(&line) {
-            let message = dispatch_context_adapter(&store, client.id, request, false, peer, role);
+            let message =
+                dispatch_context_adapter(&store, client.id, request, fds, false, peer, role);
             context_adapter = matches!(message, ContextAdapterMessage::Registered { .. });
             reply_context_adapter(writer.clone(), &message).await;
             continue;
         }
 
+        if !fds.is_empty() {
+            reply(writer.clone(), &PolicydError::InvalidJson.into()).await;
+            continue;
+        }
         let req: RpcRequest = if let Ok(req) = parse_rpc_request(&line) {
             req
         } else {
@@ -255,11 +267,20 @@ fn dispatch_context_adapter(
     store: &PolicyStore,
     connection_id: u64,
     request: ContextAdapterRequest,
+    fds: Vec<ReceivedFd>,
     registered: bool,
     peer: ClientPeer,
     role: SocketRole,
 ) -> ContextAdapterMessage {
     let request_id = request.request_id();
+    let attaches_process = matches!(&request, ContextAdapterRequest::AttachProcess { .. });
+    if (attaches_process && fds.len() != 1) || (!attaches_process && !fds.is_empty()) {
+        return adapter_error(
+            Some(request_id),
+            ContextAdapterErrorCode::MalformedMessage,
+            "unexpected ancillary descriptor count",
+        );
+    }
     let result = match request {
         ContextAdapterRequest::RegisterContextAdapter {
             protocol_major,
@@ -327,13 +348,15 @@ fn dispatch_context_adapter(
             ReleasableHandle::Claim(claim) => store.release_project_claim(connection_id, &claim),
         }
         .map(|()| ContextAdapterMessage::Released { request_id }),
-        ContextAdapterRequest::AttachProcess { .. } if registered => {
-            return adapter_error(
-                Some(request_id),
-                ContextAdapterErrorCode::InvalidProcess,
-                "attach_process requires exactly one pidfd",
-            );
-        }
+        ContextAdapterRequest::AttachProcess { context, .. } if registered => store
+            .attach_project_process(
+                connection_id,
+                context,
+                fds.into_iter()
+                    .next()
+                    .expect("descriptor count was validated"),
+            )
+            .map(|()| ContextAdapterMessage::ProcessAttached { request_id }),
         _ => {
             return adapter_error(
                 Some(request_id),
@@ -405,31 +428,89 @@ fn envelope_proxy_reply(
     reply
 }
 
-async fn read_line_limited(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    max_bytes: usize,
-) -> std::io::Result<Option<String>> {
-    let mut buf = Vec::new();
-    let n = reader.read_until(b'\n', &mut buf).await?;
+struct ReceivedFrame {
+    line: String,
+    fds: Vec<ReceivedFd>,
+}
 
-    if n == 0 {
-        return Ok(None);
+#[derive(Default)]
+struct FrameReader {
+    bytes: Vec<u8>,
+    fds: Vec<ReceivedFd>,
+}
+
+impl FrameReader {
+    async fn read(
+        &mut self,
+        reader: &OwnedReadHalf,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<ReceivedFrame>> {
+        loop {
+            if let Some(newline) = self.bytes.iter().position(|byte| *byte == b'\n') {
+                if newline > max_bytes {
+                    self.bytes.clear();
+                    self.fds.clear();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "RPC line too large",
+                    ));
+                }
+                let mut bytes: Vec<_> = self.bytes.drain(..=newline).collect();
+                bytes.pop();
+                let line = String::from_utf8(bytes).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
+                })?;
+                return Ok(Some(ReceivedFrame {
+                    line,
+                    fds: std::mem::take(&mut self.fds),
+                }));
+            }
+            if self.bytes.len() > max_bytes {
+                self.bytes.clear();
+                self.fds.clear();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "RPC line too large",
+                ));
+            }
+
+            reader.readable().await?;
+            let mut chunk = [0_u8; 8192];
+            let mut cmsg = nix::cmsg_space!([std::os::fd::RawFd; 2]);
+            let received = {
+                let mut iov = [IoSliceMut::new(&mut chunk)];
+                match recvmsg::<()>(
+                    reader.as_ref().as_raw_fd(),
+                    &mut iov,
+                    Some(&mut cmsg),
+                    MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
+                ) {
+                    Ok(message) => {
+                        if message.flags.contains(MsgFlags::MSG_CTRUNC) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "too many ancillary descriptors",
+                            ));
+                        }
+                        let mut descriptors = Vec::new();
+                        for control in message.cmsgs().map_err(std::io::Error::from)? {
+                            if let ControlMessageOwned::ScmRights(rights) = control {
+                                descriptors.extend(rights);
+                            }
+                        }
+                        (message.bytes, descriptors)
+                    }
+                    Err(nix::errno::Errno::EAGAIN) => continue,
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
+            };
+            if received.0 == 0 {
+                return Ok(None);
+            }
+            self.bytes.extend_from_slice(&chunk[..received.0]);
+            self.fds.extend(received.1.into_iter().map(ReceivedFd::new));
+        }
     }
-
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-    }
-
-    if buf.len() > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "RPC line too large",
-        ));
-    }
-
-    Ok(Some(String::from_utf8(buf).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8")
-    })?))
 }
 
 async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
@@ -475,6 +556,7 @@ mod tests {
                 session_key: agent_sandbox_core::ExternalSessionKey::new("session").unwrap(),
                 activation: agent_sandbox_core::ActivationHandle::new(),
             },
+            Vec::new(),
             false,
             ClientPeer {
                 pid: std::process::id(),

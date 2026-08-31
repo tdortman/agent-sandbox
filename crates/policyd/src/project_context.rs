@@ -5,17 +5,46 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    os::unix::fs::MetadataExt,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::fs::MetadataExt,
+    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
-    ActivationHandle, BindingHandle, ClaimHandle, ContextAdapterErrorCode, ExternalOperationKey,
-    ExternalSessionKey, WorkspaceActivation,
+    ActivationHandle, AttachmentHandle, BindingHandle, ClaimHandle, ContextAdapterErrorCode,
+    ExternalOperationKey, ExternalSessionKey, ProcessIdentity, WorkspaceActivation,
 };
 
 const MAX_ACTIVATIONS_PER_SANDBOX: usize = 256;
+const MAX_ATTACHMENTS_PER_SANDBOX: usize = 1024;
+
+#[derive(Debug)]
+pub(crate) struct ReceivedFd(RawFd);
+
+impl ReceivedFd {
+    pub(crate) const fn new(fd: RawFd) -> Self {
+        Self(fd)
+    }
+
+    pub(crate) const fn raw(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl AsRawFd for ReceivedFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for ReceivedFd {
+    fn drop(&mut self) {
+        let _ = nix::unistd::close(self.0);
+    }
+}
 const MAX_BINDINGS_PER_ADAPTER: usize = 4096;
 const MAX_OVERRIDES_PER_ADAPTER: usize = 1024;
 const CLAIM_TTL: Duration = Duration::from_secs(30);
@@ -141,6 +170,23 @@ struct ClaimRecord {
     binding: BindingHandle,
     activation: ActivationHandle,
     expires_at: Instant,
+    active: bool,
+}
+
+#[derive(Debug)]
+struct ProcessAttachment {
+    connection_id: u64,
+    context: AttachmentHandle,
+    _pidfd: ReceivedFd,
+    cgroup: Option<PathBuf>,
+}
+
+impl Drop for ProcessAttachment {
+    fn drop(&mut self) {
+        if let Some(cgroup) = &self.cgroup {
+            let _ = std::fs::remove_dir(cgroup);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +210,7 @@ pub(crate) struct ProjectContextRegistry {
     adapter_by_sandbox: HashMap<String, u64>,
     bindings: HashMap<BindingHandle, BindingRecord>,
     claims: HashMap<ClaimHandle, ClaimRecord>,
+    attachments: HashMap<ProcessIdentity, ProcessAttachment>,
 }
 
 impl Default for ProjectContextRegistry {
@@ -176,6 +223,7 @@ impl Default for ProjectContextRegistry {
             adapter_by_sandbox: HashMap::new(),
             bindings: HashMap::new(),
             claims: HashMap::new(),
+            attachments: HashMap::new(),
         }
     }
 }
@@ -277,6 +325,8 @@ impl ProjectContextRegistry {
         }
         self.claims
             .retain(|_, claim| claim.connection_id != connection_id);
+        self.attachments
+            .retain(|_, attachment| attachment.connection_id != connection_id);
     }
 
     pub(crate) fn bind_session(
@@ -366,8 +416,97 @@ impl ProjectContextRegistry {
             binding,
             activation,
             expires_at: now + CLAIM_TTL,
+            active: false,
         });
         Ok(claim)
+    }
+
+    pub(crate) fn adapter_sandbox(&self, connection_id: u64) -> Option<&str> {
+        self.adapters
+            .get(&connection_id)
+            .map(|adapter| adapter.sandbox.as_str())
+    }
+
+    pub(crate) fn attach_process(
+        &mut self,
+        connection_id: u64,
+        process: ProcessIdentity,
+        context: AttachmentHandle,
+        pidfd: ReceivedFd,
+        cgroup: Option<PathBuf>,
+        now: Instant,
+    ) -> Result<()> {
+        self.expire_claims(now);
+        if let Some(existing) = self.attachments.get(&process) {
+            if existing.connection_id == connection_id && existing.context == context {
+                return Ok(());
+            }
+            return Err(error(
+                ContextAdapterErrorCode::Conflict,
+                "process is already attached",
+            ));
+        }
+        let claim_to_activate = match &context {
+            AttachmentHandle::Binding(binding) => {
+                self.require_binding(connection_id, binding)?;
+                None
+            }
+            AttachmentHandle::Claim(claim) => {
+                let record = self.claims.get(claim).ok_or_else(|| {
+                    error(ContextAdapterErrorCode::UnknownHandle, "claim is unknown")
+                })?;
+                if record.connection_id != connection_id {
+                    return Err(error(
+                        ContextAdapterErrorCode::UnknownHandle,
+                        "claim is unknown on this connection",
+                    ));
+                }
+                if self.attachments.values().any(|attachment| {
+                    matches!(&attachment.context, AttachmentHandle::Claim(current) if current == claim)
+                        && attachment.connection_id == connection_id
+                }) {
+                    return Err(error(
+                        ContextAdapterErrorCode::Conflict,
+                        "claim is attached to another process",
+                    ));
+                }
+                Some(claim.clone())
+            }
+        };
+        if self
+            .attachments
+            .values()
+            .filter(|attachment| attachment.connection_id == connection_id)
+            .count()
+            >= MAX_ATTACHMENTS_PER_SANDBOX
+        {
+            return Err(error(
+                ContextAdapterErrorCode::ResourceExhausted,
+                "process attachment limit reached",
+            ));
+        }
+        self.attachments.insert(process, ProcessAttachment {
+            connection_id,
+            context,
+            _pidfd: pidfd,
+            cgroup,
+        });
+        if let Some(claim) = claim_to_activate {
+            self.claims
+                .get_mut(&claim)
+                .expect("validated claim remains live")
+                .active = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn detach_process(&mut self, process: &ProcessIdentity) {
+        if let Some(attachment) = self.attachments.remove(process)
+            && let AttachmentHandle::Claim(claim) = &attachment.context
+            && let Some(record) = self.claims.get_mut(claim)
+        {
+            record.active = false;
+        }
     }
 
     pub(crate) fn release_binding_for(
@@ -447,6 +586,10 @@ impl ProjectContextRegistry {
                 .operations
                 .retain(|_, operation| &operation.binding != binding);
             adapter.released_claims.extend(claims.iter().cloned());
+            self.attachments.retain(|_, attachment| {
+                !matches!(&attachment.context, AttachmentHandle::Binding(current) if current == binding)
+                    && !matches!(&attachment.context, AttachmentHandle::Claim(current) if claims.contains(current))
+            });
             for claim in claims {
                 self.claims.remove(&claim);
             }
@@ -455,6 +598,9 @@ impl ProjectContextRegistry {
 
     pub(crate) fn release_claim(&mut self, claim: &ClaimHandle) {
         self.claims.remove(claim);
+        self.attachments.retain(
+            |_, attachment| !matches!(&attachment.context, AttachmentHandle::Claim(current) if current == claim),
+        );
         for adapter in self.adapters.values_mut() {
             if adapter
                 .operations
@@ -562,13 +708,46 @@ impl ProjectContextRegistry {
         let expired: Vec<_> = self
             .claims
             .iter()
-            .filter(|(_, claim)| claim.expires_at <= now)
+            .filter(|(_, claim)| !claim.active && claim.expires_at <= now)
             .map(|(handle, _)| handle.clone())
             .collect();
         for claim in expired {
             self.release_claim(&claim);
         }
     }
+}
+
+fn pid_from_pidfd(pidfd: &ReceivedFd) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.raw()))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:")?.trim().parse().ok())
+}
+
+fn process_facts(pid: u32) -> Option<(u32, u64, char)> {
+    let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Uid:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let mut fields = stat[end + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some((uid, start_time, state))
+}
+
+fn unified_cgroup(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
 }
 
 impl crate::store::PolicyStore {
@@ -618,6 +797,127 @@ impl crate::store::PolicyStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .begin_operation(connection_id, key, binding, activation, Instant::now())
+    }
+
+    pub(crate) fn attach_project_process(
+        &self,
+        connection_id: u64,
+        context: AttachmentHandle,
+        pidfd: ReceivedFd,
+    ) -> Result<()> {
+        let sandbox = self
+            .project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .adapter_sandbox(connection_id)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                error(
+                    ContextAdapterErrorCode::Unauthorized,
+                    "connection is not a context adapter",
+                )
+            })?;
+        let registration = self
+            .sandbox_sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&sandbox)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    ContextAdapterErrorCode::InvalidProcess,
+                    "sandbox registration is unavailable",
+                )
+            })?;
+        let pid = pid_from_pidfd(&pidfd).ok_or_else(|| {
+            error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "descriptor is not a live pidfd",
+            )
+        })?;
+        let (uid, start_time, state) = process_facts(pid).ok_or_else(|| {
+            error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "process identity is unavailable",
+            )
+        })?;
+        if uid != registration.owner_uid || !matches!(state, 'T' | 't') {
+            return Err(error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "process is not stopped or has the wrong owner",
+            ));
+        }
+        let process_cgroup = unified_cgroup(pid);
+        let sandbox_cgroup = (registration.root_pid != 0)
+            .then(|| unified_cgroup(registration.root_pid))
+            .flatten();
+        if !matches!((process_cgroup.as_deref(), sandbox_cgroup.as_deref()),
+            (Some(process), Some(root)) if process == root || process.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/')))
+        {
+            return Err(error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "process is outside the managed sandbox cgroup",
+            ));
+        }
+        let process = ProcessIdentity::new(pid, uid, start_time).map_err(|_| {
+            error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "process identity is invalid",
+            )
+        })?;
+        let root = sandbox_cgroup.expect("validated sandbox cgroup");
+        let leaf_name = format!(
+            "agent-sandbox-context/{}-{}",
+            process.pid(),
+            process.process_start_time_ticks().get()
+        );
+        let leaf_cgroup = if root == "/" {
+            format!("/{leaf_name}")
+        } else {
+            format!("{root}/{leaf_name}")
+        };
+        let leaf = Path::new("/sys/fs/cgroup").join(leaf_cgroup.trim_start_matches('/'));
+        std::fs::create_dir_all(&leaf).map_err(|_| {
+            error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "controlled process cgroup cannot be created",
+            )
+        })?;
+        std::fs::write(leaf.join("cgroup.procs"), pid.to_string()).map_err(|_| {
+            error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "process cannot be moved into the controlled cgroup",
+            )
+        })?;
+        if unified_cgroup(pid).as_deref() != Some(leaf_cgroup.as_str()) {
+            return Err(error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "controlled cgroup membership could not be verified",
+            ));
+        }
+        let raw_pidfd = pidfd.raw();
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attach_process(
+                connection_id,
+                process,
+                context,
+                pidfd,
+                Some(leaf),
+                Instant::now(),
+            )?;
+        if agent_sandbox_sysutil::pidfd_send_signal(raw_pidfd, nix::libc::SIGCONT).is_err() {
+            self.project_context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .detach_process(&process);
+            return Err(error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "attached process could not be resumed",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn project_context_boot_epoch(&self) -> u64 {
@@ -727,5 +1027,53 @@ mod tests {
         registry.release_binding_for(7, &binding).unwrap();
         registry.release_binding_for(7, &binding).unwrap();
         assert!(registry.resolve_binding(7, &binding).is_none());
+    }
+
+    #[test]
+    fn attached_claim_stays_live_until_release() {
+        use std::os::fd::IntoRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().metadata().unwrap().uid();
+        let mut registry = ProjectContextRegistry::default();
+        let activation = registry.activate("sandbox", owner, dir.path()).unwrap();
+        registry.register_adapter(7, "sandbox").unwrap();
+        let binding = registry
+            .bind_session(
+                7,
+                ExternalSessionKey::new("session").unwrap(),
+                activation.activation.clone(),
+            )
+            .unwrap();
+        let now = Instant::now();
+        let claim = registry
+            .begin_operation(
+                7,
+                ExternalOperationKey::new("operation").unwrap(),
+                binding,
+                activation.activation,
+                now,
+            )
+            .unwrap();
+        let process = ProcessIdentity::new(123, owner, 456).unwrap();
+        let fd = File::open("/dev/null").unwrap().into_raw_fd();
+        registry
+            .attach_process(
+                7,
+                process,
+                AttachmentHandle::Claim(claim.clone()),
+                ReceivedFd::new(fd),
+                None,
+                now,
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .resolve_claim(7, &claim, now + CLAIM_TTL + Duration::from_secs(1))
+                .is_some()
+        );
+        registry.release_claim_for(7, &claim).unwrap();
+        assert!(registry.attachments.is_empty());
     }
 }

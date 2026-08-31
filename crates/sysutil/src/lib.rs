@@ -50,6 +50,24 @@ pub fn pidfd_getfd(pidfd: impl AsFd, fd: i32) -> io::Result<OwnedFd> {
     fd_from_syscall(raw)
 }
 
+/// Send a signal through a pidfd without racing PID reuse.
+///
+/// # Errors
+/// Returns the kernel error from `pidfd_send_signal(2)`.
+pub fn pidfd_send_signal(pidfd: std::os::fd::RawFd, signal: i32) -> io::Result<()> {
+    // SAFETY: the syscall receives a descriptor, signal number, null siginfo,
+    // and flags=0. No userspace memory is dereferenced.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    })
+}
+
 /// Rename a path relative to two trusted directory descriptors.
 ///
 /// # Errors
