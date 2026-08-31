@@ -173,23 +173,14 @@ impl PolicyStore {
         self.resolve_from_peer(ctx, peer)
     }
 
-    pub(crate) fn resolve_dbus_proxy_context(
+    /// Resolve a gate context without allowing root peer credentials to trust
+    /// caller-supplied paths or session identifiers.
+    pub(crate) fn resolve_gate_context_with_peer(
         &self,
         ctx: &MergeContext,
         peer: TrustedPeer,
     ) -> ResolvedRequestContext {
-        let pid = ctx
-            .ids
-            .pid()
-            .filter(|_| ctx.ids.uid().is_none_or(|uid| uid == peer.uid));
-
-        let ids = ProcessIds::from_options(pid, Some(peer.uid));
-
-        self.resolve_trusted_context(&ResolvedRequestContext::new(
-            SandboxPaths::default(),
-            ids,
-            ctx.sandbox_session_id.clone(),
-        ))
+        self.resolve_from_peer_strict(ctx, peer)
     }
 
     /// Re-resolve a context that was already sanitized upstream by
@@ -249,10 +240,27 @@ impl PolicyStore {
     }
 
     fn resolve_from_peer(&self, ctx: &MergeContext, peer: TrustedPeer) -> ResolvedRequestContext {
+        self.resolve_from_peer_inner(ctx, peer, true)
+    }
+
+    fn resolve_from_peer_strict(
+        &self,
+        ctx: &MergeContext,
+        peer: TrustedPeer,
+    ) -> ResolvedRequestContext {
+        self.resolve_from_peer_inner(ctx, peer, false)
+    }
+
+    fn resolve_from_peer_inner(
+        &self,
+        ctx: &MergeContext,
+        peer: TrustedPeer,
+        allow_root_wire_context: bool,
+    ) -> ResolvedRequestContext {
         // Host-side helpers (fsmon, syscall-broker) connect to the sandbox
         // socket as root. Their wire ctx was populated at spawn time (or carries
         // the tracee pid); peer-based home/cwd would be wrong and breaks UI spawn.
-        if peer.uid == 0 {
+        if allow_root_wire_context && peer.uid == 0 {
             return self.resolve_trusted_context(&ResolvedRequestContext::new(
                 ctx.paths.clone(),
                 ctx.ids,
@@ -275,7 +283,11 @@ impl PolicyStore {
         };
 
         let trusted_uid = trusted_uid.or_else(|| ctx.ids.uid());
-        let mut sandbox_session_id = ctx.sandbox_session_id.clone();
+        let mut sandbox_session_id = if allow_root_wire_context {
+            ctx.sandbox_session_id.clone()
+        } else {
+            None
+        };
 
         if sandbox_session_id.is_none()
             && let Some(pid) = verified_pid

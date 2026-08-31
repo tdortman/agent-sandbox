@@ -374,6 +374,7 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                evidence: None,
             })
             .await
             .expect("Check after RegisterUi");
@@ -450,6 +451,7 @@ mod tests {
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
                 },
+                evidence: None,
             })
             .await
             .expect("write Check");
@@ -631,6 +633,7 @@ mod tests {
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
                 },
+                evidence: None,
             })
             .await
             .expect("write Elevate");

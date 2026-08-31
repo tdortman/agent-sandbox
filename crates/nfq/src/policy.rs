@@ -1,15 +1,63 @@
 //! Policy RPC client for NFQUEUE, calls policyd's `Check` endpoint.
 
-use std::{net::IpAddr, time::Duration};
+use std::{
+    fs,
+    net::IpAddr,
+    os::unix::fs::MetadataExt,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use agent_sandbox_core::{
-    FlowRegistration, RequestContext, RpcReply, RpcRequest, attach_check_aliases, daemon_context,
-    persist_session_paths, policy_rpc,
+    CgroupIdentity, FlowRegistration, NetworkFlowKey, NfqEvidence, OperationIdentity,
+    RequestContext, RoleEvidenceRequest, RpcReply, RpcRequest, SocketIdentity, SubcheckIdentity,
+    attach_check_aliases, daemon_context, persist_session_paths, policy_rpc,
 };
 use nfq_updated::Verdict;
 use tracing::{debug, info, warn};
 
 use crate::{flow::NfqState, packet, packet::TransportProtocol};
+
+static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn nfq_evidence(
+    meta: packet::PacketMeta,
+    owner: Option<SocketIdentity>,
+) -> Option<RoleEvidenceRequest> {
+    let owner = owner?;
+    let pid = owner.pid().get();
+    let cgroup_content = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let cgroup_path = cgroup_content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let cgroup = CgroupIdentity::new(
+        fs::metadata(format!("/sys/fs/cgroup{cgroup_path}"))
+            .ok()?
+            .ino(),
+    )
+    .ok()?;
+    let flow = NetworkFlowKey::try_new(
+        meta.protocol,
+        meta.src_ip,
+        meta.src_port,
+        meta.dst_ip,
+        meta.dst_port,
+    )
+    .ok()?;
+    let operation_id =
+        OperationIdentity::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed).max(1)).ok()?;
+    let subcheck_id = SubcheckIdentity::new(1).ok()?;
+    Some(RoleEvidenceRequest::Nfq {
+        request_id: operation_id.get(),
+        evidence: NfqEvidence {
+            operation_id,
+            subcheck_id,
+            flow,
+            owner,
+            cgroup,
+        },
+    })
+}
 
 /// Inputs for a single policy check, grouped to keep the call signature small.
 pub struct CheckDestinationArgs<'a> {
@@ -19,6 +67,7 @@ pub struct CheckDestinationArgs<'a> {
     pub protocol: TransportProtocol,
     pub src_pid: Option<u32>,
     pub aliases: &'a [String],
+    pub evidence: Option<RoleEvidenceRequest>,
 }
 
 /// Check whether a destination is allowed by policy.
@@ -30,6 +79,9 @@ pub async fn check_destination(
     args: CheckDestinationArgs<'_>,
     timeout: Duration,
 ) -> std::io::Result<bool> {
+    let Some(evidence) = args.evidence else {
+        return Err(std::io::Error::other("NFQ owner evidence is unavailable"));
+    };
     let ctx = daemon_context(args.src_pid);
     persist_session_paths(&ctx.paths);
     let scheme = args.protocol.as_str();
@@ -42,6 +94,7 @@ pub async fn check_destination(
         scheme: scheme.to_string(),
         url: attach_check_aliases(Some(url), args.aliases),
         ctx: RequestContext::from(&ctx),
+        evidence: Some(evidence),
     };
 
     let resp = policy_rpc(socket, req, timeout)
@@ -170,6 +223,7 @@ pub fn transport_check(
     meta: packet::PacketMeta,
     src_pid: Option<u32>,
     session_id: Option<&str>,
+    owner: Option<SocketIdentity>,
     check: &mut dyn FnMut(CheckDestinationArgs<'_>) -> std::io::Result<bool>,
 ) -> TransportCheck {
     let dst_ip = meta.dst_ip.to_string();
@@ -188,6 +242,7 @@ pub fn transport_check(
         protocol: meta.protocol,
         src_pid,
         aliases: &aliases,
+        evidence: nfq_evidence(meta, owner),
     });
 
     let allowed = result.unwrap_or_else(|err| {

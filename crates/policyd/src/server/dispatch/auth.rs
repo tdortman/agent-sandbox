@@ -110,15 +110,18 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::Elevate {
                 argv: vec!["id".into()],
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::CheckFilesystem {
                 path: "/tmp/test".into(),
                 access: FileAccess::ReadWrite,
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::StartFilesystemMonitor {
                 ctx: RequestContext::default(),
@@ -239,15 +242,18 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::Elevate {
                 argv: vec!["id".into()],
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::CheckFilesystem {
                 path: "/tmp/test".into(),
                 access: FileAccess::ReadWrite,
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::StartFilesystemMonitor {
                 ctx: RequestContext::default(),
@@ -354,15 +360,18 @@ mod tests {
                 scheme: "https".into(),
                 url: None,
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::Elevate {
                 argv: vec!["id".into()],
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::CheckFilesystem {
                 path: "/tmp/test".into(),
                 access: FileAccess::ReadWrite,
                 ctx: RequestContext::default(),
+                evidence: None,
             },
             RpcRequest::StartFilesystemMonitor {
                 ctx: RequestContext::default(),

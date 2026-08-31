@@ -8,6 +8,7 @@ use std::{
     io,
     io::{Read, Write},
     mem::size_of,
+    num::NonZeroU32,
     os::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::{
@@ -17,16 +18,27 @@ use std::{
     },
     path::{Path, PathBuf},
     process,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use agent_sandbox_core::{
-    FileAccess, ProcessIds, normalize_directory_traverse_access, open_flags_to_file_access,
-    wire_context,
+    CgroupIdentity, FanotifyEventId, FanotifyEvidence, FileAccess, OperationIdentity,
+    ProcessIdentity, ProcessIds, RoleEvidenceRequest, SubcheckIdentity, ThreadIdentity,
+    normalize_directory_traverse_access, open_flags_to_file_access, wire_context,
 };
 use agent_sandbox_fsmon::MonitorClient;
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
 };
+static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SUBCHECK_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id(counter: &AtomicU64) -> Option<u64> {
+    let value = counter.fetch_add(1, Ordering::Relaxed);
+    (value != 0).then_some(value)
+}
+
 fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
     let response = FanotifyResponse {
         fd: event_fd.as_raw_fd(),
@@ -206,6 +218,38 @@ impl HostProc {
         }
 
         None
+    }
+
+    fn process_identity(&self, pid: i32) -> io::Result<ProcessIdentity> {
+        let pid = u32::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process id"))?;
+        let status = self.read_to_string(pid as i32, "status")?;
+        let uid = status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Uid:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process uid"))?;
+        let stat = self.read_to_string(pid as i32, "stat")?;
+        let (_, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?;
+        let start_time = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing process start time")
+            })?
+            .parse()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid process start time")
+            })?;
+        ProcessIdentity::new(pid, uid, start_time)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }
 
@@ -708,7 +752,10 @@ fn mark_mountpoints(
 /// A process remains in its cgroup after daemonisation/reparenting, while its
 /// `PPid` ancestry can immediately point at an unrelated host process.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SandboxCgroup(String);
+struct SandboxCgroup {
+    path: String,
+    identity: CgroupIdentity,
+}
 
 impl SandboxCgroup {
     fn read(host_proc: &HostProc, pid: i32) -> Option<Self> {
@@ -717,12 +764,36 @@ impl SandboxCgroup {
             let (hierarchy, path) = line.split_once("::")?;
             (hierarchy == "0" && !path.is_empty()).then(|| path.to_string())
         })?;
-        Some(Self(path))
+        let identity = host_proc
+            .metadata(pid, &format!("root/sys/fs/cgroup{path}"))
+            .ok()
+            .and_then(|metadata| CgroupIdentity::new(metadata.st_ino).ok())
+            .or_else(|| {
+                fs::metadata(format!("/sys/fs/cgroup{path}"))
+                    .ok()
+                    .and_then(|metadata| CgroupIdentity::new(metadata.ino()).ok())
+            })?;
+        Some(Self { path, identity })
+    }
+
+    fn identity(&self) -> CgroupIdentity {
+        self.identity
     }
 
     fn contains(&self, host_proc: &HostProc, pid: i32) -> Option<bool> {
-        Some(Self::read(host_proc, pid)?.0 == self.0)
+        Some(cgroup_path_contains(
+            &self.path,
+            &Self::read(host_proc, pid)?.path,
+        ))
     }
+}
+
+fn cgroup_path_contains(root: &str, candidate: &str) -> bool {
+    candidate == root
+        || root == "/"
+        || candidate
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Event loop: read fanotify events and forward to policyd for allow/deny
@@ -815,12 +886,83 @@ fn run_event_loop(
                     mask_to_access(host_proc, meta.mask, &event_fd, meta.pid),
                 );
 
-                tracing::info!(%path, ?access, pid = meta.pid, "filesystem check");
-                let mut event_ctx = ctx.clone();
-                event_ctx.pid = u32::try_from(meta.pid).ok();
+                let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
+                let process = match host_proc.process_identity(process_pid) {
+                    Ok(process) => process,
+                    Err(error) => {
+                        tracing::warn!(pid = process_pid, %error, "process identity capture failed, denying");
+                        respond(fan_fd, &event_fd, FAN_DENY);
+                        offset += event_len;
+                        continue;
+                    }
+                };
+                let Some(tid) = NonZeroU32::new(meta.pid.cast_unsigned()) else {
+                    respond(fan_fd, &event_fd, FAN_DENY);
+                    offset += event_len;
+                    continue;
+                };
+                let Some(tgid) = NonZeroU32::new(process_pid.cast_unsigned()) else {
+                    respond(fan_fd, &event_fd, FAN_DENY);
+                    offset += event_len;
+                    continue;
+                };
+                let Some(operation_id) =
+                    next_id(&NEXT_OPERATION_ID).and_then(|id| OperationIdentity::new(id).ok())
+                else {
+                    respond(fan_fd, &event_fd, FAN_DENY);
+                    offset += event_len;
+                    continue;
+                };
+                let Some(subcheck_id) =
+                    next_id(&NEXT_SUBCHECK_ID).and_then(|id| SubcheckIdentity::new(id).ok())
+                else {
+                    respond(fan_fd, &event_fd, FAN_DENY);
+                    offset += event_len;
+                    continue;
+                };
+                let Some(event_id) =
+                    next_id(&NEXT_EVENT_ID).and_then(|id| FanotifyEventId::new(id).ok())
+                else {
+                    respond(fan_fd, &event_fd, FAN_DENY);
+                    offset += event_len;
+                    continue;
+                };
+                tracing::info!(%path, ?access, pid = process_pid, "filesystem check");
+                let event_ctx = agent_sandbox_core::RequestContext {
+                    sandbox_session_id: ctx.sandbox_session_id.clone(),
+                    ..agent_sandbox_core::RequestContext::default()
+                };
+                let Some(event_cgroup) =
+                    SandboxCgroup::read(host_proc, process_pid).map(|cgroup| cgroup.identity())
+                else {
+                    tracing::warn!(
+                        pid = process_pid,
+                        "event cgroup identity capture failed, denying"
+                    );
+                    respond(fan_fd, &event_fd, FAN_DENY);
+                    offset += event_len;
+                    continue;
+                };
+                let evidence = RoleEvidenceRequest::Fanotify {
+                    request_id: operation_id.get(),
+                    evidence: FanotifyEvidence {
+                        operation_id,
+                        subcheck_id,
+                        event_id,
+                        process,
+                        opener: ThreadIdentity { tid, tgid },
+                        cgroup: event_cgroup,
+                        path: PathBuf::from(&path),
+                        access,
+                    },
+                };
 
-                let reply =
-                    runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
+                let reply = runtime.block_on(rpc.check_filesystem_with_evidence(
+                    Path::new(&path),
+                    access,
+                    event_ctx,
+                    Some(evidence),
+                ));
 
                 let verdict = match &reply {
                     Ok(r) if r.allowed => FAN_ALLOW,
@@ -928,6 +1070,15 @@ fn main() {
         std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
     );
 
+    let target_pid = i32::try_from(cli.pid).unwrap_or_else(|_| {
+        eprintln!("agent-sandbox-fsmon: --pid does not fit in pid_t");
+        process::exit(1);
+    });
+    let sandbox_cgroup = SandboxCgroup::read(&host_proc, target_pid).unwrap_or_else(|| {
+        eprintln!("agent-sandbox-fsmon: cannot read target cgroup membership");
+        process::exit(1);
+    });
+
     // setns into the target mount namespace before marking its mounts.
     join_target_mount_namespace(cli.pid);
 
@@ -965,16 +1116,6 @@ fn main() {
 
     let _ = io::stdout().flush();
     let socket_path = cli.socket.as_path();
-
-    let target_pid = i32::try_from(cli.pid).unwrap_or_else(|_| {
-        eprintln!("agent-sandbox-fsmon: --pid does not fit in pid_t");
-        process::exit(1);
-    });
-
-    let sandbox_cgroup = SandboxCgroup::read(&host_proc, target_pid).unwrap_or_else(|| {
-        eprintln!("agent-sandbox-fsmon: cannot read target cgroup membership");
-        process::exit(1);
-    });
 
     run_event_loop(
         &fan_fd,
@@ -1321,10 +1462,29 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_paths_include_controlled_descendants_without_prefix_collisions() {
+        assert!(cgroup_path_contains(
+            "/sandbox/session.scope",
+            "/sandbox/session.scope"
+        ));
+        assert!(cgroup_path_contains(
+            "/sandbox/session.scope",
+            "/sandbox/session.scope/context-leaf"
+        ));
+        assert!(!cgroup_path_contains(
+            "/sandbox/session.scope",
+            "/sandbox/session.scope-other"
+        ));
+    }
+
+    #[test]
     fn cgroup_membership_is_stable_identity_not_parent_ancestry() {
-        let session = SandboxCgroup("/sandbox/session.scope".to_string());
-        assert_eq!(session.0, "/sandbox/session.scope");
-        assert_ne!(session.0, "/");
+        let session = SandboxCgroup {
+            path: "/sandbox/session.scope".to_string(),
+            identity: CgroupIdentity::new(42).expect("non-zero cgroup identity"),
+        };
+        assert_eq!(session.path, "/sandbox/session.scope");
+        assert_ne!(session.path, "/");
     }
 
     #[test]

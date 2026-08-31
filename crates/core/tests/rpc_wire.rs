@@ -25,6 +25,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
             uid: Some(1000),
             sandbox_session_id: Some("session-1".into()),
         },
+        evidence: None,
     };
 
     let wire = serde_json::to_string(&request).expect("serialize RPC request");
@@ -38,6 +39,7 @@ fn check_request_round_trips_with_context_over_json_wire() {
             scheme,
             url,
             ctx,
+            ..
         } => {
             assert_eq!(host.as_deref(), Some("example.com"));
             assert_eq!(connect_host.as_deref(), Some("203.0.113.7"));

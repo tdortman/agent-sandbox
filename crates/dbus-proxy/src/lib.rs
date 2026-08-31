@@ -1,10 +1,14 @@
 //! Unix-socket D-Bus relay with policy checks.
 
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{fs, num::NonZeroU32, os::unix::fs::MetadataExt, path::PathBuf, time::Duration};
 
 use agent_sandbox_core::{
     policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusTarget},
-    rpc::{RequestContext, RpcReply, RpcRequest},
+    rpc::{
+        CgroupIdentity, DbusEvidence, DbusFdEvidence, DbusOperationIdentity, DbusSerial,
+        DbusTargetEvidence, ProcessIdentity, RequestContext, RoleEvidenceRequest, RpcReply,
+        RpcRequest, SubcheckIdentity,
+    },
     rpc_client::PersistentRpcClient,
 };
 use futures_util::StreamExt;
@@ -57,6 +61,45 @@ impl RelayConfig {
             bus: DbusBus::Session,
             context: RequestContext::default(),
         }
+    }
+}
+
+fn peer_identity(pid: i32, uid: u32) -> Option<(ProcessIdentity, CgroupIdentity)> {
+    let pid = u32::try_from(pid).ok()?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let start_time = fields.split_whitespace().nth(19)?.parse().ok()?;
+    let cgroup_content = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let cgroup_path = cgroup_content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let cgroup = CgroupIdentity::new(
+        fs::metadata(format!("/sys/fs/cgroup{cgroup_path}"))
+            .ok()?
+            .ino(),
+    )
+    .ok()?;
+    let process = ProcessIdentity::new(pid, uid, start_time).ok()?;
+    Some((process, cgroup))
+}
+
+fn evidence_target(target: &DbusTarget) -> DbusTargetEvidence {
+    DbusTargetEvidence {
+        bus: target.bus,
+        destination: target.destination.clone(),
+        object_path: target.object_path.clone(),
+        interface: target.interface.clone(),
+        member: target.member.clone(),
+        message_kind: target.message_kind,
+        signature: target.signature.clone(),
+        fd_metadata: target
+            .fd_metadata
+            .iter()
+            .map(|fd| DbusFdEvidence {
+                kind: fd.kind.clone(),
+                read_only: fd.read_only,
+            })
+            .collect(),
     }
 }
 
@@ -165,6 +208,8 @@ async fn handle_client(
 
     config.context.pid = u32::try_from(credentials.pid()).ok();
     config.context.uid = Some(credentials.uid());
+    let (peer_process, peer_cgroup) = peer_identity(credentials.pid(), credentials.uid())
+        .ok_or_else(|| RelayError::Message("cannot capture D-Bus peer identity".into()))?;
 
     let client_stream = Builder::unix_stream(client_socket)
         .p2p()
@@ -185,6 +230,7 @@ async fn handle_client(
         .ok_or_else(|| RelayError::Message("upstream has no unique name".into()))?;
 
     let mut policy = PersistentRpcClient::new_trusted(config.policy_socket.clone());
+    let relay_connection = agent_sandbox_core::ProxyConnectionId::new();
 
     relay_loop(
         RelayChannels {
@@ -196,6 +242,9 @@ async fn handle_client(
         upstream_name,
         &mut policy,
         &config,
+        relay_connection,
+        peer_process,
+        peer_cgroup,
     )
     .await
 }
@@ -205,6 +254,9 @@ async fn relay_loop(
     upstream_name: String,
     policy: &mut PersistentRpcClient,
     config: &RelayConfig,
+    relay_connection: agent_sandbox_core::ProxyConnectionId,
+    peer_process: ProcessIdentity,
+    peer_cgroup: CgroupIdentity,
 ) -> Result<(), RelayError> {
     let RelayChannels {
         mut client_stream,
@@ -235,12 +287,26 @@ async fn relay_loop(
                     continue;
                 }
                 let target = target_from_message(&client_message, config.bus);
-                let allowed = policy_check(policy, target, config.context.clone(), POLICY_TIMEOUT).await;
+                let serial = client_message.header().primary().serial_num();
+                let evidence = dbus_evidence(
+                    relay_connection,
+                    serial.get(),
+                    peer_process,
+                    peer_cgroup,
+                    &target,
+                );
+                let allowed = policy_check(
+                    policy,
+                    target,
+                    config.context.clone(),
+                    evidence,
+                    POLICY_TIMEOUT,
+                )
+                .await;
                 if !allowed {
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
                 }
-                let serial = client_message.header().primary().serial_num();
                 let forwarded = rewrite_message(&client_message, serial, None)?;
                 upstream_connection.send(&forwarded).await?;
             }
@@ -261,10 +327,20 @@ async fn relay_loop(
                 if upstream_message.message_type() == Type::MethodCall {
                     continue;
                 }
+                let target = target_from_message(&upstream_message, config.bus);
+                let serial = upstream_message.header().primary().serial_num();
+                let evidence = dbus_evidence(
+                    relay_connection,
+                    serial.get(),
+                    peer_process,
+                    peer_cgroup,
+                    &target,
+                );
                 if !policy_check(
                     policy,
-                    target_from_message(&upstream_message, config.bus),
+                    target,
                     config.context.clone(),
+                    evidence,
                     POLICY_TIMEOUT,
                 )
                 .await
@@ -277,15 +353,43 @@ async fn relay_loop(
     }
 }
 
+fn dbus_evidence(
+    relay_connection: agent_sandbox_core::ProxyConnectionId,
+    serial: u32,
+    peer: ProcessIdentity,
+    cgroup: CgroupIdentity,
+    target: &DbusTarget,
+) -> Option<RoleEvidenceRequest> {
+    let serial = DbusSerial::new(serial).ok()?;
+    let subcheck_id = SubcheckIdentity::new(u64::from(serial.get())).ok()?;
+    Some(RoleEvidenceRequest::Dbus {
+        request_id: u64::from(serial.get()),
+        evidence: DbusEvidence {
+            operation_id: DbusOperationIdentity {
+                relay_connection,
+                serial,
+            },
+            subcheck_id,
+            peer,
+            cgroup,
+            attribution_token: None,
+            reply_to: None,
+            target: evidence_target(target),
+        },
+    })
+}
+
 async fn policy_check(
     policy: &mut PersistentRpcClient,
     target: DbusTarget,
     context: RequestContext,
+    evidence: Option<RoleEvidenceRequest>,
     timeout: Duration,
 ) -> bool {
     let request = RpcRequest::CheckDbus {
         target,
         ctx: context,
+        evidence,
     };
 
     match policy.request(request, timeout).await {

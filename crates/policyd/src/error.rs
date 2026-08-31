@@ -62,6 +62,10 @@ pub enum PolicydError {
     /// The request is not allowed on the sandbox policy socket.
     UnauthorizedRequest,
 
+    #[error("invalid or unauthenticated gate evidence")]
+    /// Gate evidence did not match its authenticated producer or request.
+    InvalidGateEvidence,
+
     #[error("request not allowed on inherited UI policy fd")]
     /// The request is not allowed on an inherited UI policy fd.
     UnauthorizedUiFdRequest,

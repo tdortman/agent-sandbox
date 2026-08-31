@@ -17,8 +17,8 @@ use crate::{
         },
         peer::ClientPeer,
     },
-    store::{DecisionAction, PolicyStore, TrustedPeer, UiClientHandle},
-    wire::{ElevationRequest, HostApproveRequest, MergeContext, PendingDecision, ScopeWire},
+    store::{DecisionAction, PolicyStore, UiClientHandle},
+    wire::{ElevationRequest, HostApproveRequest, PendingDecision, ScopeWire},
 };
 
 pub async fn handle(
@@ -203,7 +203,13 @@ async fn handle_non_proxy_request(
             scheme,
             url,
             ctx,
+            evidence,
         } => {
+            if let Some(evidence) = evidence.as_ref()
+                && !context::network_evidence_matches(&host, &connect_host, port, evidence)
+            {
+                return Err(PolicydError::InvalidGateEvidence);
+            }
             handle_network_check(store, CheckArgs {
                 host,
                 connect_host,
@@ -211,37 +217,89 @@ async fn handle_non_proxy_request(
                 scheme,
                 url,
                 aliases: Vec::new(),
-                ctx: resolve(&ctx),
+                ctx: context::resolve_gate_context(
+                    store,
+                    peer,
+                    role,
+                    client.id,
+                    context::GateKind::Network,
+                    &ctx,
+                    evidence.as_ref(),
+                )?,
             })
             .await
         }
 
-        RpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
-            store
-                .check_filesystem(crate::wire::FilesystemCheckRequest {
-                    path,
-                    access,
-                    ctx: resolve(&ctx),
-                })
-                .await,
-        )),
+        RpcRequest::CheckFilesystem {
+            path,
+            access,
+            ctx,
+            evidence,
+        } => {
+            if let Some(evidence) = evidence.as_ref()
+                && !context::filesystem_evidence_matches(&path, access, evidence)
+            {
+                return Err(PolicydError::InvalidGateEvidence);
+            }
+            let ctx = context::resolve_gate_context(
+                store,
+                peer,
+                role,
+                client.id,
+                context::GateKind::Filesystem,
+                &ctx,
+                evidence.as_ref(),
+            )?;
+            Ok(RpcReply::FilesystemCheck(
+                store
+                    .check_filesystem(crate::wire::FilesystemCheckRequest { path, access, ctx })
+                    .await,
+            ))
+        }
 
         RpcRequest::CheckResource {
             kind,
             path,
             access,
             ctx,
-        } => handle_check_resource(store, kind, path, access, resolve(&ctx)).await,
+            evidence,
+        } => {
+            if let Some(evidence) = evidence.as_ref()
+                && !context::resource_evidence_matches(kind, &path, access, evidence)
+            {
+                return Err(PolicydError::InvalidGateEvidence);
+            }
+            let ctx = context::resolve_gate_context(
+                store,
+                peer,
+                role,
+                client.id,
+                context::GateKind::Resource,
+                &ctx,
+                evidence.as_ref(),
+            )?;
+            handle_check_resource(store, kind, path, access, ctx).await
+        }
 
-        RpcRequest::CheckDbus { target, ctx } => {
-            let ctx = if role == SocketRole::Host {
-                store.resolve_dbus_proxy_context(&MergeContext::from(&ctx), TrustedPeer {
-                    pid: peer.pid,
-                    uid: peer.uid,
-                })
-            } else {
-                resolve(&ctx)
-            };
+        RpcRequest::CheckDbus {
+            target,
+            ctx,
+            evidence,
+        } => {
+            if let Some(evidence) = evidence.as_ref()
+                && !context::dbus_evidence_matches(&target, evidence)
+            {
+                return Err(PolicydError::InvalidGateEvidence);
+            }
+            let ctx = context::resolve_gate_context(
+                store,
+                peer,
+                role,
+                client.id,
+                context::GateKind::Dbus,
+                &ctx,
+                evidence.as_ref(),
+            )?;
             Ok(RpcReply::DbusCheck(
                 store
                     .check_dbus(crate::wire::DbusCheckRequest { target, ctx })
@@ -273,8 +331,26 @@ async fn handle_non_proxy_tail(
     let resolve = |ctx: &RequestContext| context::resolve_request_context(store, peer, role, ctx);
 
     match req {
-        RpcRequest::Elevate { argv, ctx } => {
-            handle_elevate_request(store, argv, resolve(&ctx)).await
+        RpcRequest::Elevate {
+            argv,
+            ctx,
+            evidence,
+        } => {
+            if let Some(evidence) = evidence.as_ref()
+                && !context::elevation_evidence_matches(&argv, evidence)
+            {
+                return Err(PolicydError::InvalidGateEvidence);
+            }
+            let ctx = context::resolve_gate_context(
+                store,
+                peer,
+                role,
+                client.id,
+                context::GateKind::Elevation,
+                &ctx,
+                evidence.as_ref(),
+            )?;
+            handle_elevate_request(store, argv, ctx).await
         }
 
         RpcRequest::Approve {

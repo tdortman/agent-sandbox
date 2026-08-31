@@ -107,6 +107,7 @@ mod tests {
                     sandbox_session_id: Some("sandbox-a".into()),
                     ..RequestContext::default()
                 },
+                evidence: None,
             },
         )
         .await

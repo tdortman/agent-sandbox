@@ -6,7 +6,7 @@ use std::{
 
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, PersistentRpcClient, ProcessIds, RequestContext,
-    ResourceCheckReply, RpcReply, RpcRequest, wire_context,
+    ResourceCheckReply, RoleEvidenceRequest, RpcReply, RpcRequest, SeccompEvidence, wire_context,
 };
 
 use crate::{NetworkTarget, ResourceTarget};
@@ -26,6 +26,7 @@ fn request_context(pid: u32, sandbox_session_id: Option<String>) -> RequestConte
 /// Persistent sequential policyd client owned by one syscall broker.
 pub struct PersistentPolicyClient {
     client: PersistentRpcClient,
+    seccomp_evidence: Option<SeccompEvidence>,
 }
 
 impl PersistentPolicyClient {
@@ -33,6 +34,7 @@ impl PersistentPolicyClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             client: PersistentRpcClient::new(socket_path),
+            seccomp_evidence: None,
         }
     }
 
@@ -43,6 +45,7 @@ impl PersistentPolicyClient {
     pub fn new_trusted(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             client: PersistentRpcClient::new_trusted(socket_path),
+            seccomp_evidence: None,
         }
     }
 
@@ -55,6 +58,25 @@ impl PersistentPolicyClient {
 
     fn invalidate(&mut self) {
         self.client.invalidate();
+    }
+
+    /// Attach event-time evidence to the next seccomp policy requests.
+    pub fn set_seccomp_evidence(&mut self, evidence: SeccompEvidence) {
+        self.seccomp_evidence = Some(evidence);
+    }
+
+    /// Clear evidence after the notification has been fully answered.
+    pub fn clear_seccomp_evidence(&mut self) {
+        self.seccomp_evidence = None;
+    }
+
+    fn seccomp_request_evidence(&self) -> Option<RoleEvidenceRequest> {
+        self.seccomp_evidence
+            .clone()
+            .map(|evidence| RoleEvidenceRequest::Seccomp {
+                request_id: evidence.operation_id.get(),
+                evidence,
+            })
     }
 
     /// Ask policyd whether the network `target` is allowed for the given
@@ -79,6 +101,7 @@ impl PersistentPolicyClient {
                 target.scheme, target.host, target.port
             )),
             ctx: request_context(pid, sandbox_session_id),
+            evidence: self.seccomp_request_evidence(),
         };
 
         match self.request(req, timeout).await {
@@ -114,6 +137,7 @@ impl PersistentPolicyClient {
             path: target.path.clone(),
             access: target.access,
             ctx: request_context(pid, sandbox_session_id),
+            evidence: self.seccomp_request_evidence(),
         };
 
         if let RpcReply::ResourceCheck(reply) = self.request(req, timeout).await? {
@@ -147,6 +171,7 @@ impl PersistentPolicyClient {
             path: path.to_path_buf(),
             access,
             ctx: request_context(pid, sandbox_session_id),
+            evidence: self.seccomp_request_evidence(),
         };
 
         if let RpcReply::FilesystemCheck(reply) = self.request(req, timeout).await? {
