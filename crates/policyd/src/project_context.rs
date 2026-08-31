@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -112,6 +112,7 @@ struct AdapterState {
     sandbox: String,
     sessions: HashMap<ExternalSessionKey, SessionBinding>,
     operations: HashMap<ExternalOperationKey, OperationIdentity>,
+    released_claims: HashSet<ClaimHandle>,
 }
 
 #[derive(Debug)]
@@ -155,8 +156,9 @@ pub(crate) enum AttributionSource {
     OperationOverride,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ProjectContextRegistry {
+    boot_epoch: u64,
     activations: HashMap<ActivationHandle, ActivationRecord>,
     adapters: HashMap<u64, AdapterState>,
     adapter_by_sandbox: HashMap<String, u64>,
@@ -164,7 +166,25 @@ pub(crate) struct ProjectContextRegistry {
     claims: HashMap<ClaimHandle, ClaimRecord>,
 }
 
+impl Default for ProjectContextRegistry {
+    fn default() -> Self {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        Self {
+            boot_epoch: u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte UUID prefix")),
+            activations: HashMap::new(),
+            adapters: HashMap::new(),
+            adapter_by_sandbox: HashMap::new(),
+            bindings: HashMap::new(),
+            claims: HashMap::new(),
+        }
+    }
+}
+
 impl ProjectContextRegistry {
+    pub(crate) const fn boot_epoch(&self) -> u64 {
+        self.boot_epoch
+    }
+
     pub(crate) fn activate(
         &mut self,
         sandbox: &str,
@@ -229,6 +249,7 @@ impl ProjectContextRegistry {
             sandbox: sandbox.to_owned(),
             sessions: HashMap::new(),
             operations: HashMap::new(),
+            released_claims: HashSet::new(),
         });
         self.adapter_by_sandbox
             .insert(sandbox.to_owned(), connection_id);
@@ -349,6 +370,61 @@ impl ProjectContextRegistry {
         Ok(claim)
     }
 
+    pub(crate) fn release_binding_for(
+        &mut self,
+        connection_id: u64,
+        binding: &BindingHandle,
+    ) -> Result<()> {
+        let adapter = self.adapters.get(&connection_id).ok_or_else(|| {
+            error(
+                ContextAdapterErrorCode::Unauthorized,
+                "connection is not a context adapter",
+            )
+        })?;
+        let session = adapter
+            .sessions
+            .values()
+            .find(|session| &session.handle == binding)
+            .ok_or_else(|| {
+                error(
+                    ContextAdapterErrorCode::UnknownHandle,
+                    "binding is unknown on this connection",
+                )
+            })?;
+        if !session.released {
+            self.release_binding(binding);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_claim_for(
+        &mut self,
+        connection_id: u64,
+        claim: &ClaimHandle,
+    ) -> Result<()> {
+        let adapter = self.adapters.get(&connection_id).ok_or_else(|| {
+            error(
+                ContextAdapterErrorCode::Unauthorized,
+                "connection is not a context adapter",
+            )
+        })?;
+        if adapter.released_claims.contains(claim) {
+            return Ok(());
+        }
+        if !adapter
+            .operations
+            .values()
+            .any(|operation| &operation.claim == claim)
+        {
+            return Err(error(
+                ContextAdapterErrorCode::UnknownHandle,
+                "claim is unknown on this connection",
+            ));
+        }
+        self.release_claim(claim);
+        Ok(())
+    }
+
     pub(crate) fn release_binding(&mut self, binding: &BindingHandle) {
         let Some(record) = self.bindings.remove(binding) else {
             return;
@@ -370,6 +446,7 @@ impl ProjectContextRegistry {
             adapter
                 .operations
                 .retain(|_, operation| &operation.binding != binding);
+            adapter.released_claims.extend(claims.iter().cloned());
             for claim in claims {
                 self.claims.remove(&claim);
             }
@@ -379,6 +456,13 @@ impl ProjectContextRegistry {
     pub(crate) fn release_claim(&mut self, claim: &ClaimHandle) {
         self.claims.remove(claim);
         for adapter in self.adapters.values_mut() {
+            if adapter
+                .operations
+                .values()
+                .any(|operation| &operation.claim == claim)
+            {
+                adapter.released_claims.insert(claim.clone());
+            }
             adapter
                 .operations
                 .retain(|_, operation| &operation.claim != claim);
@@ -536,6 +620,42 @@ impl crate::store::PolicyStore {
             .begin_operation(connection_id, key, binding, activation, Instant::now())
     }
 
+    pub(crate) fn project_context_boot_epoch(&self) -> u64 {
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .boot_epoch()
+    }
+
+    pub(crate) fn release_project_binding(
+        &self,
+        connection_id: u64,
+        binding: &BindingHandle,
+    ) -> Result<()> {
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release_binding_for(connection_id, binding)
+    }
+
+    pub(crate) fn release_project_claim(
+        &self,
+        connection_id: u64,
+        claim: &ClaimHandle,
+    ) -> Result<()> {
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release_claim_for(connection_id, claim)
+    }
+
+    pub(crate) fn disconnect_context_adapter(&self, connection_id: u64) {
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disconnect_adapter(connection_id);
+    }
+
     pub(crate) fn resolve_project_binding(
         &self,
         connection_id: u64,
@@ -597,13 +717,15 @@ mod tests {
                 .source,
             AttributionSource::OperationOverride
         );
-        registry.release_claim(&claim);
+        registry.release_claim_for(7, &claim).unwrap();
+        registry.release_claim_for(7, &claim).unwrap();
         assert!(registry.resolve_claim(7, &claim, Instant::now()).is_none());
         assert_eq!(
             registry.resolve_binding(7, &binding).unwrap().source,
             AttributionSource::SessionBinding
         );
-        registry.release_binding(&binding);
+        registry.release_binding_for(7, &binding).unwrap();
+        registry.release_binding_for(7, &binding).unwrap();
         assert!(registry.resolve_binding(7, &binding).is_none());
     }
 }

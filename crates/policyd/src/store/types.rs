@@ -66,6 +66,8 @@ pub struct SandboxSessionRegistration {
     /// session. 0 means the session was not pre-registered. Such sessions
     /// keep the first-peer-claims-root adoption model.
     pub launcher_pid: u32,
+    /// Process start time paired with `launcher_pid` to reject PID reuse.
+    pub launcher_start_time_ticks: u64,
 }
 
 /// Exact HTTP request and context used for pending approval deduplication.

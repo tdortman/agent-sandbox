@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use agent_sandbox_core::{
-    ProxyReply, ProxyRequestId, RpcMessage, RpcReply, RpcRequest, parse_rpc_request,
+    CONTEXT_ADAPTER_PROTOCOL_MAJOR, ContextAdapterErrorCode, ContextAdapterMessage,
+    ContextAdapterRequest, ProxyReply, ProxyRequestId, ReleasableHandle, RpcMessage, RpcReply,
+    RpcRequest, parse_rpc_request,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -15,7 +17,7 @@ use super::dispatch::SocketRole;
 use crate::{
     error::PolicydError,
     server::peer::ClientPeer,
-    store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, UiClientHandle},
+    store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, TrustedPeer, UiClientHandle},
 };
 
 pub async fn handle_client(
@@ -42,6 +44,7 @@ pub async fn handle_client(
 
     let mut proxy_session_owner = false;
     let mut proxy_single_request = false;
+    let mut context_adapter = false;
 
     loop {
         let line = match read_line_limited(&mut reader, MAX_RPC_LINE_BYTES).await {
@@ -62,6 +65,31 @@ pub async fn handle_client(
         }
 
         if line.is_empty() {
+            continue;
+        }
+
+        if context_adapter {
+            let request = match serde_json::from_str::<ContextAdapterRequest>(&line) {
+                Ok(request) => request,
+                Err(_) => {
+                    reply_context_adapter(writer.clone(), &ContextAdapterMessage::Error {
+                        request_id: None,
+                        code: ContextAdapterErrorCode::MalformedMessage,
+                        detail: "invalid context adapter request".into(),
+                    })
+                    .await;
+                    continue;
+                }
+            };
+            let message = dispatch_context_adapter(&store, client.id, request, true, peer, role);
+            reply_context_adapter(writer.clone(), &message).await;
+            continue;
+        }
+
+        if let Ok(request) = serde_json::from_str::<ContextAdapterRequest>(&line) {
+            let message = dispatch_context_adapter(&store, client.id, request, false, peer, role);
+            context_adapter = matches!(message, ContextAdapterMessage::Registered { .. });
+            reply_context_adapter(writer.clone(), &message).await;
             continue;
         }
 
@@ -127,6 +155,10 @@ pub async fn handle_client(
             store.resolve_pending_declarative_allow().await;
             store.flush_pending_to_ui().await;
         }
+    }
+
+    if context_adapter {
+        store.disconnect_context_adapter(client.id);
     }
 
     finish_client(store, client, peer, role, active_checks, read_error).await
@@ -205,6 +237,128 @@ async fn spawn_proxy_check(
     });
 
     true
+}
+
+fn adapter_error(
+    request_id: Option<u64>,
+    code: ContextAdapterErrorCode,
+    detail: impl Into<String>,
+) -> ContextAdapterMessage {
+    ContextAdapterMessage::Error {
+        request_id,
+        code,
+        detail: detail.into(),
+    }
+}
+
+fn dispatch_context_adapter(
+    store: &PolicyStore,
+    connection_id: u64,
+    request: ContextAdapterRequest,
+    registered: bool,
+    peer: ClientPeer,
+    role: SocketRole,
+) -> ContextAdapterMessage {
+    let request_id = request.request_id();
+    let result = match request {
+        ContextAdapterRequest::RegisterContextAdapter {
+            protocol_major,
+            sandbox_session_id,
+            ..
+        } => {
+            if registered {
+                return adapter_error(
+                    Some(request_id),
+                    ContextAdapterErrorCode::Conflict,
+                    "context adapter is already registered",
+                );
+            }
+            if role != SocketRole::Host
+                || !store.authenticates_context_adapter(&sandbox_session_id, TrustedPeer {
+                    pid: peer.pid,
+                    uid: peer.uid,
+                })
+            {
+                return adapter_error(
+                    Some(request_id),
+                    ContextAdapterErrorCode::Unauthorized,
+                    "context adapter registration is not authorized",
+                );
+            }
+            if protocol_major != CONTEXT_ADAPTER_PROTOCOL_MAJOR {
+                return adapter_error(
+                    Some(request_id),
+                    ContextAdapterErrorCode::UnsupportedVersion,
+                    "unsupported context adapter protocol major",
+                );
+            }
+            return match store.register_context_adapter(connection_id, &sandbox_session_id) {
+                Ok(activations) => ContextAdapterMessage::Registered {
+                    request_id,
+                    protocol_major: CONTEXT_ADAPTER_PROTOCOL_MAJOR,
+                    boot_epoch: store.project_context_boot_epoch(),
+                    activations,
+                },
+                Err(error) => adapter_error(Some(request_id), error.code, error.detail),
+            };
+        }
+        ContextAdapterRequest::BindSession {
+            session_key,
+            activation,
+            ..
+        } if registered => store
+            .bind_project_session(connection_id, session_key, activation)
+            .map(|binding| ContextAdapterMessage::SessionBound {
+                request_id,
+                binding,
+            }),
+        ContextAdapterRequest::BeginOperation {
+            operation_key,
+            binding,
+            activation,
+            ..
+        } if registered => store
+            .begin_project_operation(connection_id, operation_key, binding, activation)
+            .map(|claim| ContextAdapterMessage::OperationBegun { request_id, claim }),
+        ContextAdapterRequest::Release { handle, .. } if registered => match handle {
+            ReleasableHandle::Binding(binding) => {
+                store.release_project_binding(connection_id, &binding)
+            }
+            ReleasableHandle::Claim(claim) => store.release_project_claim(connection_id, &claim),
+        }
+        .map(|()| ContextAdapterMessage::Released { request_id }),
+        ContextAdapterRequest::AttachProcess { .. } if registered => {
+            return adapter_error(
+                Some(request_id),
+                ContextAdapterErrorCode::InvalidProcess,
+                "attach_process requires exactly one pidfd",
+            );
+        }
+        _ => {
+            return adapter_error(
+                Some(request_id),
+                ContextAdapterErrorCode::Unauthorized,
+                "register_context_adapter must be the first request",
+            );
+        }
+    };
+
+    result.unwrap_or_else(|error| adapter_error(Some(request_id), error.code, error.detail))
+}
+
+async fn reply_context_adapter(
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    payload: &ContextAdapterMessage,
+) {
+    let Ok(mut line) = serde_json::to_string(payload) else {
+        tracing::error!("failed to serialize context adapter reply");
+        return;
+    };
+    line.push('\n');
+    let mut writer = writer.lock().await;
+    if writer.write_all(line.as_bytes()).await.is_ok() {
+        let _ = writer.flush().await;
+    }
 }
 
 const fn proxy_request_id(req: &RpcRequest) -> Option<ProxyRequestId> {
@@ -296,4 +450,43 @@ async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
     drop(line);
     let _ = w.flush().await;
     drop(w);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_must_register_before_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("policy.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_secs(30),
+            false,
+        ));
+        let response = dispatch_context_adapter(
+            &store,
+            7,
+            ContextAdapterRequest::BindSession {
+                request_id: 9,
+                session_key: agent_sandbox_core::ExternalSessionKey::new("session").unwrap(),
+                activation: agent_sandbox_core::ActivationHandle::new(),
+            },
+            false,
+            ClientPeer {
+                pid: std::process::id(),
+                uid: nix::unistd::getuid().as_raw(),
+                gid: nix::unistd::getgid().as_raw() as i32,
+            },
+            SocketRole::Host,
+        );
+        assert!(matches!(response, ContextAdapterMessage::Error {
+            request_id: Some(9),
+            code: ContextAdapterErrorCode::Unauthorized,
+            ..
+        }));
+    }
 }

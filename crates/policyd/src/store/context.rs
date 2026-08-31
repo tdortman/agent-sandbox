@@ -67,6 +67,7 @@ impl PolicyStore {
                 owner_uid: peer.uid,
                 package: None,
                 launcher_pid: 0,
+                launcher_start_time_ticks: 0,
             });
     }
 
@@ -113,6 +114,9 @@ impl PolicyStore {
             return Err(PolicydError::InvalidLauncherPid);
         }
 
+        let launcher_start_time_ticks =
+            read_proc_start_time_ticks(launcher_pid).ok_or(PolicydError::InvalidLauncherPid)?;
+
         let mut sessions = self
             .sandbox_sessions
             .write()
@@ -128,6 +132,7 @@ impl PolicyStore {
                 reg.package = Some(package.to_string());
                 reg.owner_uid = owner_uid;
                 reg.launcher_pid = launcher_pid;
+                reg.launcher_start_time_ticks = launcher_start_time_ticks;
             }
 
             None => {
@@ -136,6 +141,7 @@ impl PolicyStore {
                     owner_uid,
                     package: Some(package.to_string()),
                     launcher_pid,
+                    launcher_start_time_ticks,
                 });
             }
         }
@@ -618,6 +624,26 @@ impl PolicyStore {
     }
 }
 
+impl PolicyStore {
+    pub(crate) fn authenticates_context_adapter(
+        &self,
+        sandbox_session_id: &str,
+        peer: TrustedPeer,
+    ) -> bool {
+        self.sandbox_sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(sandbox_session_id)
+            .is_some_and(|registration| {
+                registration.owner_uid == peer.uid
+                    && registration.launcher_pid == peer.pid
+                    && registration.launcher_start_time_ticks != 0
+                    && read_proc_start_time_ticks(peer.pid)
+                        == Some(registration.launcher_start_time_ticks)
+            })
+    }
+}
+
 fn validate_package_name(package: &str) -> Result<(), PolicydError> {
     if package.is_empty() {
         return Err(PolicydError::InvalidPackageName(
@@ -657,6 +683,12 @@ fn read_proc_ppid(pid: u32) -> Option<u32> {
     let mut fields = stat[end + 1..].split_whitespace();
     fields.next()?;
     fields.next()?.parse().ok()
+}
+
+fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    stat[end + 1..].split_whitespace().nth(19)?.parse().ok()
 }
 
 fn policy_file_mtime(path: &Path) -> Option<super::types::MtimeKey> {
@@ -839,6 +871,7 @@ mod tests {
                 owner_uid: uid,
                 package: Some("codex".into()),
                 launcher_pid,
+                launcher_start_time_ticks: read_proc_start_time_ticks(launcher_pid).unwrap(),
             });
         }
 
@@ -888,6 +921,7 @@ mod tests {
                 owner_uid: uid,
                 package: Some("codex".into()),
                 launcher_pid,
+                launcher_start_time_ticks: read_proc_start_time_ticks(launcher_pid).unwrap(),
             });
         }
 

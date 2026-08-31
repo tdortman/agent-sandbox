@@ -1870,6 +1870,7 @@ mod tests {
                 owner_uid: 1000,
                 package: None,
                 launcher_pid: 0,
+                launcher_start_time_ticks: 0,
             },
         );
 
@@ -2044,6 +2045,7 @@ mod tests {
                 owner_uid: 1000,
                 package: None,
                 launcher_pid: 0,
+                launcher_start_time_ticks: 0,
             },
         );
 
