@@ -9,7 +9,7 @@ use agent_sandbox_core::{
 };
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncWriteExt, Interest},
     net::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -477,32 +477,32 @@ impl FrameReader {
             reader.readable().await?;
             let mut chunk = [0_u8; 8192];
             let mut cmsg = nix::cmsg_space!([std::os::fd::RawFd; 2]);
-            let received = {
+            let received = match reader.as_ref().try_io(Interest::READABLE, || {
                 let mut iov = [IoSliceMut::new(&mut chunk)];
-                match recvmsg::<()>(
+                let message = recvmsg::<()>(
                     reader.as_ref().as_raw_fd(),
                     &mut iov,
                     Some(&mut cmsg),
                     MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
-                ) {
-                    Ok(message) => {
-                        let mut descriptors = Vec::new();
-                        for control in message.cmsgs().map_err(std::io::Error::from)? {
-                            if let ControlMessageOwned::ScmRights(rights) = control {
-                                descriptors.extend(rights.into_iter().map(ReceivedFd::new));
-                            }
-                        }
-                        if message.flags.contains(MsgFlags::MSG_CTRUNC) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "too many ancillary descriptors",
-                            ));
-                        }
-                        (message.bytes, descriptors)
+                )
+                .map_err(std::io::Error::from)?;
+                let mut descriptors = Vec::new();
+                for control in message.cmsgs().map_err(std::io::Error::from)? {
+                    if let ControlMessageOwned::ScmRights(rights) = control {
+                        descriptors.extend(rights.into_iter().map(ReceivedFd::new));
                     }
-                    Err(nix::errno::Errno::EAGAIN) => continue,
-                    Err(error) => return Err(std::io::Error::from(error)),
                 }
+                if message.flags.contains(MsgFlags::MSG_CTRUNC) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many ancillary descriptors",
+                    ));
+                }
+                Ok((message.bytes, descriptors))
+            }) {
+                Ok(received) => received,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
             };
             if received.0 == 0 {
                 return Ok(None);
