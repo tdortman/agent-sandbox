@@ -213,6 +213,7 @@ struct AttachmentFailureGuard<'a> {
     process: ProcessIdentity,
     pidfd: ReceivedFd,
     provisional_leaf: Option<PathBuf>,
+    registry_inserted: bool,
     committed: bool,
 }
 
@@ -228,8 +229,13 @@ impl<'a> AttachmentFailureGuard<'a> {
             process,
             pidfd,
             provisional_leaf,
+            registry_inserted: false,
             committed: false,
         }
+    }
+
+    fn mark_registry_inserted(&mut self) {
+        self.registry_inserted = true;
     }
 
     fn commit(mut self) {
@@ -247,10 +253,12 @@ impl Drop for AttachmentFailureGuard<'_> {
         // pidfd rather than the numeric PID, then remove any provisional
         // registry state before dropping the cgroup leaf.
         let _ = agent_sandbox_sysutil::pidfd_send_signal(self.pidfd.raw(), nix::libc::SIGKILL);
-        self.registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .detach_process(&self.process);
+        if self.registry_inserted {
+            self.registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .detach_process(&self.process);
+        }
         if let Some(leaf) = &self.provisional_leaf {
             let _ = std::fs::remove_dir(leaf);
         }
@@ -1074,7 +1082,7 @@ impl crate::store::PolicyStore {
         // Once cgroup.procs accepts the PID, every return path must either
         // complete the attachment or kill the still-stopped process and clean
         // up both provisional registry state and a newly-created leaf.
-        let rollback = AttachmentFailureGuard::new(
+        let mut rollback = AttachmentFailureGuard::new(
             &self.project_context,
             process,
             pidfd,
@@ -1092,6 +1100,12 @@ impl crate::store::PolicyStore {
                 "pidfd could not be retained for attachment",
             )
         })?;
+        let registry_had_attachment = self
+            .project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attachments
+            .contains_key(&process);
         self.project_context
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1103,6 +1117,9 @@ impl crate::store::PolicyStore {
                 Some(leaf),
                 Instant::now(),
             )?;
+        if !registry_had_attachment {
+            rollback.mark_registry_inserted();
+        }
         if agent_sandbox_sysutil::pidfd_send_signal(rollback.pidfd.raw(), nix::libc::SIGCONT)
             .is_err()
         {
@@ -1366,12 +1383,13 @@ mod tests {
             .unwrap();
 
         let registry = Mutex::new(registry);
-        let rollback = AttachmentFailureGuard::new(
+        let mut rollback = AttachmentFailureGuard::new(
             &registry,
             process,
             ReceivedFd::new(File::open("/dev/null").unwrap().into_raw_fd()),
             Some(leaf.clone()),
         );
+        rollback.mark_registry_inserted();
         drop(rollback);
 
         let registry = registry.lock().unwrap();
