@@ -339,8 +339,8 @@ mod tests {
     };
 
     use super::{
-        current_cgroup_identity, evidence_request_id_matches, filesystem_evidence_matches,
-        resolve_gate_context, resolve_request_context,
+        evidence_request_id_matches, filesystem_evidence_matches, resolve_gate_context,
+        resolve_request_context,
     };
     use crate::{
         server::{dispatch::SocketRole, peer::ClientPeer},
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn gate_resolver_rejects_unregistered_cgroup_evidence() {
         use agent_sandbox_core::{
-            FanotifyEventId, FanotifyEvidence, OperationIdentity, ProcessIdentity,
+            CgroupIdentity, FanotifyEventId, FanotifyEvidence, OperationIdentity, ProcessIdentity,
             RoleEvidenceRequest, SubcheckIdentity, ThreadIdentity,
         };
 
@@ -440,7 +440,7 @@ mod tests {
             .parse()
             .expect("numeric process start time");
         let process = ProcessIdentity::new(pid, uid, start_time).expect("process identity");
-        let cgroup = current_cgroup_identity(pid).expect("process cgroup identity");
+        let cgroup = CgroupIdentity::new(19).expect("cgroup identity");
         let evidence = RoleEvidenceRequest::Fanotify {
             request_id: 31,
             evidence: FanotifyEvidence {
