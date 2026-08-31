@@ -427,6 +427,54 @@ impl ProjectContextRegistry {
             .map(|adapter| adapter.sandbox.as_str())
     }
 
+    pub(crate) fn prepare_process_attachment(
+        &mut self,
+        connection_id: u64,
+        process: ProcessIdentity,
+        context: &AttachmentHandle,
+        now: Instant,
+    ) -> Result<(bool, Option<PathBuf>)> {
+        self.expire_claims(now);
+        match context {
+            AttachmentHandle::Binding(binding) => {
+                self.require_binding(connection_id, binding)?;
+            }
+            AttachmentHandle::Claim(claim) => {
+                let record = self.claims.get(claim).ok_or_else(|| {
+                    error(ContextAdapterErrorCode::UnknownHandle, "claim is unknown")
+                })?;
+                if record.connection_id != connection_id {
+                    return Err(error(
+                        ContextAdapterErrorCode::UnknownHandle,
+                        "claim is unknown on this connection",
+                    ));
+                }
+            }
+        }
+        if let Some(existing) = self.attachments.get(&process) {
+            if existing.connection_id == connection_id && &existing.context == context {
+                return Ok((true, existing.cgroup.clone()));
+            }
+            return Err(error(
+                ContextAdapterErrorCode::Conflict,
+                "process is already attached",
+            ));
+        }
+        let matching = self.attachments.values().find(|attachment| {
+            attachment.connection_id == connection_id && &attachment.context == context
+        });
+        if matches!(context, AttachmentHandle::Claim(_)) && matching.is_some() {
+            return Err(error(
+                ContextAdapterErrorCode::Conflict,
+                "claim is attached to another process",
+            ));
+        }
+        Ok((
+            false,
+            matching.and_then(|attachment| attachment.cgroup.clone()),
+        ))
+    }
+
     pub(crate) fn attach_process(
         &mut self,
         connection_id: u64,
@@ -503,6 +551,9 @@ impl ProjectContextRegistry {
     pub(crate) fn detach_process(&mut self, process: &ProcessIdentity) {
         if let Some(attachment) = self.attachments.remove(process)
             && let AttachmentHandle::Claim(claim) = &attachment.context
+            && !self.attachments.values().any(|current| {
+                matches!(&current.context, AttachmentHandle::Claim(current_claim) if current_claim == claim)
+            })
             && let Some(record) = self.claims.get_mut(claim)
         {
             record.active = false;
@@ -841,10 +892,10 @@ impl crate::store::PolicyStore {
                 "process identity is unavailable",
             )
         })?;
-        if uid != registration.owner_uid || !matches!(state, 'T' | 't') {
+        if uid != registration.owner_uid {
             return Err(error(
                 ContextAdapterErrorCode::InvalidProcess,
-                "process is not stopped or has the wrong owner",
+                "process has the wrong owner",
             ));
         }
         let process_cgroup = unified_cgroup(pid);
@@ -865,18 +916,33 @@ impl crate::store::PolicyStore {
                 "process identity is invalid",
             )
         })?;
+        let (already_attached, shared_leaf) = self
+            .project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prepare_process_attachment(connection_id, process, &context, Instant::now())?;
+        if already_attached {
+            return Ok(());
+        }
+        if !matches!(state, 'T' | 't') {
+            return Err(error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "process is not stopped",
+            ));
+        }
         let root = sandbox_cgroup.expect("validated sandbox cgroup");
-        let leaf_name = format!(
-            "agent-sandbox-context/{}-{}",
-            process.pid(),
-            process.process_start_time_ticks().get()
+        let leaf = shared_leaf.unwrap_or_else(|| {
+            let name = format!("agent-sandbox-context/{}", uuid::Uuid::new_v4());
+            Path::new("/sys/fs/cgroup")
+                .join(root.trim_start_matches('/'))
+                .join(name)
+        });
+        let leaf_cgroup = format!(
+            "/{}",
+            leaf.strip_prefix("/sys/fs/cgroup")
+                .expect("controlled cgroup is under cgroupfs")
+                .display()
         );
-        let leaf_cgroup = if root == "/" {
-            format!("/{leaf_name}")
-        } else {
-            format!("{root}/{leaf_name}")
-        };
-        let leaf = Path::new("/sys/fs/cgroup").join(leaf_cgroup.trim_start_matches('/'));
         std::fs::create_dir_all(&leaf).map_err(|_| {
             error(
                 ContextAdapterErrorCode::InvalidProcess,
@@ -1057,16 +1123,37 @@ mod tests {
             .unwrap();
         let process = ProcessIdentity::new(123, owner, 456).unwrap();
         let fd = File::open("/dev/null").unwrap().into_raw_fd();
+        let leaf = dir.path().join("context-leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        let context = AttachmentHandle::Claim(claim.clone());
         registry
             .attach_process(
                 7,
                 process,
-                AttachmentHandle::Claim(claim.clone()),
+                context.clone(),
                 ReceivedFd::new(fd),
-                None,
+                Some(leaf.clone()),
                 now,
             )
             .unwrap();
+        assert_eq!(
+            registry
+                .prepare_process_attachment(7, process, &context, now)
+                .unwrap(),
+            (true, Some(leaf.clone()))
+        );
+        assert_eq!(
+            registry
+                .prepare_process_attachment(
+                    7,
+                    ProcessIdentity::new(124, owner, 457).unwrap(),
+                    &context,
+                    now,
+                )
+                .unwrap_err()
+                .code,
+            ContextAdapterErrorCode::Conflict
+        );
 
         assert!(
             registry
@@ -1075,5 +1162,6 @@ mod tests {
         );
         registry.release_claim_for(7, &claim).unwrap();
         assert!(registry.attachments.is_empty());
+        assert!(!leaf.exists());
     }
 }
