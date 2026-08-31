@@ -682,6 +682,34 @@ impl ProjectContextRegistry {
         }
     }
 
+    /// Resolve an event-time process through a registered cgroup leaf.
+    ///
+    /// Gate RPC connections are separate from the context-adapter connection
+    /// that owns the binding. Use the attachment owner for binding lookup.
+    /// The event process and its current cgroup are checked by the caller;
+    /// this lookup only finds the registered leaf by its stable inode. This
+    /// permits several producer processes to share one attached leaf without
+    /// allowing an unregistered cgroup to supply project attribution.
+    pub(crate) fn resolve_attached_process_for_gate(
+        &mut self,
+        _process: &ProcessIdentity,
+        cgroup: CgroupIdentity,
+        now: Instant,
+    ) -> Option<ResolvedWorkspace> {
+        let attachment = self
+            .attachments
+            .values()
+            .find(|attachment| attachment.cgroup_identity == Some(cgroup))?;
+        let owner_connection_id = attachment.connection_id;
+        let context = attachment.context.clone();
+        match context {
+            AttachmentHandle::Binding(binding) => {
+                self.resolve_binding(owner_connection_id, &binding)
+            }
+            AttachmentHandle::Claim(claim) => self.resolve_claim(owner_connection_id, &claim, now),
+        }
+    }
+
     pub(crate) fn release_binding_for(
         &mut self,
         connection_id: u64,
@@ -1191,6 +1219,17 @@ impl crate::store::PolicyStore {
             .resolve_attached_process(process, cgroup, connection_id, Instant::now())
     }
 
+    pub(crate) fn resolve_attached_process_for_gate(
+        &self,
+        process: &ProcessIdentity,
+        cgroup: CgroupIdentity,
+    ) -> Option<ResolvedWorkspace> {
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve_attached_process_for_gate(process, cgroup, Instant::now())
+    }
+
     pub(crate) fn resolve_project_claim(
         &self,
         connection_id: u64,
@@ -1303,6 +1342,25 @@ mod tests {
             registry
                 .resolve_attached_process(&process, cgroup, 7, now)
                 .is_some()
+        );
+        // A gate producer can be a different process and RPC connection than
+        // the adapter that owns this binding. Its event-time process must
+        // still be in the registered leaf, while the binding lookup uses the
+        // adapter owner recorded on the attachment.
+        let gate_process = ProcessIdentity::new(124, owner, 457).unwrap();
+        assert!(
+            registry
+                .resolve_attached_process_for_gate(&gate_process, cgroup, now)
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_attached_process_for_gate(
+                    &gate_process,
+                    CgroupIdentity::new(999).unwrap(),
+                    now,
+                )
+                .is_none()
         );
         assert!(
             registry
