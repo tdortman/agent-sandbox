@@ -169,7 +169,7 @@ pub(super) fn resolve_gate_context(
     store: &Arc<PolicyStore>,
     peer: ClientPeer,
     role: SocketRole,
-    connection_id: u64,
+    _connection_id: u64,
     kind: GateKind,
     ctx: &RequestContext,
     evidence: Option<&RoleEvidenceRequest>,
@@ -211,8 +211,7 @@ pub(super) fn resolve_gate_context(
     };
     // The registry lookup is the producer authentication boundary. In
     // particular, root credentials do not authorize an arbitrary cgroup.
-    let Some(attached_workspace) = store.resolve_attached_process(&process, cgroup, connection_id)
-    else {
+    let Some(attached_workspace) = store.resolve_attached_process_for_gate(&process, cgroup) else {
         return Err(crate::error::PolicydError::InvalidGateEvidence);
     };
     let authenticated_peer = peer.uid == 0
