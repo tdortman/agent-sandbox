@@ -555,6 +555,7 @@ pub struct PolicyStore {
 
     pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
     pub(crate) merged_cache: std::sync::Mutex<MergedPolicyCache>,
+    pub(crate) project_context: std::sync::Mutex<crate::project_context::ProjectContextRegistry>,
     pub(crate) cgroup_freeze: super::freeze::CgroupFreezeManager,
 }
 

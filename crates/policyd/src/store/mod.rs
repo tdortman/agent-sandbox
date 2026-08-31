@@ -81,6 +81,9 @@ impl PolicyStore {
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
             ui_spawn_lock: tokio::sync::Mutex::new(()),
             merged_cache: std::sync::Mutex::new(MergedPolicyCache::default()),
+            project_context: std::sync::Mutex::new(
+                crate::project_context::ProjectContextRegistry::default(),
+            ),
             cgroup_freeze: freeze::CgroupFreezeManager::new_without_recovery(),
         }
     }

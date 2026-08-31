@@ -2,6 +2,8 @@
 
 pub mod error;
 
+mod project_context;
+
 pub mod server;
 pub mod spawn;
 pub mod store;
