@@ -486,17 +486,17 @@ impl FrameReader {
                     MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
                 ) {
                     Ok(message) => {
+                        let mut descriptors = Vec::new();
+                        for control in message.cmsgs().map_err(std::io::Error::from)? {
+                            if let ControlMessageOwned::ScmRights(rights) = control {
+                                descriptors.extend(rights.into_iter().map(ReceivedFd::new));
+                            }
+                        }
                         if message.flags.contains(MsgFlags::MSG_CTRUNC) {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 "too many ancillary descriptors",
                             ));
-                        }
-                        let mut descriptors = Vec::new();
-                        for control in message.cmsgs().map_err(std::io::Error::from)? {
-                            if let ControlMessageOwned::ScmRights(rights) = control {
-                                descriptors.extend(rights);
-                            }
                         }
                         (message.bytes, descriptors)
                     }
@@ -508,7 +508,7 @@ impl FrameReader {
                 return Ok(None);
             }
             self.bytes.extend_from_slice(&chunk[..received.0]);
-            self.fds.extend(received.1.into_iter().map(ReceivedFd::new));
+            self.fds.extend(received.1);
         }
     }
 }
