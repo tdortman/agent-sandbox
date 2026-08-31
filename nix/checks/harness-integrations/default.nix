@@ -65,6 +65,13 @@ assert variables.CODEX_APP_SERVER_TRANSPORT == "stdio-jsonl";
 assert variables.CODEX_APP_SERVER_SHARED_SOCKET == "0";
 pkgs.runCommand "harness-integrations" { nativeBuildInputs = [ pkgs.python3 ]; } ''
     set -euo pipefail
+
+    # bubblewrap's lifecycle sync fd is held by its monitor and closed before
+    # COMMAND. It cannot carry the adapter socket through the normal sandbox.
+    exec 4</dev/null
+    ${pkgs.bubblewrap}/bin/bwrap --unshare-user-try --ro-bind / / --proc /proc --sync-fd 4 -- /bin/sh -c 'test ! -e /proc/self/fd/4'
+    exec 4<&-
+
     for executable in agent-sandbox-context-adapter agent-sandbox-child agent-sandbox-proxy agent-sandbox-dbus-proxy; do
       test -x "${harnessPkg}/bin/$executable"
     done
