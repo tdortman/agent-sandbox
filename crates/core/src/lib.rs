@@ -51,16 +51,20 @@ pub use policy::{
     open_flags_to_file_access,
 };
 pub use rpc::{
-    AliasSplit, ApprovalScope, ApprovalTarget, AttributionToken, CheckReply, DbusCheckReply,
-    DbusScopeActionReply, ElevateReply, ErrorReply, FilesystemCheckReply, FilesystemMonitorReply,
-    FilesystemScopeActionReply, FlowClaimReply, FlowContext, FlowProtocol, FlowRegistration,
-    HttpApprovalRequest, HttpCheckReply, HttpCheckRequest, HttpScopeActionReply,
-    NetworkFlowCheckReply, NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost,
-    PendingSummary, ProcessIdentity, ProcessStartTimeTicks, ProxyConnectionId, ProxyReply,
-    ProxyReplyBody, ProxyRequestId, ProxySessionReply, ProxySessionToken, RegisterUiReply,
-    RequestContext, ResourceCheckReply, ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest,
+    ActivationHandle, AliasSplit, ApprovalScope, ApprovalTarget, AttachmentHandle,
+    AttributionToken, BindingHandle, CONTEXT_ADAPTER_PROTOCOL_MAJOR, CheckReply, ClaimHandle,
+    ContextAdapterErrorCode, ContextAdapterMessage, ContextAdapterRequest, DbusCheckReply,
+    DbusScopeActionReply, ElevateReply, ErrorReply, ExternalOperationKey, ExternalSessionKey,
+    FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply, FlowClaimReply,
+    FlowContext, FlowProtocol, FlowRegistration, HttpApprovalRequest, HttpCheckReply,
+    HttpCheckRequest, HttpScopeActionReply, MAX_CONTEXT_KEY_BYTES, NetworkFlowCheckReply,
+    NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, PendingSummary, ProcessIdentity,
+    ProcessStartTimeTicks, ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId,
+    ProxySessionReply, ProxySessionToken, RegisterUiReply, ReleasableHandle, RequestContext,
+    ResourceCheckReply, ResourceScopeActionReply, RpcMessage, RpcReply, RpcRequest,
     ScopeActionReply, SimpleOkReply, SocketIdentity, SocketInode, StatusReply, UiPush, Verdict,
-    VerdictSource, attach_check_aliases, parse_rpc_request, split_check_aliases,
+    VerdictSource, WorkspaceActivation, attach_check_aliases, parse_rpc_request,
+    split_check_aliases,
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};

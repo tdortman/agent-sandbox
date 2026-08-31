@@ -2,6 +2,7 @@
 //! shapes).
 
 mod message;
+mod project_context;
 
 mod proxy;
 mod push;
@@ -13,6 +14,11 @@ mod scope;
 mod tests;
 
 pub use message::RpcMessage;
+pub use project_context::{
+    ActivationHandle, AttachmentHandle, BindingHandle, CONTEXT_ADAPTER_PROTOCOL_MAJOR, ClaimHandle,
+    ContextAdapterErrorCode, ContextAdapterMessage, ContextAdapterRequest, ExternalOperationKey,
+    ExternalSessionKey, MAX_CONTEXT_KEY_BYTES, ReleasableHandle, WorkspaceActivation,
+};
 pub use proxy::{
     AttributionToken, FlowContext, FlowRegistration, HttpApprovalRequest, HttpCheckRequest,
     NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, ProcessIdentity,
