@@ -11,7 +11,7 @@
 use std::{
     ffi::CStr,
     io::{self, Read, Seek, SeekFrom},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
 };
 
@@ -48,6 +48,13 @@ pub fn pidfd_getfd(pidfd: impl AsFd, fd: i32) -> io::Result<OwnedFd> {
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_fd().as_raw_fd(), fd, 0u32) };
 
     fd_from_syscall(raw)
+}
+
+/// Duplicate a local descriptor with close-on-exec enabled.
+pub fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: the caller supplies a live descriptor; the returned descriptor is
+    // owned exclusively by this call.
+    fd_from_syscall(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) as libc::c_long })
 }
 
 /// Send a signal through a pidfd without racing PID reuse.

@@ -5,11 +5,13 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
+    io,
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{AsRawFd, IntoRawFd, RawFd},
         unix::fs::MetadataExt,
     },
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -32,6 +34,12 @@ impl ReceivedFd {
 
     pub(crate) const fn raw(&self) -> RawFd {
         self.0
+    }
+
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self(
+            agent_sandbox_sysutil::duplicate_fd(self.raw())?.into_raw_fd(),
+        ))
     }
 }
 
@@ -194,6 +202,57 @@ impl Drop for ProcessAttachment {
             .and_then(|metadata| CgroupIdentity::new(metadata.ino()).ok());
         if actual == Some(expected) {
             let _ = std::fs::remove_dir(cgroup);
+        }
+    }
+}
+
+/// Rolls back a stopped process attachment until the cgroup move, registry
+/// insertion, and resume have all succeeded.
+struct AttachmentFailureGuard<'a> {
+    registry: &'a Mutex<ProjectContextRegistry>,
+    process: ProcessIdentity,
+    pidfd: ReceivedFd,
+    provisional_leaf: Option<PathBuf>,
+    committed: bool,
+}
+
+impl<'a> AttachmentFailureGuard<'a> {
+    fn new(
+        registry: &'a Mutex<ProjectContextRegistry>,
+        process: ProcessIdentity,
+        pidfd: ReceivedFd,
+        provisional_leaf: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            registry,
+            process,
+            pidfd,
+            provisional_leaf,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AttachmentFailureGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        // The process is still stopped while this guard is armed. Use the
+        // pidfd rather than the numeric PID, then remove any provisional
+        // registry state before dropping the cgroup leaf.
+        let _ = agent_sandbox_sysutil::pidfd_send_signal(self.pidfd.raw(), nix::libc::SIGKILL);
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .detach_process(&self.process);
+        if let Some(leaf) = &self.provisional_leaf {
+            let _ = std::fs::remove_dir(leaf);
         }
     }
 }
@@ -986,6 +1045,7 @@ impl crate::store::PolicyStore {
             ));
         }
         let root = sandbox_cgroup.expect("validated sandbox cgroup");
+        let provisional_leaf = shared_leaf.is_none();
         let leaf = shared_leaf.unwrap_or_else(|| {
             let name = format!("agent-sandbox-context/{}", uuid::Uuid::new_v4());
             Path::new("/sys/fs/cgroup")
@@ -1010,13 +1070,28 @@ impl crate::store::PolicyStore {
                 "process cannot be moved into the controlled cgroup",
             )
         })?;
+
+        // Once cgroup.procs accepts the PID, every return path must either
+        // complete the attachment or kill the still-stopped process and clean
+        // up both provisional registry state and a newly-created leaf.
+        let rollback = AttachmentFailureGuard::new(
+            &self.project_context,
+            process,
+            pidfd,
+            provisional_leaf.then(|| leaf.clone()),
+        );
         if unified_cgroup(pid).as_deref() != Some(leaf_cgroup.as_str()) {
             return Err(error(
                 ContextAdapterErrorCode::InvalidProcess,
                 "controlled cgroup membership could not be verified",
             ));
         }
-        let raw_pidfd = pidfd.raw();
+        let registry_pidfd = rollback.pidfd.try_clone().map_err(|_| {
+            error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "pidfd could not be retained for attachment",
+            )
+        })?;
         self.project_context
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1024,20 +1099,19 @@ impl crate::store::PolicyStore {
                 connection_id,
                 process,
                 context,
-                pidfd,
+                registry_pidfd,
                 Some(leaf),
                 Instant::now(),
             )?;
-        if agent_sandbox_sysutil::pidfd_send_signal(raw_pidfd, nix::libc::SIGCONT).is_err() {
-            self.project_context
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .detach_process(&process);
+        if agent_sandbox_sysutil::pidfd_send_signal(rollback.pidfd.raw(), nix::libc::SIGCONT)
+            .is_err()
+        {
             return Err(error(
                 ContextAdapterErrorCode::InvalidProcess,
                 "attached process could not be resumed",
             ));
         }
+        rollback.commit();
         Ok(())
     }
 
@@ -1248,6 +1322,59 @@ mod tests {
                 .is_some()
         );
         registry.release_claim_for(7, &claim).unwrap();
+        assert!(registry.attachments.is_empty());
+        assert!(!leaf.exists());
+    }
+
+    #[test]
+    fn failed_attachment_rolls_back_registry_and_provisional_leaf() {
+        use std::os::fd::IntoRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().metadata().unwrap().uid();
+        let mut registry = ProjectContextRegistry::default();
+        let activation = registry.activate("sandbox", owner, dir.path()).unwrap();
+        registry.register_adapter(7, "sandbox").unwrap();
+        let binding = registry
+            .bind_session(
+                7,
+                ExternalSessionKey::new("session").unwrap(),
+                activation.activation.clone(),
+            )
+            .unwrap();
+        let claim = registry
+            .begin_operation(
+                7,
+                ExternalOperationKey::new("operation").unwrap(),
+                binding,
+                activation.activation,
+                Instant::now(),
+            )
+            .unwrap();
+        let process = ProcessIdentity::new(123, owner, 456).unwrap();
+        let leaf = dir.path().join("provisional-leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        registry
+            .attach_process(
+                7,
+                process,
+                AttachmentHandle::Claim(claim),
+                ReceivedFd::new(File::open("/dev/null").unwrap().into_raw_fd()),
+                Some(leaf.clone()),
+                Instant::now(),
+            )
+            .unwrap();
+
+        let registry = Mutex::new(registry);
+        let rollback = AttachmentFailureGuard::new(
+            &registry,
+            process,
+            ReceivedFd::new(File::open("/dev/null").unwrap().into_raw_fd()),
+            Some(leaf.clone()),
+        );
+        drop(rollback);
+
+        let registry = registry.lock().unwrap();
         assert!(registry.attachments.is_empty());
         assert!(!leaf.exists());
     }
