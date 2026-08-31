@@ -1,6 +1,12 @@
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{
+    fs, net::SocketAddr, num::NonZeroU32, os::unix::fs::MetadataExt, path::Path, time::Duration,
+};
 
-use agent_sandbox_core::{NetworkOwnership, ResourceKind};
+use agent_sandbox_core::{
+    CgroupIdentity, NetworkOwnership, OperationIdentity, ProcessIdentity, ResourceKind,
+    SeccompEvidence, SeccompListenerGeneration, SeccompNotificationId, SeccompSubcheck,
+    SubcheckIdentity, ThreadIdentity,
+};
 use agent_sandbox_syscall_broker::{
     PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget,
     notification_arch_valid, send_response,
@@ -8,6 +14,89 @@ use agent_sandbox_syscall_broker::{
 use tracing::{debug, info, warn};
 
 use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
+
+fn seccomp_evidence(
+    listener_fd: i32,
+    notif: &SeccompNotif,
+    facts: &NormalizedNotification,
+) -> Option<SeccompEvidence> {
+    let status = fs::read_to_string(format!("/proc/{}/status", notif.pid)).ok()?;
+    let uid = status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })?;
+    let tgid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok())?;
+    let stat = fs::read_to_string(format!("/proc/{tgid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let start_time = fields.split_whitespace().nth(19)?.parse().ok()?;
+    let cgroup_content = fs::read_to_string(format!("/proc/{tgid}/cgroup")).ok()?;
+    let cgroup_path = cgroup_content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let cgroup = CgroupIdentity::new(
+        fs::metadata(format!("/sys/fs/cgroup{cgroup_path}"))
+            .ok()?
+            .ino(),
+    )
+    .ok()?;
+    let tid = NonZeroU32::new(notif.pid)?;
+    let tgid = NonZeroU32::new(tgid)?;
+    let process = ProcessIdentity::new(tgid.get(), uid, start_time).ok()?;
+    let operation_id = OperationIdentity::new(notif.id.max(1)).ok()?;
+    let notification_id = SeccompNotificationId::new(notif.id.max(1)).ok()?;
+    let listener_generation =
+        SeccompListenerGeneration::new(u64::try_from(listener_fd).ok()?.max(1)).ok()?;
+    let thread = ThreadIdentity { tid, tgid };
+    let subchecks = match facts {
+        NormalizedNotification::Target {
+            target: SyscallTarget::Network(target),
+        } => vec![SeccompSubcheck::Network {
+            subcheck_id: SubcheckIdentity::new(1).ok()?,
+            destination: target.host.as_bytes().to_vec(),
+            socket: None,
+        }],
+        NormalizedNotification::Target {
+            target: SyscallTarget::Resource(target),
+        } => vec![SeccompSubcheck::Resource {
+            subcheck_id: SubcheckIdentity::new(1).ok()?,
+            resource_kind: target.kind,
+            path: target.path.clone(),
+            access: target.access,
+        }],
+        NormalizedNotification::Target {
+            target: SyscallTarget::Filesystem(target),
+        } => target
+            .checks
+            .iter()
+            .enumerate()
+            .map(|(index, (path, access))| {
+                Some(SeccompSubcheck::Filesystem {
+                    subcheck_id: SubcheckIdentity::new(
+                        u64::try_from(index).ok()?.saturating_add(1),
+                    )
+                    .ok()?,
+                    path: path.clone(),
+                    access: *access,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    (!subchecks.is_empty()).then_some(SeccompEvidence {
+        operation_id,
+        listener_generation,
+        notification_id,
+        process,
+        thread,
+        cgroup,
+        subchecks,
+    })
+}
 
 fn should_bypass_network_policy(
     network_policy: &NetworkPolicyBypass,
@@ -96,7 +185,23 @@ pub async fn dispatch_notification_with_mode(
         // also delegates only its transparent service ports.
         ResponsePlan::Continue
     } else {
-        decide(client, sandbox_session_id, notif.pid, timeout, facts).await
+        match seccomp_evidence(listener_fd, notif, &facts) {
+            Some(evidence) => {
+                client.set_seccomp_evidence(evidence);
+                let plan = decide(client, sandbox_session_id, notif.pid, timeout, facts).await;
+                client.clear_seccomp_evidence();
+                plan
+            }
+            None => {
+                warn!(
+                    pid = notif.pid,
+                    "could not capture seccomp evidence; denying"
+                );
+                ResponsePlan::DenyErrno {
+                    errno: libc::EACCES,
+                }
+            }
+        }
     };
 
     execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);

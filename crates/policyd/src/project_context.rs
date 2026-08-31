@@ -14,8 +14,9 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    ActivationHandle, AttachmentHandle, BindingHandle, ClaimHandle, ContextAdapterErrorCode,
-    ExternalOperationKey, ExternalSessionKey, ProcessIdentity, WorkspaceActivation,
+    ActivationHandle, AttachmentHandle, BindingHandle, CgroupIdentity, ClaimHandle,
+    ContextAdapterErrorCode, ExternalOperationKey, ExternalSessionKey, ProcessIdentity,
+    WorkspaceActivation,
 };
 
 const MAX_ACTIVATIONS_PER_SANDBOX: usize = 256;
@@ -179,11 +180,19 @@ struct ProcessAttachment {
     context: AttachmentHandle,
     _pidfd: ReceivedFd,
     cgroup: Option<PathBuf>,
+    /// Inode captured from the policyd-created binding or claim leaf.
+    cgroup_identity: Option<CgroupIdentity>,
 }
 
 impl Drop for ProcessAttachment {
     fn drop(&mut self) {
-        if let Some(cgroup) = &self.cgroup {
+        let (Some(cgroup), Some(expected)) = (&self.cgroup, self.cgroup_identity) else {
+            return;
+        };
+        let actual = std::fs::metadata(cgroup)
+            .ok()
+            .and_then(|metadata| CgroupIdentity::new(metadata.ino()).ok());
+        if actual == Some(expected) {
             let _ = std::fs::remove_dir(cgroup);
         }
     }
@@ -533,11 +542,23 @@ impl ProjectContextRegistry {
                 "process attachment limit reached",
             ));
         }
+        let cgroup_identity = cgroup.as_deref().and_then(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .and_then(|metadata| CgroupIdentity::new(metadata.ino()).ok())
+        });
+        if cgroup.is_some() && cgroup_identity.is_none() {
+            return Err(error(
+                ContextAdapterErrorCode::InvalidProcess,
+                "controlled process cgroup identity is unavailable",
+            ));
+        }
         self.attachments.insert(process, ProcessAttachment {
             connection_id,
             context,
             _pidfd: pidfd,
             cgroup,
+            cgroup_identity,
         });
         if let Some(claim) = claim_to_activate {
             self.claims
@@ -557,6 +578,40 @@ impl ProjectContextRegistry {
             && let Some(record) = self.claims.get_mut(claim)
         {
             record.active = false;
+        }
+    }
+
+    pub(crate) fn attached_cgroup_for_process(
+        &self,
+        process: &ProcessIdentity,
+        connection_id: u64,
+    ) -> Option<CgroupIdentity> {
+        self.attachments
+            .get(process)
+            .filter(|attachment| attachment.connection_id == connection_id)
+            .and_then(|attachment| attachment.cgroup_identity)
+    }
+
+    pub(crate) fn resolve_attached_process(
+        &mut self,
+        process: &ProcessIdentity,
+        cgroup: CgroupIdentity,
+        connection_id: u64,
+        now: Instant,
+    ) -> Option<ResolvedWorkspace> {
+        let attachment = if let Some(exact) = self.attachments.get(process) {
+            (exact.connection_id == connection_id && exact.cgroup_identity == Some(cgroup))
+                .then_some(exact)
+        } else {
+            self.attachments.values().find(|attachment| {
+                attachment.connection_id == connection_id
+                    && attachment.cgroup_identity == Some(cgroup)
+            })
+        }?;
+        let context = attachment.context.clone();
+        match context {
+            AttachmentHandle::Binding(binding) => self.resolve_binding(connection_id, &binding),
+            AttachmentHandle::Claim(claim) => self.resolve_claim(connection_id, &claim, now),
         }
     }
 
@@ -1033,6 +1088,18 @@ impl crate::store::PolicyStore {
             .resolve_binding(connection_id, binding)
     }
 
+    pub(crate) fn resolve_attached_process(
+        &self,
+        process: &ProcessIdentity,
+        cgroup: CgroupIdentity,
+        connection_id: u64,
+    ) -> Option<ResolvedWorkspace> {
+        self.project_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve_attached_process(process, cgroup, connection_id, Instant::now())
+    }
+
     pub(crate) fn resolve_project_claim(
         &self,
         connection_id: u64,
@@ -1136,6 +1203,26 @@ mod tests {
                 now,
             )
             .unwrap();
+        let cgroup = CgroupIdentity::new(leaf.metadata().unwrap().ino()).unwrap();
+        assert_eq!(
+            registry.attached_cgroup_for_process(&process, 7),
+            Some(cgroup)
+        );
+        assert!(
+            registry
+                .resolve_attached_process(&process, cgroup, 7, now)
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_attached_process(&process, cgroup, 8, now)
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve_attached_process(&process, CgroupIdentity::new(999).unwrap(), 7, now)
+                .is_none()
+        );
         assert_eq!(
             registry
                 .prepare_process_attachment(7, process, &context, now)

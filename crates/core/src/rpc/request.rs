@@ -12,7 +12,7 @@ use super::{
     scope::ApprovalScope,
 };
 use crate::{
-    ProcessIds, ResolvedRequestContext, SandboxPaths,
+    ProcessIds, ResolvedRequestContext, RoleEvidenceRequest, SandboxPaths,
     http::{HttpRequest, HttpRuleTarget},
     policy::{DbusTarget, FileAccess, FilesystemRule, ResourceAccess, ResourceKind},
 };
@@ -327,6 +327,10 @@ pub enum RpcRequest {
         /// Context of the checking process.
         #[serde(default)]
         ctx: RequestContext,
+
+        /// Immutable event-time evidence captured by the gate producer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<RoleEvidenceRequest>,
     },
 
     /// Check whether a filesystem access is allowed.
@@ -341,6 +345,10 @@ pub enum RpcRequest {
         /// Context of the checking process.
         #[serde(default)]
         ctx: RequestContext,
+
+        /// Immutable event-time evidence captured by the gate producer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<RoleEvidenceRequest>,
     },
 
     /// Check whether access to a resource at a path is allowed.
@@ -357,6 +365,10 @@ pub enum RpcRequest {
         /// Context of the checking process.
         #[serde(default)]
         ctx: RequestContext,
+
+        /// Immutable event-time evidence captured by the gate producer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<RoleEvidenceRequest>,
     },
 
     /// Check whether a D-Bus connection or message is allowed.
@@ -367,6 +379,10 @@ pub enum RpcRequest {
         /// Context of the checking process.
         #[serde(default)]
         ctx: RequestContext,
+
+        /// Immutable event-time evidence captured by the gate producer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<RoleEvidenceRequest>,
     },
 
     /// Start monitoring a filesystem tree for rule violations.
@@ -388,6 +404,10 @@ pub enum RpcRequest {
         /// Context of the elevating process.
         #[serde(default)]
         ctx: RequestContext,
+
+        /// Immutable event-time evidence captured by the gate producer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<RoleEvidenceRequest>,
     },
 
     /// Approve a previously issued check.

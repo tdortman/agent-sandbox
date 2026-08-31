@@ -78,6 +78,7 @@ pub async fn run() -> Result<(), ElevateCliError> {
     let req = RpcRequest::Elevate {
         argv: cli.argv,
         ctx,
+        evidence: None,
     };
 
     let resp = policy_rpc(&cli.socket, req, Duration::from_mins(2))

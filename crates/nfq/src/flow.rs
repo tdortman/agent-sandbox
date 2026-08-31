@@ -416,8 +416,14 @@ pub fn handle_packet_payload_with_registration(
         return (verdict, Some(meta));
     }
 
-    let allowed = match policy::transport_check(state, meta, src_pid, session_id.as_deref(), check)
-    {
+    let allowed = match policy::transport_check(
+        state,
+        meta,
+        src_pid,
+        session_id.as_deref(),
+        source_owner.map(OwnerSnapshot::identity),
+        check,
+    ) {
         TransportCheck::Rejected(verdict) => return (verdict, Some(meta)),
         TransportCheck::Allowed(destination) => destination,
     };

@@ -12,7 +12,7 @@ use std::{
 
 use agent_sandbox_core::{
     FileAccess, FilesystemCheckReply, FilesystemMonitorReply, FilesystemRule, PersistentRpcClient,
-    RequestContext, RpcClientError, RpcReply, RpcRequest,
+    RequestContext, RoleEvidenceRequest, RpcClientError, RpcReply, RpcRequest,
 };
 
 /// Per-check RPC timeout.
@@ -57,6 +57,21 @@ impl MonitorClient {
         access: FileAccess,
         ctx: RequestContext,
     ) -> Result<FilesystemCheckReply, RpcClientError> {
+        self.check_filesystem_with_evidence(path, access, ctx, None)
+            .await
+    }
+
+    /// Check one event with immutable evidence captured by the monitor.
+    ///
+    /// The evidence is carried to policyd alongside the legacy request shape;
+    /// policyd validates it before resolving the request context.
+    pub async fn check_filesystem_with_evidence(
+        &mut self,
+        path: &Path,
+        access: FileAccess,
+        ctx: RequestContext,
+        evidence: Option<RoleEvidenceRequest>,
+    ) -> Result<FilesystemCheckReply, RpcClientError> {
         let reply = self
             .client
             .request(
@@ -64,6 +79,7 @@ impl MonitorClient {
                     path: path.to_path_buf(),
                     access,
                     ctx,
+                    evidence,
                 },
                 CHECK_TIMEOUT,
             )
