@@ -13,6 +13,7 @@ let
   dshPkg = flake.package "dsh";
   flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
   harnessPkg = flake.package "harness-integrations";
+  sandboxPkg = flake.package "agent-sandbox";
   requiredSystems = [
     "x86_64-linux"
     "aarch64-linux"
@@ -83,8 +84,11 @@ in
 
     environment = {
       sessionVariables = {
-        AGENT_SANDBOX_CHILD = "agent-sandbox-child";
+        AGENT_SANDBOX_CHILD = "${harnessPkg}/bin/agent-sandbox-child";
+        AGENT_SANDBOX_CONTEXT_ADAPTER = "${harnessPkg}/bin/agent-sandbox-context-adapter";
         AGENT_SANDBOX_CONTEXT_ADAPTER_PROTOCOL = toString contract.protocolMajor;
+        AGENT_SANDBOX_PROXY = "${sandboxPkg}/bin/agent-sandbox-proxy";
+        AGENT_SANDBOX_DBUS_PROXY = "${sandboxPkg}/bin/agent-sandbox-dbus-proxy";
         AGENT_SANDBOX_CONTEXT_ADAPTER_REQUIRED = "1";
         AGENT_SANDBOX_CONTEXT_ADAPTER_SOCKET = cfg.policy.socketPath;
         CODEX_APP_SERVER_SHARED_SOCKET = "0";

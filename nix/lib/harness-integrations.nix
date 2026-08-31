@@ -77,6 +77,13 @@
     stopSignal = "SIGSTOP";
   };
 
+  executables = {
+    contextAdapter = "agent-sandbox-context-adapter";
+    dbusBridge = "agent-sandbox-dbus-proxy";
+    proxy = "agent-sandbox-proxy";
+    stoppedChild = "agent-sandbox-child";
+  };
+
   codex = {
     appServer = {
       electronAsarPatch = false;

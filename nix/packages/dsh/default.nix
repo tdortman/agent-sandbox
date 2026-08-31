@@ -1,6 +1,8 @@
 { lib, pkgs, ... }:
 
 let
+  harnessPkg = pkgs.agent-sandbox.harness-integrations;
+  sandboxPkg = pkgs.agent-sandbox.agent-sandbox;
   release = pkgs.fetchurl {
     url = "https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.1.1-rc.2.tgz";
     hash = "sha256-R+wF9FraWrh3ea4YqQRWtev/VCHcD/XBeWd9ZeHBYFc=";
@@ -15,7 +17,6 @@ pkgs.buildNpmPackage rec {
   inherit src;
   pname = "dsh";
   version = "0.1.1-rc.2";
-  nativeBuildInputs = [ pkgs.makeWrapper ];
   npmDepsHash = "sha256-wtozzqw6GiiwDNXXHSZgLMt5qF1rvFKnwfUePi9T2JY=";
 
   postInstall = ''
@@ -24,12 +25,20 @@ pkgs.buildNpmPackage rec {
       $out/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-terminal-bash/lib/index.js \
       --replace-fail '"/bin/bash"' '"${pkgs.bashInteractive}/bin/bash"'
 
-    # Keep DSH's launcher neutral. The adapter and stopped-child provider are
-    # selected by the shared profile environment, not by a policy fork.
-    wrapProgram $out/bin/dsh \
-      --set-default AGENT_SANDBOX_CONTEXT_ADAPTER_PROTOCOL 1 \
-      --set-default AGENT_SANDBOX_CONTEXT_ADAPTER agent-sandbox \
-      --set-default AGENT_SANDBOX_CHILD agent-sandbox-child
+    # Keep the installed CLI thin: the shared adapter owns registration, while
+    # the harness-specific process provider remains an environment seam.
+    mv $out/bin/dsh $out/bin/dsh-unwrapped
+    install -Dm0755 /dev/stdin $out/bin/dsh <<'DSH'
+    #!${pkgs.bash}/bin/bash
+    set -euo pipefail
+    export AGENT_SANDBOX_CONTEXT_ADAPTER_PROTOCOL=1
+    export AGENT_SANDBOX_CONTEXT_ADAPTER="${harnessPkg}/bin/agent-sandbox-context-adapter"
+    export AGENT_SANDBOX_CHILD="${harnessPkg}/bin/agent-sandbox-child"
+    export AGENT_SANDBOX_PROXY="${sandboxPkg}/bin/agent-sandbox-proxy"
+    export AGENT_SANDBOX_DBUS_PROXY="${sandboxPkg}/bin/agent-sandbox-dbus-proxy"
+    exec ${harnessPkg}/bin/agent-sandbox-context-adapter -- "@out@/bin/dsh-unwrapped" "$@"
+    DSH
+    substituteInPlace $out/bin/dsh --replace-fail @out@ $out
   '';
 
   dontNpmBuild = true;

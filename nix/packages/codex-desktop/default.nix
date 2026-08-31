@@ -1,6 +1,8 @@
 { lib, pkgs, ... }:
 
 let
+  harnessPkg = pkgs.agent-sandbox.harness-integrations;
+  sandboxPkg = pkgs.agent-sandbox.agent-sandbox;
   officialPackage =
     {
       aarch64-linux = {
@@ -93,19 +95,35 @@ pkgs.stdenvNoCC.mkDerivation {
     # The app-server transport stays stdio JSON-RPC. A shared socket would
     # erase the logical connection that the adapter observes.
     rm -f "$out/bin/codex" "$out/bin/codex-desktop"
-    makeWrapper "$out/lib/chatgpt/resources/codex" "$out/bin/codex" \
+    makeWrapper "$out/lib/chatgpt/resources/codex" "$out/bin/codex-unwrapped" \
       --set-default AGENT_SANDBOX_CONTEXT_ADAPTER_PROTOCOL 1 \
-      --set-default AGENT_SANDBOX_CONTEXT_ADAPTER agent-sandbox \
-      --set-default AGENT_SANDBOX_CHILD agent-sandbox-child \
+      --set-default AGENT_SANDBOX_CONTEXT_ADAPTER "${harnessPkg}/bin/agent-sandbox-context-adapter" \
+      --set-default AGENT_SANDBOX_CHILD "${harnessPkg}/bin/agent-sandbox-child" \
+      --set-default AGENT_SANDBOX_PROXY "${sandboxPkg}/bin/agent-sandbox-proxy" \
+      --set-default AGENT_SANDBOX_DBUS_PROXY "${sandboxPkg}/bin/agent-sandbox-dbus-proxy" \
       --set-default CODEX_APP_SERVER_TRANSPORT stdio-jsonl \
       --set-default CODEX_APP_SERVER_SHARED_SOCKET 0
-    makeWrapper "$out/bin/chatgpt" "$out/bin/codex-desktop" \
+    install -Dm0755 /dev/stdin "$out/bin/codex" <<'CODEX'
+    #!${pkgs.bash}/bin/bash
+    set -euo pipefail
+    exec ${harnessPkg}/bin/agent-sandbox-context-adapter -- "@out@/bin/codex-unwrapped" "$@"
+    CODEX
+    substituteInPlace $out/bin/codex --replace-fail @out@ $out
+    makeWrapper "$out/bin/chatgpt" "$out/bin/codex-desktop-unwrapped" \
       --set-default CODEX_CLI_PATH "$out/bin/codex" \
       --set-default AGENT_SANDBOX_CONTEXT_ADAPTER_PROTOCOL 1 \
-      --set-default AGENT_SANDBOX_CONTEXT_ADAPTER agent-sandbox \
-      --set-default AGENT_SANDBOX_CHILD agent-sandbox-child \
+      --set-default AGENT_SANDBOX_CONTEXT_ADAPTER "${harnessPkg}/bin/agent-sandbox-context-adapter" \
+      --set-default AGENT_SANDBOX_CHILD "${harnessPkg}/bin/agent-sandbox-child" \
+      --set-default AGENT_SANDBOX_PROXY "${sandboxPkg}/bin/agent-sandbox-proxy" \
+      --set-default AGENT_SANDBOX_DBUS_PROXY "${sandboxPkg}/bin/agent-sandbox-dbus-proxy" \
       --set-default CODEX_APP_SERVER_TRANSPORT stdio-jsonl \
       --set-default CODEX_APP_SERVER_SHARED_SOCKET 0
+    install -Dm0755 /dev/stdin "$out/bin/codex-desktop" <<'DESKTOP'
+    #!${pkgs.bash}/bin/bash
+    set -euo pipefail
+    exec ${harnessPkg}/bin/agent-sandbox-context-adapter -- "@out@/bin/codex-desktop-unwrapped" "$@"
+    DESKTOP
+    substituteInPlace $out/bin/codex-desktop --replace-fail @out@ $out
 
     install -Dm0644 /dev/stdin "$out/share/agent-sandbox/codex-desktop.json" <<EOF
     {
