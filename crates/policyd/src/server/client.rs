@@ -537,6 +537,43 @@ async fn reply(writer: Arc<Mutex<OwnedWriteHalf>>, payload: &RpcReply) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn frame_reader_receives_one_close_on_exec_descriptor() {
+        use std::{io::IoSlice, os::fd::AsRawFd};
+
+        use nix::sys::socket::{ControlMessage, sendmsg};
+
+        let (sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let receiver = tokio::net::UnixStream::from_std(receiver).unwrap();
+        let (reader, _) = receiver.into_split();
+        let descriptor = std::fs::File::open("/dev/null").unwrap();
+        let rights = [descriptor.as_raw_fd()];
+        sendmsg::<()>(
+            sender.as_raw_fd(),
+            &[IoSlice::new(b"attach\n")],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+
+        let frame = FrameReader::default()
+            .read(&reader, MAX_RPC_LINE_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(frame.line, "attach");
+        assert_eq!(frame.fds.len(), 1);
+        let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", frame.fds[0].raw()))
+            .unwrap()
+            .lines()
+            .find_map(|line| u32::from_str_radix(line.strip_prefix("flags:\t")?, 8).ok())
+            .unwrap();
+        assert_ne!(flags & nix::libc::O_CLOEXEC as u32, 0);
+    }
+
     #[test]
     fn adapter_must_register_before_binding() {
         let dir = tempfile::tempdir().unwrap();
