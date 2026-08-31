@@ -802,6 +802,14 @@ fn unified_cgroup(pid: u32) -> Option<String> {
         .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
 }
 
+fn cgroup_contains(root: &str, process: &str) -> bool {
+    root == "/"
+        || process == root
+        || process
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 impl crate::store::PolicyStore {
     pub(crate) fn activate_workspace(
         &self,
@@ -904,7 +912,7 @@ impl crate::store::PolicyStore {
             .then(|| unified_cgroup(registration.root_pid))
             .flatten();
         if !matches!((process_cgroup.as_deref(), sandbox_cgroup.as_deref()),
-            (Some(process), Some(root)) if process == root || process.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/')))
+            (Some(process), Some(root)) if cgroup_contains(root, process))
         {
             return Err(error(
                 ContextAdapterErrorCode::InvalidProcess,
@@ -1049,6 +1057,13 @@ impl crate::store::PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_containment_respects_component_boundaries() {
+        assert!(cgroup_contains("/", "/sandbox/child"));
+        assert!(cgroup_contains("/sandbox", "/sandbox/child"));
+        assert!(!cgroup_contains("/sandbox", "/sandbox-escape"));
+    }
 
     #[test]
     fn bindings_are_immutable_and_claims_do_not_fallback() {
