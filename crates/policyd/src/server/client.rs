@@ -1,6 +1,6 @@
 //! Per-connection read loop and reply framing.
 
-use std::{io::IoSliceMut, os::fd::AsRawFd, sync::Arc};
+use std::{collections::HashSet, io::IoSliceMut, os::fd::AsRawFd, sync::Arc};
 
 use agent_sandbox_core::{
     CONTEXT_ADAPTER_PROTOCOL_MAJOR, ContextAdapterErrorCode, ContextAdapterMessage,
@@ -24,6 +24,26 @@ use crate::{
     server::peer::ClientPeer,
     store::{MAX_RPC_LINE_BYTES, PolicyStore, ProxyCheckId, TrustedPeer, UiClientHandle},
 };
+
+const MAX_CONTEXT_ADAPTER_REQUESTS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct ContextAdapterRequestState {
+    seen_ids: HashSet<u64>,
+}
+
+impl ContextAdapterRequestState {
+    fn accept(&mut self, request_id: u64) -> Result<(), ContextAdapterErrorCode> {
+        if self.seen_ids.contains(&request_id) {
+            return Err(ContextAdapterErrorCode::DuplicateRequestId);
+        }
+        if self.seen_ids.len() >= MAX_CONTEXT_ADAPTER_REQUESTS {
+            return Err(ContextAdapterErrorCode::ResourceExhausted);
+        }
+        self.seen_ids.insert(request_id);
+        Ok(())
+    }
+}
 
 pub async fn handle_client(
     store: Arc<PolicyStore>,
@@ -50,6 +70,7 @@ pub async fn handle_client(
     let mut proxy_session_owner = false;
     let mut proxy_single_request = false;
     let mut context_adapter = false;
+    let mut context_adapter_requests = ContextAdapterRequestState::default();
 
     loop {
         let frame = match reader.read(&reader_half, MAX_RPC_LINE_BYTES).await {
@@ -87,17 +108,47 @@ pub async fn handle_client(
                     continue;
                 }
             };
-            let message =
-                dispatch_context_adapter(&store, client.id, request, fds, true, peer, role);
+            let message = dispatch_context_adapter(
+                &store,
+                client.id,
+                request,
+                fds,
+                true,
+                peer,
+                role,
+                &mut context_adapter_requests,
+            );
+            let close = matches!(&message, ContextAdapterMessage::Error {
+                code: ContextAdapterErrorCode::ResourceExhausted,
+                ..
+            });
             reply_context_adapter(writer.clone(), &message).await;
+            if close {
+                break;
+            }
             continue;
         }
 
         if let Ok(request) = serde_json::from_str::<ContextAdapterRequest>(&line) {
-            let message =
-                dispatch_context_adapter(&store, client.id, request, fds, false, peer, role);
+            let message = dispatch_context_adapter(
+                &store,
+                client.id,
+                request,
+                fds,
+                false,
+                peer,
+                role,
+                &mut context_adapter_requests,
+            );
+            let close = matches!(&message, ContextAdapterMessage::Error {
+                code: ContextAdapterErrorCode::ResourceExhausted,
+                ..
+            });
             context_adapter = matches!(message, ContextAdapterMessage::Registered { .. });
             reply_context_adapter(writer.clone(), &message).await;
+            if close {
+                break;
+            }
             continue;
         }
 
@@ -271,8 +322,19 @@ fn dispatch_context_adapter(
     registered: bool,
     peer: ClientPeer,
     role: SocketRole,
+    request_state: &mut ContextAdapterRequestState,
 ) -> ContextAdapterMessage {
     let request_id = request.request_id();
+    if let Err(code) = request_state.accept(request_id) {
+        let detail = match code {
+            ContextAdapterErrorCode::DuplicateRequestId => {
+                "request id was already used on this connection"
+            }
+            ContextAdapterErrorCode::ResourceExhausted => "context adapter request limit reached",
+            _ => unreachable!("request tracking only returns duplicate or exhausted"),
+        };
+        return adapter_error(Some(request_id), code, detail);
+    }
     let attaches_process = matches!(&request, ContextAdapterRequest::AttachProcess { .. });
     if (attaches_process && fds.len() != 1) || (!attaches_process && !fds.is_empty()) {
         return adapter_error(
@@ -585,6 +647,7 @@ mod tests {
             std::time::Duration::from_secs(30),
             false,
         ));
+        let mut request_state = ContextAdapterRequestState::default();
         let response = dispatch_context_adapter(
             &store,
             7,
@@ -601,11 +664,77 @@ mod tests {
                 gid: nix::unistd::getgid().as_raw() as i32,
             },
             SocketRole::Host,
+            &mut request_state,
         );
         assert!(matches!(response, ContextAdapterMessage::Error {
             request_id: Some(9),
             code: ContextAdapterErrorCode::Unauthorized,
             ..
         }));
+    }
+
+    #[test]
+    fn adapter_rejects_reused_ids_across_registration_and_lifetime_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("host.sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("policy.json"),
+            dir.path().join("export.json"),
+            std::time::Duration::from_secs(30),
+            false,
+        ));
+        let peer = ClientPeer {
+            pid: std::process::id(),
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw() as i32,
+        };
+        let mut request_state = ContextAdapterRequestState::default();
+        let registration = dispatch_context_adapter(
+            &store,
+            7,
+            ContextAdapterRequest::RegisterContextAdapter {
+                request_id: 1,
+                protocol_major: CONTEXT_ADAPTER_PROTOCOL_MAJOR,
+                sandbox_session_id: "sandbox".into(),
+            },
+            Vec::new(),
+            false,
+            peer,
+            SocketRole::Host,
+            &mut request_state,
+        );
+        assert!(matches!(registration, ContextAdapterMessage::Error {
+            request_id: Some(1),
+            ..
+        }));
+
+        let duplicate = dispatch_context_adapter(
+            &store,
+            7,
+            ContextAdapterRequest::BindSession {
+                request_id: 1,
+                session_key: agent_sandbox_core::ExternalSessionKey::new("session").unwrap(),
+                activation: agent_sandbox_core::ActivationHandle::new(),
+            },
+            Vec::new(),
+            true,
+            peer,
+            SocketRole::Host,
+            &mut request_state,
+        );
+        assert!(matches!(duplicate, ContextAdapterMessage::Error {
+            request_id: Some(1),
+            code: ContextAdapterErrorCode::DuplicateRequestId,
+            ..
+        }));
+
+        for request_id in 2..=(MAX_CONTEXT_ADAPTER_REQUESTS as u64) {
+            assert!(request_state.accept(request_id).is_ok());
+        }
+        assert_eq!(
+            request_state.accept(MAX_CONTEXT_ADAPTER_REQUESTS as u64 + 1),
+            Err(ContextAdapterErrorCode::ResourceExhausted)
+        );
     }
 }
