@@ -3,6 +3,7 @@
 
 mod message;
 mod project_context;
+mod role_evidence;
 
 mod proxy;
 mod push;
@@ -36,6 +37,13 @@ pub use reply::{
 pub use request::{
     AliasSplit, ApprovalTarget, RequestContext, RpcRequest, attach_check_aliases,
     parse_rpc_request, split_check_aliases,
+};
+pub use role_evidence::{
+    CgroupIdentity, DbusEvidence, DbusFdEvidence, DbusOperationIdentity, DbusSerial,
+    DbusTargetEvidence, ElevationEvidence, FanotifyEventId, FanotifyEvidence, HttpBridgeEvidence,
+    NfqEvidence, OperationIdentity, RoleEvidenceRequest, SeccompEvidence,
+    SeccompListenerGeneration, SeccompNotificationId, SeccompSubcheck, SubcheckIdentity,
+    ThreadIdentity,
 };
 pub use scope::ApprovalScope;
 
