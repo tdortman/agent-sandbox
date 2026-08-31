@@ -3,10 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
-    SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
-    peer_context, read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
-    trusted_project_policy_path,
+    FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext, SandboxPaths,
+    home_from_uid, is_descendant_of, load_policy, merge_layers, peer_context,
+    resolve_policy_write_path, sandbox_session_id_from_pid, trusted_project_policy_path,
 };
 
 use super::types::PolicyStore;
@@ -42,14 +41,6 @@ impl PolicyStore {
             return;
         }
 
-        let trusted = peer_context(peer.pid, Some(peer.uid));
-
-        let project_root = trusted
-            .project_root
-            .clone()
-            .or_else(|| trusted.cwd.clone())
-            .unwrap_or_default();
-
         let mut sessions = self
             .sandbox_sessions
             .write()
@@ -70,19 +61,10 @@ impl PolicyStore {
                 {
                     reg.root_pid = peer.pid;
                 }
-
-                if is_descendant_of(reg.root_pid, peer.pid)
-                    && !project_root.as_os_str().is_empty()
-                    && (reg.project_root.as_os_str().is_empty()
-                        || is_path_descendant(&project_root, &reg.project_root))
-                {
-                    reg.project_root.clone_from(&project_root);
-                }
             })
             .or_insert(SandboxSessionRegistration {
                 root_pid: peer.pid,
                 owner_uid: peer.uid,
-                project_root,
                 package: None,
                 launcher_pid: 0,
             });
@@ -91,8 +73,8 @@ impl PolicyStore {
     /// Register a sandbox session's package identity.
     ///
     /// Inserts the registration when the session is unknown, and otherwise
-    /// updates the owner uid and package while keeping the observed
-    /// `root_pid` and `project_root`. The package is immutable per session:
+    /// updates the owner uid and package while keeping the observed root pid.
+    /// The package is immutable per session:
     /// once a registration carries a package, a different package is
     /// rejected with [`PolicydError::PackageImmutable`] and the stored
     /// registration is left unchanged.
@@ -152,7 +134,6 @@ impl PolicyStore {
                 sessions.insert(session_id.to_string(), SandboxSessionRegistration {
                     root_pid: 0,
                     owner_uid,
-                    project_root: PathBuf::new(),
                     package: Some(package.to_string()),
                     launcher_pid,
                 });
@@ -231,31 +212,15 @@ impl PolicyStore {
 
         let mut cwd = ctx.paths.cwd_path();
         let mut home = ctx.paths.home_path();
-        let mut project_root = ctx.paths.project_root_path();
 
         if home.is_none() {
             home = uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from);
         }
 
-        if (cwd.is_none() || project_root.is_none())
+        if cwd.is_none()
             && let Some(pid) = pid
         {
-            let proc = peer_context(pid, uid);
-
-            if cwd.is_none() {
-                cwd = proc.cwd;
-            }
-
-            if project_root.is_none() {
-                project_root = proc.project_root;
-            }
-        }
-
-        if project_root.is_none()
-            && let (Some(home), Some(cwd_path)) = (home.as_deref(), cwd.as_deref())
-        {
-            let project = ProjectPolicyContext::new(Some(home), Some(cwd_path), None);
-            project_root = project.project_root().map(Path::to_path_buf);
+            cwd = peer_context(pid, uid).cwd;
         }
 
         // Root and internal callers are policyd-side trusted: there is no
@@ -270,45 +235,11 @@ impl PolicyStore {
         });
 
         ResolvedRequestContext {
-            paths: SandboxPaths::from_wire(cwd, home, project_root),
+            paths: SandboxPaths::from_wire(cwd, home, None),
             ids: ProcessIds::from_options(pid, uid),
             sandbox_session_id,
             package,
         }
-    }
-
-    /// Read the launcher env vars and `/proc` paths for a verified sandbox
-    /// peer, then constrain the project root to the registered one.
-    fn peer_paths(
-        pid: u32,
-        trusted_uid: Option<u32>,
-        registration: Option<&SandboxSessionRegistration>,
-    ) -> (Option<PathBuf>, Option<PathBuf>) {
-        let env = read_proc_environ(pid);
-
-        let mut cwd = env
-            .get("AGENT_SANDBOX_CWD")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-
-        let mut project_root = env
-            .get("AGENT_SANDBOX_PROJECT_ROOT")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-
-        let proc = peer_context(pid, trusted_uid);
-
-        cwd = cwd.or(proc.cwd);
-        project_root = project_root.or(proc.project_root);
-
-        if let (Some(pr), Some(reg)) = (&project_root, registration)
-            && !reg.project_root.as_os_str().is_empty()
-            && !is_path_descendant(pr, &reg.project_root)
-        {
-            project_root = None;
-        }
-
-        (cwd, project_root)
     }
 
     fn resolve_from_peer(&self, ctx: &MergeContext, peer: TrustedPeer) -> ResolvedRequestContext {
@@ -354,7 +285,6 @@ impl PolicyStore {
             .map(PathBuf::from);
 
         let mut cwd = None;
-        let mut project_root = None;
         let mut package = None;
 
         if let Some(pid) = verified_pid {
@@ -403,24 +333,14 @@ impl PolicyStore {
             }
 
             if pid_allowed {
-                let (peer_cwd, peer_project) =
-                    Self::peer_paths(pid, trusted_uid, registration.as_ref());
-                cwd = cwd.or(peer_cwd);
-                project_root = project_root.or(peer_project);
+                cwd = peer_context(pid, trusted_uid).cwd;
             }
-        }
-
-        if project_root.is_none()
-            && let (Some(home), Some(cwd_path)) = (home.as_deref(), cwd.as_deref())
-        {
-            let project = ProjectPolicyContext::new(Some(home), Some(cwd_path), None);
-            project_root = project.project_root().map(Path::to_path_buf);
         }
 
         let ids = ProcessIds::from_options(verified_pid, trusted_uid);
 
         ResolvedRequestContext {
-            paths: SandboxPaths::from_wire(cwd, home, project_root),
+            paths: SandboxPaths::from_wire(cwd, home, None),
             ids,
             sandbox_session_id,
             package,
@@ -825,14 +745,11 @@ mod tests {
             Some(PathBuf::from("/attacker/home"))
         );
 
-        assert_ne!(
-            resolved.paths.project_root_path(),
-            Some(PathBuf::from("/attacker/project"))
-        );
+        assert_eq!(resolved.paths.project_root_path(), None);
     }
 
     #[test]
-    fn root_helper_preserves_wire_paths_from_fsmon() {
+    fn root_helper_preserves_display_paths_but_not_project_root() {
         let store = test_store();
 
         let wire = MergeContext {
@@ -860,10 +777,7 @@ mod tests {
 
         assert_eq!(resolved.paths.cwd_path(), Some(PathBuf::from("/home/user")));
 
-        assert_eq!(
-            resolved.paths.project_root_path(),
-            Some(PathBuf::from("/home/user/project"))
-        );
+        assert_eq!(resolved.paths.project_root_path(), None);
 
         assert_eq!(
             resolved.sandbox_session_id.as_deref(),
@@ -923,7 +837,6 @@ mod tests {
             sessions.insert("broker-session".into(), SandboxSessionRegistration {
                 root_pid,
                 owner_uid: uid,
-                project_root: PathBuf::from("/work/project"),
                 package: Some("codex".into()),
                 launcher_pid,
             });
@@ -973,7 +886,6 @@ mod tests {
             sessions.insert("broker-tracee-session".into(), SandboxSessionRegistration {
                 root_pid,
                 owner_uid: uid,
-                project_root: PathBuf::from("/work/project"),
                 package: Some("codex".into()),
                 launcher_pid,
             });

@@ -1868,7 +1868,6 @@ mod tests {
             crate::store::types::SandboxSessionRegistration {
                 root_pid: 42,
                 owner_uid: 1000,
-                project_root: "/repo".into(),
                 package: None,
                 launcher_pid: 0,
             },
@@ -2043,7 +2042,6 @@ mod tests {
             crate::store::types::SandboxSessionRegistration {
                 root_pid: 42,
                 owner_uid: 1000,
-                project_root: "/repo".into(),
                 package: None,
                 launcher_pid: 0,
             },

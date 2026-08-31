@@ -366,11 +366,10 @@ pub fn wire_context(
     ctx
 }
 
-/// Cwd / home / `project_root` for policyd trust decisions.
+/// Cwd and home facts read from a verified peer process.
 ///
-/// Trust level: `/proc`. The environment is read from the peer process, the
-/// home comes from the verified peer uid, and `project_root` is inferred from
-/// those. It is never taken from agent-controlled environ values alone.
+/// A process environment and cwd are display facts. They never establish a
+/// project root; project attribution requires a separate authority binding.
 #[must_use]
 pub fn peer_context(pid: u32, uid: Option<u32>) -> ProcContext {
     if pid == 0 {
@@ -378,41 +377,21 @@ pub fn peer_context(pid: u32, uid: Option<u32>) -> ProcContext {
     }
 
     let env = read_proc_environ(pid);
-
-    let mut cwd = env
+    let cwd = env
         .get("AGENT_SANDBOX_CWD")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| read_proc_cwd(pid));
-
     let home = env
         .get("AGENT_SANDBOX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from));
 
-    let mut project_root = env
-        .get("AGENT_SANDBOX_PROJECT_ROOT")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-
-    if project_root.is_none() {
-        let project =
-            ProjectPolicyContext::new(home.as_deref().map(Path::new), cwd.as_deref(), None);
-
-        project_root = project.project_root().map(Path::to_path_buf);
-    }
-
-    if cwd.is_none()
-        && let Some(root) = project_root.as_deref()
-    {
-        cwd = Some(root.to_path_buf());
-    }
-
     ProcContext {
         cwd,
         home,
-        project_root,
+        project_root: None,
     }
 }
 

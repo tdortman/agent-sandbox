@@ -59,8 +59,6 @@ pub struct SandboxSessionRegistration {
     pub root_pid: u32,
     /// Uid that owns the sandbox session.
     pub owner_uid: u32,
-    /// Project root directory of the session.
-    pub project_root: PathBuf,
     /// Optional package the session is attributed to.
     pub package: Option<String>,
 
