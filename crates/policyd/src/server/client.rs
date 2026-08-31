@@ -569,8 +569,24 @@ impl FrameReader {
             if received.0 == 0 {
                 return Ok(None);
             }
+            let descriptors = received.1;
+            let complete_frames = self
+                .bytes
+                .iter()
+                .chain(chunk[..received.0].iter())
+                .filter(|byte| **byte == b'\n')
+                .count();
+            if (!descriptors.is_empty() || !self.fds.is_empty()) && complete_frames > 1 {
+                drop(descriptors);
+                self.bytes.clear();
+                self.fds.clear();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ancillary descriptors must accompany one frame",
+                ));
+            }
             self.bytes.extend_from_slice(&chunk[..received.0]);
-            self.fds.extend(received.1);
+            self.fds.extend(descriptors);
         }
     }
 }
@@ -634,6 +650,51 @@ mod tests {
             .find_map(|line| u32::from_str_radix(line.strip_prefix("flags:\t")?, 8).ok())
             .unwrap();
         assert_ne!(flags & nix::libc::O_CLOEXEC as u32, 0);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_descriptors_with_multiple_frames() {
+        use std::{
+            io::{IoSlice, Write},
+            os::fd::AsRawFd,
+        };
+
+        use nix::sys::socket::{ControlMessage, sendmsg};
+
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let receiver = tokio::net::UnixStream::from_std(receiver).unwrap();
+        let (reader, _) = receiver.into_split();
+        let descriptor = std::fs::File::open("/dev/null").unwrap();
+        let rights = [descriptor.as_raw_fd()];
+        sendmsg::<()>(
+            sender.as_raw_fd(),
+            &[IoSlice::new(b"first\nsecond\n")],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+
+        let mut frames = FrameReader::default();
+        let error = match frames.read(&reader, MAX_RPC_LINE_BYTES).await {
+            Ok(_) => panic!("descriptor-bearing multi-frame recvmsg was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "ancillary descriptors must accompany one frame"
+        );
+
+        sender.write_all(b"third\n").unwrap();
+        let frame = frames
+            .read(&reader, MAX_RPC_LINE_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.line, "third");
+        assert!(frame.fds.is_empty());
     }
 
     #[test]
