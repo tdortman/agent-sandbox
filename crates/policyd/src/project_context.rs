@@ -79,18 +79,19 @@ impl ActivationRecord {
                 "workspace root is not absolute",
             ));
         }
-        let canonical_path = root.canonicalize().map_err(|_| {
-            error(
-                ContextAdapterErrorCode::InvalidWorkspace,
-                "workspace root cannot be canonicalised",
-            )
-        })?;
-        let directory = File::open(&canonical_path).map_err(|_| {
+        let directory = File::open(root).map_err(|_| {
             error(
                 ContextAdapterErrorCode::InvalidWorkspace,
                 "workspace root cannot be opened",
             )
         })?;
+        let canonical_path = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            .map_err(|_| {
+                error(
+                    ContextAdapterErrorCode::InvalidWorkspace,
+                    "workspace root cannot be canonicalised",
+                )
+            })?;
         let metadata = directory.metadata().map_err(|_| {
             error(
                 ContextAdapterErrorCode::InvalidWorkspace,
@@ -1092,6 +1093,29 @@ mod tests {
         );
         registry.release_binding_for(7, &binding).unwrap();
         registry.release_binding_for(7, &binding).unwrap();
+        assert!(registry.resolve_binding(7, &binding).is_none());
+    }
+
+    #[test]
+    fn replaced_workspace_invalidates_new_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let owner = root.metadata().unwrap().uid();
+        let mut registry = ProjectContextRegistry::default();
+        let activation = registry.activate("sandbox", owner, &root).unwrap();
+        registry.register_adapter(7, "sandbox").unwrap();
+        let binding = registry
+            .bind_session(
+                7,
+                ExternalSessionKey::new("session").unwrap(),
+                activation.activation,
+            )
+            .unwrap();
+
+        std::fs::rename(&root, dir.path().join("moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
         assert!(registry.resolve_binding(7, &binding).is_none());
     }
 
