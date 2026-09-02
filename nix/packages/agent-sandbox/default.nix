@@ -20,12 +20,13 @@ let
       pkgs.kdePackages.plasma-integration
       pkgs.qt6.qtbase
     ];
-    name = "agent-sandbox-qt-dialog";
 
     postFixup = ''
       grep -aqF '${pkgs.kdePackages.breeze}/lib/qt-6/plugins' "$out/bin/agent-sandbox-qt-dialog"
       grep -aqF '${pkgs.kdePackages.plasma-integration}/lib/qt-6/plugins' "$out/bin/agent-sandbox-qt-dialog"
     '';
+
+    name = "agent-sandbox-qt-dialog";
   };
   rust = (import "${inputs.self}/nix/lib/rust-toolchain.nix") { inherit pkgs; };
   src = inputs.self;
