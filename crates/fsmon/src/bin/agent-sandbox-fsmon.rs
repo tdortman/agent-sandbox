@@ -2,6 +2,7 @@
 //! mark each mountpoint, then event-loop handling permission events.
 
 use std::{
+    collections::HashSet,
     ffi::CString,
     fs,
     fs::File,
@@ -20,8 +21,8 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    FileAccess, ProcessIds, normalize_directory_traverse_access, open_flags_to_file_access,
-    wire_context,
+    EXPORTED_POLICY_PATH, FileAccess, ProcessIds, StaticPolicyAllow,
+    normalize_directory_traverse_access, open_flags_to_file_access, wire_context,
 };
 use agent_sandbox_fsmon::MonitorClient;
 use agent_sandbox_sysutil::{
@@ -92,12 +93,22 @@ struct Cli {
     /// `AGENT_SANDBOX_HOME` if unset.
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<PathBuf>,
-
     /// Project root directory inside the sandbox. Required for "project" scope
     /// approvals to land in the right per-project policy file. Defaults to the
     /// env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_PROJECT_ROOT")]
     project_root: Option<PathBuf>,
+
+    /// Merged policy JSON exported by policyd at startup. Events matching its
+    /// static filesystem allow rules are answered locally without a policyd
+    /// round trip. The snapshot is loaded once; runtime policy changes (new
+    /// approvals, session verdicts) keep flowing through policyd.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = EXPORTED_POLICY_PATH
+    )]
+    static_policy: PathBuf,
 }
 
 // fanotify constants and event structs come from `agent_sandbox_sysutil`.
@@ -735,6 +746,7 @@ fn run_event_loop(
     host_proc: &HostProc,
     ctx: &agent_sandbox_core::RequestContext,
     socket_path: &Path,
+    static_allow: &StaticPolicyAllow,
 ) -> ! {
     use std::os::fd::AsFd;
 
@@ -744,7 +756,7 @@ fn run_event_loop(
         .enable_all()
         .build()
         .expect("tokio runtime");
-
+    let mut pid_cgroup_cache = HashSet::new();
     let mut rpc = MonitorClient::new(socket_path);
 
     loop {
@@ -781,7 +793,6 @@ fn run_event_loop(
                     != 0
             {
                 let event_fd = take_fanotify_event_fd(meta.fd).expect("event fd");
-
                 if try_fast_path_allow(
                     fan_fd,
                     &meta,
@@ -790,6 +801,7 @@ fn run_event_loop(
                     sandbox_cgroup,
                     saw_pre_access_mark,
                     host_proc,
+                    &mut pid_cgroup_cache,
                 ) {
                     offset += event_len;
                     continue;
@@ -815,7 +827,13 @@ fn run_event_loop(
                     mask_to_access(host_proc, meta.mask, &event_fd, meta.pid),
                 );
 
-                tracing::info!(%path, ?access, pid = meta.pid, "filesystem check");
+                if static_allow.allows(Path::new(&path), access) {
+                    respond(fan_fd, &event_fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
+
+                tracing::debug!(%path, ?access, pid = meta.pid, "filesystem check");
                 let mut event_ctx = ctx.clone();
                 event_ctx.pid = u32::try_from(meta.pid).ok();
 
@@ -923,11 +941,16 @@ fn main() {
     let ctx = wire_context(
         cli.cwd,
         cli.home.clone(),
-        cli.project_root,
+        cli.project_root.clone(),
         ProcessIds::default(),
         std::env::var("AGENT_SANDBOX_SESSION_ID").ok(),
     );
 
+    // Load the exported policy snapshot before joining the sandbox mount
+    // namespace: the file lives on the host filesystem, and reading it after
+    // mark_mountpoints would raise a permission event to our own fanotify
+    // group before the event loop exists to answer it.
+    let static_allow = StaticPolicyAllow::load(&cli.static_policy, cli.project_root.clone());
     // setns into the target mount namespace before marking its mounts.
     join_target_mount_namespace(cli.pid);
 
@@ -984,11 +1007,21 @@ fn main() {
         &host_proc,
         &ctx,
         socket_path,
+        &static_allow,
     );
 }
 
 /// Fast-path allow checks that do not need a policyd RPC.
 /// Returns `true` when the event was already handled.
+///
+/// `pid_cgroup_cache` remembers pids already proven to belong to the sandbox
+/// cgroup. Every fanotify event otherwise costs two procfs reads (status for
+/// the thread-group id, cgroup for membership). Both are immutable for the
+/// lifetime of a process, and only sandbox-namespace processes can generate
+/// events on the marked mounts, so only membership is cached: a reused pid
+/// can only ever belong to another sandbox process, and a hypothetical host
+/// process hitting a stale entry is still policy-mediated rather than
+/// auto-allowed.
 fn try_fast_path_allow(
     fan_fd: &OwnedFd,
     meta: &FanotifyEventMetadata,
@@ -997,22 +1030,29 @@ fn try_fast_path_allow(
     sandbox_cgroup: &SandboxCgroup,
     saw_pre_access_mark: bool,
     host_proc: &HostProc,
+    pid_cgroup_cache: &mut HashSet<i32>,
 ) -> bool {
     if meta.pid == self_pid {
         respond(fan_fd, event_fd, FAN_ALLOW);
         return true;
     }
 
-    let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
-    match sandbox_cgroup.contains(host_proc, process_pid) {
-        Some(true) => {}
-        Some(false) => {
-            respond(fan_fd, event_fd, FAN_ALLOW);
-            return true;
-        }
-        None => {
-            respond(fan_fd, event_fd, FAN_DENY);
-            return true;
+    if pid_cgroup_cache.insert(meta.pid) {
+        // First observation of this pid: classify its cgroup membership.
+        let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
+
+        match sandbox_cgroup.contains(host_proc, process_pid) {
+            Some(true) => {}
+            Some(false) => {
+                pid_cgroup_cache.remove(&meta.pid);
+                respond(fan_fd, event_fd, FAN_ALLOW);
+                return true;
+            }
+            None => {
+                pid_cgroup_cache.remove(&meta.pid);
+                respond(fan_fd, event_fd, FAN_DENY);
+                return true;
+            }
         }
     }
 
