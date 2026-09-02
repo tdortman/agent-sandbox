@@ -1413,14 +1413,86 @@ mod dbus_tests {
     }
 }
 
+/// Default path of the merged policy JSON policyd exports at startup.
+pub const EXPORTED_POLICY_PATH: &str = "/var/lib/agent-sandbox/exported-policy.json";
+
+/// Static filesystem allow rules loaded from policyd's exported merged
+/// policy snapshot.
+///
+/// Enforcement components (fsmon, the syscall broker) answer events whose
+/// (path, access) matches one of these rules locally: policyd would reach
+/// the same verdict from its static policy layers, and the matching code is
+/// the same [`FilesystemRule::matches`] the store uses. Deny rules and every
+/// live verdict (session buckets, approvals, deny-inode cache) are never
+/// replayed locally: anything that does not match is forwarded to policyd, so
+/// runtime approvals keep working and no deny can be bypassed. The snapshot
+/// is loaded once; editing policy files mid-session is out of scope by
+/// design.
+pub struct StaticPolicyAllow {
+    rules: Vec<FilesystemRule>,
+    project_root: Option<PathBuf>,
+}
+
+impl StaticPolicyAllow {
+    /// Load the filesystem allow rules from a policyd policy export.
+    ///
+    /// Returns an empty evaluator when the file is missing or unparseable;
+    /// callers then round-trip every event through policyd.
+    #[must_use]
+    pub fn load(path: &Path, project_root: Option<PathBuf>) -> Self {
+        let rules = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<Policy>(&content).ok())
+            .map_or_else(
+                || {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "cannot load static policy export; all events will round-trip policyd"
+                    );
+
+                    Vec::new()
+                },
+                |policy| policy.filesystem.allow,
+            );
+
+        Self {
+            rules,
+            project_root,
+        }
+    }
+
+    /// Whether the static snapshot allows the given path and access mode.
+    #[must_use]
+    pub fn allows(&self, path: &Path, access: FileAccess) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.matches(path, access, self.project_root.as_deref()))
+    }
+
+    /// Whether the static snapshot allows every path/access pair.
+    #[must_use]
+    pub fn allows_all(&self, checks: &[(PathBuf, FileAccess)]) -> bool {
+        checks
+            .iter()
+            .all(|(path, access)| self.allows(path, *access))
+    }
+
+    /// Whether the snapshot holds no usable rules (load failed or empty
+    /// policy), so every event must round-trip policyd.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        DeviceAccess, FileAccess, FilesystemRule, ResourceAccess, ResourceKind, ResourceRule,
-        SocketAccess, SudoRule, contract_home_path, contract_project_path, expand_home_path,
-        filesystem_approval_paths, open_flags_to_file_access,
+        DeviceAccess, FileAccess, FilesystemRule, Policy, ResourceAccess, ResourceKind,
+        ResourceRule, SocketAccess, StaticPolicyAllow, SudoRule, contract_home_path,
+        contract_project_path, expand_home_path, filesystem_approval_paths,
+        open_flags_to_file_access,
     };
 
     #[test]
@@ -2042,5 +2114,56 @@ mod tests {
         assert!(rule.path_matches(Path::new("/run/user/1000/bus"), None));
         assert!(rule.path_matches(Path::new("/run/user/1000/bus/socket"), None));
         assert!(!rule.path_matches(Path::new("/run/user/1000/bus-other"), None));
+    }
+
+    #[test]
+    fn static_policy_allow_matches_allow_rules_only() {
+        let mut policy = Policy::default();
+
+        policy.filesystem.allow.push(FilesystemRule::new(
+            "/home/user/bench",
+            FileAccess::All,
+            "test",
+        ));
+        policy
+            .filesystem
+            .allow
+            .push(FilesystemRule::new("/readonly", FileAccess::Read, "test"));
+
+        let eval = StaticPolicyAllow {
+            rules: policy.filesystem.allow,
+            project_root: None,
+        };
+
+        assert!(eval.allows(Path::new("/home/user/bench/run/f0"), FileAccess::ReadWrite));
+        assert!(eval.allows(Path::new("/readonly"), FileAccess::Read));
+        assert!(
+            !eval.allows(Path::new("/readonly"), FileAccess::Write),
+            "access mode must match"
+        );
+        assert!(!eval.allows(Path::new("/denied"), FileAccess::Read));
+        assert!(
+            !eval.allows(Path::new("/home/user/benchmark"), FileAccess::Read),
+            "prefix must not match"
+        );
+        assert!(eval.allows_all(&[
+            (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
+            (PathBuf::from("/readonly"), FileAccess::Read),
+        ]));
+        assert!(!eval.allows_all(&[
+            (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
+            (PathBuf::from("/denied"), FileAccess::Read),
+        ]));
+    }
+
+    #[test]
+    fn static_policy_load_falls_back_to_empty_on_missing_file() {
+        let eval = StaticPolicyAllow::load(
+            Path::new("/nonexistent/agent-sandbox-exported-policy.json"),
+            None,
+        );
+
+        assert!(eval.is_empty());
+        assert!(!eval.allows(Path::new("/anything"), FileAccess::Read));
     }
 }
