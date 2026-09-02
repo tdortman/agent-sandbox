@@ -128,6 +128,7 @@ impl PolicyStore {
         if let Some(p) = &project_root {
             command.arg("--project-root").arg(p);
         }
+        command.arg("--static-policy").arg(&self.args.export_json);
 
         let static_allow_input = req.static_allow.clone();
         let home_for_expand = home.clone();

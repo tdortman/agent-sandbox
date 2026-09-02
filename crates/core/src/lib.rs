@@ -43,12 +43,12 @@ pub use merge_policy::{
 };
 pub use policy::{
     DbusBus, DbusFdMetadata, DbusMessageKind, DbusRule, DbusSection, DbusTarget, DeviceAccess,
-    DirectNetworkSection, FileAccess, FilesystemRule, FilesystemRuleKey, FilesystemSection,
-    HttpSection, InodeIdentity, NetworkRule, NetworkSection, Policy, ResourceAccess, ResourceKind,
-    ResourceRule, ResourceRuleKey, ResourceSection, SocketAccess, SudoRule, SudoSection,
-    contains_glob_syntax, contract_home_path, contract_project_path, expand_home_path,
-    expand_policy_path, filesystem_approval_paths, normalize_directory_traverse_access,
-    open_flags_to_file_access,
+    DirectNetworkSection, EXPORTED_POLICY_PATH, FileAccess, FilesystemRule, FilesystemRuleKey,
+    FilesystemSection, HttpSection, InodeIdentity, NetworkRule, NetworkSection, Policy,
+    ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, ResourceSection, SocketAccess,
+    StaticPolicyAllow, SudoRule, SudoSection, contains_glob_syntax, contract_home_path,
+    contract_project_path, expand_home_path, expand_policy_path, filesystem_approval_paths,
+    normalize_directory_traverse_access, open_flags_to_file_access,
 };
 pub use rpc::{
     AliasSplit, ApprovalScope, ApprovalTarget, AttributionToken, CheckReply, DbusCheckReply,
