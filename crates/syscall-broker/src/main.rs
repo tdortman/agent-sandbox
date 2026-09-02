@@ -14,7 +14,9 @@ use std::{
     time::Duration,
 };
 
-use agent_sandbox_core::{InodeIdentity, NetworkOwnership, ResourceKind};
+use agent_sandbox_core::{
+    EXPORTED_POLICY_PATH, InodeIdentity, NetworkOwnership, ResourceKind, StaticPolicyAllow,
+};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
     FilesystemMutation, FilesystemTarget, NetworkMode, PersistentPolicyClient, ResourceTarget,
@@ -123,6 +125,10 @@ async fn main() -> std::io::Result<()> {
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
     let mut policy_client = PersistentPolicyClient::new_trusted(cli.policy_socket.clone());
+    let project_root = std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
+        .ok()
+        .map(PathBuf::from);
+    let static_allow = StaticPolicyAllow::load(Path::new(EXPORTED_POLICY_PATH), project_root);
 
     // Don't SIGCONT the child until the broker is inside its notification
     // loop and ready to receive. The child traps from the first openat onward
@@ -185,6 +191,7 @@ async fn main() -> std::io::Result<()> {
         dispatch::dispatch_notification_with_mode(
             &cli.policy_socket,
             &mut policy_client,
+            &static_allow,
             cli.sandbox_session_id.as_deref(),
             cli.listener_fd,
             &notif,

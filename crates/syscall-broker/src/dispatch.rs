@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
-use agent_sandbox_core::{NetworkOwnership, ResourceKind};
+use agent_sandbox_core::{NetworkOwnership, ResourceKind, StaticPolicyAllow};
 use agent_sandbox_syscall_broker::{
     PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget,
     notification_arch_valid, send_response,
@@ -33,10 +33,26 @@ pub struct NetworkPolicyBypass {
     pub ownership: NetworkOwnership,
     pub dns_endpoint: Option<SocketAddr>,
 }
+/// Whether a classified filesystem target is covered by the static policy
+/// snapshot exported by policyd, so its emulation can proceed without a
+/// policyd round trip. Live verdicts (denies, session buckets, approvals)
+/// still round-trip: anything the snapshot does not allow is decided by
+/// `decide`.
+fn static_policy_allows(facts: &NormalizedNotification, static_allow: &StaticPolicyAllow) -> bool {
+    let NormalizedNotification::Target {
+        target: SyscallTarget::Filesystem(target),
+    } = facts
+    else {
+        return false;
+    };
+
+    !static_allow.is_empty() && static_allow.allows_all(&target.checks)
+}
 
 pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
     client: &mut PersistentPolicyClient,
+    static_allow: &StaticPolicyAllow,
     sandbox_session_id: Option<&str>,
     listener_fd: i32,
     notif: &SeccompNotif,
@@ -95,6 +111,13 @@ pub async fn dispatch_notification_with_mode(
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // also delegates only its transparent service ports.
         ResponsePlan::Continue
+    } else if static_policy_allows(&facts, static_allow) {
+        match facts {
+            NormalizedNotification::Target {
+                target: SyscallTarget::Filesystem(target),
+            } => ResponsePlan::emulate_filesystem(target),
+            _ => unreachable!("static_policy_allows accepts only filesystem targets"),
+        }
     } else {
         decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
