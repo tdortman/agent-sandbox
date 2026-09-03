@@ -50,7 +50,6 @@ dependencies = [
  "tokio",
  "tracing",
  "zbus",
- "zvariant",
 ]
 
 [[package]]
@@ -129,8 +128,6 @@ name = "agent-sandbox-proxy"
 version = "0.52.1"
 dependencies = [
  "agent-sandbox-core",
- "async-trait",
- "base64 0.23.0",
  "bytes",
  "clap",
  "h3",

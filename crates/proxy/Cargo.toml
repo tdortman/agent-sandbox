@@ -11,8 +11,6 @@ path = "src/main.rs"
 [dependencies]
 agent-sandbox-core = { path = "../core" }
 
-async-trait.workspace = true
-base64.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
 h3.workspace = true

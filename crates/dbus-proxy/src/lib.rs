@@ -15,8 +15,8 @@ use zbus::{
     Connection, Guid, MessageStream,
     connection::Builder,
     message::{Builder as MessageBuilder, Message, Type},
+    zvariant::Fd,
 };
-use zvariant::Fd;
 
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
@@ -349,7 +349,7 @@ fn rewrite_message(
         .iter()
         .map(Fd::try_to_owned)
         .map(|fd| fd.map(Into::into))
-        .collect::<Result<Vec<zvariant::OwnedFd>, _>>()
+        .collect::<Result<Vec<zbus::zvariant::OwnedFd>, _>>()
         .map_err(|error| RelayError::Message(format!("duplicating D-Bus fd: {error}")))?;
 
     let builder = MessageBuilder::from(message.header())
@@ -369,8 +369,8 @@ fn rewrite_message(
 fn build_raw_body(
     builder: MessageBuilder<'_>,
     body: &[u8],
-    signature: &zvariant::Signature,
-    fds: Vec<zvariant::OwnedFd>,
+    signature: &zbus::zvariant::Signature,
+    fds: Vec<zbus::zvariant::OwnedFd>,
 ) -> Result<Message, zbus::Error> {
     // SAFETY: the bytes and signature originate from a validated zbus
     // message, and cloned FDs preserve the indices referenced by the body.

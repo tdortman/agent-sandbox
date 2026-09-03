@@ -9,7 +9,6 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-async-trait = "0.1.91"
 base64 = "0.23.0"
 bytes = "1.12.1"
 caps = "0.5.6"
@@ -43,7 +42,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4", "v7"] }
 which = "8.0.5"
-zvariant = "5.13"
 
 [workspace.dependencies.h3]
 git = "https://github.com/hyperium/h3.git"
