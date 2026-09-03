@@ -331,16 +331,6 @@ where
     Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
 }
 
-/// Read a NUL-terminated path pointer from `pid`'s address space using the
-/// default tracee read strategy ([`read_tracee_bytes`]). Returns `None` for
-/// a null pointer or non-UTF-8 path.
-///
-/// # Errors
-/// Returns an error when the tracee memory cannot be read.
-pub fn read_tracee_path_ptr(pid: u32, path_ptr: u64) -> io::Result<Option<PathBuf>> {
-    read_tracee_path_ptr_with(|addr, len| read_tracee_bytes(pid, addr, len), path_ptr)
-}
-
 /// Read the `SO_TYPE` of a socket fd. Returns `None` on any failure so
 /// callers fall through to a safe default.
 ///
