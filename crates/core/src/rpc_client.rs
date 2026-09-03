@@ -322,7 +322,7 @@ mod tests {
                 .await
                 .expect("request succeeds");
 
-            assert!(matches!(reply, RpcReply::Check(reply) if reply.allowed));
+            assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
         }
 
         server.await.expect("server task");
@@ -375,7 +375,7 @@ mod tests {
             .await
             .expect("next request reconnects");
 
-        assert!(matches!(reply, RpcReply::Check(reply) if reply.allowed));
+        assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
         server.await.expect("server task");
     }
 

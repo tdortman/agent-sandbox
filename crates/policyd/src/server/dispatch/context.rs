@@ -28,10 +28,14 @@ pub(super) fn resolve_request_context(
         );
     }
 
-    let mc = crate::wire::MergeContext::from(ctx);
+    let resolved = ResolvedRequestContext::new(
+        ctx.sandbox_paths(),
+        ctx.ids(),
+        ctx.sandbox_session_id.clone(),
+    );
 
     store.resolve_context_with_peer(
-        &mc,
+        &resolved,
         Some(TrustedPeer {
             pid: peer.pid,
             uid: peer.uid,

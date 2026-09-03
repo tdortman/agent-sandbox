@@ -19,7 +19,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use agent_sandbox_core::{HttpCheckReply, HttpUrl};
+use agent_sandbox_core::{FlowProtocol, HttpCheckReply, HttpUrl};
 use doh::{is_doh_request, rewrite_doh_response};
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
@@ -116,15 +116,6 @@ pub fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
         )));
     }
 
-    let origin = HttpUrl::parse(value)
-        .map_err(|error| BoxError::from(format!("invalid HTTP/1.0 upstream origin: {error}")))?;
-
-    if origin.path().is_none_or(|path| path.as_str() != "/") {
-        return Err(BoxError::from(format!(
-            "HTTP/1.0 upstream origin must not include a path: {value:?}"
-        )));
-    }
-
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(BoxError::from(format!(
             "HTTP/1.0 upstream origin must not include userinfo: {value:?}"
@@ -156,19 +147,6 @@ pub fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
         parsed.scheme(),
         authority_for_policy(host, port)
     ))
-}
-
-/// Canonicalise the configured upstream origins for HTTP/1.0 relays.
-///
-/// # Errors
-///
-/// Returns the first `BoxError` produced by [`canonical_http10_origin`].
-pub fn canonical_http10_origins(values: &[String]) -> Result<Vec<String>, BoxError> {
-    values
-        .iter()
-        .map(String::as_str)
-        .map(canonical_http10_origin)
-        .collect()
 }
 
 #[derive(Clone)]
@@ -457,7 +435,7 @@ fn build_listener_service(
             let destination_ip = destination.ip();
             let source = peer;
             info!(%peer, %source, %destination, "accepted transparent proxy stream");
-            let flow = flow_key(source, destination)?;
+            let flow = flow_key(FlowProtocol::Tcp, source, destination)?;
             let claim = policy.claim(flow).await?;
 
             let state = {
@@ -692,7 +670,7 @@ async fn proxy_request(
     let (semantic_request, check, authority, path) =
         check_http_policy(&request, &state, &shutdown).await?;
 
-    if !check.ok || !check.allowed {
+    if !check.ok || !check.verdict.allowed {
         info!(
             %authority, %path, method = %request.method().as_str(),
             ?websocket, version = ?request.version(),
@@ -1547,7 +1525,7 @@ mod tests {
             check_http_policy(&request, &state, &shutdown).await?;
 
         assert!(check.ok);
-        assert!(check.allowed);
+        assert!(check.verdict.allowed);
         assert_eq!(authority, "127.0.0.1:8080");
         assert_eq!(path, "/");
         assert_eq!(semantic.authority(), "127.0.0.1:8080");

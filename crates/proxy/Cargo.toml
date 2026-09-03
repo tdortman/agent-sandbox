@@ -33,6 +33,7 @@ rama-tls-rustls.workspace = true
 rcgen.workspace = true
 ring.workspace = true
 rustls = { workspace = true, features = ["ring", "std"] }
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = {
   workspace = true,

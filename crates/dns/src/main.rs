@@ -18,7 +18,6 @@ use agent_sandbox_core::{
     DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, EchRewrite, mappings_from_response,
     rewrite_ech_config,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
@@ -93,14 +92,6 @@ struct Args {
     #[arg(long, default_value_t = 5_000)]
     forward_timeout_ms: u64,
 
-    #[arg(long)]
-    verbose: bool,
-
-    /// Base64-encoded `ECHConfigList` used to rewrite unsigned HTTPS/SVCB
-    /// answers.
-    #[arg(long, env = "AGENT_SANDBOX_ECH_CONFIG_LIST")]
-    ech_config_list: Option<String>,
-
     #[arg(long, env = "AGENT_SANDBOX_ECH_CONFIG_PATH")]
     ech_config_path: Option<PathBuf>,
 
@@ -118,13 +109,11 @@ const TCP_MAX_REQUESTS: usize = 128;
 struct DnsForwarder {
     cache: Arc<std::sync::Mutex<DnsCache>>,
     max_ttl: u32,
-    verbose: bool,
     suppress_https_svcb: bool,
     push_socket: Arc<UnixDatagram>,
     push_socket_path: PathBuf,
     cache_client_ip: Option<IpAddr>,
     ech_config_path: Option<PathBuf>,
-    ech_config_list: Option<Vec<u8>>,
     forward_target: SocketAddr,
     forward_timeout: Duration,
     admission: Arc<Semaphore>,
@@ -144,16 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let ech_config_list = args
-        .ech_config_list
-        .as_deref()
-        .map(|encoded| {
-            STANDARD
-                .decode(encoded)
-                .map_err(|error| format!("invalid ECH config list: {error}"))
-        })
-        .transpose()?;
-
     let mut dns_cache = DnsCache::new(Some(&args.cache_path), args.max_ttl);
     dns_cache.reload();
     let cache = Arc::new(std::sync::Mutex::new(dns_cache));
@@ -168,13 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let forwarder = DnsForwarder {
         cache,
         max_ttl: args.max_ttl,
-        verbose: args.verbose,
         suppress_https_svcb: args.suppress_https_svcb,
         push_socket: push_socket.clone(),
         push_socket_path: args.push_socket.clone(),
         cache_client_ip: args.cache_client_ip,
         ech_config_path: args.ech_config_path,
-        ech_config_list,
         forward_target: args.forward_target,
         forward_timeout: Duration::from_millis(args.forward_timeout_ms),
         admission: Arc::new(Semaphore::new(MAX_ADMITTED_WORK)),
@@ -250,9 +227,7 @@ impl DnsForwarder {
         let resp = match self.forward_udp(&data).await {
             Ok(resp) => resp,
             Err(err) => {
-                if self.verbose {
-                    warn!(error = %err, "dns upstream udp forward failed");
-                }
+                warn!(error = %err, "dns upstream udp forward failed");
                 match servfail_response(&data) {
                     Some(resp) => resp,
                     None => return Ok(()),
@@ -263,9 +238,7 @@ impl DnsForwarder {
         let resp = match self.sanitize_response(resp) {
             Ok(resp) => resp,
             Err(err) => {
-                if self.verbose {
-                    warn!(error = %err, "dns response sanitization failed");
-                }
+                warn!(error = %err, "dns response sanitization failed");
                 match servfail_response(&data) {
                     Some(resp) => resp,
                     None => return Ok(()),
@@ -299,9 +272,7 @@ impl DnsForwarder {
             let resp = match self.forward_tcp(&data).await {
                 Ok(resp) => resp,
                 Err(err) => {
-                    if self.verbose {
-                        warn!(error = %err, "dns upstream tcp forward failed");
-                    }
+                    warn!(error = %err, "dns upstream tcp forward failed");
                     match servfail_response(&data) {
                         Some(resp) => resp,
                         None => continue,
@@ -312,9 +283,7 @@ impl DnsForwarder {
             let resp = match self.sanitize_response(resp) {
                 Ok(resp) => resp,
                 Err(err) => {
-                    if self.verbose {
-                        warn!(error = %err, "dns response sanitization failed");
-                    }
+                    warn!(error = %err, "dns response sanitization failed");
                     match servfail_response(&data) {
                         Some(resp) => resp,
                         None => continue,
@@ -394,15 +363,10 @@ impl DnsForwarder {
     }
 
     fn sanitize_response(&self, response: Vec<u8>) -> std::io::Result<Vec<u8>> {
-        let file_config = match &self.ech_config_path {
-            Some(path) => Some(std::fs::read(path)?),
-            None => None,
-        };
+        let response = if let Some(path) = &self.ech_config_path {
+            let replacement = std::fs::read(path)?;
 
-        let replacement = self.ech_config_list.as_deref().or(file_config.as_deref());
-
-        let response = if let Some(replacement) = replacement {
-            match rewrite_ech_config(&response, replacement) {
+            match rewrite_ech_config(&response, &replacement) {
                 Ok(EchRewrite::Rewritten(response)) => response,
                 Ok(EchRewrite::Unchanged) => response,
                 Ok(EchRewrite::DnssecProtected) => {
@@ -524,16 +488,14 @@ impl DnsForwarder {
             }
         }
 
-        if self.verbose {
-            let addrs = mappings
-                .iter()
-                .map(|m| m.ip.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+        let addrs = mappings
+            .iter()
+            .map(|m| m.ip.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
 
-            if let Some(hostname) = mappings.first().map(|m| m.hostname.as_str()) {
-                info!(%hostname, addrs = %addrs, "resolved");
-            }
+        if let Some(hostname) = mappings.first().map(|m| m.hostname.as_str()) {
+            info!(%hostname, addrs = %addrs, "resolved");
         }
     }
 }
@@ -567,12 +529,10 @@ mod tests {
                 DEFAULT_MAX_TTL,
             ))),
             max_ttl: DEFAULT_MAX_TTL,
-            verbose: false,
             suppress_https_svcb: false,
             push_socket: Arc::new(UnixDatagram::unbound().expect("unbound push socket")),
             ech_config_path: None,
             push_socket_path: PathBuf::from("/nonexistent/dns-push.sock"),
-            ech_config_list: None,
             cache_client_ip: None,
             forward_target,
             forward_timeout: Duration::from_secs(2),
@@ -688,7 +648,10 @@ mod tests {
         ));
 
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
-        forwarder.ech_config_list = Some(vec![4, 5, 6]);
+        let ech_path =
+            std::env::temp_dir().join(format!("agent-sandbox-test-ech-{}.bin", std::process::id()));
+        std::fs::write(&ech_path, [4, 5, 6])?;
+        forwarder.ech_config_path = Some(ech_path);
         forwarder.suppress_https_svcb = true;
         let filtered = Message::from_vec(&forwarder.sanitize_response(message.to_vec()?)?)?;
 

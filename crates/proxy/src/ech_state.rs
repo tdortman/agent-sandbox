@@ -1,14 +1,11 @@
 //! Persistent ECH key material and DNS configuration for the transparent proxy.
 
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::Arc,
 };
 
 use ring::rand::SecureRandom as _;
@@ -23,23 +20,11 @@ const CONFIG_FILE: &str = "ech-config-list";
 const PRIVATE_KEY_FILE: &str = "ech-private-key";
 const PUBLIC_NAME: &[u8] = b"proxy.agent-sandbox.invalid";
 const CIPHER_SUITES: &[(u16, u16)] = &[(0x0001, 0x0002), (0x0001, 0x0001)];
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// ECH state loaded by the proxy for client-facing TLS and DNS rewriting.
-///
-/// The private key is persisted separately from the public `ECHConfigList`;
-/// the configuration is regenerated from the key whenever the proxy starts.
-pub struct EchState {
-    /// The RFC 9849 `ECHConfigList` advertised to clients.
-    pub config_list: Vec<u8>,
-    /// The matching X25519 private key.
-    pub private_key: [u8; 32],
-}
 
 /// One downstream ECH value: the client-facing configuration and the
 /// matching private key.
 ///
-/// Built once from the persisted [`EchState`] and shared by the TCP and
+/// Built once from the persisted key material and shared by the TCP and
 /// HTTP/3 legs, so both terminate ECH with identical key material.
 #[derive(Clone)]
 pub struct DownstreamEch {
@@ -47,15 +32,6 @@ pub struct DownstreamEch {
     pub config_list: Arc<Vec<u8>>,
     /// The matching X25519 private key.
     pub private_key: [u8; 32],
-}
-
-impl From<EchState> for DownstreamEch {
-    fn from(state: EchState) -> Self {
-        Self {
-            config_list: Arc::new(state.config_list),
-            private_key: state.private_key,
-        }
-    }
 }
 
 impl DownstreamEch {
@@ -89,7 +65,7 @@ impl DownstreamEch {
 ///
 /// Returns an I/O error when the state directory or either state file cannot be
 /// created, read, or updated, or when persisted key material is invalid.
-pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
+pub fn load_or_generate(state_dir: &Path) -> io::Result<DownstreamEch> {
     fs::create_dir_all(state_dir)?;
     let config_path = state_dir.join(CONFIG_FILE);
     let private_key_path = state_dir.join(PRIVATE_KEY_FILE);
@@ -110,8 +86,8 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
         let config_list = encode_config_list(&public_key);
         atomic_write(&config_path, &config_list)?;
 
-        return Ok(EchState {
-            config_list,
+        return Ok(DownstreamEch {
+            config_list: Arc::new(config_list),
             private_key,
         });
     }
@@ -131,8 +107,8 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<EchState> {
     let config_list = encode_config_list(&public_key);
     atomic_write(&config_path, &config_list)?;
 
-    Ok(EchState {
-        config_list,
+    Ok(DownstreamEch {
+        config_list: Arc::new(config_list),
         private_key,
     })
 }
@@ -149,40 +125,33 @@ fn generate_x25519_private_key() -> io::Result<X25519PrivateKey> {
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let temporary_path = unique_temporary_path(path);
-
-    let result = write_temporary_file(&temporary_path, contents, 0o644)
-        .and_then(|()| fs::rename(&temporary_path, path));
-
-    let _ = fs::remove_file(temporary_path);
-    result
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "ECH state path has no parent")
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn create_if_missing(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-    let temporary_path = unique_temporary_path(path);
-
-    let result = write_temporary_file(&temporary_path, contents, mode)
-        .and_then(|()| fs::hard_link(&temporary_path, path));
-
-    let _ = fs::remove_file(temporary_path);
-    result
-}
-
-fn write_temporary_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)?;
-
-    file.write_all(contents)?;
-    file.sync_all()
-}
-
-fn unique_temporary_path(path: &Path) -> PathBuf {
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let suffix = format!("tmp.{}.{}", std::process::id(), counter);
-    path.with_extension(suffix)
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "ECH state path has no parent")
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Encode the proxy's ECH configuration in RFC 9849 wire format.
@@ -259,7 +228,7 @@ mod tests {
         let second = load_or_generate(&directory).expect("load ECH state");
         assert_eq!(first.config_list, second.config_list);
         assert_eq!(first.private_key, second.private_key);
-        let downstream = DownstreamEch::from(first);
+        let downstream = first;
         let keys = downstream.ech_keys().expect("valid ECH config");
         assert!(!keys.is_empty());
 
@@ -289,7 +258,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
 
-        let handles: [std::thread::JoinHandle<io::Result<EchState>>; 8] =
+        let handles: [std::thread::JoinHandle<io::Result<DownstreamEch>>; 8] =
             std::array::from_fn(|_| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 let directory = directory.clone();

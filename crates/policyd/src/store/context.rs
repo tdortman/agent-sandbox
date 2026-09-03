@@ -13,7 +13,6 @@ use super::types::PolicyStore;
 use crate::{
     error::PolicydError,
     store::types::{SandboxSessionRegistration, TrustedPeer},
-    wire::MergeContext,
 };
 
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
@@ -163,16 +162,16 @@ impl PolicyStore {
         Ok(())
     }
 
-    /// Resolve an incoming RPC [`MergeContext`] into a fully attributed
-    /// [`ResolvedRequestContext`]. For a caller that has not been sanitized
-    /// upstream this is the policy entry point: when a `peer` is present the
-    /// context is re-resolved from the verified `peer` (see
-    /// [`Self::resolve_from_peer`]); without a peer the incoming paths are
-    /// treated as trusted and only missing fields are enriched from the wire
-    /// ids and session id.
+    /// Resolve an incoming RPC [`ResolvedRequestContext`] into a fully
+    /// attributed [`ResolvedRequestContext`]. For a caller that has not
+    /// been sanitized upstream this is the policy entry point: when a
+    /// `peer` is present the context is re-resolved from the verified
+    /// `peer` (see [`Self::resolve_from_peer`]); without a peer the
+    /// incoming paths are treated as trusted and only missing fields are
+    /// enriched from the wire ids and session id.
     pub fn resolve_context_with_peer(
         &self,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
         peer: Option<TrustedPeer>,
     ) -> ResolvedRequestContext {
         let Some(peer) = peer else {
@@ -188,7 +187,7 @@ impl PolicyStore {
 
     pub(crate) fn resolve_dbus_proxy_context(
         &self,
-        ctx: &MergeContext,
+        ctx: &ResolvedRequestContext,
         peer: TrustedPeer,
     ) -> ResolvedRequestContext {
         let pid = ctx
@@ -311,7 +310,11 @@ impl PolicyStore {
         (cwd, project_root)
     }
 
-    fn resolve_from_peer(&self, ctx: &MergeContext, peer: TrustedPeer) -> ResolvedRequestContext {
+    fn resolve_from_peer(
+        &self,
+        ctx: &ResolvedRequestContext,
+        peer: TrustedPeer,
+    ) -> ResolvedRequestContext {
         // Host-side helpers (fsmon, syscall-broker) connect to the sandbox
         // socket as root. Their wire ctx was populated at spawn time (or carries
         // the tracee pid); peer-based home/cwd would be wrong and breaks UI spawn.
@@ -797,7 +800,7 @@ mod tests {
         let uid = nix::unistd::getuid().as_raw();
         let real_home = home_from_uid(Some(uid)).map(PathBuf::from);
 
-        let wire = MergeContext {
+        let wire = ResolvedRequestContext {
             paths: SandboxPaths::from_wire(
                 Some(PathBuf::from("/attacker/cwd")),
                 Some(PathBuf::from("/attacker/home")),
@@ -805,6 +808,7 @@ mod tests {
             ),
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,
+            package: None,
         };
 
         let resolved = store.resolve_context_with_peer(&wire, Some(TrustedPeer { pid: 0, uid }));
@@ -825,7 +829,7 @@ mod tests {
     fn root_helper_preserves_wire_paths_from_fsmon() {
         let store = test_store();
 
-        let wire = MergeContext {
+        let wire = ResolvedRequestContext {
             paths: SandboxPaths::from_wire(
                 Some(PathBuf::from("/home/user")),
                 Some(PathBuf::from("/home/user")),
@@ -833,6 +837,7 @@ mod tests {
             ),
             ids: ProcessIds::from_options(None, None),
             sandbox_session_id: Some("sandbox-session".into()),
+            package: None,
         };
 
         let resolved = store.resolve_context_with_peer(
@@ -876,10 +881,11 @@ mod tests {
             })
             .expect("parent pid");
 
-        let wire = MergeContext {
+        let wire = ResolvedRequestContext {
             paths: SandboxPaths::default(),
             ids: ProcessIds::from_options(Some(pid), Some(1000)),
             sandbox_session_id: None,
+            package: None,
         };
 
         let resolved = store.resolve_context_with_peer(
@@ -922,10 +928,11 @@ mod tests {
         // The wire pid is a jail-local tracee pid (unresolvable from the
         // host); the peer is the broker, an ancestor of the adopted root
         // that descends from the recorded launcher.
-        let wire = MergeContext {
+        let wire = ResolvedRequestContext {
             paths: SandboxPaths::default(),
             ids: ProcessIds::from_options(Some(2_147_483_647), None),
             sandbox_session_id: Some("broker-session".into()),
+            package: None,
         };
 
         let resolved = store.resolve_context_with_peer(
@@ -971,10 +978,11 @@ mod tests {
 
         // The wire tracee pid is the peer itself (a descendant of the peer,
         // but not of the adopted root).
-        let wire = MergeContext {
+        let wire = ResolvedRequestContext {
             paths: SandboxPaths::default(),
             ids: ProcessIds::from_options(Some(peer_pid), None),
             sandbox_session_id: Some("broker-tracee-session".into()),
+            package: None,
         };
 
         let resolved =
@@ -1040,10 +1048,11 @@ mod tests {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
 
-        let forged = MergeContext {
+        let forged = ResolvedRequestContext {
             paths: SandboxPaths::from_wire(Some(evil.clone()), Some(evil.clone()), Some(evil)),
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,
+            package: None,
         };
 
         let resolved = store.resolve_context_with_peer(&forged, Some(TrustedPeer { pid: 0, uid }));
@@ -1655,10 +1664,11 @@ mod tests {
         // Positive control: the owner peer (session root, matching uid)
         // gets the package layer.
         let legit = store.resolve_context_with_peer(
-            &MergeContext {
+            &ResolvedRequestContext {
                 paths: SandboxPaths::default(),
                 ids: ProcessIds::from_options(Some(owner_pid), Some(1000)),
                 sandbox_session_id: Some("s1".into()),
+                package: None,
             },
             Some(TrustedPeer {
                 pid: owner_pid,
@@ -1673,10 +1683,11 @@ mod tests {
         // not inside the session root's subtree. The wire session id alone
         // must not grant the package.
         let forged = store.resolve_context_with_peer(
-            &MergeContext {
+            &ResolvedRequestContext {
                 paths: SandboxPaths::default(),
                 ids: ProcessIds::from_options(Some(parent_pid), Some(2000)),
                 sandbox_session_id: Some("s1".into()),
+                package: None,
             },
             Some(TrustedPeer {
                 pid: parent_pid,
@@ -1694,10 +1705,11 @@ mod tests {
         // Forged: the owning uid, but the pid is not the session root or a
         // descendant of it.
         let wrong_pid = store.resolve_context_with_peer(
-            &MergeContext {
+            &ResolvedRequestContext {
                 paths: SandboxPaths::default(),
                 ids: ProcessIds::from_options(Some(parent_pid), Some(1000)),
                 sandbox_session_id: Some("s1".into()),
+                package: None,
             },
             Some(TrustedPeer {
                 pid: parent_pid,
@@ -1716,10 +1728,11 @@ mod tests {
         // by the launcher itself (a root ancestor outside the sandbox). The
         // launcher must not be able to claim the package either.
         let launcher_forged = store.resolve_context_with_peer(
-            &MergeContext {
+            &ResolvedRequestContext {
                 paths: SandboxPaths::default(),
                 ids: ProcessIds::from_options(Some(owner_pid), Some(1000)),
                 sandbox_session_id: Some("s1".into()),
+                package: None,
             },
             Some(TrustedPeer {
                 pid: parent_pid,

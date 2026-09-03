@@ -397,6 +397,22 @@ impl Http3Client {
         Self { endpoint }
     }
 
+    async fn connect_quic(
+        &self,
+        server: SocketAddr,
+        server_name: &str,
+    ) -> Result<quinn::Connection, String> {
+        let connecting = self
+            .endpoint
+            .connect(server, server_name)
+            .map_err(|error| error.to_string())?;
+
+        tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "QUIC handshake timed out".to_owned())?
+            .map_err(|error| format!("QUIC handshake failed: {error}"))
+    }
+
     /// Report whether a resumed connection accepts QUIC 0-RTT data.
     ///
     /// Returns `None` when the server does not issue a resumption ticket.
@@ -451,15 +467,7 @@ impl Http3Client {
         server_name: &str,
         path: &str,
     ) -> Result<(Vec<http::Response<()>>, Http3Response), String> {
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let connection = self.connect_quic(server, server_name).await?;
 
         let h3 = h3_quinn::Connection::new(connection);
 
@@ -522,15 +530,7 @@ impl Http3Client {
         expect_continue: bool,
         send_trailers: bool,
     ) -> Result<Http3Response, String> {
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let connection = self.connect_quic(server, server_name).await?;
 
         let h3 = h3_quinn::Connection::new(connection);
 
@@ -640,15 +640,7 @@ impl Http3Client {
         local_ip: IpAddr,
         release_gate: Option<&Path>,
     ) -> Result<Vec<u8>, String> {
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let quinn_connection = self.connect_quic(server, server_name).await?;
 
         let h3 = h3_quinn::Connection::new(quinn_connection.clone());
 
@@ -727,15 +719,7 @@ impl Http3Client {
         server_name: &str,
         path: &str,
     ) -> Result<Vec<u8>, String> {
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let quinn_connection = self.connect_quic(server, server_name).await?;
 
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
@@ -841,15 +825,7 @@ impl Http3Client {
         use h3::quic::{RecvStream as _, SendStream as _};
         use h3_datagram::datagram_handler::HandleDatagramsExt;
 
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let quinn_connection = self.connect_quic(server, server_name).await?;
 
         let h3_quic = h3_quinn::Connection::new(quinn_connection.clone());
         let mut builder = h3::client::builder();
@@ -1013,15 +989,7 @@ impl Http3Client {
         malformed: bool,
         capsule_protocol: bool,
     ) -> Result<Vec<(u64, Vec<u8>)>, String> {
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let quinn_connection = self.connect_quic(server, server_name).await?;
 
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
@@ -1128,15 +1096,7 @@ impl Http3Client {
     ) -> Result<Vec<Vec<u8>>, String> {
         use h3_datagram::datagram_handler::HandleDatagramsExt;
 
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let quinn_connection = self.connect_quic(server, server_name).await?;
 
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
@@ -1239,15 +1199,7 @@ impl Http3Client {
     ) -> Result<Vec<u8>, String> {
         use h3_datagram::datagram_handler::HandleDatagramsExt;
 
-        let connecting = self
-            .endpoint
-            .connect(server, server_name)
-            .map_err(|error| error.to_string())?;
-
-        let quinn_connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-            .await
-            .map_err(|_| "QUIC handshake timed out".to_owned())?
-            .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        let quinn_connection = self.connect_quic(server, server_name).await?;
 
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();

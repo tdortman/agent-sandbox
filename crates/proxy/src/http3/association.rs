@@ -615,7 +615,7 @@ pub(super) async fn rebind_migrated_path(
         return Ok(());
     }
 
-    let flow = crate::policy::udp_flow_key(source, destination)?;
+    let flow = crate::policy::flow_key(agent_sandbox_core::FlowProtocol::Udp, source, destination)?;
 
     if let Err(error) = policy.rebind(claim, flow).await {
         connection.close(varint(Code::H3_INTERNAL_ERROR), b"QUIC path rebind failed");

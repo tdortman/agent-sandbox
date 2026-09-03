@@ -1,13 +1,16 @@
-use agent_sandbox_core::{ApprovalScope, DbusCheckReply, Verdict, VerdictSource};
+use agent_sandbox_core::{
+    ApprovalScope, DbusCheckReply, DbusTarget, ResolvedRequestContext, Verdict, VerdictSource,
+};
 
 use super::PolicyStore;
-use crate::wire::DbusCheckRequest;
-
 impl PolicyStore {
     /// Check a D-Bus target against declarative rules, then route unknown
     /// capabilities through the typed approval path.
-    pub async fn check_dbus(&self, req: DbusCheckRequest) -> DbusCheckReply {
-        let DbusCheckRequest { target, ctx } = req;
+    pub async fn check_dbus(
+        &self,
+        target: DbusTarget,
+        ctx: ResolvedRequestContext,
+    ) -> DbusCheckReply {
         let policy_verdict = self.dbus_verdict(&target, &ctx);
 
         if let Some(verdict) = policy_verdict.as_ref()

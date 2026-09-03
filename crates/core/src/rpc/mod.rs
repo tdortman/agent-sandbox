@@ -14,17 +14,15 @@ mod tests;
 
 pub use message::RpcMessage;
 pub use proxy::{
-    AttributionToken, FlowContext, FlowRegistration, HttpApprovalRequest, HttpCheckRequest,
-    NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, ProcessIdentity,
-    ProcessStartTimeTicks, ProxyConnectionId, ProxyRequestId, ProxySessionToken, SocketIdentity,
-    SocketInode,
+    AttributionToken, FlowContext, FlowRegistration, NetworkFlowKey, NetworkFlowSelector,
+    NormalizedPolicyHost, ProcessIdentity, ProcessStartTimeTicks, ProxyConnectionId,
+    ProxyRequestId, ProxySessionToken, SocketIdentity, SocketInode,
 };
 pub use push::{PendingSummary, UiPush};
 pub use reply::{
-    CheckReply, DbusCheckReply, DbusScopeActionReply, ElevateReply, ErrorReply,
-    FilesystemCheckReply, FilesystemMonitorReply, FilesystemScopeActionReply, FlowClaimReply,
-    HttpCheckReply, HttpScopeActionReply, NetworkFlowCheckReply, ProxyReply, ProxyReplyBody,
-    ProxySessionReply, RegisterUiReply, ResourceCheckReply, ResourceScopeActionReply, RpcReply,
+    CheckReply, DbusCheckReply, ElevateReply, ErrorReply, FilesystemCheckReply,
+    FilesystemMonitorReply, FlowClaimReply, HttpCheckReply, NetworkFlowCheckReply, ProxyReply,
+    ProxyReplyBody, ProxySessionReply, RegisterUiReply, ResourceCheckReply, RpcReply,
     ScopeActionReply, SimpleOkReply, StatusReply, Verdict, VerdictSource,
 };
 pub use request::{

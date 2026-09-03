@@ -1,7 +1,7 @@
 //! HTTP/3 scenarios: QUIC policy flow, WebTransport, CONNECT-UDP,
 //! streaming, migration, and upstream ECH discovery.
 
-use std::{collections::BTreeSet, sync::atomic::Ordering, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::atomic::Ordering, time::Duration};
 
 use bytes::Buf;
 use tokio::{
@@ -146,43 +146,25 @@ async fn wait_for_h3_condition(mut condition: impl FnMut() -> bool, timeout_seco
     panic!("HTTP/3 harness condition was not met in time");
 }
 
-/// Strip ANSI escape sequences from captured proxy output.
-///
-/// The proxy pins its own formatter to plain text, but log parsing must not
-/// depend on the colour configuration of whatever process spawned it.
-fn strip_ansi(input: &str) -> String {
-    let mut plain = String::with_capacity(input.len());
-    let mut chars = input.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' && chars.next() == Some('[') {
-            for ch in chars.by_ref() {
-                if ch.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            plain.push(ch);
-        }
-    }
-
-    plain
+/// Unwrap an HTTP/3 probe result, dumping the proxy and origin logs on failure.
+async fn expect_http3<T>(
+    harness: &TransparentHarness,
+    request: impl Future<Output = Result<T, String>>,
+) -> T {
+    request.await.unwrap_or_else(|error| {
+        panic!(
+            "{error}\nproxy log:\n{}\norigin log:\n{}",
+            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
+            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+        )
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_allow_records_policy_and_upstream() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
 
-    let response = match harness.http3_request("/allow?raw=query").await {
-        Ok(response) => response,
-        Err(error) => {
-            panic!(
-                "HTTP/3 request failed: {error}\nproxy log:\n{}\norigin log:\n{}",
-                std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
-                std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
-            );
-        }
-    };
+    let response = expect_http3(&harness, harness.http3_request("/allow?raw=query")).await;
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
@@ -232,16 +214,7 @@ async fn transparent_http3_allow_records_policy_and_upstream() {
 async fn transparent_http3_ech_offer_is_decrypted() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
 
-    let response = match harness.http3_ech_request("/allow").await {
-        Ok(response) => response,
-        Err(error) => {
-            panic!(
-                "HTTP/3 ECH request failed: {error}\nproxy log:\n{}\norigin log:\n{}",
-                std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
-                std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
-            );
-        }
-    };
+    let response = expect_http3(&harness, harness.http3_ech_request("/allow")).await;
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
@@ -396,17 +369,11 @@ async fn transparent_http3_retries_approved_session_without_rechecking_policy() 
 
     let client = Http3Client::new(&harness.ca_file());
 
-    let body = match client
-        .websocket_probe(harness.proxy_address, "localhost", "/allow")
-        .await
-    {
-        Ok(body) => body,
-        Err(error) => panic!(
-            "{error}\nproxy log:\n{}\norigin log:\n{}",
-            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
-            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
-        ),
-    };
+    let body = expect_http3(
+        &harness,
+        client.websocket_probe(harness.proxy_address, "localhost", "/allow"),
+    )
+    .await;
 
     assert_eq!(body, b"websocket-response\n");
     wait_for_release(&harness).await;
@@ -512,17 +479,11 @@ async fn transparent_http3_connect_udp_relays_datagrams() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
     let client = Http3Client::new(&harness.ca_file());
 
-    let body = match client
-        .connect_udp_probe(harness.proxy_address, "localhost", "/allow")
-        .await
-    {
-        Ok(body) => body,
-        Err(error) => panic!(
-            "{error}\nproxy log:\n{}\norigin log:\n{}",
-            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
-            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
-        ),
-    };
+    let body = expect_http3(
+        &harness,
+        client.connect_udp_probe(harness.proxy_address, "localhost", "/allow"),
+    )
+    .await;
 
     assert_eq!(body, b"connect-udp-probe");
     wait_for_release(&harness).await;
@@ -535,17 +496,11 @@ async fn transparent_http3_relays_connect_udp_capsules() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
     let client = Http3Client::new(&harness.ca_file());
 
-    let capsules = match client
-        .connect_udp_capsule_probe(harness.proxy_address, "localhost", "/allow")
-        .await
-    {
-        Ok(capsules) => capsules,
-        Err(error) => panic!(
-            "{error}\nproxy log:\n{}\norigin log:\n{}",
-            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
-            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
-        ),
-    };
+    let capsules = expect_http3(
+        &harness,
+        client.connect_udp_capsule_probe(harness.proxy_address, "localhost", "/allow"),
+    )
+    .await;
 
     assert_eq!(capsules, vec![
         (0, b"\0capsule-probe".to_vec()),
@@ -660,17 +615,16 @@ async fn transparent_http3_routes_concurrent_connect_udp_streams() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
     let client = Http3Client::new(&harness.ca_file());
 
-    let bodies = match client
-        .connect_udp_two_streams_probe(harness.proxy_address, "localhost", "/allow", "/allow-again")
-        .await
-    {
-        Ok(bodies) => bodies,
-        Err(error) => panic!(
-            "{error}\nproxy log:\n{}\norigin log:\n{}",
-            std::fs::read_to_string(&harness.proxy_log).unwrap_or_default(),
-            std::fs::read_to_string(harness.h3_origin().log_path()).unwrap_or_default()
+    let bodies = expect_http3(
+        &harness,
+        client.connect_udp_two_streams_probe(
+            harness.proxy_address,
+            "localhost",
+            "/allow",
+            "/allow-again",
         ),
-    };
+    )
+    .await;
 
     assert_eq!(bodies, [b"route-0".to_vec(), b"route-1".to_vec()]);
     wait_for_release(&harness).await;
@@ -839,7 +793,7 @@ async fn transparent_http3_tracks_authenticated_connection_ids() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
     wait_for_release(&harness).await;
-    let log = strip_ansi(&std::fs::read_to_string(&harness.proxy_log).unwrap_or_default());
+    let log = std::fs::read_to_string(&harness.proxy_log).unwrap_or_default();
 
     let bound: Vec<&str> = log
         .lines()
@@ -953,7 +907,7 @@ async fn transparent_http3_downstream_alpn_mismatch_fails_closed() {
 async fn transparent_http3_ordinary_tls_fallback_when_no_ech() {
     // The injected DNS serves no HTTPS record for the origin, so the proxy
     // uses ordinary TLS and the identity checks still pass.
-    let dns = start_empty_dns().await;
+    let dns = start_dns(empty_dns_answer()).await;
 
     let harness = TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
 
@@ -984,7 +938,7 @@ async fn transparent_http3_upstream_ech_fails_closed() {
 
     assert!(init.success());
     let config = std::fs::read(state.join("ech-config-list")).expect("ECH configuration");
-    let dns = start_ech_dns(config).await;
+    let dns = start_dns(https_answer_with_ech(&config)).await;
     let harness = TransparentHarness::start_http3_with_ech_dns(loopback(IpVersion::V4), dns).await;
     let result = harness.http3_request("/allow").await;
 
@@ -997,17 +951,15 @@ async fn transparent_http3_upstream_ech_fails_closed() {
     assert_eq!(harness.h3_origin().attempts(), 0);
 }
 
-/// Serve an empty NOERROR answer for every query, so the proxy's upstream
-/// ECH discovery concludes the origin does not advertise ECH.
-async fn start_empty_dns() -> std::net::SocketAddr {
+/// Serve one canned `packet` for every query.
+async fn start_dns(packet: Vec<u8>) -> std::net::SocketAddr {
     let socket = UdpSocket::bind((loopback(IpVersion::V4), 0))
         .await
-        .expect("bind empty DNS server");
+        .expect("bind DNS server");
 
-    let address = socket.local_addr().expect("empty DNS address");
+    let address = socket.local_addr().expect("DNS address");
 
     tokio::spawn(async move {
-        let packet = empty_dns_answer();
         let mut buffer = [0_u8; 2_048];
 
         loop {
@@ -1034,32 +986,6 @@ fn empty_dns_answer() -> Vec<u8> {
     message.metadata.recursion_desired = true;
     message.add_query(Query::query(name, RecordType::HTTPS));
     message.to_vec().expect("encode DNS answer")
-}
-
-/// Serve one canned HTTPS answer with the given ECH configuration for every
-/// query, so the proxy's upstream ECH discovery finds it.
-async fn start_ech_dns(config: Vec<u8>) -> std::net::SocketAddr {
-    let socket = UdpSocket::bind((loopback(IpVersion::V4), 0))
-        .await
-        .expect("bind ECH DNS server");
-
-    let address = socket.local_addr().expect("ECH DNS address");
-
-    tokio::spawn(async move {
-        let packet = https_answer_with_ech(&config);
-        let mut buffer = [0_u8; 2_048];
-
-        loop {
-            let Ok((size, peer)) = socket.recv_from(&mut buffer).await else {
-                break;
-            };
-
-            let _ = socket.send_to(&packet, peer).await;
-            let _ = size;
-        }
-    });
-
-    address
 }
 
 fn https_answer_with_ech(config: &[u8]) -> Vec<u8> {

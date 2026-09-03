@@ -4,7 +4,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest};
+use agent_sandbox_core::{AttributionToken, HttpCheckReply, HttpRequest, Verdict};
 use bytes::{Buf, Bytes};
 use h3::{
     ConnectionState,
@@ -374,7 +374,7 @@ pub(super) async fn authorize_request(
 
         let HttpCheckReply {
             ok: true,
-            allowed: true,
+            verdict: Verdict { allowed: true, .. },
             request: Some(normalized),
             ..
         } = check
@@ -440,9 +440,9 @@ pub(super) fn semantic_request(
     for header in headers
         .as_slice()
         .iter()
-        .filter(|header| header.name() == "host")
+        .filter(|header| header.0.as_str() == "host")
     {
-        let host = std::str::from_utf8(header.value())
+        let host = std::str::from_utf8(header.1.as_bytes())
             .map_err(|_| boxed("HTTP/3 Host header is not valid UTF-8"))?;
 
         reconcile_authorities(&[&authority, host], fallback_port)
@@ -466,13 +466,13 @@ fn has_capsule_protocol(semantic: &SemanticRequest) -> bool {
         .headers()
         .as_slice()
         .iter()
-        .filter(|header| header.name() == "capsule-protocol");
+        .filter(|header| header.0.as_str() == "capsule-protocol");
 
     let Some(header) = values.next() else {
         return false;
     };
 
-    header.value() == b"?1" && values.next().is_none()
+    header.1.as_bytes() == b"?1" && values.next().is_none()
 }
 
 fn require_capsule_protocol(enabled: bool) -> Result<(), BoxError> {
@@ -533,8 +533,8 @@ async fn relay_request(
 
     let expects_continue = protocol.is_none()
         && semantic.headers().as_slice().iter().any(|header| {
-            header.name().eq_ignore_ascii_case("expect")
-                && header.value().eq_ignore_ascii_case(b"100-continue")
+            header.0.as_str().eq_ignore_ascii_case("expect")
+                && header.1.as_bytes().eq_ignore_ascii_case(b"100-continue")
         });
 
     let (continue_tx, continue_rx) = oneshot::channel();
@@ -877,7 +877,7 @@ pub(super) fn build_upstream_request(
         request.extensions_mut().insert(protocol.extension());
     }
 
-    *request.headers_mut() = upstream_headers(semantic.headers())?;
+    *request.headers_mut() = upstream_headers(semantic.headers());
     Ok(request)
 }
 
@@ -1152,21 +1152,15 @@ async fn relay_response(
     relay_result
 }
 
-fn upstream_headers(headers: &SemanticHeaders) -> Result<http::HeaderMap, BoxError> {
+fn upstream_headers(headers: &SemanticHeaders) -> http::HeaderMap {
     let mut map = http::HeaderMap::new();
 
-    for header in headers.as_slice() {
-        let name = http::header::HeaderName::from_bytes(header.name().as_bytes())
-            .map_err(|error| BoxError::from(format!("invalid upstream header name: {error}")))?;
-
-        let value = http::header::HeaderValue::from_bytes(header.value())
-            .map_err(|error| BoxError::from(format!("invalid upstream header value: {error}")))?;
-
-        map.append(name, value);
+    for (name, value) in headers.as_slice() {
+        map.append(name.clone(), value.clone());
     }
 
     map.remove("host");
-    Ok(map)
+    map
 }
 
 const fn is_session_refusal(error: &StreamError) -> bool {
@@ -1392,7 +1386,7 @@ mod tests {
             .body(())?;
 
         let semantic = semantic_request(&request, None, 8443)?;
-        let headers = upstream_headers(semantic.headers())?;
+        let headers = upstream_headers(semantic.headers());
         assert!(!headers.contains_key("host"));
         assert_eq!(headers.get("x-custom").expect("custom header"), "value");
         Ok(())

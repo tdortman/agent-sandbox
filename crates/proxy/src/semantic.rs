@@ -8,7 +8,7 @@ use agent_sandbox_core::{
     HttpAuthority, HttpMethod, HttpParseError, HttpRequest as CoreHttpRequest, HttpScheme,
     HttpSessionMetadata as CoreHttpSessionMetadata,
 };
-use http::HeaderMap;
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 /// Whether a header must not be forwarded end to end.
 ///
@@ -35,8 +35,10 @@ pub fn is_hop_by_hop_header(name: &str, connection_tokens: &[String]) -> bool {
 /// fields and connection-header tokens.
 ///
 /// # Errors
-/// Returns [`HeaderError`] for an invalid field name or value.
-pub fn semantic_request_headers(headers: &HeaderMap) -> Result<SemanticHeaders, HeaderError> {
+/// Returns an error for an invalid field name or value.
+pub fn semantic_request_headers(
+    headers: &HeaderMap,
+) -> Result<SemanticHeaders, Box<dyn std::error::Error + Send + Sync>> {
     let connection_tokens = headers
         .get_all("connection")
         .iter()
@@ -90,53 +92,9 @@ impl fmt::Display for HttpVersion {
     }
 }
 
-/// An end-to-end HTTP header with a validated name and value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticHeader {
-    name: Box<str>,
-    value: Box<[u8]>,
-}
-
-impl SemanticHeader {
-    /// Construct a header without removing hop-by-hop fields.
-    /// # Errors
-    /// Returns [`HeaderError`] for an invalid field name or value.
-    pub fn new<V>(name: &str, value: V) -> Result<Self, HeaderError>
-    where
-        V: AsRef<[u8]>,
-    {
-        let value = value.as_ref();
-
-        if name.is_empty() || !name.bytes().all(is_header_name_byte) {
-            return Err(HeaderError::InvalidName);
-        }
-
-        if value.iter().copied().any(is_invalid_header_value_byte) {
-            return Err(HeaderError::InvalidValue);
-        }
-
-        Ok(Self {
-            name: name.to_ascii_lowercase().into_boxed_str(),
-            value: value.into(),
-        })
-    }
-
-    /// The lowercase header name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The raw header value.
-    #[must_use]
-    pub fn value(&self) -> &[u8] {
-        &self.value
-    }
-}
-
-/// An ordered collection of validated end-to-end semantic headers.
+/// An ordered collection of validated end-to-end headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SemanticHeaders(Vec<SemanticHeader>);
+pub struct SemanticHeaders(Vec<(HeaderName, HeaderValue)>);
 
 impl SemanticHeaders {
     /// Create an empty header collection.
@@ -146,18 +104,24 @@ impl SemanticHeaders {
     }
 
     /// # Errors
-    /// Returns [`HeaderError`] for an invalid field name or value.
-    pub fn try_push<V>(&mut self, name: &str, value: V) -> Result<(), HeaderError>
+    /// Returns an error for an invalid field name or value.
+    pub fn try_push<V>(
+        &mut self,
+        name: &str,
+        value: V,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         V: AsRef<[u8]>,
     {
-        self.0.push(SemanticHeader::new(name, value)?);
+        let name = HeaderName::from_bytes(name.as_bytes())?;
+        let value = HeaderValue::from_bytes(value.as_ref())?;
+        self.0.push((name, value));
         Ok(())
     }
 
     /// The headers as a slice, in insertion order.
     #[must_use]
-    pub fn as_slice(&self) -> &[SemanticHeader] {
+    pub fn as_slice(&self) -> &[(HeaderName, HeaderValue)] {
         &self.0
     }
 }
@@ -593,18 +557,6 @@ impl Default for ResponseSequence {
     }
 }
 
-/// Header validation failure for a semantic header value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum HeaderError {
-    /// The header name is empty or contains an invalid character.
-    #[error("invalid header name")]
-    InvalidName,
-
-    /// The header value contains an invalid byte.
-    #[error("invalid header value")]
-    InvalidValue,
-}
-
 /// Validation failure for a semantic value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ValueError {
@@ -677,18 +629,6 @@ fn canonical_authority(scheme: HttpScheme, authority: &HttpAuthority) -> String 
     } else {
         format!("{host}:{}", authority.port_number())
     }
-}
-
-const fn is_header_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
-        )
-}
-
-const fn is_invalid_header_value_byte(byte: u8) -> bool {
-    (byte < 0x20 && byte != b'\t') || byte == 0x7F
 }
 
 #[cfg(test)]
@@ -769,7 +709,8 @@ mod tests {
 
     #[test]
     fn invalid_values_are_rejected() {
-        assert!(SemanticHeader::new("bad name", "value").is_err());
+        let mut headers = SemanticHeaders::new();
+        assert!(headers.try_push("bad name", "value").is_err());
         assert!(RawQuery::parse("x=1#fragment").is_err());
 
         assert!(
@@ -786,7 +727,7 @@ mod tests {
             .is_err()
         );
 
-        assert!(SemanticHeader::new("x-opaque", [0x80, b'a']).is_ok());
+        assert!(headers.try_push("x-opaque", [0x80, b'a']).is_ok());
     }
 
     #[test]

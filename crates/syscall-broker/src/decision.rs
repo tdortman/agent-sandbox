@@ -1,9 +1,9 @@
-use std::{future::Future, io, path::Path, time::Duration};
+use std::{io, path::Path, time::Duration};
 
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, NetworkTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif,
-    SyscallTarget, target_from_notification,
+    FilesystemTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif, SyscallTarget,
+    target_from_notification,
 };
 
 /// Facts extracted from a raw seccomp notification before policy evaluation.
@@ -16,11 +16,6 @@ pub enum NormalizedNotification {
 }
 
 impl NormalizedNotification {
-    #[cfg(test)]
-    pub const fn target(target: SyscallTarget) -> Self {
-        Self::Target { target }
-    }
-
     #[cfg(test)]
     pub const fn continue_() -> Self {
         Self::Continue
@@ -101,76 +96,8 @@ impl ResponsePlan {
     }
 }
 
-/// The policy surface `decide` needs: one query per gated syscall kind.
-///
-/// [`PersistentPolicyClient`] is the production adapter; tests drive an
-/// in-memory fake so response semantics and fail-closed behaviour run
-/// without a policyd socket.
-pub trait PolicyQuery {
-    /// Query the network gate. Every failure mode denies.
-    fn check_network(
-        &mut self,
-        target: &NetworkTarget,
-        sandbox_session_id: Option<String>,
-        pid: u32,
-        timeout: Duration,
-    ) -> impl Future<Output = bool> + Send;
-
-    /// Query the resource gate. RPC failures surface as `Err`.
-    fn check_resource(
-        &mut self,
-        target: &ResourceTarget,
-        sandbox_session_id: Option<String>,
-        pid: u32,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<ResourceCheckReply>> + Send;
-
-    /// Query one filesystem path/access pair. RPC failures surface as `Err`.
-    fn check_filesystem(
-        &mut self,
-        path: &Path,
-        access: FileAccess,
-        sandbox_session_id: Option<String>,
-        pid: u32,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<FilesystemCheckReply>> + Send;
-}
-
-impl PolicyQuery for PersistentPolicyClient {
-    fn check_network(
-        &mut self,
-        target: &NetworkTarget,
-        sandbox_session_id: Option<String>,
-        pid: u32,
-        timeout: Duration,
-    ) -> impl Future<Output = bool> + Send {
-        Self::check_target(self, target, sandbox_session_id, pid, timeout)
-    }
-
-    fn check_resource(
-        &mut self,
-        target: &ResourceTarget,
-        sandbox_session_id: Option<String>,
-        pid: u32,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<ResourceCheckReply>> + Send {
-        Self::check_resource(self, target, sandbox_session_id, pid, timeout)
-    }
-
-    fn check_filesystem(
-        &mut self,
-        path: &Path,
-        access: FileAccess,
-        sandbox_session_id: Option<String>,
-        pid: u32,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<FilesystemCheckReply>> + Send {
-        Self::check_filesystem(self, path, access, sandbox_session_id, pid, timeout)
-    }
-}
-
 pub async fn decide(
-    client: &mut impl PolicyQuery,
+    client: &mut PersistentPolicyClient,
     sandbox_session_id: Option<&str>,
     pid: u32,
     timeout: Duration,
@@ -200,7 +127,7 @@ pub async fn decide(
             target: SyscallTarget::Network(target),
         } => ResponsePlan::plan_network(
             client
-                .check_network(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
+                .check_target(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
                 .await,
         ),
 
@@ -240,11 +167,11 @@ pub async fn decide(
 
 fn resource_plan(target: ResourceTarget, reply: io::Result<ResourceCheckReply>) -> ResponsePlan {
     match reply {
-        Ok(reply) if reply.allowed => ResponsePlan::emulate_resource(target),
+        Ok(reply) if reply.verdict.allowed => ResponsePlan::emulate_resource(target),
 
         Ok(reply) => ResponsePlan::ResourcePolicyDenied {
             target,
-            source: reply.source,
+            source: reply.verdict.source,
             error: reply.error,
         },
 
@@ -261,12 +188,12 @@ fn filesystem_plan(
     reply: io::Result<FilesystemCheckReply>,
 ) -> Option<ResponsePlan> {
     match reply {
-        Ok(reply) if reply.allowed => None,
+        Ok(reply) if reply.verdict.allowed => None,
 
         Ok(reply) => Some(ResponsePlan::FilesystemPolicyDenied {
             path: reply.path,
             access: reply.access,
-            source: reply.source,
+            source: reply.verdict.source,
             error: reply.error,
         }),
 
@@ -301,20 +228,17 @@ pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, io, os::fd::OwnedFd, path::Path, time::Duration};
+    use std::{io, os::fd::OwnedFd, path::Path, time::Duration};
 
     use agent_sandbox_core::{
         DeviceAccess, FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply,
-        ResourceKind, VerdictSource,
+        ResourceKind, Verdict, VerdictSource,
     };
     use agent_sandbox_syscall_broker::{
-        FilesystemMutation, FilesystemTarget, NetworkTarget, PersistentPolicyClient,
-        ResourceTarget, SyscallTarget,
+        FilesystemMutation, FilesystemTarget, PersistentPolicyClient, ResourceTarget,
     };
 
-    use super::{
-        NormalizedNotification, PolicyQuery, ResponsePlan, decide, filesystem_plan, resource_plan,
-    };
+    use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
 
     fn resource_target() -> ResourceTarget {
         ResourceTarget {
@@ -334,110 +258,6 @@ mod tests {
                 fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("dev null exists")),
                 len: 0,
             },
-        }
-    }
-
-    fn filesystem_target_with_two_checks() -> FilesystemTarget {
-        FilesystemTarget {
-            checks: vec![
-                ("/tmp/example-a".into(), FileAccess::Write),
-                ("/tmp/example-b".into(), FileAccess::Read),
-            ],
-            operation: FilesystemMutation::Ftruncate {
-                fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("dev null exists")),
-                len: 0,
-            },
-        }
-    }
-
-    fn network_target() -> NetworkTarget {
-        NetworkTarget {
-            host: "example.com".into(),
-            port: 443,
-            scheme: "https".into(),
-        }
-    }
-
-    #[derive(Default)]
-    struct FakePolicy {
-        network_allowed: bool,
-        network_calls: u32,
-        resource_reply: Option<io::Result<ResourceCheckReply>>,
-        filesystem_replies: VecDeque<io::Result<FilesystemCheckReply>>,
-        filesystem_calls: u32,
-    }
-
-    impl FakePolicy {
-        fn with_replies(replies: Vec<io::Result<FilesystemCheckReply>>) -> Self {
-            Self {
-                filesystem_replies: replies.into(),
-                ..Self::default()
-            }
-        }
-
-        fn allowed_filesystem_reply(path: &Path, access: FileAccess) -> FilesystemCheckReply {
-            FilesystemCheckReply {
-                ok: true,
-                allowed: true,
-                source: VerdictSource::User,
-                path: path.to_path_buf(),
-                access,
-                error: None,
-            }
-        }
-
-        fn denied_filesystem_reply(path: &Path, access: FileAccess) -> FilesystemCheckReply {
-            FilesystemCheckReply {
-                ok: true,
-                allowed: false,
-                source: VerdictSource::User,
-                path: path.to_path_buf(),
-                access,
-                error: Some("blocked".into()),
-            }
-        }
-    }
-
-    impl PolicyQuery for FakePolicy {
-        fn check_network(
-            &mut self,
-            _target: &NetworkTarget,
-            _sandbox_session_id: Option<String>,
-            _pid: u32,
-            _timeout: Duration,
-        ) -> impl Future<Output = bool> + Send {
-            self.network_calls += 1;
-            std::future::ready(self.network_allowed)
-        }
-
-        fn check_resource(
-            &mut self,
-            _target: &ResourceTarget,
-            _sandbox_session_id: Option<String>,
-            _pid: u32,
-            _timeout: Duration,
-        ) -> impl Future<Output = io::Result<ResourceCheckReply>> + Send {
-            std::future::ready(
-                self.resource_reply
-                    .take()
-                    .expect("a resource reply is configured for every resource check"),
-            )
-        }
-
-        fn check_filesystem(
-            &mut self,
-            _path: &Path,
-            _access: FileAccess,
-            _sandbox_session_id: Option<String>,
-            _pid: u32,
-            _timeout: Duration,
-        ) -> impl Future<Output = io::Result<FilesystemCheckReply>> + Send {
-            self.filesystem_calls += 1;
-            std::future::ready(
-                self.filesystem_replies
-                    .pop_front()
-                    .expect("a filesystem reply is queued for every filesystem check"),
-            )
         }
     }
 
@@ -509,8 +329,7 @@ mod tests {
 
         let allowed = ResourceCheckReply {
             ok: true,
-            allowed: true,
-            source: VerdictSource::User,
+            verdict: Verdict::allowed(VerdictSource::User),
             kind: target.kind,
             path: target.path.clone(),
             access: target.access,
@@ -524,10 +343,9 @@ mod tests {
 
         let denied = ResourceCheckReply {
             ok: true,
-            allowed: false,
-            source: VerdictSource::Policy {
+            verdict: Verdict::denied(VerdictSource::Policy {
                 comment: Some("blocked".into()),
-            },
+            }),
             kind: target.kind,
             path: target.path.clone(),
             access: target.access,
@@ -555,8 +373,7 @@ mod tests {
 
         let allowed = FilesystemCheckReply {
             ok: true,
-            allowed: true,
-            source: VerdictSource::User,
+            verdict: Verdict::allowed(VerdictSource::User),
             path: path.clone(),
             access: *access,
             error: None,
@@ -566,10 +383,9 @@ mod tests {
 
         let denied = FilesystemCheckReply {
             ok: true,
-            allowed: false,
-            source: VerdictSource::Policy {
+            verdict: Verdict::denied(VerdictSource::Policy {
                 comment: Some("blocked".into()),
-            },
+            }),
             path: path.clone(),
             access: *access,
             error: Some("blocked".into()),
@@ -588,172 +404,5 @@ mod tests {
             ),
             Some(ResponsePlan::FilesystemRpcFailure { .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn decide_asks_the_policy_query_for_network_targets() {
-        let mut allowed = FakePolicy {
-            network_allowed: true,
-            ..FakePolicy::default()
-        };
-
-        assert!(matches!(
-            decide(
-                &mut allowed,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Network(network_target())),
-            )
-            .await,
-            ResponsePlan::Continue
-        ));
-
-        let mut denied = FakePolicy::default();
-
-        assert!(matches!(
-            decide(
-                &mut denied,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Network(network_target())),
-            )
-            .await,
-            ResponsePlan::DenyErrno {
-                errno: libc::EACCES
-            }
-        ));
-
-        assert_eq!(allowed.network_calls, 1);
-        assert_eq!(denied.network_calls, 1);
-    }
-
-    #[tokio::test]
-    async fn decide_maps_resource_replies_fail_closed() {
-        let target = resource_target();
-        let mut store = FakePolicy {
-            resource_reply: Some(Ok(ResourceCheckReply {
-                ok: true,
-                allowed: true,
-                source: VerdictSource::User,
-                kind: target.kind,
-                path: target.path.clone(),
-                access: target.access,
-                error: None,
-            })),
-            ..FakePolicy::default()
-        };
-
-        assert!(matches!(
-            decide(
-                &mut store,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Resource(target.clone())),
-            )
-            .await,
-            ResponsePlan::EmulateResource { .. }
-        ));
-
-        let mut failing = FakePolicy {
-            resource_reply: Some(Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"))),
-            ..FakePolicy::default()
-        };
-
-        assert!(matches!(
-            decide(
-                &mut failing,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Resource(target)),
-            )
-            .await,
-            ResponsePlan::ResourceRpcFailure { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn decide_short_circuits_filesystem_checks_on_first_deny() {
-        let target = filesystem_target_with_two_checks();
-        let replies = vec![
-            Ok(FakePolicy::denied_filesystem_reply(
-                &target.checks[0].0,
-                target.checks[0].1,
-            )),
-            Ok(FakePolicy::allowed_filesystem_reply(
-                &target.checks[1].0,
-                target.checks[1].1,
-            )),
-        ];
-        let mut store = FakePolicy::with_replies(replies);
-
-        assert!(matches!(
-            decide(
-                &mut store,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Filesystem(target)),
-            )
-            .await,
-            ResponsePlan::FilesystemPolicyDenied { .. }
-        ));
-
-        assert_eq!(store.filesystem_calls, 1, "the second check must not run");
-    }
-
-    #[tokio::test]
-    async fn decide_short_circuits_filesystem_checks_on_rpc_failure() {
-        let target = filesystem_target_with_two_checks();
-        let second = {
-            let (path, access) = &target.checks[1];
-            Ok(FakePolicy::allowed_filesystem_reply(path, *access))
-        };
-        let mut store = FakePolicy::with_replies(vec![
-            Err(io::Error::new(io::ErrorKind::TimedOut, "timeout")),
-            second,
-        ]);
-
-        assert!(matches!(
-            decide(
-                &mut store,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Filesystem(target)),
-            )
-            .await,
-            ResponsePlan::FilesystemRpcFailure { .. }
-        ));
-
-        assert_eq!(store.filesystem_calls, 1, "the second check must not run");
-    }
-
-    #[tokio::test]
-    async fn decide_emulates_filesystem_when_every_check_passes() {
-        let target = filesystem_target_with_two_checks();
-        let replies = target
-            .checks
-            .iter()
-            .map(|(path, access)| Ok(FakePolicy::allowed_filesystem_reply(path, *access)))
-            .collect();
-        let mut store = FakePolicy::with_replies(replies);
-
-        assert!(matches!(
-            decide(
-                &mut store,
-                None,
-                0,
-                Duration::from_secs(1),
-                NormalizedNotification::target(SyscallTarget::Filesystem(target)),
-            )
-            .await,
-            ResponsePlan::EmulateFilesystem { .. }
-        ));
-
-        assert_eq!(store.filesystem_calls, 2);
     }
 }

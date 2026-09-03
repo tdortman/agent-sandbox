@@ -123,82 +123,43 @@ fn push_filesystem_mutation_syscalls(syscalls: &mut BTreeSet<i64>) {
 mod tests {
     use super::{default_syscalls, nr, syscalls_without_filesystem};
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn default_syscalls_contains_udp_entry_points() {
+    fn default_syscalls_contains_shared_policy_set() {
         let syscalls = default_syscalls();
 
-        // Network egress set.
-        assert!(syscalls.contains(&nr::SENDTO));
-
-        assert!(syscalls.contains(&nr::SENDMSG));
-
-        // io_uring setup/operation syscalls are trapped and denied with ENOSYS
-        // by the broker; otherwise IORING_OP_OPENAT bypasses path mediation.
-        assert!(syscalls.contains(&nr::IO_URING_SETUP));
-
-        assert!(syscalls.contains(&nr::IO_URING_ENTER));
-        assert!(syscalls.contains(&nr::IO_URING_REGISTER));
-        assert!(syscalls.contains(&nr::SENDMMSG));
-        assert!(syscalls.contains(&nr::CONNECT));
-
-        // Resource open* set (the broker policy-gates device access).
-        assert!(syscalls.contains(&nr::OPEN));
-
-        assert!(syscalls.contains(&nr::OPENAT));
-        assert!(syscalls.contains(&nr::OPENAT2));
-        assert!(syscalls.contains(&nr::CREAT));
-
-        // Filesystem mutation set (broker policy-gates via CheckFilesystem).
-        assert!(syscalls.contains(&nr::RENAME));
-
-        assert!(syscalls.contains(&nr::RENAMEAT));
-        assert!(syscalls.contains(&nr::RENAMEAT2));
-        assert!(syscalls.contains(&nr::LINK));
-        assert!(syscalls.contains(&nr::LINKAT));
-        assert!(syscalls.contains(&nr::SYMLINK));
-        assert!(syscalls.contains(&nr::SYMLINKAT));
-        assert!(syscalls.contains(&nr::UNLINK));
-        assert!(syscalls.contains(&nr::UNLINKAT));
-        assert!(syscalls.contains(&nr::TRUNCATE));
-        assert!(syscalls.contains(&nr::FTRUNCATE));
-        assert!(syscalls.contains(&nr::MKDIR));
-        assert!(syscalls.contains(&nr::MKDIRAT));
-        assert!(syscalls.contains(&nr::RMDIR));
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn default_syscalls_contains_udp_entry_points() {
-        // The aarch64 default syscalls are the same resource-gate set as
-        // x86_64; the broker path is the only thing that differs.
-        let syscalls = default_syscalls();
-
-        assert!(syscalls.contains(&nr::SENDTO));
-        assert!(syscalls.contains(&nr::SENDMSG));
-        assert!(syscalls.contains(&nr::SENDMMSG));
-        assert!(syscalls.contains(&nr::CONNECT));
-        assert!(syscalls.contains(&nr::OPEN));
-        assert!(syscalls.contains(&nr::OPENAT));
-        assert!(syscalls.contains(&nr::OPENAT2));
-        assert!(syscalls.contains(&nr::CREAT));
-        assert!(syscalls.contains(&nr::RENAME));
-        assert!(syscalls.contains(&nr::RENAMEAT));
-        assert!(syscalls.contains(&nr::RENAMEAT2));
-        assert!(syscalls.contains(&nr::LINK));
-        assert!(syscalls.contains(&nr::LINKAT));
-        assert!(syscalls.contains(&nr::SYMLINK));
-        assert!(syscalls.contains(&nr::SYMLINKAT));
-        assert!(syscalls.contains(&nr::UNLINK));
-        assert!(syscalls.contains(&nr::IO_URING_SETUP));
-        assert!(syscalls.contains(&nr::IO_URING_ENTER));
-        assert!(syscalls.contains(&nr::IO_URING_REGISTER));
-        assert!(syscalls.contains(&nr::UNLINKAT));
-        assert!(syscalls.contains(&nr::TRUNCATE));
-        assert!(syscalls.contains(&nr::FTRUNCATE));
-        assert!(syscalls.contains(&nr::MKDIR));
-        assert!(syscalls.contains(&nr::MKDIRAT));
-        assert!(syscalls.contains(&nr::RMDIR));
+        for nr in [
+            nr::CONNECT,
+            nr::SENDTO,
+            nr::SENDMSG,
+            nr::SENDMMSG,
+            nr::OPEN,
+            nr::OPENAT,
+            nr::OPENAT2,
+            nr::CREAT,
+            nr::IO_URING_SETUP,
+            nr::IO_URING_ENTER,
+            nr::IO_URING_REGISTER,
+            nr::RENAME,
+            nr::RENAMEAT,
+            nr::RENAMEAT2,
+            nr::LINK,
+            nr::LINKAT,
+            nr::SYMLINK,
+            nr::SYMLINKAT,
+            nr::UNLINK,
+            nr::UNLINKAT,
+            nr::TRUNCATE,
+            nr::FTRUNCATE,
+            nr::MKDIR,
+            nr::MKDIRAT,
+            nr::RMDIR,
+        ] {
+            assert!(
+                syscalls.contains(&nr),
+                "syscall {nr} must be in the seccomp trap set"
+            );
+        }
     }
 
     /// Regression: high-frequency I/O and thread/namespace syscalls must

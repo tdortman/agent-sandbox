@@ -11,6 +11,7 @@ use super::{
     decisions::DecisionAction,
     persist::PersistResourceRuleArgs,
     scope_apply::{ScopeLadder, ScopePersistFlags},
+    state::apply_bucket,
     types::PolicyStore,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
@@ -72,7 +73,13 @@ impl PolicyStore {
                         ScopeTarget::Ephemeral => {}
 
                         ScopeTarget::Session { session_id } => {
-                            inner.session.filesystem().apply(action, session_id, &key);
+                            apply_bucket(
+                                &mut inner.session.session_filesystem_allow,
+                                &mut inner.session.session_filesystem_deny,
+                                action,
+                                session_id,
+                                &key,
+                            );
                         }
 
                         ScopeTarget::Global { .. }
@@ -157,7 +164,13 @@ impl PolicyStore {
                         ScopeTarget::Ephemeral => {}
 
                         ScopeTarget::Session { session_id } => {
-                            inner.session.dbus().apply(action, session_id, &target);
+                            apply_bucket(
+                                &mut inner.session.session_dbus_allow,
+                                &mut inner.session.session_dbus_deny,
+                                action,
+                                session_id,
+                                &target,
+                            );
                         }
 
                         ScopeTarget::Global { .. }
@@ -244,7 +257,13 @@ impl PolicyStore {
                         ScopeTarget::Ephemeral => {}
 
                         ScopeTarget::Session { session_id } => {
-                            inner.session.resource().apply(action, session_id, &key);
+                            apply_bucket(
+                                &mut inner.session.session_resource_allow,
+                                &mut inner.session.session_resource_deny,
+                                action,
+                                session_id,
+                                &key,
+                            );
                         }
 
                         ScopeTarget::Global { .. }

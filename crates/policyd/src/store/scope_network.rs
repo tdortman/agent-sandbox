@@ -7,6 +7,7 @@ use agent_sandbox_core::{NetworkRuleKey, RpcReply, ScopeActionReply, ScopeTarget
 use super::{
     decisions::DecisionAction,
     scope_apply::{ScopeLadder, ScopePersistFlags},
+    state::apply_bucket,
     types::PolicyStore,
 };
 use crate::wire::{NetworkScopeOp, ScopeWire};
@@ -68,7 +69,13 @@ impl PolicyStore {
                         }
 
                         ScopeTarget::Session { session_id } => {
-                            inner.session.network().apply(action, session_id, &key);
+                            apply_bucket(
+                                &mut inner.session.session_allow,
+                                &mut inner.session.session_deny,
+                                action,
+                                session_id,
+                                &key,
+                            );
                         }
 
                         ScopeTarget::Global { .. }

@@ -244,11 +244,13 @@ mod tests {
         }
     }
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
-        NormalizedNotification::target(SyscallTarget::Network(NetworkTarget {
-            host: host.to_owned(),
-            port,
-            scheme: scheme.to_owned(),
-        }))
+        NormalizedNotification::Target {
+            target: SyscallTarget::Network(NetworkTarget {
+                host: host.to_owned(),
+                port,
+                scheme: scheme.to_owned(),
+            }),
+        }
     }
 
     #[test]

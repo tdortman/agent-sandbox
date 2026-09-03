@@ -14,7 +14,7 @@ use agent_sandbox_proxy::{
     http3::{self, Http3Backend, Http3Config},
     policy::PolicySession,
     tcp_backend::{
-        ListenConfig, MAX_ACTIVE_CHECKS, canonical_http10_origins, destination_for_stream,
+        ListenConfig, MAX_ACTIVE_CHECKS, canonical_http10_origin, destination_for_stream,
         run_tcp_listener,
     },
 };
@@ -223,13 +223,11 @@ fn load_ca_issuer(args: &Args) -> Result<CertificateIssuer, BoxError> {
 ///
 /// Returns an I/O error when the ECH state cannot be loaded or generated.
 fn load_downstream_ech(args: &Args) -> Result<Option<DownstreamEch>, BoxError> {
-    let ech_state = args
-        .ech_state_dir
+    args.ech_state_dir
         .as_deref()
         .map(ech_state::load_or_generate)
-        .transpose()?;
-
-    Ok(ech_state.map(DownstreamEch::from))
+        .transpose()
+        .map_err(BoxError::from)
 }
 
 fn load_listener_config(
@@ -252,8 +250,13 @@ fn load_listener_config(
 
     let websocket_http11_urls = Arc::new(websocket_http11_urls);
 
-    let http10_upstream_origins =
-        Arc::new(canonical_http10_origins(&args.http10_upstream_origins)?);
+    let http10_upstream_origins = args
+        .http10_upstream_origins
+        .iter()
+        .map(String::as_str)
+        .map(canonical_http10_origin)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Arc::new)?;
 
     #[cfg(debug_assertions)]
     let transparent = args.test_destination.is_none();

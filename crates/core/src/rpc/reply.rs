@@ -363,72 +363,7 @@ impl Verdict {
     }
 }
 
-impl From<ApprovalScope> for VerdictSource {
-    fn from(value: ApprovalScope) -> Self {
-        Self::Scope(value)
-    }
-}
-
-/// Result of a network-flow access check.
-#[derive(Debug, Clone)]
-pub struct CheckReply {
-    /// Whether the request was processed (protocol-level success).
-    pub ok: bool,
-    /// Whether the network flow is permitted.
-    pub allowed: bool,
-    /// Where the verdict came from.
-    pub source: VerdictSource,
-    /// Human-readable failure detail, present when `allowed` is false.
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireCheckReply {
-    ok: bool,
-    allowed: bool,
-    source: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl CheckReply {
-    /// An allowed reply with the given source.
-    #[must_use]
-    pub fn allowed(source: VerdictSource) -> Self {
-        Self::from_verdict(Verdict::allowed(source))
-    }
-
-    /// A denied reply with the given source.
-    #[must_use]
-    pub fn denied(source: VerdictSource) -> Self {
-        Self::from_verdict(Verdict::denied(source))
-    }
-
-    /// Builds a reply from a [`Verdict`].
-    #[must_use]
-    pub fn from_verdict(verdict: Verdict) -> Self {
-        Self {
-            ok: true,
-            allowed: verdict.allowed,
-            source: verdict.source,
-            error: None,
-        }
-    }
-
-    /// A blocked reply carrying the given message.
-    pub fn blocked(message: impl Into<String>) -> Self {
-        Self {
-            ok: true,
-            allowed: false,
-            source: VerdictSource::blocked(),
-            error: Some(message.into()),
-        }
-    }
-}
-
-impl Serialize for CheckReply {
+impl Serialize for Verdict {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -437,75 +372,110 @@ impl Serialize for CheckReply {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
-
-        let field_count = if self.error.is_some() { 4 } else { 3 };
-        let mut state = serializer.serialize_struct("CheckReply", field_count)?;
-        state.serialize_field("ok", &self.ok)?;
+        let mut state = serializer.serialize_struct("Verdict", 2)?;
         state.serialize_field("allowed", &self.allowed)?;
         state.serialize_field("source", source.as_ref())?;
-
-        if let Some(error) = &self.error {
-            state.serialize_field("error", error)?;
-        }
-
         state.end()
     }
 }
 
-impl<'de> Deserialize<'de> for CheckReply {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireVerdict {
+    allowed: bool,
+    source: String,
+}
+
+impl<'de> Deserialize<'de> for Verdict {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let wire = WireCheckReply::deserialize(deserializer)?;
-
+        let wire = WireVerdict::deserialize(deserializer)?;
         Ok(Self {
-            ok: wire.ok,
             allowed: wire.allowed,
             source: VerdictSource::from_wire(wire.allowed, &wire.source)
                 .map_err(serde::de::Error::custom)?,
-            error: wire.error,
         })
     }
 }
 
+impl From<ApprovalScope> for VerdictSource {
+    fn from(value: ApprovalScope) -> Self {
+        Self::Scope(value)
+    }
+}
+
+/// Result of a network-flow access check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckReply {
+    /// Whether the request was processed (protocol-level success).
+    pub ok: bool,
+    /// Whether the network flow is permitted and where the verdict came from.
+    #[serde(flatten)]
+    pub verdict: Verdict,
+    /// Human-readable failure detail, present when the verdict denies access.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CheckReply {
+    /// An allowed reply with the given source.
+    #[must_use]
+    pub const fn allowed(source: VerdictSource) -> Self {
+        Self::from_verdict(Verdict::allowed(source))
+    }
+
+    /// A denied reply with the given source.
+    #[must_use]
+    pub const fn denied(source: VerdictSource) -> Self {
+        Self::from_verdict(Verdict::denied(source))
+    }
+
+    /// Builds a reply from a [`Verdict`].
+    #[must_use]
+    pub const fn from_verdict(verdict: Verdict) -> Self {
+        Self {
+            ok: true,
+            verdict,
+            error: None,
+        }
+    }
+
+    /// A blocked reply carrying the given message.
+    pub fn blocked(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            verdict: Verdict::blocked(),
+            error: Some(message.into()),
+        }
+    }
+}
+
 /// HTTP request verdict with the exact normalized request echoed on success.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
-    /// Whether the HTTP request is permitted.
-    pub allowed: bool,
-    /// Where the verdict came from.
-    pub source: VerdictSource,
-    /// Human-readable failure detail, present when `allowed` is false.
+    /// Whether the HTTP request is permitted and where the verdict came from.
+    #[serde(flatten)]
+    pub verdict: Verdict,
+    /// Human-readable failure detail, present when the verdict denies access.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// The normalized request echoed back on an allowed verdict.
     pub request: Option<HttpRequest>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireHttpCheckReply {
-    ok: bool,
-    allowed: bool,
-    source: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-
-    #[serde(default)]
-    request: Option<HttpRequest>,
-}
-
 impl HttpCheckReply {
     /// Builds an allowed reply echoing the normalized `request` and verdict.
     #[must_use]
-    pub fn from_verdict(request: HttpRequest, verdict: Verdict) -> Self {
+    pub const fn from_verdict(request: HttpRequest, verdict: Verdict) -> Self {
         Self {
             ok: true,
-            allowed: verdict.allowed,
-            source: verdict.source,
+            verdict,
             error: None,
             request: Some(request),
         }
@@ -516,66 +486,10 @@ impl HttpCheckReply {
     pub fn blocked(message: impl Into<String>) -> Self {
         Self {
             ok: false,
-            allowed: false,
-            source: VerdictSource::blocked(),
+            verdict: Verdict::blocked(),
             error: Some(message.into()),
             request: None,
         }
-    }
-}
-
-impl Serialize for HttpCheckReply {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let source = self
-            .source
-            .to_wire(self.allowed)
-            .map_err(serde::ser::Error::custom)?;
-
-        let mut field_count = 3;
-
-        if self.error.is_some() {
-            field_count += 1;
-        }
-
-        if self.request.is_some() {
-            field_count += 1;
-        }
-
-        let mut state = serializer.serialize_struct("HttpCheckReply", field_count)?;
-        state.serialize_field("ok", &self.ok)?;
-        state.serialize_field("allowed", &self.allowed)?;
-        state.serialize_field("source", source.as_ref())?;
-
-        if let Some(error) = &self.error {
-            state.serialize_field("error", error)?;
-        }
-
-        if let Some(request) = &self.request {
-            state.serialize_field("request", request)?;
-        }
-
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for HttpCheckReply {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WireHttpCheckReply::deserialize(deserializer)?;
-
-        Ok(Self {
-            ok: wire.ok,
-            allowed: wire.allowed,
-            source: VerdictSource::from_wire(wire.allowed, &wire.source)
-                .map_err(serde::de::Error::custom)?,
-            error: wire.error,
-            request: wire.request,
-        })
     }
 }
 
@@ -672,54 +586,43 @@ impl ElevateReply {
 }
 
 /// Result of a filesystem access check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilesystemCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
-    /// Whether the filesystem access is permitted.
-    pub allowed: bool,
-    /// Where the verdict came from.
-    pub source: VerdictSource,
+    /// Whether the filesystem access is permitted and where the verdict came
+    /// from.
+    #[serde(flatten)]
+    pub verdict: Verdict,
     /// The path subjected to the check.
     pub path: PathBuf,
     /// The filesystem access mode checked.
     pub access: FileAccess,
-    /// Human-readable failure detail, present when `allowed` is false.
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WireFilesystemCheckReply {
-    ok: bool,
-    allowed: bool,
-    source: String,
-    path: PathBuf,
-    access: FileAccess,
-
+    /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 impl FilesystemCheckReply {
     /// An allowed reply for `path`/`access` with the given source.
     #[must_use]
-    pub fn allowed(source: VerdictSource, path: PathBuf, access: FileAccess) -> Self {
+    pub const fn allowed(source: VerdictSource, path: PathBuf, access: FileAccess) -> Self {
         Self::from_verdict(Verdict::allowed(source), path, access)
     }
 
     /// A denied reply for `path`/`access` with the given source.
     #[must_use]
-    pub fn denied(source: VerdictSource, path: PathBuf, access: FileAccess) -> Self {
+    pub const fn denied(source: VerdictSource, path: PathBuf, access: FileAccess) -> Self {
         Self::from_verdict(Verdict::denied(source), path, access)
     }
 
     /// Builds a filesystem reply from a [`Verdict`].
     #[must_use]
-    pub fn from_verdict(verdict: Verdict, path: PathBuf, access: FileAccess) -> Self {
+    pub const fn from_verdict(verdict: Verdict, path: PathBuf, access: FileAccess) -> Self {
         Self {
             ok: true,
-            allowed: verdict.allowed,
-            source: verdict.source,
+            verdict,
             path,
             access,
             error: None,
@@ -730,8 +633,7 @@ impl FilesystemCheckReply {
     pub fn blocked(message: impl Into<String>, path: PathBuf, access: FileAccess) -> Self {
         Self {
             ok: true,
-            allowed: false,
-            source: VerdictSource::blocked(),
+            verdict: Verdict::blocked(),
             path,
             access,
             error: Some(message.into()),
@@ -739,87 +641,31 @@ impl FilesystemCheckReply {
     }
 }
 
-impl Serialize for FilesystemCheckReply {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let source = self
-            .source
-            .to_wire(self.allowed)
-            .map_err(serde::ser::Error::custom)?;
-
-        let field_count = if self.error.is_some() { 6 } else { 5 };
-        let mut state = serializer.serialize_struct("FilesystemCheckReply", field_count)?;
-        state.serialize_field("ok", &self.ok)?;
-        state.serialize_field("allowed", &self.allowed)?;
-        state.serialize_field("source", source.as_ref())?;
-        state.serialize_field("path", &self.path)?;
-        state.serialize_field("access", &self.access)?;
-
-        if let Some(error) = &self.error {
-            state.serialize_field("error", error)?;
-        }
-
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for FilesystemCheckReply {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WireFilesystemCheckReply::deserialize(deserializer)?;
-
-        Ok(Self {
-            ok: wire.ok,
-            allowed: wire.allowed,
-            source: VerdictSource::from_wire(wire.allowed, &wire.source)
-                .map_err(serde::de::Error::custom)?,
-            path: wire.path,
-            access: wire.access,
-            error: wire.error,
-        })
-    }
-}
-
 /// Result of a resource access check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
-    /// Whether the resource access is permitted.
-    pub allowed: bool,
-    /// Where the verdict came from.
-    pub source: VerdictSource,
+    /// Whether the resource access is permitted and where the verdict came
+    /// from.
+    #[serde(flatten)]
+    pub verdict: Verdict,
     /// The kind of resource checked.
     pub kind: ResourceKind,
     /// The resource path or device subjected to the check.
     pub path: PathBuf,
     /// The resource access mode checked.
     pub access: ResourceAccess,
-    /// Human-readable failure detail, present when `allowed` is false.
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WireResourceCheckReply {
-    ok: bool,
-    allowed: bool,
-    source: String,
-    kind: ResourceKind,
-    path: PathBuf,
-    access: ResourceAccess,
-
+    /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 impl ResourceCheckReply {
     /// An allowed reply for `kind`/`path`/`access` with the given source.
     #[must_use]
-    pub fn allowed(
+    pub const fn allowed(
         source: VerdictSource,
         kind: ResourceKind,
         path: PathBuf,
@@ -830,7 +676,7 @@ impl ResourceCheckReply {
 
     /// A denied reply for `kind`/`path`/`access` with the given source.
     #[must_use]
-    pub fn denied(
+    pub const fn denied(
         source: VerdictSource,
         kind: ResourceKind,
         path: PathBuf,
@@ -841,7 +687,7 @@ impl ResourceCheckReply {
 
     /// Builds a resource reply from a [`Verdict`].
     #[must_use]
-    pub fn from_verdict(
+    pub const fn from_verdict(
         verdict: Verdict,
         kind: ResourceKind,
         path: PathBuf,
@@ -849,8 +695,7 @@ impl ResourceCheckReply {
     ) -> Self {
         Self {
             ok: true,
-            allowed: verdict.allowed,
-            source: verdict.source,
+            verdict,
             kind,
             path,
             access,
@@ -867,8 +712,7 @@ impl ResourceCheckReply {
     ) -> Self {
         Self {
             ok: true,
-            allowed: false,
-            source: VerdictSource::blocked(),
+            verdict: Verdict::blocked(),
             kind,
             path,
             access,
@@ -877,88 +721,29 @@ impl ResourceCheckReply {
     }
 }
 
-impl Serialize for ResourceCheckReply {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let source = self
-            .source
-            .to_wire(self.allowed)
-            .map_err(serde::ser::Error::custom)?;
-
-        let field_count = if self.error.is_some() { 7 } else { 6 };
-        let mut state = serializer.serialize_struct("ResourceCheckReply", field_count)?;
-        state.serialize_field("ok", &self.ok)?;
-        state.serialize_field("allowed", &self.allowed)?;
-        state.serialize_field("source", source.as_ref())?;
-        state.serialize_field("kind", &self.kind)?;
-        state.serialize_field("path", &self.path)?;
-        state.serialize_field("access", &self.access)?;
-
-        if let Some(error) = &self.error {
-            state.serialize_field("error", error)?;
-        }
-
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ResourceCheckReply {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WireResourceCheckReply::deserialize(deserializer)?;
-
-        Ok(Self {
-            ok: wire.ok,
-            allowed: wire.allowed,
-            source: VerdictSource::from_wire(wire.allowed, &wire.source)
-                .map_err(serde::de::Error::custom)?,
-            kind: wire.kind,
-            path: wire.path,
-            access: wire.access,
-            error: wire.error,
-        })
-    }
-}
-
 /// Result of a D-Bus access check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbusCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
-    /// Whether the D-Bus access is permitted.
-    pub allowed: bool,
-    /// Where the verdict came from.
-    pub source: VerdictSource,
+    /// Whether the D-Bus access is permitted and where the verdict came from.
+    #[serde(flatten)]
+    pub verdict: Verdict,
     /// The D-Bus target subjected to the check.
     pub target: DbusTarget,
-    /// Human-readable failure detail, present when `allowed` is false.
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireDbusCheckReply {
-    ok: bool,
-    allowed: bool,
-    source: String,
-    target: DbusTarget,
-
+    /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 impl DbusCheckReply {
     /// Builds a D-Bus reply from a [`Verdict`] for `target`.
     #[must_use]
-    pub fn from_verdict(verdict: Verdict, target: DbusTarget) -> Self {
+    pub const fn from_verdict(verdict: Verdict, target: DbusTarget) -> Self {
         Self {
             ok: true,
-            allowed: verdict.allowed,
-            source: verdict.source,
+            verdict,
             target,
             error: None,
         }
@@ -966,13 +751,13 @@ impl DbusCheckReply {
 
     /// An allowed reply for `target` with the given source.
     #[must_use]
-    pub fn allowed(source: VerdictSource, target: DbusTarget) -> Self {
+    pub const fn allowed(source: VerdictSource, target: DbusTarget) -> Self {
         Self::from_verdict(Verdict::allowed(source), target)
     }
 
     /// A denied reply for `target` with the given source.
     #[must_use]
-    pub fn denied(source: VerdictSource, target: DbusTarget) -> Self {
+    pub const fn denied(source: VerdictSource, target: DbusTarget) -> Self {
         Self::from_verdict(Verdict::denied(source), target)
     }
 
@@ -980,54 +765,10 @@ impl DbusCheckReply {
     pub fn blocked(message: impl Into<String>, target: DbusTarget) -> Self {
         Self {
             ok: true,
-            allowed: false,
-            source: VerdictSource::blocked(),
+            verdict: Verdict::blocked(),
             target,
             error: Some(message.into()),
         }
-    }
-}
-
-impl Serialize for DbusCheckReply {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let source = self
-            .source
-            .to_wire(self.allowed)
-            .map_err(serde::ser::Error::custom)?;
-
-        let field_count = if self.error.is_some() { 5 } else { 4 };
-        let mut state = serializer.serialize_struct("DbusCheckReply", field_count)?;
-        state.serialize_field("ok", &self.ok)?;
-        state.serialize_field("allowed", &self.allowed)?;
-        state.serialize_field("source", source.as_ref())?;
-        state.serialize_field("target", &self.target)?;
-
-        if let Some(error) = &self.error {
-            state.serialize_field("error", error)?;
-        }
-
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for DbusCheckReply {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WireDbusCheckReply::deserialize(deserializer)?;
-
-        Ok(Self {
-            ok: wire.ok,
-            allowed: wire.allowed,
-            source: VerdictSource::from_wire(wire.allowed, &wire.source)
-                .map_err(serde::de::Error::custom)?,
-            target: wire.target,
-            error: wire.error,
-        })
     }
 }
 
@@ -1070,152 +811,109 @@ impl FilesystemMonitorReply {
 #[serde(untagged)]
 pub enum ScopeActionReply {
     /// Success payload for a network scope action.
-    Network(NetworkScopeActionReply),
+    Network {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The host the scope was granted for.
+        host: String,
+        /// The port the scope was granted for.
+        port: u16,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the scope was keyed on, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
     /// Success payload for an HTTP scope action.
-    Http(HttpScopeActionReply),
+    Http {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The HTTP rule target the scope was granted for.
+        target: HttpRuleTarget,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the scope was keyed on, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
     /// Success payload for a sudo scope action.
-    Sudo(SudoScopeActionReply),
+    Sudo {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The command arguments the sudo scope was granted for.
+        argv: Vec<String>,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the scope was keyed on, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
     /// Success payload for an elevation scope action.
-    Elevation(ElevationScopeActionReply),
+    Elevation {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the scope was keyed on, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+        /// Whether elevation was approved.
+        allowed: bool,
+    },
     /// Success payload for a filesystem scope action.
-    Filesystem(FilesystemScopeActionReply),
+    Filesystem {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The path the scope was granted for.
+        path: PathBuf,
+        /// The filesystem access mode the scope was granted for.
+        access: FileAccess,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the granted scope points at, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_path: Option<PathBuf>,
+    },
     /// Success payload for a resource scope action.
-    Resource(ResourceScopeActionReply),
+    Resource {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The resource kind the scope was granted for.
+        kind: ResourceKind,
+        /// The resource path the scope was granted for.
+        path: PathBuf,
+        /// The resource access mode the scope was granted for.
+        access: ResourceAccess,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the granted scope points at, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_path: Option<PathBuf>,
+    },
     /// Success payload for a D-Bus scope action.
-    Dbus(DbusScopeActionReply),
-}
-
-/// Success payload for an HTTP scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The HTTP rule target the scope was granted for.
-    pub target: HttpRuleTarget,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the scope was keyed on, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-}
-
-/// Success payload for a network scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NetworkScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The host the scope was granted for.
-    pub host: String,
-    /// The port the scope was granted for.
-    pub port: u16,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the scope was keyed on, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-}
-
-/// Success payload for a sudo scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SudoScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The command arguments the sudo scope was granted for.
-    pub argv: Vec<String>,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the scope was keyed on, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-}
-
-/// Success payload for an elevation scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElevationScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the scope was keyed on, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-
-    /// Whether elevation was approved.
-    pub allowed: bool,
-}
-
-/// Success payload for a filesystem scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FilesystemScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The path the scope was granted for.
-    pub path: PathBuf,
-    /// The filesystem access mode the scope was granted for.
-    pub access: FileAccess,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the granted scope points at, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy_path: Option<PathBuf>,
-}
-
-/// Success payload for a resource scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The resource kind the scope was granted for.
-    pub kind: ResourceKind,
-    /// The resource path the scope was granted for.
-    pub path: PathBuf,
-    /// The resource access mode the scope was granted for.
-    pub access: ResourceAccess,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the granted scope points at, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy_path: Option<PathBuf>,
-}
-
-/// Success payload for a D-Bus scope action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DbusScopeActionReply {
-    /// Whether the scope action was applied.
-    pub ok: bool,
-    /// The D-Bus target the scope was granted for.
-    pub target: DbusTarget,
-    /// The granted approval scope as a string.
-    pub scope: String,
-
-    /// The policy path the scope was keyed on, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
+    Dbus {
+        /// Whether the scope action was applied.
+        ok: bool,
+        /// The D-Bus target the scope was granted for.
+        target: DbusTarget,
+        /// The granted approval scope as a string.
+        scope: String,
+        /// The policy path the scope was keyed on, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
 }
 
 impl ScopeActionReply {
     /// An HTTP scope-action success payload.
     #[must_use]
     pub fn ok_http(target: HttpRuleTarget, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
-        Self::Http(HttpScopeActionReply {
+        Self::Http {
             ok: true,
             target,
             scope: scope.to_string(),
             path,
-        })
+        }
     }
 
     /// A network scope-action success payload.
@@ -1226,35 +924,35 @@ impl ScopeActionReply {
         scope: ApprovalScope,
         path: Option<PathBuf>,
     ) -> Self {
-        Self::Network(NetworkScopeActionReply {
+        Self::Network {
             ok: true,
             host,
             port,
             scope: scope.to_string(),
             path,
-        })
+        }
     }
 
     /// A sudo scope-action success payload.
     #[must_use]
     pub fn ok_sudo(argv: Vec<String>, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
-        Self::Sudo(SudoScopeActionReply {
+        Self::Sudo {
             ok: true,
             argv,
             scope: scope.to_string(),
             path,
-        })
+        }
     }
 
     /// An elevation approve scope-action success payload.
     #[must_use]
     pub fn ok_elevation_approve(scope: ApprovalScope, path: Option<PathBuf>) -> Self {
-        Self::Elevation(ElevationScopeActionReply {
+        Self::Elevation {
             ok: true,
             scope: scope.to_string(),
             path,
             allowed: true,
-        })
+        }
     }
 
     /// A filesystem scope-action success payload.
@@ -1265,13 +963,13 @@ impl ScopeActionReply {
         scope: ApprovalScope,
         policy_path: Option<PathBuf>,
     ) -> Self {
-        Self::Filesystem(FilesystemScopeActionReply {
+        Self::Filesystem {
             ok: true,
             path,
             access,
             scope: scope.to_string(),
             policy_path,
-        })
+        }
     }
 
     /// A resource scope-action success payload.
@@ -1283,38 +981,38 @@ impl ScopeActionReply {
         scope: ApprovalScope,
         policy_path: Option<PathBuf>,
     ) -> Self {
-        Self::Resource(ResourceScopeActionReply {
+        Self::Resource {
             ok: true,
             kind,
             path,
             access,
             scope: scope.to_string(),
             policy_path,
-        })
+        }
     }
 
     /// A D-Bus scope-action success payload.
     #[must_use]
     pub fn ok_dbus(target: DbusTarget, scope: ApprovalScope, path: Option<PathBuf>) -> Self {
-        Self::Dbus(DbusScopeActionReply {
+        Self::Dbus {
             ok: true,
             target,
             scope: scope.to_string(),
             path,
-        })
+        }
     }
 
     /// Whether the scope action was applied successfully.
     #[must_use]
     pub const fn is_ok(&self) -> bool {
         match self {
-            Self::Network(reply) => reply.ok,
-            Self::Sudo(reply) => reply.ok,
-            Self::Http(reply) => reply.ok,
-            Self::Elevation(reply) => reply.ok,
-            Self::Filesystem(reply) => reply.ok,
-            Self::Resource(reply) => reply.ok,
-            Self::Dbus(reply) => reply.ok,
+            Self::Network { ok, .. }
+            | Self::Sudo { ok, .. }
+            | Self::Http { ok, .. }
+            | Self::Elevation { ok, .. }
+            | Self::Filesystem { ok, .. }
+            | Self::Resource { ok, .. }
+            | Self::Dbus { ok, .. } => *ok,
         }
     }
 
@@ -1322,13 +1020,13 @@ impl ScopeActionReply {
     #[must_use]
     pub fn scope_label(&self) -> &str {
         match self {
-            Self::Http(reply) => &reply.scope,
-            Self::Network(reply) => &reply.scope,
-            Self::Sudo(reply) => &reply.scope,
-            Self::Elevation(reply) => &reply.scope,
-            Self::Filesystem(reply) => &reply.scope,
-            Self::Resource(reply) => &reply.scope,
-            Self::Dbus(reply) => &reply.scope,
+            Self::Http { scope, .. }
+            | Self::Network { scope, .. }
+            | Self::Sudo { scope, .. }
+            | Self::Elevation { scope, .. }
+            | Self::Filesystem { scope, .. }
+            | Self::Resource { scope, .. }
+            | Self::Dbus { scope, .. } => scope,
         }
     }
 
@@ -1336,13 +1034,12 @@ impl ScopeActionReply {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Http(reply) => reply.path.as_deref(),
-            Self::Network(reply) => reply.path.as_deref(),
-            Self::Sudo(reply) => reply.path.as_deref(),
-            Self::Elevation(reply) => reply.path.as_deref(),
-            Self::Filesystem(reply) => Some(reply.path.as_path()),
-            Self::Resource(reply) => Some(reply.path.as_path()),
-            Self::Dbus(reply) => reply.path.as_deref(),
+            Self::Http { path, .. }
+            | Self::Network { path, .. }
+            | Self::Sudo { path, .. }
+            | Self::Elevation { path, .. }
+            | Self::Dbus { path, .. } => path.as_deref(),
+            Self::Filesystem { path, .. } | Self::Resource { path, .. } => Some(path.as_path()),
         }
     }
 }
@@ -1427,7 +1124,7 @@ mod tests {
 
         assert!(matches!(
             reply,
-            RpcReply::ScopeAction(ScopeActionReply::Network(_))
+            RpcReply::ScopeAction(ScopeActionReply::Network { .. })
         ));
     }
 
@@ -1465,6 +1162,6 @@ mod tests {
             serde_json::from_value(value).expect("D-Bus reply deserializes");
 
         assert_eq!(decoded.target, target);
-        assert!(decoded.allowed);
+        assert!(decoded.verdict.allowed);
     }
 }

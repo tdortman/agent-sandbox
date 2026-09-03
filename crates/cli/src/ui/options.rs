@@ -103,18 +103,7 @@ impl ApprovalFormRequest {
         let scopes = self
             .scopes
             .iter()
-            .map(|scope| {
-                let label = match scope {
-                    ApprovalScope::Once => "Once",
-                    ApprovalScope::Session => "This session",
-                    ApprovalScope::ProjectPackage => "This project, this package",
-                    ApprovalScope::Project => "This project, all packages",
-                    ApprovalScope::GlobalPackage => "All projects, this package",
-                    ApprovalScope::Global => "Everywhere",
-                };
-
-                json!({ "value": scope.as_str(), "label": label })
-            })
+            .map(|scope| json!({ "value": scope.as_str(), "label": scope_label(*scope) }))
             .collect::<Vec<_>>();
 
         let fields = self
@@ -172,57 +161,54 @@ pub struct ApprovalFormResult {
 /// so the user can fix the input and resubmit.
 pub type ReviewValidator = Box<dyn Fn(&ApprovalFormResult) -> Result<(), String> + Send + 'static>;
 
+/// Scope ladder, most specific first: (scope, label, needs session, needs
+/// package).
+const SCOPE_LADDER: [(ApprovalScope, &str, bool, bool); 6] = [
+    (ApprovalScope::Once, "Once", false, false),
+    (ApprovalScope::Session, "This session", true, false),
+    (
+        ApprovalScope::ProjectPackage,
+        "This project, this package",
+        false,
+        true,
+    ),
+    (
+        ApprovalScope::Project,
+        "This project, all packages",
+        false,
+        false,
+    ),
+    (
+        ApprovalScope::GlobalPackage,
+        "All projects, this package",
+        false,
+        true,
+    ),
+    (ApprovalScope::Global, "Everywhere", false, false),
+];
+
+fn scope_label(scope: ApprovalScope) -> &'static str {
+    SCOPE_LADDER
+        .iter()
+        .find(|(candidate, ..)| *candidate == scope)
+        .map(|(_, label, ..)| *label)
+        .expect("scope ladder covers every scope")
+}
+
 #[must_use]
 pub fn scope_only_options(session_available: bool, package_available: bool) -> Vec<ScopeOption> {
-    let mut options = vec![ScopeOption {
-        label: "Once".into(),
-        scope: ApprovalScope::Once,
-        target: None,
-        comment: None,
-    }];
-
-    if session_available {
-        options.push(ScopeOption {
-            label: "This session".into(),
-            scope: ApprovalScope::Session,
+    SCOPE_LADDER
+        .iter()
+        .filter(|(_, _, need_session, need_package)| {
+            (!need_session || session_available) && (!need_package || package_available)
+        })
+        .map(|(scope, label, ..)| ScopeOption {
+            label: (*label).into(),
+            scope: *scope,
             target: None,
             comment: None,
-        });
-    }
-
-    if package_available {
-        options.push(ScopeOption {
-            label: "This project, this package".into(),
-            scope: ApprovalScope::ProjectPackage,
-            target: None,
-            comment: None,
-        });
-    }
-
-    options.push(ScopeOption {
-        label: "This project, all packages".into(),
-        scope: ApprovalScope::Project,
-        target: None,
-        comment: None,
-    });
-
-    if package_available {
-        options.push(ScopeOption {
-            label: "All projects, this package".into(),
-            scope: ApprovalScope::GlobalPackage,
-            target: None,
-            comment: None,
-        });
-    }
-
-    options.push(ScopeOption {
-        label: "Everywhere".into(),
-        scope: ApprovalScope::Global,
-        target: None,
-        comment: None,
-    });
-
-    options
+        })
+        .collect()
 }
 
 #[must_use]

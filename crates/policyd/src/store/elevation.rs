@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use agent_sandbox_core::{ElevateReply, ProcessIds, UiPush};
+use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, UiPush};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -13,7 +13,7 @@ use super::{
     types::{MAX_PENDING_APPROVALS, Pending, PendingElevation, PendingResult, PolicyStore},
     ui::VerdictExit,
 };
-use crate::{error::PolicydError, wire::ElevationRequest};
+use crate::error::PolicydError;
 
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
@@ -170,8 +170,11 @@ impl PolicyStore {
     /// Handles an elevation request: applies the sudo policy (allowing or
     /// denying outright), otherwise registers it as pending and awaits the
     /// UI verdict.
-    pub async fn request_elevation(&self, req: ElevationRequest) -> ElevateReply {
-        let ElevationRequest { argv, ctx } = req;
+    pub async fn request_elevation(
+        &self,
+        argv: Vec<String>,
+        ctx: ResolvedRequestContext,
+    ) -> ElevateReply {
         let argv: Vec<String> = argv.into_iter().collect();
         let wire_ids = ctx.ids;
         let cwd = ctx.paths.cwd_path();
@@ -207,17 +210,7 @@ impl PolicyStore {
             };
         }
 
-        let Some(entry) = self
-            .create_pending_elevation_entry(
-                &argv,
-                cwd.as_deref(),
-                home.as_deref(),
-                project_root.as_deref(),
-                sandbox_session_id.as_deref(),
-                ctx.package.as_deref(),
-            )
-            .await
-        else {
+        let Some(entry) = self.create_pending_elevation_entry(&argv, &ctx).await else {
             return ElevateReply {
                 ok: true,
                 allowed: false,
@@ -254,20 +247,16 @@ impl PolicyStore {
     async fn create_pending_elevation_entry(
         &self,
         argv: &[String],
-        cwd: Option<&Path>,
-        home: Option<&Path>,
-        project_root: Option<&Path>,
-        sandbox_session_id: Option<&str>,
-        package: Option<&str>,
+        ctx: &ResolvedRequestContext,
     ) -> Option<PendingResult<String, ElevateReply>> {
         let pending_id = format!("elev:{}", Uuid::now_v7().simple());
         let (tx, rx) = oneshot::channel();
 
         {
             let mut inner = self.inner.lock().await;
-            if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
+            if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
                 tracing::warn!(
-                    pending_count = inner.pending.pending_len(),
+                    pending_count = inner.pending.pending.len(),
                     "elevation approval blocked (too many pending approvals)"
                 );
                 return None;
@@ -276,20 +265,18 @@ impl PolicyStore {
                 .pending
                 .elevation_futures
                 .insert(pending_id.clone(), tx);
+            let pending = Pending::Elevation(PendingElevation {
+                id: pending_id.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                argv: argv.to_vec(),
+                ctx: ctx.clone(),
+            });
             inner
                 .pending
-                .insert_pending(Pending::Elevation(PendingElevation {
-                    id: pending_id.clone(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0.0, |d| d.as_secs_f64()),
-                    argv: argv.to_vec(),
-                    cwd: cwd.map(PathBuf::from),
-                    home: home.map(PathBuf::from),
-                    project_root: project_root.map(PathBuf::from),
-                    sandbox_session_id: sandbox_session_id.map(String::from),
-                    package: package.map(String::from),
-                }));
+                .pending
+                .insert(pending.id().to_owned(), pending);
         }
 
         let detail = format!("id={pending_id} argv={argv:?}");
@@ -336,7 +323,7 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.elevation_futures.remove(pending_id);
                         drop(inner);
 
@@ -353,7 +340,7 @@ impl PolicyStore {
                     VerdictExit::ChannelClosed => ElevateReply::denied(),
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.elevation_futures.remove(pending_id);
                         drop(inner);
                         Self::audit("timeout", None, None, pending_id);
@@ -389,26 +376,23 @@ mod tests {
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
 
     use super::ELEVATION_PATH;
-    use crate::{store::test_store, wire::ElevationRequest};
+    use crate::store::test_store;
 
     fn system_profile_true() -> Option<PathBuf> {
         let path = Path::new(ELEVATION_PATH).join("true");
         path.is_file().then_some(path)
     }
 
-    fn elevation_request(argv: Vec<String>) -> ElevationRequest {
-        ElevationRequest {
-            argv,
-            ctx: ResolvedRequestContext {
-                paths: SandboxPaths::from_wire(
-                    Some("/repo".into()),
-                    Some("/home/user".into()),
-                    Some("/repo".into()),
-                ),
-                ids: ProcessIds::from_options(Some(0), Some(1000)),
-                sandbox_session_id: Some("sandbox-cap".into()),
-                package: None,
-            },
+    fn elevation_ctx() -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+            ),
+            ids: ProcessIds::from_options(Some(0), Some(1000)),
+            sandbox_session_id: Some("sandbox-cap".into()),
+            package: None,
         }
     }
 
@@ -423,10 +407,7 @@ mod tests {
 
         let task = tokio::spawn(async move {
             store_for_task
-                .request_elevation(elevation_request(vec![
-                    "systemctl".into(),
-                    "restart".into(),
-                ]))
+                .request_elevation(vec!["systemctl".into(), "restart".into()], elevation_ctx())
                 .await
         });
 
@@ -438,7 +419,8 @@ mod tests {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
                     .pending
-                    .pending_keys()
+                    .pending
+                    .keys()
                     .find(|k| k.starts_with("elev:"))
                     .cloned()
                 {
@@ -501,10 +483,11 @@ mod tests {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
 
-        let forged = crate::wire::MergeContext {
+        let forged = ResolvedRequestContext {
             paths: SandboxPaths::from_wire(Some(evil.clone()), Some(evil.clone()), Some(evil)),
             ids: ProcessIds::from_options(Some(0), Some(uid)),
             sandbox_session_id: None,
+            package: None,
         };
 
         let resolved = store.resolve_context_with_peer(&forged, Some(TrustedPeer { pid: 0, uid }));

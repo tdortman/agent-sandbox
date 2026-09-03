@@ -841,7 +841,7 @@ fn run_event_loop(
                     runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
 
                 let verdict = match &reply {
-                    Ok(r) if r.allowed => FAN_ALLOW,
+                    Ok(r) if r.verdict.allowed => FAN_ALLOW,
                     _ => FAN_DENY,
                 };
 

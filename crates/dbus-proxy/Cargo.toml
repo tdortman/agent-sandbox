@@ -9,7 +9,6 @@ agent-sandbox-core = { path = "../core" }
 
 clap.workspace = true
 futures-util.workspace = true
-nix = { workspace = true, features = ["socket"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tracing.workspace = true

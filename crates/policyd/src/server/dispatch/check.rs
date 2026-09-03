@@ -7,7 +7,7 @@ use agent_sandbox_core::{
     normalize_host, policy_host_for_connect,
 };
 
-use crate::{error::PolicydError, store::PolicyStore, wire::NetworkCheckRequest};
+use crate::{error::PolicydError, store::PolicyStore};
 
 /// Inputs for `handle_check`, grouped to keep the call signature small.
 pub struct CheckArgs {
@@ -119,16 +119,7 @@ pub async fn handle_check(
 
     Ok(RpcReply::Check(
         store
-            .request_network_approval_with_aliases(
-                NetworkCheckRequest {
-                    host: policy_host,
-                    port,
-                    scheme,
-                    url,
-                    ctx,
-                },
-                aliases,
-            )
+            .request_network_approval_with_aliases(policy_host, port, scheme, url, ctx, aliases)
             .await,
     ))
 }
@@ -247,9 +238,9 @@ mod tests {
 
         match reply {
             RpcReply::Check(check) => {
-                assert!(!check.allowed, "port 0 must be denied");
+                assert!(!check.verdict.allowed, "port 0 must be denied");
                 assert_eq!(
-                    check.source,
+                    check.verdict.source,
                     VerdictSource::PortZero,
                     "port 0 source must be 'port-zero'"
                 );
@@ -269,8 +260,8 @@ mod tests {
 
         match reply {
             RpcReply::Check(check) => {
-                assert!(!check.allowed, "port None must be denied");
-                assert_eq!(check.source, VerdictSource::PortZero);
+                assert!(!check.verdict.allowed, "port None must be denied");
+                assert_eq!(check.verdict.source, VerdictSource::PortZero);
             }
 
             other => panic!("expected Check reply, got {other:?}"),
@@ -302,8 +293,11 @@ mod tests {
 
         match first {
             RpcReply::Check(check) => {
-                assert!(check.allowed, "first once approval must allow");
-                assert_eq!(check.source, VerdictSource::Scope(ApprovalScope::Once));
+                assert!(check.verdict.allowed, "first once approval must allow");
+                assert_eq!(
+                    check.verdict.source,
+                    VerdictSource::Scope(ApprovalScope::Once)
+                );
             }
 
             other => panic!("expected Check reply, got {other:?}"),
@@ -321,10 +315,10 @@ mod tests {
         match second {
             RpcReply::Check(check) => {
                 assert!(
-                    !check.allowed,
+                    !check.verdict.allowed,
                     "second check must not reuse consumed once approval"
                 );
-                assert_eq!(check.source, VerdictSource::Blocked);
+                assert_eq!(check.verdict.source, VerdictSource::Blocked);
             }
 
             other => panic!("expected Check reply, got {other:?}"),

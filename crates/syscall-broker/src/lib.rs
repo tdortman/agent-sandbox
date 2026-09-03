@@ -1493,13 +1493,13 @@ mod tests {
     use agent_sandbox_syscall::policy::nr;
 
     use super::{
-        FileAccess, FilesystemMutation, FilesystemTarget, MsghdrParts, SECCOMP_IOCTL_NOTIF_ADDFD,
-        SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND,
-        SeccompData, SeccompNotif, SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg,
-        device_file_type, hex_encode_lower, is_at_fdcwd, is_device_bypass,
-        is_device_node_for_resource_gate, notification_arch_valid, parse_msghdr_target,
-        parse_sockaddr, resolve_open_path, resolve_tracee_path, scheme_for_socket_type,
-        target_from_notification, tracee_fd_path, tracee_open_dir_base,
+        MsghdrParts, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID,
+        SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
+        SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg, device_file_type,
+        hex_encode_lower, is_at_fdcwd, is_device_bypass, is_device_node_for_resource_gate,
+        notification_arch_valid, parse_msghdr_target, parse_sockaddr, resolve_open_path,
+        resolve_tracee_path, scheme_for_socket_type, target_from_notification, tracee_fd_path,
+        tracee_open_dir_base,
     };
 
     #[test]
@@ -1921,85 +1921,6 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).expect("remove temp dir");
-    }
-
-    /// Mirrors `dispatch_filesystem_target`: every `(path, access)` must pass
-    /// before the broker may continue the syscall.
-    #[cfg(test)]
-    async fn filesystem_target_allowed_with<F, Fut>(target: &FilesystemTarget, mut check: F) -> bool
-    where
-        F: FnMut(&Path, FileAccess) -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        for (path, access) in &target.checks {
-            if !check(path, *access).await {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    #[tokio::test]
-    async fn filesystem_mutation_dispatch_denies_when_any_endpoint_denied() {
-        let target = FilesystemTarget {
-            checks: vec![
-                (PathBuf::from("/repo/allowed.txt"), FileAccess::Write),
-                (PathBuf::from("/repo/denied.txt"), FileAccess::Write),
-            ],
-            operation: FilesystemMutation::Truncate {
-                dir: super::open_path_handle(Path::new("/")).expect("open root"),
-                path: b"/repo/allowed.txt".to_vec(),
-                len: 0,
-            },
-        };
-
-        let mut calls = 0_u32;
-
-        let allowed = filesystem_target_allowed_with(&target, |path, _access| {
-            calls += 1;
-            let denied = path == Path::new("/repo/denied.txt");
-            async move { !denied }
-        })
-        .await;
-
-        assert!(
-            !allowed,
-            "broker must deny when any mutation endpoint fails"
-        );
-
-        assert_eq!(calls, 2, "broker must CheckFilesystem every affected path");
-    }
-
-    #[tokio::test]
-    async fn filesystem_mutation_dispatch_short_circuits_on_first_denial() {
-        let target = FilesystemTarget {
-            checks: vec![
-                (PathBuf::from("/repo/denied.txt"), FileAccess::Write),
-                (PathBuf::from("/repo/allowed.txt"), FileAccess::Write),
-            ],
-            operation: FilesystemMutation::Truncate {
-                dir: super::open_path_handle(Path::new("/")).expect("open root"),
-                path: b"/repo/denied.txt".to_vec(),
-                len: 0,
-            },
-        };
-
-        let mut calls = 0_u32;
-
-        let allowed = filesystem_target_allowed_with(&target, |path, _access| {
-            calls += 1;
-            let denied = path == Path::new("/repo/denied.txt");
-            async move { !denied }
-        })
-        .await;
-
-        assert!(!allowed);
-
-        assert_eq!(
-            calls, 1,
-            "broker should stop checking once a mutation endpoint is denied"
-        );
     }
 
     #[test]

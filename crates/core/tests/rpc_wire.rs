@@ -80,8 +80,11 @@ fn proxy_http_reply_round_trips_as_a_single_json_line() {
             match proxy.reply {
                 ProxyReplyBody::HttpCheck(reply) => {
                     assert!(reply.ok);
-                    assert!(reply.allowed);
-                    assert_eq!(reply.source, VerdictSource::Scope(ApprovalScope::Session));
+                    assert!(reply.verdict.allowed);
+                    assert_eq!(
+                        reply.verdict.source,
+                        VerdictSource::Scope(ApprovalScope::Session)
+                    );
                     assert_eq!(reply.request, Some(request));
                 }
                 other => panic!("unexpected proxy body: {other:?}"),
@@ -107,8 +110,8 @@ fn denied_proxy_http_reply_round_trips_as_a_single_json_line() {
         RpcMessage::Reply(RpcReply::Proxy(proxy)) => match proxy.reply {
             ProxyReplyBody::HttpCheck(reply) => {
                 assert!(reply.ok);
-                assert!(!reply.allowed);
-                assert_eq!(reply.source, VerdictSource::User);
+                assert!(!reply.verdict.allowed);
+                assert_eq!(reply.verdict.source, VerdictSource::User);
                 assert_eq!(reply.request, Some(request));
             }
             other => panic!("unexpected proxy body: {other:?}"),

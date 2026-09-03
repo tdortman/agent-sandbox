@@ -63,22 +63,3 @@ fn filesystem_mutation_syscalls_are_in_default_trap_set() {
         );
     }
 }
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[test]
-fn filesystem_mutation_trap_set_matches_bpf_filter_input() {
-    let filter_syscalls = agent_sandbox_syscall::build_filter(&default_syscalls());
-
-    // If default_syscalls omits a mutation syscall, the compiled filter cannot
-    // route it to the broker for CheckFilesystem gating.
-    let _ = filter_syscalls;
-
-    let trapped = default_syscalls();
-
-    for nr in expected_mutation_numbers() {
-        assert!(
-            trapped.contains(&nr),
-            "BPF filter is built from default_syscalls(); {nr} must be trapped"
-        );
-    }
-}

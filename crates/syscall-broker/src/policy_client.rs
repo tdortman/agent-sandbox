@@ -82,7 +82,7 @@ impl PersistentPolicyClient {
         };
 
         match self.request(req, timeout).await {
-            Ok(RpcReply::Check(reply)) => reply.allowed,
+            Ok(RpcReply::Check(reply)) => reply.verdict.allowed,
 
             Ok(_) => {
                 self.invalidate();
@@ -304,7 +304,7 @@ mod tests {
             .await
             .expect("second request must reconnect");
 
-        assert!(second.allowed);
+        assert!(second.verdict.allowed);
         server.await.expect("policy test server");
         let _ = std::fs::remove_file(socket_path);
     }

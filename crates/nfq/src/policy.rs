@@ -48,7 +48,7 @@ pub async fn check_destination(
         .await
         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-    let allowed = matches!(resp, RpcReply::Check(check) if check.allowed);
+    let allowed = matches!(resp, RpcReply::Check(check) if check.verdict.allowed);
     Ok(allowed)
 }
 
@@ -88,24 +88,11 @@ pub fn is_bypass_traffic(dst_ip: IpAddr, dst_port: u16, dns_server_ip: IpAddr) -
     dst_ip == dns_server_ip && dst_port == 53
 }
 
-/// Run the configured `nft` binary with the given args, returning the output.
-fn run_nft_real(binary: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(binary).args(args).output()
-}
-
 /// Add the destination IP and port to the transient nftables reject set, then
 /// return `Verdict::Repeat` so nftables re-evaluates and rejects the packet.
 ///
 /// Falls back to `Verdict::Drop` if nft add fails.
 fn nft_reject_and_repeat(nft_binary: &str, dst_ip: IpAddr, dst_port: u16) -> Verdict {
-    nft_reject_and_repeat_inner(dst_ip, dst_port, |args| run_nft_real(nft_binary, args))
-}
-
-/// Inner reject helper with injectable command runner.
-fn nft_reject_and_repeat_inner<F>(dst_ip: IpAddr, dst_port: u16, run_nft: F) -> Verdict
-where
-    F: FnOnce(&[&str]) -> std::io::Result<std::process::Output>,
-{
     let set_name = match dst_ip {
         IpAddr::V4(_) => "reject_v4",
         IpAddr::V6(_) => "reject_v6",
@@ -113,16 +100,16 @@ where
 
     let element = format!("{{ {dst_ip} . {dst_port} timeout 5s }}");
 
-    let args = [
-        "add",
-        "element",
-        "inet",
-        "agent_sandbox",
-        set_name,
-        element.as_str(),
-    ];
-
-    let out = run_nft(&args);
+    let out = std::process::Command::new(nft_binary)
+        .args([
+            "add",
+            "element",
+            "inet",
+            "agent_sandbox",
+            set_name,
+            element.as_str(),
+        ])
+        .output();
 
     match out {
         Ok(o) if o.status.success() => {
@@ -231,10 +218,7 @@ pub fn transport_check(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr, Ipv6Addr},
-        os::unix::process::ExitStatusExt,
-    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::*;
     use crate::flow::{
@@ -321,34 +305,14 @@ mod tests {
 
     #[test]
     fn nft_reject_returns_repeat_when_insertion_succeeds() {
-        // Mock a successful nft command.
-        let mock_run = |_args: &[&str]| -> std::io::Result<std::process::Output> {
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })
-        };
-
-        let v =
-            nft_reject_and_repeat_inner(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443, mock_run);
+        let v = nft_reject_and_repeat("true", IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
 
         assert_eq!(v, Verdict::Repeat);
     }
 
     #[test]
     fn nft_reject_falls_back_to_drop_on_failure() {
-        // Mock a failing nft command.
-        let mock_run = |_args: &[&str]| -> std::io::Result<std::process::Output> {
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(1),
-                stdout: Vec::new(),
-                stderr: b"nft: no such file".to_vec(),
-            })
-        };
-
-        let v =
-            nft_reject_and_repeat_inner(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443, mock_run);
+        let v = nft_reject_and_repeat("false", IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
 
         assert_eq!(v, Verdict::Drop);
     }

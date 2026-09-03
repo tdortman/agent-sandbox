@@ -10,8 +10,8 @@ use std::{
     process,
 };
 
-use agent_sandbox_core::{FilesystemRule, ProcessIds, wire_context};
-use agent_sandbox_fsmon::start_monitor_trusted;
+use agent_sandbox_core::{FilesystemRule, ProcessIds, expand_home_path, wire_context};
+use agent_sandbox_fsmon::start_monitor;
 use clap::Parser as _;
 
 #[derive(clap::Parser, Debug)]
@@ -44,22 +44,6 @@ struct Cli {
     command: Vec<OsString>,
 }
 
-fn expand_home_static_allow(static_allow: &mut [FilesystemRule], home: Option<&Path>) {
-    let Some(home) = home else {
-        return;
-    };
-
-    let home = home.to_string_lossy();
-
-    for rule in static_allow {
-        if let Ok(rest) = rule.path.strip_prefix("~/") {
-            rule.path = PathBuf::from(format!("{}/{}", home.trim_end_matches('/'), rest.display()));
-        } else if rule.path == Path::new("~") {
-            rule.path = PathBuf::from(home.to_string());
-        }
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     let real_args = cli.command;
@@ -88,7 +72,10 @@ fn main() {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    expand_home_static_allow(&mut static_allow, home.as_deref().map(Path::new));
+    let home_path = home.as_deref().map(Path::new);
+    for rule in &mut static_allow {
+        rule.path = expand_home_path(&rule.path, home_path);
+    }
     eprintln!("agent-sandbox-fs-arm: starting filesystem monitor...");
 
     // Connect to policyd and request monitor startup.
@@ -98,11 +85,7 @@ fn main() {
         .expect("tokio runtime");
 
     let reply = runtime
-        .block_on(start_monitor_trusted(
-            Path::new(&socket_path),
-            ctx,
-            static_allow,
-        ))
+        .block_on(start_monitor(Path::new(&socket_path), ctx, static_allow))
         .unwrap_or_else(|e| {
             eprintln!("agent-sandbox-fs-arm: failed to start filesystem monitor: {e}");
             process::exit(1);

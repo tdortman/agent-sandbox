@@ -11,6 +11,7 @@ use super::{
     decisions::DecisionAction,
     http::{http_context, target_for_request},
     scope_apply::{ScopeApplyError, ScopeLadder, ScopePersistFlags},
+    state::apply_bucket,
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
 use crate::{error::PolicydError, wire::ScopeWire};
@@ -86,7 +87,13 @@ fn apply_http_memory_locked(
                 DecisionAction::Deny
             };
 
-            inner.session.http().apply(action, session_id, &key);
+            apply_bucket(
+                &mut inner.session.http_session_allow,
+                &mut inner.session.http_session_deny,
+                action,
+                session_id,
+                &key,
+            );
         }
 
         ScopeTarget::Project { .. }
@@ -204,7 +211,8 @@ impl PolicyStore {
             let inner = self.inner.lock().await;
             inner
                 .pending
-                .pending_values()
+                .pending
+                .values()
                 .filter_map(|pending| {
                     let Pending::Http(value) = pending else {
                         return None;
@@ -300,7 +308,10 @@ impl PolicyStore {
 
         {
             let mut inner = self.inner.lock().await;
-            inner.pending.insert_pending(Pending::Http(pending.clone()));
+            inner
+                .pending
+                .pending
+                .insert(pending.id.clone(), Pending::Http(pending.clone()));
         }
 
         let reply = self
@@ -567,8 +578,8 @@ mod tests {
             .expect("global approval");
 
         match &reply {
-            ScopeActionReply::Http(value) => {
-                assert_eq!(value.path.as_deref(), Some(policy_path.as_path()));
+            ScopeActionReply::Http { path, .. } => {
+                assert_eq!(path.as_deref(), Some(policy_path.as_path()));
             }
 
             _ => panic!("expected HTTP scope reply"),
@@ -657,8 +668,8 @@ mod tests {
             .expect("project_package approval without an explicit target");
 
         match &reply {
-            ScopeActionReply::Http(value) => {
-                assert_eq!(value.path.as_deref(), Some(policy_path.as_path()));
+            ScopeActionReply::Http { path, .. } => {
+                assert_eq!(path.as_deref(), Some(policy_path.as_path()));
             }
 
             _ => panic!("expected HTTP scope reply"),
@@ -733,7 +744,7 @@ mod tests {
             .expect("session approval must resolve");
 
         assert!(
-            matches!(reply, ScopeActionReply::Http(_)),
+            matches!(reply, ScopeActionReply::Http { .. }),
             "the direct approval must return an http scope action reply"
         );
 

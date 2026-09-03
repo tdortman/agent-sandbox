@@ -338,24 +338,9 @@ where
 /// Never.
 #[must_use]
 pub fn socket_type(fd: impl AsFd) -> Option<i32> {
-    let mut sock_type: libc::c_int = 0;
-
-    let mut optlen: libc::socklen_t =
-        u32::try_from(std::mem::size_of::<libc::c_int>()).expect("c_int size fits in socklen_t");
-
-    // SAFETY: getsockopt writes into the live `sock_type` and `optlen`. The fd
-    // is borrowed for the call. Arguments match the SO_TYPE signature.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_fd().as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&raw mut sock_type).cast::<libc::c_void>(),
-            &raw mut optlen,
-        )
-    };
-
-    (rc == 0).then_some(sock_type)
+    nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::SockType)
+        .ok()
+        .map(|sock_type| sock_type as i32)
 }
 
 /// Return `true` when the socket fd has a connected peer. For `SOCK_STREAM`

@@ -14,48 +14,40 @@ use uuid::Uuid;
 
 use super::{
     types::{
-        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingContext, PendingResource,
-        PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, Pending, PendingResource, PendingResult,
+        PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
-use crate::wire::ResourceCheckRequest;
 
 impl PolicyStore {
     /// Evaluate a resource access request, returning an immediate verdict
     /// when declarative rules or the verdict cache decide it, otherwise
     /// routing it through interactive approval.
-    pub async fn check_resource(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
-        let ResourceCheckRequest {
-            kind,
-            path,
-            access,
-            ctx,
-        } = req;
-
+    pub async fn check_resource(
+        &self,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+        ctx: ResolvedRequestContext,
+    ) -> ResourceCheckReply {
         if let Some(verdict) = self.resource_allow_source(kind, &path, access, &ctx).await {
             return ResourceCheckReply::from_verdict(verdict, kind, path.clone(), access);
         }
 
-        self.request_resource_approval(ResourceCheckRequest {
-            kind,
-            path,
-            access,
-            ctx,
-        })
-        .await
+        self.request_resource_approval(kind, path, access, ctx)
+            .await
     }
 
     /// Request interactive approval for a resource access, prompting the
     /// policy UI if needed and waiting for the verdict.
-    pub async fn request_resource_approval(&self, req: ResourceCheckRequest) -> ResourceCheckReply {
-        let ResourceCheckRequest {
-            kind,
-            path,
-            access,
-            ctx,
-        } = req;
-
+    pub async fn request_resource_approval(
+        &self,
+        kind: ResourceKind,
+        path: PathBuf,
+        access: ResourceAccess,
+        ctx: ResolvedRequestContext,
+    ) -> ResourceCheckReply {
         let wire_ids = ctx.ids;
         let cwd = ctx.paths.cwd_path();
         let home = ctx.paths.home_path();
@@ -75,13 +67,7 @@ impl PolicyStore {
         }
 
         let result = match self
-            .dedup_or_create_pending_resource(kind, &path, access, &PendingContext {
-                cwd: cwd.as_deref(),
-                home: home.as_deref(),
-                project_root: project_root.as_deref(),
-                sandbox_session_id: sandbox_session_id.as_deref(),
-                package: ctx.package.as_deref(),
-            })
+            .dedup_or_create_pending_resource(kind, &path, access, &ctx)
             .await
         {
             Ok(r) => r,
@@ -138,16 +124,7 @@ impl PolicyStore {
         let project_root = ctx.paths.project_root_path();
         let sandbox_session_id = ctx.sandbox_session_id.clone();
 
-        let result = match self
-            .dedup_or_create_pending_dbus(&target, &PendingContext {
-                cwd: cwd.as_deref(),
-                home: home.as_deref(),
-                project_root: project_root.as_deref(),
-                sandbox_session_id: sandbox_session_id.as_deref(),
-                package: ctx.package.as_deref(),
-            })
-            .await
-        {
+        let result = match self.dedup_or_create_pending_dbus(&target, &ctx).await {
             Ok(r) => r,
             Err(reply) => return *reply,
         };
@@ -227,7 +204,7 @@ impl PolicyStore {
         kind: ResourceKind,
         path: &Path,
         access: ResourceAccess,
-        ctx: &PendingContext<'_>,
+        ctx: &ResolvedRequestContext,
     ) -> Result<PendingResult<String, ResourceCheckReply>, ResourceCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
@@ -237,12 +214,12 @@ impl PolicyStore {
         // instead of creating a new prompt. The session is part of the key
         // so one sandbox's stale pending is not reused for another's
         // requests to the same socket.
-        let existing_id = inner.pending.pending_values().find_map(|p| match p {
+        let existing_id = inner.pending.pending.values().find_map(|p| match p {
             Pending::Resource(res)
                 if res.kind == kind
                     && res.path == path
                     && res.access == access
-                    && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
+                    && res.ctx.sandbox_session_id == ctx.sandbox_session_id =>
             {
                 Some(res.id.clone())
             }
@@ -281,7 +258,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
             return Err(ResourceCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 kind,
@@ -306,14 +283,11 @@ impl PolicyStore {
             kind,
             path: path.to_path_buf(),
             access,
-            cwd: ctx.cwd.map(PathBuf::from),
-            home: ctx.home.map(PathBuf::from),
-            project_root: ctx.project_root.map(PathBuf::from),
-            sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-            package: ctx.package.map(String::from),
+            ctx: ctx.clone(),
         });
 
-        inner.pending.insert_pending(pending);
+        let id = pending.id().to_owned();
+        inner.pending.pending.insert(id, pending);
         drop(inner);
 
         Ok(PendingResult {
@@ -326,17 +300,17 @@ impl PolicyStore {
     async fn dedup_or_create_pending_dbus(
         &self,
         target: &DbusTarget,
-        ctx: &PendingContext<'_>,
+        ctx: &ResolvedRequestContext,
     ) -> Result<PendingResult<String, DbusCheckReply>, Box<DbusCheckReply>> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
         // Deduplicate: if a pending already exists for the same target and
         // sandbox session, join its waiters instead of creating a new prompt.
-        let existing_id = inner.pending.pending_values().find_map(|p| match p {
+        let existing_id = inner.pending.pending.values().find_map(|p| match p {
             Pending::Dbus(res)
                 if &res.target == target
-                    && res.sandbox_session_id.as_deref() == ctx.sandbox_session_id =>
+                    && res.ctx.sandbox_session_id == ctx.sandbox_session_id =>
             {
                 Some(res.id.clone())
             }
@@ -373,7 +347,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
             return Err(Box::new(DbusCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 target.clone(),
@@ -394,14 +368,11 @@ impl PolicyStore {
             id: pending_id.clone(),
             created_at,
             target: target.clone(),
-            cwd: ctx.cwd.map(PathBuf::from),
-            home: ctx.home.map(PathBuf::from),
-            project_root: ctx.project_root.map(PathBuf::from),
-            sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-            package: ctx.package.map(String::from),
+            ctx: ctx.clone(),
         });
 
-        inner.pending.insert_pending(pending);
+        let id = pending.id().to_owned();
+        inner.pending.pending.insert(id, pending);
         drop(inner);
 
         Ok(PendingResult {
@@ -428,7 +399,7 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.resource_futures.remove(pending_id);
                         drop(inner);
 
@@ -448,7 +419,7 @@ impl PolicyStore {
                     ),
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.resource_futures.remove(pending_id);
                         drop(inner);
 
@@ -484,7 +455,7 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.dbus_futures.remove(pending_id);
                         drop(inner);
 
@@ -499,7 +470,7 @@ impl PolicyStore {
                     }
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.dbus_futures.remove(pending_id);
                         drop(inner);
 
@@ -587,7 +558,7 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::{Path, PathBuf},
+        path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -598,26 +569,18 @@ mod tests {
     };
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
-    use crate::{
-        store::{UiSessionContext, test_store, types::UiClient},
-        wire::ResourceCheckRequest,
-    };
+    use crate::store::{UiSessionContext, test_store, types::UiClient};
 
-    fn unique_request(path: &str) -> ResourceCheckRequest {
-        ResourceCheckRequest {
-            kind: ResourceKind::UnixSocket,
-            path: PathBuf::from(path),
-            access: ResourceAccess::Socket(SocketAccess::Connect),
-            ctx: ResolvedRequestContext {
-                paths: SandboxPaths::from_wire(
-                    Some("/repo".into()),
-                    Some("/home/user".into()),
-                    Some("/repo".into()),
-                ),
-                ids: ProcessIds::from_options(Some(0), Some(1000)),
-                sandbox_session_id: Some("sandbox-cap".into()),
-                package: None,
-            },
+    fn resource_ctx() -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+            ),
+            ids: ProcessIds::from_options(Some(0), Some(1000)),
+            sandbox_session_id: Some("sandbox-cap".into()),
+            package: None,
         }
     }
 
@@ -649,7 +612,12 @@ mod tests {
 
         let task = tokio::spawn(async move {
             store_for_task
-                .request_resource_approval(unique_request("/repo/fast.sock"))
+                .request_resource_approval(
+                    ResourceKind::UnixSocket,
+                    PathBuf::from("/repo/fast.sock"),
+                    ResourceAccess::Socket(SocketAccess::Connect),
+                    resource_ctx(),
+                )
                 .await
         });
 
@@ -671,7 +639,8 @@ mod tests {
             let inner = store.inner.lock().await;
             inner
                 .pending
-                .pending_keys()
+                .pending
+                .keys()
                 .find(|k| k.starts_with("res:"))
                 .cloned()
                 .expect("pending resource request should be tracked")
@@ -689,8 +658,14 @@ mod tests {
             .await;
 
         let reply = task.await.expect("task should not panic");
-        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
-        assert_eq!(reply.source, VerdictSource::policy_with_comment("test"));
+        assert!(
+            reply.verdict.allowed,
+            "expected allowed reply, got: {reply:?}"
+        );
+        assert_eq!(
+            reply.verdict.source,
+            VerdictSource::policy_with_comment("test")
+        );
     }
 
     #[tokio::test]
@@ -768,7 +743,8 @@ mod tests {
             let inner = store.inner.lock().await;
             inner
                 .pending
-                .pending_keys()
+                .pending
+                .keys()
                 .find(|k| k.starts_with("dbus:"))
                 .cloned()
                 .expect("pending D-Bus request should be tracked")
@@ -784,8 +760,14 @@ mod tests {
             .await;
 
         let reply = task.await.expect("task should not panic");
-        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
-        assert_eq!(reply.source, VerdictSource::policy_with_comment("test"));
+        assert!(
+            reply.verdict.allowed,
+            "expected allowed reply, got: {reply:?}"
+        );
+        assert_eq!(
+            reply.verdict.source,
+            VerdictSource::policy_with_comment("test")
+        );
         assert_eq!(reply.target, target);
         let inner = store.inner.lock().await;
 
@@ -804,7 +786,12 @@ mod tests {
 
         let task = tokio::spawn(async move {
             store_for_task
-                .request_resource_approval(unique_request("/repo/slow.sock"))
+                .request_resource_approval(
+                    ResourceKind::UnixSocket,
+                    PathBuf::from("/repo/slow.sock"),
+                    ResourceAccess::Socket(SocketAccess::Connect),
+                    resource_ctx(),
+                )
                 .await
         });
 
@@ -814,7 +801,8 @@ mod tests {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
                     .pending
-                    .pending_keys()
+                    .pending
+                    .keys()
                     .find(|k| k.starts_with("res:"))
                     .cloned()
                 {
@@ -845,18 +833,27 @@ mod tests {
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
 
-        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
-        assert_eq!(reply.source, VerdictSource::policy_with_comment("cli"));
+        assert!(
+            reply.verdict.allowed,
+            "expected allowed reply, got: {reply:?}"
+        );
+        assert_eq!(
+            reply.verdict.source,
+            VerdictSource::policy_with_comment("cli")
+        );
     }
 
     #[tokio::test]
     async fn resource_pending_dedup_is_scoped_to_the_sandbox_session() {
-        fn pending_ctx(session: &str) -> super::PendingContext<'_> {
-            super::PendingContext {
-                cwd: Some(Path::new("/repo")),
-                home: Some(Path::new("/home/user")),
-                project_root: Some(Path::new("/repo")),
-                sandbox_session_id: Some(session),
+        fn pending_ctx(session: &str) -> ResolvedRequestContext {
+            ResolvedRequestContext {
+                paths: SandboxPaths::from_wire(
+                    Some("/repo".into()),
+                    Some("/home/user".into()),
+                    Some("/repo".into()),
+                ),
+                ids: ProcessIds::default(),
+                sandbox_session_id: Some(session.into()),
                 package: None,
             }
         }

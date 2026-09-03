@@ -6,20 +6,16 @@
 //! for bubblewrap).
 
 use std::{
-    ffi::CString,
     fs::OpenOptions,
     io,
-    os::unix::ffi::OsStrExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process,
 };
 
 use caps::CapSet;
 use clap::Parser as _;
-use nix::{
-    sched::{CloneFlags, setns},
-    unistd::execvp,
-};
+use nix::sched::{CloneFlags, setns};
 
 fn die(msg: &str, err: &io::Error) -> ! {
     eprintln!("{msg}: {err}");
@@ -148,23 +144,15 @@ fn main() {
         die("drop capabilities", &err);
     }
 
-    let cargs: Vec<CString> = cli
+    let (prog, args) = cli
         .command
-        .iter()
-        .map(|s| CString::new(s.as_os_str().as_bytes()).expect("interior NUL"))
-        .collect();
+        .split_first()
+        .expect("clap requires at least one command");
 
-    let cmd = cargs
-        .first()
-        .expect("clap requires at least one command")
-        .clone();
+    // Replaces the process image; only returns when the exec fails.
+    let err = process::Command::new(prog).args(args).exec();
 
-    // execvp returns Result<Infallible, Errno>; the Ok arm is uninhabited
-    // because the process image is replaced. unwrap_err is safe because
-    // the compiler can prove the Ok variant is uninhabited.
-    let err = execvp(&cmd, &cargs).unwrap_err();
-
-    die("execvp", &io::Error::other(err));
+    die("exec", &err);
 }
 
 #[cfg(test)]

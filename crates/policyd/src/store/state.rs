@@ -3,7 +3,7 @@
 //!
 //! `SessionState` concentrates the deny-wins invariant for the runtime
 //! decision buckets: an approve always clears the matching deny key and
-//! vice versa, through [`BucketPair::apply`].
+//! vice versa, through [`apply_bucket`].
 //!
 //! `PendingBoard` concentrates the pending map and the per capability
 //! oneshot waiter maps, so a pending id, its futures, and its http
@@ -54,36 +54,34 @@ pub struct NetworkWaiter {
     pub(crate) tx: oneshot::Sender<CheckReply>,
 }
 
-/// A session allow/deny bucket pair with deny-wins insertion.
-pub struct BucketPair<'a, T> {
-    allow: &'a mut HashMap<String, HashSet<T>>,
-    deny: &'a mut HashMap<String, HashSet<T>>,
-}
-
-impl<T: Clone + Eq + std::hash::Hash> BucketPair<'_, T> {
-    /// Insert `key` for `session_id` under `action`, clearing the matching
-    /// key from the opposite bucket. Approve wins by removing deny; deny
-    /// wins by removing allow.
-    pub(crate) fn apply(&mut self, action: DecisionAction, session_id: &str, key: &T) {
-        match action {
-            DecisionAction::Approve => {
-                self.allow
-                    .entry(session_id.to_owned())
-                    .or_default()
-                    .insert(key.clone());
-                if let Some(bucket) = self.deny.get_mut(session_id) {
-                    bucket.remove(key);
-                }
+/// Insert `key` for `session_id` under `action`, clearing the matching
+/// key from the opposite bucket. Approve wins by removing deny; deny
+/// wins by removing allow.
+pub fn apply_bucket<T: Clone + Eq + std::hash::Hash>(
+    allow: &mut HashMap<String, HashSet<T>>,
+    deny: &mut HashMap<String, HashSet<T>>,
+    action: DecisionAction,
+    session_id: &str,
+    key: &T,
+) {
+    match action {
+        DecisionAction::Approve => {
+            allow
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(key.clone());
+            if let Some(bucket) = deny.get_mut(session_id) {
+                bucket.remove(key);
             }
+        }
 
-            DecisionAction::Deny => {
-                self.deny
-                    .entry(session_id.to_owned())
-                    .or_default()
-                    .insert(key.clone());
-                if let Some(bucket) = self.allow.get_mut(session_id) {
-                    bucket.remove(key);
-                }
+        DecisionAction::Deny => {
+            deny.entry(session_id.to_owned())
+                .or_default()
+                .insert(key.clone());
+
+            if let Some(bucket) = allow.get_mut(session_id) {
+                bucket.remove(key);
             }
         }
     }
@@ -110,50 +108,6 @@ pub struct SessionState {
     pub(crate) http_session_deny: HashMap<String, HashSet<HttpScopeKey>>,
 }
 
-impl SessionState {
-    pub(crate) const fn network(&mut self) -> BucketPair<'_, NetworkRuleKey> {
-        BucketPair {
-            allow: &mut self.session_allow,
-            deny: &mut self.session_deny,
-        }
-    }
-
-    pub(crate) const fn sudo(&mut self) -> BucketPair<'_, Vec<String>> {
-        BucketPair {
-            allow: &mut self.session_sudo_allow,
-            deny: &mut self.session_sudo_deny,
-        }
-    }
-
-    pub(crate) const fn filesystem(&mut self) -> BucketPair<'_, FilesystemRuleKey> {
-        BucketPair {
-            allow: &mut self.session_filesystem_allow,
-            deny: &mut self.session_filesystem_deny,
-        }
-    }
-
-    pub(crate) const fn resource(&mut self) -> BucketPair<'_, ResourceRuleKey> {
-        BucketPair {
-            allow: &mut self.session_resource_allow,
-            deny: &mut self.session_resource_deny,
-        }
-    }
-
-    pub(crate) const fn dbus(&mut self) -> BucketPair<'_, DbusTarget> {
-        BucketPair {
-            allow: &mut self.session_dbus_allow,
-            deny: &mut self.session_dbus_deny,
-        }
-    }
-
-    pub(crate) const fn http(&mut self) -> BucketPair<'_, HttpScopeKey> {
-        BucketPair {
-            allow: &mut self.http_session_allow,
-            deny: &mut self.http_session_deny,
-        }
-    }
-}
-
 /// The pending approval map plus the per capability oneshot waiter maps.
 #[derive(Default)]
 pub struct PendingBoard {
@@ -165,43 +119,6 @@ pub struct PendingBoard {
     pub(crate) dbus_futures: HashMap<String, Vec<oneshot::Sender<DbusCheckReply>>>,
     pub(crate) http_futures: HashMap<PendingHttpId, Vec<HttpWaiter>>,
     pub(crate) http_waiters: HashMap<ProxyCheckId, PendingHttpId>,
-}
-
-impl PendingBoard {
-    pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub(crate) fn pending_values(&self) -> impl Iterator<Item = &Pending> {
-        self.pending.values()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_keys(&self) -> impl Iterator<Item = &String> {
-        self.pending.keys()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_entries(&self) -> impl Iterator<Item = (&String, &Pending)> {
-        self.pending.iter()
-    }
-
-    pub(crate) fn pending_get(&self, pending_id: &str) -> Option<&Pending> {
-        self.pending.get(pending_id)
-    }
-
-    pub(crate) fn insert_pending(&mut self, pending: Pending) -> Option<Pending> {
-        let pending_id = pending.id().to_owned();
-        self.pending.insert(pending_id, pending)
-    }
-
-    pub(crate) fn take_pending(&mut self, pending_id: &str) -> Option<Pending> {
-        self.pending.remove(pending_id)
-    }
-
-    pub(crate) fn restore_pending(&mut self, pending: Pending) {
-        let _ = self.insert_pending(pending);
-    }
 }
 
 /// The full decision state behind `PolicyStore::inner`.

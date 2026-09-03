@@ -215,8 +215,15 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             session_id,
             context,
         } => {
-            let ctx = request_context(context);
-            handle_approve(socket, id, scope, session_id, ctx).await
+            let req = RpcRequest::Approve {
+                id,
+                scope,
+                session_id,
+                target: None,
+                comment: None,
+                ctx: request_context(context),
+            };
+            print_json(&rpc(socket, req).await?)
         }
 
         Command::ApproveHost {
@@ -226,8 +233,14 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             session_id,
             context,
         } => {
-            let ctx = request_context(context);
-            handle_approve_host(socket, host, port, scope, session_id, ctx).await
+            let req = RpcRequest::ApproveHost {
+                host,
+                port,
+                scope,
+                session_id,
+                ctx: request_context(context),
+            };
+            print_json(&rpc(socket, req).await?)
         }
 
         Command::ApproveHttp {
@@ -246,7 +259,10 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             session_id,
             package,
             launcher_pid,
-        } => handle_register_sandbox(socket, session_id, package, launcher_pid).await,
+        } => {
+            let req = register_sandbox_request(session_id, package, launcher_pid);
+            print_json(&rpc(socket, req).await?)
+        }
 
         Command::Deny {
             id,
@@ -254,8 +270,15 @@ async fn dispatch(socket: &Path, command: Command) -> Result<(), ApproveCliError
             session_id,
             context,
         } => {
-            let ctx = request_context(context);
-            handle_deny(socket, id, scope, session_id, ctx).await
+            let req = RpcRequest::Deny {
+                id,
+                scope,
+                session_id,
+                target: None,
+                comment: None,
+                ctx: request_context(context),
+            };
+            print_json(&rpc(socket, req).await?)
         }
     }
 }
@@ -275,59 +298,6 @@ const fn register_sandbox_request(
         package,
         launcher_pid,
     }
-}
-
-async fn handle_register_sandbox(
-    socket: &Path,
-    session_id: String,
-    package: String,
-    launcher_pid: u32,
-) -> Result<(), ApproveCliError> {
-    print_json(
-        &rpc(
-            socket,
-            register_sandbox_request(session_id, package, launcher_pid),
-        )
-        .await?,
-    )
-}
-
-async fn handle_approve(
-    socket: &Path,
-    id: String,
-    scope: ApprovalScope,
-    session_id: Option<String>,
-    ctx: RequestContext,
-) -> Result<(), ApproveCliError> {
-    let req = RpcRequest::Approve {
-        id,
-        scope,
-        session_id,
-        target: None,
-        comment: None,
-        ctx,
-    };
-
-    print_json(&rpc(socket, req).await?)
-}
-
-async fn handle_approve_host(
-    socket: &Path,
-    host: String,
-    port: u16,
-    scope: ApprovalScope,
-    session_id: Option<String>,
-    ctx: RequestContext,
-) -> Result<(), ApproveCliError> {
-    let req = RpcRequest::ApproveHost {
-        host,
-        port,
-        scope,
-        session_id,
-        ctx,
-    };
-
-    print_json(&rpc(socket, req).await?)
 }
 
 async fn handle_approve_http(
@@ -373,25 +343,6 @@ async fn handle_approve_http(
         target,
         scope,
         session_id,
-        ctx,
-    };
-
-    print_json(&rpc(socket, req).await?)
-}
-
-async fn handle_deny(
-    socket: &Path,
-    id: String,
-    scope: ApprovalScope,
-    session_id: Option<String>,
-    ctx: RequestContext,
-) -> Result<(), ApproveCliError> {
-    let req = RpcRequest::Deny {
-        id,
-        scope,
-        session_id,
-        target: None,
-        comment: None,
         ctx,
     };
 

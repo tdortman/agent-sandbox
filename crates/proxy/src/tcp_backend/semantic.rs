@@ -363,7 +363,7 @@ mod tests {
         ))
         .expect("semantic headers");
 
-        assert_eq!(headers.as_slice()[0].value(), &[0x80, b'a']);
+        assert_eq!(headers.as_slice()[0].1.as_bytes(), &[0x80, b'a']);
     }
 
     #[test]
@@ -388,17 +388,15 @@ mod tests {
         ))
         .expect("semantic headers");
 
-        assert!(
-            headers.as_slice().iter().all(|header| {
-                !["connection", "x-remove", "keep-alive"].contains(&header.name())
-            })
-        );
+        assert!(headers.as_slice().iter().all(|header| {
+            !["connection", "x-remove", "keep-alive"].contains(&header.0.as_str())
+        }));
 
         assert!(
             headers
                 .as_slice()
                 .iter()
-                .any(|header| header.name() == "x-end-to-end")
+                .any(|header| header.0.as_str() == "x-end-to-end")
         );
     }
 
@@ -411,18 +409,15 @@ mod tests {
         headers.insert("x-visible", HeaderValue::from_static("visible"));
         let semantic = semantic_response_headers(&headers).expect("response headers");
 
-        assert!(
-            semantic
-                .as_slice()
-                .iter()
-                .any(|header| { header.name() == "x-visible" && header.value() == b"visible" })
-        );
+        assert!(semantic.as_slice().iter().any(|header| {
+            header.0.as_str() == "x-visible" && header.1.as_bytes() == b"visible"
+        }));
 
         assert!(
             !semantic
                 .as_slice()
                 .iter()
-                .any(|header| header.name() == "x-private")
+                .any(|header| header.0.as_str() == "x-private")
         );
     }
 

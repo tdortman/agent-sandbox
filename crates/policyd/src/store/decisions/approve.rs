@@ -136,7 +136,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Network(net));
+                    .pending
+                    .insert(net.id.clone(), Pending::Network(net));
                 return err.into();
             }
         };
@@ -174,7 +175,7 @@ impl PolicyStore {
                     host: resolved.host.clone(),
                     port: resolved.port,
                     scope,
-                    wire: Self::scope_wire_for_pending(wire, &net),
+                    wire: Self::scope_wire_for_context(wire, &net.ctx),
                 },
                 action,
             )
@@ -225,7 +226,8 @@ impl PolicyStore {
                 .lock()
                 .await
                 .pending
-                .insert_pending(Pending::Network(net));
+                .pending
+                .insert(net.id.clone(), Pending::Network(net));
         }
 
         result
@@ -248,12 +250,13 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Elevation(elev));
+                    .pending
+                    .insert(elev.id.clone(), Pending::Elevation(elev));
                 return err.into();
             }
         };
 
-        let scope_wire = Self::scope_wire_for_pending(wire, &elev);
+        let scope_wire = Self::scope_wire_for_context(wire, &elev.ctx);
 
         if action == DecisionAction::Deny {
             if scope == ApprovalScope::Once {
@@ -285,7 +288,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Elevation(elev));
+                    .pending
+                    .insert(elev.id.clone(), Pending::Elevation(elev));
             }
 
             return result;
@@ -309,7 +313,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Elevation(elev));
+                    .pending
+                    .insert(elev.id.clone(), Pending::Elevation(elev));
                 return scope_result;
             }
             scope_result.scope_path()
@@ -321,8 +326,8 @@ impl PolicyStore {
         let elevation = match self
             .exec_elevation(
                 &argv,
-                elev.cwd.as_deref().or_else(|| scope_wire.paths.cwd()),
-                elev.home.as_deref().or_else(|| scope_wire.paths.home()),
+                elev.ctx.paths.cwd().or_else(|| scope_wire.paths.cwd()),
+                elev.ctx.paths.home().or_else(|| scope_wire.paths.home()),
             )
             .await
         {
@@ -332,7 +337,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Elevation(elev));
+                    .pending
+                    .insert(elev.id.clone(), Pending::Elevation(elev));
                 return err.into();
             }
         };
@@ -359,7 +365,9 @@ impl PolicyStore {
             &fs,
             scope,
             target,
-            wire.paths.project_root().or(fs.project_root.as_deref()),
+            wire.paths
+                .project_root()
+                .or_else(|| fs.ctx.paths.project_root()),
         ) {
             Ok(value) => value,
             Err(err) => {
@@ -367,7 +375,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Filesystem(fs));
+                    .pending
+                    .insert(fs.id.clone(), Pending::Filesystem(fs));
                 return err.into();
             }
         };
@@ -454,7 +463,8 @@ impl PolicyStore {
                 .lock()
                 .await
                 .pending
-                .insert_pending(Pending::Filesystem(fs));
+                .pending
+                .insert(fs.id.clone(), Pending::Filesystem(fs));
         }
 
         result
@@ -466,7 +476,7 @@ impl PolicyStore {
         fs: &PendingFilesystem,
         scope: ApprovalScope,
     ) -> crate::wire::ScopeWire {
-        let mut scope_wire = Self::scope_wire_for_pending(wire, fs);
+        let mut scope_wire = Self::scope_wire_for_context(wire, &fs.ctx);
 
         if scope != ApprovalScope::Session {
             return scope_wire;
@@ -496,7 +506,7 @@ impl PolicyStore {
         project_root: Option<&Path>,
     ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
-        let project_root = project_root.or(pending.project_root.as_deref());
+        let project_root = project_root.or_else(|| pending.ctx.paths.project_root());
 
         let path = match target {
             None => pending_path.clone(),
@@ -543,7 +553,8 @@ impl PolicyStore {
                         .lock()
                         .await
                         .pending
-                        .insert_pending(Pending::Dbus(res));
+                        .pending
+                        .insert(res.id.clone(), Pending::Dbus(res));
                     return PolicydError::InvalidDecisionTarget.into();
                 }
                 target.clone()
@@ -553,7 +564,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Dbus(res));
+                    .pending
+                    .insert(res.id.clone(), Pending::Dbus(res));
                 return PolicydError::InvalidDecisionTarget.into();
             }
         };
@@ -573,7 +585,7 @@ impl PolicyStore {
             return RpcReply::ScopeAction(ScopeActionReply::ok_dbus(dbus_target, scope, None));
         }
 
-        let scope_wire = Self::scope_wire_for_pending(wire, &res);
+        let scope_wire = Self::scope_wire_for_context(wire, &res.ctx);
 
         let result = self
             .apply_dbus_scope(dbus_target, scope, scope_wire, action)
@@ -587,7 +599,8 @@ impl PolicyStore {
                 .lock()
                 .await
                 .pending
-                .insert_pending(Pending::Dbus(res));
+                .pending
+                .insert(res.id.clone(), Pending::Dbus(res));
         }
 
         result
@@ -607,7 +620,9 @@ impl PolicyStore {
             &res,
             scope,
             target,
-            wire.paths.project_root().or(res.project_root.as_deref()),
+            wire.paths
+                .project_root()
+                .or_else(|| res.ctx.paths.project_root()),
         ) {
             Ok(value) => value,
             Err(err) => {
@@ -615,7 +630,8 @@ impl PolicyStore {
                     .lock()
                     .await
                     .pending
-                    .insert_pending(Pending::Resource(res));
+                    .pending
+                    .insert(res.id.clone(), Pending::Resource(res));
                 return err.into();
             }
         };
@@ -705,7 +721,8 @@ impl PolicyStore {
                 .lock()
                 .await
                 .pending
-                .insert_pending(Pending::Resource(res));
+                .pending
+                .insert(res.id.clone(), Pending::Resource(res));
         }
 
         result
@@ -717,7 +734,7 @@ impl PolicyStore {
         res: &PendingResource,
         scope: ApprovalScope,
     ) -> crate::wire::ScopeWire {
-        let mut scope_wire = Self::scope_wire_for_pending(wire, res);
+        let mut scope_wire = Self::scope_wire_for_context(wire, &res.ctx);
 
         if scope != ApprovalScope::Session {
             return scope_wire;
@@ -747,7 +764,7 @@ impl PolicyStore {
         project_root: Option<&Path>,
     ) -> Result<PathBuf, PolicydError> {
         let pending_path = &pending.path;
-        let project_root = project_root.or(pending.project_root.as_deref());
+        let project_root = project_root.or_else(|| pending.ctx.paths.project_root());
 
         let path = match target {
             None => pending_path.clone(),
@@ -861,8 +878,8 @@ mod tests {
 
     use agent_sandbox_core::{
         ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, NetworkRuleKey,
-        PendingSummary, ProcessIds, ResourceAccess, ResourceKind, RpcReply, SandboxPaths,
-        ScopeActionReply, SocketAccess, load_policy,
+        PendingSummary, ProcessIds, ResolvedRequestContext, ResourceAccess, ResourceKind, RpcReply,
+        SandboxPaths, ScopeActionReply, SocketAccess, load_policy,
     };
     use tokio::{net::UnixStream, sync::Mutex};
 
@@ -876,6 +893,20 @@ mod tests {
         wire::{PendingDecision, ScopeWire},
     };
 
+    fn pending_context(
+        cwd: Option<PathBuf>,
+        home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+        sandbox_session_id: Option<&str>,
+    ) -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(cwd, home, project_root),
+            ids: ProcessIds::default(),
+            sandbox_session_id: sandbox_session_id.map(str::to_owned),
+            package: None,
+        }
+    }
+
     #[test]
     fn network_target_accepts_parent_domain_patterns() {
         let pending = Pending::Network(PendingNetwork {
@@ -886,11 +917,7 @@ mod tests {
             scheme: "https".into(),
             url: "https://foo.bar.baz.com".into(),
             aliases: Vec::new(),
-            cwd: None,
-            home: None,
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, None, None, None),
         });
 
         let target = ApprovalTarget::NetworkHost {
@@ -921,11 +948,7 @@ mod tests {
             scheme: "https".into(),
             url: "https://api.v1.example.com".into(),
             aliases: Vec::new(),
-            cwd: None,
-            home: None,
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, None, None, None),
         };
 
         let target = ApprovalTarget::NetworkHost {
@@ -949,11 +972,7 @@ mod tests {
             id: "p1".into(),
             created_at: 0.0,
             argv: vec!["foo".into(), "bar".into(), "baz".into()],
-            cwd: None,
-            home: None,
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, None, None, None),
         });
 
         let target = ApprovalTarget::SudoCommand {
@@ -981,11 +1000,7 @@ mod tests {
             created_at: 0.0,
             path: "/home/user/projects/foo/src/main.rs".into(),
             access: FileAccess::Read,
-            cwd: None,
-            home: None,
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, None, None, None),
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1014,11 +1029,7 @@ mod tests {
             created_at: 0.0,
             path: "/home/user/projects/foo/src/main.rs".into(),
             access: FileAccess::Read,
-            cwd: None,
-            home: None,
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, None, None, None),
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1047,11 +1058,7 @@ mod tests {
             created_at: 0.0,
             path: "/home/user/file.txt".into(),
             access: FileAccess::Read,
-            cwd: None,
-            home: None,
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, None, None, None),
         });
 
         // Once scope: exact match is valid
@@ -1095,11 +1102,12 @@ mod tests {
             created_at: 0.0,
             path: "/home/user/repo/.gitattributes".into(),
             access: FileAccess::Read,
-            cwd: None,
-            home: Some("/home/user".into()),
-            project_root: Some("/home/user/repo".into()),
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(
+                None,
+                Some("/home/user".into()),
+                Some("/home/user/repo".into()),
+                None,
+            ),
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1129,11 +1137,12 @@ mod tests {
             kind: ResourceKind::UnixSocket,
             path: "/home/user/repo/.sock".into(),
             access: ResourceAccess::Socket(SocketAccess::Connect),
-            cwd: None,
-            home: Some("/home/user".into()),
-            project_root: Some("/home/user/repo".into()),
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(
+                None,
+                Some("/home/user".into()),
+                Some("/home/user/repo".into()),
+                None,
+            ),
         });
 
         let target = ApprovalTarget::ResourcePath {
@@ -1163,11 +1172,7 @@ mod tests {
             created_at: 0.0,
             path: "/home/user/repo/.git/config".into(),
             access: FileAccess::ReadWrite,
-            cwd: None,
-            home: Some("/home/user".into()),
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, Some("/home/user".into()), None, None),
         });
 
         let target = ApprovalTarget::FilesystemPath {
@@ -1207,11 +1212,7 @@ mod tests {
             created_at: 0.0,
             path: project_root.join(".git/config"),
             access: FileAccess::ReadWrite,
-            cwd: Some(project_root.clone()),
-            home: Some(home.clone()),
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(Some(project_root.clone()), Some(home.clone()), None, None),
         };
 
         let pending_id = pending.id.clone();
@@ -1221,7 +1222,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -1276,19 +1278,22 @@ mod tests {
         {
             let mut inner = store.inner.lock().await;
 
+            let pending = Pending::Filesystem(PendingFilesystem {
+                id: pending_id.clone(),
+                created_at: 0.0,
+                path: PathBuf::from("/etc/nextdns.conf"),
+                access: FileAccess::Read,
+                ctx: pending_context(
+                    Some(project.clone()),
+                    Some(home.clone()),
+                    Some(project.clone()),
+                    None,
+                ),
+            });
             inner
                 .pending
-                .insert_pending(Pending::Filesystem(PendingFilesystem {
-                    id: pending_id.clone(),
-                    created_at: 0.0,
-                    path: PathBuf::from("/etc/nextdns.conf"),
-                    access: FileAccess::Read,
-                    cwd: Some(project.clone()),
-                    home: Some(home.clone()),
-                    project_root: Some(project.clone()),
-                    sandbox_session_id: None,
-                    package: None,
-                }));
+                .pending
+                .insert(pending.id().to_owned(), pending);
 
             inner
                 .pending
@@ -1324,7 +1329,10 @@ mod tests {
 
         let check = rx.await.expect("pending waiter must receive the verdict");
 
-        assert!(!check.allowed, "scoped deny must deny the pending open");
+        assert!(
+            !check.verdict.allowed,
+            "scoped deny must deny the pending open"
+        );
 
         let line = serde_json::to_string(&RpcReply::FilesystemCheck(check))
             .expect("deny verdict must be wire-serializable");
@@ -1332,7 +1340,7 @@ mod tests {
         let decoded: RpcReply = serde_json::from_str(&line).expect("deny verdict must round-trip");
 
         assert!(
-            matches!(decoded, RpcReply::FilesystemCheck(decoded) if !decoded.allowed),
+            matches!(decoded, RpcReply::FilesystemCheck(decoded) if !decoded.verdict.allowed),
             "round-tripped deny verdict must stay denied"
         );
     }
@@ -1355,11 +1363,12 @@ mod tests {
             created_at: 0.0,
             path: project_root.join(".git/config"),
             access: FileAccess::ReadWrite,
-            cwd: Some(project_root.clone()),
-            home: Some(home.clone()),
-            project_root: Some(project_root.clone()),
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(
+                Some(project_root.clone()),
+                Some(home.clone()),
+                Some(project_root.clone()),
+                None,
+            ),
         };
 
         let pending_id = pending.id.clone();
@@ -1369,7 +1378,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -1444,11 +1454,7 @@ mod tests {
             kind: ResourceKind::UnixSocket,
             path: "/dev/fd/3".into(),
             access: ResourceAccess::Socket(SocketAccess::Connect),
-            cwd: None,
-            home: Some(home.clone()),
-            project_root: None,
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(None, Some(home.clone()), None, None),
         };
 
         let pending_id = pending.id.clone();
@@ -1458,7 +1464,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Resource(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Resource(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -1582,16 +1589,21 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.pending.insert_pending(Pending::Dbus(PendingDbus {
+            let pending = Pending::Dbus(PendingDbus {
                 id: pending_id.clone(),
                 created_at: 0.0,
                 target: target.clone(),
-                cwd: Some("/repo".into()),
-                home: Some("/home/user".into()),
-                project_root: Some("/repo".into()),
-                sandbox_session_id: None,
-                package: None,
-            }));
+                ctx: pending_context(
+                    Some("/repo".into()),
+                    Some("/home/user".into()),
+                    Some("/repo".into()),
+                    None,
+                ),
+            });
+            inner
+                .pending
+                .pending
+                .insert(pending.id().to_owned(), pending);
         }
 
         let ctx = agent_sandbox_core::ResolvedRequestContext {
@@ -1621,7 +1633,7 @@ mod tests {
 
         assert!(matches!(
             reply,
-            RpcReply::ScopeAction(ScopeActionReply::Dbus(_))
+            RpcReply::ScopeAction(ScopeActionReply::Dbus { .. })
         ));
 
         let inner = store.inner.lock().await;
@@ -1667,16 +1679,16 @@ mod tests {
 
         {
             let mut inner = store.inner.lock().await;
-            inner.pending.insert_pending(Pending::Dbus(PendingDbus {
+            let pending = Pending::Dbus(PendingDbus {
                 id: pending_id.clone(),
                 created_at: 0.0,
                 target: requested.clone(),
-                cwd: Some("/repo".into()),
-                home: Some(home.clone()),
-                project_root: None,
-                sandbox_session_id: None,
-                package: None,
-            }));
+                ctx: pending_context(Some("/repo".into()), Some(home.clone()), None, None),
+            });
+            inner
+                .pending
+                .pending
+                .insert(pending.id().to_owned(), pending);
         }
 
         add_ui_sessions(&store).await;
@@ -1744,11 +1756,12 @@ mod tests {
             created_at: 0.0,
             path: "/home/user/projects/foo/src/main.rs".into(),
             access: FileAccess::Read,
-            cwd: Some("/repo".into()),
-            home: Some("/home/user".into()),
-            project_root: Some("/repo".into()),
-            sandbox_session_id: None,
-            package: None,
+            ctx: pending_context(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+                None,
+            ),
         }
     }
 
@@ -1775,7 +1788,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -1875,7 +1889,7 @@ mod tests {
         );
 
         let mut pending = pending_filesystem();
-        pending.sandbox_session_id = Some("sandbox-a".into());
+        pending.ctx.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
 
         store
@@ -1883,7 +1897,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -1943,7 +1958,7 @@ mod tests {
         }
 
         let mut pending = pending_filesystem();
-        pending.sandbox_session_id = Some("sandbox-a".into());
+        pending.ctx.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
 
         store
@@ -1951,7 +1966,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -2004,7 +2020,7 @@ mod tests {
         }
 
         let mut pending = pending_filesystem();
-        pending.sandbox_session_id = Some("sandbox-a".into());
+        pending.ctx.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
 
         store
@@ -2012,7 +2028,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(
@@ -2050,7 +2067,7 @@ mod tests {
         );
 
         let mut pending = pending_filesystem();
-        pending.sandbox_session_id = Some("sandbox-a".into());
+        pending.ctx.sandbox_session_id = Some("sandbox-a".into());
         let pending_id = pending.id.clone();
 
         store
@@ -2058,7 +2075,8 @@ mod tests {
             .lock()
             .await
             .pending
-            .insert_pending(Pending::Filesystem(pending));
+            .pending
+            .insert(pending.id.clone(), Pending::Filesystem(pending));
 
         let reply = store
             .apply_pending_decision(

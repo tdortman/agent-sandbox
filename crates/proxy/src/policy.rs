@@ -499,12 +499,13 @@ impl PolicyError {
     }
 }
 
-/// Build the typed flow key used to claim an intercepted TCP connection.
+/// Build the typed flow key used to claim an intercepted flow.
 ///
 /// # Errors
 ///
 /// Returns an error when either socket endpoint has a zero port.
 pub fn flow_key(
+    protocol: FlowProtocol,
     source: SocketAddr,
     destination: SocketAddr,
 ) -> Result<NetworkFlowKey, PolicyError> {
@@ -515,31 +516,7 @@ pub fn flow_key(
         .ok_or_else(|| PolicyError::Rpc("destination port must be non-zero".to_owned()))?;
 
     Ok(NetworkFlowKey::new(
-        FlowProtocol::Tcp,
-        source.ip(),
-        source_port,
-        destination.ip(),
-        destination_port,
-    ))
-}
-
-/// Build the typed flow key used to claim an intercepted UDP association.
-///
-/// # Errors
-///
-/// Returns an error when either socket endpoint has a zero port.
-pub fn udp_flow_key(
-    source: SocketAddr,
-    destination: SocketAddr,
-) -> Result<NetworkFlowKey, PolicyError> {
-    let source_port = NonZeroU16::new(source.port())
-        .ok_or_else(|| PolicyError::Rpc("source port must be non-zero".to_owned()))?;
-
-    let destination_port = NonZeroU16::new(destination.port())
-        .ok_or_else(|| PolicyError::Rpc("destination port must be non-zero".to_owned()))?;
-
-    Ok(NetworkFlowKey::new(
-        FlowProtocol::Udp,
+        protocol,
         source.ip(),
         source_port,
         destination.ip(),
@@ -868,7 +845,7 @@ mod tests {
             .await?;
 
         assert!(check.ok);
-        assert!(check.allowed);
+        assert!(check.verdict.allowed);
 
         assert!(matches!(
             fake.events.recv().await,

@@ -183,7 +183,8 @@ fn check_reply_deserializes_as_check_not_simple() {
 
     assert!(matches!(
         reply,
-        RpcReply::Check(c) if c.allowed && c.source == VerdictSource::Scope(ApprovalScope::Once)
+        RpcReply::Check(c) if c.verdict.allowed
+            && c.verdict.source == VerdictSource::Scope(ApprovalScope::Once)
     ));
 }
 
@@ -198,7 +199,8 @@ fn package_scope_verdict_sources_round_trip() {
         assert!(matches!(
             reply,
             RpcReply::Check(c)
-                if c.allowed && matches!(c.source, VerdictSource::Scope(s) if s == scope)
+                if c.verdict.allowed
+                    && matches!(c.verdict.source, VerdictSource::Scope(s) if s == scope)
         ));
     }
 }
@@ -269,8 +271,8 @@ fn filesystem_check_reply_deserializes_as_filesystem_check() {
     assert!(matches!(
         reply,
         RpcReply::FilesystemCheck(c)
-            if c.allowed
-                && c.source == VerdictSource::Scope(ApprovalScope::Once)
+            if c.verdict.allowed
+                && c.verdict.source == VerdictSource::Scope(ApprovalScope::Once)
                 && c.path == Path::new("/data")
     ));
 }
@@ -283,8 +285,10 @@ fn check_reply_roundtrips_allow_comment_wire_string() {
     assert!(matches!(
         &reply,
         RpcReply::Check(CheckReply {
-            allowed: true,
-            source,
+            verdict: Verdict {
+                allowed: true,
+                source,
+            },
             error: None,
             ..
         }) if source == &VerdictSource::policy_with_comment("trusted policy file")

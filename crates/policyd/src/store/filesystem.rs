@@ -19,12 +19,10 @@ use uuid::Uuid;
 use super::{
     types::{
         MAX_PENDING_APPROVALS, MAX_STATIC_ALLOW_RULES, MAX_WAITERS_PER_PENDING, Pending,
-        PendingContext, PendingFilesystem, PendingResult, PolicyStore, VerdictEntry,
-        enforce_verdict_cache_limit,
+        PendingFilesystem, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
-use crate::wire::{FilesystemCheckRequest, FilesystemMonitorRequest};
 
 /// Timeout for waiting for the fsmon `ready` line.
 const FSMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,7 +82,9 @@ impl PolicyStore {
     /// readiness, and return a reply.
     pub async fn start_filesystem_monitor(
         &self,
-        req: FilesystemMonitorRequest,
+        peer_pid: u32,
+        ctx: ResolvedRequestContext,
+        static_allow: Vec<FilesystemRule>,
     ) -> FilesystemMonitorReply {
         let cmd = match &self.args.fs_monitor_cmd {
             Some(c) => c.clone(),
@@ -93,15 +93,14 @@ impl PolicyStore {
             }
         };
 
-        if req.peer_pid == 0 {
+        if peer_pid == 0 {
             return FilesystemMonitorReply::failed("cannot determine monitor target pid");
         }
 
-        if req.static_allow.len() > MAX_STATIC_ALLOW_RULES {
+        if static_allow.len() > MAX_STATIC_ALLOW_RULES {
             return FilesystemMonitorReply::failed("too many filesystem static allow rules");
         }
 
-        let ctx = req.ctx.clone();
         let cwd = ctx.paths.cwd_path();
         let home = ctx.paths.home_path();
         let project_root = ctx.paths.project_root_path();
@@ -111,7 +110,7 @@ impl PolicyStore {
 
         command
             .arg("--pid")
-            .arg(req.peer_pid.to_string())
+            .arg(peer_pid.to_string())
             .arg("--socket")
             .arg(&socket_str)
             .stdout(Stdio::piped())
@@ -128,7 +127,7 @@ impl PolicyStore {
         }
         command.arg("--static-policy").arg(&self.args.export_json);
 
-        let static_allow_input = req.static_allow.clone();
+        let static_allow_input = static_allow.clone();
         let home_for_expand = home.clone();
         let project_root_for_expand = project_root.clone();
 
@@ -167,8 +166,7 @@ impl PolicyStore {
             return FilesystemMonitorReply::failed("stdout not captured");
         };
 
-        tracing::info!(peer_pid = req.peer_pid, "spawning fsmon");
-        let peer_pid = req.peer_pid;
+        tracing::info!(peer_pid, "spawning fsmon");
 
         let result = tokio::time::timeout(
             FSMON_READY_TIMEOUT,
@@ -195,25 +193,29 @@ impl PolicyStore {
 
     /// Check a filesystem access request against static allow sources and,
     /// if not already allowed, route it to an interactive approval.
-    pub async fn check_filesystem(&self, req: FilesystemCheckRequest) -> FilesystemCheckReply {
-        let FilesystemCheckRequest { path, access, ctx } = req;
+    pub async fn check_filesystem(
+        &self,
+        path: PathBuf,
+        access: FileAccess,
+        ctx: ResolvedRequestContext,
+    ) -> FilesystemCheckReply {
         let access = normalize_directory_traverse_access(&path, access);
 
         if let Some(verdict) = self.filesystem_allow_source(&path, access, &ctx).await {
             return FilesystemCheckReply::from_verdict(verdict, path, access);
         }
 
-        self.request_filesystem_approval(FilesystemCheckRequest { path, access, ctx })
-            .await
+        self.request_filesystem_approval(path, access, ctx).await
     }
 
     /// Request interactive approval for a filesystem access, deduplicating
     /// concurrent requests for the same path and awaiting the user verdict.
     pub async fn request_filesystem_approval(
         &self,
-        req: FilesystemCheckRequest,
+        path: PathBuf,
+        access: FileAccess,
+        ctx: ResolvedRequestContext,
     ) -> FilesystemCheckReply {
-        let FilesystemCheckRequest { path, access, ctx } = req;
         let wire_ids = ctx.ids;
         let cwd = ctx.paths.cwd_path();
         let home = ctx.paths.home_path();
@@ -233,13 +235,7 @@ impl PolicyStore {
         }
 
         let result = match self
-            .dedup_or_create_pending_filesystem(&path, access, PendingContext {
-                cwd: cwd.as_deref(),
-                home: home.as_deref(),
-                project_root: project_root.as_deref(),
-                sandbox_session_id: sandbox_session_id.as_deref(),
-                package: ctx.package.as_deref(),
-            })
+            .dedup_or_create_pending_filesystem(&path, access, &ctx)
             .await
         {
             Ok(r) => r,
@@ -332,14 +328,14 @@ impl PolicyStore {
         &self,
         path: &Path,
         access: FileAccess,
-        ctx: PendingContext<'_>,
+        ctx: &ResolvedRequestContext,
     ) -> Result<PendingResult<String, FilesystemCheckReply>, FilesystemCheckReply> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().await;
 
         // Deduplicate: if a pending already exists for the same file and
         // access type, join its waiters instead of creating a new prompt.
-        let existing_id = inner.pending.pending_values().find_map(|p| {
+        let existing_id = inner.pending.pending.values().find_map(|p| {
             let Pending::Filesystem(fs) = p else {
                 return None;
             };
@@ -378,7 +374,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
             return Err(FilesystemCheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
                 path.to_path_buf(),
@@ -393,21 +389,19 @@ impl PolicyStore {
             .filesystem_futures
             .insert(pending_id.clone(), vec![tx]);
 
+        let pending = Pending::Filesystem(PendingFilesystem {
+            id: pending_id.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64()),
+            path: path.to_path_buf(),
+            access,
+            ctx: ctx.clone(),
+        });
         inner
             .pending
-            .insert_pending(Pending::Filesystem(PendingFilesystem {
-                id: pending_id.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
-                path: path.to_path_buf(),
-                access,
-                cwd: ctx.cwd.map(PathBuf::from),
-                home: ctx.home.map(PathBuf::from),
-                project_root: ctx.project_root.map(PathBuf::from),
-                sandbox_session_id: ctx.sandbox_session_id.map(String::from),
-                package: ctx.package.map(String::from),
-            }));
+            .pending
+            .insert(pending.id().to_owned(), pending);
 
         drop(inner);
 
@@ -462,7 +456,7 @@ impl PolicyStore {
                 match reason {
                     VerdictExit::NoUi => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.filesystem_futures.remove(pending_id);
                         drop(inner);
 
@@ -478,7 +472,7 @@ impl PolicyStore {
                     }
                     VerdictExit::Timeout => {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.take_pending(pending_id);
+                        inner.pending.pending.remove(pending_id);
                         inner.pending.filesystem_futures.remove(pending_id);
                         drop(inner);
 
@@ -540,7 +534,7 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::{Path, PathBuf},
+        path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -550,25 +544,18 @@ mod tests {
         SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
 
-    use crate::{
-        store::{test_store, types::PolicyStore},
-        wire::FilesystemCheckRequest,
-    };
+    use crate::store::{test_store, types::PolicyStore};
 
-    fn filesystem_request(path: &Path, access: FileAccess) -> FilesystemCheckRequest {
-        FilesystemCheckRequest {
-            path: path.into(),
-            access,
-            ctx: ResolvedRequestContext {
-                paths: SandboxPaths::from_wire(
-                    Some("/repo".into()),
-                    Some("/home/user".into()),
-                    Some("/repo".into()),
-                ),
-                ids: ProcessIds::from_options(Some(0), Some(1000)),
-                sandbox_session_id: Some("sandbox-cap".into()),
-                package: None,
-            },
+    fn filesystem_ctx() -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+            ),
+            ids: ProcessIds::from_options(Some(0), Some(1000)),
+            sandbox_session_id: Some("sandbox-cap".into()),
+            package: None,
         }
     }
 
@@ -583,10 +570,11 @@ mod tests {
 
         let task = tokio::spawn(async move {
             store_for_task
-                .request_filesystem_approval(filesystem_request(
-                    Path::new("/repo/file.txt"),
+                .request_filesystem_approval(
+                    PathBuf::from("/repo/file.txt"),
                     FileAccess::Read,
-                ))
+                    filesystem_ctx(),
+                )
                 .await
         });
 
@@ -598,7 +586,8 @@ mod tests {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
                     .pending
-                    .pending_keys()
+                    .pending
+                    .keys()
                     .find(|k| k.starts_with("fs:"))
                     .cloned()
                 {
@@ -630,7 +619,10 @@ mod tests {
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
 
-        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
+        assert!(
+            reply.verdict.allowed,
+            "expected allowed reply, got: {reply:?}"
+        );
     }
 
     #[tokio::test]
@@ -677,7 +669,7 @@ mod tests {
             .await
             .expect("deny verdict should be cached");
 
-        assert!(!reply.allowed);
+        assert!(!reply.verdict.allowed);
     }
 
     #[tokio::test]
@@ -732,28 +724,20 @@ mod tests {
         };
 
         let source_reply = store
-            .check_filesystem(FilesystemCheckRequest {
-                path: allowed_path.clone(),
-                access: FileAccess::ReadWrite,
-                ctx: ctx.clone(),
-            })
+            .check_filesystem(allowed_path.clone(), FileAccess::ReadWrite, ctx.clone())
             .await;
 
         let dest_reply = store
-            .check_filesystem(FilesystemCheckRequest {
-                path: denied_path.clone(),
-                access: FileAccess::ReadWrite,
-                ctx,
-            })
+            .check_filesystem(denied_path.clone(), FileAccess::ReadWrite, ctx)
             .await;
 
         assert!(
-            source_reply.allowed,
+            source_reply.verdict.allowed,
             "rename/link source must pass read_write CheckFilesystem, got: {source_reply:?}"
         );
 
         assert!(
-            !dest_reply.allowed,
+            !dest_reply.verdict.allowed,
             "rename/link destination must be denied on read_write, got: {dest_reply:?}"
         );
     }
@@ -809,28 +793,20 @@ mod tests {
         };
 
         let target_reply = store
-            .check_filesystem(FilesystemCheckRequest {
-                path: target_path.clone(),
-                access: FileAccess::Read,
-                ctx: ctx.clone(),
-            })
+            .check_filesystem(target_path.clone(), FileAccess::Read, ctx.clone())
             .await;
 
         let link_reply = store
-            .check_filesystem(FilesystemCheckRequest {
-                path: link_path.clone(),
-                access: FileAccess::Write,
-                ctx,
-            })
+            .check_filesystem(link_path.clone(), FileAccess::Write, ctx)
             .await;
 
         assert!(
-            target_reply.allowed,
+            target_reply.verdict.allowed,
             "symlink target must pass read CheckFilesystem, got: {target_reply:?}"
         );
 
         assert!(
-            !link_reply.allowed,
+            !link_reply.verdict.allowed,
             "symlink linkpath must be denied on write, got: {link_reply:?}"
         );
     }
@@ -877,20 +853,16 @@ mod tests {
         }
 
         let reply = store
-            .check_filesystem(FilesystemCheckRequest {
-                path: nested_path,
-                access: FileAccess::Read,
-                ctx,
-            })
+            .check_filesystem(nested_path, FileAccess::Read, ctx)
             .await;
 
         assert!(
-            reply.allowed,
+            reply.verdict.allowed,
             "broad static-allow globs must remain functional when not denied, got: {reply:?}"
         );
 
         assert_eq!(
-            reply.source,
+            reply.verdict.source,
             VerdictSource::Static,
             "static allow should be evaluated through policyd after deny/inode checks"
         );
@@ -952,19 +924,15 @@ mod tests {
         }
 
         let reply = store
-            .check_filesystem(FilesystemCheckRequest {
-                path: license_path,
-                access: FileAccess::Read,
-                ctx,
-            })
+            .check_filesystem(license_path, FileAccess::Read, ctx)
             .await;
 
         assert!(
-            !reply.allowed,
+            !reply.verdict.allowed,
             "policyd must deny before broad static-allow globs can allow, got: {reply:?}"
         );
 
-        assert_eq!(reply.source, VerdictSource::policy());
+        assert_eq!(reply.verdict.source, VerdictSource::policy());
     }
 
     #[test]

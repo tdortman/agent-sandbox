@@ -3,11 +3,7 @@
 //! Multi-path syscalls register every affected endpoint for
 //! `CheckFilesystem`, and dispatch denies when any endpoint is denied.
 
-use std::{
-    ffi::CString,
-    os::fd::{AsRawFd, OwnedFd},
-    path::{Path, PathBuf},
-};
+use std::{ffi::CString, os::fd::AsRawFd, path::PathBuf};
 
 use agent_sandbox_core::FileAccess;
 use agent_sandbox_syscall::policy::nr;
@@ -46,10 +42,6 @@ fn notif_with_path_args(syscall_nr: i64, paths: &[&str]) -> SeccompNotif {
     }
 }
 
-fn root_dir() -> OwnedFd {
-    std::fs::File::open("/").expect("open root").into()
-}
-
 fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
     let target = target_from_notification(notif).expect("classify notification");
 
@@ -58,22 +50,6 @@ fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
     };
 
     checks
-}
-
-/// Contract mirrored from filesystem target dispatch: every `(path, access)`
-/// pair must pass before the broker emulates the syscall.
-async fn filesystem_mutation_allowed<F, Fut>(target: &FilesystemTarget, mut check: F) -> bool
-where
-    F: FnMut(&Path, FileAccess) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    for (path, access) in &target.checks {
-        if !check(path, *access).await {
-            return false;
-        }
-    }
-
-    true
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -244,69 +220,4 @@ fn relative_renameat2_accepts_zero_extended_at_fdcwd() {
         (current_dir.join("old-path"), FileAccess::ReadWrite,),
         (current_dir.join("new-path"), FileAccess::ReadWrite,),
     ]);
-}
-
-#[tokio::test]
-async fn filesystem_mutation_dispatch_denies_when_any_endpoint_denied() {
-    let target = FilesystemTarget {
-        checks: vec![
-            (PathBuf::from("/repo/allowed.txt"), FileAccess::ReadWrite),
-            (PathBuf::from("/repo/denied.txt"), FileAccess::ReadWrite),
-        ],
-        operation: FilesystemMutation::Truncate {
-            dir: root_dir(),
-            path: b"/repo/allowed.txt".to_vec(),
-            len: 0,
-        },
-    };
-
-    let mut calls = 0_u32;
-
-    let allowed = filesystem_mutation_allowed(&target, |path, _access| {
-        calls += 1;
-        let ok = path != Path::new("/repo/denied.txt");
-        async move { ok }
-    })
-    .await;
-
-    assert!(
-        !allowed,
-        "broker must deny the syscall when any mutation endpoint fails CheckFilesystem"
-    );
-
-    assert_eq!(
-        calls, 2,
-        "broker must evaluate every endpoint up to the first denial"
-    );
-}
-
-#[tokio::test]
-async fn filesystem_mutation_dispatch_short_circuits_on_first_denial() {
-    let target = FilesystemTarget {
-        checks: vec![
-            (PathBuf::from("/repo/denied.txt"), FileAccess::ReadWrite),
-            (PathBuf::from("/repo/allowed.txt"), FileAccess::ReadWrite),
-        ],
-        operation: FilesystemMutation::Truncate {
-            dir: root_dir(),
-            path: b"/repo/denied.txt".to_vec(),
-            len: 0,
-        },
-    };
-
-    let mut calls = 0_u32;
-
-    let allowed = filesystem_mutation_allowed(&target, |path, _access| {
-        calls += 1;
-        let ok = path != Path::new("/repo/denied.txt");
-        async move { ok }
-    })
-    .await;
-
-    assert!(!allowed);
-
-    assert_eq!(
-        calls, 1,
-        "broker should stop checking once a mutation endpoint is denied"
-    );
 }

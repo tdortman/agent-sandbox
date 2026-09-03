@@ -14,7 +14,7 @@ use super::{
     state::ProxyCheckId,
     types::{MAX_PROXY_FLOWS, PolicyStore, ProxyCancellation, ProxyFlowState, ProxySessionState},
 };
-use crate::{error::PolicydError, wire::NetworkCheckRequest};
+use crate::error::PolicydError;
 
 const UNCLAIMED_TTL: Duration = Duration::from_secs(30);
 const MAX_PROXY_CANCEL_TOMBSTONES: usize = 4096;
@@ -363,13 +363,11 @@ impl PolicyStore {
 
         let reply = self
             .request_network_approval_with_aliases_cancellable(
-                NetworkCheckRequest {
-                    host,
-                    port,
-                    scheme: scheme_for(protocol, port).into(),
-                    url: String::new(),
-                    ctx,
-                },
+                host,
+                port,
+                scheme_for(protocol, port).into(),
+                String::new(),
+                ctx,
                 Vec::new(),
                 Some(ProxyCheckId {
                     session: proxy_session.clone(),
@@ -713,7 +711,7 @@ impl PolicyStore {
                     }
                 }
                 if retained.is_empty() {
-                    inner.pending.take_pending(&pending_id.to_string());
+                    inner.pending.pending.remove(&pending_id.to_string());
                 } else {
                     inner.pending.http_futures.insert(pending_id, retained);
                 }
@@ -1007,7 +1005,7 @@ mod tests {
             loop {
                 let inner = store.inner.lock().await;
                 if let Some((id, Pending::Network(pending))) =
-                    inner.pending.pending_entries().find(|(id, pending)| {
+                    inner.pending.pending.iter().find(|(id, pending)| {
                         id.starts_with("net:") && matches!(pending, Pending::Network(_))
                     })
                 {
@@ -1037,10 +1035,13 @@ mod tests {
             .expect("check task should not panic")
             .expect("check should succeed");
 
-        assert!(reply.allowed, "expected allowed reply, got {reply:?}");
+        assert!(
+            reply.verdict.allowed,
+            "expected allowed reply, got {reply:?}"
+        );
 
         assert_eq!(
-            reply.source,
+            reply.verdict.source,
             VerdictSource::policy_with_comment("test"),
             "raw fallback must use the transport policy verdict"
         );
@@ -1062,7 +1063,7 @@ mod tests {
             .await
             .expect("canceled check should return a verdict");
 
-        assert!(!canceled.allowed, "canceled check must be blocked");
+        assert!(!canceled.verdict.allowed, "canceled check must be blocked");
     }
 
     async fn test_udp_owner(source: std::net::SocketAddr) -> SocketIdentity {
@@ -1169,7 +1170,7 @@ mod tests {
             .await
             .expect("denied check should reply");
 
-        assert!(!denied.allowed, "deny rule must apply");
+        assert!(!denied.verdict.allowed, "deny rule must apply");
 
         let allowed = store
             .check_http(
@@ -1182,7 +1183,7 @@ mod tests {
             .expect("allowed check should reply");
 
         assert!(
-            allowed.allowed,
+            allowed.verdict.allowed,
             "allow rule must still apply on the same claim"
         );
 
@@ -1221,7 +1222,7 @@ mod tests {
             .await
             .expect("canceled check should reply");
 
-        assert!(!reply.allowed, "canceled check must be blocked");
+        assert!(!reply.verdict.allowed, "canceled check must be blocked");
 
         assert_eq!(
             reply.error.as_deref(),
@@ -1584,7 +1585,10 @@ mod tests {
             .await
             .expect("claim must survive long idle");
 
-        assert!(reply.allowed, "long-idle claim must still reach policy");
+        assert!(
+            reply.verdict.allowed,
+            "long-idle claim must still reach policy"
+        );
 
         store
             .release_network_flow(session, token, connection_id)

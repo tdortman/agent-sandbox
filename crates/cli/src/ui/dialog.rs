@@ -25,41 +25,6 @@ pub enum ApprovalReviewOutcome {
 /// Mutex serialising graphical prompts: only one prompt UI at a time.
 static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
-trait PolicyUiBackend {
-    fn select_option(&self, title: &str, options: &[&str]) -> Option<String>;
-    fn input_text(&self, title: &str, default_text: &str) -> Option<String>;
-}
-
-struct QtDialogBackend<'a> {
-    binary: String,
-    env: &'a HashMap<String, String>,
-}
-
-impl PolicyUiBackend for QtDialogBackend<'_> {
-    fn select_option(&self, title: &str, options: &[&str]) -> Option<String> {
-        qt_dialog_select(&self.binary, title, options, self.env)
-    }
-
-    fn input_text(&self, title: &str, default_text: &str) -> Option<String> {
-        qt_dialog_input(&self.binary, title, default_text, self.env)
-    }
-}
-
-struct ZenityBackend<'a> {
-    binary: String,
-    env: &'a HashMap<String, String>,
-}
-
-impl PolicyUiBackend for ZenityBackend<'_> {
-    fn select_option(&self, title: &str, options: &[&str]) -> Option<String> {
-        zenity_select(&self.binary, title, options, self.env)
-    }
-
-    fn input_text(&self, title: &str, default_text: &str) -> Option<String> {
-        zenity_input(&self.binary, title, default_text, self.env)
-    }
-}
-
 pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
     if prefer_graphical() {
         if let Some(c) = pick_with_backends(title, options) {
@@ -94,26 +59,6 @@ fn prefer_graphical() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok()
 }
 
-fn first_selected_option<'a>(
-    backends: impl IntoIterator<Item = &'a dyn PolicyUiBackend>,
-    title: &str,
-    options: &[&str],
-) -> Option<String> {
-    backends
-        .into_iter()
-        .find_map(|backend| backend.select_option(title, options))
-}
-
-fn first_input_text<'a>(
-    backends: impl IntoIterator<Item = &'a dyn PolicyUiBackend>,
-    title: &str,
-    default_text: &str,
-) -> Option<String> {
-    backends
-        .into_iter()
-        .find_map(|backend| backend.input_text(title, default_text))
-}
-
 fn graphical_env() -> HashMap<String, String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     let uid = nix::unistd::getuid().as_raw();
@@ -125,45 +70,56 @@ fn graphical_env() -> HashMap<String, String> {
     env
 }
 
-fn graphical_backends(env: &HashMap<String, String>) -> Vec<Box<dyn PolicyUiBackend + '_>> {
+fn pick_with_backends(title: &str, options: &[&str]) -> Option<String> {
+    let env = graphical_env();
     match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {
-        Some("qt-dialog") => resolve_qt_dialog(env)
-            .map(|binary| {
-                vec![Box::new(QtDialogBackend { binary, env }) as Box<dyn PolicyUiBackend + '_>]
-            })
-            .unwrap_or_default(),
-
-        Some("zenity") => resolve_zenity(env)
-            .map(|binary| {
-                vec![Box::new(ZenityBackend { binary, env }) as Box<dyn PolicyUiBackend + '_>]
-            })
-            .unwrap_or_default(),
-
-        Some("none") => Vec::new(),
-
+        Some("qt-dialog") => {
+            let binary = resolve_qt_dialog(&env)?;
+            qt_dialog_select(&binary, title, options, &env)
+        }
+        Some("zenity") => {
+            let binary = resolve_zenity(&env)?;
+            zenity_select(&binary, title, options, &env)
+        }
+        Some("none") => None,
         Some(_) | None => {
-            let mut backends: Vec<Box<dyn PolicyUiBackend + '_>> = Vec::new();
-            if let Some(binary) = resolve_qt_dialog(env) {
-                backends.push(Box::new(QtDialogBackend { binary, env }));
+            if let Some(binary) = resolve_qt_dialog(&env)
+                && let Some(choice) = qt_dialog_select(&binary, title, options, &env)
+            {
+                return Some(choice);
             }
-            if let Some(binary) = resolve_zenity(env) {
-                backends.push(Box::new(ZenityBackend { binary, env }));
+            if let Some(binary) = resolve_zenity(&env) {
+                return zenity_select(&binary, title, options, &env);
             }
-            backends
+            None
         }
     }
 }
 
-fn pick_with_backends(title: &str, options: &[&str]) -> Option<String> {
-    let env = graphical_env();
-    let backends = graphical_backends(&env);
-    first_selected_option(backends.iter().map(Box::as_ref), title, options)
-}
-
 fn input_with_backends(title: &str, default_text: &str) -> Option<String> {
     let env = graphical_env();
-    let backends = graphical_backends(&env);
-    first_input_text(backends.iter().map(Box::as_ref), title, default_text)
+    match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {
+        Some("qt-dialog") => {
+            let binary = resolve_qt_dialog(&env)?;
+            qt_dialog_input(&binary, title, default_text, &env)
+        }
+        Some("zenity") => {
+            let binary = resolve_zenity(&env)?;
+            zenity_input(&binary, title, default_text, &env)
+        }
+        Some("none") => None,
+        Some(_) | None => {
+            if let Some(binary) = resolve_qt_dialog(&env)
+                && let Some(input) = qt_dialog_input(&binary, title, default_text, &env)
+            {
+                return Some(input);
+            }
+            if let Some(binary) = resolve_zenity(&env) {
+                return zenity_input(&binary, title, default_text, &env);
+            }
+            None
+        }
+    }
 }
 
 pub fn review_approval(
@@ -456,42 +412,12 @@ mod tests {
     use agent_sandbox_core::ApprovalScope;
     use tempfile::{NamedTempFile, TempPath};
 
-    use super::{
-        ApprovalFormRequest, PolicyUiBackend, first_input_text, first_selected_option,
-        parse_review_result, qt_dialog_review,
-    };
+    use super::{ApprovalFormRequest, parse_review_result, qt_dialog_review};
     use crate::ui::options::{ApprovalFormContext, ReviewValidator, scope_only_options};
 
     struct EofReviewHelper {
         executable: TempPath,
         pid_file: TempPath,
-    }
-
-    struct FakeBackend {
-        select_result: Option<String>,
-        input_result: Option<String>,
-    }
-
-    impl PolicyUiBackend for FakeBackend {
-        fn select_option(&self, _title: &str, _options: &[&str]) -> Option<String> {
-            self.select_result.clone()
-        }
-
-        fn input_text(&self, _title: &str, _default_text: &str) -> Option<String> {
-            self.input_result.clone()
-        }
-    }
-
-    struct PanicSelectBackend;
-
-    impl PolicyUiBackend for PanicSelectBackend {
-        fn select_option(&self, _title: &str, _options: &[&str]) -> Option<String> {
-            panic!("backend should not be called after first success");
-        }
-
-        fn input_text(&self, _title: &str, _default_text: &str) -> Option<String> {
-            None
-        }
     }
 
     fn fake_review_helper() -> TempPath {
@@ -659,53 +585,6 @@ printf '%s' "$$" > "$PID_FILE"
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "helper process {pid} should be reaped"
         );
-    }
-
-    #[test]
-    fn select_option_uses_first_successful_backend() {
-        let a = FakeBackend {
-            select_result: None,
-            input_result: None,
-        };
-
-        let b = FakeBackend {
-            select_result: Some("Allow once".to_string()),
-            input_result: None,
-        };
-
-        let backends: [&dyn PolicyUiBackend; 2] = [&a, &b];
-        let result = first_selected_option(backends, "title", &["Allow once"]);
-        assert_eq!(result, Some("Allow once".to_string()));
-    }
-
-    #[test]
-    fn input_text_uses_first_successful_backend() {
-        let a = FakeBackend {
-            select_result: None,
-            input_result: None,
-        };
-
-        let b = FakeBackend {
-            select_result: None,
-            input_result: Some("./src".to_string()),
-        };
-
-        let backends: [&dyn PolicyUiBackend; 2] = [&a, &b];
-        let result = first_input_text(backends, "title", "./");
-        assert_eq!(result, Some("./src".to_string()));
-    }
-
-    #[test]
-    fn select_option_stops_after_first_success() {
-        let a = FakeBackend {
-            select_result: Some("A".to_string()),
-            input_result: None,
-        };
-
-        let b = PanicSelectBackend;
-        let backends: [&dyn PolicyUiBackend; 2] = [&a, &b];
-        let result = first_selected_option(backends, "title", &["A", "B"]);
-        assert_eq!(result, Some("A".to_string()));
     }
 
     #[test]

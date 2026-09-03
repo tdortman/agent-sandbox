@@ -111,9 +111,9 @@ impl PolicyStore {
         pending: &PendingFilesystem,
     ) -> HashSet<String> {
         let route = Self::route_for_pending_fields(
-            pending.cwd.as_deref(),
-            pending.project_root.as_deref(),
-            pending.sandbox_session_id.as_deref(),
+            pending.ctx.paths.cwd(),
+            pending.ctx.paths.project_root(),
+            pending.ctx.sandbox_session_id.as_deref(),
         );
 
         self.session_ids_for_route(&route).await
@@ -124,9 +124,9 @@ impl PolicyStore {
         pending: &PendingResource,
     ) -> HashSet<String> {
         let route = Self::route_for_pending_fields(
-            pending.cwd.as_deref(),
-            pending.project_root.as_deref(),
-            pending.sandbox_session_id.as_deref(),
+            pending.ctx.paths.cwd(),
+            pending.ctx.paths.project_root(),
+            pending.ctx.sandbox_session_id.as_deref(),
         );
 
         self.session_ids_for_route(&route).await
@@ -358,7 +358,8 @@ impl PolicyStore {
             .lock()
             .await
             .pending
-            .pending_values()
+            .pending
+            .values()
             .cloned()
             .collect();
         let deadline = tokio::time::Instant::now() + UI_SPAWN_WAIT;
@@ -425,10 +426,10 @@ impl PolicyStore {
                 port: Some(net.port),
                 scheme: Some(net.scheme.clone()),
                 url: attach_check_aliases(Some(net.url.clone()), &net.aliases),
-                cwd: net.cwd.clone(),
-                home: net.home.clone(),
-                project_root: net.project_root.clone(),
-                package: net.package.clone(),
+                cwd: net.ctx.paths.cwd_path(),
+                home: net.ctx.paths.home_path(),
+                project_root: net.ctx.paths.project_root_path(),
+                package: net.ctx.package.clone(),
             },
             Pending::Http(http) => UiPush::HttpRequest {
                 id: http.pending_id,
@@ -442,38 +443,38 @@ impl PolicyStore {
             Pending::Elevation(elev) => UiPush::ElevationRequest {
                 id: elev.id.clone(),
                 argv: Some(elev.argv.clone()),
-                cwd: elev.cwd.clone(),
-                home: elev.home.clone(),
-                project_root: elev.project_root.clone(),
-                package: elev.package.clone(),
+                cwd: elev.ctx.paths.cwd_path(),
+                home: elev.ctx.paths.home_path(),
+                project_root: elev.ctx.paths.project_root_path(),
+                package: elev.ctx.package.clone(),
             },
             Pending::Filesystem(fs) => UiPush::FilesystemRequest {
                 id: fs.id.clone(),
                 path: fs.path.clone(),
                 access: fs.access,
-                cwd: fs.cwd.clone(),
-                home: fs.home.clone(),
-                project_root: fs.project_root.clone(),
-                package: fs.package.clone(),
+                cwd: fs.ctx.paths.cwd_path(),
+                home: fs.ctx.paths.home_path(),
+                project_root: fs.ctx.paths.project_root_path(),
+                package: fs.ctx.package.clone(),
             },
             Pending::Resource(res) => UiPush::ResourceRequest {
                 id: res.id.clone(),
                 kind: res.kind,
                 path: res.path.clone(),
                 access: res.access,
-                cwd: res.cwd.clone(),
-                home: res.home.clone(),
-                project_root: res.project_root.clone(),
-                package: res.package.clone(),
+                cwd: res.ctx.paths.cwd_path(),
+                home: res.ctx.paths.home_path(),
+                project_root: res.ctx.paths.project_root_path(),
+                package: res.ctx.package.clone(),
             },
             Pending::Dbus(res) => UiPush::DbusRequest {
                 id: res.id.clone(),
                 target: res.target.clone(),
-                cwd: res.cwd.clone(),
-                home: res.home.clone(),
-                project_root: res.project_root.clone(),
-                sandbox_session_id: res.sandbox_session_id.clone(),
-                package: res.package.clone(),
+                cwd: res.ctx.paths.cwd_path(),
+                home: res.ctx.paths.home_path(),
+                project_root: res.ctx.paths.project_root_path(),
+                sandbox_session_id: res.ctx.sandbox_session_id.clone(),
+                package: res.ctx.package.clone(),
             },
         };
 
@@ -558,7 +559,8 @@ impl PolicyStore {
             .lock()
             .await
             .pending
-            .pending_values()
+            .pending
+            .values()
             .cloned()
             .collect();
 
@@ -572,7 +574,7 @@ impl PolicyStore {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use agent_sandbox_core::FileAccess;
+    use agent_sandbox_core::{FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths};
     use tokio::{
         io::AsyncReadExt,
         net::UnixStream,
@@ -614,6 +616,19 @@ mod tests {
         read
     }
 
+    fn test_ctx(sandbox_session_id: &str) -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+            ),
+            ids: ProcessIds::default(),
+            sandbox_session_id: Some(sandbox_session_id.into()),
+            package: None,
+        }
+    }
+
     fn pending_network(id: &str) -> Pending {
         Pending::Network(PendingNetwork {
             id: id.into(),
@@ -623,11 +638,7 @@ mod tests {
             scheme: "tcp".into(),
             url: "tcp://example.com:443".into(),
             aliases: Vec::new(),
-            cwd: Some("/repo".into()),
-            home: Some("/home/user".into()),
-            project_root: Some("/repo".into()),
-            sandbox_session_id: Some("sandbox-a".into()),
-            package: None,
+            ctx: test_ctx("sandbox-a"),
         })
     }
 
@@ -637,11 +648,7 @@ mod tests {
             created_at: 0.0,
             path: "/repo/file.txt".into(),
             access: FileAccess::Read,
-            cwd: Some("/repo".into()),
-            home: Some("/home/user".into()),
-            project_root: Some("/repo".into()),
-            sandbox_session_id: Some("sandbox-a".into()),
-            package: None,
+            ctx: test_ctx("sandbox-a"),
         })
     }
 
@@ -653,8 +660,14 @@ mod tests {
         let pending = pending_network("net:spawn-race");
         let pending_second = pending_network("net:spawn-race-second");
         let mut inner = store.inner.lock().await;
-        inner.pending.insert_pending(pending);
-        inner.pending.insert_pending(pending_second);
+        inner
+            .pending
+            .pending
+            .insert(pending.id().to_owned(), pending);
+        inner
+            .pending
+            .pending
+            .insert(pending_second.id().to_owned(), pending_second);
         drop(inner);
         let (read_tx, read_rx) = oneshot::channel();
         let registration_store = Arc::clone(&store);
@@ -722,12 +735,14 @@ mod tests {
         let mut foreign_read = register_ui(&store, 2, "ui-foreign", "sandbox-b").await;
         let mut live_read = register_ui(&store, 3, "ui-live", "sandbox-a").await;
 
+        let pending = pending_network("net:reroute");
         store
             .inner
             .lock()
             .await
             .pending
-            .insert_pending(pending_network("net:reroute"));
+            .pending
+            .insert(pending.id().to_owned(), pending);
 
         store.end_ui_session(1).await;
         let mut live_buf = [0u8; 1024];
@@ -765,12 +780,14 @@ mod tests {
         let mut foreign_read = register_ui(&store, 2, "ui-foreign", "sandbox-b").await;
         let mut live_read = register_ui(&store, 3, "ui-live", "sandbox-a").await;
 
+        let pending = pending_filesystem("fs:reroute");
         store
             .inner
             .lock()
             .await
             .pending
-            .insert_pending(pending_filesystem("fs:reroute"));
+            .pending
+            .insert(pending.id().to_owned(), pending);
 
         store.end_ui_session(1).await;
         let mut live_buf = [0u8; 1024];
@@ -888,13 +905,19 @@ mod tests {
         let mut recovered_pending = pending_network("net:recovered");
 
         if let Pending::Network(network) = &mut recovered_pending {
-            network.sandbox_session_id = Some("sandbox-b".into());
+            network.ctx.sandbox_session_id = Some("sandbox-b".into());
         }
 
         {
             let mut inner = store.inner.lock().await;
-            inner.pending.insert_pending(dead_pending.clone());
-            inner.pending.insert_pending(recovered_pending);
+            inner
+                .pending
+                .pending
+                .insert(dead_pending.id().to_owned(), dead_pending.clone());
+            inner
+                .pending
+                .pending
+                .insert(recovered_pending.id().to_owned(), recovered_pending);
         }
 
         store.notify_pending(&dead_pending).await;

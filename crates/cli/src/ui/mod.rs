@@ -9,7 +9,6 @@ mod push;
 
 use std::{
     fs::{File, OpenOptions},
-    future::Future,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -285,16 +284,15 @@ impl UiClient {
             }
         };
 
-        process_prompts(queued_pushes, |push| self.handle_prompt(&session_id, push)).await;
+        for push in queued_pushes {
+            self.handle_prompt(&session_id, push).await;
+        }
 
         loop {
             let msg = conn.read_message().await?;
 
             if let RpcMessage::UiPush(push) = msg {
-                process_prompts(std::iter::once(push), |push| {
-                    self.handle_prompt(&session_id, push)
-                })
-                .await;
+                self.handle_prompt(&session_id, push).await;
             }
         }
     }
@@ -330,73 +328,16 @@ impl UiClient {
     }
 }
 
-async fn process_prompts<F, Fut>(pushes: impl IntoIterator<Item = UiPush>, mut process: F)
-where
-    F: FnMut(UiPush) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    for push in pushes {
-        process(push).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::Arc;
 
     use tokio::{
-        sync::{Mutex, Notify, oneshot},
+        sync::{Notify, oneshot},
         time::timeout,
     };
 
     use super::*;
-
-    #[tokio::test]
-    async fn queued_prompts_are_processed_serially() {
-        let pushes = (0..4)
-            .map(|id| UiPush::NetworkRequest {
-                id: id.to_string(),
-                host: Some("example.com".into()),
-                port: Some(443),
-                scheme: Some("https".into()),
-                url: Some("https://example.com/".into()),
-                cwd: None,
-                home: None,
-                project_root: None,
-                package: None,
-            })
-            .collect::<Vec<_>>();
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let seen_by_handler = Arc::clone(&seen);
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-
-        process_prompts(pushes, |push| {
-            let seen = Arc::clone(&seen_by_handler);
-            let active = Arc::clone(&active);
-            let max_active = Arc::clone(&max_active);
-
-            async move {
-                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                max_active.fetch_max(current, Ordering::SeqCst);
-
-                if let UiPush::NetworkRequest { id, .. } = push {
-                    seen.lock().await.push(id);
-                }
-
-                tokio::task::yield_now().await;
-                active.fetch_sub(1, Ordering::SeqCst);
-            }
-        })
-        .await;
-
-        assert_eq!(*seen.lock().await, ["0", "1", "2", "3"].map(str::to_owned));
-        assert_eq!(max_active.load(Ordering::SeqCst), 1);
-    }
 
     #[tokio::test]
     async fn prompt_lock_serializes_independent_workers() {

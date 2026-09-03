@@ -183,16 +183,8 @@ pub struct PendingElevation {
     pub created_at: f64,
     /// Commandline arguments to elevate.
     pub argv: Vec<String>,
-    /// Optional current working directory.
-    pub cwd: Option<PathBuf>,
-    /// Optional home directory.
-    pub home: Option<PathBuf>,
-    /// Optional project root directory.
-    pub project_root: Option<PathBuf>,
-    /// Optional sandbox session id.
-    pub sandbox_session_id: Option<String>,
-    /// Optional package attribution.
-    pub package: Option<String>,
+    /// Resolved request context for attribution.
+    pub ctx: ResolvedRequestContext,
 }
 
 /// A pending network approval request.
@@ -212,16 +204,8 @@ pub struct PendingNetwork {
     pub url: String,
     /// Host aliases supplied for attribution.
     pub aliases: Vec<String>,
-    /// Optional current working directory.
-    pub cwd: Option<PathBuf>,
-    /// Optional home directory.
-    pub home: Option<PathBuf>,
-    /// Optional project root directory.
-    pub project_root: Option<PathBuf>,
-    /// Optional sandbox session id.
-    pub sandbox_session_id: Option<String>,
-    /// Optional package attribution.
-    pub package: Option<String>,
+    /// Resolved request context for attribution.
+    pub ctx: ResolvedRequestContext,
 }
 
 /// A pending HTTP approval request.
@@ -253,16 +237,8 @@ pub struct PendingFilesystem {
     pub path: PathBuf,
     /// Access mode requested.
     pub access: FileAccess,
-    /// Optional current working directory.
-    pub cwd: Option<PathBuf>,
-    /// Optional home directory.
-    pub home: Option<PathBuf>,
-    /// Optional project root directory.
-    pub project_root: Option<PathBuf>,
-    /// Optional sandbox session id.
-    pub sandbox_session_id: Option<String>,
-    /// Optional package attribution.
-    pub package: Option<String>,
+    /// Resolved request context for attribution.
+    pub ctx: ResolvedRequestContext,
 }
 
 /// A pending resource approval request.
@@ -278,16 +254,8 @@ pub struct PendingResource {
     pub path: PathBuf,
     /// Access mode requested.
     pub access: ResourceAccess,
-    /// Optional current working directory.
-    pub cwd: Option<PathBuf>,
-    /// Optional home directory.
-    pub home: Option<PathBuf>,
-    /// Optional project root directory.
-    pub project_root: Option<PathBuf>,
-    /// Optional sandbox session id.
-    pub sandbox_session_id: Option<String>,
-    /// Optional package attribution.
-    pub package: Option<String>,
+    /// Resolved request context for attribution.
+    pub ctx: ResolvedRequestContext,
 }
 
 /// A pending D-Bus approval request.
@@ -299,16 +267,8 @@ pub struct PendingDbus {
     pub created_at: f64,
     /// D-Bus target being addressed.
     pub target: DbusTarget,
-    /// Optional current working directory.
-    pub cwd: Option<PathBuf>,
-    /// Optional home directory.
-    pub home: Option<PathBuf>,
-    /// Optional project root directory.
-    pub project_root: Option<PathBuf>,
-    /// Optional sandbox session id.
-    pub sandbox_session_id: Option<String>,
-    /// Optional package attribution.
-    pub package: Option<String>,
+    /// Resolved request context for attribution.
+    pub ctx: ResolvedRequestContext,
 }
 
 /// Kind of a pending approval request, mirroring the [`Pending`] variants.
@@ -326,15 +286,6 @@ pub enum PendingKind {
     Resource,
     /// D-Bus approval request.
     Dbus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PendingContext<'a> {
-    pub(super) cwd: Option<&'a Path>,
-    pub(super) home: Option<&'a Path>,
-    pub(super) project_root: Option<&'a Path>,
-    pub(super) sandbox_session_id: Option<&'a str>,
-    pub(super) package: Option<&'a str>,
 }
 
 /// Pending approval awaiting a policy decision.
@@ -398,12 +349,12 @@ impl Pending {
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
         match self {
-            Self::Elevation(p) => p.cwd.as_deref(),
-            Self::Network(p) => p.cwd.as_deref(),
+            Self::Elevation(p) => p.ctx.paths.cwd(),
+            Self::Network(p) => p.ctx.paths.cwd(),
             Self::Http(p) => p.context.cwd.as_deref(),
-            Self::Filesystem(p) => p.cwd.as_deref(),
-            Self::Resource(p) => p.cwd.as_deref(),
-            Self::Dbus(p) => p.cwd.as_deref(),
+            Self::Filesystem(p) => p.ctx.paths.cwd(),
+            Self::Resource(p) => p.ctx.paths.cwd(),
+            Self::Dbus(p) => p.ctx.paths.cwd(),
         }
     }
 
@@ -411,12 +362,12 @@ impl Pending {
     #[must_use]
     pub fn home(&self) -> Option<&Path> {
         match self {
-            Self::Elevation(p) => p.home.as_deref(),
-            Self::Network(p) => p.home.as_deref(),
+            Self::Elevation(p) => p.ctx.paths.home(),
+            Self::Network(p) => p.ctx.paths.home(),
             Self::Http(p) => p.context.home.as_deref(),
-            Self::Filesystem(p) => p.home.as_deref(),
-            Self::Resource(p) => p.home.as_deref(),
-            Self::Dbus(p) => p.home.as_deref(),
+            Self::Filesystem(p) => p.ctx.paths.home(),
+            Self::Resource(p) => p.ctx.paths.home(),
+            Self::Dbus(p) => p.ctx.paths.home(),
         }
     }
 
@@ -424,12 +375,12 @@ impl Pending {
     #[must_use]
     pub fn project_root(&self) -> Option<&Path> {
         match self {
-            Self::Elevation(p) => p.project_root.as_deref(),
-            Self::Network(p) => p.project_root.as_deref(),
+            Self::Elevation(p) => p.ctx.paths.project_root(),
+            Self::Network(p) => p.ctx.paths.project_root(),
             Self::Http(p) => p.context.project_root.as_deref(),
-            Self::Filesystem(p) => p.project_root.as_deref(),
-            Self::Resource(p) => p.project_root.as_deref(),
-            Self::Dbus(p) => p.project_root.as_deref(),
+            Self::Filesystem(p) => p.ctx.paths.project_root(),
+            Self::Resource(p) => p.ctx.paths.project_root(),
+            Self::Dbus(p) => p.ctx.paths.project_root(),
         }
     }
 
@@ -437,12 +388,12 @@ impl Pending {
     #[must_use]
     pub fn sandbox_session_id(&self) -> Option<&str> {
         match self {
-            Self::Elevation(p) => p.sandbox_session_id.as_deref(),
-            Self::Network(p) => p.sandbox_session_id.as_deref(),
+            Self::Elevation(p) => p.ctx.sandbox_session_id.as_deref(),
+            Self::Network(p) => p.ctx.sandbox_session_id.as_deref(),
             Self::Http(p) => p.context.sandbox_session_id.as_deref(),
-            Self::Filesystem(p) => p.sandbox_session_id.as_deref(),
-            Self::Resource(p) => p.sandbox_session_id.as_deref(),
-            Self::Dbus(p) => p.sandbox_session_id.as_deref(),
+            Self::Filesystem(p) => p.ctx.sandbox_session_id.as_deref(),
+            Self::Resource(p) => p.ctx.sandbox_session_id.as_deref(),
+            Self::Dbus(p) => p.ctx.sandbox_session_id.as_deref(),
         }
     }
 }
@@ -458,9 +409,9 @@ impl From<&Pending> for PendingSummary {
                 port: Some(net.port),
                 scheme: Some(net.scheme.clone()),
                 url: Some(net.url.clone()),
-                cwd: net.cwd.clone(),
-                home: net.home.clone(),
-                package: net.package.clone(),
+                cwd: net.ctx.paths.cwd_path(),
+                home: net.ctx.paths.home_path(),
+                package: net.ctx.package.clone(),
             },
             Pending::Http(http) => Self::Http {
                 id: http.pending_id,
@@ -474,35 +425,35 @@ impl From<&Pending> for PendingSummary {
             Pending::Elevation(elev) => Self::Elevation {
                 id: elev.id.clone(),
                 argv: Some(elev.argv.clone()),
-                cwd: elev.cwd.clone(),
-                home: elev.home.clone(),
-                package: elev.package.clone(),
+                cwd: elev.ctx.paths.cwd_path(),
+                home: elev.ctx.paths.home_path(),
+                package: elev.ctx.package.clone(),
             },
             Pending::Filesystem(fs) => Self::Filesystem {
                 id: fs.id.clone(),
                 path: Some(fs.path.clone()),
                 access: Some(fs.access),
-                cwd: fs.cwd.clone(),
-                home: fs.home.clone(),
-                package: fs.package.clone(),
+                cwd: fs.ctx.paths.cwd_path(),
+                home: fs.ctx.paths.home_path(),
+                package: fs.ctx.package.clone(),
             },
             Pending::Resource(res) => Self::Resource {
                 id: res.id.clone(),
                 resource_kind: res.kind,
                 path: Some(res.path.clone()),
                 access: Some(res.access),
-                cwd: res.cwd.clone(),
-                home: res.home.clone(),
-                package: res.package.clone(),
+                cwd: res.ctx.paths.cwd_path(),
+                home: res.ctx.paths.home_path(),
+                package: res.ctx.package.clone(),
             },
             Pending::Dbus(dbus) => Self::Dbus {
                 id: dbus.id.clone(),
                 target: dbus.target.clone(),
-                cwd: dbus.cwd.clone(),
-                home: dbus.home.clone(),
-                project_root: dbus.project_root.clone(),
-                sandbox_session_id: dbus.sandbox_session_id.clone(),
-                package: dbus.package.clone(),
+                cwd: dbus.ctx.paths.cwd_path(),
+                home: dbus.ctx.paths.home_path(),
+                project_root: dbus.ctx.paths.project_root_path(),
+                sandbox_session_id: dbus.ctx.sandbox_session_id.clone(),
+                package: dbus.ctx.package.clone(),
             },
         }
     }

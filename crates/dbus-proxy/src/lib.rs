@@ -3,12 +3,12 @@
 use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use agent_sandbox_core::{
+    peer_cred_unix,
     policy::{DbusBus, DbusFdMetadata, DbusMessageKind, DbusTarget},
     rpc::{RequestContext, RpcReply, RpcRequest},
     rpc_client::PersistentRpcClient,
 };
 use futures_util::StreamExt;
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 use zbus::{
@@ -159,12 +159,11 @@ async fn handle_client(
     client_socket: UnixStream,
     mut config: RelayConfig,
 ) -> Result<(), RelayError> {
-    let credentials = getsockopt(&client_socket, PeerCredentials).map_err(|error| {
-        RelayError::Message(format!("cannot read D-Bus peer credentials: {error}"))
-    })?;
+    let credentials = peer_cred_unix(&client_socket)
+        .ok_or_else(|| RelayError::Message("cannot read D-Bus peer credentials".to_owned()))?;
 
-    config.context.pid = u32::try_from(credentials.pid()).ok();
-    config.context.uid = Some(credentials.uid());
+    config.context.pid = Some(credentials.pid);
+    config.context.uid = Some(credentials.uid);
 
     let client_stream = Builder::unix_stream(client_socket)
         .p2p()
@@ -289,7 +288,7 @@ async fn policy_check(
     };
 
     match policy.request(request, timeout).await {
-        Ok(RpcReply::DbusCheck(reply)) => reply.ok && reply.allowed,
+        Ok(RpcReply::DbusCheck(reply)) => reply.ok && reply.verdict.allowed,
 
         Ok(other) => {
             warn!(reply = %other, "policyd returned an unexpected reply for D-Bus check");

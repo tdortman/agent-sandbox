@@ -12,7 +12,6 @@ path = "src/main.rs"
 agent-sandbox-syscall = { path = "../syscall" }
 agent-sandbox-sysutil = { path = "../sysutil" }
 
-clap.workspace = true
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "process", "signal"] }
 

@@ -7,6 +7,7 @@ use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 use super::{
     decisions::DecisionAction,
     scope_apply::{ScopeLadder, ScopePersistFlags},
+    state::apply_bucket,
     types::PolicyStore,
 };
 use crate::wire::{ScopeWire, SudoScopeOp};
@@ -61,7 +62,13 @@ impl PolicyStore {
                         ScopeTarget::Ephemeral => {}
 
                         ScopeTarget::Session { session_id } => {
-                            inner.session.sudo().apply(action, session_id, &argv);
+                            apply_bucket(
+                                &mut inner.session.session_sudo_allow,
+                                &mut inner.session.session_sudo_deny,
+                                action,
+                                session_id,
+                                &argv,
+                            );
                         }
 
                         ScopeTarget::Global { .. }

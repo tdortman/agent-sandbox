@@ -4,12 +4,6 @@ use super::{
     *,
 };
 
-#[derive(Clone, Copy)]
-enum Http3SessionSettings {
-    Enabled,
-    Rejected,
-}
-
 /// Origin selection for one harness.
 struct OriginOptions {
     ip: IpAddr,
@@ -25,7 +19,7 @@ struct OriginOptions {
 
 struct Http3OriginOptions {
     alt_svc: bool,
-    session_settings: Http3SessionSettings,
+    reject_sessions: bool,
     refuse_sessions: bool,
     drop_first_session: bool,
 }
@@ -52,7 +46,7 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
             Http3OriginSettings {
                 gate: Some(&gate),
                 alt_svc_file: alt_svc_file.as_deref(),
-                reject_sessions: matches!(http3.session_settings, Http3SessionSettings::Rejected),
+                reject_sessions: http3.reject_sessions,
                 refuse_sessions: http3.refuse_sessions,
                 drop_first_session: http3.drop_first_session,
             },
@@ -97,51 +91,16 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
     }
 }
 
-/// Whether one harness advertises and intercepts an alternative endpoint.
-#[derive(Default)]
-enum Http3AltPort {
-    #[default]
-    None,
-
-    /// Let the proxy bind an ephemeral port and report it back; the origin
-    /// then advertises the reported port.
-    Allocate,
-}
-
-impl Http3AltPort {
-    const fn enabled(&self) -> bool {
-        matches!(self, Self::Allocate)
-    }
-}
-
 /// Extra HTTP/3 options for one harness.
 #[derive(Default)]
 struct Http3Options {
-    alt_port: Http3AltPort,
+    /// Let the proxy bind an ephemeral alternative port and report it back;
+    /// the origin then advertises the reported port.
+    alt_svc: bool,
     test_ech_dns: Option<SocketAddr>,
     reject_sessions: bool,
     refuse_sessions: bool,
     drop_first_session: bool,
-}
-
-impl Http3Options {
-    const fn session_settings(&self) -> Http3SessionSettings {
-        if self.reject_sessions {
-            Http3SessionSettings::Rejected
-        } else {
-            Http3SessionSettings::Enabled
-        }
-    }
-}
-
-#[derive(Default)]
-enum HarnessMode {
-    #[default]
-    Plain,
-
-    Http10Origin,
-    ClaimErrors,
-    Http3(Http3Options),
 }
 
 #[derive(Default)]
@@ -149,16 +108,9 @@ struct HarnessOptions {
     tls: bool,
     advertise_http11_alpn: bool,
     keep_alive: bool,
-    mode: HarnessMode,
-}
-
-fn harness_mode_options(mode: HarnessMode) -> (bool, bool, bool, Http3Options) {
-    match mode {
-        HarnessMode::Plain => (false, false, false, Http3Options::default()),
-        HarnessMode::Http10Origin => (true, false, false, Http3Options::default()),
-        HarnessMode::ClaimErrors => (false, true, false, Http3Options::default()),
-        HarnessMode::Http3(options) => (false, false, true, options),
-    }
+    http10_origin: bool,
+    claim_errors: bool,
+    http3: Option<Http3Options>,
 }
 
 fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> Child {
@@ -243,7 +195,7 @@ impl TransparentHarness {
     /// Start a plain harness whose origin is an explicit HTTP/1.0 upstream.
     pub async fn start_with_http10_origin(ip: IpAddr, origin_port: u16) -> Self {
         Self::start_inner(ip, origin_port, HarnessOptions {
-            mode: HarnessMode::Http10Origin,
+            http10_origin: true,
             ..HarnessOptions::default()
         })
         .await
@@ -252,7 +204,7 @@ impl TransparentHarness {
     /// Start a harness whose policy service rejects every flow claim.
     pub async fn start_claim_error(ip: IpAddr, origin_port: u16) -> Self {
         Self::start_inner(ip, origin_port, HarnessOptions {
-            mode: HarnessMode::ClaimErrors,
+            claim_errors: true,
             ..HarnessOptions::default()
         })
         .await
@@ -261,7 +213,7 @@ impl TransparentHarness {
     /// Start a harness with the HTTP/3 backend enabled and an HTTP/3 origin.
     pub async fn start_http3(ip: IpAddr) -> Self {
         Self::start_inner(ip, 0, HarnessOptions {
-            mode: HarnessMode::Http3(Http3Options::default()),
+            http3: Some(Http3Options::default()),
             ..HarnessOptions::default()
         })
         .await
@@ -275,7 +227,7 @@ impl TransparentHarness {
         };
 
         Self::start_inner(ip, 0, HarnessOptions {
-            mode: HarnessMode::Http3(http3_options),
+            http3: Some(http3_options),
             ..HarnessOptions::default()
         })
         .await
@@ -289,7 +241,7 @@ impl TransparentHarness {
         };
 
         Self::start_inner(ip, 0, HarnessOptions {
-            mode: HarnessMode::Http3(http3_options),
+            http3: Some(http3_options),
             ..HarnessOptions::default()
         })
         .await
@@ -303,7 +255,7 @@ impl TransparentHarness {
         };
 
         Self::start_inner(ip, 0, HarnessOptions {
-            mode: HarnessMode::Http3(http3_options),
+            http3: Some(http3_options),
             ..HarnessOptions::default()
         })
         .await
@@ -313,12 +265,12 @@ impl TransparentHarness {
     /// endpoint, which the proxy also intercepts.
     pub async fn start_http3_with_alt(ip: IpAddr) -> Self {
         let http3_options = Http3Options {
-            alt_port: Http3AltPort::Allocate,
+            alt_svc: true,
             ..Http3Options::default()
         };
 
         Self::start_inner(ip, 0, HarnessOptions {
-            mode: HarnessMode::Http3(http3_options),
+            http3: Some(http3_options),
             ..HarnessOptions::default()
         })
         .await
@@ -332,7 +284,7 @@ impl TransparentHarness {
         };
 
         Self::start_inner(ip, 0, HarnessOptions {
-            mode: HarnessMode::Http3(http3_options),
+            http3: Some(http3_options),
             ..HarnessOptions::default()
         })
         .await
@@ -343,10 +295,10 @@ impl TransparentHarness {
             tls,
             advertise_http11_alpn,
             keep_alive,
-            mode,
+            http10_origin,
+            claim_errors,
+            http3,
         } = options;
-
-        let (http10_origin, claim_errors, http3, http3_options) = harness_mode_options(mode);
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = start_harness_policy(&root, claim_errors);
         let (ca_cert, ca_key) = write_harness_ca(&root);
@@ -357,11 +309,11 @@ impl TransparentHarness {
             tls,
             tls_alpn: harness_tls_alpn(advertise_http11_alpn),
             keep_alive,
-            http3: http3.then_some(Http3OriginOptions {
-                alt_svc: http3_options.alt_port.enabled(),
-                session_settings: http3_options.session_settings(),
-                refuse_sessions: http3_options.refuse_sessions,
-                drop_first_session: http3_options.drop_first_session,
+            http3: http3.as_ref().map(|http3| Http3OriginOptions {
+                alt_svc: http3.alt_svc,
+                reject_sessions: http3.reject_sessions,
+                refuse_sessions: http3.refuse_sessions,
+                drop_first_session: http3.drop_first_session,
             }),
             certificate: ca_cert.clone(),
             private_key: ca_key.clone(),
@@ -418,16 +370,16 @@ impl TransparentHarness {
             proxy_command.env("SSL_CERT_FILE", &ca_cert);
         }
 
-        if http3 {
+        if let Some(http3) = http3.as_ref() {
             proxy_command
                 .args(["--enable-http3-backend", "--http3-listen-port"])
                 .arg("0");
 
-            if http3_options.alt_port.enabled() {
+            if http3.alt_svc {
                 proxy_command.args(["--http3-alt-port", "0"]);
             }
 
-            if let Some(dns) = http3_options.test_ech_dns {
+            if let Some(dns) = http3.test_ech_dns {
                 proxy_command.args(["--test-ech-dns", &dns.to_string()]);
             }
 

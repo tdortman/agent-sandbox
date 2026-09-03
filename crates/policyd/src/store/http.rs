@@ -200,7 +200,7 @@ impl PolicyStore {
         if is_new {
             let pending = {
                 let inner = self.inner.lock().await;
-                match inner.pending.pending_get(&pending_id.to_string()) {
+                match inner.pending.pending.get(&pending_id.to_string()) {
                     Some(Pending::Http(value)) => value.clone(),
                     _ => {
                         return Ok(HttpCheckReply::blocked(
@@ -258,7 +258,7 @@ impl PolicyStore {
             ));
         }
 
-        let existing = inner.pending.pending_values().find_map(|pending| {
+        let existing = inner.pending.pending.values().find_map(|pending| {
             let Pending::Http(value) = pending else {
                 return None;
             };
@@ -276,7 +276,7 @@ impl PolicyStore {
             }
             id
         } else {
-            if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
+            if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
                 return Err(PolicydError::Proxy("too many pending approvals".into()));
             }
             let id = PendingHttpId::new();
@@ -290,7 +290,10 @@ impl PolicyStore {
                 context: key.context.clone(),
                 package: ctx.package.clone(),
             };
-            inner.pending.insert_pending(Pending::Http(pending));
+            inner
+                .pending
+                .pending
+                .insert(pending.id.clone(), Pending::Http(pending));
             inner.pending.http_futures.insert(id, Vec::new());
             id
         };
@@ -429,7 +432,7 @@ impl PolicyStore {
 
         if waiters.is_empty() {
             inner.pending.http_futures.remove(&pending_id);
-            inner.pending.take_pending(&pending_id.to_string());
+            inner.pending.pending.remove(&pending_id.to_string());
         }
 
         Some(waiter.tx)
@@ -458,7 +461,7 @@ impl PolicyStore {
     ) -> bool {
         let mut inner = self.inner.lock().await;
 
-        let Some(Pending::Http(pending)) = inner.pending.take_pending(&pending_id.to_string())
+        let Some(Pending::Http(pending)) = inner.pending.pending.remove(&pending_id.to_string())
         else {
             return false;
         };
@@ -603,8 +606,8 @@ mod tests {
             .await
             .expect("policy evaluation");
 
-        assert!(reply.allowed);
-        assert_eq!(reply.source, VerdictSource::policy());
+        assert!(reply.verdict.allowed);
+        assert_eq!(reply.verdict.source, VerdictSource::policy());
 
         assert!(
             store.pending_summaries().await.is_empty(),
@@ -643,8 +646,8 @@ mod tests {
 
         let reply = HttpCheckReply::from_verdict(request, verdict);
         assert!(reply.ok);
-        assert!(!reply.allowed);
-        assert_eq!(reply.source, VerdictSource::User);
+        assert!(!reply.verdict.allowed);
+        assert_eq!(reply.verdict.source, VerdictSource::User);
     }
 
     #[test]
@@ -881,8 +884,8 @@ mod tests {
             .expect("second waiter reply timed out")
             .expect("second waiter reply");
 
-        assert_eq!(reply_1.allowed, reply_2.allowed);
-        assert_eq!(reply_1.source, reply_2.source);
+        assert_eq!(reply_1.verdict.allowed, reply_2.verdict.allowed);
+        assert_eq!(reply_1.verdict.source, reply_2.verdict.source);
         assert_eq!(reply_1.request, reply_2.request);
 
         assert!(

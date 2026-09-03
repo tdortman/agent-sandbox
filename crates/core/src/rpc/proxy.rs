@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::request::RequestContext;
 use crate::{
-    HttpRequest, HttpRuleTarget, SandboxPaths,
+    SandboxPaths,
     hosts::{normalize_dns_name, normalize_host},
     transport::FlowProtocol,
 };
@@ -942,34 +942,6 @@ impl FlowRegistration {
     pub const fn context(&self) -> &FlowContext {
         &self.ctx
     }
-}
-
-/// Proxy check operation payloads share one typed HTTP request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpCheckRequest {
-    /// The outgoing HTTP request to be checked.
-    pub request: HttpRequest,
-    /// The attribution token binding this request to a registered session.
-    pub attribution_token: AttributionToken,
-}
-
-/// Target used by host-side HTTP approval requests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpApprovalRequest {
-    /// The rule target the approval applies to.
-    pub target: HttpRuleTarget,
-    /// The approval scope for the request.
-    pub scope: crate::ApprovalScope,
-
-    /// The sandbox session ID, if any.
-    #[serde(default)]
-    pub session_id: Option<String>,
-
-    /// The request context used to evaluate the approval.
-    #[serde(default)]
-    pub ctx: RequestContext,
 }
 
 #[cfg(test)]

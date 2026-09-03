@@ -85,7 +85,7 @@ async fn sandbox_filesystem_rpc_applies_allow_and_deny_policy() {
     match allowed {
         RpcReply::FilesystemCheck(reply) => {
             assert!(reply.ok);
-            assert!(reply.allowed);
+            assert!(reply.verdict.allowed);
             assert_eq!(reply.path, Path::new("/workspace/file"));
         }
 
@@ -101,7 +101,7 @@ async fn sandbox_filesystem_rpc_applies_allow_and_deny_policy() {
     match denied {
         RpcReply::FilesystemCheck(reply) => {
             assert!(reply.ok);
-            assert!(!reply.allowed);
+            assert!(!reply.verdict.allowed);
             assert_eq!(reply.path, Path::new("/workspace/secret"));
         }
 

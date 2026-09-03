@@ -1,13 +1,13 @@
 //! Policy store, network.
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
-    CheckReply, NetworkRuleKey, ProcessIds, ResolvedRequestContext, SandboxPaths, UiPush,
-    VerdictSource, attach_check_aliases, normalize_host,
+    CheckReply, NetworkRuleKey, ResolvedRequestContext, UiPush, VerdictSource,
+    attach_check_aliases, normalize_host,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -20,7 +20,6 @@ use super::{
     },
     ui::VerdictExit,
 };
-use crate::wire::NetworkCheckRequest;
 
 /// How long a network verdict is cached after the first policy check for the
 /// same hostname plus port. This deduplicates prompts when curl tries multiple
@@ -42,11 +41,11 @@ impl NetworkRequestIdentity<'_> {
     fn matches(&self, pending: &PendingNetwork) -> bool {
         pending.host == self.host
             && pending.port == self.port
-            && pending.cwd.as_deref() == self.cwd
-            && pending.home.as_deref() == self.home
-            && pending.project_root.as_deref() == self.project_root
-            && pending.sandbox_session_id.as_deref() == self.sandbox_session_id
-            && pending.package.as_deref() == self.package
+            && pending.ctx.paths.cwd() == self.cwd
+            && pending.ctx.paths.home() == self.home
+            && pending.ctx.paths.project_root() == self.project_root
+            && pending.ctx.sandbox_session_id.as_deref() == self.sandbox_session_id
+            && pending.ctx.package.as_deref() == self.package
     }
 }
 
@@ -67,7 +66,8 @@ impl PolicyStore {
             .lock()
             .await
             .pending
-            .pending_values()
+            .pending
+            .values()
             .filter(|p| p.kind() == PendingKind::Network)
             .cloned()
             .collect();
@@ -85,16 +85,7 @@ impl PolicyStore {
                 continue;
             };
 
-            let merge = ResolvedRequestContext {
-                paths: SandboxPaths::from_wire(
-                    net.cwd.clone(),
-                    net.home.clone(),
-                    net.project_root.clone(),
-                ),
-                ids: ProcessIds::default(),
-                sandbox_session_id: net.sandbox_session_id.clone(),
-                package: None,
-            };
+            let merge = net.ctx.clone();
 
             let Some(verdict) = self.allow_verdict(&host, port, &merge).await else {
                 continue;
@@ -122,7 +113,7 @@ impl PolicyStore {
             )
             .await;
 
-            self.inner.lock().await.pending.take_pending(p.id());
+            self.inner.lock().await.pending.pending.remove(p.id());
         }
     }
 
@@ -163,35 +154,44 @@ impl PolicyStore {
     /// Request interactive approval for a network connection, prompting the
     /// policy UI when needed. Returns the cached or policy-derived verdict
     /// immediately when one already exists.
-    pub async fn request_network_approval(&self, req: NetworkCheckRequest) -> CheckReply {
-        self.request_network_approval_with_aliases(req, Vec::new())
+    pub async fn request_network_approval(
+        &self,
+        host: String,
+        port: u16,
+        scheme: String,
+        url: String,
+        ctx: ResolvedRequestContext,
+    ) -> CheckReply {
+        self.request_network_approval_with_aliases(host, port, scheme, url, ctx, Vec::new())
             .await
     }
 
     pub(crate) async fn request_network_approval_with_aliases(
         &self,
-        req: NetworkCheckRequest,
+        host: String,
+        port: u16,
+        scheme: String,
+        url: String,
+        ctx: ResolvedRequestContext,
         aliases: Vec<String>,
     ) -> CheckReply {
-        self.request_network_approval_with_aliases_cancellable(req, aliases, None, None)
-            .await
+        self.request_network_approval_with_aliases_cancellable(
+            host, port, scheme, url, ctx, aliases, None, None,
+        )
+        .await
     }
 
     pub(crate) async fn request_network_approval_with_aliases_cancellable(
         &self,
-        req: NetworkCheckRequest,
+        host: String,
+        port: u16,
+        scheme: String,
+        url: String,
+        ctx: ResolvedRequestContext,
         aliases: Vec<String>,
         waiter: Option<ProxyCheckId>,
         cancel: Option<oneshot::Receiver<()>>,
     ) -> CheckReply {
-        let NetworkCheckRequest {
-            host,
-            port,
-            scheme,
-            url,
-            ctx,
-        } = req;
-
         let policy_host = normalize_host(&host);
         let wire_ids = ctx.ids;
         let cwd = ctx.paths.cwd_path();
@@ -231,7 +231,14 @@ impl PolicyStore {
         };
 
         let result = match self
-            .dedup_or_create_pending_network(&identity, &scheme, &url, &aliases, waiter.as_ref())
+            .dedup_or_create_pending_network(
+                &identity,
+                &scheme,
+                &url,
+                &ctx,
+                &aliases,
+                waiter.as_ref(),
+            )
             .await
         {
             Ok(r) => r,
@@ -310,6 +317,7 @@ impl PolicyStore {
         identity: &NetworkRequestIdentity<'_>,
         scheme: &str,
         url: &str,
+        ctx: &ResolvedRequestContext,
         aliases: &[String],
         waiter: Option<&ProxyCheckId>,
     ) -> Result<PendingResult<String, CheckReply>, CheckReply> {
@@ -331,7 +339,7 @@ impl PolicyStore {
 
         let proxy = waiter.cloned();
 
-        let existing_id = inner.pending.pending_values().find_map(|pending| {
+        let existing_id = inner.pending.pending.values().find_map(|pending| {
             let Pending::Network(net) = pending else {
                 return None;
             };
@@ -368,7 +376,7 @@ impl PolicyStore {
             });
         }
 
-        if inner.pending.pending_len() >= MAX_PENDING_APPROVALS {
+        if inner.pending.pending.len() >= MAX_PENDING_APPROVALS {
             return Err(CheckReply::blocked(
                 "agent-sandbox: too many pending approvals",
             ));
@@ -381,9 +389,9 @@ impl PolicyStore {
             .network_futures
             .insert(pending_id.clone(), vec![NetworkWaiter { proxy, tx }]);
 
-        inner
-            .pending
-            .insert_pending(Pending::Network(PendingNetwork {
+        inner.pending.pending.insert(
+            pending_id.clone(),
+            Pending::Network(PendingNetwork {
                 id: pending_id.clone(),
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -393,12 +401,9 @@ impl PolicyStore {
                 scheme: scheme.to_string(),
                 url: url.to_string(),
                 aliases: aliases.to_vec(),
-                cwd: identity.cwd.map(PathBuf::from),
-                home: identity.home.map(PathBuf::from),
-                project_root: identity.project_root.map(PathBuf::from),
-                sandbox_session_id: identity.sandbox_session_id.map(String::from),
-                package: identity.package.map(String::from),
-            }));
+                ctx: ctx.clone(),
+            }),
+        );
 
         drop(inner);
 
@@ -429,7 +434,7 @@ impl PolicyStore {
             }
 
             if waiters.is_empty() {
-                inner.pending.take_pending(pending_id);
+                inner.pending.pending.remove(pending_id);
             } else {
                 inner
                     .pending
@@ -438,7 +443,7 @@ impl PolicyStore {
             }
         } else {
             canceled.extend(waiters.into_iter().map(|waiter| waiter.tx));
-            inner.pending.take_pending(pending_id);
+            inner.pending.pending.remove(pending_id);
         }
 
         canceled
@@ -582,7 +587,7 @@ mod tests {
 
     use agent_sandbox_core::{ApprovalScope, NetworkRuleKey, VerdictSource};
 
-    use super::{NetworkRequestIdentity, PendingNetwork};
+    use super::{NetworkRequestIdentity, PendingNetwork, PolicyStore};
 
     fn pending_network(host: &str, sandbox_session_id: Option<&str>) -> PendingNetwork {
         PendingNetwork {
@@ -593,11 +598,12 @@ mod tests {
             scheme: "tcp".into(),
             url: format!("tcp://{host}:443"),
             aliases: Vec::new(),
-            cwd: Some("/repo".into()),
-            home: Some("/home/user".into()),
-            project_root: Some("/repo".into()),
-            sandbox_session_id: sandbox_session_id.map(str::to_string),
-            package: None,
+            ctx: ResolvedRequestContext {
+                paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                ids: ProcessIds::default(),
+                sandbox_session_id: sandbox_session_id.map(str::to_string),
+                package: None,
+            },
         }
     }
 
@@ -633,33 +639,40 @@ mod tests {
     };
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
-    use crate::{
-        store::{
-            test_store,
-            types::{Pending, UiClient, UiSessionContext},
-        },
-        wire::NetworkCheckRequest,
+    use crate::store::{
+        test_store,
+        types::{Pending, UiClient, UiSessionContext},
     };
 
-    fn unique_request(host: &str, port: u16) -> NetworkCheckRequest {
-        NetworkCheckRequest {
-            host: host.into(),
-            port,
-            scheme: "tcp".into(),
-            url: format!("tcp://{host}:{port}"),
-            ctx: ResolvedRequestContext {
-                paths: SandboxPaths::from_wire(
-                    Some("/repo".into()),
-                    Some("/home/user".into()),
-                    Some("/repo".into()),
-                ),
-                // pid 0 short-circuits resolve_context, so the explicit
-                // paths are preserved verbatim.
-                ids: ProcessIds::from_options(Some(0), Some(1000)),
-                sandbox_session_id: Some("sandbox-cap".into()),
-                package: None,
-            },
+    fn request_context() -> ResolvedRequestContext {
+        ResolvedRequestContext {
+            paths: SandboxPaths::from_wire(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+            ),
+            // pid 0 short-circuits resolve_context, so the explicit
+            // paths are preserved verbatim.
+            ids: ProcessIds::from_options(Some(0), Some(1000)),
+            sandbox_session_id: Some("sandbox-cap".into()),
+            package: None,
         }
+    }
+
+    async fn request_network(
+        store: &PolicyStore,
+        host: &str,
+        port: u16,
+    ) -> agent_sandbox_core::CheckReply {
+        store
+            .request_network_approval(
+                host.into(),
+                port,
+                "tcp".into(),
+                format!("tcp://{host}:{port}"),
+                request_context(),
+            )
+            .await
     }
 
     #[tokio::test]
@@ -691,28 +704,33 @@ mod tests {
                 .insert(NetworkRuleKey::new("example.com", 443));
         }
 
-        let first = store
-            .request_network_approval(unique_request("example.com", 443))
-            .await;
+        let first = request_network(&store, "example.com", 443).await;
 
-        assert!(first.allowed, "session approval should allow first request");
-        assert_eq!(first.source, VerdictSource::Scope(ApprovalScope::Session));
+        assert!(
+            first.verdict.allowed,
+            "session approval should allow first request"
+        );
+        assert_eq!(
+            first.verdict.source,
+            VerdictSource::Scope(ApprovalScope::Session)
+        );
 
         assert!(
             store.pending_summaries().await.is_empty(),
             "session approval must not create a pending prompt"
         );
 
-        let second = store
-            .request_network_approval(unique_request("example.com", 443))
-            .await;
+        let second = request_network(&store, "example.com", 443).await;
 
         assert!(
-            second.allowed,
+            second.verdict.allowed,
             "session approval should allow second request"
         );
 
-        assert_eq!(second.source, VerdictSource::Scope(ApprovalScope::Session));
+        assert_eq!(
+            second.verdict.source,
+            VerdictSource::Scope(ApprovalScope::Session)
+        );
 
         assert!(
             store.pending_summaries().await.is_empty(),
@@ -732,12 +750,16 @@ mod tests {
                 .insert(NetworkRuleKey::new("example.com", 443));
         }
 
-        let first = store
-            .request_network_approval(unique_request("example.com", 443))
-            .await;
+        let first = request_network(&store, "example.com", 443).await;
 
-        assert!(first.allowed, "Once grant should allow the first request");
-        assert_eq!(first.source, VerdictSource::Scope(ApprovalScope::Once));
+        assert!(
+            first.verdict.allowed,
+            "Once grant should allow the first request"
+        );
+        assert_eq!(
+            first.verdict.source,
+            VerdictSource::Scope(ApprovalScope::Once)
+        );
 
         assert!(
             store.inner.lock().await.session.once_allow.is_empty(),
@@ -746,11 +768,8 @@ mod tests {
 
         let task_store = store.clone();
 
-        let task = tokio::spawn(async move {
-            task_store
-                .request_network_approval(unique_request("example.com", 443))
-                .await
-        });
+        let task =
+            tokio::spawn(async move { request_network(&task_store, "example.com", 443).await });
 
         let pending_id = {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -758,7 +777,8 @@ mod tests {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
                     .pending
-                    .pending_keys()
+                    .pending
+                    .keys()
                     .find(|id| id.starts_with("net:"))
                     .cloned()
                 {
@@ -778,7 +798,10 @@ mod tests {
             .await;
 
         let second = task.await.expect("second request should not panic");
-        assert!(!second.allowed, "second request must not reuse Once grant");
+        assert!(
+            !second.verdict.allowed,
+            "second request must not reuse Once grant"
+        );
     }
 
     fn pending_network_owned(host: String) -> PendingNetwork {
@@ -790,11 +813,12 @@ mod tests {
             scheme: "tcp".into(),
             url: "tcp://seed".into(),
             aliases: Vec::new(),
-            cwd: Some("/repo".into()),
-            home: Some("/home/user".into()),
-            project_root: Some("/repo".into()),
-            sandbox_session_id: Some("sandbox-cap".into()),
-            package: None,
+            ctx: ResolvedRequestContext {
+                paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                ids: ProcessIds::default(),
+                sandbox_session_id: Some("sandbox-cap".into()),
+                package: None,
+            },
         }
     }
 
@@ -808,20 +832,22 @@ mod tests {
                 let id = format!("net:seed{i}");
                 let mut pending = pending_network_owned(format!("host{i}.example"));
                 pending.id = id;
-                inner.pending.insert_pending(Pending::Network(pending));
+                let pending = Pending::Network(pending);
+                inner
+                    .pending
+                    .pending
+                    .insert(pending.id().to_owned(), pending);
             }
             drop(inner);
         }
 
-        let reply = store
-            .request_network_approval(unique_request("overflow.example", 443))
-            .await;
+        let reply = request_network(&store, "overflow.example", 443).await;
 
-        assert!(!reply.allowed);
-        assert_eq!(reply.source, VerdictSource::Blocked);
+        assert!(!reply.verdict.allowed);
+        assert_eq!(reply.verdict.source, VerdictSource::Blocked);
         let err = reply.error.unwrap_or_default();
         assert!(err.contains("too many pending"), "got: {err}");
-        let pending_count = store.inner.lock().await.pending.pending_len();
+        let pending_count = store.inner.lock().await.pending.pending.len();
 
         assert_eq!(
             pending_count,
@@ -838,7 +864,11 @@ mod tests {
             let mut inner = store.inner.lock().await;
             let mut net = pending_network("example.com", Some("sandbox-cap"));
             net.id = "net:open".into();
-            inner.pending.insert_pending(Pending::Network(net));
+            let pending = Pending::Network(net);
+            inner
+                .pending
+                .pending
+                .insert(pending.id().to_owned(), pending);
             for _ in 0..super::MAX_WAITERS_PER_PENDING {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
                 inner
@@ -850,12 +880,10 @@ mod tests {
             }
         }
 
-        let reply = store
-            .request_network_approval(unique_request("example.com", 443))
-            .await;
+        let reply = request_network(&store, "example.com", 443).await;
 
-        assert!(!reply.allowed);
-        assert_eq!(reply.source, VerdictSource::Blocked);
+        assert!(!reply.verdict.allowed);
+        assert_eq!(reply.verdict.source, VerdictSource::Blocked);
         let err = reply.error.unwrap_or_default();
         assert!(err.contains("too many waiters"), "got: {err}");
     }
@@ -1006,11 +1034,8 @@ mod tests {
 
         let store_for_task = store.clone();
 
-        let task = tokio::spawn(async move {
-            store_for_task
-                .request_network_approval(unique_request("fast.example", 53))
-                .await
-        });
+        let task =
+            tokio::spawn(async move { request_network(&store_for_task, "fast.example", 53).await });
 
         let mut buf = [0u8; 4096];
 
@@ -1031,7 +1056,8 @@ mod tests {
             let inner = store.inner.lock().await;
             inner
                 .pending
-                .pending_keys()
+                .pending
+                .keys()
                 .find(|k| k.starts_with("net:"))
                 .cloned()
                 .expect("pending network request should be tracked")
@@ -1058,11 +1084,10 @@ mod tests {
 
         let store_for_task = store.clone();
 
-        let task = tokio::spawn(async move {
-            store_for_task
-                .request_network_approval(unique_request("slow.example", 443))
-                .await
-        });
+        let task =
+            tokio::spawn(
+                async move { request_network(&store_for_task, "slow.example", 443).await },
+            );
 
         // Wait for the request to register a pending. The task is now
         // inside the UI-registration wait loop.
@@ -1072,7 +1097,8 @@ mod tests {
                 let inner = store.inner.lock().await;
                 if let Some(id) = inner
                     .pending
-                    .pending_keys()
+                    .pending
+                    .keys()
                     .find(|k| k.starts_with("net:"))
                     .cloned()
                 {
@@ -1103,8 +1129,14 @@ mod tests {
             .expect("request should unblock within 2s of the CLI approval")
             .expect("task should not panic");
 
-        assert!(reply.allowed, "expected allowed reply, got: {reply:?}");
-        assert_eq!(reply.source, VerdictSource::policy_with_comment("cli"));
+        assert!(
+            reply.verdict.allowed,
+            "expected allowed reply, got: {reply:?}"
+        );
+        assert_eq!(
+            reply.verdict.source,
+            VerdictSource::policy_with_comment("cli")
+        );
     }
 
     #[tokio::test]
@@ -1137,14 +1169,21 @@ mod tests {
             created_at: 0.0,
             path: "/repo/file.txt".into(),
             access: FileAccess::Read,
-            cwd: Some("/repo".into()),
-            home: Some("/home/user".into()),
-            project_root: Some("/repo".into()),
-            sandbox_session_id: None,
-            package: None,
+            ctx: ResolvedRequestContext {
+                paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+                ids: ProcessIds::default(),
+                sandbox_session_id: None,
+                package: None,
+            },
         });
 
-        store.inner.lock().await.pending.insert_pending(pending);
+        {
+            let mut inner = store.inner.lock().await;
+            inner
+                .pending
+                .pending
+                .insert(pending.id().to_owned(), pending);
+        }
         store.flush_pending_to_ui().await;
 
         // Standalone should have received the filesystem request

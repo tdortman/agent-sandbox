@@ -29,7 +29,8 @@ impl PolicyStore {
 
         inner
             .pending
-            .pending_values()
+            .pending
+            .values()
             .filter(|p| {
                 p.sandbox_session_id().is_none_or(|session_id| {
                     sessions
@@ -59,7 +60,8 @@ impl PolicyStore {
         let inner = self.inner.lock().await;
         inner
             .pending
-            .pending_values()
+            .pending
+            .values()
             .map(PendingSummary::from)
             .collect()
     }

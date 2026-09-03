@@ -580,7 +580,7 @@ mod tests {
         assert!(reply.scope_succeeded(), "approval failed: {reply:?}");
 
         let verdict = approval_task.await.expect("D-Bus approval task");
-        assert!(verdict.allowed);
+        assert!(verdict.verdict.allowed);
         server_task.abort();
     }
 

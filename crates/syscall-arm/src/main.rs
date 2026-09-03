@@ -8,7 +8,7 @@
 use std::{
     env,
     ffi::{CStr, CString, OsString},
-    io::{BufRead, BufReader, Write},
+    io::{Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::ffi::OsStrExt,
@@ -18,7 +18,6 @@ use std::{
 
 use agent_sandbox_syscall::{build_filter, default_syscalls, syscalls_without_filesystem};
 use agent_sandbox_sysutil::{install_seccomp_notify, pidfd_getfd, pidfd_open, pre_exec_fork};
-use clap::Parser as _;
 use nix::{
     fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     sys::{
@@ -29,6 +28,15 @@ use nix::{
 };
 
 const DEFAULT_POLICY_SOCKET: &str = "/run/agent-sandbox/policy.sock";
+const HELP: &str = "Usage: agent-sandbox-syscall-arm [OPTIONS] [COMMAND]...
+
+Options:
+  --filesystem  Include filesystem syscalls in the notification filter
+  -h, --help    Print help
+
+Everything after the flags is forwarded verbatim to COMMAND.
+The broker uses AGENT_SANDBOX_POLICY_SOCKET when set.
+";
 
 fn die(msg: &str) -> ! {
     eprintln!(
@@ -71,49 +79,6 @@ fn install_filter(include_filesystem: bool) -> OwnedFd {
 
     install_seccomp_notify(&mut prog)
         .unwrap_or_else(|_| die("seccomp user notification install failed"))
-}
-
-/// Create a `pipe2(O_CLOEXEC)` pair for passing the listener fd number
-/// across the fork/exec boundary. Both ends are CLOEXEC so they close
-/// automatically in any exec'd child except when we explicitly keep one.
-fn handoff_pipe() -> (OwnedFd, OwnedFd) {
-    // ponytail: pipe2 with O_CLOEXEC is the atomic, thread-safe way to
-    // build a pipe that survives fork but closes on exec, matching the
-    // pre-exec handoff semantics exactly.
-    pipe2(OFlag::O_CLOEXEC).unwrap_or_else(|_| die("pipe2 failed"))
-}
-
-/// Write the listener fd number, decimal + newline, to the write end of
-/// the handoff pipe. The pipe fd closes on drop.
-fn write_listener_fd(write_end: OwnedFd, listener_fd: i32) {
-    let mut buf = listener_fd.to_string();
-    buf.push('\n');
-    let mut file = std::fs::File::from(write_end);
-
-    file.write_all(buf.as_bytes())
-        .unwrap_or_else(|_| die("writing listener fd to handoff pipe failed"));
-}
-
-/// Read the listener fd number (decimal + newline) from the read end of
-/// the handoff pipe. The pipe fd closes on drop.
-fn read_listener_fd(read_end: OwnedFd) -> i32 {
-    let file = std::fs::File::from(read_end);
-    let mut reader = BufReader::new(file);
-    let mut text = String::new();
-
-    let bytes_read = reader
-        .read_line(&mut text)
-        .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
-
-    if bytes_read == 0 {
-        die("handoff pipe closed before listener fd was sent");
-    }
-
-    let fd: i32 = text.trim().parse().unwrap_or_else(|_| {
-        die("listener fd on handoff pipe was not a decimal integer");
-    });
-
-    fd
 }
 
 fn exec_command(os_args: &[OsString]) -> ! {
@@ -163,48 +128,23 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
     die("execvp broker failed");
 }
 
-#[derive(clap::Parser, Debug)]
-#[command(
-    name = "agent-sandbox-syscall-arm",
-    version,
-    about = "Install a seccomp user-notification filter, then exec the command",
-    long_about = r"Runs INSIDE the sandbox as the first process in the syscall-gate path.
-Installs a seccomp user-notification filter on the immediate child, forks the child, sends the seccomp listener fd number to the parent over a `pipe2(O_CLOEXEC)` pair, raises SIGSTOP, and execs the command.
-The parent reads the fd number, re-acquires the listener fd from the sibling via `pidfd_open` + `pidfd_getfd`, kills the child SIGCONT, and execs `agent-sandbox-syscall-broker` with the listener fd and child pid, which talks to policyd over the policy socket to make per-syscall verdicts.
-
-Environment variables consumed from the bwrap wrapper:
-  AGENT_SANDBOX_POLICY_SOCKET  policyd socket path 
-    (default /run/agent-sandbox/policy.sock)
-  AGENT_SANDBOX_SESSION_ID     forwarded to the broker and policyd for per-session
-    audit logging
-
-EXAMPLES:
-# Install the filter, then exec python3. The `--` is optional.
-agent-sandbox-syscall-arm /usr/bin/python3 -i
-
-# Install the filter, then exec a wrapped agent.
-agent-sandbox-syscall-arm /home/user/bin/my-agent --flag"
-)]
-struct Cli {
-    /// Trap filesystem mutation syscalls for the filesystem policy gate.
-    #[arg(long)]
-    filesystem: bool,
-
-    /// The command to exec after the seccomp filter is installed. Everything
-    /// after the flags is forwarded verbatim to execvp, including values that
-    /// look like flags. A `--` separator is accepted but not required.
-    #[arg(
-        value_name = "COMMAND",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
-    command: Vec<OsString>,
-}
-
 fn main() {
-    let cli = Cli::parse();
-    let include_filesystem = cli.filesystem;
-    let command = cli.command;
+    let mut include_filesystem = false;
+    let mut command: Vec<OsString> = Vec::new();
+    let mut only_command = false;
+    for arg in env::args_os().skip(1) {
+        if !only_command && (arg == "--help" || arg == "-h") {
+            print!("{HELP}");
+            return;
+        } else if !only_command && arg == "--filesystem" {
+            include_filesystem = true;
+        } else if !only_command && arg == "--" {
+            only_command = true;
+        } else {
+            only_command = true;
+            command.push(arg);
+        }
+    }
 
     if command.is_empty() {
         eprintln!(
@@ -215,7 +155,7 @@ fn main() {
         process::exit(2);
     }
 
-    let (read_end, write_end) = handoff_pipe();
+    let (read_end, write_end) = pipe2(OFlag::O_CLOEXEC).unwrap_or_else(|_| die("pipe2 failed"));
     let fork_result = pre_exec_fork().unwrap_or_else(|_| die("fork failed"));
 
     match fork_result {
@@ -226,7 +166,9 @@ fn main() {
             // pidfd_getfd before the command execs, then exec.
             drop(read_end);
             let listener_fd = install_filter(include_filesystem);
-            write_listener_fd(write_end, listener_fd.as_raw_fd());
+            let mut pipe = std::fs::File::from(write_end);
+            pipe.write_all(format!("{}\n", listener_fd.as_raw_fd()).as_bytes())
+                .unwrap_or_else(|_| die("writing listener fd to handoff pipe failed"));
             raise(Signal::SIGSTOP)
                 .map_err(|_| ())
                 .unwrap_or_else(|()| die("raise SIGSTOP failed"));
@@ -243,7 +185,24 @@ fn main() {
             // never touches SCM_RIGHTS and the listener fd is acquired through
             // the same pidfd path it already uses for socket emulation.
             drop(write_end);
-            let listener_fd_number = read_listener_fd(read_end);
+            let mut pipe = std::fs::File::from(read_end);
+            let mut text = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                pipe.read_exact(&mut byte)
+                    .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
+                if byte[0] == b'\n' {
+                    break;
+                }
+                text.push(byte[0]);
+                if text.len() > 11 {
+                    die("listener fd on handoff pipe was not a decimal integer");
+                }
+            }
+            let listener_fd_number: i32 = std::str::from_utf8(&text)
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .unwrap_or_else(|| die("listener fd on handoff pipe was not a decimal integer"));
 
             // pidfd_open(2): Linux 5.3+. Refer to the child pid so we can dup its
             // fds without racing /proc.
