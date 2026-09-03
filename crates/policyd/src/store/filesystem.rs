@@ -550,18 +550,10 @@ mod tests {
         SandboxPaths, VerdictSource, atomic_write_policy, trusted_project_policy_path,
     };
 
-    use crate::{store::types::PolicyStore, wire::FilesystemCheckRequest};
-
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(crate::store::test_args(
-            "/tmp/test.sock".into(),
-            "/tmp/test-sandbox.sock".into(),
-            "/tmp/declarative.json".into(),
-            "/tmp/export.json".into(),
-            Duration::from_secs(30),
-            true,
-        ))
-    }
+    use crate::{
+        store::{test_store, types::PolicyStore},
+        wire::FilesystemCheckRequest,
+    };
 
     fn filesystem_request(path: &Path, access: FileAccess) -> FilesystemCheckRequest {
         FilesystemCheckRequest {

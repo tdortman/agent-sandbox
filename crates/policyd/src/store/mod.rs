@@ -70,6 +70,18 @@ pub(crate) const fn test_args(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_store() -> PolicyStore {
+    PolicyStore::new(test_args(
+        "/tmp/test.sock".into(),
+        "/tmp/test-sandbox.sock".into(),
+        "/tmp/declarative.json".into(),
+        "/tmp/export.json".into(),
+        Duration::from_secs(30),
+        true,
+    ))
+}
+
 impl PolicyStore {
     /// Create a new [`PolicyStore`] from the given daemon arguments.
     #[must_use]

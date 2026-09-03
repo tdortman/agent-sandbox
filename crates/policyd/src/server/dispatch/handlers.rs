@@ -474,7 +474,7 @@ async fn handle_approve_host(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use agent_sandbox_core::{ProcessIds, SandboxPaths};
     use tokio::{net::UnixStream, sync::Mutex};
@@ -482,19 +482,8 @@ mod tests {
     use super::*;
     use crate::{
         error::PolicydError,
-        store::{PolicyStore, TrustedPeer},
+        store::{PolicyStore, TrustedPeer, test_store},
     };
-
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(crate::store::test_args(
-            "/tmp/test.sock".into(),
-            "/tmp/test-sandbox.sock".into(),
-            "/tmp/declarative.json".into(),
-            "/tmp/export.json".into(),
-            Duration::from_secs(30),
-            true,
-        ))
-    }
 
     fn writer() -> Arc<Mutex<tokio::net::unix::OwnedWriteHalf>> {
         Arc::new(Mutex::new(

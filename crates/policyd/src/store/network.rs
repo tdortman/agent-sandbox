@@ -634,20 +634,12 @@ mod tests {
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
     use crate::{
-        store::types::{Pending, PolicyStore, UiClient, UiSessionContext},
+        store::{
+            test_store,
+            types::{Pending, UiClient, UiSessionContext},
+        },
         wire::NetworkCheckRequest,
     };
-
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(crate::store::test_args(
-            "/tmp/test.sock".into(),
-            "/tmp/test-sandbox.sock".into(),
-            "/tmp/declarative.json".into(),
-            "/tmp/export.json".into(),
-            Duration::from_secs(30),
-            true,
-        ))
-    }
 
     fn unique_request(host: &str, port: u16) -> NetworkCheckRequest {
         NetworkCheckRequest {

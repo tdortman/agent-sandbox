@@ -598,22 +598,10 @@ mod tests {
     };
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex};
 
-    use super::PolicyStore;
     use crate::{
-        store::{UiSessionContext, types::UiClient},
+        store::{UiSessionContext, test_store, types::UiClient},
         wire::ResourceCheckRequest,
     };
-
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(crate::store::test_args(
-            "/tmp/test.sock".into(),
-            "/tmp/test-sandbox.sock".into(),
-            "/tmp/declarative.json".into(),
-            "/tmp/export.json".into(),
-            Duration::from_secs(30),
-            true,
-        ))
-    }
 
     fn unique_request(path: &str) -> ResourceCheckRequest {
         ResourceCheckRequest {

@@ -756,17 +756,7 @@ mod tests {
     use agent_sandbox_core::SudoRule;
 
     use super::*;
-
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(crate::store::test_args(
-            "/tmp/test.sock".into(),
-            "/tmp/test-sandbox.sock".into(),
-            "/tmp/declarative.json".into(),
-            "/tmp/export.json".into(),
-            Duration::from_secs(30),
-            true,
-        ))
-    }
+    use crate::store::test_store;
 
     /// `(launcher_pid, peer_pid)` that passes the launcher binding check:
     /// the test process is the peer and its real parent is the launcher.

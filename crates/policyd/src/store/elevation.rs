@@ -389,22 +389,11 @@ mod tests {
     use agent_sandbox_core::{ElevateReply, ProcessIds, ResolvedRequestContext, SandboxPaths};
 
     use super::ELEVATION_PATH;
-    use crate::{store::types::PolicyStore, wire::ElevationRequest};
+    use crate::{store::test_store, wire::ElevationRequest};
 
     fn system_profile_true() -> Option<PathBuf> {
         let path = Path::new(ELEVATION_PATH).join("true");
         path.is_file().then_some(path)
-    }
-
-    fn test_store() -> PolicyStore {
-        PolicyStore::new(crate::store::test_args(
-            "/tmp/test.sock".into(),
-            "/tmp/test-sandbox.sock".into(),
-            "/tmp/declarative.json".into(),
-            "/tmp/export.json".into(),
-            Duration::from_secs(30),
-            true,
-        ))
     }
 
     fn elevation_request(argv: Vec<String>) -> ElevationRequest {
