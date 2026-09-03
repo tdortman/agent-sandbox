@@ -83,6 +83,30 @@ let
       (unsafe-add-raw-args "--dir /run")
       (unsafe-add-raw-args "--tmpfs /run/wrappers")
     ];
+  dbusRuleJson =
+    rule:
+    {
+      target = {
+        inherit (rule.target)
+          bus
+          destination
+          interface
+          member
+          signature
+          ;
+
+        fd_metadata = map (fd: {
+          inherit (fd) kind;
+          read_only = fd.readOnly;
+        }) rule.target.fdMetadata;
+
+        message_kind = rule.target.messageKind;
+        object_path = rule.target.objectPath;
+      };
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
   defaultBlockEnvVars = [
     "AWS_ACCESS_KEY_ID"
     "AWS_SECRET_ACCESS_KEY"
@@ -121,6 +145,21 @@ let
     "/run/opengl-driver-32"
   ];
   homeMountRel = path: if path == "~" then "" else lib.removePrefix "~/" path;
+  httpRuleJson =
+    rule:
+    assert lib.assertMsg
+      (
+        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
+        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
+      )
+      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
+    {
+      inherit (rule) url;
+      methods = if rule.allMethods then [ ] else rule.methods;
+    }
+    // lib.optionalAttrs (rule.comment != null) {
+      inherit (rule) comment;
+    };
   isHomeMountPath = path: path == "~" || lib.hasPrefix "~/" path;
   isHostMountPath = path: lib.hasPrefix "/" path;
   mkRuntime =
@@ -198,6 +237,20 @@ let
       RUNTIME_ARGS+=(--setenv LD_LIBRARY_PATH "$_asbx_ld")
     fi
   '';
+  packageHasPolicy =
+    value:
+    value.policy.network.direct.allow != [ ]
+    || value.policy.network.direct.deny != [ ]
+    || value.policy.network.http.allow != [ ]
+    || value.policy.network.http.deny != [ ]
+    || value.policy.filesystem.allow != [ ]
+    || value.policy.filesystem.deny != [ ]
+    || value.policy.resources.allow != [ ]
+    || value.policy.resources.deny != [ ]
+    || value.policy.dbus.allow != [ ]
+    || value.policy.dbus.deny != [ ]
+    || value.policy.sudo.allow != [ ]
+    || value.policy.sudo.deny != [ ];
   policyContextScript = ''
     # Reuse outer context if already set.
     if [[ -n "''${AGENT_SANDBOX_SESSION_ID:-}" ]]; then
@@ -248,11 +301,14 @@ let
 in
 {
   inherit
+    dbusRuleJson
     defaultBlockEnvVars
     defaultCommonPkgs
     defaultDevicePaths
     defaultRuntimeReadonlyDirs
+    httpRuleJson
     mkRuntime
+    packageHasPolicy
     ;
 
   mkWrapPackage =

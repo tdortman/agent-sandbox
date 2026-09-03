@@ -6,6 +6,7 @@
   ...
 }:
 let
+  inherit (agentSandboxLib) dbusRuleJson httpRuleJson packageHasPolicy;
   agentSandboxLib = import ./lib.nix {
     inherit lib;
     inherit (flake) jail-nix;
@@ -28,30 +29,6 @@ let
       };
     };
   };
-  dbusRuleJson =
-    rule:
-    {
-      target = {
-        inherit (rule.target)
-          bus
-          destination
-          interface
-          member
-          signature
-          ;
-
-        fd_metadata = map (fd: {
-          inherit (fd) kind;
-          read_only = fd.readOnly;
-        }) rule.target.fdMetadata;
-
-        message_kind = rule.target.messageKind;
-        object_path = rule.target.objectPath;
-      };
-    }
-    // lib.optionalAttrs (rule.comment != null) {
-      inherit (rule) comment;
-    };
   dbusRuleType = lib.types.submodule {
     options = {
       comment = lib.mkOption {
@@ -145,21 +122,6 @@ let
       builtins.stringLength method <= 64 && builtins.match "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" method != null
     ) "agent-sandbox HTTP rule methods must contain valid HTTP method tokens, got: ${method}"
   );
-  httpRuleJson =
-    rule:
-    assert lib.assertMsg
-      (
-        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
-        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
-      )
-      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
-    {
-      inherit (rule) url;
-      methods = if rule.allMethods then [ ] else rule.methods;
-    }
-    // lib.optionalAttrs (rule.comment != null) {
-      inherit (rule) comment;
-    };
   httpRuleType = lib.types.submodule {
     options = {
       allMethods = lib.mkOption {
@@ -269,20 +231,6 @@ let
       value.binary
     else
       value.package.pname or (lib.getName value.package);
-  packageHasPolicy =
-    value:
-    value.policy.network.direct.allow != [ ]
-    || value.policy.network.direct.deny != [ ]
-    || value.policy.network.http.allow != [ ]
-    || value.policy.network.http.deny != [ ]
-    || value.policy.filesystem.allow != [ ]
-    || value.policy.filesystem.deny != [ ]
-    || value.policy.resources.allow != [ ]
-    || value.policy.resources.deny != [ ]
-    || value.policy.dbus.allow != [ ]
-    || value.policy.dbus.deny != [ ]
-    || value.policy.sudo.allow != [ ]
-    || value.policy.sudo.deny != [ ];
   packageNameValid = name: name != "" && !(lib.hasInfix "/" name) && !(lib.hasInfix ".." name);
   packageOptions = mountOptions // {
     package = lib.mkOption {

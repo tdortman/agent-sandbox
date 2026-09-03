@@ -6,6 +6,7 @@
   ...
 }:
 let
+  inherit (agentSandboxLib) dbusRuleJson httpRuleJson packageHasPolicy;
   agentSandboxLib = import ./lib.nix {
     inherit lib;
     inherit (flake) jail-nix;
@@ -17,30 +18,6 @@ let
     else
       lib.concatMapStringsSep " || " (port: "port == ${toString port}") ports;
   cfg = config.agent-sandbox.network;
-  dbusRuleJson =
-    rule:
-    {
-      target = {
-        inherit (rule.target)
-          bus
-          destination
-          interface
-          member
-          signature
-          ;
-
-        fd_metadata = map (fd: {
-          inherit (fd) kind;
-          read_only = fd.readOnly;
-        }) rule.target.fdMetadata;
-
-        message_kind = rule.target.messageKind;
-        object_path = rule.target.objectPath;
-      };
-    }
-    // lib.optionalAttrs (rule.comment != null) {
-      inherit (rule) comment;
-    };
   dnsTargetHost =
     let
       parts = lib.splitString ":" runtime.dnsForwardTarget;
@@ -100,21 +77,12 @@ let
     hostLoopbackPreroutingRule6 = lib.escapeShellArg "";
     vethHost = runtime.network.vethHost;
   };
-  httpRuleJson =
-    rule:
-    assert lib.assertMsg
-      (
-        (rule.methods != null && builtins.length rule.methods > 0 && !rule.allMethods)
-        || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
-      )
-      "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
-    {
-      inherit (rule) url;
-      methods = if rule.allMethods then [ ] else rule.methods;
-    }
-    // lib.optionalAttrs (rule.comment != null) {
-      inherit (rule) comment;
-    };
+  http3UdpPorts = [
+    (toString runtime.httpProxy.http3.udpPort)
+  ]
+  ++ map toString runtime.httpProxy.http3.altUdpPorts;
+  http3UdpPortsComma = lib.concatStringsSep "," http3UdpPorts;
+  http3UdpPortsSpace = lib.concatStringsSep " " http3UdpPorts;
   loopbackBpfObject =
     pkgs.runCommand "agent-sandbox-loopback-bpf.o"
       {
@@ -437,20 +405,6 @@ let
       value.binary
     else
       lib.baseNameOf (lib.getExe value.package);
-  packageHasPolicy =
-    value:
-    value.policy.network.direct.allow != [ ]
-    || value.policy.network.direct.deny != [ ]
-    || value.policy.network.http.allow != [ ]
-    || value.policy.network.http.deny != [ ]
-    || value.policy.filesystem.allow != [ ]
-    || value.policy.filesystem.deny != [ ]
-    || value.policy.resources.allow != [ ]
-    || value.policy.resources.deny != [ ]
-    || value.policy.dbus.allow != [ ]
-    || value.policy.dbus.deny != [ ]
-    || value.policy.sudo.allow != [ ]
-    || value.policy.sudo.deny != [ ];
   policyEnabled =
     cfg.enable
     || rootCfg.policy.dbus.enable
@@ -929,9 +883,7 @@ lib.mkIf policyEnabled (
               ]
               ++ lib.optionals (cfg.httpProxy.enable && cfg.httpProxy.http3.enable) [
                 "--udp-proxy-ports"
-                (lib.concatStringsSep "," (
-                  [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
-                ))
+                http3UdpPortsComma
               ]
             );
 
@@ -1058,14 +1010,7 @@ lib.mkIf policyEnabled (
                 "agent_sandbox_proxy"
               ]
               ++ [
-                (
-                  if runtime.httpProxy.http3.enable then
-                    lib.concatStringsSep "," (
-                      [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
-                    )
-                  else
-                    "0"
-                )
+                (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
               ]
             );
 
@@ -1079,14 +1024,7 @@ lib.mkIf policyEnabled (
                 "agent_sandbox_proxy"
               ]
               ++ [
-                (
-                  if runtime.httpProxy.http3.enable then
-                    lib.concatStringsSep "," (
-                      [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
-                    )
-                  else
-                    "0"
-                )
+                (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
               ]
               ++ [ "cleanup" ]
             );
@@ -1175,9 +1113,7 @@ lib.mkIf policyEnabled (
                 nfqReadyPath
               ]
               ++ lib.optionals runtime.httpProxy.http3.enable [
-                (lib.concatStringsSep " " (
-                  [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
-                ))
+                http3UdpPortsSpace
               ]
             );
 
@@ -1196,11 +1132,7 @@ lib.mkIf policyEnabled (
                 nfqReadyPath
               ]
               ++ [
-                (lib.optionalString runtime.httpProxy.http3.enable (
-                  lib.concatStringsSep " " (
-                    [ (toString runtime.httpProxy.http3.udpPort) ] ++ map toString runtime.httpProxy.http3.altUdpPorts
-                  )
-                ))
+                (lib.optionalString runtime.httpProxy.http3.enable http3UdpPortsSpace)
                 "cleanup"
               ]
             );
