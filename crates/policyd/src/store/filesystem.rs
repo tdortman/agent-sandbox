@@ -117,16 +117,14 @@ impl PolicyStore {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        if let Some(c) = &cwd {
-            command.arg("--cwd").arg(c);
-        }
-
-        if let Some(h) = &home {
-            command.arg("--home").arg(h);
-        }
-
-        if let Some(p) = &project_root {
-            command.arg("--project-root").arg(p);
+        for (flag, path) in [
+            ("--cwd", cwd.as_ref()),
+            ("--home", home.as_ref()),
+            ("--project-root", project_root.as_ref()),
+        ] {
+            if let Some(path) = path {
+                command.arg(flag).arg(path);
+            }
         }
         command.arg("--static-policy").arg(&self.args.export_json);
 

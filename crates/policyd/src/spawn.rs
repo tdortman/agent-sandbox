@@ -47,25 +47,14 @@ pub fn ui_spawn_env(
         ),
     ]);
 
-    if let Some(home) = home {
-        env.insert(
-            "AGENT_SANDBOX_HOME".into(),
-            home.to_string_lossy().into_owned(),
-        );
-    }
-
-    if let Some(cwd) = cwd {
-        env.insert(
-            "AGENT_SANDBOX_CWD".into(),
-            cwd.to_string_lossy().into_owned(),
-        );
-    }
-
-    if let Some(project_root) = project_root {
-        env.insert(
-            "AGENT_SANDBOX_PROJECT_ROOT".into(),
-            project_root.to_string_lossy().into_owned(),
-        );
+    for (key, path) in [
+        ("AGENT_SANDBOX_HOME", home),
+        ("AGENT_SANDBOX_CWD", cwd),
+        ("AGENT_SANDBOX_PROJECT_ROOT", project_root),
+    ] {
+        if let Some(path) = path {
+            env.insert(key.into(), path.to_string_lossy().into_owned());
+        }
     }
 
     if let Some(sandbox_session_id) = sandbox_session_id {
@@ -356,16 +345,14 @@ fn build_ui_spawn_command(
         .arg("--")
         .arg(cmd);
 
-    if let Some(cwd) = spawn.cwd {
-        command.arg("--cwd").arg(cwd);
-    }
-
-    if let Some(home) = spawn.home {
-        command.arg("--home").arg(home);
-    }
-
-    if let Some(project_root) = spawn.project_root {
-        command.arg("--project-root").arg(project_root);
+    for (flag, path) in [
+        ("--cwd", spawn.cwd),
+        ("--home", spawn.home),
+        ("--project-root", spawn.project_root),
+    ] {
+        if let Some(path) = path {
+            command.arg(flag).arg(path);
+        }
     }
 
     command
