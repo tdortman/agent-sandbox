@@ -389,19 +389,21 @@ pub fn policy_json(policy: &Policy) -> serde_json::Result<String> {
 fn contracted_policy(policy: &Policy, home: Option<&Path>) -> Policy {
     let mut out = policy.clone();
 
-    for rule in &mut out.filesystem.allow {
+    for rule in out
+        .filesystem
+        .allow
+        .iter_mut()
+        .chain(out.filesystem.deny.iter_mut())
+    {
         rule.path = contract_home_path(&rule.path, home);
     }
 
-    for rule in &mut out.filesystem.deny {
-        rule.path = contract_home_path(&rule.path, home);
-    }
-
-    for rule in &mut out.resources.allow {
-        rule.path = contract_home_path(&rule.path, home);
-    }
-
-    for rule in &mut out.resources.deny {
+    for rule in out
+        .resources
+        .allow
+        .iter_mut()
+        .chain(out.resources.deny.iter_mut())
+    {
         rule.path = contract_home_path(&rule.path, home);
     }
 
