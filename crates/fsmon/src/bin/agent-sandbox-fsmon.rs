@@ -498,7 +498,7 @@ fn read_tracee_open_how_flags(host_proc: &HostProc, pid: i32, how_ptr: u64) -> O
     open_how_flags_from_bytes(&bytes)
 }
 
-/// Parse a blocked open-family syscall from `/proc/<tid>/syscall`.
+/// Classify a blocked syscall that generated an open permission event.
 ///
 /// Layout per `proc_pid_syscall(5)`: `nr arg0 arg1 … arg5 sp pc`, where each
 /// `argN` is the corresponding syscall argument register in ABI order
@@ -548,6 +548,11 @@ fn parse_open_syscall_access(
 
         // creat(const char *pathname, mode_t mode) — open(2) with O_WRONLY|O_CREAT|O_TRUNC
         n if n == libc::SYS_creat => Some(FileAccess::Write),
+
+        // do_open_execat opens executables and interpreters with __FMODE_EXEC.
+        // fsnotify sends OPEN_EXEC_PERM and OPEN_PERM separately for that open;
+        // both occur inside execve/execveat, which have no open-flags argument.
+        n if n == libc::SYS_execve || n == libc::SYS_execveat => Some(FileAccess::Execute),
 
         _ => None,
     }
@@ -1178,6 +1183,19 @@ mod tests {
             parse_open_syscall_access(&host_proc, 1, &content),
             Some(FileAccess::Write)
         );
+    }
+
+    #[test]
+    fn exec_syscalls_classify_plain_open_permission_as_execute() {
+        let host_proc = test_host_proc();
+
+        for nr in [libc::SYS_execve, libc::SYS_execveat] {
+            let content = format!("{nr} 0x7fff00004000 0x0 0x0 0x0 0x0 0x0");
+            assert_eq!(
+                parse_open_syscall_access(&host_proc, 1, &content),
+                Some(FileAccess::Execute)
+            );
+        }
     }
 
     #[test]
