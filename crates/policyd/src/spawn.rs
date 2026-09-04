@@ -163,6 +163,14 @@ impl PolicyStore {
             return;
         }
 
+        // Unattributed pendings have no sandbox session, and UI
+        // registration requires one: a spawned UI could never serve the
+        // pending and would only retry its rejected registration forever.
+        // Skip the spawn and let the pending fail closed on timeout.
+        if sandbox_session_id.is_none() {
+            return;
+        }
+
         let mut spawn_uid = base_uid;
 
         if spawn_uid.is_none_or(|u| u == 0)

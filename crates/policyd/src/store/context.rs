@@ -228,6 +228,16 @@ impl PolicyStore {
             sandbox_session_id = sandbox_session_id_from_pid(pid);
         }
 
+        // Sandbox children that run with a filtered environment (agents
+        // spawn tools and runtimes with a whitelisted env that drops
+        // AGENT_SANDBOX_SESSION_ID) are attributed by process ancestry
+        // against the registered session launcher/root instead.
+        if sandbox_session_id.is_none()
+            && let Some(pid) = pid
+        {
+            sandbox_session_id = self.session_id_for_descendant(pid, uid);
+        }
+
         let mut cwd = ctx.paths.cwd_path();
         let mut home = ctx.paths.home_path();
         let mut project_root = ctx.paths.project_root_path();
@@ -274,6 +284,50 @@ impl PolicyStore {
             sandbox_session_id,
             package,
         }
+    }
+
+    /// Adopt the sandbox session whose launcher or root pid is an ancestor of
+    /// `pid`. Session adoption requires the owner uid to match the process
+    /// uid. For nested sandboxes the innermost matching anchor wins.
+    fn session_id_for_descendant(&self, pid: u32, uid: Option<u32>) -> Option<String> {
+        let registrations: Vec<(String, u32, u32)> = self
+            .sandbox_sessions
+            .read()
+            .ok()?
+            .iter()
+            .map(|(id, reg)| {
+                (
+                    id.clone(),
+                    if reg.root_pid > 0 {
+                        reg.root_pid
+                    } else {
+                        reg.launcher_pid
+                    },
+                    reg.owner_uid,
+                )
+            })
+            .collect();
+
+        let mut candidates: Vec<(String, u32)> = Vec::new();
+
+        for (id, anchor, owner_uid) in &registrations {
+            if *owner_uid != 0 && Some(*owner_uid) != uid {
+                continue;
+            }
+
+            if *anchor > 0 && is_descendant_of(*anchor, pid) {
+                candidates.push((id.clone(), *anchor));
+            }
+        }
+
+        candidates
+            .iter()
+            .find(|(_, anchor)| {
+                !candidates
+                    .iter()
+                    .any(|(_, other)| other != anchor && is_descendant_of(*anchor, *other))
+            })
+            .map(|(id, _)| id.clone())
     }
 
     /// Read the launcher env vars and `/proc` paths for a verified sandbox
@@ -864,6 +918,59 @@ mod tests {
             resolved.sandbox_session_id.as_deref(),
             Some("sandbox-session")
         );
+    }
+
+    #[test]
+    fn env_stripped_descendant_adopts_session_by_ancestry() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let (launcher_pid, peer_pid) = launcher_pair();
+
+        store
+            .register_sandbox("sandbox-desc", "codex", uid, launcher_pid, peer_pid)
+            .expect("register sandbox");
+
+        // The requesting pid descends from the registered launcher but its
+        // environment carries no AGENT_SANDBOX_SESSION_ID, like an agent's
+        // tool child spawned with a whitelisted env.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .spawn()
+            .expect("spawn env-stripped child");
+
+        let resolved = store.resolve_trusted_context(&ResolvedRequestContext::new(
+            SandboxPaths::default(),
+            ProcessIds::new(child.id(), uid),
+            None,
+        ));
+
+        assert_eq!(resolved.sandbox_session_id.as_deref(), Some("sandbox-desc"));
+        assert_eq!(resolved.package.as_deref(), Some("codex"));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn foreign_uid_descendant_does_not_adopt_session() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let (launcher_pid, peer_pid) = launcher_pair();
+        let foreign_uid = uid.wrapping_add(1).max(1);
+
+        store
+            .register_sandbox("sandbox-uid", "codex", uid, launcher_pid, peer_pid)
+            .expect("register sandbox");
+
+        let resolved = store.resolve_trusted_context(&ResolvedRequestContext::new(
+            SandboxPaths::default(),
+            ProcessIds::new(peer_pid, foreign_uid),
+            None,
+        ));
+
+        assert_eq!(resolved.sandbox_session_id, None);
     }
 
     #[test]

@@ -246,8 +246,15 @@ impl UiClient {
 
     async fn run(self) -> Result<(), UiCliError> {
         loop {
-            if let Err(err) = self.session().await {
-                warn!(error = %err, "disconnected; retrying");
+            match self.session().await {
+                Ok(()) => {}
+                Err(UiCliError::Register(err)) => {
+                    // A rejected registration is permanent: retrying cannot
+                    // help and each attempt logs a policyd dispatch error.
+                    warn!(error = %err, "registration rejected; exiting");
+                    return Ok(());
+                }
+                Err(err) => warn!(error = %err, "disconnected; retrying"),
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
