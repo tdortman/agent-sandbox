@@ -379,23 +379,6 @@ fn parse_open_syscall_path(host_proc: &HostProc, trace_pid: i32, content: &str) 
     }
 }
 
-/// Scan every thread in `tgid` for a blocked open-family syscall.
-fn scan_threads<T>(
-    host_proc: &HostProc,
-    tgid: i32,
-    parse: fn(&HostProc, i32, &str) -> Option<T>,
-) -> Option<T> {
-    for thread_id in host_proc.numeric_entries(tgid, "task").ok()? {
-        let content = host_proc.read_to_string(thread_id, "syscall").ok()?;
-
-        if let Some(value) = parse(host_proc, thread_id, &content) {
-            return Some(value);
-        }
-    }
-
-    None
-}
-
 /// Read the blocked tracee's open syscall args from `/proc/{pid}/syscall`.
 ///
 /// During a `FAN_OPEN_PERM` event the open is blocked: the tracee's fd
@@ -404,11 +387,10 @@ fn scan_threads<T>(
 /// read the syscall arguments from `/proc/{pid}/syscall`, which the kernel
 /// exposes while the task is blocked inside the syscall.
 ///
-/// Fanotify normally reports the process id. On multi-threaded programs the
-/// blocked `open` runs on a worker thread, so `/proc/<tgid>/syscall` shows
-/// `0` (not in a syscall) while `/proc/<tid>/syscall` has the real args.
-/// With `FAN_REPORT_TID`, `trace_pid` is already the opener's tid; otherwise
-/// we scan `/proc/<tgid>/task/*/syscall`.
+/// `FAN_REPORT_TID` identifies the exact opener. The event may reach the
+/// monitor before that thread sleeps, when procfs still reports `running`.
+/// Wait briefly for its syscall snapshot; another thread's arguments cannot
+/// establish this opener's access.
 fn syscall_lookup<T>(
     host_proc: &HostProc,
     trace_pid: i32,
@@ -418,14 +400,28 @@ fn syscall_lookup<T>(
         return None;
     }
 
-    if let Ok(content) = host_proc.read_to_string(trace_pid, "syscall")
-        && let Some(value) = parse(host_proc, trace_pid, &content)
-    {
-        return Some(value);
+    let file = host_proc.open_entry(trace_pid, "syscall").ok()?;
+    // The procfs record contains at most nine 64-bit numeric fields. Reject
+    // incomplete records rather than classifying truncated arguments.
+    let mut buffer = [0u8; 256];
+    let mut deadline = None;
+    loop {
+        let length = file.read_at(&mut buffer, 0).ok()?;
+        let content = std::str::from_utf8(&buffer[..length]).ok()?;
+        if !content.ends_with('\n') {
+            return None;
+        }
+        if content.trim() != "running" {
+            return parse(host_proc, trace_pid, content);
+        }
+        let deadline = deadline.get_or_insert_with(|| {
+            std::time::Instant::now() + std::time::Duration::from_millis(10)
+        });
+        if std::time::Instant::now() >= *deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(50));
     }
-
-    let tgid = host_proc.thread_group_id(trace_pid)?;
-    scan_threads(host_proc, tgid, parse)
 }
 
 /// Best-effort path for a fanotify permission event: event fd first, then the
@@ -526,22 +522,20 @@ fn parse_open_syscall_access(
         return None;
     }
 
-    let args: Vec<&str> = parts.collect();
-
     match nr {
         // open(const char *pathname, int flags, mode_t mode)
         n if n == libc::SYS_open => Some(open_flags_to_file_access(open_flags_from_proc_arg(
-            args.get(1)?,
+            parts.nth(1)?,
         )?)),
 
         // openat(int dirfd, const char *pathname, int flags, mode_t mode)
         n if n == libc::SYS_openat => Some(open_flags_to_file_access(open_flags_from_proc_arg(
-            args.get(2)?,
+            parts.nth(2)?,
         )?)),
 
         // openat2(int dirfd, const char *pathname, struct open_how *how, size_t size)
         n if n == libc::SYS_openat2 => {
-            let how_ptr = parse_proc_syscall_arg(args.get(2)?)?;
+            let how_ptr = parse_proc_syscall_arg(parts.nth(2)?)?;
             let flags = read_tracee_open_how_flags(host_proc, trace_pid, how_ptr)?;
             Some(open_flags_to_file_access(flags))
         }
@@ -827,6 +821,11 @@ fn run_event_loop(
                     }
                 };
 
+                if static_allow.allows_literal(Path::new(&path), FileAccess::All) {
+                    respond(fan_fd, &event_fd, FAN_ALLOW);
+                    offset += event_len;
+                    continue;
+                }
                 let access = normalize_directory_traverse_access(
                     Path::new(&path),
                     mask_to_access(host_proc, meta.mask, &event_fd, meta.pid),
@@ -920,8 +919,9 @@ fn main() {
             process::exit(1);
         });
 
-    if fanotify_reports_tid {
-        tracing::debug!("fanotify reports opener thread ids (FAN_REPORT_TID)");
+    if !fanotify_reports_tid {
+        eprintln!("agent-sandbox-fsmon: FAN_REPORT_TID is required to identify the opener safely");
+        process::exit(1);
     }
 
     // Open host procfs before setns. After joining the sandbox mount namespace,
@@ -1291,6 +1291,50 @@ mod tests {
             mask_to_access(&host_proc, FAN_OPEN_PERM | FAN_ACCESS_PERM, &event_fd, -1,),
             FileAccess::Read
         );
+    }
+
+    #[test]
+    fn unavailable_opener_never_uses_another_threads_read_access() {
+        let host_proc = test_host_proc();
+        let path = std::env::temp_dir().join(format!("fsmon-opener-{}", process::id()));
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).expect("create FIFO");
+        let reader_path = path.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            send.send(nix::unistd::gettid().as_raw())
+                .expect("send opener tid");
+            File::open(reader_path).expect("open FIFO for reading")
+        });
+        let reader_tid = receive.recv().expect("receive opener tid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut reader_access = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = host_proc.read_to_string(reader_tid, "syscall") {
+                reader_access = parse_open_syscall_access(&host_proc, reader_tid, &content);
+                if reader_access.is_some() {
+                    break;
+                }
+            }
+            std::thread::yield_now();
+        }
+        let opener_access = syscall_lookup(&host_proc, reader_tid, parse_open_syscall_access);
+        let access = mask_to_access(
+            &host_proc,
+            FAN_OPEN_PERM,
+            &test_event_file(),
+            nix::unistd::gettid().as_raw(),
+        );
+        let release = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("release blocked FIFO reader");
+        drop(reader.join().expect("join reader"));
+        drop(release);
+        fs::remove_file(path).expect("remove FIFO");
+        assert_eq!(reader_access, Some(FileAccess::Read));
+        assert_eq!(opener_access, Some(FileAccess::Read));
+        assert_eq!(access, FileAccess::ReadWrite);
     }
 
     #[test]
