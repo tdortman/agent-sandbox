@@ -61,10 +61,10 @@ pub const AUDIT_ARCH_NATIVE: u32 = match () {
 /// trapped so the broker can return `ENOSYS`; allowing rings would let
 /// `IORING_OP_OPENAT` execute in-kernel outside seccomp user notification.
 /// Never trap high-frequency I/O (`write`, `writev`, `sendfile`) or
-/// thread/namespace syscalls (`clone3`, `unshare`). The broker is
-/// single-threaded, so trapping them serializes every I/O call and thread
-/// spawn and starves the sandboxed process until its runtime aborts. `SOCKET`
-/// is excluded because the broker duplicates tracee socket fds via
+/// thread/namespace syscalls (`clone3`, `unshare`). The broker classifies
+/// notifications serially, so trapping them serializes every I/O call and
+/// thread spawn and starves the sandboxed process until its runtime aborts.
+/// `SOCKET` is excluded because the broker duplicates tracee socket fds via
 /// `pidfd_getfd` to emulate connect/send. Trapping `socket` would deadlock that
 /// emulation path. `PR_SET_NO_NEW_PRIVS` blocks `clone3` escape.
 #[must_use]
@@ -164,7 +164,7 @@ mod tests {
 
     /// Regression: high-frequency I/O and thread/namespace syscalls must
     /// stay out of the trap set. Trapping them serializes every write
-    /// and every thread spawn through the single-threaded broker,
+    /// and every thread spawn through serial broker classification,
     /// starving the sandboxed process until its runtime aborts.
     #[test]
     fn default_syscalls_excludes_high_frequency_and_thread_syscalls() {
