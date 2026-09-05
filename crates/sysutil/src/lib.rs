@@ -28,17 +28,21 @@ use nix::{
 /// Returns the kernel error (`ESRCH` when the pid is gone, `EINVAL`/`ENOSYS`
 /// on kernels without pidfd support).
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
-    // SAFETY: `pidfd_open(pid_t pid, unsigned int flags)` with flags=0. The
+    pidfd_open_with_flags(pid, 0)
+}
+
+fn pidfd_open_with_flags(pid: u32, flags: u32) -> io::Result<OwnedFd> {
+    // SAFETY: `pidfd_open(pid_t pid, unsigned int flags)`. The
     // returned fd is owned exclusively by this call.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), 0u32) };
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), flags) };
 
     fd_from_syscall(raw)
 }
 
 /// Duplicate a foreign fd into this process via `pidfd_getfd(2)` (Linux 5.6+).
 ///
-/// `pidfd` is a pidfd from [`pidfd_open`]. `fd` is the target fd in that
-/// process. Returns an `OwnedFd` that closes on drop.
+/// `pidfd` refers to the target task; `fd` is a descriptor in its file table.
+/// Returns an `OwnedFd` that closes on drop.
 ///
 /// # Errors
 /// Returns the kernel error.
@@ -190,16 +194,19 @@ fn tracee_process_id(thread_id: u32) -> io::Result<u32> {
 
 /// Duplicate a tracee thread's fd into our fd table.
 ///
-/// Seccomp notifications identify the thread that made the syscall, while
-/// `pidfd_getfd` requires a pidfd for the thread-group leader. The process fd
-/// table is shared by all threads, so resolving the leader still addresses
-/// the requested descriptor.
+/// Use a thread pidfd on Linux 6.9+ to address the exact notifying task.
+/// Older kernels use the thread-group leader and its shared descriptor table.
 ///
 /// # Errors
 /// Returns the kernel error from either step or from resolving the thread ID.
 pub fn dup_tracee_fd(thread_id: u32, fd: i32) -> io::Result<OwnedFd> {
-    let process_id = tracee_process_id(thread_id)?;
-    let pidfd = pidfd_open(process_id)?;
+    let pidfd = match pidfd_open_with_flags(thread_id, libc::PIDFD_THREAD) {
+        Ok(pidfd) => pidfd,
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            pidfd_open(tracee_process_id(thread_id)?)?
+        }
+        Err(error) => return Err(error),
+    };
     pidfd_getfd(&pidfd, fd)
 }
 
