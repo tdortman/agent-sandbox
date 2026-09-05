@@ -1308,6 +1308,10 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
     let Ok(Some(raw_path)) = read_tracee_open_path(notif) else {
         return None;
     };
+    // stat follows aliases, so definite non-devices need no canonical pathname.
+    if device_file_type(&raw_path) == Some(false) {
+        return None;
+    }
 
     let path = normalize_path(&raw_path);
     if !is_device_node_for_resource_gate(&path) {
@@ -1800,6 +1804,32 @@ mod tests {
                 "compat/non-native arch {arch:#x} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn device_alias_outside_dev_remains_resource_gated() {
+        let alias =
+            std::env::temp_dir().join(format!("broker-device-alias-{}", std::process::id()));
+        std::os::unix::fs::symlink("/dev/ptmx", &alias).expect("create device alias");
+        let cpath = std::ffi::CString::new(alias.as_os_str().as_encoded_bytes()).expect("path");
+        let notif = SeccompNotif {
+            pid: std::process::id(),
+            data: SeccompData {
+                nr: i32::try_from(nr::OPEN).expect("syscall number"),
+                args: [cpath.as_ptr() as u64, 0, 0, 0, 0, 0],
+                ..SeccompData::default()
+            },
+            ..SeccompNotif::default()
+        };
+        let target = target_from_notification(&notif).expect("classify device alias");
+        fs::remove_file(alias).expect("remove device alias");
+        let Some(SyscallTarget::Resource(target)) = target else {
+            panic!("device alias must remain resource-gated");
+        };
+        assert_eq!(
+            target.path,
+            fs::canonicalize("/dev/ptmx").expect("canonical device")
+        );
     }
 
     #[test]
