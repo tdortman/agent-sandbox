@@ -283,13 +283,13 @@ fn prefix_matches(rule_path: &Path, requested: &Path, require_directory_boundary
 }
 
 fn compiled_matches(
-    compiled: CompiledPath,
+    compiled: &CompiledPath,
     requested: &Path,
     require_directory_boundary: bool,
 ) -> bool {
     match compiled {
         CompiledPath::Prefix(rule_path) => {
-            prefix_matches(&rule_path, requested, require_directory_boundary)
+            prefix_matches(rule_path, requested, require_directory_boundary)
         }
 
         CompiledPath::Glob(matcher) => matcher.is_match(requested),
@@ -306,7 +306,7 @@ fn path_matches_rule(
     let raw = CompiledPath::compile_raw(rule_path, project_root);
 
     if let Ok(compiled) = raw
-        && compiled_matches(compiled, &requested, require_directory_boundary)
+        && compiled_matches(&compiled, &requested, require_directory_boundary)
     {
         return true;
     }
@@ -316,8 +316,7 @@ fn path_matches_rule(
         // Previously a panic via .expect; now degrades gracefully.
         return false;
     };
-
-    compiled_matches(compiled, &requested, require_directory_boundary)
+    compiled_matches(&compiled, &requested, require_directory_boundary)
 }
 
 /// One allow or deny rule for a filesystem path.
@@ -1430,6 +1429,8 @@ pub const EXPORTED_POLICY_PATH: &str = "/var/lib/agent-sandbox/exported-policy.j
 /// design.
 pub struct StaticPolicyAllow {
     rules: Vec<FilesystemRule>,
+    // Only syntactic matchers are cached; filesystem aliases stay live.
+    literal_rules: Vec<(CompiledPath, FileAccess)>,
     project_root: Option<PathBuf>,
 }
 
@@ -1455,8 +1456,17 @@ impl StaticPolicyAllow {
                 |policy| policy.filesystem.allow,
             );
 
+        let literal_rules = rules
+            .iter()
+            .filter_map(|rule| {
+                CompiledPath::compile_raw(&rule.path, project_root.as_deref())
+                    .ok()
+                    .map(|compiled| (compiled, rule.access))
+            })
+            .collect();
         Self {
             rules,
+            literal_rules,
             project_root,
         }
     }
@@ -1475,12 +1485,9 @@ impl StaticPolicyAllow {
     /// A miss does not exclude a grant through a live symlink alias.
     #[must_use]
     pub fn allows_literal(&self, path: &Path, access: FileAccess) -> bool {
-        let project_root = self.project_root.as_deref();
         let requested = normalize_rule_path(path);
-        self.rules.iter().any(|rule| {
-            rule.access.covers(access)
-                && CompiledPath::compile_raw(&rule.path, project_root)
-                    .is_ok_and(|compiled| compiled_matches(compiled, &requested, false))
+        self.literal_rules.iter().any(|(compiled, granted)| {
+            granted.covers(access) && compiled_matches(compiled, &requested, false)
         })
     }
 
@@ -2145,10 +2152,14 @@ mod tests {
             .allow
             .push(FilesystemRule::new("/readonly", FileAccess::Read, "test"));
 
-        let eval = StaticPolicyAllow {
-            rules: policy.filesystem.allow,
-            project_root: None,
-        };
+        let temporary = tempfile::tempdir().expect("temporary policy directory");
+        let export = temporary.path().join("policy.json");
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&policy).expect("serialize policy"),
+        )
+        .expect("write policy");
+        let eval = StaticPolicyAllow::load(&export, None);
 
         assert!(eval.allows(Path::new("/home/user/bench/run/f0"), FileAccess::ReadWrite));
         assert!(eval.allows(Path::new("/readonly"), FileAccess::Read));
