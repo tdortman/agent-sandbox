@@ -12,7 +12,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::ffi::OsStringExt,
+        unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
 };
@@ -973,8 +973,14 @@ fn two_path_target(
     let (new_dir, new, new_check) = capture_path(notif, new_dirfd, new_ptr)?;
     Ok(filesystem_target(
         vec![
-            (normalize_path(&old_check), FileAccess::ReadWrite),
-            (normalize_path(&new_check), FileAccess::ReadWrite),
+            (
+                normalize_captured_path(&old_dir, &old, &old_check),
+                FileAccess::ReadWrite,
+            ),
+            (
+                normalize_captured_path(&new_dir, &new, &new_check),
+                FileAccess::ReadWrite,
+            ),
         ],
         operation(old_dir, old, new_dir, new),
     ))
@@ -1061,7 +1067,10 @@ fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     Ok(filesystem_target(
         vec![
             (normalize_path(&target_path), FileAccess::Read),
-            (normalize_path(&resolved), FileAccess::Write),
+            (
+                normalize_captured_path(&link_dir, &link, &resolved),
+                FileAccess::Write,
+            ),
         ],
         FilesystemMutation::Symlink {
             target,
@@ -1078,7 +1087,10 @@ fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     Ok(filesystem_target(
         vec![
             (normalize_path(&target_path), FileAccess::Read),
-            (normalize_path(&resolved), FileAccess::Write),
+            (
+                normalize_captured_path(&link_dir, &link, &resolved),
+                FileAccess::Write,
+            ),
         ],
         FilesystemMutation::Symlink {
             target,
@@ -1106,7 +1118,7 @@ fn single_path_target(
 ) -> io::Result<SyscallTarget> {
     let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
     Ok(filesystem_target(
-        vec![(normalize_path(&path), access)],
+        vec![(normalize_captured_path(&dir, &raw, &path), access)],
         operation(dir, raw),
     ))
 }
@@ -1142,7 +1154,10 @@ fn target_from_truncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let len = i64::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
     Ok(filesystem_target(
-        vec![(normalize_path(&path), FileAccess::Write)],
+        vec![(
+            normalize_captured_path(&dir, &raw, &path),
+            FileAccess::Write,
+        )],
         FilesystemMutation::Truncate {
             dir,
             path: raw,
@@ -1190,7 +1205,10 @@ fn mkdir_target(
         return Ok(SyscallTarget::Errno(libc::EEXIST));
     }
     Ok(filesystem_target(
-        vec![(normalize_path(&path), FileAccess::Write)],
+        vec![(
+            normalize_captured_path(&dir, &raw, &path),
+            FileAccess::Write,
+        )],
         FilesystemMutation::Mkdir {
             dir,
             path: raw,
@@ -1244,7 +1262,22 @@ fn target_from_filesystem_mutation(notif: &SeccompNotif) -> Option<SyscallTarget
 /// Canonicalize a filesystem path by resolving symlinks.
 #[must_use]
 pub fn normalize_path(path: &Path) -> PathBuf {
-    let fd = match open_path_handle(path) {
+    normalize_path_handle(path, open_path_handle(path))
+}
+
+fn normalize_captured_path(dir: &OwnedFd, raw: &[u8], path: &Path) -> PathBuf {
+    let fd = nix::fcntl::openat(
+        dir,
+        Path::new(std::ffi::OsStr::from_bytes(raw)),
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(io::Error::from);
+    normalize_path_handle(path, fd)
+}
+
+fn normalize_path_handle(path: &Path, fd: io::Result<OwnedFd>) -> PathBuf {
+    let fd = match fd {
         Ok(fd) => Some(fd),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
             return path.to_path_buf();

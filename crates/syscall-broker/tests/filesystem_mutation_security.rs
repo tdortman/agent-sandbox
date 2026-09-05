@@ -193,6 +193,32 @@ fn relative_mutation_captures_tracee_cwd() {
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
+fn relative_mutation_resolves_live_symlink_targets() {
+    let cwd = std::env::current_dir().expect("current directory");
+    let root = cwd.join(format!("broker-relative-{}", std::process::id()));
+    std::fs::create_dir(&root).expect("temporary directory");
+    let first = root.join("first");
+    let second = root.join("second");
+    let alias = root.join("alias");
+    std::fs::write(&first, b"first").expect("first file");
+    std::fs::write(&second, b"second").expect("second file");
+    std::os::unix::fs::symlink(&first, &alias).expect("first alias");
+    let relative = alias
+        .strip_prefix(&cwd)
+        .expect("relative alias")
+        .to_string_lossy();
+    let notif = notif_with_path_args(nr::UNLINK, &[&relative]);
+    let before = filesystem_checks(&notif);
+    std::fs::remove_file(&alias).expect("remove alias");
+    std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
+    let after = filesystem_checks(&notif);
+    std::fs::remove_dir_all(&root).expect("remove temporary directory");
+    assert_eq!(before, vec![(first, FileAccess::Write)]);
+    assert_eq!(after, vec![(second, FileAccess::Write)]);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
 fn relative_unlinkat_accepts_zero_extended_at_fdcwd() {
     let mut notif = notif_with_path_args(nr::UNLINKAT, &["relative-path"]);
     notif.data.args[1] = notif.data.args[0];
