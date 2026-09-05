@@ -377,7 +377,7 @@ impl FilesystemRule {
     /// Whether this rule matches the given path and access request.
     #[must_use]
     pub fn matches(&self, path: &Path, access: FileAccess, project_root: Option<&Path>) -> bool {
-        self.path_matches(path, project_root) && self.access.covers(access)
+        self.access.covers(access) && self.path_matches(path, project_root)
     }
 }
 
@@ -1464,9 +1464,24 @@ impl StaticPolicyAllow {
     /// Whether the static snapshot allows the given path and access mode.
     #[must_use]
     pub fn allows(&self, path: &Path, access: FileAccess) -> bool {
-        self.rules
-            .iter()
-            .any(|rule| rule.matches(path, access, self.project_root.as_deref()))
+        self.allows_literal(path, access)
+            || self
+                .rules
+                .iter()
+                .any(|rule| rule.matches(path, access, self.project_root.as_deref()))
+    }
+
+    /// Whether a rule grants access without resolving filesystem aliases.
+    /// A miss does not exclude a grant through a live symlink alias.
+    #[must_use]
+    pub fn allows_literal(&self, path: &Path, access: FileAccess) -> bool {
+        let project_root = self.project_root.as_deref();
+        let requested = normalize_rule_path(path);
+        self.rules.iter().any(|rule| {
+            rule.access.covers(access)
+                && CompiledPath::compile_raw(&rule.path, project_root)
+                    .is_ok_and(|compiled| compiled_matches(compiled, &requested, false))
+        })
     }
 
     /// Whether the static snapshot allows every path/access pair.
@@ -2154,6 +2169,44 @@ mod tests {
             (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
             (PathBuf::from("/denied"), FileAccess::Read),
         ]));
+    }
+
+    #[test]
+    fn static_policy_allow_resolves_current_rule_and_request_aliases() {
+        let temporary = tempfile::tempdir().expect("temporary policy directory");
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        let alias = temporary.path().join("alias");
+        std::fs::create_dir(&first).expect("create first target");
+        std::fs::create_dir(&second).expect("create second target");
+        std::os::unix::fs::symlink(&first, &alias).expect("create alias");
+        let export = temporary.path().join("policy.json");
+        let mut policy = Policy::default();
+        policy
+            .filesystem
+            .allow
+            .push(FilesystemRule::new(&alias, FileAccess::Read, "test"));
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&policy).expect("serialize policy"),
+        )
+        .expect("write policy");
+        let rule_alias = StaticPolicyAllow::load(&export, None);
+        policy.filesystem.allow[0].path.clone_from(&first);
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&policy).expect("serialize policy"),
+        )
+        .expect("write policy");
+        let request_alias = StaticPolicyAllow::load(&export, None);
+        assert!(rule_alias.allows(&first, FileAccess::Read));
+        assert!(request_alias.allows(&alias, FileAccess::Read));
+        assert!(!request_alias.allows(&alias, FileAccess::Write));
+        std::fs::remove_file(&alias).expect("remove alias");
+        std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
+        assert!(!rule_alias.allows(&first, FileAccess::Read));
+        assert!(rule_alias.allows(&second, FileAccess::Read));
+        assert!(!request_alias.allows(&alias, FileAccess::Read));
     }
 
     #[test]
