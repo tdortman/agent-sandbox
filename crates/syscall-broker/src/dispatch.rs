@@ -1,13 +1,45 @@
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::mpsc::SyncSender, time::Duration};
 
 use agent_sandbox_core::{NetworkOwnership, ResourceKind, StaticPolicyAllow};
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget,
-    notification_arch_valid, send_response,
+    FilesystemTarget, PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif,
+    SyscallTarget, notification_arch_valid, send_response,
 };
 use tracing::{debug, info, warn};
 
 use super::decision::{NormalizedNotification, ResponsePlan, decide, normalize_or_failure};
+
+pub fn start_filesystem_worker(
+    listener_fd: i32,
+) -> std::io::Result<SyncSender<(SeccompNotif, FilesystemTarget)>> {
+    // A rendezvous overlaps classification with one mutation without queuing
+    // operations.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+    drop(
+        std::thread::Builder::new()
+            .name("filesystem-emulation".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(move || {
+                    for (notif, target) in receiver {
+                        execute_filesystem_target(listener_fd, &notif, &target);
+                    }
+                });
+                if result.is_err() {
+                    tracing::error!("filesystem emulation worker panicked");
+                    std::process::exit(1);
+                }
+            })?,
+    );
+    Ok(sender)
+}
+
+fn execute_filesystem_target(listener_fd: i32, notif: &SeccompNotif, target: &FilesystemTarget) {
+    if let Err(err) = super::emulate_filesystem_mutation(listener_fd, notif, target) {
+        let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+        warn!(error = %err, target = ?target, "filesystem mutation emulation failed");
+        super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
+    }
+}
 
 fn should_bypass_network_policy(
     network_policy: &NetworkPolicyBypass,
@@ -58,6 +90,7 @@ pub async fn dispatch_notification_with_mode(
     notif: &SeccompNotif,
     timeout: Duration,
     network_policy: NetworkPolicyBypass,
+    filesystem_worker: &SyncSender<(SeccompNotif, FilesystemTarget)>,
 ) {
     if !notification_arch_valid(notif) {
         warn!(
@@ -122,7 +155,13 @@ pub async fn dispatch_notification_with_mode(
         decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
 
-    execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
+    execute_response_plan(
+        plan,
+        listener_fd,
+        notif,
+        policy_socket_bypass,
+        filesystem_worker,
+    );
 }
 
 /// Reply to the tracee with `EACCES` and log the notification response.
@@ -135,6 +174,7 @@ fn execute_response_plan(
     listener_fd: i32,
     notif: &SeccompNotif,
     policy_socket_bypass: bool,
+    filesystem_worker: &SyncSender<(SeccompNotif, FilesystemTarget)>,
 ) {
     match plan {
         ResponsePlan::Continue => {
@@ -208,16 +248,9 @@ fn execute_response_plan(
         }
 
         ResponsePlan::EmulateFilesystem { target } => {
-            if let Err(err) = super::emulate_filesystem_mutation(listener_fd, notif, &target) {
-                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-                warn!(error = %err, target = ?target, "filesystem mutation emulation failed");
-                super::log_notification_response(send_response(
-                    listener_fd,
-                    notif.id,
-                    0,
-                    -errno,
-                    0,
-                ));
+            if filesystem_worker.send((*notif, target)).is_err() {
+                tracing::error!("filesystem emulation worker disconnected");
+                std::process::exit(1);
             }
         }
     }
