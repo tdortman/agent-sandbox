@@ -934,7 +934,7 @@ fn open_path_handle(path: &Path) -> io::Result<OwnedFd> {
 fn tracee_dir_handle(pid: u32, dirfd: u64) -> io::Result<OwnedFd> {
     let fd = syscall_i32_arg(dirfd);
     if fd == libc::AT_FDCWD {
-        return std::fs::File::open(format!("/proc/{pid}/cwd")).map(Into::into);
+        return open_path_handle(Path::new(&format!("/proc/{pid}/cwd")));
     }
     if fd < 0 {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
@@ -1156,11 +1156,15 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
         notif.pid,
         i32::try_from(notif.data.args[0]).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?,
     )?;
-    let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    let mut path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    // An ordinary fd link already names the resolved, frozen file description.
+    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().ends_with(b" (deleted)") {
+        path = normalize_path(&path);
+    }
     let len = i64::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
     Ok(filesystem_target(
-        vec![(normalize_path(&path), FileAccess::Write)],
+        vec![(path, FileAccess::Write)],
         FilesystemMutation::Ftruncate { fd, len },
     ))
 }
@@ -1240,6 +1244,24 @@ fn target_from_filesystem_mutation(notif: &SeccompNotif) -> Option<SyscallTarget
 /// Canonicalize a filesystem path by resolving symlinks.
 #[must_use]
 pub fn normalize_path(path: &Path) -> PathBuf {
+    let fd = match open_path_handle(path) {
+        Ok(fd) => Some(fd),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return path.to_path_buf();
+        }
+        Err(_) => None,
+    };
+    if let Some(fd) = fd
+        && let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        && resolved.is_absolute()
+        && !resolved
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(b" (deleted)")
+    {
+        return resolved;
+    }
+    // Anonymous descriptors and unlinked handles have no canonical pathname.
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -1501,6 +1523,45 @@ mod tests {
         resolve_tracee_path, scheme_for_socket_type, target_from_notification, tracee_fd_path,
         tracee_open_dir_base,
     };
+
+    #[test]
+    fn canonical_paths_follow_live_aliases_and_preserve_unresolvable_paths() {
+        let root = std::env::temp_dir().join(format!("broker-canonical-{}", std::process::id()));
+        fs::create_dir(&root).expect("create temporary directory");
+        let first = root.join("first");
+        let second = root.join("second");
+        let alias = root.join("alias");
+        fs::write(&first, b"first").expect("write first file");
+        fs::write(&second, b"second").expect("write second file");
+        std::os::unix::fs::symlink(&first, &alias).expect("create alias");
+        let before = super::normalize_path(&alias);
+        fs::remove_file(&alias).expect("remove alias");
+        std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
+        let after = super::normalize_path(&alias);
+        let missing = root.join("missing");
+        let unresolved = super::normalize_path(&missing);
+        let directory_alias = root.join("directory-alias");
+        std::os::unix::fs::symlink(&root, &directory_alias).expect("create directory alias");
+        let missing_alias = directory_alias.join("missing");
+        let missing_alias_result = super::normalize_path(&missing_alias);
+        let not_directory = alias.join("child");
+        let not_directory_result = super::normalize_path(&not_directory);
+        let held = fs::File::open(&first).expect("hold first file");
+        fs::remove_file(&first).expect("unlink held file");
+        let deleted = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+        let deleted_result = super::normalize_path(&deleted);
+        let (reader, _writer) = nix::unistd::pipe().expect("create anonymous pipe");
+        let anonymous = PathBuf::from(format!("/proc/self/fd/{}", reader.as_raw_fd()));
+        let anonymous_result = super::normalize_path(&anonymous);
+        fs::remove_dir_all(&root).expect("remove temporary directory");
+        assert_eq!(before, first);
+        assert_eq!(after, second);
+        assert_eq!(unresolved, missing);
+        assert_eq!(missing_alias_result, missing_alias);
+        assert_eq!(not_directory_result, not_directory);
+        assert_eq!(deleted_result, deleted);
+        assert_eq!(anonymous_result, anonymous);
+    }
 
     #[test]
     fn transient_tracee_io_err_classifies_expected_errno() {
