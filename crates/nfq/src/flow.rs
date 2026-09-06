@@ -436,20 +436,26 @@ pub fn handle_packet_payload_with_registration(
 /// Production wrapper: calls `policy::check_destination` via the tokio runtime.
 pub fn handle_packet(
     state: &NfqState,
-    policy_socket: &str,
+    policy_client: &mut agent_sandbox_core::PersistentRpcClient,
     timeout: Duration,
     message: &nfq_updated::Message,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Handle,
 ) -> (Verdict, Option<packet::PacketMeta>) {
     let payload = message.get_payload();
+    // These callbacks run sequentially and share one policy connection.
+    let policy_client = std::cell::RefCell::new(policy_client);
 
     let mut check = |args: policy::CheckDestinationArgs<'_>| {
-        runtime.block_on(policy::check_destination(policy_socket, args, timeout))
+        runtime.block_on(policy::check_destination(
+            &mut policy_client.borrow_mut(),
+            args,
+            timeout,
+        ))
     };
 
     let mut register = |registration: FlowRegistration| {
         runtime.block_on(policy::register_network_flow(
-            policy_socket,
+            &mut policy_client.borrow_mut(),
             registration,
             timeout,
         ))

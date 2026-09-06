@@ -154,11 +154,7 @@ pub fn validate_socket_identity(identity: SocketIdentity) -> bool {
     let expected_start_time = identity.process_start_time_ticks().get();
     let expected_inode = identity.socket_inode().get();
 
-    let Some(uids) = process_uids(pid) else {
-        return false;
-    };
-
-    if !uids.contains(&expected_uid) {
+    if !process_has_uid(pid, expected_uid) {
         return false;
     }
 
@@ -193,11 +189,7 @@ pub fn validate_socket_identity(identity: SocketIdentity) -> bool {
 
         // Recheck identity after finding the descriptor to reject PID reuse
         // and changes that race the descriptor scan.
-        let Some(uids) = process_uids(pid) else {
-            return false;
-        };
-
-        return uids.contains(&expected_uid)
+        return process_has_uid(pid, expected_uid)
             && process_start_time_ticks(pid) == Some(expected_start_time);
     }
 
@@ -269,20 +261,21 @@ fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<Soc
     let mut entries = Vec::new();
 
     for line in table.lines().skip(1) {
-        let parts: Vec<_> = line.split_whitespace().collect();
-
-        if parts.len() < 10
-            || (parts[1] != exact && parts[1] != wildcard)
-            || (remote && remote_field.as_deref() != Some(parts[2]))
-        {
-            continue;
-        }
-
-        let Some(uid) = parts[7].parse().ok() else {
+        let mut parts = line.split_whitespace();
+        let Some(local) = parts.nth(1) else {
             continue;
         };
-
-        let Ok(inode_value) = parts[9].parse() else {
+        if local != exact && local != wildcard {
+            continue;
+        }
+        let peer = parts.next();
+        if remote && remote_field.as_deref() != peer {
+            continue;
+        }
+        let Some(uid) = parts.nth(4).and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(inode_value) = parts.nth(1).and_then(|value| value.parse().ok()) else {
             continue;
         };
 
@@ -325,11 +318,7 @@ fn process_candidates(
             continue;
         };
 
-        let Some(uids) = process_uids(pid) else {
-            continue;
-        };
-
-        if !uids.contains(&expected_uid) {
+        if !process_has_uid(pid, expected_uid) {
             continue;
         }
 
@@ -379,30 +368,26 @@ fn process_candidates(
                 tuple,
                 fd_number,
             ));
+            // Duplicate descriptors in one process identify the same owner.
+            break;
         }
     }
 
     candidates
 }
 
-fn process_uids(pid: u32) -> Option<Vec<u32>> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-
-    status.lines().find_map(|line| {
-        let values = line.strip_prefix("Uid:")?.split_whitespace();
-        let values = values.collect::<Vec<_>>();
-
-        if values.is_empty() {
-            return None;
-        }
-
-        Some(
+fn process_has_uid(pid: u32, expected_uid: u32) -> bool {
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .is_some_and(|values| {
             values
-                .into_iter()
-                .filter_map(|value| value.parse().ok())
-                .collect(),
-        )
-    })
+                .split_whitespace()
+                .any(|value| value.parse::<u32>() == Ok(expected_uid))
+        })
 }
 
 fn process_start_time_ticks(pid: u32) -> Option<u64> {
@@ -499,6 +484,16 @@ mod tests {
         assert_ne!(snapshot.process_start_time_ticks().get(), 0);
         let identity = snapshot.identity();
         assert!(validate_socket_identity(identity));
+        let invalid_uid = ProcessIdentity::new(
+            identity.pid().get(),
+            u32::MAX,
+            identity.process_start_time_ticks().get(),
+        )
+        .expect("non-zero process identity");
+        assert!(!validate_socket_identity(SocketIdentity::new(
+            invalid_uid,
+            identity.socket_inode(),
+        )));
 
         let invalid_start_time = if identity.process_start_time_ticks().get() == u64::MAX {
             u64::MAX - 1

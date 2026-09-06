@@ -54,20 +54,20 @@ fn read_session_context() -> SessionContext {
     serde_json::from_str(&data).unwrap_or_default()
 }
 
-fn write_session_context(ctx: &SessionContext) {
-    let path = session_context_path();
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let tmp = path.with_extension("tmp");
-
-    if let Ok(json) = serde_json::to_string_pretty(ctx)
-        && std::fs::write(&tmp, format!("{json}\n")).is_ok()
-    {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+fn write_session_context(path: &Path, ctx: &SessionContext) -> std::io::Result<()> {
+    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o666))
+        .tempfile_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, ctx)?;
+    temporary.write_all(b"\n")?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn non_empty_path(path: &Path) -> Option<&Path> {
@@ -514,7 +514,7 @@ fn resolve_daemon_paths(ids: ProcessIds) -> SandboxPaths {
 pub fn persist_session_paths(paths: &SandboxPaths) {
     if paths.home().is_some() {
         let ctx = SessionContext::from(paths);
-        write_session_context(&ctx);
+        let _ = write_session_context(&session_context_path(), &ctx);
     }
 }
 
@@ -602,10 +602,11 @@ pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
         return None;
     }
 
-    read_proc_environ(pid)
-        .get("AGENT_SANDBOX_SESSION_ID")
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    raw.rsplit(|&byte| byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"AGENT_SANDBOX_SESSION_ID="))
         .filter(|value| !value.is_empty())
-        .cloned()
+        .map(|value| String::from_utf8_lossy(value).into_owned())
 }
 
 /// Return process credentials for the peer of a connected Unix domain socket.
@@ -733,6 +734,71 @@ mod tests {
             ctx.paths.cwd().is_some(),
             "cwd must resolve from /proc/self/cwd"
         );
+    }
+
+    #[test]
+    fn concurrent_session_snapshots_remain_complete() {
+        let directory = tempfile::tempdir().expect("context directory");
+        let path = directory.path().join("context.json");
+        super::write_session_context(&path, &SessionContext::default()).expect("initial context");
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for index in 0..4 {
+                let path = &path;
+                let start = &start;
+                scope.spawn(move || {
+                    let value = Some(std::path::PathBuf::from(format!("writer-{index}")));
+                    let context = SessionContext {
+                        cwd: value.clone(),
+                        home: value.clone(),
+                        project_root: value,
+                    };
+                    start.wait();
+                    for _ in 0..100 {
+                        super::write_session_context(path, &context).expect("atomic context write");
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..400 {
+                let data = std::fs::read(&path).expect("read published context");
+                let context: SessionContext =
+                    serde_json::from_slice(&data).expect("complete JSON snapshot");
+                assert_eq!(context.cwd, context.home);
+                assert_eq!(context.home, context.project_root);
+            }
+        });
+    }
+
+    #[test]
+    fn session_id_reads_only_the_named_process_environment() {
+        use std::{
+            io::Read,
+            process::{Command, Stdio},
+        };
+
+        for session in [None, Some(""), Some("session=with=equals")] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf ready; read ignored"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            command.env_remove("AGENT_SANDBOX_SESSION_ID");
+            if let Some(value) = session {
+                command.env("AGENT_SANDBOX_SESSION_ID", value);
+            }
+            let mut child = command.spawn().expect("spawn environment owner");
+            child
+                .stdout
+                .take()
+                .expect("readiness pipe")
+                .read_exact(&mut [0; 5])
+                .expect("child initialized");
+            let actual = super::sandbox_session_id_from_pid(child.id());
+            child.kill().expect("stop environment owner");
+            child.wait().expect("reap environment owner");
+            assert_eq!(actual.as_deref(), session.filter(|value| !value.is_empty()));
+        }
     }
 
     #[test]

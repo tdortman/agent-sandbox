@@ -18,11 +18,11 @@ mod queue;
 use std::time::Duration;
 
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     args::Cli,
-    flow::{NfqState, handle_packet, mark_accepted_proxy_udp},
+    flow::NfqState,
     push::spawn_push_socket_listener,
     queue::{open_queue, write_ready_marker_or_exit},
 };
@@ -41,7 +41,7 @@ fn main() {
     let cli = Cli::parse();
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
-    let mut queue = match open_queue(cli.queue, cli.queue_len) {
+    let queue = match open_queue(cli.queue, cli.queue_len) {
         Ok(queue) => queue,
         Err(err) => {
             eprintln!(
@@ -63,24 +63,7 @@ fn main() {
     let state = NfqState::new(&cli);
     spawn_push_socket_listener(&cli.push_socket, cli.push_trusted_uid, &state);
 
-    loop {
-        let mut message = match queue.recv() {
-            Ok(message) => message,
-            Err(err) => {
-                warn!(error = %err, "nfqueue recv error");
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-        };
-
-        let (verdict, meta) =
-            handle_packet(&state, &cli.policy_socket, timeout, &message, &runtime);
-
-        mark_accepted_proxy_udp(&state, &mut message, verdict, meta);
-        message.set_verdict(verdict);
-
-        if let Err(err) = queue.verdict(message) {
-            warn!(error = %err, "nfqueue verdict error");
-        }
-    }
+    runtime
+        .block_on(queue::run_queue(queue, state, cli.policy_socket, timeout))
+        .expect("nfqueue event loop");
 }

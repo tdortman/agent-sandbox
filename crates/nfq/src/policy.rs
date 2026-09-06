@@ -1,10 +1,11 @@
-//! Policy RPC client for NFQUEUE, calls policyd's `Check` endpoint.
+//! Persistent policy RPCs, sequential within each NFQUEUE worker. Failed
+//! requests are never replayed.
 
 use std::{net::IpAddr, time::Duration};
 
 use agent_sandbox_core::{
-    FlowRegistration, RequestContext, RpcReply, RpcRequest, attach_check_aliases, daemon_context,
-    persist_session_paths, policy_rpc,
+    FlowRegistration, PersistentRpcClient, RequestContext, RpcReply, RpcRequest,
+    attach_check_aliases, daemon_context, persist_session_paths,
 };
 use nfq_updated::Verdict;
 use tracing::{debug, info, warn};
@@ -26,7 +27,7 @@ pub struct CheckDestinationArgs<'a> {
 /// `hostname` should be pre-resolved by the caller (DNS cache or PTR).
 /// Blocks until policyd responds (which may wait for user approval).
 pub async fn check_destination(
-    socket: &str,
+    client: &mut PersistentRpcClient,
     args: CheckDestinationArgs<'_>,
     timeout: Duration,
 ) -> std::io::Result<bool> {
@@ -44,12 +45,17 @@ pub async fn check_destination(
         ctx: RequestContext::from(&ctx),
     };
 
-    let resp = policy_rpc(socket, req, timeout)
+    let resp = client
+        .request(req, timeout)
         .await
         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-    let allowed = matches!(resp, RpcReply::Check(check) if check.verdict.allowed);
-    Ok(allowed)
+    if let RpcReply::Check(check) = resp {
+        Ok(check.verdict.allowed)
+    } else {
+        client.invalidate();
+        Ok(false)
+    }
 }
 
 /// Register one owner-identified flow with policyd before proxy forwarding.
@@ -58,26 +64,29 @@ pub async fn check_destination(
 /// the transparent proxy to claim later. Any malformed reply is an RPC failure
 /// and must be treated as a failed registration by callers.
 pub async fn register_network_flow(
-    socket: &str,
+    client: &mut PersistentRpcClient,
     registration: FlowRegistration,
     timeout: Duration,
 ) -> std::io::Result<bool> {
-    let response = policy_rpc(
-        socket,
-        RpcRequest::RegisterNetworkFlow { registration },
-        timeout,
-    )
-    .await
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let response = client
+        .request(RpcRequest::RegisterNetworkFlow { registration }, timeout)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
 
     match response {
         RpcReply::Simple(reply) => Ok(reply.ok),
-        RpcReply::Error(error) => Err(std::io::Error::other(error.error)),
+        RpcReply::Error(error) => {
+            client.invalidate();
+            Err(std::io::Error::other(error.error))
+        }
 
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "policyd returned an unexpected reply for RegisterNetworkFlow",
-        )),
+        _ => {
+            client.invalidate();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policyd returned an unexpected reply for RegisterNetworkFlow",
+            ))
+        }
     }
 }
 
