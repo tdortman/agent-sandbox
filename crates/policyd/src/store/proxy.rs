@@ -630,6 +630,8 @@ impl PolicyStore {
     }
 
     /// Release a previously claimed network flow.
+    /// TCP registrations retire with the stream. UDP registrations remain
+    /// available for another association on the same socket until expiry.
     ///
     /// # Errors
     ///
@@ -653,10 +655,15 @@ impl PolicyStore {
                 return Err(proxy_error("unknown connection identifier"));
             }
 
-            state.attribution_token = None;
-            state.connection_id = None;
-            state.claimed_at = None;
-            state.last_check = Instant::now();
+            if state.registration.flow().protocol() == FlowProtocol::Tcp {
+                let flow = state.registration.flow().clone();
+                inner.proxy_flows.remove(&flow);
+            } else {
+                state.attribution_token = None;
+                state.connection_id = None;
+                state.claimed_at = None;
+                state.last_check = Instant::now();
+            }
         }
 
         drop(inner);
@@ -1478,6 +1485,97 @@ mod tests {
             .release_network_flow(session, token, connection_id)
             .await
             .expect("correct identifier must release the claim");
+    }
+
+    #[tokio::test]
+    async fn released_tcp_tuple_can_be_registered_by_a_new_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&dir);
+        let session = store
+            .open_proxy_session(1)
+            .await
+            .expect("open session")
+            .proxy_session;
+        let first = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first TCP socket");
+        let source = first.local_addr().expect("source address");
+        let owner = || match resolve_owner_snapshot(
+            SocketProtocol::Tcp,
+            SocketTuple::from_local(source.ip(), source.port()),
+        ) {
+            OwnerResolution::Unique(snapshot) => snapshot.identity(),
+            resolution => panic!("expected unique TCP socket owner: {resolution:?}"),
+        };
+        let flow = NetworkFlowKey::try_new(
+            FlowProtocol::Tcp,
+            source.ip(),
+            source.port(),
+            "1.1.1.1".parse().expect("destination"),
+            443,
+        )
+        .expect("flow");
+        let registration = FlowRegistration::new(
+            flow.clone(),
+            owner(),
+            NormalizedPolicyHost::parse("example.com").expect("host"),
+            FlowContext::default(),
+        );
+        store
+            .register_network_flow(registration.clone())
+            .await
+            .expect("register first socket");
+        let connection_id = ProxyConnectionId::new();
+        let first_claim = store
+            .claim_network_flow(session.clone(), flow.clone(), connection_id)
+            .await
+            .expect("claim first socket");
+        drop(first);
+        let _second = std::net::TcpListener::bind(source).expect("reuse released TCP endpoint");
+        let replacement = FlowRegistration::new(
+            flow.clone(),
+            owner(),
+            NormalizedPolicyHost::parse("example.com").expect("host"),
+            FlowContext::default(),
+        );
+        assert_ne!(registration.owner(), replacement.owner());
+        assert!(
+            store
+                .register_network_flow(replacement.clone())
+                .await
+                .is_err(),
+            "a live claim must not change ownership"
+        );
+        store
+            .release_network_flow(
+                session.clone(),
+                first_claim.attribution_token.clone(),
+                connection_id,
+            )
+            .await
+            .expect("release first socket");
+        store
+            .register_network_flow(replacement)
+            .await
+            .expect("register replacement socket without waiting for expiry");
+        let second_claim = store
+            .claim_network_flow(session.clone(), flow.clone(), ProxyConnectionId::new())
+            .await
+            .expect("claim replacement socket");
+        assert_eq!(second_claim.flow, flow);
+        assert_ne!(
+            second_claim.attribution_token,
+            first_claim.attribution_token
+        );
+        assert!(
+            store
+                .check_network_flow(
+                    session,
+                    ProxyRequestId::new(),
+                    first_claim.attribution_token
+                )
+                .await
+                .is_err(),
+            "released attribution cannot authorize the replacement socket"
+        );
     }
 
     #[tokio::test]
