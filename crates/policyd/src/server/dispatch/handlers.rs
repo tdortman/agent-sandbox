@@ -31,12 +31,36 @@ pub async fn handle(
     let resolve = |ctx: &RequestContext| context::resolve_request_context(store, peer, role, ctx);
 
     match req {
+        RpcRequest::ObserveNetworkGrants {
+            program,
+            pins,
+            pid,
+            cgroup,
+            endpoints,
+            dns,
+        } => Ok(store
+            .observe_captured_network_grants(&program, &pins, pid, cgroup, &endpoints, &dns)?),
+        RpcRequest::PublishNetworkGrants => {
+            store.publish_network_grants()?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+
+        RpcRequest::BindNetworkRevocation { path } => {
+            store.enable_network_revocation(&path).await?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+
         RpcRequest::OpenProxySession => Ok(RpcReply::ProxySession(
             store.open_proxy_session(client.id).await?,
         )),
 
-        RpcRequest::RegisterNetworkFlow { registration } => {
-            store.register_network_flow(registration).await?;
+        RpcRequest::RegisterNetworkFlow {
+            registration,
+            owner_fd_hint,
+        } => {
+            store
+                .register_network_flow(registration, owner_fd_hint)
+                .await?;
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
@@ -113,7 +137,7 @@ pub async fn handle(
         }
 
         RpcRequest::RegisterUi { ui_client: _, ctx } => {
-            handle_register_ui(store, client, peer, resolve(&ctx)).await
+            handle_register_ui(store, client, peer, resolve(&ctx)?).await
         }
 
         RpcRequest::UnregisterUi => {
@@ -144,13 +168,13 @@ pub async fn handle(
                 scheme,
                 url,
                 aliases: Vec::new(),
-                ctx: resolve(&ctx),
+                ctx: resolve(&ctx)?,
             })
             .await
         }
 
         RpcRequest::CheckFilesystem { path, access, ctx } => Ok(RpcReply::FilesystemCheck(
-            store.check_filesystem(path, access, resolve(&ctx)).await,
+            store.check_filesystem(path, access, resolve(&ctx)?).await,
         )),
 
         RpcRequest::CheckResource {
@@ -160,7 +184,7 @@ pub async fn handle(
             ctx,
         } => Ok(RpcReply::ResourceCheck(
             store
-                .check_resource(kind, path, access, resolve(&ctx))
+                .check_resource(kind, path, access, resolve(&ctx)?)
                 .await,
         )),
 
@@ -178,13 +202,13 @@ pub async fn handle(
                     },
                 )
             } else {
-                resolve(&ctx)
+                resolve(&ctx)?
             };
             Ok(RpcReply::DbusCheck(store.check_dbus(target, ctx).await))
         }
 
         RpcRequest::StartFilesystemMonitor { ctx, static_allow } => {
-            let ctx = resolve(&ctx);
+            let ctx = resolve(&ctx)?;
             let peer_pid = if peer.pid > 0 {
                 peer.pid
             } else {
@@ -203,7 +227,7 @@ pub async fn handle(
             }
 
             Ok(RpcReply::Elevate(
-                store.request_elevation(argv, resolve(&ctx)).await,
+                store.request_elevation(argv, resolve(&ctx)?).await,
             ))
         }
 
@@ -222,7 +246,7 @@ pub async fn handle(
                     target,
                     wire: ScopeWire {
                         comment,
-                        ..ScopeWire::from_resolved(&resolve(&ctx), session_id)
+                        ..ScopeWire::from_resolved(&resolve(&ctx)?, session_id)
                     },
                     client_id: client.id,
                     approver_uid: (peer.uid > 0).then_some(peer.uid),
@@ -238,7 +262,7 @@ pub async fn handle(
             session_id,
             ctx,
         } => Ok(store
-            .approve_host(host, port, scope, session_id, resolve(&ctx))
+            .approve_host(host, port, scope, session_id, resolve(&ctx)?)
             .await),
 
         RpcRequest::ApproveHttp {
@@ -248,7 +272,7 @@ pub async fn handle(
             ctx,
         } => Ok(RpcReply::ScopeAction(
             store
-                .approve_http(target, scope, session_id, resolve(&ctx))
+                .approve_http(target, scope, session_id, resolve(&ctx)?)
                 .await?,
         )),
 
@@ -267,7 +291,7 @@ pub async fn handle(
                     target,
                     wire: ScopeWire {
                         comment,
-                        ..ScopeWire::from_resolved(&resolve(&ctx), session_id)
+                        ..ScopeWire::from_resolved(&resolve(&ctx)?, session_id)
                     },
                     client_id: client.id,
                     approver_uid: (peer.uid > 0).then_some(peer.uid),
@@ -276,10 +300,10 @@ pub async fn handle(
             )
             .await),
 
-        RpcRequest::Status { ctx } => Ok(RpcReply::Status(store.status(resolve(&ctx)).await)),
+        RpcRequest::Status { ctx } => Ok(RpcReply::Status(store.status(resolve(&ctx)?).await)),
 
         RpcRequest::Reload { ctx } => store
-            .export_policy_files(resolve(&ctx).paths)
+            .export_policy_files(resolve(&ctx)?.paths)
             .map_err(PolicydError::from)
             .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
     }
@@ -386,13 +410,15 @@ mod tests {
     async fn register_ui_rejects_cross_uid_peer() {
         let store = Arc::new(test_store());
 
-        store.note_sandbox_peer(
-            TrustedPeer {
-                pid: 100,
-                uid: 1000,
-            },
-            "sandbox-a",
-        );
+        store
+            .note_sandbox_peer(
+                TrustedPeer {
+                    pid: 100,
+                    uid: 1000,
+                },
+                "sandbox-a",
+            )
+            .expect("record sandbox peer");
 
         let handle = PolicyStore::new_client_handle(writer());
 

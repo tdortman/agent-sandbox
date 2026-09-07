@@ -171,6 +171,7 @@ pub enum ApprovalTarget {
     ResourcePath {
         /// The kind of resource (e.g. token, credential) being accessed.
         resource_kind: ResourceKind,
+
         /// The path within the resource root.
         path: PathBuf,
     },
@@ -208,6 +209,7 @@ pub enum RpcRequest {
     RegisterSandbox {
         /// Identifier of the sandbox session being registered.
         session_id: String,
+
         /// Name of the package running in the sandbox.
         package: String,
 
@@ -220,6 +222,33 @@ pub enum RpcRequest {
         launcher_pid: u32,
     },
 
+    /// Attach a trusted publisher's revocation map before capturing a new
+    /// snapshot. Only root on the host control socket may issue this
+    /// operation.
+    BindNetworkRevocation {
+        /// Pinned runtime guard; binding never resets or rearms it.
+        path: PathBuf,
+    },
+
+    /// Capture a task and compile its file grants in the trusted daemon.
+    ObserveNetworkGrants {
+        /// Trusted kernel context-capture program.
+        program: PathBuf,
+        /// Trusted source-observation programs.
+        pins: PathBuf,
+        /// Target process and enforcement cgroup.
+        pid: u32,
+        /// Enforcement cgroup id.
+        cgroup: u64,
+        /// Candidate literal TCP endpoints.
+        endpoints: Vec<std::net::SocketAddrV4>,
+        /// DNS attribution file guarded by the same publisher.
+        dns: PathBuf,
+    },
+
+    /// Publish the daemon's retained observation after installing its grants.
+    PublishNetworkGrants,
+
     /// Open a new proxy session for outbound network flows.
     OpenProxySession,
 
@@ -228,14 +257,20 @@ pub enum RpcRequest {
     RegisterNetworkFlow {
         /// The flow registration describing the new network flow.
         registration: FlowRegistration,
+
+        /// Descriptor observed during NFQ owner resolution; advisory only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_fd_hint: Option<u32>,
     },
 
     /// Claim an existing network flow for a sandbox session.
     ClaimNetworkFlow {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// The flow to claim.
         flow: NetworkFlowKey,
+
         /// The connection to bind to the claimed flow.
         connection_id: ProxyConnectionId,
     },
@@ -244,8 +279,10 @@ pub enum RpcRequest {
     ClaimNetworkFlowBySource {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// Selector describing the flow's origin.
         selector: NetworkFlowSelector,
+
         /// The connection to bind to the claimed flow.
         connection_id: ProxyConnectionId,
     },
@@ -254,10 +291,13 @@ pub enum RpcRequest {
     RebindNetworkFlow {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// Token proving the prior attribution.
         attribution_token: AttributionToken,
+
         /// The connection being rebound.
         connection_id: ProxyConnectionId,
+
         /// The flow to bind the connection to.
         flow: NetworkFlowKey,
     },
@@ -266,10 +306,13 @@ pub enum RpcRequest {
     CheckHttp {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// Identifier used to correlate the check with a response.
         request_id: ProxyRequestId,
+
         /// Token proving attribution of the flow.
         attribution_token: AttributionToken,
+
         /// The HTTP request being checked against policy.
         request: HttpRequest,
     },
@@ -278,8 +321,10 @@ pub enum RpcRequest {
     CheckNetworkFlow {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// Identifier used to correlate the check with a response.
         request_id: ProxyRequestId,
+
         /// Token proving attribution of the flow.
         attribution_token: AttributionToken,
     },
@@ -288,6 +333,7 @@ pub enum RpcRequest {
     CancelCheck {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// Identifier of the check to cancel.
         request_id: ProxyRequestId,
     },
@@ -296,8 +342,10 @@ pub enum RpcRequest {
     ReleaseNetworkFlow {
         /// Token identifying the proxy session.
         proxy_session: ProxySessionToken,
+
         /// Token proving attribution of the flow being released.
         attribution_token: AttributionToken,
+
         /// The connection being released.
         connection_id: ProxyConnectionId,
     },
@@ -347,6 +395,7 @@ pub enum RpcRequest {
     CheckResource {
         /// The kind of resource being accessed.
         kind: ResourceKind,
+
         /// The path within the resource root.
         path: PathBuf,
 
@@ -394,6 +443,7 @@ pub enum RpcRequest {
     Approve {
         /// Identifier of the check being approved.
         id: String,
+
         /// How long the approval remains in effect.
         scope: ApprovalScope,
 
@@ -418,8 +468,10 @@ pub enum RpcRequest {
     ApproveHost {
         /// The host being approved.
         host: String,
+
         /// The port being approved.
         port: u16,
+
         /// How long the approval remains in effect.
         scope: ApprovalScope,
 
@@ -436,6 +488,7 @@ pub enum RpcRequest {
     ApproveHttp {
         /// The HTTP rule being approved.
         target: HttpRuleTarget,
+
         /// How long the approval remains in effect.
         scope: ApprovalScope,
 
@@ -517,7 +570,7 @@ fn validate_proxy_fields(value: &serde_json::Value) -> Result<(), String> {
 
     let allowed = match op {
         "open_proxy_session" => &["op"][..],
-        "register_network_flow" => &["op", "registration"][..],
+        "register_network_flow" => &["op", "registration", "owner_fd_hint"][..],
         "claim_network_flow" => &["op", "proxy_session", "flow", "connection_id"][..],
         "claim_network_flow_by_source" => &["op", "proxy_session", "selector", "connection_id"][..],
         "rebind_network_flow" => &[
@@ -573,6 +626,9 @@ impl RpcRequest {
             | Self::Reload { ctx } => Some(ctx),
 
             Self::UnregisterUi
+            | Self::BindNetworkRevocation { .. }
+            | Self::ObserveNetworkGrants { .. }
+            | Self::PublishNetworkGrants
             | Self::OpenProxySession
             | Self::RegisterNetworkFlow { .. }
             | Self::ClaimNetworkFlow { .. }
@@ -606,6 +662,7 @@ pub struct AliasSplit {
     /// The URL with any attribution hints stripped, or `None` if the input
     /// URL was `None`.
     pub url: Option<String>,
+
     /// Attribution aliases parsed from the URL (empty when none present).
     pub aliases: Vec<String>,
 }
@@ -648,7 +705,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{ApprovalTarget, RequestContext, RpcRequest};
-    use crate::{FileAccess, ProcessIds, ResolvedRequestContext, SandboxPaths};
+    use crate::{
+        FileAccess, FlowContext, FlowProtocol, FlowRegistration, NetworkFlowKey,
+        NormalizedPolicyHost, ProcessIdentity, ProcessIds, ResolvedRequestContext, SandboxPaths,
+        SocketIdentity, SocketInode,
+    };
 
     #[test]
     fn attach_check_aliases_roundtrip() {
@@ -669,6 +730,69 @@ mod tests {
         .unwrap();
 
         assert!(matches!(req, RpcRequest::Check { .. }));
+    }
+
+    #[test]
+    fn register_network_flow_owner_fd_hint_roundtrips_defaults_and_rejects_unknown_fields() {
+        let flow = NetworkFlowKey::try_new(
+            FlowProtocol::Tcp,
+            "127.0.0.1".parse().expect("valid source"),
+            4242,
+            "93.184.216.34".parse().expect("valid destination"),
+            443,
+        )
+        .expect("valid flow");
+
+        let process = ProcessIdentity::new(123, 1000, 456).expect("valid process identity");
+
+        let registration = FlowRegistration::new(
+            flow,
+            SocketIdentity::new(process, SocketInode::new(789).expect("valid inode")),
+            NormalizedPolicyHost::parse("example.com").expect("valid host"),
+            FlowContext::default(),
+        );
+
+        let request = RpcRequest::RegisterNetworkFlow {
+            registration,
+            owner_fd_hint: Some(17),
+        };
+
+        let wire = serde_json::to_value(&request).expect("serialize registration");
+        assert_eq!(wire["owner_fd_hint"], 17);
+
+        let decoded = serde_json::from_value::<RpcRequest>(wire.clone())
+            .expect("deserialize registration with hint");
+
+        assert!(matches!(decoded, RpcRequest::RegisterNetworkFlow {
+            owner_fd_hint: Some(17),
+            ..
+        }));
+
+        let mut without_hint = wire.clone();
+
+        without_hint
+            .as_object_mut()
+            .expect("registration is an object")
+            .remove("owner_fd_hint");
+
+        let decoded = serde_json::from_value::<RpcRequest>(without_hint)
+            .expect("deserialize registration without hint");
+
+        assert!(matches!(decoded, RpcRequest::RegisterNetworkFlow {
+            owner_fd_hint: None,
+            ..
+        }));
+
+        let reserialized = serde_json::to_value(&decoded).expect("serialize omitted hint");
+        assert!(reserialized.get("owner_fd_hint").is_none());
+        let mut unknown = wire;
+        unknown["unexpected"] = serde_json::json!(true);
+        let line = serde_json::to_string(&unknown).expect("serialize unknown field");
+
+        let error = super::parse_rpc_request(&line)
+            .expect_err("registration wire must reject unknown fields");
+
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

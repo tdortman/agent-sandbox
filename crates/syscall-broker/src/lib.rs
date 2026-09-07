@@ -20,11 +20,13 @@ use std::{
 use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess};
 use agent_sandbox_syscall::policy::nr;
 pub use policy_client::PersistentPolicyClient;
+
 #[cfg(test)]
 fn resolve_tracee_path(pid: u32, dirfd: u64, path: PathBuf) -> io::Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path);
     }
+
     Ok(resolve_open_path(
         &path,
         &tracee_open_dir_base(pid, dirfd)?,
@@ -59,20 +61,25 @@ pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<Sysca
         nr::SENDMSG => target_from_sendmsg(notif),
         nr::SENDMMSG => target_from_sendmmsg(notif),
         nr::OPEN | nr::OPENAT | nr::OPENAT2 | nr::CREAT => Ok(target_from_open(notif)),
+
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
             Ok(Some(SyscallTarget::Errno(libc::ENOSYS)))
         }
+
         _ => Ok(target_from_filesystem_mutation(notif)),
     }
 }
+
 /// `SECCOMP_IOCTL_NOTIF_RECV` ioctl number: receive a seccomp user
 pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xC050_2100;
+
 /// `SECCOMP_IOCTL_NOTIF_SEND` ioctl number: send a seccomp user
 /// notification response to the kernel.
 pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xC018_2101;
 
 /// `SECCOMP_IOW(2, __u64)` — not `IOWR` like SEND; argument is a single u64 id.
 pub const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
+
 /// `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl number: install a file descriptor into
 /// the tracee from the broker.
 pub const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
@@ -90,14 +97,18 @@ pub struct SeccompNotifAddfd {
     /// Notification ID, matching the `id` of the received notification that
     /// this ADDFD request extends.
     pub id: u64,
+
     /// Flags for the ADDFD request; may include
     /// [`SECCOMP_ADDFD_FLAG_SEND`].
     pub flags: u32,
+
     /// File descriptor in the broker to install into the tracee.
     pub srcfd: u32,
+
     /// File descriptor number the kernel assigns in the tracee for the
     /// installed descriptor.
     pub newfd: u32,
+
     /// Flags applied to the new descriptor in the tracee (e.g. `O_CLOEXEC`).
     pub newfd_flags: u32,
 }
@@ -113,8 +124,10 @@ pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 // LP64 and are verified at compile time against the libc layout below.
 #[cfg(target_pointer_width = "64")]
 const MSG_NAME_OFFSET: usize = 0;
+
 #[cfg(target_pointer_width = "64")]
 const MSG_NAMELEN_OFFSET: usize = 8;
+
 #[cfg(target_pointer_width = "64")]
 const MSGHDR_LEN: usize = 56;
 
@@ -134,10 +147,13 @@ const _: () = {
 pub struct SeccompData {
     /// Syscall number (`__NR_*` for the target architecture).
     pub nr: i32,
+
     /// Architecture identifier from `SECCOMP_ARCH_*` (`AUDIT_ARCH_*`).
     pub arch: u32,
+
     /// Instruction pointer in the tracee at the time of the notification.
     pub instruction_pointer: u64,
+
     /// Up to six syscall arguments (`__AUDIT_ARCH_64BIT` passes the
     /// full `x86_64` register set).
     pub args: [u64; 6],
@@ -151,10 +167,13 @@ pub struct SeccompData {
 pub struct SeccompNotif {
     /// Notification ID, echoed back in the matching response.
     pub id: u64,
+
     /// PID of the tracee that triggered the notification.
     pub pid: u32,
+
     /// Notification flags, e.g. [`SECCOMP_USER_NOTIF_FLAG_CONTINUE`].
     pub flags: u32,
+
     /// Syscall data (`nr`, `arch`, `instruction_pointer`, and `args`) for the
     /// intercepted syscall.
     pub data: SeccompData,
@@ -167,12 +186,15 @@ pub struct SeccompNotif {
 pub struct SeccompNotifResp {
     /// Notification ID this response answers (echoed from the notification).
     pub id: u64,
+
     /// Value returned to the tracee when the syscall is answered with
     /// success (`error == 0`).
     pub val: i64,
+
     /// Errno-related value: a negative errno (e.g. `-EPERM`) reported to the
     /// tracee as the syscall result.
     pub error: i32,
+
     /// Response flags, e.g. [`SECCOMP_USER_NOTIF_FLAG_CONTINUE`].
     pub flags: u32,
 }
@@ -189,6 +211,7 @@ pub enum NetworkMode {
     /// Direct mediation: network transport policy checks are performed
     /// through the normal `Check` RPC, with no transparent proxy.
     Direct,
+
     /// Proxy mediation: the transparent proxy owns only the configured
     /// HTTP(S) service-port `AF_INET`/`AF_INET6` connect/send decisions;
     /// other network destinations stay gated by seccomp user notification.
@@ -201,8 +224,10 @@ pub enum NetworkMode {
 pub struct NetworkTarget {
     /// Hostname or IP address of the network destination.
     pub host: String,
+
     /// Destination port.
     pub port: u16,
+
     /// URL scheme of the request (e.g. `http` or `https`). Might be empty
     /// for non-URL destinations.
     pub scheme: String,
@@ -219,8 +244,10 @@ pub struct NetworkTarget {
 pub struct ResourceTarget {
     /// Classifies what the target is: a Unix socket path or a device node.
     pub kind: ResourceKind,
+
     /// Filesystem path of the Unix socket or device node.
     pub path: PathBuf,
+
     /// Access mode (read/write/etc.) being requested.
     pub access: ResourceAccess,
 
@@ -247,75 +274,100 @@ pub enum FilesystemMutation {
     Rename {
         /// Source directory descriptor.
         old_dir: OwnedFd,
+
         /// Source pathname bytes.
         old: Vec<u8>,
+
         /// Destination directory descriptor.
         new_dir: OwnedFd,
+
         /// Destination pathname bytes.
         new: Vec<u8>,
+
         /// `renameat2` flags.
         flags: u32,
     },
+
     /// Create a hard link.
     Link {
         /// Source directory descriptor.
         old_dir: OwnedFd,
+
         /// Source pathname bytes.
         old: Vec<u8>,
+
         /// Destination directory descriptor.
         new_dir: OwnedFd,
+
         /// Destination pathname bytes.
         new: Vec<u8>,
+
         /// `linkat` flags.
         flags: u32,
     },
+
     /// Create a symbolic link.
     Symlink {
         /// Link target bytes.
         target: Vec<u8>,
+
         /// Link directory descriptor.
         link_dir: OwnedFd,
+
         /// Link pathname bytes.
         link: Vec<u8>,
     },
+
     /// Remove a directory entry.
     Unlink {
         /// Parent directory descriptor.
         dir: OwnedFd,
+
         /// Entry pathname bytes.
         path: Vec<u8>,
+
         /// `unlinkat` flags.
         flags: u32,
     },
+
     /// Truncate a named file.
     Truncate {
         /// Captured cwd descriptor.
         dir: OwnedFd,
+
         /// Captured pathname bytes.
         path: Vec<u8>,
+
         /// Requested length.
         len: i64,
     },
+
     /// Truncate an open file description.
     Ftruncate {
         /// Duplicated tracee descriptor.
         fd: OwnedFd,
+
         /// Requested length.
         len: i64,
     },
+
     /// Create a directory.
     Mkdir {
         /// Parent directory descriptor.
         dir: OwnedFd,
+
         /// Directory pathname bytes.
         path: Vec<u8>,
+
         /// Requested mode.
         mode: u32,
     },
+
     /// Remove a directory.
     Rmdir {
         /// Parent directory descriptor.
         dir: OwnedFd,
+
         /// Directory pathname bytes.
         path: Vec<u8>,
     },
@@ -342,11 +394,14 @@ pub struct FilesystemTarget {
 pub enum SyscallTarget {
     /// Network target, dispatched through the `Check` RPC.
     Network(NetworkTarget),
+
     /// Resource target (Unix socket / device node), dispatched through
     /// `CheckResource`.
     Resource(ResourceTarget),
+
     /// Filesystem mutation target, dispatched through `CheckFilesystem`.
     Filesystem(FilesystemTarget),
+
     /// Complete the syscall by returning this errno value to the tracee.
     Errno(i32),
 }
@@ -361,6 +416,7 @@ pub enum SyscallTarget {
 pub enum UnixAddress {
     /// Filesystem path of the Unix socket.
     Path(String),
+
     /// Kernel abstract socket name, hex-encoded (used for non-printable
     /// names).
     AbstractHex(String),
@@ -375,14 +431,17 @@ pub enum SockaddrTarget {
     Inet {
         /// IP address of the endpoint.
         ip: IpAddr,
+
         /// Port of the endpoint.
         port: u16,
     },
+
     /// Unix-domain endpoint (`AF_UNIX`): a parsed address plus the raw
     /// captured bytes.
     Unix {
         /// Parsed `AF_UNIX` address.
         address: UnixAddress,
+
         /// Raw captured sockaddr bytes.
         raw: Vec<u8>,
     },
@@ -393,6 +452,7 @@ pub enum SockaddrTarget {
 fn hex_encode_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
+
     for &b in bytes {
         out.push(HEX[usize::from(b >> 4)] as char);
         out.push(HEX[usize::from(b & 0x0F)] as char);
@@ -400,6 +460,7 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
 
     out
 }
+
 /// Format a kernel abstract socket name for use as a policy key.
 ///
 /// Printable UTF-8 names become `@abstract:<text>` so users can write glob
@@ -464,6 +525,7 @@ pub fn send_response(
     flags: u32,
 ) -> io::Result<()> {
     notif_id_valid(listener_fd, id)?;
+
     let mut resp = SeccompNotifResp {
         id,
         val,
@@ -490,6 +552,7 @@ pub fn send_response(
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails.
 pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::Result<()> {
     notif_id_valid(listener_fd, id)?;
+
     let mut addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
@@ -552,6 +615,7 @@ fn scheme_for_fd(notif: &SeccompNotif, sockfd: u64, default: &str) -> String {
         .map_or(default, |sock_type| scheme_for_socket_type(sock_type))
         .to_owned()
 }
+
 /// Parse a raw sockaddr buffer into a `SockaddrTarget`.
 ///
 /// Supports `AF_INET`/`AF_INET6` (`IpAddr` + port) and `AF_UNIX`
@@ -563,6 +627,7 @@ fn scheme_for_fd(notif: &SeccompNotif, sockfd: u64, default: &str) -> String {
 #[must_use]
 fn parse_sockaddr(bytes: &[u8], addrlen: usize) -> Option<SockaddrTarget> {
     let addrlen = addrlen.min(bytes.len());
+
     if addrlen < 2 {
         return None;
     }
@@ -636,6 +701,7 @@ fn parse_sockaddr(bytes: &[u8], addrlen: usize) -> Option<SockaddrTarget> {
                 })
             }
         }
+
         _ => None,
     }
 }
@@ -734,6 +800,7 @@ fn parse_msghdr_target(bytes: &[u8]) -> Option<MsghdrParts> {
 /// `process_vm_readv` fails.
 fn target_from_sendmsg(notif: &SeccompNotif) -> io::Result<Option<SyscallTarget>> {
     let msg = notif.data.args[1];
+
     if msg == 0 {
         return Ok(None);
     }
@@ -892,6 +959,7 @@ fn sockaddr_target(
 
     Ok(Some(target))
 }
+
 const fn filesystem_target(
     checks: Vec<(PathBuf, FileAccess)>,
     operation: FilesystemMutation,
@@ -907,14 +975,18 @@ fn read_raw_path(pid: u32, ptr: u64) -> io::Result<Vec<u8>> {
     if ptr == 0 {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }
+
     let bytes = read_tracee_bytes(pid, ptr, libc::PATH_MAX as usize)?;
+
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
+
     if end == bytes.len() {
         return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     }
+
     Ok(bytes[..end].to_vec())
 }
 
@@ -933,9 +1005,11 @@ fn open_path_handle(path: &Path) -> io::Result<OwnedFd> {
 
 fn tracee_dir_handle(pid: u32, dirfd: u64) -> io::Result<OwnedFd> {
     let fd = syscall_i32_arg(dirfd);
+
     if fd == libc::AT_FDCWD {
         return open_path_handle(Path::new(&format!("/proc/{pid}/cwd")));
     }
+
     if fd < 0 {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
@@ -949,18 +1023,23 @@ fn capture_path(
     ptr: u64,
 ) -> io::Result<(OwnedFd, Vec<u8>, PathBuf)> {
     let raw = read_raw_path(notif.pid, ptr)?;
+
     if raw.is_empty() {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
+
     let path = path_from_raw(&raw);
+
     if path.is_absolute() {
         return Ok((open_path_handle(Path::new("/"))?, raw, path));
     }
+
     let dir = tracee_dir_handle(notif.pid, dirfd)?;
     let base = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
     let resolved = base.join(path);
     Ok((dir, raw, resolved))
 }
+
 fn two_path_target(
     notif: &SeccompNotif,
     old_dirfd: u64,
@@ -971,6 +1050,7 @@ fn two_path_target(
 ) -> io::Result<SyscallTarget> {
     let (old_dir, old, old_check) = capture_path(notif, old_dirfd, old_ptr)?;
     let (new_dir, new, new_check) = capture_path(notif, new_dirfd, new_ptr)?;
+
     Ok(filesystem_target(
         vec![
             (
@@ -1009,6 +1089,7 @@ fn target_from_renameat_family(notif: &SeccompNotif) -> io::Result<SyscallTarget
     } else {
         u32::try_from(notif.data.args[4]).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
     };
+
     two_path_target(
         notif,
         notif.data.args[0],
@@ -1024,6 +1105,7 @@ fn target_from_renameat_family(notif: &SeccompNotif) -> io::Result<SyscallTarget
         },
     )
 }
+
 fn target_from_link(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     two_path_target(
         notif,
@@ -1044,6 +1126,7 @@ fn target_from_link(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 fn target_from_linkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let flags = u32::try_from(notif.data.args[4])
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
     two_path_target(
         notif,
         notif.data.args[0],
@@ -1064,6 +1147,7 @@ fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let target = read_raw_path(notif.pid, notif.data.args[0])?;
     let (link_dir, link, resolved) = capture_path(notif, at_fdcwd_arg(), notif.data.args[1])?;
     let target_path = resolve_symlink_target_path(&target, &resolved);
+
     Ok(filesystem_target(
         vec![
             (normalize_path(&target_path), FileAccess::Read),
@@ -1084,6 +1168,7 @@ fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let target = read_raw_path(notif.pid, notif.data.args[0])?;
     let (link_dir, link, resolved) = capture_path(notif, notif.data.args[1], notif.data.args[2])?;
     let target_path = resolve_symlink_target_path(&target, &resolved);
+
     Ok(filesystem_target(
         vec![
             (normalize_path(&target_path), FileAccess::Read),
@@ -1102,6 +1187,7 @@ fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 fn resolve_symlink_target_path(target: &[u8], link: &Path) -> PathBuf {
     let target = PathBuf::from(std::ffi::OsString::from_vec(target.to_vec()));
+
     if target.is_absolute() {
         target
     } else {
@@ -1109,6 +1195,7 @@ fn resolve_symlink_target_path(target: &[u8], link: &Path) -> PathBuf {
             .map_or_else(|| target.clone(), |parent| parent.join(&target))
     }
 }
+
 fn single_path_target(
     notif: &SeccompNotif,
     dirfd: u64,
@@ -1117,6 +1204,7 @@ fn single_path_target(
     access: FileAccess,
 ) -> io::Result<SyscallTarget> {
     let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
+
     Ok(filesystem_target(
         vec![(normalize_captured_path(&dir, &raw, &path), access)],
         operation(dir, raw),
@@ -1140,6 +1228,7 @@ fn target_from_unlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 fn target_from_unlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let flags = u32::try_from(notif.data.args[2])
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
     single_path_target(
         notif,
         notif.data.args[0],
@@ -1151,8 +1240,10 @@ fn target_from_unlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 fn target_from_truncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let (dir, raw, path) = capture_path(notif, at_fdcwd_arg(), notif.data.args[0])?;
+
     let len = i64::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
     Ok(filesystem_target(
         vec![(
             normalize_captured_path(&dir, &raw, &path),
@@ -1171,13 +1262,17 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
         notif.pid,
         i32::try_from(notif.data.args[0]).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?,
     )?;
+
     let mut path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+
     // An ordinary fd link already names the resolved, frozen file description.
     if !path.is_absolute() || path.as_os_str().as_encoded_bytes().ends_with(b" (deleted)") {
         path = normalize_path(&path);
     }
+
     let len = i64::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
     Ok(filesystem_target(
         vec![(path, FileAccess::Write)],
         FilesystemMutation::Ftruncate { fd, len },
@@ -1191,9 +1286,11 @@ fn mkdir_target(
     mode: u32,
 ) -> io::Result<SyscallTarget> {
     let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
+
     if raw.is_empty() {
         return Ok(SyscallTarget::Errno(libc::ENOENT));
     }
+
     let exists = if raw.starts_with(b"/") {
         std::fs::symlink_metadata(&path).is_ok()
     } else {
@@ -1201,9 +1298,11 @@ fn mkdir_target(
         candidate.extend_from_slice(&raw);
         std::fs::symlink_metadata(PathBuf::from(std::ffi::OsString::from_vec(candidate))).is_ok()
     };
+
     if exists {
         return Ok(SyscallTarget::Errno(libc::EEXIST));
     }
+
     Ok(filesystem_target(
         vec![(
             normalize_captured_path(&dir, &raw, &path),
@@ -1220,12 +1319,14 @@ fn mkdir_target(
 fn target_from_mkdir(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let mode = u32::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
     mkdir_target(notif, at_fdcwd_arg(), notif.data.args[0], mode)
 }
 
 fn target_from_mkdirat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let mode = u32::try_from(notif.data.args[2])
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
     mkdir_target(notif, notif.data.args[0], notif.data.args[1], mode)
 }
 
@@ -1256,6 +1357,7 @@ fn target_from_filesystem_mutation(notif: &SeccompNotif) -> Option<SyscallTarget
         nr::RMDIR => target_from_rmdir(notif),
         _ => return None,
     };
+
     Some(result.unwrap_or_else(|err| mutation_errno(&err)))
 }
 
@@ -1273,6 +1375,7 @@ fn normalize_captured_path(dir: &OwnedFd, raw: &[u8], path: &Path) -> PathBuf {
         nix::sys::stat::Mode::empty(),
     )
     .map_err(io::Error::from);
+
     normalize_path_handle(path, fd)
 }
 
@@ -1284,6 +1387,7 @@ fn normalize_path_handle(path: &Path, fd: io::Result<OwnedFd>) -> PathBuf {
         }
         Err(_) => None,
     };
+
     if let Some(fd) = fd
         && let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
         && resolved.is_absolute()
@@ -1294,6 +1398,7 @@ fn normalize_path_handle(path: &Path, fd: io::Result<OwnedFd>) -> PathBuf {
     {
         return resolved;
     }
+
     // Anonymous descriptors and unlinked handles have no canonical pathname.
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1341,12 +1446,14 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
     let Ok(Some(raw_path)) = read_tracee_open_path(notif) else {
         return None;
     };
+
     // stat follows aliases, so definite non-devices need no canonical pathname.
     if device_file_type(&raw_path) == Some(false) {
         return None;
     }
 
     let path = normalize_path(&raw_path);
+
     if !is_device_node_for_resource_gate(&path) {
         return None;
     }
@@ -1357,7 +1464,6 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
 
     let (open_flags, open_mode) = read_tracee_open_flags_mode(notif);
     let raw = path.to_string_lossy().into_owned().into_bytes();
-
     let acc = open_flags & libc::O_ACCMODE;
 
     let access = if acc == libc::O_WRONLY {
@@ -1389,6 +1495,7 @@ fn resolve_open_path(path: &Path, dir_base: &Path, absolute_in_dir: bool) -> Pat
         if absolute_in_dir {
             return dir_base.join(path.strip_prefix("/").unwrap_or(path));
         }
+
         path.to_path_buf()
     } else {
         dir_base.join(path)
@@ -1444,6 +1551,7 @@ fn read_tracee_open_path(notif: &SeccompNotif) -> io::Result<Option<PathBuf>> {
 
     // Read up to PATH_MAX (4096) bytes, then truncate at the first NUL.
     let bytes = read_tracee_bytes(notif.pid, path_arg, 4096)?;
+
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
 
     let Some(path) = std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from) else {
@@ -1634,6 +1742,7 @@ mod tests {
         // ID_VALID is IOW(2, __u64), not IOREWR like SEND. Mixing them up
         // makes every response fail with EINVAL.
         assert_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, ioc(IOW, 2, 8));
+
         assert_eq!(SECCOMP_IOCTL_NOTIF_ADDFD, ioc(IOW, 3, 24));
     }
 
@@ -1694,6 +1803,7 @@ mod tests {
     fn scheme_for_socket_type_raw_and_seqpacket_are_tcp() {
         // Policyd only knows tcp/udp today; raw and seqpacket default to tcp.
         assert_eq!(scheme_for_socket_type(libc::SOCK_RAW), "tcp");
+
         assert_eq!(scheme_for_socket_type(libc::SOCK_SEQPACKET), "tcp");
     }
 
@@ -1701,6 +1811,7 @@ mod tests {
     fn parse_unix_sockaddr_path() {
         // AF_UNIX (family=1), path "/tmp/agent-sandbox.sock".
         let mut bytes = vec![1, 0]; // sa_family = AF_UNIX
+
         let path = b"/tmp/agent-sandbox.sock";
         bytes.extend_from_slice(path);
         bytes.push(0); // NUL terminator
@@ -1715,6 +1826,7 @@ mod tests {
                 );
                 assert_eq!(raw.len(), 32);
             }
+
             other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
         }
     }
@@ -1724,6 +1836,7 @@ mod tests {
         // Printable UTF-8 abstract names become `@abstract:<text>` so glob
         // rules like `nv_target_process_*` match the decoded name.
         let mut bytes = vec![1, 0, 0]; // family + abstract marker
+
         bytes.extend_from_slice(b"nv_target_process_1104286");
         let parsed = parse_sockaddr(&bytes, bytes.len()).expect("AF_UNIX abstract parses");
 
@@ -1735,6 +1848,7 @@ mod tests {
                 );
                 assert_eq!(raw, bytes);
             }
+
             other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
         }
     }
@@ -1744,6 +1858,7 @@ mod tests {
         // Abstract names can contain embedded NULs. The policy key must use
         // the full addrlen span so it matches the emulated connect target.
         let mut bytes = vec![1, 0, 0]; // family + abstract marker
+
         bytes.extend_from_slice(b"agent\x00sandbox");
         let parsed = parse_sockaddr(&bytes, bytes.len()).expect("AF_UNIX abstract parses");
 
@@ -1755,6 +1870,7 @@ mod tests {
                 );
                 assert_eq!(raw, bytes);
             }
+
             other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
         }
     }
@@ -1764,6 +1880,7 @@ mod tests {
         // Non-UTF-8 or control-byte names keep the `@hex:` form so the key
         // stays byte-stable when there is no printable text to decode.
         let mut bytes = vec![1, 0, 0]; // family + abstract marker
+
         bytes.extend_from_slice(&[0xFF, 0xAB, 0x01]);
         let parsed = parse_sockaddr(&bytes, bytes.len()).expect("AF_UNIX abstract parses");
 
@@ -1772,6 +1889,7 @@ mod tests {
                 assert_eq!(address, UnixAddress::AbstractHex("@hex:ffab01".into()));
                 assert_eq!(raw, bytes);
             }
+
             other @ SockaddrTarget::Inet { .. } => panic!("expected Unix, got {other:?}"),
         }
     }
@@ -1780,6 +1898,7 @@ mod tests {
     fn parse_unix_sockaddr_unnamed_is_none() {
         // AF_UNIX with empty sun_path: unnamed socket.
         let bytes = [1, 0];
+
         assert_eq!(parse_sockaddr(&bytes, bytes.len()), None);
     }
 
@@ -1788,6 +1907,7 @@ mod tests {
         // Ponytail: inlined encoder must match the canonical lowercase
         // hex alphabet so policyd's @hex: keys are byte-stable.
         assert_eq!(hex_encode_lower(b""), "");
+
         assert_eq!(hex_encode_lower(&[0x00, 0xFF, 0xAB, 0x10]), "00ffab10");
         assert_eq!(hex_encode_lower(b"agent"), "6167656e74");
     }
@@ -1843,8 +1963,10 @@ mod tests {
     fn device_alias_outside_dev_remains_resource_gated() {
         let alias =
             std::env::temp_dir().join(format!("broker-device-alias-{}", std::process::id()));
+
         std::os::unix::fs::symlink("/dev/ptmx", &alias).expect("create device alias");
         let cpath = std::ffi::CString::new(alias.as_os_str().as_encoded_bytes()).expect("path");
+
         let notif = SeccompNotif {
             pid: std::process::id(),
             data: SeccompData {
@@ -1854,11 +1976,14 @@ mod tests {
             },
             ..SeccompNotif::default()
         };
+
         let target = target_from_notification(&notif).expect("classify device alias");
         fs::remove_file(alias).expect("remove device alias");
+
         let Some(SyscallTarget::Resource(target)) = target else {
             panic!("device alias must remain resource-gated");
         };
+
         assert_eq!(
             target.path,
             fs::canonicalize("/dev/ptmx").expect("canonical device")
@@ -1936,6 +2061,7 @@ mod tests {
 
         std::mem::forget(cpath);
         let target = target_from_notification(&notif).expect("classify openat");
+
         assert!(
             target.is_none(),
             "directory open must continue to fanotify, got {target:?}"
@@ -2087,6 +2213,7 @@ mod tests {
 
         let _ = fs::remove_file(&file);
         let opened = fs::File::create(&file).expect("create temp file");
+
         let resolved = tracee_fd_path(
             std::process::id(),
             u64::try_from(opened.as_raw_fd()).expect("fd"),

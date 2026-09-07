@@ -96,6 +96,7 @@ pub async fn start_monitor(
     static_allow: Vec<FilesystemRule>,
 ) -> Result<FilesystemMonitorReply, RpcClientError> {
     let mut client = PersistentRpcClient::new_trusted(socket_path);
+
     let reply = client
         .request(
             RpcRequest::StartFilesystemMonitor { ctx, static_allow },

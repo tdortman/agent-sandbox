@@ -11,6 +11,7 @@ struct OriginOptions {
     tls: bool,
     tls_alpn: TlsAlpn,
     keep_alive: bool,
+    h2c: bool,
     http3: Option<Http3OriginOptions>,
     certificate: PathBuf,
     private_key: PathBuf,
@@ -78,7 +79,9 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
         };
     }
 
-    let origin = if options.keep_alive {
+    let origin = if options.h2c {
+        TcpOrigin::start_h2(options.ip, options.origin_port).await
+    } else if options.keep_alive {
         TcpOrigin::start_keep_alive(options.ip, options.origin_port, b"origin-response").await
     } else {
         TcpOrigin::start(options.ip, options.origin_port, b"origin-response").await
@@ -97,6 +100,7 @@ struct Http3Options {
     /// Let the proxy bind an ephemeral alternative port and report it back;
     /// the origin then advertises the reported port.
     alt_svc: bool,
+
     test_ech_dns: Option<SocketAddr>,
     reject_sessions: bool,
     refuse_sessions: bool,
@@ -106,8 +110,10 @@ struct Http3Options {
 #[derive(Default)]
 struct HarnessOptions {
     tls: bool,
+    configured_tls_port: bool,
     advertise_http11_alpn: bool,
     keep_alive: bool,
+    h2c: bool,
     http10_origin: bool,
     claim_errors: bool,
     http3: Option<Http3Options>,
@@ -183,10 +189,28 @@ impl TransparentHarness {
         .await
     }
 
+    pub async fn start_configured_tls_port(ip: IpAddr) -> Self {
+        Self::start_inner(ip, 0, HarnessOptions {
+            tls: true,
+            configured_tls_port: true,
+            advertise_http11_alpn: true,
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
     /// Start a TLS harness whose origin does not advertise ALPN.
     pub async fn start_tls_without_alpn(ip: IpAddr) -> Self {
         Self::start_inner(ip, 0, HarnessOptions {
             tls: true,
+            ..HarnessOptions::default()
+        })
+        .await
+    }
+
+    pub async fn start_h2c(ip: IpAddr) -> Self {
+        Self::start_inner(ip, 0, HarnessOptions {
+            h2c: true,
             ..HarnessOptions::default()
         })
         .await
@@ -293,12 +317,15 @@ impl TransparentHarness {
     async fn start_inner(ip: IpAddr, origin_port: u16, options: HarnessOptions) -> Self {
         let HarnessOptions {
             tls,
+            configured_tls_port,
             advertise_http11_alpn,
             keep_alive,
+            h2c,
             http10_origin,
             claim_errors,
             http3,
         } = options;
+
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = start_harness_policy(&root, claim_errors);
         let (ca_cert, ca_key) = write_harness_ca(&root);
@@ -309,6 +336,7 @@ impl TransparentHarness {
             tls,
             tls_alpn: harness_tls_alpn(advertise_http11_alpn),
             keep_alive,
+            h2c,
             http3: http3.as_ref().map(|http3| Http3OriginOptions {
                 alt_svc: http3.alt_svc,
                 reject_sessions: http3.reject_sessions,
@@ -355,8 +383,19 @@ impl TransparentHarness {
             &destination.to_string(),
         ]);
 
-        if tls {
+        if configured_tls_port {
+            let ports = root.path().join("https-ports.json");
+            std::fs::write(&ports, format!("[{}]", origin.address.port())).unwrap();
+            proxy_command.env("AGENT_SANDBOX_TEST_HTTPS_PORTS_FILE", ports);
+        } else if tls {
             proxy_command.arg("--test-tls");
+        }
+
+        if h2c {
+            proxy_command.args([
+                "--h2c-upstream-origin",
+                &format!("http://localhost:{}", origin.address.port()),
+            ]);
         }
 
         if http10_origin {

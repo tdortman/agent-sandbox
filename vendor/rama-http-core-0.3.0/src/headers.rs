@@ -1,0 +1,205 @@
+use rama_core::{bytes::BytesMut, telemetry::tracing::debug};
+use rama_http_types::{
+    HeaderMap, HeaderValue, Method,
+    header::{CONTENT_LENGTH, OccupiedEntry, TRANSFER_ENCODING, ValueIter},
+};
+
+pub(super) fn connection_keep_alive(value: &HeaderValue) -> bool {
+    connection_has(value, "keep-alive")
+}
+
+pub(super) fn connection_close(value: &HeaderValue) -> bool {
+    connection_has(value, "close")
+}
+
+fn connection_has(value: &HeaderValue, needle: &str) -> bool {
+    if let Ok(s) = value.to_str() {
+        for val in s.split(',') {
+            if val.trim().eq_ignore_ascii_case(needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn content_length_parse(value: &HeaderValue) -> Option<u64> {
+    from_digits(value.as_bytes())
+}
+
+pub(super) fn content_length_parse_all(headers: &HeaderMap) -> Option<u64> {
+    content_length_parse_all_values(headers.get_all(CONTENT_LENGTH).into_iter())
+}
+
+pub(super) fn content_length_parse_all_values(values: ValueIter<'_, HeaderValue>) -> Option<u64> {
+    // If multiple Content-Length headers were sent, everything can still
+    // be alright if they all contain the same value, and all parse
+    // correctly. If not, then it's an error.
+
+    let mut content_length: Option<u64> = None;
+    for h in values {
+        if let Ok(line) = h.to_str() {
+            for v in line.split(',') {
+                let n = from_digits(v.trim().as_bytes())?;
+                if content_length.is_none() {
+                    content_length = Some(n)
+                } else if content_length != Some(n) {
+                    return None;
+                }
+            }
+        } else {
+            return None;
+        }
+    }
+
+    content_length
+}
+
+fn from_digits(bytes: &[u8]) -> Option<u64> {
+    // cannot use FromStr for u64, since it allows a signed prefix
+    let mut result = 0u64;
+    const RADIX: u64 = 10;
+
+    if bytes.is_empty() {
+        return None;
+    }
+
+    for &b in bytes {
+        // can't use char::to_digit, since we haven't verified these bytes
+        // are utf-8.
+        match b {
+            b'0'..=b'9' => {
+                result = result.checked_mul(RADIX)?;
+                result = result.checked_add(u64::from(b - b'0'))?;
+            }
+            _ => {
+                // not a DIGIT, get outta here!
+                return None;
+            }
+        }
+    }
+
+    Some(result)
+}
+
+pub(super) fn method_has_defined_payload_semantics(method: &Method) -> bool {
+    !matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::DELETE | Method::CONNECT
+    )
+}
+
+pub(super) fn set_content_length_if_missing(headers: &mut HeaderMap, len: u64) {
+    headers
+        .entry(CONTENT_LENGTH)
+        .or_insert_with(|| HeaderValue::from(len));
+}
+
+pub(super) fn transfer_encoding_is_chunked(headers: &HeaderMap) -> bool {
+    is_chunked(headers.get_all(TRANSFER_ENCODING).into_iter())
+}
+
+pub(super) fn is_chunked(mut encodings: ValueIter<'_, HeaderValue>) -> bool {
+    // chunked must always be the last encoding, according to spec
+    if let Some(line) = encodings.next_back() {
+        return is_chunked_(line);
+    }
+
+    false
+}
+
+pub(super) fn is_chunked_(value: &HeaderValue) -> bool {
+    // chunked must always be the last encoding, according to spec
+    if let Ok(s) = value.to_str()
+        && let Some(encoding) = s.rsplit(',').next()
+    {
+        return encoding.trim().eq_ignore_ascii_case("chunked");
+    }
+
+    false
+}
+
+/// RFC 9112 §6.1: chunked MUST NOT be applied more than once. Returns true
+/// if the value's comma-separated coding list contains `chunked` more than
+/// once (case-insensitive, ignoring surrounding whitespace).
+pub(super) fn has_duplicate_chunked(value: &HeaderValue) -> bool {
+    let Ok(s) = value.to_str() else {
+        return false;
+    };
+    let mut seen = false;
+    for coding in s.split(',') {
+        if coding.trim().eq_ignore_ascii_case("chunked") {
+            if seen {
+                return true;
+            }
+            seen = true;
+        }
+    }
+    false
+}
+
+pub(super) fn add_chunked(mut entry: OccupiedEntry<'_, HeaderValue>) {
+    const CHUNKED: &str = "chunked";
+
+    if let Some(line) = entry.iter_mut().next_back() {
+        // + 2 for ", "
+        let new_cap = line.as_bytes().len() + CHUNKED.len() + 2;
+        let mut buf = BytesMut::with_capacity(new_cap);
+        buf.extend_from_slice(line.as_bytes());
+        buf.extend_from_slice(b", ");
+        buf.extend_from_slice(CHUNKED.as_bytes());
+
+        match HeaderValue::from_maybe_shared(buf.freeze()) {
+            Ok(v) => *line = v,
+            Err(err) => {
+                debug!(
+                    "failed to create header with chunked added from original header value: {err}; append entry instead"
+                );
+                entry.append(HeaderValue::from_static(CHUNKED));
+            }
+        }
+        return;
+    }
+
+    entry.insert(HeaderValue::from_static(CHUNKED));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_duplicate_chunked_detects_dupes() {
+        let cases_dup: &[&[u8]] = &[
+            b"chunked, chunked",
+            b"chunked,chunked",
+            b"Chunked, CHUNKED",
+            b"gzip, chunked, chunked",
+            b"chunked, gzip, chunked",
+        ];
+        for v in cases_dup {
+            let hv = HeaderValue::from_bytes(v).unwrap();
+            assert!(
+                has_duplicate_chunked(&hv),
+                "expected duplicate chunked detected in {:?}",
+                std::str::from_utf8(v).unwrap()
+            );
+        }
+
+        let cases_ok: &[&[u8]] = &[
+            b"chunked",
+            b"gzip, chunked",
+            b"identity",
+            b"deflate, gzip",
+            b"",
+        ];
+        for v in cases_ok {
+            let hv = HeaderValue::from_bytes(v).unwrap();
+            assert!(
+                !has_duplicate_chunked(&hv),
+                "expected no duplicate chunked in {:?}",
+                std::str::from_utf8(v).unwrap()
+            );
+        }
+    }
+}

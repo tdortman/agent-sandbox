@@ -125,8 +125,8 @@ impl PolicyStore {
                 command.arg(flag).arg(path);
             }
         }
-        command.arg("--static-policy").arg(&self.args.export_json);
 
+        command.arg("--static-policy").arg(&self.args.export_json);
         let static_allow_input = static_allow.clone();
         let home_for_expand = home.clone();
         let project_root_for_expand = project_root.clone();
@@ -398,6 +398,7 @@ impl PolicyStore {
             access,
             ctx: ctx.clone(),
         });
+
         inner
             .pending
             .pending

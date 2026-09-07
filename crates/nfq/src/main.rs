@@ -14,7 +14,6 @@ mod packet;
 mod policy;
 mod push;
 mod queue;
-
 use std::time::Duration;
 
 use clap::Parser;
@@ -52,16 +51,22 @@ fn main() {
         }
     };
 
-    let _ready_marker = cli.ready_file.as_deref().map(write_ready_marker_or_exit);
-    info!(queue = cli.queue, "nfqueue listening");
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
 
-    let state = NfqState::new(&cli);
+    let mut state = NfqState::new(&cli);
+    if let Some(path) = &cli.network_revocation_map
+        && let Err(error) = state.enable_network_revocation(path)
+    {
+        eprintln!("agent-sandbox-nfq: cannot configure network revocation guard: {error}");
+        std::process::exit(1);
+    }
     spawn_push_socket_listener(&cli.push_socket, cli.push_trusted_uid, &state);
+
+    let _ready_marker = cli.ready_file.as_deref().map(write_ready_marker_or_exit);
+    info!(queue = cli.queue, "nfqueue listening");
 
     runtime
         .block_on(queue::run_queue(queue, state, cli.policy_socket, timeout))

@@ -28,6 +28,7 @@ use nix::{
 };
 
 const DEFAULT_POLICY_SOCKET: &str = "/run/agent-sandbox/policy.sock";
+
 const HELP: &str = "Usage: agent-sandbox-syscall-arm [OPTIONS] [COMMAND]...
 
 Options:
@@ -132,6 +133,7 @@ fn main() {
     let mut include_filesystem = false;
     let mut command: Vec<OsString> = Vec::new();
     let mut only_command = false;
+
     for arg in env::args_os().skip(1) {
         if !only_command && (arg == "--help" || arg == "-h") {
             print!("{HELP}");

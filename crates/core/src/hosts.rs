@@ -14,6 +14,25 @@ pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error>
         .build()
 }
 
+// Keep complex glob syntax on the existing engine; common forms need no regex.
+pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let literal = pattern.strip_suffix('*').unwrap_or(pattern);
+        if !literal.contains(['*', '?', '[', ']', '{', '}', '\\']) {
+            return if literal.len() == pattern.len() {
+                pattern == value
+            } else {
+                value
+                    .strip_prefix(literal)
+                    .is_some_and(|rest| !rest.contains('/'))
+            };
+        }
+    }
+
+    build_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
+}
+
 use crate::dns_cache::lookup_dns_cache;
 
 /// Whether `host` (after trimming and optional IPv6 bracket stripping) parses
@@ -105,6 +124,7 @@ pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
 pub struct NetworkRuleKey {
     /// Normalized hostname or IP literal.
     pub host: String,
+
     /// Port number.
     pub port: u16,
 }
@@ -127,8 +147,10 @@ pub struct NetworkSortKey {
     /// Registrable domain (last two non-empty labels), or the whole host when
     /// it is an IP literal or short name.
     pub domain: String,
+
     /// Subdomain labels from most to least specific (excluding the domain).
     pub subdomains: Vec<String>,
+
     /// Port number.
     pub port: u16,
 }
@@ -229,9 +251,7 @@ pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
         return host == bare || host.ends_with(suffix);
     }
 
-    if let Ok(glob) = build_glob(&pattern)
-        && glob.compile_matcher().is_match(&host)
-    {
+    if glob_matches(&pattern, &host) {
         return true;
     }
 
@@ -331,6 +351,60 @@ fn ipv6_prefix_matches(pattern: &str, host: &str) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::dns_cache::DnsCache;
+
+    #[test]
+    fn simple_globs_preserve_existing_semantics() {
+        for pattern in [
+            "",
+            "literal",
+            "literal*",
+            "*",
+            "**",
+            "a/*",
+            "a/**",
+            "a/?",
+            "a/[xy]",
+            "a/{x,y}",
+            "[",
+            "]",
+            "broken}",
+            "literal\\*",
+            "http://bench.test/*",
+            "é*",
+            "a\n*",
+        ] {
+            for value in [
+                "",
+                "literal",
+                "literalX",
+                "literal*",
+                "a/",
+                "a/x",
+                "a/x/y",
+                "a//",
+                "a/.",
+                "a/..",
+                "[",
+                "]",
+                "broken}",
+                "http://bench.test/small",
+                "http://bench.test/a/b",
+                "é",
+                "é/",
+                "éx",
+                "a\nx",
+            ] {
+                let expected =
+                    build_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value));
+
+                assert_eq!(
+                    glob_matches(pattern, value),
+                    expected,
+                    "{pattern:?}: {value:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn policy_host_uses_dns_cache() {

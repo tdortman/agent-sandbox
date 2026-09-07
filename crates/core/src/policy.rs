@@ -10,7 +10,7 @@ use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    hosts::{NetworkRuleKey, build_glob},
+    hosts::{NetworkRuleKey, build_glob, glob_matches},
     http::HttpRule,
 };
 
@@ -45,6 +45,7 @@ pub enum FileAccess {
 
     /// Execute access.
     Execute,
+
     /// All access levels.
     All,
 }
@@ -185,6 +186,7 @@ pub fn open_flags_to_file_access(flags: i32) -> FileAccess {
 pub struct FilesystemRuleKey {
     /// Path the rule applies to.
     pub path: PathBuf,
+
     /// Access level the rule grants or denies.
     pub access: FileAccess,
 }
@@ -316,6 +318,7 @@ fn path_matches_rule(
         // Previously a panic via .expect; now degrades gracefully.
         return false;
     };
+
     compiled_matches(&compiled, &requested, require_directory_boundary)
 }
 
@@ -331,6 +334,7 @@ pub struct FilesystemRule {
     ///
     /// May contain glob syntax; see [`contains_glob_syntax`].
     pub path: PathBuf,
+
     /// Access level the rule grants or denies.
     pub access: FileAccess,
 
@@ -630,6 +634,7 @@ pub enum ResourceKind {
     /// A device node opened by the broker.
     Device,
 }
+
 impl ResourceKind {
     /// Return the stable wire / policy-file name of this resource kind.
     #[must_use]
@@ -810,8 +815,10 @@ impl std::fmt::Display for ResourceAccess {
 pub struct ResourceRuleKey {
     /// Kind of resource the rule applies to.
     pub kind: ResourceKind,
+
     /// Path of the resource the rule applies to.
     pub path: PathBuf,
+
     /// Access level the rule grants or denies.
     pub access: ResourceAccess,
 }
@@ -848,10 +855,12 @@ impl ResourceRuleKey {
 pub struct ResourceRule {
     /// Kind of resource the rule applies to.
     pub kind: ResourceKind,
+
     /// Path of the resource the rule applies to.
     ///
     /// May contain glob syntax; see [`contains_glob_syntax`].
     pub path: PathBuf,
+
     /// Access level the rule grants or denies.
     pub access: ResourceAccess,
 
@@ -980,16 +989,22 @@ pub struct DbusFdMetadata {
 pub struct DbusTarget {
     /// Bus the message traverses.
     pub bus: DbusBus,
+
     /// Destination service name of the message.
     pub destination: String,
+
     /// Object path addressed by the message.
     pub object_path: String,
+
     /// Interface the message targets.
     pub interface: String,
+
     /// Method or signal name of the message.
     pub member: String,
+
     /// Kind of D-Bus message.
     pub message_kind: DbusMessageKind,
+
     /// D-Bus signature (type encoding) of the message body.
     pub signature: String,
 
@@ -1065,10 +1080,6 @@ impl DbusRule {
             && (self.target.signature == target.signature
                 || glob_matches(&self.target.signature, &target.signature))
     }
-}
-
-fn glob_matches(pattern: &str, value: &str) -> bool {
-    build_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
 }
 
 /// The `dbus` policy section: ordered lists of allow and deny [`DbusRule`]s
@@ -1161,6 +1172,7 @@ pub struct SudoSection {
 pub struct NetworkRule {
     /// Host name or IP the rule applies to.
     pub host: String,
+
     /// Port the rule applies to.
     pub port: u16,
 
@@ -1247,6 +1259,7 @@ impl SudoRule {
 pub struct InodeIdentity {
     /// Inode number of the filesystem object.
     pub inode: u64,
+
     /// Device number of the filesystem containing the object.
     pub device: u64,
 }
@@ -1429,8 +1442,10 @@ pub const EXPORTED_POLICY_PATH: &str = "/var/lib/agent-sandbox/exported-policy.j
 /// design.
 pub struct StaticPolicyAllow {
     rules: Vec<FilesystemRule>,
+
     // Only syntactic matchers are cached; filesystem aliases stay live.
     literal_rules: Vec<(CompiledPath, FileAccess)>,
+
     project_root: Option<PathBuf>,
 }
 
@@ -1464,6 +1479,7 @@ impl StaticPolicyAllow {
                     .map(|compiled| (compiled, rule.access))
             })
             .collect();
+
         Self {
             rules,
             literal_rules,
@@ -1486,6 +1502,7 @@ impl StaticPolicyAllow {
     #[must_use]
     pub fn allows_literal(&self, path: &Path, access: FileAccess) -> bool {
         let requested = normalize_rule_path(path);
+
         self.literal_rules.iter().any(|(compiled, granted)| {
             granted.covers(access) && compiled_matches(compiled, &requested, false)
         })
@@ -1506,6 +1523,7 @@ impl StaticPolicyAllow {
         self.rules.is_empty()
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -2147,6 +2165,7 @@ mod tests {
             FileAccess::All,
             "test",
         ));
+
         policy
             .filesystem
             .allow
@@ -2154,28 +2173,34 @@ mod tests {
 
         let temporary = tempfile::tempdir().expect("temporary policy directory");
         let export = temporary.path().join("policy.json");
+
         std::fs::write(
             &export,
             serde_json::to_vec(&policy).expect("serialize policy"),
         )
         .expect("write policy");
-        let eval = StaticPolicyAllow::load(&export, None);
 
+        let eval = StaticPolicyAllow::load(&export, None);
         assert!(eval.allows(Path::new("/home/user/bench/run/f0"), FileAccess::ReadWrite));
         assert!(eval.allows(Path::new("/readonly"), FileAccess::Read));
+
         assert!(
             !eval.allows(Path::new("/readonly"), FileAccess::Write),
             "access mode must match"
         );
+
         assert!(!eval.allows(Path::new("/denied"), FileAccess::Read));
+
         assert!(
             !eval.allows(Path::new("/home/user/benchmark"), FileAccess::Read),
             "prefix must not match"
         );
+
         assert!(eval.allows_all(&[
             (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
             (PathBuf::from("/readonly"), FileAccess::Read),
         ]));
+
         assert!(!eval.allows_all(&[
             (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
             (PathBuf::from("/denied"), FileAccess::Read),
@@ -2193,22 +2218,27 @@ mod tests {
         std::os::unix::fs::symlink(&first, &alias).expect("create alias");
         let export = temporary.path().join("policy.json");
         let mut policy = Policy::default();
+
         policy
             .filesystem
             .allow
             .push(FilesystemRule::new(&alias, FileAccess::Read, "test"));
+
         std::fs::write(
             &export,
             serde_json::to_vec(&policy).expect("serialize policy"),
         )
         .expect("write policy");
+
         let rule_alias = StaticPolicyAllow::load(&export, None);
         policy.filesystem.allow[0].path.clone_from(&first);
+
         std::fs::write(
             &export,
             serde_json::to_vec(&policy).expect("serialize policy"),
         )
         .expect("write policy");
+
         let request_alias = StaticPolicyAllow::load(&export, None);
         assert!(rule_alias.allows(&first, FileAccess::Read));
         assert!(request_alias.allows(&alias, FileAccess::Read));

@@ -71,6 +71,49 @@ agent-sandbox.network.httpProxy.http3 = {
 };
 ```
 
+To allow more than the default two seconds for upstream QUIC TLS handshakes:
+
+```nix
+agent-sandbox.network.httpProxy.http3.upstreamHandshakeTimeoutMs = 15000;
+```
+
+For upstream services that require mTLS, configure a runtime credentials file:
+
+```nix
+agent-sandbox.network.httpProxy.upstreamClientIdentitiesFile = "/run/secrets/proxy-identities.json";
+```
+
+The JSON file contains an array of exact HTTPS origins and PEM file paths:
+
+```json
+[
+  {
+    "origin": "https://api.example.com:8443",
+    "certificate": "/run/secrets/api-client-chain.pem",
+    "private_key": "/run/secrets/api-client-key.pem"
+  }
+]
+```
+
+Use a leaf-first certificate chain and an unencrypted private key. Set the JSON
+file and PEM files to owner `agent-sandbox-proxy:agent-sandbox-proxy` with mode
+`0600`. Parent directories must allow this user to traverse them. Keep private
+keys outside the Nix store. Relative PEM paths resolve against the JSON file's directory.
+Restart the proxy after changing credentials. The proxy rejects invalid keys,
+mismatched certificates, and duplicate origins at startup.
+
+Credentials apply to the exact HTTPS host and port on both TCP and HTTP/3.
+They do not grant policy access or propagate the downstream client's TLS identity.
+Other origins receive no client certificate. Wildcards and URL paths are rejected.
+
+The standalone flags are `--upstream-client-identities FILE` and
+`--http3-upstream-handshake-timeout-ms MILLISECONDS`.
+
+Ordinary HTTPS requests negotiate `h2` or `http/1.1` independently of the
+downstream HTTP version. Explicit HTTP/1.0 and WebSocket requirements still apply.
+Downstream leaf certificates prefer ECDSA P-256, then P-384, then RSA according
+to the client's advertised support.
+
 ## Share localhost ports
 
 Select the localhost ports that should be visible from both network namespaces:
@@ -91,6 +134,38 @@ agent-sandbox.network.httpProxy.http10UpstreamOrigins = [
   "https://legacy.example.com"
 ];
 ```
+
+For a cleartext HTTP/2 service, select its exact origin:
+
+```nix
+agent-sandbox.network.httpProxy.h2cUpstreamOrigins = [
+  "http://grpc.example.com:8080"
+];
+```
+
+The standalone flag is `--h2c-upstream-origin ORIGIN`. These origins use HTTP/2
+prior knowledge without HTTP/1 fallback. They cannot also be listed under
+`http10UpstreamOrigins`. Cleartext HTTP/2 downstream connections are accepted;
+HTTP/1 `Upgrade: h2c` remains rejected. Each request still requires HTTP policy
+approval, including requests on an existing HTTP/2 connection.
+
+To intercept HTTPS on additional TCP ports:
+
+```nix
+agent-sandbox.network.httpProxy.extraHttpsPorts = [ 9443 10443 ];
+```
+
+Ports 443 and 8443 remain enabled. The module writes the shared host configuration
+to `/etc/agent-sandbox/https-ports.json` and adds the ports to the transparent
+routes and fail-closed rules. The syscall gate, NFQUEUE, policy daemon and proxy
+read the same list. The module restarts the affected services when it changes;
+relaunch existing sandboxes so their brokers also load the new list. Ports used
+for HTTP or DNS cannot be reassigned. This setting does not grant access.
+
+The TCP proxy forwards informational responses such as `103 Early Hints` on
+HTTP/1.1 and HTTP/2 before the final response. It forwards at most 16 upstream
+interim responses per request and omits them for HTTP/1.0 clients. The Rama patch is described in
+[vendor/README.md](vendor/README.md).
 
 ## Policy
 

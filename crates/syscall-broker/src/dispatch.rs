@@ -15,6 +15,7 @@ pub fn start_filesystem_worker(
     // A rendezvous overlaps classification with one mutation without queuing
     // operations.
     let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+
     drop(
         std::thread::Builder::new()
             .name("filesystem-emulation".into())
@@ -24,12 +25,14 @@ pub fn start_filesystem_worker(
                         execute_filesystem_target(listener_fd, &notif, &target);
                     }
                 });
+
                 if result.is_err() {
                     tracing::error!("filesystem emulation worker panicked");
                     std::process::exit(1);
                 }
             })?,
     );
+
     Ok(sender)
 }
 
@@ -65,6 +68,7 @@ pub struct NetworkPolicyBypass {
     pub ownership: NetworkOwnership,
     pub dns_endpoint: Option<SocketAddr>,
 }
+
 /// Whether a classified filesystem target is covered by the static policy
 /// snapshot exported by policyd, so its emulation can proceed without a
 /// policyd round trip. Live verdicts (denies, session buckets, approvals)
@@ -276,6 +280,7 @@ mod tests {
             dns_endpoint,
         }
     }
+
     fn target(scheme: &str, host: &str, port: u16) -> NormalizedNotification {
         NormalizedNotification::Target {
             target: SyscallTarget::Network(NetworkTarget {

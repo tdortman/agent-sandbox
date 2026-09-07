@@ -94,8 +94,13 @@ async fn proxy_upstream_pool_reaches_standalone_origin() {
     .await;
 
     let pool = std::sync::Arc::new(
-        agent_sandbox_proxy::http3::upstream::UpstreamPool::new(&ca_cert, None)
-            .expect("upstream pool"),
+        agent_sandbox_proxy::http3::upstream::UpstreamPool::new(
+            &ca_cert,
+            None,
+            Duration::from_secs(2),
+            std::sync::Arc::default(),
+        )
+        .expect("upstream pool"),
     );
 
     let authority = format!("localhost:{}", origin.address.port());
@@ -163,9 +168,7 @@ async fn expect_http3<T>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_allow_records_policy_and_upstream() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
-
     let response = expect_http3(&harness, harness.http3_request("/allow?raw=query")).await;
-
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
     wait_for_release(&harness).await;
@@ -213,9 +216,7 @@ async fn transparent_http3_allow_records_policy_and_upstream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http3_ech_offer_is_decrypted() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
-
     let response = expect_http3(&harness, harness.http3_ech_request("/allow")).await;
-
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().await, b"origin-response\n");
     wait_for_release(&harness).await;

@@ -13,14 +13,19 @@ use agent_sandbox_core::{
 pub struct ScopeWire {
     /// Sandbox paths for the scope.
     pub paths: SandboxPaths,
+
     /// Optional session id.
     pub session_id: Option<String>,
+
     /// Owner uid deduced from the resolved context.
     pub owner_uid: Option<u32>,
+
     /// Optional sandbox session id.
     pub sandbox_session_id: Option<String>,
+
     /// Optional free-text comment supplied on the wire.
     pub comment: Option<String>,
+
     /// Optional package name associated with the scope.
     pub package: Option<String>,
 }
@@ -47,10 +52,13 @@ impl ScopeWire {
 pub struct NetworkScopeOp {
     /// Target host.
     pub host: String,
+
     /// Target port.
     pub port: u16,
+
     /// Approval scope for the operation.
     pub scope: ApprovalScope,
+
     /// Wire-supplied scope context.
     pub wire: ScopeWire,
 }
@@ -60,8 +68,10 @@ pub struct NetworkScopeOp {
 pub struct SudoScopeOp {
     /// Commandline arguments to elevate.
     pub argv: Vec<String>,
+
     /// Approval scope for the operation.
     pub scope: ApprovalScope,
+
     /// Wire-supplied scope context.
     pub wire: ScopeWire,
 }
@@ -71,10 +81,13 @@ pub struct SudoScopeOp {
 pub struct FilesystemScopeOp {
     /// Filesystem path being accessed.
     pub path: PathBuf,
+
     /// Access mode requested.
     pub access: FileAccess,
+
     /// Approval scope for the operation.
     pub scope: ApprovalScope,
+
     /// Wire-supplied scope context.
     pub wire: ScopeWire,
 }
@@ -84,12 +97,16 @@ pub struct FilesystemScopeOp {
 pub struct ResourceScopeOp {
     /// Type of resource being accessed.
     pub kind: ResourceKind,
+
     /// Resource path.
     pub path: PathBuf,
+
     /// Access mode requested.
     pub access: ResourceAccess,
+
     /// Approval scope for the operation.
     pub scope: ApprovalScope,
+
     /// Wire-supplied scope context.
     pub wire: ScopeWire,
 }
@@ -98,14 +115,19 @@ pub struct ResourceScopeOp {
 pub struct UiSpawnContext<'a> {
     /// Whether a matching UI session exists.
     pub has_matching_ui: bool,
+
     /// Optional sandbox session id.
     pub sandbox_session_id: Option<&'a str>,
+
     /// Optional uid of the registering process.
     pub uid: Option<u32>,
+
     /// Optional home directory.
     pub home: Option<&'a Path>,
+
     /// Optional current working directory.
     pub cwd: Option<&'a Path>,
+
     /// Optional project root directory.
     pub project_root: Option<&'a Path>,
 }
@@ -115,12 +137,16 @@ pub struct UiSpawnContext<'a> {
 pub struct PendingDecision {
     /// Id identifying this pending decision.
     pub pending_id: String,
+
     /// Approval scope of the pending decision.
     pub scope: ApprovalScope,
+
     /// Optional approval target.
     pub target: Option<ApprovalTarget>,
+
     /// Wire-supplied scope context.
     pub wire: ScopeWire,
+
     /// Client id that issued the request.
     pub client_id: u64,
 

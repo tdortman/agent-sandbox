@@ -28,16 +28,20 @@ use agent_sandbox_fsmon::MonitorClient;
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
 };
+
 fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
     let response = FanotifyResponse {
         fd: event_fd.as_raw_fd(),
         response: verdict,
     };
+
     let bytes = fanotify_response_bytes(&response);
+
     if let Err(error) = nix::unistd::write(fan_fd, bytes) {
         tracing::warn!(%error, "failed to send fanotify response");
     }
 }
+
 use clap::Parser;
 use nix::{
     dir::Dir,
@@ -93,6 +97,7 @@ struct Cli {
     /// `AGENT_SANDBOX_HOME` if unset.
     #[arg(long, value_name = "DIR", env = "AGENT_SANDBOX_HOME")]
     home: Option<PathBuf>,
+
     /// Project root directory inside the sandbox. Required for "project" scope
     /// approvals to land in the right per-project policy file. Defaults to the
     /// env var `AGENT_SANDBOX_PROJECT_ROOT` if unset.
@@ -401,25 +406,33 @@ fn syscall_lookup<T>(
     }
 
     let file = host_proc.open_entry(trace_pid, "syscall").ok()?;
+
     // The procfs record contains at most nine 64-bit numeric fields. Reject
     // incomplete records rather than classifying truncated arguments.
     let mut buffer = [0u8; 256];
+
     let mut deadline = None;
+
     loop {
         let length = file.read_at(&mut buffer, 0).ok()?;
         let content = std::str::from_utf8(&buffer[..length]).ok()?;
+
         if !content.ends_with('\n') {
             return None;
         }
+
         if content.trim() != "running" {
             return parse(host_proc, trace_pid, content);
         }
+
         let deadline = deadline.get_or_insert_with(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(10)
         });
+
         if std::time::Instant::now() >= *deadline {
             return None;
         }
+
         std::thread::sleep(std::time::Duration::from_micros(50));
     }
 }
@@ -723,10 +736,12 @@ struct SandboxCgroup(String);
 impl SandboxCgroup {
     fn read(host_proc: &HostProc, pid: i32) -> Option<Self> {
         let content = host_proc.read_to_string(pid, "cgroup").ok()?;
+
         let path = content.lines().find_map(|line| {
             let (hierarchy, path) = line.split_once("::")?;
             (hierarchy == "0" && !path.is_empty()).then(|| path.to_string())
         })?;
+
         Some(Self(path))
     }
 
@@ -755,6 +770,7 @@ fn run_event_loop(
         .enable_all()
         .build()
         .expect("tokio runtime");
+
     let mut pid_cgroup_cache = HashSet::new();
     let mut rpc = MonitorClient::new(socket_path);
 
@@ -792,6 +808,7 @@ fn run_event_loop(
                     != 0
             {
                 let event_fd = take_fanotify_event_fd(meta.fd).expect("event fd");
+
                 if try_fast_path_allow(
                     fan_fd,
                     &meta,
@@ -826,6 +843,7 @@ fn run_event_loop(
                     offset += event_len;
                     continue;
                 }
+
                 let access = normalize_directory_traverse_access(
                     Path::new(&path),
                     mask_to_access(host_proc, meta.mask, &event_fd, meta.pid),
@@ -956,6 +974,7 @@ fn main() {
     // mark_mountpoints would raise a permission event to our own fanotify
     // group before the event loop exists to answer it.
     let static_allow = StaticPolicyAllow::load(&cli.static_policy, cli.project_root.clone());
+
     // setns into the target mount namespace before marking its mounts.
     join_target_mount_namespace(cli.pid);
 
@@ -1048,11 +1067,13 @@ fn try_fast_path_allow(
 
         match sandbox_cgroup.contains(host_proc, process_pid) {
             Some(true) => {}
+
             Some(false) => {
                 pid_cgroup_cache.remove(&meta.pid);
                 respond(fan_fd, event_fd, FAN_ALLOW);
                 return true;
             }
+
             None => {
                 pid_cgroup_cache.remove(&meta.pid);
                 respond(fan_fd, event_fd, FAN_DENY);
@@ -1191,6 +1212,7 @@ mod tests {
 
         for nr in [libc::SYS_execve, libc::SYS_execveat] {
             let content = format!("{nr} 0x7fff00004000 0x0 0x0 0x0 0x0 0x0");
+
             assert_eq!(
                 parse_open_syscall_access(&host_proc, 1, &content),
                 Some(FileAccess::Execute)
@@ -1300,35 +1322,45 @@ mod tests {
         nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).expect("create FIFO");
         let reader_path = path.clone();
         let (send, receive) = std::sync::mpsc::channel();
+
         let reader = std::thread::spawn(move || {
             send.send(nix::unistd::gettid().as_raw())
                 .expect("send opener tid");
+
             File::open(reader_path).expect("open FIFO for reading")
         });
+
         let reader_tid = receive.recv().expect("receive opener tid");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut reader_access = None;
+
         while std::time::Instant::now() < deadline {
             if let Ok(content) = host_proc.read_to_string(reader_tid, "syscall") {
                 reader_access = parse_open_syscall_access(&host_proc, reader_tid, &content);
+
                 if reader_access.is_some() {
                     break;
                 }
             }
+
             std::thread::yield_now();
         }
+
         let opener_access = syscall_lookup(&host_proc, reader_tid, parse_open_syscall_access);
+
         let access = mask_to_access(
             &host_proc,
             FAN_OPEN_PERM,
             &test_event_file(),
             nix::unistd::gettid().as_raw(),
         );
+
         let release = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .expect("release blocked FIFO reader");
+
         drop(reader.join().expect("join reader"));
         drop(release);
         fs::remove_file(path).expect("remove FIFO");

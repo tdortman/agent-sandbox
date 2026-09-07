@@ -468,7 +468,6 @@ impl Http3Client {
         path: &str,
     ) -> Result<(Vec<http::Response<()>>, Http3Response), String> {
         let connection = self.connect_quic(server, server_name).await?;
-
         let h3 = h3_quinn::Connection::new(connection);
 
         let (connection, mut send_request) = h3::client::new(h3)
@@ -531,7 +530,6 @@ impl Http3Client {
         send_trailers: bool,
     ) -> Result<Http3Response, String> {
         let connection = self.connect_quic(server, server_name).await?;
-
         let h3 = h3_quinn::Connection::new(connection);
 
         let (connection, mut send_request) = h3::client::new(h3)
@@ -641,7 +639,6 @@ impl Http3Client {
         release_gate: Option<&Path>,
     ) -> Result<Vec<u8>, String> {
         let quinn_connection = self.connect_quic(server, server_name).await?;
-
         let h3 = h3_quinn::Connection::new(quinn_connection.clone());
 
         let (connection, mut send_request) = h3::client::new(h3)
@@ -720,7 +717,6 @@ impl Http3Client {
         path: &str,
     ) -> Result<Vec<u8>, String> {
         let quinn_connection = self.connect_quic(server, server_name).await?;
-
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true);
@@ -826,7 +822,6 @@ impl Http3Client {
         use h3_datagram::datagram_handler::HandleDatagramsExt;
 
         let quinn_connection = self.connect_quic(server, server_name).await?;
-
         let h3_quic = h3_quinn::Connection::new(quinn_connection.clone());
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true);
@@ -990,7 +985,6 @@ impl Http3Client {
         capsule_protocol: bool,
     ) -> Result<Vec<(u64, Vec<u8>)>, String> {
         let quinn_connection = self.connect_quic(server, server_name).await?;
-
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);
@@ -1097,7 +1091,6 @@ impl Http3Client {
         use h3_datagram::datagram_handler::HandleDatagramsExt;
 
         let quinn_connection = self.connect_quic(server, server_name).await?;
-
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);
@@ -1200,7 +1193,6 @@ impl Http3Client {
         use h3_datagram::datagram_handler::HandleDatagramsExt;
 
         let quinn_connection = self.connect_quic(server, server_name).await?;
-
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);

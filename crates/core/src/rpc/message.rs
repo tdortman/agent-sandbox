@@ -12,6 +12,7 @@ use super::{push::UiPush, reply::RpcReply};
 pub enum RpcMessage {
     /// A reply to an in-flight RPC request.
     Reply(RpcReply),
+
     /// A UI push sent unsolicited to clients.
     UiPush(UiPush),
 }

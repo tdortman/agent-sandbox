@@ -26,6 +26,7 @@ use tracing::debug;
 pub trait AltSvcResponse {
     /// Return the raw `alt-svc` header values present on the response.
     fn alt_svc_values(&self) -> Vec<Vec<u8>>;
+
     /// Replace the `alt-svc` header(s); `None` removes them.
     fn rewrite_alt_svc(&mut self, rewritten: Option<Vec<u8>>);
 }

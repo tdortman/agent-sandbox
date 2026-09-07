@@ -120,6 +120,10 @@ impl SessionAttribution {
         self.persist()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn lookup(&self, session_id: &str, ip: &str) -> Option<&str> {
         self.entries
             .get(&SessionIpKey::new(session_id, ip))
@@ -187,11 +191,13 @@ mod tests {
     #[test]
     fn mapping_is_scoped_to_exact_session_and_ip() {
         let mut attribution = SessionAttribution::new();
+        assert!(attribution.is_empty());
 
         attribution
             .remember("session-a", "192.0.2.10", "example.test")
             .expect("remember attribution");
 
+        assert!(!attribution.is_empty());
         assert_eq!(
             attribution.lookup("session-a", "192.0.2.10"),
             Some("example.test")

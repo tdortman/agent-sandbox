@@ -60,3 +60,36 @@ Vendored unmodified.
   at 0.23.43 (matching the workspace version requirement, so quinn and
   rama keep resolving to it unchanged) until upstream offers an
   equivalent API.
+
+## rama-http-core 0.3.0
+
+The high-level HTTP services previously exposed only the final response. This
+patch lets the TCP proxy relay informational responses while the origin is still
+processing the request.
+
+- Added the `InformationalSender` request extension for HTTP/1 and HTTP/2
+  servers. A service can queue interim heads before returning its final response.
+- HTTP/1 writes interim heads without completing the response or changing body
+  framing. HTTP/1.0 clients receive no interim heads.
+- HTTP/2 forwards interim heads through the existing `send_informational` API.
+- The HTTP/2 client now invokes the existing `OnInformational` callback, matching
+  the HTTP/1 client. It consumes interim heads before polling the final response.
+- Forwarding is limited to 16 upstream interim heads per request. Overflow fails the
+  connection or stream. `101 Switching Protocols` uses the existing upgrade
+  path, and the interim API rejects it and body-framing headers.
+- The proxy filters hop-by-hop headers. HTTP/1's existing local `100 Continue`
+  behavior remains; the proxy suppresses a duplicate upstream `100` when the
+  downstream requested `100-continue`.
+
+The proxy's `transparent_suite/compatibility.rs` tests exercise the wire behavior,
+including early hints before a gated final response, uploads, and h2c streaming.
+Remove this patch once upstream Rama exposes equivalent interim response
+forwarding on both server protocols and its HTTP/2 client, then rerun those tests.
+
+HTTP/2 recovery also preserves whether a stream was above a remote GOAWAY's
+last-stream ID. The public `h2::Error::is_unprocessed()` reports this case and
+remote `REFUSED_STREAM` resets. Ordinary connection errors remain ineligible.
+The proxy retries once only while its request body is unconsumed and available,
+preserving the destination, attribution, and HTTP version. The raw-peer
+`h2_recovery_retries_only_unprocessed_recoverable_requests_once` test covers
+GOAWAY boundaries, reset reasons, uploads, and the retry limit.

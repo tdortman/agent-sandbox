@@ -618,6 +618,7 @@ impl PolicyStore {
                 if !Self::walk_dir_inodes(&entry.path(), access, inodes, visited_dirs, budget) {
                     return false;
                 }
+
                 continue;
             }
 
@@ -632,6 +633,7 @@ impl PolicyStore {
                 if !Self::walk_dir_inodes(&entry.path(), access, inodes, visited_dirs, budget) {
                     return false;
                 }
+
                 continue;
             }
 
@@ -1923,14 +1925,18 @@ mod tests {
         // path after the kernel resolves the symlink, so a symlink cache hit
         // on the link inode would miss the request for the real file.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let home = dir.path().join("home");
+
         let real = dir
             .path()
             .join("home/dotfiles/home/dot_config/agent-sandbox/packages");
+
         std::fs::create_dir_all(&real).expect("real target dir");
         std::fs::create_dir_all(home.join(".config/agent-sandbox/packages")).expect("alias dir");
         let secret = real.join("codex.json");
         std::fs::write(&secret, "policy").expect("write real policy file");
+
         std::os::unix::fs::symlink(
             &secret,
             home.join(".config/agent-sandbox/packages/codex.json"),
@@ -1940,11 +1946,13 @@ mod tests {
         // The declarative layer denies ~/.config/agent-sandbox, exactly as the
         // host-wide policy declares.
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             "~/.config/agent-sandbox".to_string(),
             FileAccess::All,
             "deny policy tree",
         ));
+
         atomic_write_policy(
             &dir.path().join("declarative.json"),
             &policy,
@@ -1990,6 +1998,7 @@ mod tests {
         // agent-sandbox/loop -> .config/agent-sandbox`) must terminate instead
         // of looping the walk.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let home = dir.path().join("home");
         let denied = home.join(".config/agent-sandbox");
         let outside = dir.path().join("outside");
@@ -1998,17 +2007,20 @@ mod tests {
         let notes = outside.join("notes.txt");
         std::fs::write(&notes, "plain").expect("outside file");
         std::os::unix::fs::symlink(&outside, denied.join("escape")).expect("dir symlink");
+
         // A self-referential link would send a naive recursive walk into a
         // loop; the visited-directory guard must terminate it.
         std::os::unix::fs::symlink(&denied, denied.join("loop")).expect("cycle symlink");
-        std::os::unix::fs::symlink(".", denied.join("dot")).expect("self-cycle symlink");
 
+        std::os::unix::fs::symlink(".", denied.join("dot")).expect("self-cycle symlink");
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             "~/.config/agent-sandbox".to_string(),
             FileAccess::All,
             "deny policy tree",
         ));
+
         atomic_write_policy(
             &dir.path().join("declarative.json"),
             &policy,
@@ -2058,6 +2070,7 @@ mod tests {
         // must survive even though the shared directory was already walked
         // for rule A's read.
         let dir = tempfile::tempdir().expect("create tempdir");
+
         let home = dir.path().join("home");
         let real = dir.path().join("real-shared");
         std::fs::create_dir_all(&real).expect("real shared dir");
@@ -2067,18 +2080,20 @@ mod tests {
         std::fs::create_dir_all(home.join(".config/b")).expect("b dir");
         std::os::unix::fs::symlink(&real, home.join(".config/a/shared")).expect("a link");
         std::os::unix::fs::symlink(&real, home.join(".config/b/shared")).expect("b link");
-
         let mut policy = Policy::default();
+
         policy.filesystem.deny.push(FilesystemRule::new(
             "~/.config/a".to_string(),
             FileAccess::Read,
             "deny a read-only",
         ));
+
         policy.filesystem.deny.push(FilesystemRule::new(
             "~/.config/b".to_string(),
             FileAccess::Write,
             "deny b write",
         ));
+
         atomic_write_policy(
             &dir.path().join("declarative.json"),
             &policy,
@@ -2267,6 +2282,7 @@ mod tests {
 
         assert!(store.session_dbus_allowed(&concrete, &ctx).await);
         assert!(!store.session_dbus_allowed(&other, &ctx).await);
+
         let wildcard = DbusTarget::session(
             "org.example.Service",
             "**",

@@ -100,6 +100,7 @@ struct Args {
     #[arg(long)]
     suppress_https_svcb: bool,
 }
+
 const MAX_ADMITTED_WORK: usize = 256;
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -132,7 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-
     let mut dns_cache = DnsCache::new(Some(&args.cache_path), args.max_ttl);
     dns_cache.reload();
     let cache = Arc::new(std::sync::Mutex::new(dns_cache));
@@ -144,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let push_socket = Arc::new(UnixDatagram::unbound()?);
+
     let forwarder = DnsForwarder {
         cache,
         max_ttl: args.max_ttl,
@@ -167,8 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forward = %args.forward_target,
         "dns forwarder listening"
     );
+
     let udp = Arc::new(udp);
     let udp_forwarder = forwarder.clone();
+
     let udp_task = tokio::spawn(async move {
         let mut buf = vec![0_u8; 65_535];
         loop {
@@ -262,6 +265,7 @@ impl DnsForwarder {
             };
 
             let mut data = vec![0_u8; usize::from(len)];
+
             match tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut data)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -296,6 +300,7 @@ impl DnsForwarder {
             stream.write_u16(resp_len).await?;
             stream.write_all(&resp).await?;
         }
+
         Ok(())
     }
 
@@ -539,15 +544,18 @@ mod tests {
             admission: Arc::new(Semaphore::new(MAX_ADMITTED_WORK)),
         }
     }
+
     #[tokio::test]
     async fn stalled_tcp_length_read_times_out() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let forwarder = test_forwarder(SocketAddr::from(([127, 0, 0, 1], 1)));
+
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.expect("accept");
             forwarder.handle_tcp(stream, peer).await
         });
+
         let client = TcpStream::connect(addr).await.expect("connect");
         drop(client);
         let result = tokio::time::timeout(Duration::from_secs(1), server).await;
@@ -648,8 +656,10 @@ mod tests {
         ));
 
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
+
         let ech_path =
             std::env::temp_dir().join(format!("agent-sandbox-test-ech-{}.bin", std::process::id()));
+
         std::fs::write(&ech_path, [4, 5, 6])?;
         forwarder.ech_config_path = Some(ech_path);
         forwarder.suppress_https_svcb = true;

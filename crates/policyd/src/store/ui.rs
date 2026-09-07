@@ -324,16 +324,20 @@ impl PolicyStore {
             inner.session.session_deny.remove(&client.session_id);
             inner.session.session_sudo_allow.remove(&client.session_id);
             inner.session.session_sudo_deny.remove(&client.session_id);
+
             inner
                 .session
                 .session_filesystem_allow
                 .remove(&client.session_id);
+
             inner.session.session_dbus_allow.remove(&client.session_id);
             inner.session.session_dbus_deny.remove(&client.session_id);
+
             inner
                 .session
                 .session_filesystem_deny
                 .remove(&client.session_id);
+
             inner.ui_context_by_session.remove(&client.session_id);
             true
         })
@@ -362,6 +366,7 @@ impl PolicyStore {
             .values()
             .cloned()
             .collect();
+
         let deadline = tokio::time::Instant::now() + UI_SPAWN_WAIT;
         let mut registration_flush_observed = false;
 
@@ -660,14 +665,17 @@ mod tests {
         let pending = pending_network("net:spawn-race");
         let pending_second = pending_network("net:spawn-race-second");
         let mut inner = store.inner.lock().await;
+
         inner
             .pending
             .pending
             .insert(pending.id().to_owned(), pending);
+
         inner
             .pending
             .pending
             .insert(pending_second.id().to_owned(), pending_second);
+
         drop(inner);
         let (read_tx, read_rx) = oneshot::channel();
         let registration_store = Arc::clone(&store);
@@ -734,8 +742,8 @@ mod tests {
         let _dead_read = register_ui(&store, 1, "ui-dead", "sandbox-a").await;
         let mut foreign_read = register_ui(&store, 2, "ui-foreign", "sandbox-b").await;
         let mut live_read = register_ui(&store, 3, "ui-live", "sandbox-a").await;
-
         let pending = pending_network("net:reroute");
+
         store
             .inner
             .lock()
@@ -779,8 +787,8 @@ mod tests {
         let _dead_read = register_ui(&store, 1, "ui-dead", "sandbox-a").await;
         let mut foreign_read = register_ui(&store, 2, "ui-foreign", "sandbox-b").await;
         let mut live_read = register_ui(&store, 3, "ui-live", "sandbox-a").await;
-
         let pending = pending_filesystem("fs:reroute");
+
         store
             .inner
             .lock()

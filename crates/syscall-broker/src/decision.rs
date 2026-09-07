@@ -315,6 +315,7 @@ mod tests {
             ResponsePlan::plan_network(true),
             ResponsePlan::Continue
         ));
+
         assert!(matches!(
             ResponsePlan::plan_network(false),
             ResponsePlan::DenyErrno {

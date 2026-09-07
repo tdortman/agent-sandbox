@@ -21,7 +21,6 @@ use zbus::{
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const HELLO: &str = "Hello";
-
 const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
 
 /// Configuration for the D-Bus relay listener.
@@ -29,12 +28,16 @@ const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
 pub struct RelayConfig {
     /// Unix socket path the relay listens on.
     pub listen: PathBuf,
+
     /// Upstream D-Bus address to relay to.
     pub upstream_address: String,
+
     /// Socket path of the policy daemon RPC endpoint.
     pub policy_socket: PathBuf,
+
     /// Which bus (session/system) the relay handles.
     pub bus: DbusBus,
+
     /// Request context attributed to the relay's own policy checks.
     pub context: RequestContext,
 }
@@ -428,6 +431,7 @@ mod tests {
         .expect("rewrite");
 
         let body = rewritten.body();
+
         let (r_session, _parameters, r_value, r_content_type): (
             ObjectPath,
             Vec<u8>,

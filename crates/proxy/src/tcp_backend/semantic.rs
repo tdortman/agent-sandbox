@@ -547,14 +547,17 @@ mod tests {
                 )?,
                 "a.test:8080"
             );
+
             assert_eq!(
                 resolved(None, Some("a.test:8080"), Some("a.test:8080"), None)?,
                 "a.test:8080"
             );
+
             assert_eq!(
                 resolved(None, None, Some("a.test:8080"), None)?,
                 "a.test:8080"
             );
+
             Ok(())
         }
 
@@ -570,6 +573,7 @@ mod tests {
                 resolved(None, None, None, Some("93.184.216.34:443"))?,
                 "93.184.216.34:443"
             );
+
             assert!(resolved(None, None, None, None).is_err());
             Ok(())
         }

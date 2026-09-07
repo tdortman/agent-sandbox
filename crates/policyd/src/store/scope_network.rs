@@ -5,10 +5,7 @@ use std::path::Path;
 use agent_sandbox_core::{NetworkRuleKey, RpcReply, ScopeActionReply, ScopeTarget};
 
 use super::{
-    decisions::DecisionAction,
-    scope_apply::{ScopeLadder, ScopePersistFlags},
-    state::apply_bucket,
-    types::PolicyStore,
+    decisions::DecisionAction, scope_apply::ScopeLadder, state::apply_bucket, types::PolicyStore,
 };
 use crate::wire::{NetworkScopeOp, ScopeWire};
 
@@ -56,11 +53,14 @@ impl PolicyStore {
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
                     paths: &paths,
-                    flags: ScopePersistFlags::new(false, true),
+
                     project_log: Some("project policy saved"),
                     project_package_log: Some("project package policy saved"),
                 },
                 |inner, target| {
+                    if matches!(target, ScopeTarget::Ephemeral | ScopeTarget::Session { .. }) {
+                        self.revoke_network_grants()?;
+                    }
                     match target {
                         ScopeTarget::Ephemeral => {
                             if action == DecisionAction::Approve {
@@ -213,7 +213,6 @@ mod tests {
             .await;
 
         assert!(matches!(deny, RpcReply::ScopeAction(_)));
-
         let inner = store.inner.lock().await;
 
         assert!(
@@ -269,7 +268,6 @@ mod tests {
             .await;
 
         assert!(matches!(deny, RpcReply::ScopeAction(_)));
-
         let inner = store.inner.lock().await;
         let key = NetworkRuleKey::new("example.com", 443);
 

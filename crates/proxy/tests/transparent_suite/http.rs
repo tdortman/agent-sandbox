@@ -131,7 +131,7 @@ async fn transparent_http_conflicting_authorities_are_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transparent_cleartext_http2_prior_knowledge_is_rejected() {
+async fn transparent_cleartext_http2_preface_disconnect_releases_claim() {
     let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
 
     let mut stream = TcpStream::connect(harness.proxy_address)
@@ -145,6 +145,7 @@ async fn transparent_cleartext_http2_prior_knowledge_is_rejected() {
 
     let mut response = [0; 64];
     let _ = timeout(Duration::from_secs(2), stream.read(&mut response)).await;
+    drop(stream);
     wait_for_release(&harness).await;
     assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 0);
 }

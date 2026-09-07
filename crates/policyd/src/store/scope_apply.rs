@@ -3,9 +3,7 @@
 //! Every capability scope decision runs the same ladder: resolve the
 //! [`ScopeTarget`] from the [`ApprovalScope`], apply the in-memory session
 //! arms under the state lock, then run the four persistent arms through the
-//! capability's rule writer. Merged-policy cache invalidation follows the
-//! ladder's flags after each persistent write, and project-scope writes emit
-//! the ladder's log lines.
+//! capability's rule writer. Project-scope writes emit the ladder's log lines.
 
 use std::path::{Path, PathBuf};
 
@@ -14,34 +12,16 @@ use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeContext, Sc
 use super::types::{PolicyDecisionState, PolicyStore};
 use crate::error::PolicydError;
 
-/// Whether a persistent scope write invalidates the merged-policy cache.
-///
-/// `global` covers the `Global` and `Project` arms; `package` covers the
-/// `GlobalPackage` and `ProjectPackage` arms. Values preserve the per
-/// capability behaviour of the former copy-pasted `match` blocks.
-#[derive(Clone, Copy)]
-pub struct ScopePersistFlags {
-    /// `invalidate` for `Global` and `Project`.
-    pub global: bool,
-    /// `invalidate` for `GlobalPackage` and `ProjectPackage`.
-    pub package: bool,
-}
-
-impl ScopePersistFlags {
-    pub const fn new(global: bool, package: bool) -> Self {
-        Self { global, package }
-    }
-}
-
 /// The capability-independent inputs of one scope decision.
 pub struct ScopeLadder<'a> {
     pub scope: ApprovalScope,
     pub session_id: Option<&'a str>,
     pub package: Option<&'a str>,
     pub paths: &'a SandboxPaths,
-    pub flags: ScopePersistFlags,
+
     /// Log line emitted after a `Project` write; `None` suppresses it.
     pub project_log: Option<&'a str>,
+
     /// Log line emitted after a `ProjectPackage` write; `None` suppresses it.
     pub project_package_log: Option<&'a str>,
 }
@@ -49,6 +29,7 @@ pub struct ScopeLadder<'a> {
 /// What one ladder run changed, for the capability's reply tail.
 pub struct ScopeApplied {
     pub target: ScopeTarget,
+
     /// Policy file written by a persistent arm, if any.
     pub policy_path: Option<PathBuf>,
 }
@@ -57,8 +38,10 @@ pub struct ScopeApplied {
 pub enum ScopeApplyError {
     /// The approval scope could not be resolved for this request.
     Resolve(Box<RpcReply>),
+
     /// The capability's memory step rejected the decision.
     Memory(PolicydError),
+
     /// A persistent rule write failed.
     Persist(PolicydError),
 }
@@ -118,10 +101,6 @@ impl PolicyStore {
                 persist(policy_path, Some(home.as_path()))
                     .map_err(|err| ScopeApplyError::Persist(err.into()))?;
 
-                if ladder.flags.global {
-                    self.invalidate_merged_policy_cache();
-                }
-
                 Some(policy_path.clone())
             }
 
@@ -131,19 +110,11 @@ impl PolicyStore {
                 persist(policy_path, Some(home.as_path()))
                     .map_err(|err| ScopeApplyError::Persist(err.into()))?;
 
-                if ladder.flags.package {
-                    self.invalidate_merged_policy_cache();
-                }
-
                 Some(policy_path.clone())
             }
 
             ScopeTarget::Project { policy_path, .. } => {
                 persist(policy_path, home).map_err(|err| ScopeApplyError::Persist(err.into()))?;
-
-                if ladder.flags.global {
-                    self.invalidate_merged_policy_cache();
-                }
 
                 if let Some(log) = ladder.project_log {
                     tracing::info!(path = ?policy_path, "{log}");
@@ -154,10 +125,6 @@ impl PolicyStore {
 
             ScopeTarget::ProjectPackage { policy_path, .. } => {
                 persist(policy_path, home).map_err(|err| ScopeApplyError::Persist(err.into()))?;
-
-                if ladder.flags.package {
-                    self.invalidate_merged_policy_cache();
-                }
 
                 if let Some(log) = ladder.project_package_log {
                     tracing::info!(path = ?policy_path, "{log}");

@@ -13,7 +13,15 @@ NETNS_IP6_CIDR="@netnsIp6Cidr@"
 
 if ! ip netns exec "$NETNS" true 2>/dev/null; then
   ip netns del "$NETNS" 2>/dev/null || rm -f "/run/netns/$NETNS"
-  ip netns add "$NETNS"
+  # Keep TCP ownership scans off the host-sized shared hash table. The temporary
+  # parent changes only its own sysctl; the named child retains its private table.
+  # ponytail: 4096 buckets, increase if concurrent sandbox TCP flows outgrow this.
+  unshare --net "$BASH" -euc '
+    if [[ -e /proc/sys/net/ipv4/tcp_child_ehash_entries ]]; then
+      printf "4096\n" > /proc/sys/net/ipv4/tcp_child_ehash_entries
+    fi
+    exec ip netns add "$1"
+  ' -- "$NETNS"
 fi
 
 ip link del "$HOST_IF" 2>/dev/null || true

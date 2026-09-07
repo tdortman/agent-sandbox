@@ -687,10 +687,35 @@ in
           description = "HTTP(S) URL rules denied even when another policy allows them.";
         };
 
+        extraHttpsPorts = lib.mkOption {
+          type = lib.types.listOf (
+            lib.types.addCheck lib.types.port (
+              port:
+              !(builtins.elem port [
+                0
+                53
+                80
+                8008
+                8080
+                853
+              ])
+            )
+          );
+
+          default = [ ];
+          description = "Additional TCP ports intercepted as HTTPS, alongside 443 and 8443. Relaunch existing sandboxes after changing this list.";
+        };
+
         gid = lib.mkOption {
           type = lib.types.nullOr lib.types.int;
           default = null;
           description = "Optional explicit group ID allowed to connect to the trusted proxy socket; null uses the dedicated proxy group.";
+        };
+
+        h2cUpstreamOrigins = lib.mkOption {
+          type = lib.types.listOf (lib.types.addCheck http10OriginType (lib.hasPrefix "http://"));
+          default = [ ];
+          description = "Exact HTTP origins requiring HTTP/2 prior knowledge. Validated at proxy startup; no HTTP/1 fallback.";
         };
 
         http10UpstreamOrigins = lib.mkOption {
@@ -721,6 +746,12 @@ in
             default = 443;
             description = "UDP port whose intercepted QUIC traffic terminates at the proxy.";
           };
+
+          upstreamHandshakeTimeoutMs = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 2000;
+            description = "Maximum time in milliseconds for an upstream QUIC TLS handshake.";
+          };
         };
 
         socketPath = lib.mkOption {
@@ -734,6 +765,20 @@ in
           type = lib.types.listOf lib.types.str;
           default = [ ];
           description = "Additional CIDRs the dedicated proxy UID may reach directly.";
+        };
+
+        upstreamClientIdentitiesFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+
+          description = ''
+            Absolute path to a JSON array of upstream mTLS identities. Each entry
+            has an exact HTTPS origin, a certificate PEM path, and a private_key
+            PEM path. Relative PEM paths resolve against the JSON file directory.
+            Set the JSON and PEM files to owner agent-sandbox-proxy:agent-sandbox-proxy
+            with mode 0600, and allow that user to traverse their parent directories.
+            Credentials are loaded at startup and do not grant policy access to the origin.
+          '';
         };
 
         websocketHttp11Urls = lib.mkOption {
@@ -846,7 +891,7 @@ in
       };
 
       dbus = {
-        enable = lib.mkEnableOption "filtered session D-Bus access for sandboxes (requires gates.resources.enable)";
+        enable = lib.mkEnableOption "filtered session and system D-Bus access for sandboxes (requires gates.resources.enable)";
 
         declarativeAllow = lib.mkOption {
           type = lib.types.listOf dbusRuleType;
@@ -869,7 +914,7 @@ in
         upstreamAddress = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
           default = null;
-          description = "Optional D-Bus upstream address; defaults to DBUS_SESSION_BUS_ADDRESS.";
+          description = "Optional session D-Bus upstream address; defaults to DBUS_SESSION_BUS_ADDRESS. The system relay uses DBUS_SYSTEM_BUS_ADDRESS or unix:path=/run/dbus/system_bus_socket.";
         };
       };
 
@@ -1043,6 +1088,10 @@ in
           lib.all cidrValid proxy.upstreamAllowCidrs;
 
         message = "agent-sandbox.network.httpProxy.upstreamAllowCidrs entries must be non-empty CIDR strings";
+      }
+      {
+        assertion = credentialPathValid cfg.network.httpProxy.upstreamClientIdentitiesFile;
+        message = "agent-sandbox HTTP proxy upstreamClientIdentitiesFile must use an absolute path";
       }
       {
         assertion = cfg.network.httpProxy.gid == null || cfg.network.httpProxy.gid > 0;

@@ -400,9 +400,11 @@ mod tests {
             fs_monitor_cmd: None,
             syscall_broker_cmd: None,
         };
+
         let user = User::from_uid(nix::unistd::Uid::current())
             .expect("uid lookup")
             .expect("current user");
+
         let spawn = UiSpawnContext {
             has_matching_ui: false,
             uid: Some(user.uid.as_raw()),
@@ -411,6 +413,7 @@ mod tests {
             project_root: None,
             sandbox_session_id: None,
         };
+
         let command = build_ui_spawn_command(
             "/run/current-system/sw/bin/runuser",
             &args,
@@ -419,6 +422,7 @@ mod tests {
             user.uid.as_raw(),
             &spawn,
         );
+
         let debug = format!("{command:?}");
         assert!(!debug.contains("agent-sandbox-ui.log"));
         assert!(debug.contains("runuser"));

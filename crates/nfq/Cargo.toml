@@ -9,7 +9,7 @@ name = "agent-sandbox-nfq"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-core = { path = "../core" }
+agent-sandbox-core.workspace = true
 
 clap.workspace = true
 nfq-updated.workspace = true

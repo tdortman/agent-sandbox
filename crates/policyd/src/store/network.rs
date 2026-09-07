@@ -467,6 +467,7 @@ impl PolicyStore {
     ) -> (Vec<oneshot::Sender<CheckReply>>, bool) {
         let mut inner = self.inner.lock().await;
         let canceled = Self::remove_network_waiter_locked(&mut inner, target.pending_id, proxy);
+
         let last = !inner
             .pending
             .network_futures
@@ -710,6 +711,7 @@ mod tests {
             first.verdict.allowed,
             "session approval should allow first request"
         );
+
         assert_eq!(
             first.verdict.source,
             VerdictSource::Scope(ApprovalScope::Session)
@@ -756,6 +758,7 @@ mod tests {
             first.verdict.allowed,
             "Once grant should allow the first request"
         );
+
         assert_eq!(
             first.verdict.source,
             VerdictSource::Scope(ApprovalScope::Once)
@@ -798,6 +801,7 @@ mod tests {
             .await;
 
         let second = task.await.expect("second request should not panic");
+
         assert!(
             !second.verdict.allowed,
             "second request must not reuse Once grant"
@@ -842,7 +846,6 @@ mod tests {
         }
 
         let reply = request_network(&store, "overflow.example", 443).await;
-
         assert!(!reply.verdict.allowed);
         assert_eq!(reply.verdict.source, VerdictSource::Blocked);
         let err = reply.error.unwrap_or_default();
@@ -881,7 +884,6 @@ mod tests {
         }
 
         let reply = request_network(&store, "example.com", 443).await;
-
         assert!(!reply.verdict.allowed);
         assert_eq!(reply.verdict.source, VerdictSource::Blocked);
         let err = reply.error.unwrap_or_default();
@@ -1133,6 +1135,7 @@ mod tests {
             reply.verdict.allowed,
             "expected allowed reply, got: {reply:?}"
         );
+
         assert_eq!(
             reply.verdict.source,
             VerdictSource::policy_with_comment("cli")
@@ -1184,6 +1187,7 @@ mod tests {
                 .pending
                 .insert(pending.id().to_owned(), pending);
         }
+
         store.flush_pending_to_ui().await;
 
         // Standalone should have received the filesystem request

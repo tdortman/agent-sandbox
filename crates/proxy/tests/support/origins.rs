@@ -79,6 +79,33 @@ async fn serve_tcp_origin_connection(
             .expect("request heads lock")
             .push(String::from_utf8_lossy(&request).into_owned());
 
+        let head = String::from_utf8_lossy(&request);
+        if head.contains("/hints") {
+            let count = if head.contains("/hints-overflow") {
+                17
+            } else {
+                1
+            };
+            for _ in 0..count {
+                let _ = stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\nConnection: x-hop\r\nX-Hop: removed\r\n\r\n").await;
+            }
+            if count == 1 {
+                stream_gate.notified().await;
+            }
+        }
+        if head.contains("/reject-upload") {
+            let _ = stream.write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            break;
+        }
+        if head.contains("/continue-upload") {
+            let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+            let mut payload = [0; 4];
+            if stream.read_exact(&mut payload).await.is_err() {
+                break;
+            }
+            assert_eq!(&payload, b"ping");
+        }
+
         let doh_packet = if request
             .windows(b"/doh-ech".len())
             .any(|window| window == b"/doh-ech")
@@ -125,6 +152,81 @@ async fn serve_tcp_origin_connection(
         if !keep_alive {
             break;
         }
+    }
+}
+
+async fn serve_h2_origin_connection(
+    stream: TcpStream,
+    gate: Arc<Notify>,
+    heads: Arc<Mutex<Vec<String>>>,
+) {
+    use rama_http::{HeaderMap, HeaderValue, Response};
+    let Ok(mut connection) =
+        rama_http_core::h2::server::handshake(rama_tcp::TcpStream::from(stream)).await
+    else {
+        return;
+    };
+    while let Some(Ok((mut request, mut respond))) = connection.accept().await {
+        heads.lock().unwrap().push(format!(
+            "{} {} {:?}",
+            request.method(),
+            request.uri(),
+            request.version()
+        ));
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            if request.uri().path_or_root().contains("/hints") {
+                let count = if request.uri().path_or_root().contains("overflow") {
+                    17
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    respond
+                        .send_informational(
+                            Response::builder()
+                                .status(103)
+                                .header("link", "</style.css>; rel=preload")
+                                .body(())
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                if count == 1 {
+                    gate.notified().await;
+                }
+            }
+            if request.uri().path_or_root().contains("/echo") {
+                let response = Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut output = respond.send_response(response, false).unwrap();
+                while let Some(Ok(data)) = request.body_mut().data().await {
+                    request
+                        .body_mut()
+                        .flow_control()
+                        .release_capacity(data.len())
+                        .unwrap();
+                    output.send_data(data, false).unwrap();
+                }
+                let trailers = request.body_mut().trailers().await.unwrap();
+                assert_eq!(
+                    trailers.unwrap().get("x-request-trailer").unwrap(),
+                    "present"
+                );
+                let mut trailers = HeaderMap::new();
+                trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                output.send_trailers(trailers).unwrap();
+            } else {
+                let response = Response::builder()
+                    .header("content-length", "15")
+                    .body(())
+                    .unwrap();
+                let mut output = respond.send_response(response, false).unwrap();
+                let _ = output.send_data(Bytes::from_static(b"origin-response"), true);
+            }
+        });
     }
 }
 
@@ -248,18 +350,23 @@ fn doh_dns_message(dnssec: bool) -> Vec<u8> {
 
 impl TcpOrigin {
     pub async fn start(ip: IpAddr, port: u16, body: &'static [u8]) -> Self {
-        Self::start_with_keep_alive(ip, port, body, false).await
+        Self::start_with_protocol(ip, port, body, false, false).await
     }
 
     pub async fn start_keep_alive(ip: IpAddr, port: u16, body: &'static [u8]) -> Self {
-        Self::start_with_keep_alive(ip, port, body, true).await
+        Self::start_with_protocol(ip, port, body, true, false).await
     }
 
-    async fn start_with_keep_alive(
+    pub async fn start_h2(ip: IpAddr, port: u16) -> Self {
+        Self::start_with_protocol(ip, port, b"origin-response", false, true).await
+    }
+
+    async fn start_with_protocol(
         ip: IpAddr,
         port: u16,
         body: &'static [u8],
         keep_alive: bool,
+        h2c: bool,
     ) -> Self {
         let listener = TcpListener::bind(SocketAddr::new(ip, port))
             .await
@@ -284,6 +391,14 @@ impl TcpOrigin {
                 let stream_gate = task_stream_gate.clone();
                 let request_heads = task_request_heads.clone();
                 task_attempts.fetch_add(1, Ordering::SeqCst);
+                if h2c {
+                    tokio::spawn(serve_h2_origin_connection(
+                        stream,
+                        stream_gate,
+                        request_heads,
+                    ));
+                    continue;
+                }
                 tokio::spawn(serve_tcp_origin_connection(
                     stream,
                     body,

@@ -268,6 +268,7 @@ impl PolicyStore {
         }
 
         let pending_id = format!("res:{}", Uuid::now_v7().simple());
+
         inner
             .pending
             .resource_futures
@@ -355,6 +356,7 @@ impl PolicyStore {
         }
 
         let pending_id = format!("dbus:{}", Uuid::now_v7().simple());
+
         inner
             .pending
             .dbus_futures
@@ -658,10 +660,12 @@ mod tests {
             .await;
 
         let reply = task.await.expect("task should not panic");
+
         assert!(
             reply.verdict.allowed,
             "expected allowed reply, got: {reply:?}"
         );
+
         assert_eq!(
             reply.verdict.source,
             VerdictSource::policy_with_comment("test")
@@ -760,14 +764,17 @@ mod tests {
             .await;
 
         let reply = task.await.expect("task should not panic");
+
         assert!(
             reply.verdict.allowed,
             "expected allowed reply, got: {reply:?}"
         );
+
         assert_eq!(
             reply.verdict.source,
             VerdictSource::policy_with_comment("test")
         );
+
         assert_eq!(reply.target, target);
         let inner = store.inner.lock().await;
 
@@ -837,6 +844,7 @@ mod tests {
             reply.verdict.allowed,
             "expected allowed reply, got: {reply:?}"
         );
+
         assert_eq!(
             reply.verdict.source,
             VerdictSource::policy_with_comment("cli")
@@ -867,12 +875,14 @@ mod tests {
             .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-a"))
             .await
             .expect("first session pending");
+
         assert!(a.is_new, "first session must create its own pending");
 
         let b = store
             .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-b"))
             .await
             .expect("second session pending");
+
         assert!(
             b.is_new,
             "a different sandbox session must not reuse the first pending"
@@ -882,6 +892,7 @@ mod tests {
             .dedup_or_create_pending_resource(kind, &path, access, &pending_ctx("sandbox-a"))
             .await
             .expect("same session pending");
+
         assert!(
             !c.is_new,
             "the same session must deduplicate to its own pending"

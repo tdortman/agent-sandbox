@@ -4,6 +4,7 @@ mod client;
 
 mod dispatch;
 pub(crate) mod peer;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{path::Path, sync::Arc};
@@ -487,8 +488,8 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-
         let approval_store = store.clone();
+
         let approval_task = tokio::spawn(async move {
             approval_store
                 .request_dbus_approval(
@@ -519,13 +520,16 @@ mod tests {
             if !store.pending_summaries().await.is_empty() {
                 break;
             }
+
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
         assert_eq!(store.pending_summaries().await.len(), 1);
 
         let mut ui_conn = RpcConnection::connect(&args.host_socket)
             .await
             .expect("connect host socket");
+
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
@@ -539,9 +543,11 @@ mod tests {
             })
             .await
             .expect("RegisterUi");
+
         let RpcReply::RegisterUi(registered) = reply else {
             panic!("expected successful UI registration, got: {reply:?}");
         };
+
         assert!(registered.ok);
 
         let pushed = tokio::time::timeout(Duration::from_secs(1), ui_conn.read_message())
@@ -561,6 +567,7 @@ mod tests {
         let RpcMessage::UiPush(UiPush::DbusRequest { id, .. }) = pushed else {
             unreachable!();
         };
+
         let reply = send_and_recv(&args.host_socket, RpcRequest::Approve {
             id,
             scope: ApprovalScope::Once,
@@ -577,8 +584,8 @@ mod tests {
         })
         .await
         .expect("approve pending D-Bus request");
-        assert!(reply.scope_succeeded(), "approval failed: {reply:?}");
 
+        assert!(reply.scope_succeeded(), "approval failed: {reply:?}");
         let verdict = approval_task.await.expect("D-Bus approval task");
         assert!(verdict.verdict.allowed);
         server_task.abort();

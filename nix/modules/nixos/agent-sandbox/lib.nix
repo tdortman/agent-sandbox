@@ -354,8 +354,10 @@ in
       blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
       builtinCombinators = (jail-nix.lib.init pkgs).combinators;
       dbusCleanupScript = lib.optionalString dbusMode ''
-        kill "$_asbx_dbus_pid" 2>/dev/null || true
-        wait "$_asbx_dbus_pid" 2>/dev/null || true
+        for _asbx_dbus_pid in "''${_asbx_dbus_pids[@]}"; do
+          kill "$_asbx_dbus_pid" 2>/dev/null || true
+          wait "$_asbx_dbus_pid" 2>/dev/null || true
+        done
         rm -rf "$_asbx_dbus_dir"
       '';
       dbusMode = dbus != null && dbus.enable && dbusProxyPkg != null;
@@ -363,7 +365,6 @@ in
         _asbx_dbus_root="${dbusSocketDirectory}/''${UID}"
         mkdir -p "$_asbx_dbus_root"
         _asbx_dbus_dir="$(mktemp -d "$_asbx_dbus_root/agent-sandbox-dbus.XXXXXX")"
-        _asbx_dbus_socket="$_asbx_dbus_dir/session.sock"
         _asbx_dbus_upstream=${
           if dbusUpstreamAddress != null then
             lib.escapeShellArg dbusUpstreamAddress
@@ -375,30 +376,37 @@ in
           rm -rf "$_asbx_dbus_dir"
           exit 1
         }
-        ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
-          --listen "$_asbx_dbus_socket" \
-          --upstream-address "$_asbx_dbus_upstream" \
-          --policy-socket ${lib.escapeShellArg policySocket} \
-          --bus session \
-          --cwd "$_agent_sandbox_cwd" \
-          --home "$_agent_sandbox_home" \
-          --project-root "$_agent_sandbox_project_root" \
-          --uid "$UID" \
-          --sandbox-session-id "$_agent_sandbox_session_id" &
-        _asbx_dbus_pid=$!
+        _asbx_dbus_pids=()
         trap '${dbusCleanupScript}' EXIT
         trap 'exit 143' INT TERM
-        while [[ ! -S "$_asbx_dbus_socket" ]]; do
-          if ! kill -0 "$_asbx_dbus_pid" 2>/dev/null; then
-            wait "$_asbx_dbus_pid" || true
-            echo "agent-sandbox D-Bus: relay failed to start" >&2
-            rm -rf "$_asbx_dbus_dir"
-            exit 1
+        for _asbx_dbus_bus in session system; do
+          _asbx_dbus_socket="$_asbx_dbus_dir/$_asbx_dbus_bus.sock"
+          if [[ "$_asbx_dbus_bus" == system ]]; then
+            _asbx_dbus_upstream="''${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/run/dbus/system_bus_socket}"
           fi
-          sleep 0.01
+          ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
+            --listen "$_asbx_dbus_socket" \
+            --upstream-address "$_asbx_dbus_upstream" \
+            --policy-socket ${lib.escapeShellArg policySocket} \
+            --bus "$_asbx_dbus_bus" \
+            --cwd "$_agent_sandbox_cwd" \
+            --home "$_agent_sandbox_home" \
+            --project-root "$_agent_sandbox_project_root" \
+            --uid "$UID" \
+            --sandbox-session-id "$_agent_sandbox_session_id" &
+          _asbx_dbus_pid=$!
+          _asbx_dbus_pids+=("$_asbx_dbus_pid")
+          while [[ ! -S "$_asbx_dbus_socket" ]]; do
+            if ! kill -0 "$_asbx_dbus_pid" 2>/dev/null; then
+              echo "agent-sandbox D-Bus: $_asbx_dbus_bus relay failed to start" >&2
+              exit 1
+            fi
+            sleep 0.01
+          done
         done
         RUNTIME_ARGS+=(--ro-bind "$_asbx_dbus_dir" "$_asbx_dbus_dir")
-        RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_socket")
+        RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_dir/session.sock")
+        RUNTIME_ARGS+=(--setenv DBUS_SYSTEM_BUS_ADDRESS "unix:path=$_asbx_dbus_dir/system.sock")
       '';
       dbusSocketDirectory = if dbus != null then dbus.socketDirectory else "/run/user";
       dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;

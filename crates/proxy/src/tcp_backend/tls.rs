@@ -139,6 +139,97 @@ mod tests {
     }
 
     #[test]
+    fn downstream_certificate_negotiates_ecdsa_and_rsa() {
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&ca_key).expect("CA certificate");
+        let issuer = crate::cert::CertificateIssuer::from_pem(&ca.pem(), &ca_key.serialize_pem())
+            .expect("issuer");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).expect("trust CA");
+
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            for offer in [
+                "both",
+                "rsa",
+                "ecdsa",
+                "p384",
+                "p384-rsa",
+                "rsa-first",
+                "rsa-ciphers",
+                "both",
+            ] {
+                if offer == "rsa-ciphers" && version == &rustls::version::TLS13 {
+                    continue;
+                }
+                let rsa_only = matches!(offer, "rsa" | "rsa-ciphers");
+                let mut provider = rustls::crypto::ring::default_provider();
+                let mut mapping = provider.signature_verification_algorithms.mapping.to_vec();
+                match offer {
+                    "rsa" => mapping.retain(|(scheme, _)| {
+                        matches!(
+                            scheme,
+                            rustls::SignatureScheme::RSA_PSS_SHA256
+                                | rustls::SignatureScheme::RSA_PKCS1_SHA256
+                        )
+                    }),
+                    "ecdsa" => mapping.retain(|(scheme, _)| {
+                        *scheme == rustls::SignatureScheme::ECDSA_NISTP256_SHA256
+                    }),
+                    "p384" => mapping.retain(|(scheme, _)| {
+                        *scheme == rustls::SignatureScheme::ECDSA_NISTP384_SHA384
+                    }),
+                    "p384-rsa" => mapping.retain(|(scheme, _)| {
+                        *scheme != rustls::SignatureScheme::ECDSA_NISTP256_SHA256
+                    }),
+                    "rsa-first" => mapping.reverse(),
+                    "rsa-ciphers" => provider.cipher_suites.retain(|suite| {
+                        matches!(
+                            suite.suite(),
+                            rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+                        )
+                    }),
+                    _ => {}
+                }
+                provider.signature_verification_algorithms.mapping =
+                    Box::leak(mapping.into_boxed_slice());
+                let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                    .with_protocol_versions(&[version])
+                    .expect("TLS version")
+                    .with_root_certificates(roots.clone())
+                    .with_no_client_auth();
+                let mut client = rustls::ClientConnection::new(
+                    Arc::new(config),
+                    "test.example".try_into().expect("name"),
+                )
+                .expect("client");
+                let config =
+                    super::build_tcp_tls_config(issuer.clone(), None, "test.example".into())
+                        .expect("server config");
+                let mut server = rustls::ServerConnection::new(Arc::new(config)).expect("server");
+                drive_handshake(&mut client, &mut server);
+                use crate::cert::LeafKeyAlgorithm;
+                let algorithm = if rsa_only {
+                    LeafKeyAlgorithm::Rsa
+                } else if matches!(offer, "p384" | "p384-rsa") {
+                    LeafKeyAlgorithm::EcdsaP384
+                } else {
+                    LeafKeyAlgorithm::EcdsaP256
+                };
+                let expected = issuer
+                    .issue_with_algorithm("test.example", algorithm)
+                    .expect("leaf");
+                assert_eq!(
+                    client.peer_certificates().expect("peer chain")[0],
+                    expected.certificate_chain[0],
+                    "{offer}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn downstream_ech_handshake_decrypts_inner_hello() {
         // Generate the same key material the proxy persists in its ECH state.
         let dir = tempfile::tempdir().expect("temp ECH state");

@@ -121,8 +121,10 @@ fn single_path_mutation_syscalls_require_write_access() {
 fn mkdir_skips_policy_only_when_target_exists() {
     let current_dir = std::env::current_dir().expect("current directory");
     let existing = current_dir.to_string_lossy();
+
     let existing_target = target_from_notification(&notif_with_path_args(nr::MKDIR, &[&existing]))
         .expect("classify existing mkdir");
+
     assert!(matches!(
         existing_target,
         Some(SyscallTarget::Errno(libc::EEXIST))
@@ -132,14 +134,18 @@ fn mkdir_skips_policy_only_when_target_exists() {
         ".agent-sandbox-missing-mkdir-{}",
         std::process::id()
     ));
+
     assert!(!missing.exists());
     let missing_text = missing.to_string_lossy();
+
     let missing_target =
         target_from_notification(&notif_with_path_args(nr::MKDIR, &[&missing_text]))
             .expect("classify missing mkdir");
+
     let Some(SyscallTarget::Filesystem(FilesystemTarget { checks, .. })) = missing_target else {
         panic!("missing mkdir must still require policy");
     };
+
     assert_eq!(checks, vec![(missing, FileAccess::Write)]);
 }
 
@@ -183,7 +189,9 @@ fn relative_mutation_captures_tracee_cwd() {
         current_dir.join("relative-path"),
         FileAccess::Write
     )]);
+
     assert_eq!(path, b"relative-path");
+
     assert_eq!(
         std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
             .expect("read captured cwd"),
@@ -203,10 +211,12 @@ fn relative_mutation_resolves_live_symlink_targets() {
     std::fs::write(&first, b"first").expect("first file");
     std::fs::write(&second, b"second").expect("second file");
     std::os::unix::fs::symlink(&first, &alias).expect("first alias");
+
     let relative = alias
         .strip_prefix(&cwd)
         .expect("relative alias")
         .to_string_lossy();
+
     let notif = notif_with_path_args(nr::UNLINK, &[&relative]);
     let before = filesystem_checks(&notif);
     std::fs::remove_file(&alias).expect("remove alias");
@@ -240,8 +250,8 @@ fn relative_renameat2_accepts_zero_extended_at_fdcwd() {
     let new = notif.data.args[1];
     let at_fdcwd = u64::from(libc::AT_FDCWD.cast_unsigned());
     notif.data.args = [at_fdcwd, old, at_fdcwd, new, 0, 0];
-
     let current_dir = std::env::current_dir().expect("current directory");
+
     assert_eq!(filesystem_checks(&notif), vec![
         (current_dir.join("old-path"), FileAccess::ReadWrite,),
         (current_dir.join("new-path"), FileAccess::ReadWrite,),

@@ -5,10 +5,7 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
 
 use super::{
-    decisions::DecisionAction,
-    scope_apply::{ScopeLadder, ScopePersistFlags},
-    state::apply_bucket,
-    types::PolicyStore,
+    decisions::DecisionAction, scope_apply::ScopeLadder, state::apply_bucket, types::PolicyStore,
 };
 use crate::wire::{ScopeWire, SudoScopeOp};
 
@@ -32,7 +29,6 @@ impl PolicyStore {
         let cwd = paths.cwd_path();
         let home = paths.home();
         let project_root = paths.project_root();
-
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
 
         let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
@@ -53,7 +49,7 @@ impl PolicyStore {
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
                     paths: &paths,
-                    flags: ScopePersistFlags::new(false, true),
+
                     project_log: Some("project sudo policy saved"),
                     project_package_log: Some("project package sudo policy saved"),
                 },
@@ -184,7 +180,6 @@ mod tests {
             .await;
 
         assert!(matches!(reply, RpcReply::ScopeAction(_)));
-
         let inner = store.inner.lock().await;
 
         assert!(

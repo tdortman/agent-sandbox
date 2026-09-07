@@ -24,6 +24,7 @@ impl PolicyStore {
         let Some(uid) = uid.filter(|&u| u > 0) else {
             return Vec::new();
         };
+
         let inner = self.inner.lock().await;
         let sessions = self.sandbox_sessions.read().ok();
 
@@ -58,6 +59,7 @@ impl PolicyStore {
     #[cfg(test)]
     pub(crate) async fn pending_summaries(&self) -> Vec<PendingSummary> {
         let inner = self.inner.lock().await;
+
         inner
             .pending
             .pending

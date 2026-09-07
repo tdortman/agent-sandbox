@@ -11,6 +11,8 @@ pub mod graphical_env;
 pub mod hosts;
 pub mod http;
 pub mod merge_policy;
+pub mod network_revocation;
+pub mod network_snapshot;
 pub mod policy;
 pub mod rpc;
 pub mod rpc_client;

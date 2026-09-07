@@ -48,6 +48,7 @@ pub(crate) fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
 
 /// Default on-disk DNS cache location: `/run/agent-sandbox/dns-cache.json`.
 pub const DEFAULT_CACHE_PATH: &str = "/run/agent-sandbox/dns-cache.json";
+
 /// Default maximum TTL (in seconds) for cached hostname entries.
 pub const DEFAULT_MAX_TTL: u32 = 600;
 

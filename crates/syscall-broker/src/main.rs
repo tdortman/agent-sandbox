@@ -5,7 +5,9 @@
 //! issues the corresponding allow/deny response or `addfd` injection.
 
 pub(crate) mod decision;
+
 pub(crate) mod dispatch;
+
 use std::{
     ffi::CString,
     net::SocketAddr,
@@ -125,9 +127,11 @@ async fn main() -> std::io::Result<()> {
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
     let mut policy_client = PersistentPolicyClient::new_trusted(cli.policy_socket.clone());
+
     let project_root = std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
         .ok()
         .map(PathBuf::from);
+
     let static_allow = StaticPolicyAllow::load(Path::new(EXPORTED_POLICY_PATH), project_root);
     let filesystem_worker = dispatch::start_filesystem_worker(cli.listener_fd)?;
 
@@ -276,6 +280,7 @@ fn is_policy_socket_bypass(target: &ResourceTarget, policy_socket: &Path) -> boo
         _ => normalize_path(&target.path) == normalize_path(policy_socket),
     }
 }
+
 /// Emulate a policy-allowed resource syscall without continuing it.
 fn emulate_resource(
     listener_fd: i32,
@@ -296,10 +301,12 @@ fn emulate_filesystem_mutation(
     fn cstring(bytes: &[u8]) -> std::io::Result<CString> {
         CString::new(bytes).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
     }
+
     fn path_at(dir: &OwnedFd, path: &[u8]) -> Vec<u8> {
         if path.starts_with(b"/") {
             return path.to_vec();
         }
+
         let mut resolved = format!("/proc/self/fd/{}", dir.as_raw_fd()).into_bytes();
         resolved.push(b'/');
         resolved.extend_from_slice(path);
@@ -356,6 +363,7 @@ fn emulate_filesystem_mutation(
             unlinkat(dir, &path, libc::AT_REMOVEDIR)
         }
     };
+
     let (val, error) = match result {
         Ok(()) => (0, 0),
         Err(err) => {
@@ -368,6 +376,7 @@ fn emulate_filesystem_mutation(
             (0, -err.raw_os_error().unwrap_or(libc::EACCES))
         }
     };
+
     send_response(listener_fd, notif.id, val, error, 0)
 }
 
@@ -386,6 +395,7 @@ fn emulate_unix_socket(
 ) -> std::io::Result<()> {
     let nr_val = i64::from(notif.data.nr);
     let sockfd = i32::try_from(notif.data.args[0]).unwrap_or(-1);
+
     if sockfd < 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -639,6 +649,7 @@ fn enhance_sendmsg_emulation(
         msg.msg_name = target.raw.as_ptr().cast::<libc::c_void>().cast_mut();
         msg.msg_namelen = u32::try_from(target.raw.len()).unwrap_or(u32::MAX);
     }
+
     // SAFETY: `msg` is a broker-owned msghdr with iovecs and a captured
     // sockaddr. All pointers are valid for the kernel call.
     #[allow(unsafe_code, reason = "raw seccomp notification iovec construction")]

@@ -10,7 +10,7 @@ use serde::{
 use thiserror::Error;
 use url::Url;
 
-use crate::hosts::{build_glob, normalize_dns_name};
+use crate::hosts::{build_glob, glob_matches, normalize_dns_name};
 
 const MAX_METHOD_BYTES: usize = 64;
 
@@ -76,8 +76,10 @@ impl<'de> Deserialize<'de> for HttpMethod {
 pub enum HttpMethodMatcher {
     /// Matches exactly the given method.
     Exact(HttpMethod),
+
     /// Matches any of the given methods.
     AnyOf(Vec<HttpMethod>),
+
     /// Matches every method.
     All,
 }
@@ -241,6 +243,7 @@ impl<'de> Deserialize<'de> for HttpMethodMatcher {
 pub enum HttpScheme {
     /// Plaintext `http`.
     Http,
+
     /// Transport-layer-secured `https`.
     Https,
 }
@@ -303,6 +306,7 @@ impl<'de> Deserialize<'de> for HttpScheme {
 pub enum HttpHost {
     /// An IPv4/IPv6 literal authority.
     Ip(IpAddr),
+
     /// A normalized DNS hostname authority.
     Dns(Box<str>),
 }
@@ -530,6 +534,7 @@ impl fmt::Display for NormalizedHttpPath {
 pub enum HttpTarget {
     /// A normalized request path.
     Path(NormalizedHttpPath),
+
     /// The reserved `OPTIONS *` asterisk target.
     Asterisk,
 }
@@ -539,10 +544,13 @@ pub enum HttpTarget {
 pub struct HttpUrl {
     /// The URL scheme.
     pub scheme: HttpScheme,
+
     /// The canonical authority (host and effective port).
     pub authority: HttpAuthority,
+
     /// The request target: a normalized path or the `OPTIONS *` asterisk.
     pub target: HttpTarget,
+
     pattern: Option<Box<str>>,
 }
 
@@ -700,9 +708,7 @@ impl HttpUrl {
     pub fn matches(&self, request: &Self) -> bool {
         if let Some(pattern) = &self.pattern {
             let pattern = glob_pattern_for_matching(self, pattern);
-
-            return build_glob(&pattern)
-                .is_ok_and(|glob| glob.compile_matcher().is_match(request.to_string()));
+            return glob_matches(&pattern, &request.to_string());
         }
 
         self.covers(request)
@@ -840,6 +846,7 @@ fn validate_session_value(value: Option<&str>) -> Result<Option<String>, HttpPar
 pub struct HttpRequest {
     /// The HTTP method of the request.
     pub method: HttpMethod,
+
     /// The canonical request URL.
     pub url: HttpUrl,
 
@@ -949,6 +956,7 @@ impl HttpRequest {
 pub struct HttpRuleTarget {
     /// Matcher for the rule's HTTP methods.
     pub method: HttpMethodMatcher,
+
     /// The rule's canonical URL, including any glob pattern.
     pub url: HttpUrl,
 }
@@ -1041,6 +1049,7 @@ pub struct HttpRule {
 
     /// The rule's URL, which may contain glob metacharacters.
     pub url: String,
+
     /// Optional human-readable comment associated with the rule.
     pub comment: Option<String>,
 }
@@ -1092,10 +1101,13 @@ impl HttpRule {
 pub struct HttpContextKey {
     /// The working directory at the time of the request, if known.
     pub cwd: Option<std::path::PathBuf>,
+
     /// The user's home directory at the time of the request, if known.
     pub home: Option<std::path::PathBuf>,
+
     /// The detected project root directory, if known.
     pub project_root: Option<std::path::PathBuf>,
+
     /// The sandbox session identifier this request belongs to, if any.
     pub sandbox_session_id: Option<String>,
 }

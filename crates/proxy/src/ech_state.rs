@@ -30,6 +30,7 @@ const CIPHER_SUITES: &[(u16, u16)] = &[(0x0001, 0x0002), (0x0001, 0x0001)];
 pub struct DownstreamEch {
     /// The client-facing ECH configuration list.
     pub config_list: Arc<Vec<u8>>,
+
     /// The matching X25519 private key.
     pub private_key: [u8; 32],
 }
@@ -128,12 +129,15 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "ECH state path has no parent")
     })?;
+
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
+
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o644))?;
+
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -142,15 +146,19 @@ fn create_if_missing(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> 
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "ECH state path has no parent")
     })?;
+
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
+
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(mode))?;
+
     temporary
         .persist_noclobber(path)
         .map_err(|error| error.error)?;
+
     Ok(())
 }
 

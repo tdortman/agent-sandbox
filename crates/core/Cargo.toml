@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-sandbox-sysutil.workspace = true
+aya.workspace = true
 getrandom.workspace = true
 globset.workspace = true
 hickory-proto.workspace = true
 idna.workspace = true
 libc.workspace = true
-nix = { workspace = true, features = ["fs", "socket", "user"] }
+nix = { workspace = true, features = ["fs", "poll", "socket", "user"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

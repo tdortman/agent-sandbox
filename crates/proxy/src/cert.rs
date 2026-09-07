@@ -35,12 +35,26 @@ pub enum CertificateError {
     IssuedKey,
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct CertificateCacheKey {
+    server_name: String,
+    algorithm: LeafKeyAlgorithm,
+}
+
 /// Issues and caches leaf certificates signed by a loaded interception CA.
 #[derive(Clone)]
 pub struct CertificateIssuer {
     ca_issuer: Arc<Issuer<'static, KeyPair>>,
     ca_certificate_der: CertificateDer<'static>,
-    cache: Arc<Mutex<HashMap<String, Arc<IssuedCertificate>>>>,
+    cache: Arc<Mutex<HashMap<CertificateCacheKey, Arc<IssuedCertificate>>>>,
+}
+
+/// The leaf public key algorithm, independent of the CA's signing algorithm.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum LeafKeyAlgorithm {
+    EcdsaP256,
+    EcdsaP384,
+    Rsa,
 }
 
 /// A leaf certificate chain and matching private key issued for one SNI name.
@@ -48,6 +62,7 @@ pub struct CertificateIssuer {
 pub struct IssuedCertificate {
     /// The leaf certificate followed by the CA certificate.
     pub certificate_chain: Vec<CertificateDer<'static>>,
+
     /// The leaf private key.
     pub private_key: Arc<PrivateKeyDer<'static>>,
 }
@@ -94,21 +109,37 @@ impl CertificateIssuer {
     /// Returns an error when the SNI name cannot be signed with the
     /// configured CA.
     pub fn issue(&self, server_name: &str) -> Result<Arc<IssuedCertificate>, CertificateError> {
+        self.issue_with_algorithm(server_name, LeafKeyAlgorithm::EcdsaP256)
+    }
+
+    pub(crate) fn issue_with_algorithm(
+        &self,
+        server_name: &str,
+        algorithm: LeafKeyAlgorithm,
+    ) -> Result<Arc<IssuedCertificate>, CertificateError> {
         let server_name = normalize_server_name(server_name);
+        let cache_key = CertificateCacheKey {
+            server_name: server_name.clone(),
+            algorithm,
+        };
 
         let cached = self
             .cache
             .lock()
             .map_err(|_| CertificateError::MissingCertificate)?
-            .get(&server_name)
+            .get(&cache_key)
             .cloned();
 
         if let Some(certificate) = cached {
             return Ok(certificate);
         }
 
-        let params = CertificateParams::new(vec![server_name.clone()])?;
-        let key_pair = KeyPair::generate()?;
+        let params = CertificateParams::new(vec![server_name])?;
+        let key_pair = KeyPair::generate_for(match algorithm {
+            LeafKeyAlgorithm::EcdsaP256 => &rcgen::PKCS_ECDSA_P256_SHA256,
+            LeafKeyAlgorithm::EcdsaP384 => &rcgen::PKCS_ECDSA_P384_SHA384,
+            LeafKeyAlgorithm::Rsa => &rcgen::PKCS_RSA_SHA256,
+        })?;
         let certificate = params.signed_by(&key_pair, &self.ca_issuer)?;
 
         let private_key = PrivateKeyDer::try_from(key_pair.serialize_der())
@@ -125,7 +156,7 @@ impl CertificateIssuer {
         self.cache
             .lock()
             .map_err(|_| CertificateError::MissingCertificate)?
-            .insert(server_name, issued.clone());
+            .insert(cache_key, issued.clone());
 
         Ok(issued)
     }

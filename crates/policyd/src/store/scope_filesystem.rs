@@ -8,11 +8,8 @@ use agent_sandbox_core::{
 };
 
 use super::{
-    decisions::DecisionAction,
-    persist::PersistResourceRuleArgs,
-    scope_apply::{ScopeLadder, ScopePersistFlags},
-    state::apply_bucket,
-    types::PolicyStore,
+    decisions::DecisionAction, persist::PersistResourceRuleArgs, scope_apply::ScopeLadder,
+    state::apply_bucket, types::PolicyStore,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 
@@ -40,9 +37,7 @@ impl PolicyStore {
 
         let home = paths.home();
         let project_root = paths.project_root();
-
         let key = FilesystemRuleKey::new(expand_policy_path(&path, home, project_root), access);
-
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
 
         let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
@@ -64,7 +59,7 @@ impl PolicyStore {
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
                     paths: &paths,
-                    flags: ScopePersistFlags::new(true, true),
+
                     project_log: Some("project filesystem policy saved"),
                     project_package_log: Some("project package filesystem policy saved"),
                 },
@@ -98,6 +93,7 @@ impl PolicyStore {
         }
 
         let scope_label = scope.as_str();
+
         let audit_detail = format!(
             "path={} access={access:?} scope={scope_label}",
             path.display()
@@ -155,7 +151,7 @@ impl PolicyStore {
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
                     paths: &paths,
-                    flags: ScopePersistFlags::new(false, true),
+
                     project_log: None,
                     project_package_log: None,
                 },
@@ -225,7 +221,6 @@ impl PolicyStore {
         } = wire;
 
         let key = ResourceRuleKey::new(kind, &path, access);
-
         let scope_label = comment.as_deref().unwrap_or_else(|| scope.as_str());
 
         let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
@@ -248,7 +243,7 @@ impl PolicyStore {
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
                     paths: &paths,
-                    flags: ScopePersistFlags::new(false, true),
+
                     project_log: Some("project resource policy saved"),
                     project_package_log: Some("project package resource policy saved"),
                 },
@@ -282,6 +277,7 @@ impl PolicyStore {
         }
 
         let scope_label = scope.as_str();
+
         let audit_detail = format!(
             "kind={kind:?} path={} access={access:?} scope={scope_label}",
             path.display()
@@ -321,7 +317,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn project_filesystem_persistence_invalidates_merged_cache() {
+    async fn project_filesystem_persistence_refreshes_merged_policy() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let home = dir.path().join("home");
         let project = home.join("project");
@@ -768,7 +764,6 @@ mod tests {
             .await;
 
         assert!(matches!(reply, RpcReply::ScopeAction(_)));
-
         let inner = store.inner.lock().await;
 
         assert!(
@@ -794,6 +789,7 @@ mod tests {
         let store = package_store(&dir);
         register_ui_session(&store, "sandbox-a");
         let omp = package_ctx(&home, &project, None);
+
         let omp_with_session = ResolvedRequestContext {
             sandbox_session_id: Some("sandbox-a".into()),
             ..omp
@@ -851,10 +847,12 @@ mod tests {
         let store = package_store(&dir);
         register_ui_session(&store, "sandbox-a");
         let omp = package_ctx(&home, &project, None);
+
         let omp_with_session = ResolvedRequestContext {
             sandbox_session_id: Some("sandbox-a".into()),
             ..omp
         };
+
         let target = DbusTarget::default();
 
         let reply = store
@@ -870,7 +868,6 @@ mod tests {
             .await;
 
         assert!(matches!(reply, RpcReply::ScopeAction(_)));
-
         let inner = store.inner.lock().await;
 
         assert!(
@@ -905,7 +902,6 @@ mod tests {
             .await;
 
         assert!(matches!(reply, RpcReply::ScopeAction(_)));
-
         let ext = home.join(".config/agent-sandbox/packages/omp.json");
         let policy: Policy = load_policy(&ext, Some(&home), None);
 
@@ -925,6 +921,7 @@ mod tests {
         let store = package_store(&dir);
         register_ui_session(&store, "sandbox-a");
         let omp = package_ctx(&home, &project, None);
+
         let omp_with_session = ResolvedRequestContext {
             sandbox_session_id: Some("sandbox-a".into()),
             ..omp
@@ -947,8 +944,8 @@ mod tests {
             .await;
 
         assert!(matches!(reply, RpcReply::ScopeAction(_)));
-
         let inner = store.inner.lock().await;
+
         let key = ResourceRuleKey::new(
             ResourceKind::UnixSocket,
             "/run/user/1000/bus",

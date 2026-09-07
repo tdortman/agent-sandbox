@@ -411,10 +411,12 @@ mod tests {
     async fn trusted_client_rejects_same_uid_listener() {
         let dir = tempdir().expect("temporary directory");
         let socket = dir.path().join("policy.sock");
+
         // The listener runs as this test process's uid, which is the same euid
         // the connecting client sees. To a trusted client that is an impostor
         // listener, so the connect must be rejected.
         let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             drop(stream);

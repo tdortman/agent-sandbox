@@ -59,6 +59,19 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", default_value = "nft")]
     pub(crate) nft_binary: String,
 
+    /// Trusted root-owned BPF iterator object. If unavailable, use procfs
+    /// ownership resolution. Kernel results never bypass policy checks.
+    #[arg(long, value_name = "OBJECT")]
+    pub(crate) owner_iterator: Option<PathBuf>,
+
+    /// Fresh private pins for optional live connect ownership hints.
+    #[arg(long, value_name = "DIRECTORY", requires = "owner_iterator")]
+    pub(crate) owner_hints: Option<PathBuf>,
+
+    /// Trusted publisher's guard for experimental file-only network grants.
+    #[arg(long, value_name = "PIN")]
+    pub(crate) network_revocation_map: Option<PathBuf>,
+
     /// DNS forwarder IP address (v4 or v6). Packets to this IP on port 53 are
     /// passed straight through without consulting policyd so the agent can
     /// always resolve names. 169.254.100.1 is the link-local address used by
@@ -86,7 +99,8 @@ pub struct Cli {
     #[arg(long, value_name = "PORTS", default_value = "443")]
     pub(crate) udp_proxy_ports: String,
 
-    /// Readiness marker written only after NFQUEUE bind succeeds. The marker
+    /// Readiness marker written after NFQUEUE bind and optional revocation
+    /// guard setup succeed. The marker
     /// contains the systemd `INVOCATION_ID` so stale daemon state cannot be
     /// mistaken for the current queue owner.
     #[arg(long, value_name = "PATH")]

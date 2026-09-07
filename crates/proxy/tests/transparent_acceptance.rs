@@ -26,3 +26,6 @@ mod transparent_https;
 
 #[path = "transparent_suite/websocket.rs"]
 mod transparent_websocket;
+
+#[path = "transparent_suite/compatibility.rs"]
+mod transparent_compatibility;

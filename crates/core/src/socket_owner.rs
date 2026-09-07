@@ -12,15 +12,29 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
     os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
 };
 
 use crate::{ProcessIdentity, ProcessStartTimeTicks, SocketIdentity, SocketInode};
+
+#[cfg(target_os = "linux")]
+mod sock_diag;
+
+#[cfg(target_os = "linux")]
+mod hint;
+
+#[cfg(target_os = "linux")]
+mod kernel;
+
+#[cfg(target_os = "linux")]
+pub use kernel::KernelOwnerResolver;
 
 /// Transport protocol used by a procfs socket table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SocketProtocol {
     /// Transmission Control Protocol.
     Tcp,
+
     /// User Datagram Protocol.
     Udp,
 }
@@ -84,6 +98,13 @@ impl OwnerSnapshot {
         }
     }
 
+    /// Descriptor observed during resolution. This is only a hint and must be
+    /// revalidated.
+    #[must_use]
+    pub const fn fd_number(self) -> u32 {
+        self.fd
+    }
+
     /// The typed process/socket identity captured by this snapshot.
     #[must_use]
     pub const fn identity(self) -> SocketIdentity {
@@ -135,8 +156,10 @@ impl OwnerSnapshot {
 pub enum OwnerResolution<T = OwnerSnapshot> {
     /// Exactly one owner matched the tuple.
     Unique(T),
+
     /// No process owned the tuple.
     Missing,
+
     /// More than one process could own the tuple.
     Ambiguous,
 }
@@ -149,51 +172,28 @@ pub enum OwnerResolution<T = OwnerSnapshot> {
 /// live descriptor still refers to the captured socket inode.
 #[must_use]
 pub fn validate_socket_identity(identity: SocketIdentity) -> bool {
+    validate_socket_identity_with_hint(identity, None)
+}
+
+/// Revalidate identity with an optional descriptor hint, falling back to
+/// discovery. UID, process generation, descriptor target and inode are always
+/// checked fresh.
+#[must_use]
+pub fn validate_socket_identity_with_hint(identity: SocketIdentity, fd_hint: Option<u32>) -> bool {
     let pid = identity.pid().get();
     let expected_uid = identity.uid();
     let expected_start_time = identity.process_start_time_ticks().get();
     let expected_inode = identity.socket_inode().get();
 
-    if !process_has_uid(pid, expected_uid) {
-        return false;
-    }
-
     if process_start_time_ticks(pid) != Some(expected_start_time) {
         return false;
     }
 
-    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+    let Some((task, _)) = process_socket_descriptor(pid, expected_inode, fd_hint) else {
         return false;
     };
 
-    let needle = format!("socket:[{expected_inode}]");
-
-    for fd in fds.flatten() {
-        let fd_path = fd.path();
-
-        let Ok(link) = fs::read_link(&fd_path) else {
-            continue;
-        };
-
-        if link.as_os_str() != std::ffi::OsStr::new(&needle) {
-            continue;
-        }
-
-        let Ok(metadata) = fs::metadata(&fd_path) else {
-            continue;
-        };
-
-        if metadata.ino() != expected_inode {
-            continue;
-        }
-
-        // Recheck identity after finding the descriptor to reject PID reuse
-        // and changes that race the descriptor scan.
-        return process_has_uid(pid, expected_uid)
-            && process_start_time_ticks(pid) == Some(expected_start_time);
-    }
-
-    false
+    task_has_uid(&task, expected_uid) && process_start_time_ticks(pid) == Some(expected_start_time)
 }
 
 /// Resolve a tuple and retain the checked descriptor as an owner snapshot.
@@ -216,10 +216,15 @@ pub fn resolve_owner_snapshot(
     let mut owners = HashMap::new();
 
     for entry in entries {
-        for candidate in process_candidates(entry.inode, entry.uid, tuple) {
-            owners
-                .entry((candidate.pid_value(), candidate.socket_inode()))
-                .or_insert(candidate);
+        match process_candidates(entry.inode, entry.uid, tuple) {
+            OwnerResolution::Missing => {}
+            OwnerResolution::Ambiguous => return OwnerResolution::Ambiguous,
+
+            OwnerResolution::Unique(candidate) => {
+                owners
+                    .entry((candidate.pid_value(), candidate.socket_inode()))
+                    .or_insert(candidate);
+            }
         }
     }
 
@@ -237,6 +242,20 @@ struct SocketTableEntry {
 }
 
 fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<SocketTableEntry> {
+    #[cfg(target_os = "linux")]
+    if protocol == SocketProtocol::Tcp
+        && let Ok(entries) = sock_diag::entries(tuple)
+    {
+        return entries;
+    }
+
+    socket_table_entries_from_proc(protocol, tuple)
+}
+
+fn socket_table_entries_from_proc(
+    protocol: SocketProtocol,
+    tuple: SocketTuple,
+) -> Vec<SocketTableEntry> {
     let table_path = match (protocol, tuple.local_ip.is_ipv6()) {
         (SocketProtocol::Tcp, false) => "/proc/net/tcp",
         (SocketProtocol::Udp, false) => "/proc/net/udp",
@@ -262,19 +281,25 @@ fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<Soc
 
     for line in table.lines().skip(1) {
         let mut parts = line.split_whitespace();
+
         let Some(local) = parts.nth(1) else {
             continue;
         };
+
         if local != exact && local != wildcard {
             continue;
         }
+
         let peer = parts.next();
+
         if remote && remote_field.as_deref() != peer {
             continue;
         }
+
         let Some(uid) = parts.nth(4).and_then(|value| value.parse().ok()) else {
             continue;
         };
+
         let Some(inode_value) = parts.nth(1).and_then(|value| value.parse().ok()) else {
             continue;
         };
@@ -294,18 +319,63 @@ fn socket_table_entries(protocol: SocketProtocol, tuple: SocketTuple) -> Vec<Soc
     entries
 }
 
+/// Check the leader first, then threads with potentially private descriptor
+/// tables. Keep the task path so credentials are read from the actual holder.
+fn process_socket_descriptor(pid: u32, inode: u64, fd_hint: Option<u32>) -> Option<(PathBuf, u32)> {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+
+    if let Some(fd) = task_socket_descriptor(&process, inode, fd_hint) {
+        return Some((process, fd));
+    }
+
+    // ponytail: scan thread tables on a leader miss; the BPF iterator avoids
+    // this repeated procfs work when available.
+    fs::read_dir(process.join("task"))
+        .ok()?
+        .flatten()
+        .filter(|task| {
+            task.file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                != Some(pid)
+        })
+        .find_map(|task| {
+            let path = task.path();
+            task_socket_descriptor(&path, inode, fd_hint).map(|fd| (path, fd))
+        })
+}
+
+fn task_socket_descriptor(task: &Path, inode: u64, fd_hint: Option<u32>) -> Option<u32> {
+    let needle = format!("socket:[{inode}]");
+    let fds = task.join("fd");
+
+    let matches_fd = |path: &Path| {
+        fs::read_link(path).is_ok_and(|link| link.as_os_str() == std::ffi::OsStr::new(&needle))
+            && fs::metadata(path).is_ok_and(|metadata| metadata.ino() == inode)
+    };
+
+    if let Some(fd) = fd_hint
+        && matches_fd(&fds.join(fd.to_string()))
+    {
+        return Some(fd);
+    }
+
+    fs::read_dir(fds).ok()?.flatten().find_map(|fd| {
+        let number = fd.file_name().to_str()?.parse().ok()?;
+        matches_fd(&fd.path()).then_some(number)
+    })
+}
+
 fn process_candidates(
     inode: SocketInode,
     expected_uid: u32,
     tuple: SocketTuple,
-) -> Vec<OwnerSnapshot> {
-    let needle = format!("socket:[{}]", inode.get());
-
+) -> OwnerResolution<OwnerSnapshot> {
     let Ok(processes) = fs::read_dir("/proc") else {
-        return Vec::new();
+        return OwnerResolution::Missing;
     };
 
-    let mut candidates = Vec::new();
+    let mut owner = None;
 
     for process in processes.flatten() {
         let name = process.file_name();
@@ -318,68 +388,39 @@ fn process_candidates(
             continue;
         };
 
-        if !process_has_uid(pid, expected_uid) {
-            continue;
-        }
-
-        let fd_dir = process.path().join("fd");
-
-        let Ok(fds) = fs::read_dir(fd_dir) else {
+        let Some((task, fd)) = process_socket_descriptor(pid, inode.get(), None) else {
             continue;
         };
 
-        for fd in fds.flatten() {
-            let Some(fd_number) = fd
-                .file_name()
-                .to_str()
-                .and_then(|value| value.parse::<u32>().ok())
-            else {
-                continue;
-            };
-
-            let fd_path = fd.path();
-
-            let Ok(link) = fs::read_link(&fd_path) else {
-                continue;
-            };
-
-            if link.to_string_lossy() != needle {
-                continue;
-            }
-
-            let Ok(metadata) = fs::metadata(&fd_path) else {
-                continue;
-            };
-
-            if metadata.ino() != inode.get() {
-                continue;
-            }
-
-            let Ok(process_identity) = ProcessIdentity::new(pid, expected_uid, start_time) else {
-                continue;
-            };
-
-            if process_start_time_ticks(pid) != Some(start_time) {
-                continue;
-            }
-
-            candidates.push(OwnerSnapshot::new(
-                SocketIdentity::new(process_identity, inode),
-                tuple,
-                fd_number,
-            ));
-            // Duplicate descriptors in one process identify the same owner.
-            break;
+        if process_start_time_ticks(pid) != Some(start_time) {
+            continue;
         }
+
+        // A transferred socket remains a holder even if its recipient no longer
+        // has the creator UID. Never turn that sharing into a unique owner.
+        if !task_has_uid(&task, expected_uid) || owner.is_some() {
+            return OwnerResolution::Ambiguous;
+        }
+
+        let Ok(process_identity) = ProcessIdentity::new(pid, expected_uid, start_time) else {
+            continue;
+        };
+
+        owner = Some(OwnerSnapshot::new(
+            SocketIdentity::new(process_identity, inode),
+            tuple,
+            fd,
+        ));
     }
 
-    candidates
+    owner.map_or(OwnerResolution::Missing, OwnerResolution::Unique)
 }
 
-fn process_has_uid(pid: u32, expected_uid: u32) -> bool {
-    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+fn task_has_uid(task: &Path, expected_uid: u32) -> bool {
+    let Ok(status) = fs::read_to_string(task.join("status")) else {
         return false;
     };
+
     status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
@@ -390,7 +431,9 @@ fn process_has_uid(pid: u32, expected_uid: u32) -> bool {
         })
 }
 
-fn process_start_time_ticks(pid: u32) -> Option<u64> {
+/// Read the kernel start-time discriminator used to distinguish reused PIDs.
+#[must_use]
+pub fn process_start_time_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let end_comm = stat.rfind(')')?;
 
@@ -484,12 +527,14 @@ mod tests {
         assert_ne!(snapshot.process_start_time_ticks().get(), 0);
         let identity = snapshot.identity();
         assert!(validate_socket_identity(identity));
+
         let invalid_uid = ProcessIdentity::new(
             identity.pid().get(),
             u32::MAX,
             identity.process_start_time_ticks().get(),
         )
         .expect("non-zero process identity");
+
         assert!(!validate_socket_identity(SocketIdentity::new(
             invalid_uid,
             identity.socket_inode(),
@@ -507,6 +552,28 @@ mod tests {
 
         let invalid_identity = SocketIdentity::new(invalid_process, identity.socket_inode());
         assert!(!validate_socket_identity(invalid_identity));
+        let hint = Some(snapshot.fd_number());
+        assert!(validate_socket_identity_with_hint(identity, hint));
+        assert!(validate_socket_identity_with_hint(identity, Some(u32::MAX)));
+        assert!(!validate_socket_identity_with_hint(invalid_identity, hint));
+
+        assert!(!validate_socket_identity_with_hint(
+            SocketIdentity::new(invalid_uid, identity.socket_inode()),
+            hint
+        ));
+
+        use std::os::fd::AsRawFd;
+
+        assert!(validate_socket_identity_with_hint(
+            identity,
+            Some(listener.as_raw_fd().cast_unsigned())
+        ));
+
+        let duplicate = client.try_clone().expect("duplicate socket");
+        drop(client);
+        assert!(validate_socket_identity_with_hint(identity, hint));
+        drop(duplicate);
+        assert!(!validate_socket_identity_with_hint(identity, hint));
     }
 
     #[test]

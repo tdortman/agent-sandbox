@@ -3,10 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemRule, Policy, ProcessIds, ProjectPolicyContext, ResolvedRequestContext,
-    SandboxPaths, home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers,
-    peer_context, read_proc_environ, resolve_policy_write_path, sandbox_session_id_from_pid,
-    trusted_project_policy_path,
+    FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext, SandboxPaths,
+    home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers, peer_context,
+    resolve_policy_write_path, sandbox_session_id_from_pid, trusted_project_policy_path,
 };
 
 use super::types::PolicyStore;
@@ -36,9 +35,13 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 impl PolicyStore {
-    pub(crate) fn note_sandbox_peer(&self, peer: TrustedPeer, sandbox_session_id: &str) {
+    pub(crate) fn note_sandbox_peer(
+        &self,
+        peer: TrustedPeer,
+        sandbox_session_id: &str,
+    ) -> std::io::Result<()> {
         if peer.pid == 0 || peer.uid == 0 {
-            return;
+            return Ok(());
         }
 
         let trusted = peer_context(peer.pid, Some(peer.uid));
@@ -54,37 +57,36 @@ impl PolicyStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        sessions
-            .entry(sandbox_session_id.to_string())
-            .and_modify(|reg| {
-                // A session pre-registered by the wrapper (RegisterSandbox)
-                // has no observed root pid yet. Adopt the first sandbox peer
-                // as root only when the peer descends from the recorded
-                // launcher. A same-uid attacker in another sandbox descends
-                // from a different launcher and must never claim the
-                // registration. Unattributed sessions (launcher_pid == 0)
-                // keep the plain first-peer-claims-root model.
-                if reg.root_pid == 0
-                    && (reg.launcher_pid == 0 || is_descendant_of(reg.launcher_pid, peer.pid))
-                {
-                    reg.root_pid = peer.pid;
+        if let Some(reg) = sessions.get_mut(sandbox_session_id) {
+            // Only the launcher's descendants may adopt a registered session.
+            let adopt_root = reg.root_pid == 0
+                && (reg.launcher_pid == 0 || is_descendant_of(reg.launcher_pid, peer.pid));
+            let root_pid = if adopt_root { peer.pid } else { reg.root_pid };
+            let update_project = is_descendant_of(root_pid, peer.pid)
+                && !project_root.as_os_str().is_empty()
+                && project_root != reg.project_root
+                && (reg.project_root.as_os_str().is_empty()
+                    || is_path_descendant(&project_root, &reg.project_root));
+            if adopt_root || update_project {
+                self.revoke_network_grants()?;
+                reg.root_pid = root_pid;
+                if update_project {
+                    reg.project_root = project_root;
                 }
-
-                if is_descendant_of(reg.root_pid, peer.pid)
-                    && !project_root.as_os_str().is_empty()
-                    && (reg.project_root.as_os_str().is_empty()
-                        || is_path_descendant(&project_root, &reg.project_root))
-                {
-                    reg.project_root.clone_from(&project_root);
-                }
-            })
-            .or_insert(SandboxSessionRegistration {
+            }
+        } else {
+            self.revoke_network_grants()?;
+            sessions.insert(sandbox_session_id.to_string(), SandboxSessionRegistration {
                 root_pid: peer.pid,
                 owner_uid: peer.uid,
                 project_root,
                 package: None,
                 launcher_pid: 0,
+                launcher_start_ticks: 0,
             });
+        }
+        drop(sessions);
+        Ok(())
     }
 
     /// Register a sandbox session's package identity.
@@ -124,9 +126,16 @@ impl PolicyStore {
             return Err(PolicydError::InvalidLauncherPid);
         }
 
+        let launcher_start_ticks =
+            agent_sandbox_core::socket_owner::process_start_time_ticks(launcher_pid)
+                .filter(|ticks| *ticks > 0)
+                .ok_or(PolicydError::InvalidLauncherPid)?;
         let parent_pid = read_proc_ppid(peer_pid).ok_or(PolicydError::InvalidLauncherPid)?;
 
-        if parent_pid != launcher_pid {
+        if parent_pid != launcher_pid
+            || agent_sandbox_core::socket_owner::process_start_time_ticks(launcher_pid)
+                != Some(launcher_start_ticks)
+        {
             return Err(PolicydError::InvalidLauncherPid);
         }
 
@@ -135,27 +144,33 @@ impl PolicyStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        match sessions.get_mut(session_id) {
-            Some(reg) => {
-                if let Some(existing) = &reg.package
-                    && existing != package
-                {
-                    return Err(PolicydError::PackageImmutable);
-                }
-                reg.package = Some(package.to_string());
-                reg.owner_uid = owner_uid;
-                reg.launcher_pid = launcher_pid;
+        if let Some(reg) = sessions.get_mut(session_id) {
+            if let Some(existing) = &reg.package
+                && existing != package
+            {
+                return Err(PolicydError::PackageImmutable);
             }
-
-            None => {
-                sessions.insert(session_id.to_string(), SandboxSessionRegistration {
-                    root_pid: 0,
-                    owner_uid,
-                    project_root: PathBuf::new(),
-                    package: Some(package.to_string()),
-                    launcher_pid,
-                });
+            if reg.package.as_deref() != Some(package)
+                || reg.owner_uid != owner_uid
+                || reg.launcher_pid != launcher_pid
+                || reg.launcher_start_ticks != launcher_start_ticks
+            {
+                self.revoke_network_grants()?;
             }
+            reg.package = Some(package.to_string());
+            reg.owner_uid = owner_uid;
+            reg.launcher_pid = launcher_pid;
+            reg.launcher_start_ticks = launcher_start_ticks;
+        } else {
+            self.revoke_network_grants()?;
+            sessions.insert(session_id.to_string(), SandboxSessionRegistration {
+                root_pid: 0,
+                owner_uid,
+                project_root: PathBuf::new(),
+                package: Some(package.to_string()),
+                launcher_pid,
+                launcher_start_ticks,
+            });
         }
 
         drop(sessions);
@@ -260,13 +275,6 @@ impl PolicyStore {
             }
         }
 
-        if project_root.is_none()
-            && let (Some(home), Some(cwd_path)) = (home.as_deref(), cwd.as_deref())
-        {
-            let project = ProjectPolicyContext::new(Some(home), Some(cwd_path), None);
-            project_root = project.project_root().map(Path::to_path_buf);
-        }
-
         // Root and internal callers are policyd-side trusted: there is no
         // peer uid to check, so the package is adopted straight from the
         // session registration.
@@ -337,22 +345,9 @@ impl PolicyStore {
         trusted_uid: Option<u32>,
         registration: Option<&SandboxSessionRegistration>,
     ) -> (Option<PathBuf>, Option<PathBuf>) {
-        let env = read_proc_environ(pid);
-
-        let mut cwd = env
-            .get("AGENT_SANDBOX_CWD")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-
-        let mut project_root = env
-            .get("AGENT_SANDBOX_PROJECT_ROOT")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-
         let proc = peer_context(pid, trusted_uid);
-
-        cwd = cwd.or(proc.cwd);
-        project_root = project_root.or(proc.project_root);
+        let cwd = proc.cwd;
+        let mut project_root = proc.project_root;
 
         if let (Some(pr), Some(reg)) = (&project_root, registration)
             && !reg.project_root.as_os_str().is_empty()
@@ -462,16 +457,10 @@ impl PolicyStore {
             if pid_allowed {
                 let (peer_cwd, peer_project) =
                     Self::peer_paths(pid, trusted_uid, registration.as_ref());
+
                 cwd = cwd.or(peer_cwd);
                 project_root = project_root.or(peer_project);
             }
-        }
-
-        if project_root.is_none()
-            && let (Some(home), Some(cwd_path)) = (home.as_deref(), cwd.as_deref())
-        {
-            let project = ProjectPolicyContext::new(Some(home), Some(cwd_path), None);
-            project_root = project.project_root().map(Path::to_path_buf);
         }
 
         let ids = ProcessIds::from_options(verified_pid, trusted_uid);
@@ -500,109 +489,23 @@ impl PolicyStore {
     /// Layers are merged with deny-wins semantics: any non-empty `deny`
     /// rule shadows the corresponding `allow` rule across the merged set.
     pub fn merged_for(&self, ctx: &ResolvedRequestContext) -> Policy {
-        let key = self.merged_cache_key(ctx);
+        let home_path = ctx.paths.home();
+        let project_root_path = ctx.paths.project_root();
 
-        if let Ok(cache) = self.merged_cache.lock()
-            && let Some(policy) = cache.get(&key)
-        {
-            return policy;
-        }
-
-        let policy = self.build_merged_for(ctx);
-
-        if let Ok(mut cache) = self.merged_cache.lock() {
-            cache.insert(key, policy.clone());
-        }
-
-        policy
-    }
-
-    fn merged_cache_key(&self, ctx: &ResolvedRequestContext) -> super::types::MergedCacheKey {
-        let ctx = ctx.clone();
-        let home_path = ctx.paths.home().map(Path::new);
-        let project_root_path = ctx.paths.project_root().map(Path::new);
-
-        let package = ctx
-            .package
-            .as_deref()
-            .filter(|name| validate_package_name(name).is_ok());
-
-        let home_policy = home_path.map(|home| {
-            home.join(".config")
-                .join("agent-sandbox")
-                .join("policy.json")
-        });
-
-        let project_policy =
-            project_root_path.and_then(|root| trusted_project_policy_path(root).ok());
-
-        let (package_base, package_home, package_project) = package
-            .map(|name| self.package_layer_paths(name, home_path, project_root_path))
-            .unwrap_or_default();
-
-        super::types::MergedCacheKey {
-            home: home_path.map(Path::to_path_buf),
-            project_root: project_root_path.map(Path::to_path_buf),
-            declarative_mtime: policy_file_mtime(&self.args.declarative),
-            home_policy_mtime: home_policy.as_deref().and_then(policy_file_mtime),
-            project_policy_mtime: project_policy.as_deref().and_then(policy_file_mtime),
-            package: ctx.package,
-            package_base_mtime: package_base.as_deref().and_then(policy_file_mtime),
-            package_home_mtime: package_home.as_deref().and_then(policy_file_mtime),
-            package_project_mtime: package_project.as_deref().and_then(policy_file_mtime),
-        }
-    }
-
-    fn build_merged_for(&self, ctx: &ResolvedRequestContext) -> Policy {
-        let ctx = ctx.clone();
-        let home_path = ctx.paths.home().map(Path::new);
-        let project_root_path = ctx.paths.project_root().map(Path::new);
-
-        let package = ctx
-            .package
-            .as_deref()
-            .filter(|name| validate_package_name(name).is_ok());
-
-        let mut layers: Vec<Policy> = Vec::new();
-        layers.push(load_policy(&self.args.declarative, home_path, None));
-
-        // Package layer: NixOS-declared base file, then the user-writable
-        // home extension file. Merged between the global declarative layer
-        // and the user policy, so a package rule cannot override a
-        // NixOS-declared deny (deny-wins across all layers).
-        let (package_base, package_home, package_project) = package
-            .map(|name| self.package_layer_paths(name, home_path, project_root_path))
-            .unwrap_or_default();
-
-        if let Some(base) = &package_base {
-            layers.push(load_policy(base, home_path, None));
-        }
-
-        if let Some(ext) = &package_home {
-            layers.push(load_policy(ext, home_path, None));
-        }
-
-        if let Some(home) = home_path {
-            let home_policy = home
-                .join(".config")
-                .join("agent-sandbox")
-                .join("policy.json");
-
-            layers.push(load_policy(&home_policy, home_path, None));
-
-            if let Some(root) = project_root_path
-                && let Ok(trusted) = trusted_project_policy_path(root)
-            {
-                layers.push(load_policy(&trusted, home_path, project_root_path));
-            }
-        }
-
-        // The package-specific project file merges last, within the project
-        // layer, and only for sessions attributed to this package in this
-        // project.
-        if let Some(pkg_project) = &package_project {
-            layers.push(load_policy(pkg_project, home_path, project_root_path));
-        }
+        let sources = self.file_policy_sources(ctx);
+        let layers: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                path.as_ref().map(|path| {
+                    load_policy(
+                        path,
+                        home_path,
+                        if index >= 4 { project_root_path } else { None },
+                    )
+                })
+            })
+            .collect();
 
         let mut merged = merge_layers(&layers);
 
@@ -610,19 +513,9 @@ impl PolicyStore {
         // the sandboxed agent so it cannot learn pre-approved paths and
         // craft bypasses. The DenyInodeCache fingerprints these by inode,
         // so hardlinks and symlink targets at any path are caught.
-        for path in [
-            Some(self.args.declarative.clone()),
-            home_path.map(|home| {
-                home.join(".config")
-                    .join("agent-sandbox")
-                    .join("policy.json")
-            }),
-            package_base,
-            package_home,
-            package_project,
-        ]
-        .into_iter()
-        .flatten()
+        for path in [0, 3, 1, 2, 5]
+            .into_iter()
+            .filter_map(|index| sources[index].clone())
         {
             merged.filesystem.deny.push(FilesystemRule {
                 path,
@@ -642,6 +535,119 @@ impl PolicyStore {
         }
 
         merged
+    }
+
+    /// Select file-policy candidates from an already resolved request context.
+    ///
+    /// Order is global, package base, package home, home, project, package
+    /// project. Package attribution must come from the daemon's context
+    /// resolver. Entries 4 and 5 must also pass project-root containment when
+    /// read; selecting paths does not establish snapshot freshness.
+    #[must_use]
+    pub fn file_policy_sources(&self, ctx: &ResolvedRequestContext) -> [Option<PathBuf>; 6] {
+        let home = ctx.paths.home();
+        let project = ctx.paths.project_root();
+        let (package_base, package_home, package_project) = ctx
+            .package
+            .as_deref()
+            .filter(|name| validate_package_name(name).is_ok())
+            .map(|name| self.package_layer_paths(name, home, project))
+            .unwrap_or_default();
+        [
+            Some(self.args.declarative.clone()),
+            package_base,
+            package_home,
+            home.map(|home| home.join(".config/agent-sandbox/policy.json")),
+            home.and(project)
+                .and_then(|root| trusted_project_policy_path(root).ok()),
+            package_project,
+        ]
+    }
+
+    /// Observe and compile the file layers selected by this daemon.
+    ///
+    /// The context must already be resolved by the daemon. Additional sources
+    /// include the DNS cache and any other files that can revoke eligibility.
+    /// Watch-only paths retain socket identities without reading policy bytes.
+    /// The caller retains the returned observation through the grant lifetime
+    /// and establishes runtime, registration, and mount validity before
+    /// publish.
+    ///
+    /// # Errors
+    /// Refuses failed observation, changing project roots, and invalid policy
+    /// documents. An error leaves the request on normal userspace enforcement.
+    pub fn observe_file_network_grants(
+        &self,
+        pins: &Path,
+        cgroup: u64,
+        ctx: &ResolvedRequestContext,
+        endpoints: &[std::net::SocketAddrV4],
+        additional_sources: &[&Path],
+        watch_only: &[&Path],
+    ) -> std::io::Result<(
+        agent_sandbox_core::network_snapshot::ObservedNetworkSources,
+        Vec<std::net::SocketAddrV4>,
+    )> {
+        use agent_sandbox_core::network_snapshot::{
+            ObservedNetworkSources, compile_file_network_grants,
+        };
+
+        let sources = self.file_policy_candidates(ctx);
+        let root = ctx
+            .paths
+            .project_root()
+            .map(Path::canonicalize)
+            .transpose()?;
+        let paths: Vec<_> = sources
+            .iter()
+            .filter_map(Option::as_deref)
+            .chain(additional_sources.iter().copied())
+            .collect();
+        let observed =
+            ObservedNetworkSources::capture_with_watches(pins, cgroup, &paths, watch_only)?;
+        if ctx
+            .paths
+            .project_root()
+            .map(Path::canonicalize)
+            .transpose()?
+            != root
+        {
+            return Err(std::io::Error::other(
+                "project root changed during observation",
+            ));
+        }
+        let mut layers = std::array::from_fn(|_| None);
+        let mut position = 0;
+        for (index, source) in sources.iter().enumerate() {
+            if source.is_none() {
+                continue;
+            }
+            let contained = index < 4
+                || root.as_ref().is_some_and(|root| {
+                    (index != 4 || (root != Path::new("/") && root.file_name().is_some()))
+                        && observed
+                            .resolved_path(position)
+                            .is_some_and(|path| path.starts_with(root))
+                });
+            if contained {
+                layers[index].clone_from(&observed.documents[position]);
+            }
+            position += 1;
+        }
+        let grants = compile_file_network_grants(&layers, endpoints)?;
+        Ok((observed, grants))
+    }
+
+    fn file_policy_candidates(&self, ctx: &ResolvedRequestContext) -> [Option<PathBuf>; 6] {
+        let mut sources = self.file_policy_sources(ctx);
+        // Watch the logical path even when its current target escapes the
+        // project. Retargeting it can introduce a deny into the next merge.
+        sources[4] = ctx
+            .paths
+            .home()
+            .and_then(|_| ctx.paths.project_root())
+            .map(|root| root.join(".agent-sandbox/policy.json"));
+        sources
     }
 
     /// Paths of the three per-package policy sources for `package`.
@@ -689,12 +695,6 @@ impl PolicyStore {
             tokio::task::block_in_place(|| self.merged_for(&ctx))
         } else {
             self.merged_for(&ctx)
-        }
-    }
-
-    pub(crate) fn invalidate_merged_policy_cache(&self) {
-        if let Ok(mut cache) = self.merged_cache.lock() {
-            cache.entries.clear();
         }
     }
 
@@ -788,22 +788,12 @@ fn validate_package_name(package: &str) -> Result<(), PolicydError> {
 /// The comm field (parenthesised, may contain spaces) is skipped by taking
 /// everything after the last `)`. The state field is then skipped, and the
 /// next field is the parent pid.
-fn read_proc_ppid(pid: u32) -> Option<u32> {
+pub(super) fn read_proc_ppid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let end = stat.rfind(')')?;
     let mut fields = stat[end + 1..].split_whitespace();
     fields.next()?;
     fields.next()?.parse().ok()
-}
-
-fn policy_file_mtime(path: &Path) -> Option<super::types::MtimeKey> {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-
-    Some(super::types::MtimeKey {
-        secs: duration.as_secs(),
-        nanos: duration.subsec_nanos(),
-    })
 }
 
 #[cfg(test)]
@@ -948,7 +938,6 @@ mod tests {
 
         assert_eq!(resolved.sandbox_session_id.as_deref(), Some("sandbox-desc"));
         assert_eq!(resolved.package.as_deref(), Some("codex"));
-
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1013,6 +1002,7 @@ mod tests {
         // jail-local, so the broker's host peer pid is used for
         // verification, and the descendant check alone would reject it.
         let store = test_store();
+
         let uid = nix::unistd::getuid().as_raw();
         let root_pid = std::process::id();
         let broker_pid = read_proc_ppid(root_pid).expect("parent of the test process");
@@ -1029,6 +1019,10 @@ mod tests {
                 project_root: PathBuf::from("/work/project"),
                 package: Some("codex".into()),
                 launcher_pid,
+                launcher_start_ticks: agent_sandbox_core::socket_owner::process_start_time_ticks(
+                    launcher_pid,
+                )
+                .expect("launcher start time"),
             });
         }
 
@@ -1064,6 +1058,7 @@ mod tests {
         // rather than under it. The verification must use the authenticated
         // peer's host pid, not the tracee pid.
         let store = test_store();
+
         let uid = nix::unistd::getuid().as_raw();
         let root_pid = std::process::id();
         let peer_pid = read_proc_ppid(root_pid).expect("parent of the test process");
@@ -1080,6 +1075,10 @@ mod tests {
                 project_root: PathBuf::from("/work/project"),
                 package: Some("codex".into()),
                 launcher_pid,
+                launcher_start_ticks: agent_sandbox_core::socket_owner::process_start_time_ticks(
+                    launcher_pid,
+                )
+                .expect("launcher start time"),
             });
         }
 
@@ -1268,7 +1267,9 @@ mod tests {
 
         // A peer that is not a descendant of the launcher (init, pid 1)
         // must not be adopted as the root of a pre-registered session.
-        store.note_sandbox_peer(TrustedPeer { pid: 1, uid: 1000 }, "sandbox-a");
+        store
+            .note_sandbox_peer(TrustedPeer { pid: 1, uid: 1000 }, "sandbox-a")
+            .expect("record sandbox peer");
 
         let sessions = store
             .sandbox_sessions
@@ -1292,13 +1293,15 @@ mod tests {
 
         let child_pid = child.id();
 
-        store.note_sandbox_peer(
-            TrustedPeer {
-                pid: child_pid,
-                uid: 1000,
-            },
-            "sandbox-a",
-        );
+        store
+            .note_sandbox_peer(
+                TrustedPeer {
+                    pid: child_pid,
+                    uid: 1000,
+                },
+                "sandbox-a",
+            )
+            .expect("record sandbox peer");
 
         let sessions = store
             .sandbox_sessions
@@ -1407,7 +1410,9 @@ mod tests {
             .register_sandbox("sandbox-a", "omp", 1000, launcher, pid)
             .expect("register sandbox");
 
-        store.note_sandbox_peer(TrustedPeer { pid, uid: 1000 }, "sandbox-a");
+        store
+            .note_sandbox_peer(TrustedPeer { pid, uid: 1000 }, "sandbox-a")
+            .expect("record sandbox peer");
 
         let sessions = store
             .sandbox_sessions
@@ -1648,7 +1653,10 @@ mod tests {
         );
 
         let store = package_store(&dir, &[("omp", base.clone())]);
-        let merged = store.merged_for(&omp_context(home, project, None));
+        let ctx = omp_context(home, project, None);
+        let sources = store.file_policy_sources(&ctx);
+        assert!([1, 2, 5].into_iter().all(|index| sources[index].is_none()));
+        let merged = store.merged_for(&ctx);
 
         assert!(
             !fs_allowed(&merged, "/granted/base"),
@@ -1667,6 +1675,38 @@ mod tests {
                 .iter()
                 .any(|r| r.path == base || r.path.ends_with("packages/omp.json")),
             "unattributed session must not inherit package policy file denies"
+        );
+    }
+
+    #[test]
+    fn selected_project_sources_still_require_containment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(project.join(".agent-sandbox/packages")).expect("project");
+        let external = dir.path().join("external.json");
+        write_fs_policy(&external, &["/escaped-grant"], &[]);
+        let project_file = project.join(".agent-sandbox/policy.json");
+        let package_file = project.join(".agent-sandbox/packages/omp.json");
+        std::os::unix::fs::symlink(&external, &project_file).expect("project symlink");
+        std::os::unix::fs::symlink(&external, &package_file).expect("package symlink");
+        let store = package_store(&dir, &[]);
+        let ctx = omp_context(home, project, Some("omp"));
+        let sources = store.file_policy_sources(&ctx);
+        assert!(sources[4].is_none());
+        assert_eq!(sources[5].as_ref(), Some(&package_file));
+        let candidates = store.file_policy_candidates(&ctx);
+        assert_eq!(candidates[4].as_ref(), Some(&project_file));
+        assert_eq!(candidates[5].as_ref(), Some(&package_file));
+        let merged = store.merged_for(&ctx);
+        assert!(!fs_allowed(&merged, "/escaped-grant"));
+        assert!(
+            merged
+                .filesystem
+                .deny
+                .iter()
+                .any(|rule| rule.path == package_file)
         );
     }
 
@@ -1710,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn package_file_mtime_change_invalidates_merged_cache() {
+    fn package_file_change_refreshes_merged_policy() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         let project = dir.path().join("repo");
@@ -1750,13 +1790,15 @@ mod tests {
             .register_sandbox("s1", "omp", 1000, launcher, owner_pid)
             .expect("register sandbox");
 
-        store.note_sandbox_peer(
-            TrustedPeer {
-                pid: owner_pid,
-                uid: 1000,
-            },
-            "s1",
-        );
+        store
+            .note_sandbox_peer(
+                TrustedPeer {
+                    pid: owner_pid,
+                    uid: 1000,
+                },
+                "s1",
+            )
+            .expect("record sandbox peer");
 
         let parent_pid = std::fs::read_to_string(format!("/proc/{owner_pid}/stat"))
             .ok()

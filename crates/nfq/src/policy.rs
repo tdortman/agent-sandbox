@@ -66,15 +66,23 @@ pub async fn check_destination(
 pub async fn register_network_flow(
     client: &mut PersistentRpcClient,
     registration: FlowRegistration,
+    owner_fd_hint: Option<u32>,
     timeout: Duration,
 ) -> std::io::Result<bool> {
     let response = client
-        .request(RpcRequest::RegisterNetworkFlow { registration }, timeout)
+        .request(
+            RpcRequest::RegisterNetworkFlow {
+                registration,
+                owner_fd_hint,
+            },
+            timeout,
+        )
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 
     match response {
         RpcReply::Simple(reply) => Ok(reply.ok),
+
         RpcReply::Error(error) => {
             client.invalidate();
             Err(std::io::Error::other(error.error))
@@ -101,7 +109,7 @@ pub fn is_bypass_traffic(dst_ip: IpAddr, dst_port: u16, dns_server_ip: IpAddr) -
 /// return `Verdict::Repeat` so nftables re-evaluates and rejects the packet.
 ///
 /// Falls back to `Verdict::Drop` if nft add fails.
-fn nft_reject_and_repeat(nft_binary: &str, dst_ip: IpAddr, dst_port: u16) -> Verdict {
+pub fn nft_reject_and_repeat(nft_binary: &str, dst_ip: IpAddr, dst_port: u16) -> Verdict {
     let set_name = match dst_ip {
         IpAddr::V4(_) => "reject_v4",
         IpAddr::V6(_) => "reject_v6",
@@ -219,9 +227,9 @@ pub fn transport_check(
 
     if let Ok(mut bindings) = state.approved_bindings.lock() {
         bindings.record(&hostname, &dst_ip);
-        let _ = bindings.save();
     }
 
+    state.notify_approved_bindings();
     TransportCheck::Allowed(AllowedDestination { hostname, dst_ip })
 }
 
@@ -315,14 +323,12 @@ mod tests {
     #[test]
     fn nft_reject_returns_repeat_when_insertion_succeeds() {
         let v = nft_reject_and_repeat("true", IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
-
         assert_eq!(v, Verdict::Repeat);
     }
 
     #[test]
     fn nft_reject_falls_back_to_drop_on_failure() {
         let v = nft_reject_and_repeat("false", IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
-
         assert_eq!(v, Verdict::Drop);
     }
 
@@ -344,7 +350,6 @@ mod tests {
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
-
         assert_eq!(v, Verdict::Accept);
 
         assert_eq!(
@@ -365,11 +370,8 @@ mod tests {
             .remember_ephemeral("93.184.216.34", "example.com", 300);
 
         let pkt = build_udp_data_packet(443);
-
         let mut check = |_: CheckDestinationArgs<'_>| Ok(true);
-
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
-
         assert_eq!(v, Verdict::Accept);
 
         let aliases = state

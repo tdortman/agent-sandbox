@@ -63,14 +63,17 @@ impl PolicyStore {
         approver_uid: Option<u32>,
     ) -> bool {
         let inner = self.inner.lock().await;
+
         let ui_session_id = inner
             .ui_clients
             .get(&client_id)
             .map(|client| client.session_id.as_str())
             .or(ui_session_id);
+
         let ui_authorized = ui_session_id
             .and_then(|session_id| {
                 let ctx = inner.ui_context_by_session.get(session_id)?;
+
                 inner
                     .ui_clients
                     .get(&ctx.client_id)
@@ -81,6 +84,7 @@ impl PolicyStore {
                 ctx.sandbox_session_id.as_deref() == sandbox_session_id
                     && approver_uid.is_none_or(|uid| uid > 0 && ctx.owner_uid == Some(uid))
             });
+
         drop(inner);
 
         if ui_authorized {

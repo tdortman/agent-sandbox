@@ -28,6 +28,7 @@ use crate::{
 pub struct ProxyReply {
     /// Identifier of the request this reply answers.
     pub request_id: ProxyRequestId,
+
     /// The body of the reply for the pipelined request.
     pub reply: ProxyReplyBody,
 }
@@ -38,10 +39,13 @@ pub struct ProxyReply {
 pub enum ProxyReplyBody {
     /// Reply to an HTTP check request.
     HttpCheck(HttpCheckReply),
+
     /// Reply to a network-flow check request.
     NetworkFlow(CheckReply),
+
     /// Reply acknowledging a canceled request.
     Canceled(SimpleOkReply),
+
     /// Failure reply.
     Error(ErrorReply),
 }
@@ -74,34 +78,56 @@ impl ProxyReply {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RpcReply {
+    /// Kernel-captured task and grants selected by the daemon's policy store.
+    NetworkSnapshot {
+        /// Captured task facts; no publisher-supplied path overrides.
+        context: Box<crate::network_snapshot::CapturedNetworkContext>,
+        /// Eligible literal TCP endpoints.
+        grants: Vec<std::net::SocketAddrV4>,
+    },
+
     /// Successful UI registration, echoing the assigned role and session.
     RegisterUi(RegisterUiReply),
+
     /// Reply to a pipelined proxy check or cancellation.
     Proxy(ProxyReply),
+
     /// Result of starting a proxied proxy session.
     ProxySession(ProxySessionReply),
+
     /// Result of claiming a network flow attribution.
     FlowClaim(FlowClaimReply),
+
     /// Filesystem access check result.
     FilesystemCheck(FilesystemCheckReply),
+
     /// Resource access check result.
     ResourceCheck(ResourceCheckReply),
+
     /// D-Bus access check result.
     DbusCheck(DbusCheckReply),
+
     /// Result of starting or stopping a filesystem monitor.
     FilesystemMonitor(FilesystemMonitorReply),
+
     /// HTTP access check result.
     HttpCheck(HttpCheckReply),
+
     /// Network flow access check result.
     Check(CheckReply),
+
     /// Result of an elevation attempt.
     Elevate(ElevateReply),
+
     /// Payload of a successful approve/deny/approve-host scope action.
     ScopeAction(ScopeActionReply),
+
     /// Process status: the merged policy and pending push requests.
     Status(StatusReply),
+
     /// Failure reply.
     Error(ErrorReply),
+
     /// Minimal success acknowledgment.
     Simple(SimpleOkReply),
 }
@@ -154,6 +180,7 @@ impl<'de> Deserialize<'de> for RpcReply {
 pub struct ErrorReply {
     /// Always `false` for an error reply.
     pub ok: bool,
+
     /// Human-readable description of the failure.
     pub error: String,
 }
@@ -198,8 +225,10 @@ impl SimpleOkReply {
 pub struct RegisterUiReply {
     /// Whether registration succeeded.
     pub ok: bool,
+
     /// The role granted to the registering UI session.
     pub role: String,
+
     /// Identifier of the register UI session.
     pub session_id: String,
 }
@@ -213,16 +242,22 @@ pub enum VerdictSource {
         /// The policy comment authorizing the verdict, when present.
         comment: Option<String>,
     },
+
     /// A verdict granted via an approval scope (once, session, project, …).
     Scope(ApprovalScope),
+
     /// A verdict arrived at because the requesting user matched the policy.
     User,
+
     /// The request was blocked outright rather than judged by policy.
     Blocked,
+
     /// The request targets static lookup-only content.
     Static,
+
     /// The request is infrastructure traffic outside the requestable scope.
     Infrastructure,
+
     /// The request targets port zero (invalid / reserved).
     PortZero,
 }
@@ -321,6 +356,7 @@ impl fmt::Display for VerdictSource {
 pub struct Verdict {
     /// Whether the request was allowed.
     pub allowed: bool,
+
     /// The source that produced the verdict.
     pub source: VerdictSource,
 }
@@ -372,6 +408,7 @@ impl Serialize for Verdict {
             .source
             .to_wire(self.allowed)
             .map_err(serde::ser::Error::custom)?;
+
         let mut state = serializer.serialize_struct("Verdict", 2)?;
         state.serialize_field("allowed", &self.allowed)?;
         state.serialize_field("source", source.as_ref())?;
@@ -392,6 +429,7 @@ impl<'de> Deserialize<'de> for Verdict {
         D: Deserializer<'de>,
     {
         let wire = WireVerdict::deserialize(deserializer)?;
+
         Ok(Self {
             allowed: wire.allowed,
             source: VerdictSource::from_wire(wire.allowed, &wire.source)
@@ -412,9 +450,11 @@ impl From<ApprovalScope> for VerdictSource {
 pub struct CheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
+
     /// Whether the network flow is permitted and where the verdict came from.
     #[serde(flatten)]
     pub verdict: Verdict,
+
     /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -459,12 +499,15 @@ impl CheckReply {
 pub struct HttpCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
+
     /// Whether the HTTP request is permitted and where the verdict came from.
     #[serde(flatten)]
     pub verdict: Verdict,
+
     /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+
     /// The normalized request echoed back on an allowed verdict.
     pub request: Option<HttpRequest>,
 }
@@ -499,6 +542,7 @@ impl HttpCheckReply {
 pub struct ProxySessionReply {
     /// Whether the session was created.
     pub ok: bool,
+
     /// The token identifying the proxied session.
     pub proxy_session: ProxySessionToken,
 }
@@ -509,10 +553,13 @@ pub struct ProxySessionReply {
 pub struct FlowClaimReply {
     /// Whether the flow was claimed.
     pub ok: bool,
+
     /// The attribution token granted for the flow.
     pub attribution_token: AttributionToken,
+
     /// The network flow that was claimed.
     pub flow: NetworkFlowKey,
+
     /// The normalized policy host matched for the flow.
     pub policy_host: NormalizedPolicyHost,
 }
@@ -523,8 +570,10 @@ pub struct FlowClaimReply {
 pub struct NetworkFlowCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
+
     /// Whether the network flow is permitted.
     pub allowed: bool,
+
     /// Wire-level verdict source string.
     pub source: String,
 
@@ -538,12 +587,16 @@ pub struct NetworkFlowCheckReply {
 pub struct ElevateReply {
     /// Whether the elevation request was processed.
     pub ok: bool,
+
     /// Whether elevation was permitted.
     pub allowed: bool,
+
     /// Exit code of the elevated process, or `1` when denied or failed.
     pub exit_code: i32,
+
     /// Captured standard output of the elevated process.
     pub stdout: String,
+
     /// Captured standard error of the elevated process or denial reason.
     pub stderr: String,
 }
@@ -591,14 +644,18 @@ impl ElevateReply {
 pub struct FilesystemCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
+
     /// Whether the filesystem access is permitted and where the verdict came
     /// from.
     #[serde(flatten)]
     pub verdict: Verdict,
+
     /// The path subjected to the check.
     pub path: PathBuf,
+
     /// The filesystem access mode checked.
     pub access: FileAccess,
+
     /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -647,16 +704,21 @@ impl FilesystemCheckReply {
 pub struct ResourceCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
+
     /// Whether the resource access is permitted and where the verdict came
     /// from.
     #[serde(flatten)]
     pub verdict: Verdict,
+
     /// The kind of resource checked.
     pub kind: ResourceKind,
+
     /// The resource path or device subjected to the check.
     pub path: PathBuf,
+
     /// The resource access mode checked.
     pub access: ResourceAccess,
+
     /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -727,11 +789,14 @@ impl ResourceCheckReply {
 pub struct DbusCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
+
     /// Whether the D-Bus access is permitted and where the verdict came from.
     #[serde(flatten)]
     pub verdict: Verdict,
+
     /// The D-Bus target subjected to the check.
     pub target: DbusTarget,
+
     /// Human-readable failure detail, present when the verdict denies access.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -777,6 +842,7 @@ impl DbusCheckReply {
 pub struct FilesystemMonitorReply {
     /// Whether the request was processed.
     pub ok: bool,
+
     /// Whether the filesystem monitor is currently active.
     pub active: bool,
 
@@ -814,90 +880,121 @@ pub enum ScopeActionReply {
     Network {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The host the scope was granted for.
         host: String,
+
         /// The port the scope was granted for.
         port: u16,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the scope was keyed on, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
     },
+
     /// Success payload for an HTTP scope action.
     Http {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The HTTP rule target the scope was granted for.
         target: HttpRuleTarget,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the scope was keyed on, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
     },
+
     /// Success payload for a sudo scope action.
     Sudo {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The command arguments the sudo scope was granted for.
         argv: Vec<String>,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the scope was keyed on, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
     },
+
     /// Success payload for an elevation scope action.
     Elevation {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the scope was keyed on, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
+
         /// Whether elevation was approved.
         allowed: bool,
     },
+
     /// Success payload for a filesystem scope action.
     Filesystem {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The path the scope was granted for.
         path: PathBuf,
+
         /// The filesystem access mode the scope was granted for.
         access: FileAccess,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the granted scope points at, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         policy_path: Option<PathBuf>,
     },
+
     /// Success payload for a resource scope action.
     Resource {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The resource kind the scope was granted for.
         kind: ResourceKind,
+
         /// The resource path the scope was granted for.
         path: PathBuf,
+
         /// The resource access mode the scope was granted for.
         access: ResourceAccess,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the granted scope points at, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         policy_path: Option<PathBuf>,
     },
+
     /// Success payload for a D-Bus scope action.
     Dbus {
         /// Whether the scope action was applied.
         ok: bool,
+
         /// The D-Bus target the scope was granted for.
         target: DbusTarget,
+
         /// The granted approval scope as a string.
         scope: String,
+
         /// The policy path the scope was keyed on, when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
@@ -1039,6 +1136,7 @@ impl ScopeActionReply {
             | Self::Sudo { path, .. }
             | Self::Elevation { path, .. }
             | Self::Dbus { path, .. } => path.as_deref(),
+
             Self::Filesystem { path, .. } | Self::Resource { path, .. } => Some(path.as_path()),
         }
     }
@@ -1049,8 +1147,10 @@ impl ScopeActionReply {
 pub struct StatusReply {
     /// Whether the status was retrieved.
     pub ok: bool,
+
     /// The currently merged policy.
     pub merged: Policy,
+
     /// Summaries of pending push requests awaiting approval.
     pub pending: Vec<super::push::PendingSummary>,
 }

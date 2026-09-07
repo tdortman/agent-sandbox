@@ -20,6 +20,70 @@ use nix::{
     unistd::Pid,
 };
 
+/// Run a BPF syscall program with no input context and return its verdict.
+///
+/// # Errors
+/// Returns the kernel error when the descriptor cannot be run.
+pub fn bpf_run_syscall_program(program: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut attr = [0_u8; 80];
+    attr[..4].copy_from_slice(&program.as_raw_fd().to_ne_bytes());
+    // SAFETY: BPF_PROG_TEST_RUN reads/writes this live, zeroed attr buffer.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_bpf, 10, attr.as_mut_ptr(), attr.len()) })?;
+    Ok(u32::from_ne_bytes([attr[4], attr[5], attr[6], attr[7]]))
+}
+
+/// Prevent future userspace writes to a BPF map.
+///
+/// # Errors
+/// Returns the kernel error for an invalid, already frozen, or busy map.
+pub fn bpf_freeze_map(map: BorrowedFd<'_>) -> io::Result<()> {
+    let attr = map.as_raw_fd().to_ne_bytes();
+    // SAFETY: BPF_MAP_FREEZE reads the map_fd from this live four-byte attr.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_bpf, 22, attr.as_ptr(), attr.len()) })?;
+    Ok(())
+}
+
+/// Create a BPF map and return its descriptor, closed on drop.
+///
+/// `map_type` is a `BPF_MAP_TYPE_*` value. Sizes and entry count follow the
+/// kernel layout the caller installs.
+///
+/// # Errors
+/// Returns the kernel error for an unsupported type or invalid layout.
+pub fn bpf_create_map(
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+) -> io::Result<OwnedFd> {
+    let mut attr = [0_u8; 64];
+    attr[..4].copy_from_slice(&map_type.to_ne_bytes());
+    attr[4..8].copy_from_slice(&key_size.to_ne_bytes());
+    attr[8..12].copy_from_slice(&value_size.to_ne_bytes());
+    attr[12..16].copy_from_slice(&max_entries.to_ne_bytes());
+    // SAFETY: BPF_MAP_CREATE reads this live, zeroed attr buffer.
+    let raw = unsafe { libc::syscall(libc::SYS_bpf, 0, attr.as_mut_ptr(), attr.len()) };
+    fd_from_syscall(raw)
+}
+
+/// Insert or replace one map element. Flags 0 (`BPF_ANY`) matches the
+/// single-writer publication flow; callers that must never overwrite an
+/// entry pass `BPF_NOEXIST`.
+///
+/// # Errors
+/// Returns the kernel error for an invalid map, key, value, or flag.
+pub fn bpf_map_update(map: BorrowedFd<'_>, key: &[u8], value: &[u8], flags: u64) -> io::Result<()> {
+    let mut attr = [0_u8; 32];
+    attr[..4].copy_from_slice(&map.as_raw_fd().to_ne_bytes());
+    attr[8..16].copy_from_slice(&(key.as_ptr() as usize).to_ne_bytes());
+    attr[16..24].copy_from_slice(&(value.as_ptr() as usize).to_ne_bytes());
+    attr[24..32].copy_from_slice(&flags.to_ne_bytes());
+    // SAFETY: BPF_MAP_UPDATE_ELEM reads map_fd, key, value, and flags from
+    // this live attr buffer; the key/value slices outlive the call.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_bpf, 2, attr.as_mut_ptr(), attr.len()) })?;
+    Ok(())
+}
+
 /// Open a pidfd referring to `pid` (Linux 5.3+ `pidfd_open(2)`).
 ///
 /// The returned `OwnedFd` closes the pidfd on drop.
@@ -77,6 +141,7 @@ pub fn renameat(
         )
     })
 }
+
 /// Create a hard link relative to trusted directory descriptors.
 ///
 /// # Errors
@@ -207,6 +272,7 @@ pub fn dup_tracee_fd(thread_id: u32, fd: i32) -> io::Result<OwnedFd> {
         }
         Err(error) => return Err(error),
     };
+
     pidfd_getfd(&pidfd, fd)
 }
 
@@ -425,6 +491,7 @@ pub const FAN_OPEN_PERM: u64 = libc::FAN_OPEN_PERM;
 
 /// Permission event mask for opening a file for executable execution.
 pub const FAN_OPEN_EXEC_PERM: u64 = libc::FAN_OPEN_EXEC_PERM;
+
 /// Permission event mask for file access (read/write/traverse).
 pub const FAN_ACCESS_PERM: u64 = libc::FAN_ACCESS_PERM;
 
@@ -433,6 +500,7 @@ pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
 /// fanotify response value permitting the requested access.
 pub const FAN_ALLOW: u32 = 0x01;
+
 /// fanotify response value denying the requested access.
 pub const FAN_DENY: u32 = 0x02;
 
@@ -572,6 +640,7 @@ pub const fn fanotify_event(bytes: &[u8]) -> Option<FanotifyEventMetadata> {
 pub struct FanotifyResponse {
     /// Fd of the event the response acknowledges.
     pub fd: i32,
+
     /// `FAN_ALLOW` or `FAN_DENY` verdict for the permission event.
     pub response: u32,
 }

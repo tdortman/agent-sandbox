@@ -1,6 +1,11 @@
 //! Load and atomically write policy JSON on disk.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    io::Read as _,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 use crate::{
     hosts::NetworkSortKey,
@@ -69,9 +74,42 @@ fn load_policy_inner(path: &Path, project_root: Option<&Path>) -> std::io::Resul
         ));
     }
 
-    let data = std::fs::read_to_string(&read_path)?;
+    let mut data = String::new();
 
-    let mut policy = serde_json::from_str::<Policy>(&data).map_err(|error| {
+    std::fs::File::open(&read_path)?
+        .take((MAX_POLICY_JSON_BYTES + 1) as u64)
+        .read_to_string(&mut data)?;
+
+    parse_policy(&data).map(Some)
+}
+
+/// Parse a policy snapshot using the same size, schema, and rule limits as file
+/// loading. Path expansion is left to the caller's policy context.
+///
+/// # Errors
+/// Returns an error for oversized input, invalid fields, or excessive rule
+/// counts.
+pub fn parse_policy(data: &str) -> std::io::Result<Policy> {
+    if data.len() > MAX_POLICY_JSON_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "policy JSON exceeds the maximum size",
+        ));
+    }
+
+    // Cache syntax by complete content. Callers establish freshness; path
+    // expansion remains specific to the caller's context.
+    static PARSED: OnceLock<Mutex<HashMap<String, Policy>>> = OnceLock::new();
+
+    let parsed = PARSED.get_or_init(Mutex::default);
+
+    if let Ok(cache) = parsed.lock()
+        && let Some(policy) = cache.get(data)
+    {
+        return Ok(policy.clone());
+    }
+
+    let mut policy = serde_json::from_str::<Policy>(data).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid policy fields: {error}"),
@@ -97,7 +135,17 @@ fn load_policy_inner(path: &Path, project_root: Option<&Path>) -> std::io::Resul
         .deny
         .retain(|rule| rule.target().is_ok());
 
-    Ok(Some(policy))
+    if let Ok(mut cache) = parsed.lock() {
+        // ponytail: clear at 32 documents; use LRU eviction if varied policy
+        // contents cause measurable churn. The file-size limit bounds memory.
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+
+        cache.insert(data.to_owned(), policy.clone());
+    }
+
+    Ok(policy)
 }
 
 fn network_rule_sort_key(rule: &NetworkRule) -> NetworkSortKey {
@@ -718,6 +766,18 @@ mod tests {
         assert_eq!(
             loaded.filesystem.deny[0].path,
             Path::new("/home/user/.cache/secret")
+        );
+
+        let other = load_policy(&path, Some(Path::new("/home/other")), None);
+
+        assert_eq!(
+            other.filesystem.allow[0].path,
+            Path::new("/home/other/.local/share/foo")
+        );
+
+        assert_eq!(
+            other.filesystem.deny[0].path,
+            Path::new("/home/other/.cache/secret")
         );
     }
 

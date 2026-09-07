@@ -9,7 +9,7 @@ name = "agent-sandbox-policyd"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-core = { path = "../core" }
+agent-sandbox-core.workspace = true
 
 clap = { workspace = true, features = ["env"] }
 nix = { workspace = true, features = ["user"] }

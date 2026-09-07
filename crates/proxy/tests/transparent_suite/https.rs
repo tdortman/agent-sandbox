@@ -203,7 +203,7 @@ async fn transparent_http2_downstream_falls_back_to_http11_without_alpn() {
 
     drop(conn);
     wait_for_release(&harness).await;
-    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
     let events = harness.policy_events();
     let events = events.lock().expect("policy events lock");
     assert_eq!(events.checks.len(), 1);

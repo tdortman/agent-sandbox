@@ -32,6 +32,111 @@ use rustls::pki_types::pem::PemObject;
 
 use super::{BoxError, ech::UpstreamEch, session::SessionProtocol};
 
+// Resolve once, then alternate address families and start another attempt every
+// 250 ms. Dropping the losing futures cancels their in-progress handshakes.
+async fn staggered_connect<T, F: Future<Output = Result<T, BoxError>>>(
+    mut addresses: Vec<SocketAddr>,
+    connect: impl Fn(SocketAddr) -> F,
+) -> Result<T, BoxError> {
+    addresses.dedup();
+    for index in 1..addresses.len() {
+        if let Some(next) = (index..addresses.len())
+            .find(|&next| addresses[next].is_ipv4() != addresses[index - 1].is_ipv4())
+        {
+            addresses[index..=next].rotate_right(1);
+        }
+    }
+    let mut addresses = addresses.into_iter();
+    let mut pending = Vec::new();
+    let mut last_error = BoxError::from("origin resolved to no addresses");
+    let delay = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(delay);
+    loop {
+        if pending.is_empty() || delay.is_elapsed() {
+            if let Some(address) = addresses.next() {
+                pending.push(Box::pin(connect(address)));
+                delay
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+            } else if pending.is_empty() {
+                return Err(last_error);
+            }
+        }
+        tokio::select! {
+            result = poll_fn(|cx| {
+                for (index, attempt) in pending.iter_mut().enumerate() {
+                    if let Poll::Ready(result) = attempt.as_mut().poll(cx) {
+                        return Poll::Ready((index, result));
+                    }
+                }
+                Poll::Pending
+            }) => {
+                let (index, result) = result;
+                drop(pending.remove(index));
+                match result {
+                    Ok(connection) => return Ok(connection),
+                    Err(error) => last_error = error,
+                }
+            }
+            () = &mut delay, if addresses.len() > 0 => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn address_race_staggers_families_cancels_losers_and_handles_failure() {
+    use std::sync::Mutex;
+    let addresses =
+        ["[::1]:1", "[::1]:2", "127.0.0.1:3"].map(|address| address.parse::<SocketAddr>().unwrap());
+    let started = Mutex::new(Vec::new());
+    let dropped = Mutex::new(Vec::new());
+    struct Attempt<'a>(&'a Mutex<Vec<u16>>, u16);
+    impl Drop for Attempt<'_> {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push(self.1);
+        }
+    }
+    let begin = tokio::time::Instant::now();
+    let winner = tokio::time::timeout(
+        Duration::from_secs(3),
+        staggered_connect(addresses.to_vec(), |address| {
+            let (dropped, started) = (&dropped, &started);
+            async move {
+                let _guard = Attempt(dropped, address.port());
+                started.lock().unwrap().push(address.port());
+                if address.is_ipv6() {
+                    std::future::pending::<()>().await;
+                }
+                Ok(address)
+            }
+        }),
+    )
+    .await
+    .expect("a stalled address must not block another family")
+    .unwrap();
+    assert_eq!(winner, addresses[2]);
+    assert_eq!(*started.lock().unwrap(), vec![1, 3]);
+    assert!(begin.elapsed() >= Duration::from_millis(250));
+    let mut dropped = dropped.into_inner().unwrap();
+    dropped.sort_unstable();
+    assert_eq!(dropped, vec![1, 3]);
+    let failures = Mutex::new(Vec::new());
+    assert!(
+        staggered_connect(addresses.to_vec(), |address| {
+            failures.lock().unwrap().push(address);
+            std::future::ready(Err::<(), _>(BoxError::from("unreachable")))
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(failures.into_inner().unwrap().len(), 3);
+    assert!(
+        staggered_connect(Vec::new(), |_| async { Ok(()) })
+            .await
+            .is_err()
+    );
+}
+
 pub(crate) enum IncomingWebTransportStream {
     Bidi(Box<h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>>),
     Uni(h3_webtransport::stream::RecvStream<h3_quinn::RecvStream, Bytes>),
@@ -49,6 +154,7 @@ pub struct UpstreamPool {
     connections: Arc<std::sync::Mutex<HashMap<UpstreamPoolKey, Weak<UpstreamConnection>>>>,
     tls: UpstreamTls,
     ech: UpstreamEch,
+    handshake_timeout: Duration,
 }
 
 /// Shared upstream TLS material: the crypto provider and the verified roots.
@@ -56,6 +162,7 @@ pub struct UpstreamPool {
 struct UpstreamTls {
     provider: Arc<rustls::crypto::CryptoProvider>,
     roots: Arc<rustls::RootCertStore>,
+    identities: Arc<crate::upstream_tls::UpstreamClientIdentities>,
 }
 
 impl UpstreamPool {
@@ -65,7 +172,17 @@ impl UpstreamPool {
     ///
     /// Returns an error when the client endpoint or its TLS configuration
     /// cannot be built.
-    pub fn new(ca_file: &Path, test_ech_dns: Option<SocketAddr>) -> Result<Self, BoxError> {
+    pub fn new(
+        ca_file: &Path,
+        test_ech_dns: Option<SocketAddr>,
+        handshake_timeout: Duration,
+        identities: Arc<crate::upstream_tls::UpstreamClientIdentities>,
+    ) -> Result<Self, BoxError> {
+        if handshake_timeout.is_zero() {
+            return Err(
+                std::io::Error::other("upstream QUIC handshake timeout must be positive").into(),
+            );
+        }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let pem = std::fs::read(ca_file)?;
 
@@ -96,8 +213,10 @@ impl UpstreamPool {
             tls: UpstreamTls {
                 provider,
                 roots: Arc::new(roots),
+                identities,
             },
             ech: UpstreamEch::new(test_ech_dns),
+            handshake_timeout,
         })
     }
 
@@ -120,22 +239,13 @@ impl UpstreamPool {
         security_context: Option<&AttributionToken>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
         let (host, port) = split_authority(authority)?;
-        let addresses = tokio::net::lookup_host((host, port)).await?;
-        let mut last_error = None;
-
-        for address in addresses {
-            match self
-                .connect_address(scheme, authority, host, address, security_context)
-                .await
-            {
-                Ok(connection) => return Ok(connection),
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            BoxError::from(format!("origin {authority} resolved to no addresses"))
-        }))
+        let addresses = tokio::net::lookup_host((host, port))
+            .await?
+            .collect::<Vec<_>>();
+        staggered_connect(addresses, |address| {
+            self.connect_address(scheme, authority, host, address, security_context)
+        })
+        .await
     }
 
     /// Get a live upstream connection for an origin authority at a known
@@ -195,7 +305,7 @@ impl UpstreamPool {
         }
 
         let connection = self
-            .establish(host, authority, address, pool_key.as_ref())
+            .establish(scheme, host, authority, address, pool_key.as_ref())
             .await?;
 
         if let Some(pool_key) = pool_key {
@@ -210,19 +320,22 @@ impl UpstreamPool {
 
     async fn establish(
         &self,
+        scheme: &str,
         host: &str,
         authority: &str,
         address: SocketAddr,
         pool_key: Option<&UpstreamPoolKey>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let client_config = self.client_config(host).await?;
+        let client_config = self
+            .client_config(host, &format!("{scheme}://{authority}"))
+            .await?;
 
         let connecting = self
             .endpoint
             .connect_with(client_config, address, host)
             .map_err(BoxError::from)?;
 
-        let connection = tokio::time::timeout(Duration::from_secs(2), connecting)
+        let connection = tokio::time::timeout(self.handshake_timeout, connecting)
             .await
             .map_err(|_| {
                 BoxError::from(format!("upstream QUIC handshake timed out for {authority}"))
@@ -288,7 +401,11 @@ impl UpstreamPool {
     /// A verified ECH configuration enables ECH for the handshake; a missing
     /// or unadvertised configuration keeps ordinary TLS. An unverifiable
     /// advertised configuration is an error, so the connection fails closed.
-    async fn client_config(&self, host: &str) -> Result<quinn::ClientConfig, BoxError> {
+    async fn client_config(
+        &self,
+        host: &str,
+        origin: &str,
+    ) -> Result<quinn::ClientConfig, BoxError> {
         let ech = self.ech.config_for(host).await?;
 
         // `with_ech` fixes TLS 1.3 as the only protocol version; the plain
@@ -306,6 +423,9 @@ impl UpstreamPool {
             .with_root_certificates(self.tls.roots.clone())
             .with_no_client_auth();
 
+        if let Some(resolver) = self.tls.identities.resolver(origin)? {
+            tls.client_auth_cert_resolver = resolver;
+        }
         tls.enable_early_data = false;
         tls.alpn_protocols = vec![b"h3".to_vec()];
 
@@ -313,7 +433,11 @@ impl UpstreamPool {
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(BoxError::from)?;
 
         let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
+        transport.max_idle_timeout(Some(
+            Duration::from_secs(10)
+                .max(self.handshake_timeout)
+                .try_into()?,
+        ));
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
         client_config.transport_config(Arc::new(transport));
         Ok(client_config)
@@ -631,6 +755,104 @@ impl UpstreamConnection {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn upstream_quic_scopes_mtls_and_honors_handshake_timeout() {
+        use std::{sync::Arc, time::Duration};
+
+        let identity = crate::upstream_tls::tests::TestIdentity::new();
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("DNS socket");
+        let dns_address = dns.local_addr().expect("DNS address");
+        let dns_task = tokio::spawn(async move {
+            let mut packet = [0; 4096];
+            loop {
+                let received = dns.recv_from(&mut packet).await.expect("DNS query");
+                let mut reply =
+                    hickory_proto::op::Message::from_vec(&packet[..received.0]).expect("query");
+                reply.metadata.message_type = hickory_proto::op::MessageType::Response;
+                dns.send_to(&reply.to_vec().expect("DNS response"), received.1)
+                    .await
+                    .expect("DNS reply");
+            }
+        });
+        let mut config = identity.server_config();
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        let config = quinn::crypto::rustls::QuicServerConfig::try_from(config).expect("QUIC TLS");
+        let endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(config)),
+            "127.0.0.1:0".parse().expect("address"),
+        )
+        .expect("endpoint");
+        let address = endpoint.local_addr().expect("server address");
+        let origin = format!("https://localhost:{}", address.port());
+        let pool = Arc::new(
+            super::UpstreamPool::new(
+                &identity.directory.path().join("ca.pem"),
+                Some(dns_address),
+                Duration::from_millis(50),
+                identity.identities(&origin),
+            )
+            .expect("pool"),
+        );
+        for matched in [true, false] {
+            let serving = endpoint.clone();
+            let server =
+                tokio::spawn(async move { serving.accept().await.expect("incoming").await });
+            let credential_origin = if matched {
+                origin.clone()
+            } else {
+                "https://localhost:1".into()
+            };
+            let config = pool
+                .client_config("localhost", &credential_origin)
+                .await
+                .expect("client config");
+            let connected = pool
+                .endpoint
+                .connect_with(config, address, "localhost")
+                .expect("connect")
+                .await;
+            let server_result = server.await.expect("server task");
+            assert_eq!(
+                server_result.is_ok(),
+                matched,
+                "mTLS must be scoped to the exact port"
+            );
+            if matched {
+                let client = connected.expect("authenticated connection");
+                let server = server_result.expect("server handshake");
+                let peer = server
+                    .peer_identity()
+                    .expect("client identity")
+                    .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                    .expect("certificate chain");
+                assert_eq!(peer[0], identity.chain[0]);
+                client.close(0_u32.into(), b"done");
+            }
+        }
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("blackhole");
+        let address = blackhole.local_addr().expect("blackhole address");
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.connect_to(
+                "https",
+                &format!("localhost:{}", address.port()),
+                address,
+                None,
+            ),
+        )
+        .await
+        .expect("configured timeout must fire before one second")
+        .err()
+        .expect("handshake must time out");
+        assert!(error.to_string().contains("handshake timed out"), "{error}");
+        dns_task.abort();
+        endpoint.close(0_u32.into(), b"done");
+    }
+
     #[test]
     fn client_builder_supports_webtransport_settings() {
         let mut builder = h3::client::builder();

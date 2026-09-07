@@ -309,6 +309,7 @@ impl PolicyStore {
                 attribution_token,
                 tx,
             });
+
         inner.pending.http_waiters.insert(
             ProxyCheckId {
                 session: proxy_session,
@@ -471,6 +472,7 @@ impl PolicyStore {
             .http_futures
             .remove(&pending_id)
             .unwrap_or_default();
+
         let mut live_waiters = Vec::with_capacity(waiters.len());
 
         for waiter in waiters {
@@ -759,12 +761,15 @@ mod tests {
         .expect("valid flow");
 
         store
-            .register_network_flow(FlowRegistration::new(
-                flow.clone(),
-                owner,
-                NormalizedPolicyHost::parse("example.com").expect("valid policy host"),
-                FlowContext::new(SandboxPaths::default(), Some("test-session".into())),
-            ))
+            .register_network_flow(
+                FlowRegistration::new(
+                    flow.clone(),
+                    owner,
+                    NormalizedPolicyHost::parse("example.com").expect("valid policy host"),
+                    FlowContext::new(SandboxPaths::default(), Some("test-session".into())),
+                ),
+                None,
+            )
             .await
             .expect("register flow");
 

@@ -135,18 +135,25 @@ impl ConnectionIdRegistry {
 pub struct Http3State {
     /// The policy session that decides every intercepted request.
     pub policy: Arc<PolicySession>,
+
     /// The certificate issuer serving downstream SNI names.
     pub issuer: CertificateIssuer,
+
     /// Signals the backend to shut down.
     pub shutdown: Arc<Notify>,
+
     /// Bounds the number of concurrency-limited policy checks.
     pub active_checks: Arc<Semaphore>,
+
     /// The upstream HTTP/3 connection pool.
     pub upstream: Arc<upstream::UpstreamPool>,
+
     /// The intercepted UDP destination port.
     pub destination_port: u16,
+
     /// The Alt-Svc store shared between the HTTP/3 and TCP legs.
     pub alt_svc: Arc<AltSvcStore>,
+
     pub(crate) connection_ids: Arc<ConnectionIdRegistry>,
 
     /// Downstream ECH configuration and key, shared with the TCP leg.
@@ -158,10 +165,19 @@ pub struct Http3State {
 pub struct Http3Config {
     /// The UDP port to listen on (0 requests an ephemeral port).
     pub listen_port: u16,
+
     /// Additional UDP ports advertised as `Alt-Svc` alternatives.
     pub alt_ports: Vec<u16>,
+
+    /// Maximum time for an upstream QUIC TLS handshake.
+    pub upstream_handshake_timeout: Duration,
+
+    /// Client credentials scoped to exact upstream HTTPS origins.
+    pub upstream_client_identities: Arc<crate::upstream_tls::UpstreamClientIdentities>,
+
     /// Test-only: a fixed destination to route associations to.
     pub test_destination: Option<SocketAddr>,
+
     /// Test-only: a fixed DNS address for ECH configuration.
     pub test_ech_dns: Option<SocketAddr>,
 }
@@ -189,7 +205,12 @@ pub fn prepare(
         .map(PathBuf::from)
         .ok_or_else(|| boxed("SSL_CERT_FILE is required to verify upstream HTTP/3 certificates"))?;
 
-    let upstream = Arc::new(upstream::UpstreamPool::new(&ca_file, config.test_ech_dns)?);
+    let upstream = Arc::new(upstream::UpstreamPool::new(
+        &ca_file,
+        config.test_ech_dns,
+        config.upstream_handshake_timeout,
+        config.upstream_client_identities,
+    )?);
     let transparent = config.test_destination.is_none();
 
     let mut state = Arc::new(Http3State {
@@ -411,6 +432,7 @@ fn downstream_tls_config(state: &Http3State) -> Result<quinn::ServerConfig, BoxE
 pub struct SandboxCertResolver {
     /// The certificate issuer used to mint leaf certificates.
     pub issuer: CertificateIssuer,
+
     /// The server name used when a client sends no SNI.
     pub fallback_name: String,
 }
@@ -432,10 +454,36 @@ impl rustls::server::ResolvesServerCert for SandboxCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let server_name = client_hello.server_name().unwrap_or(&self.fallback_name);
 
-        let issued = match self.issuer.issue(server_name) {
+        use rustls::SignatureScheme;
+
+        use crate::cert::LeafKeyAlgorithm;
+
+        // rustls filters these against the offered cipher suites for TLS 1.2.
+        let schemes = client_hello.signature_schemes();
+        let algorithm = if schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256) {
+            LeafKeyAlgorithm::EcdsaP256
+        } else if schemes.contains(&SignatureScheme::ECDSA_NISTP384_SHA384) {
+            LeafKeyAlgorithm::EcdsaP384
+        } else if schemes.iter().any(|scheme| {
+            matches!(
+                scheme,
+                SignatureScheme::RSA_PSS_SHA256
+                    | SignatureScheme::RSA_PSS_SHA384
+                    | SignatureScheme::RSA_PSS_SHA512
+                    | SignatureScheme::RSA_PKCS1_SHA256
+                    | SignatureScheme::RSA_PKCS1_SHA384
+                    | SignatureScheme::RSA_PKCS1_SHA512
+            )
+        }) {
+            LeafKeyAlgorithm::Rsa
+        } else {
+            return None;
+        };
+
+        let issued = match self.issuer.issue_with_algorithm(server_name, algorithm) {
             Ok(issued) => issued,
             Err(error) => {
-                tracing::warn!(server_name, %error, "HTTP/3 downstream certificate issue failed");
+                tracing::warn!(server_name, %error, "downstream certificate issue failed");
                 return None;
             }
         };
@@ -444,7 +492,7 @@ impl rustls::server::ResolvesServerCert for SandboxCertResolver {
         {
             Ok(signing_key) => signing_key,
             Err(error) => {
-                tracing::warn!(server_name, ?error, "HTTP/3 downstream signing key failed");
+                tracing::warn!(server_name, ?error, "downstream signing key failed");
                 return None;
             }
         };

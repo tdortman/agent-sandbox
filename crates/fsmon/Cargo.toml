@@ -13,8 +13,8 @@ name = "agent-sandbox-fsmon"
 path = "src/bin/agent-sandbox-fsmon.rs"
 
 [dependencies]
-agent-sandbox-core = { path = "../core" }
-agent-sandbox-sysutil = { path = "../sysutil" }
+agent-sandbox-core.workspace = true
+agent-sandbox-sysutil.workspace = true
 
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true

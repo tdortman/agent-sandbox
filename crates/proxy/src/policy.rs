@@ -10,15 +10,15 @@ use std::{
     num::NonZeroU16,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use agent_sandbox_core::{
     AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
-    NetworkFlowSelector, NormalizedPolicyHost, ProxyConnectionId, ProxyReply, ProxyReplyBody,
-    ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError, RpcConnection, RpcReply,
-    RpcRequest, policy_rpc,
+    NetworkFlowSelector, NormalizedPolicyHost, PersistentRpcClient, ProxyConnectionId, ProxyReply,
+    ProxyReplyBody, ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError,
+    RpcConnection, RpcReply, RpcRequest,
 };
 use rama_core::error::{BoxError, BoxErrorExt};
 use tokio::sync::{Notify, Semaphore};
@@ -30,23 +30,27 @@ use tokio::sync::{Notify, Semaphore};
 pub struct FlowClaim {
     /// The attribution token bound to the claimed flow.
     pub attribution_token: AttributionToken,
+
     /// The stable connection identifier owning this claim.
     pub connection_id: ProxyConnectionId,
+
     /// The claimed intercepted network flow.
     pub flow: NetworkFlowKey,
+
     /// The normalized policy host assigned to the flow.
     pub policy_host: NormalizedPolicyHost,
 }
 
 /// A long-lived policy session bound to one policyd instance.
 ///
-/// The session carries a stable token and serializes policy RPCs over a Unix
-/// socket. Each proxy holds one session; drops remove the readiness marker.
+/// The session carries a stable token and reuses idle Unix RPC connections.
+/// Concurrent requests use separate connections, including pending approvals.
+/// Each proxy holds one session; drops remove the readiness marker.
 pub struct PolicySession {
     /// The session lease: policyd closes the proxy session when this
-    /// connection ends, so it must outlive the session even though RPC
-    /// calls use fresh connections.
+    /// connection ends, so RPC failures must never close this lease.
     _connection: RpcConnection,
+    idle: Mutex<Vec<PersistentRpcClient>>,
 
     socket: PathBuf,
     token: ProxySessionToken,
@@ -61,7 +65,6 @@ pub struct PolicySession {
 pub struct PendingPolicyCheck {
     policy: Arc<PolicySession>,
     request_id: ProxyRequestId,
-
     armed: bool,
 }
 
@@ -144,11 +147,44 @@ impl PolicySession {
 
         Ok(Self {
             _connection: connection,
+            idle: Mutex::new(Vec::new()),
             socket,
             token: proxy_session,
             timeout,
             ready_path,
         })
+    }
+
+    async fn rpc<T>(
+        &self,
+        request: RpcRequest,
+        decode: impl FnOnce(RpcReply) -> Result<T, PolicyError>,
+    ) -> Result<T, PolicyError> {
+        let mut client = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+            .unwrap_or_else(|| PersistentRpcClient::new(&self.socket));
+        let reply = client
+            .request(request, self.timeout)
+            .await
+            .map_err(|error| PolicyError::Rpc(error.to_string()))?;
+        let result = decode(reply)?;
+        // Interrupted, failed, or malformed exchanges drop their connection.
+        // Never hold the idle-list lock across an RPC or wait for a busy client.
+        {
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // ponytail: retain eight idle clients; grow this if measured
+            // connection churn warrants using more of policyd's per-UID limit.
+            if idle.len() < 8 {
+                idle.push(client);
+            }
+        }
+        Ok(result)
     }
 
     /// Publish the readiness marker after both listeners are bound.
@@ -173,34 +209,15 @@ impl PolicySession {
     pub async fn claim(&self, flow: NetworkFlowKey) -> Result<FlowClaim, PolicyError> {
         let connection_id = ProxyConnectionId::new();
 
-        let reply = policy_rpc(
-            &self.socket,
+        self.rpc(
             RpcRequest::ClaimNetworkFlow {
                 proxy_session: self.token.clone(),
                 flow,
                 connection_id,
             },
-            self.timeout,
+            |reply| decode_flow_claim(reply, connection_id, "claim_network_flow"),
         )
         .await
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        if let RpcReply::FlowClaim(FlowClaimReply {
-            ok: true,
-            attribution_token,
-            flow,
-            policy_host,
-        }) = reply
-        {
-            Ok(FlowClaim {
-                attribution_token,
-                connection_id,
-                flow,
-                policy_host,
-            })
-        } else {
-            Err(PolicyError::UnexpectedReply("claim_network_flow"))
-        }
     }
 
     /// Claim one output-redirected UDP flow by its visible socket tuple.
@@ -222,8 +239,7 @@ impl PolicySession {
 
         let connection_id = ProxyConnectionId::new();
 
-        let reply = policy_rpc(
-            &self.socket,
+        self.rpc(
             RpcRequest::ClaimNetworkFlowBySource {
                 proxy_session: self.token.clone(),
                 selector: NetworkFlowSelector::new(
@@ -234,27 +250,9 @@ impl PolicySession {
                 ),
                 connection_id,
             },
-            self.timeout,
+            |reply| decode_flow_claim(reply, connection_id, "claim_network_flow_by_source"),
         )
         .await
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        if let RpcReply::FlowClaim(FlowClaimReply {
-            ok: true,
-            attribution_token,
-            flow,
-            policy_host,
-        }) = reply
-        {
-            Ok(FlowClaim {
-                attribution_token,
-                connection_id,
-                flow,
-                policy_host,
-            })
-        } else {
-            Err(PolicyError::UnexpectedReply("claim_network_flow_by_source"))
-        }
     }
 
     /// Rebind a claimed association to a migrated UDP path.
@@ -264,20 +262,16 @@ impl PolicySession {
     /// Returns an error when policyd rejects the attribution, connection
     /// identifier, owner, tuple, or destination.
     pub async fn rebind(&self, claim: &FlowClaim, flow: NetworkFlowKey) -> Result<(), PolicyError> {
-        let reply = policy_rpc(
-            &self.socket,
+        self.rpc(
             RpcRequest::RebindNetworkFlow {
                 proxy_session: self.token.clone(),
                 attribution_token: claim.attribution_token.clone(),
                 connection_id: claim.connection_id,
                 flow,
             },
-            self.timeout,
+            |reply| decode_simple_reply(reply, "rebind_network_flow"),
         )
         .await
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        decode_simple_reply(reply, "rebind_network_flow")
     }
 
     /// Ask policyd for a decision on one normalized HTTP request.
@@ -291,20 +285,16 @@ impl PolicySession {
         attribution_token: AttributionToken,
         request: HttpRequest,
     ) -> Result<HttpCheckReply, PolicyError> {
-        let reply = policy_rpc(
-            &self.socket,
+        self.rpc(
             RpcRequest::CheckHttp {
                 proxy_session: self.token.clone(),
                 request_id,
                 attribution_token,
                 request,
             },
-            self.timeout,
+            |reply| decode_http_check_reply(reply, request_id),
         )
         .await
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        decode_http_check_reply(reply, request_id)
     }
 
     /// Ask policyd for a decision on one normalized HTTP request, holding
@@ -351,18 +341,20 @@ impl PolicySession {
     ///
     /// Returns an error when the cancellation RPC fails.
     pub async fn cancel(&self, request_id: ProxyRequestId) -> Result<(), PolicyError> {
-        policy_rpc(
-            &self.socket,
+        self.rpc(
             RpcRequest::CancelCheck {
                 proxy_session: self.token.clone(),
                 request_id,
             },
-            self.timeout,
+            |reply| match reply {
+                RpcReply::Proxy(ProxyReply {
+                    request_id: reply_request_id,
+                    reply: ProxyReplyBody::Canceled(ok),
+                }) if reply_request_id == request_id && ok.ok => Ok(()),
+                _ => Err(PolicyError::UnexpectedReply("cancel_check")),
+            },
         )
         .await
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        Ok(())
     }
 
     /// Release a previously claimed intercepted flow.
@@ -372,19 +364,15 @@ impl PolicySession {
     /// Returns an error when the release RPC fails or policyd rejects the
     /// claim identifier.
     pub async fn release(&self, claim: &FlowClaim) -> Result<(), PolicyError> {
-        let reply = policy_rpc(
-            &self.socket,
+        self.rpc(
             RpcRequest::ReleaseNetworkFlow {
                 proxy_session: self.token.clone(),
                 attribution_token: claim.attribution_token.clone(),
                 connection_id: claim.connection_id,
             },
-            self.timeout,
+            |reply| decode_simple_reply(reply, "release_network_flow"),
         )
         .await
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        decode_simple_reply(reply, "release_network_flow")
     }
 
     fn clear_session_ready(&self) {
@@ -397,6 +385,29 @@ impl PolicySession {
 impl Drop for PolicySession {
     fn drop(&mut self) {
         self.clear_session_ready();
+    }
+}
+
+fn decode_flow_claim(
+    reply: RpcReply,
+    connection_id: ProxyConnectionId,
+    operation: &'static str,
+) -> Result<FlowClaim, PolicyError> {
+    if let RpcReply::FlowClaim(FlowClaimReply {
+        ok: true,
+        attribution_token,
+        flow,
+        policy_host,
+    }) = reply
+    {
+        Ok(FlowClaim {
+            attribution_token,
+            connection_id,
+            flow,
+            policy_host,
+        })
+    } else {
+        Err(PolicyError::UnexpectedReply(operation))
     }
 }
 
@@ -453,6 +464,7 @@ fn mark_session_ready(path: &Path) -> Result<(), PolicyError> {
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).map_err(|error| {
         PolicyError::Rpc(format!("set proxy readiness marker permissions: {error}"))
     })?;
+
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
 
@@ -588,7 +600,13 @@ pub fn reconcile_authorities(
 /// test can hold a decision pending while it exercises the shutdown path.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use agent_sandbox_core::{
         HttpCheckReply, HttpRequest, ProxyReply, ProxyRequestId, ProxySessionReply,
@@ -611,6 +629,7 @@ pub(crate) mod test_support {
         pub socket: PathBuf,
         pub events: mpsc::UnboundedReceiver<FakePolicyEvent>,
         pub release_checks: Arc<Notify>,
+        pub connections: Arc<AtomicUsize>,
         _dir: tempfile::TempDir,
         _task: tokio::task::JoinHandle<()>,
     }
@@ -623,12 +642,19 @@ pub(crate) mod test_support {
             let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
             let (events_tx, events) = mpsc::unbounded_channel();
             let release_checks = Arc::new(Notify::new());
-            let task = tokio::spawn(serve(listener, events_tx, release_checks.clone()));
+            let connections = Arc::new(AtomicUsize::new(0));
+            let task = tokio::spawn(serve(
+                listener,
+                events_tx,
+                release_checks.clone(),
+                connections.clone(),
+            ));
 
             Self {
                 socket,
                 events,
                 release_checks,
+                connections,
                 _dir: dir,
                 _task: task,
             }
@@ -639,12 +665,14 @@ pub(crate) mod test_support {
         listener: UnixListener,
         events: mpsc::UnboundedSender<FakePolicyEvent>,
         release_checks: Arc<Notify>,
+        connections: Arc<AtomicUsize>,
     ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
 
+            connections.fetch_add(1, Ordering::SeqCst);
             let events = events.clone();
             let release_checks = release_checks.clone();
             tokio::spawn(serve_connection(stream, events, release_checks));
@@ -660,56 +688,62 @@ pub(crate) mod test_support {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
 
-        if reader.read_line(&mut line).await.is_err() || line.is_empty() {
-            return;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.is_err() || line.is_empty() {
+                return;
+            }
+
+            let value: serde_json::Value = match serde_json::from_str(line.trim()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+
+            let reply = match value.get("op").and_then(serde_json::Value::as_str) {
+                Some("open_proxy_session") => Some(RpcReply::ProxySession(ProxySessionReply {
+                    ok: true,
+                    proxy_session: ProxySessionToken::from_bytes([1; 32]),
+                })),
+
+                Some("check_http") => {
+                    let request_id: ProxyRequestId = field(&value, "request_id");
+
+                    let _ = events.send(FakePolicyEvent::Check);
+
+                    release_checks.notified().await;
+
+                    let request: HttpRequest = field(&value, "request");
+
+                    Some(RpcReply::Proxy(ProxyReply::from_reply(
+                        request_id,
+                        RpcReply::HttpCheck(HttpCheckReply::from_verdict(
+                            request,
+                            Verdict::allowed(VerdictSource::policy()),
+                        )),
+                    )))
+                }
+
+                Some("cancel_check") => {
+                    let _ = events.send(FakePolicyEvent::Cancel);
+
+                    Some(RpcReply::Proxy(ProxyReply::from_reply(
+                        field(&value, "request_id"),
+                        RpcReply::Simple(SimpleOkReply { ok: true }),
+                    )))
+                }
+
+                _ => None,
+            };
+
+            let Some(reply) = reply else {
+                return;
+            };
+
+            let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
+            let _ = writer.write_all(&encoded).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
         }
-
-        let value: serde_json::Value = match serde_json::from_str(line.trim()) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-
-        let reply = match value.get("op").and_then(serde_json::Value::as_str) {
-            Some("open_proxy_session") => Some(RpcReply::ProxySession(ProxySessionReply {
-                ok: true,
-                proxy_session: ProxySessionToken::from_bytes([1; 32]),
-            })),
-
-            Some("check_http") => {
-                let request_id: ProxyRequestId = field(&value, "request_id");
-
-                let _ = events.send(FakePolicyEvent::Check);
-
-                release_checks.notified().await;
-
-                let request: HttpRequest = field(&value, "request");
-
-                Some(RpcReply::Proxy(ProxyReply::from_reply(
-                    request_id,
-                    RpcReply::HttpCheck(HttpCheckReply::from_verdict(
-                        request,
-                        Verdict::allowed(VerdictSource::policy()),
-                    )),
-                )))
-            }
-
-            Some("cancel_check") => {
-                let _ = events.send(FakePolicyEvent::Cancel);
-
-                Some(RpcReply::Simple(SimpleOkReply { ok: true }))
-            }
-
-            _ => None,
-        };
-
-        let Some(reply) = reply else {
-            return;
-        };
-
-        let encoded = serde_json::to_vec(&reply).expect("encode policy reply");
-        let _ = writer.write_all(&encoded).await;
-        let _ = writer.write_all(b"\n").await;
-        let _ = writer.flush().await;
     }
 
     fn field<T: serde::de::DeserializeOwned>(value: &serde_json::Value, name: &str) -> T {
@@ -823,6 +857,108 @@ mod tests {
     #[test]
     fn reconcile_authorities_requires_at_least_one_candidate() {
         assert!(reconcile_authorities(&[], 80).is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_pool_reuses_only_validated_exchanges() -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering;
+
+        use agent_sandbox_core::RpcRequest;
+
+        let mut fake = FakePolicy::start();
+        let policy = Arc::new(PolicySession::open(&fake.socket, Duration::from_secs(2)).await?);
+        for _ in 0..2 {
+            policy.cancel(ProxyRequestId::new()).await?;
+            assert!(matches!(
+                fake.events.recv().await,
+                Some(FakePolicyEvent::Cancel)
+            ));
+        }
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            2,
+            "lease plus one reused RPC connection"
+        );
+        let invalid = policy
+            .rpc(
+                RpcRequest::CancelCheck {
+                    proxy_session: policy.token.clone(),
+                    request_id: ProxyRequestId::new(),
+                },
+                |_| Err::<(), _>(PolicyError::UnexpectedReply("test")),
+            )
+            .await;
+        assert!(invalid.is_err());
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Cancel)
+        ));
+        policy.cancel(ProxyRequestId::new()).await?;
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Cancel)
+        ));
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            3,
+            "invalid exchanges must be discarded"
+        );
+
+        let pending = {
+            let policy = policy.clone();
+            tokio::spawn(async move {
+                policy
+                    .check_http(
+                        ProxyRequestId::new(),
+                        AttributionToken::from_bytes([2; 32]),
+                        HttpRequest::from_parts("GET", "https", "example.test", "/").unwrap(),
+                    )
+                    .await
+            })
+        };
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Check)
+        ));
+        tokio::time::timeout(Duration::from_secs(2), policy.cancel(ProxyRequestId::new()))
+            .await??;
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Cancel)
+        ));
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            4,
+            "a pending check cannot block another RPC"
+        );
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        // Discard the completed cancellation connection, leaving no valid idle
+        // client. The interrupted check must not have returned its client.
+        assert!(
+            policy
+                .rpc(
+                    RpcRequest::CancelCheck {
+                        proxy_session: policy.token.clone(),
+                        request_id: ProxyRequestId::new()
+                    },
+                    |_| Err::<(), _>(PolicyError::UnexpectedReply("test")),
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            fake.events.recv().await,
+            Some(FakePolicyEvent::Cancel)
+        ));
+        policy.cancel(ProxyRequestId::new()).await?;
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            5,
+            "interrupted exchanges must be discarded"
+        );
+        fake.release_checks.notify_one();
+        Ok(())
     }
 
     #[tokio::test]

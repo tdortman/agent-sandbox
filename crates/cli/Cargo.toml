@@ -21,7 +21,7 @@ name = "agent-sandbox-ui"
 path = "src/bin/ui.rs"
 
 [dependencies]
-agent-sandbox-core = { path = "../core" }
+agent-sandbox-core.workspace = true
 
 clap = { workspace = true, features = ["env"] }
 nix = { workspace = true, features = ["fs", "user"] }

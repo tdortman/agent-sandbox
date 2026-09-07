@@ -65,10 +65,13 @@ pub fn semantic_request_headers(
 pub enum HttpVersion {
     /// HTTP/1.0.
     Http10,
+
     /// HTTP/1.1.
     Http11,
+
     /// HTTP/2.
     Http2,
+
     /// HTTP/3.
     Http3,
 }
@@ -162,8 +165,10 @@ pub type SessionMetadata = CoreHttpSessionMetadata;
 pub enum RequestTerminal {
     /// The request body stream completed normally.
     Complete,
+
     /// The request was cancelled.
     Cancellation,
+
     /// The request body failed terminally.
     Error(TerminalError),
 }
@@ -272,18 +277,25 @@ pub struct SemanticRequest {
 pub struct SemanticRequestParts<'a> {
     /// The request method.
     pub method: &'a str,
+
     /// The URI scheme.
     pub scheme: &'a str,
+
     /// The request authority.
     pub authority: &'a str,
+
     /// The request path.
     pub path: &'a str,
+
     /// The raw (unparsed) query, without a leading `?`.
     pub raw_query: Option<&'a str>,
+
     /// The validated end-to-end request headers.
     pub headers: SemanticHeaders,
+
     /// Optional session attribution.
     pub session: Option<SessionMetadata>,
+
     /// The request body state.
     pub body: BoundedRequestBody,
 }
@@ -413,14 +425,19 @@ impl SemanticPath {
 pub enum ResponseEvent {
     /// The final response head.
     Final(ResponseHead),
+
     /// One body chunk.
     BodyChunk(Vec<u8>),
+
     /// Trailing response headers.
     Trailers(SemanticHeaders),
+
     /// The body stream ended cleanly.
     Complete,
+
     /// The response was cancelled before completion.
     Cancelled,
+
     /// A typed terminal failure.
     Error(TerminalError),
 }
@@ -799,6 +816,7 @@ mod tests {
     #[test]
     fn sequence_rejects_single_body_chunk_over_the_bound() {
         let mut sequence = ResponseSequence::new();
+
         sequence
             .push(ResponseEvent::Final(
                 ResponseHead::final_head(200, SemanticHeaders::new()).expect("final"),
@@ -834,9 +852,7 @@ mod tests {
     fn request_trailers_and_termination_apply() {
         let mut body = BoundedRequestBody::empty();
         body.set_trailers().expect("trailers");
-
         assert_eq!(body.set_trailers(), Err(BodyError::TrailersAlreadySet));
-
         body.finish().expect("finish");
         assert_eq!(body.push_chunk(&[1]), Err(BodyError::AfterTerminal));
     }

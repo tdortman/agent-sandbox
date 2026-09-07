@@ -19,8 +19,10 @@ use crate::{
 /// Default on-disk approved-bindings location:
 /// `/run/agent-sandbox/approved-bindings.json`.
 pub const APPROVED_BINDINGS_PATH: &str = "/run/agent-sandbox/approved-bindings.json";
+
 /// How long (in seconds) an approved binding is retained before it expires.
 pub const APPROVED_BINDINGS_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
 const FILE_VERSION: u32 = 1;
 const MAX_ALIASES_PER_IP: usize = 16;
 
@@ -35,6 +37,7 @@ struct IpBindingEntry {
     hosts: HashMap<String, f64>,
 }
 
+#[derive(Clone)]
 struct LiveIpBindings {
     hosts: HashMap<String, Instant>,
 }
@@ -43,6 +46,7 @@ struct LiveIpBindings {
 ///
 /// Used only for UI display when the DNS cache has expired; policy resolution
 /// must not consult this table.
+#[derive(Clone)]
 pub struct ApprovedBindings {
     path: PathBuf,
     entries: HashMap<String, LiveIpBindings>,

@@ -21,7 +21,16 @@ impl PolicyStore {
     ) -> Option<Verdict> {
         let host = normalize_host(host);
 
-        if self.policy_denied(&host, port, ctx) {
+        // One fresh policy snapshot keeps deny and allow on the same revision.
+        let merged = self.merged_for(ctx);
+
+        if merged
+            .network
+            .direct
+            .deny
+            .iter()
+            .any(|rule| rule.port == port && host_pattern_matches(&rule.host, &host))
+        {
             return Some(Verdict::denied(VerdictSource::policy()));
         }
 
@@ -38,8 +47,6 @@ impl PolicyStore {
                 ApprovalScope::Session,
             )));
         }
-
-        let merged = self.merged_for(ctx);
 
         for rule in &merged.network.direct.allow {
             if host_pattern_matches(&rule.host, &host) && rule.port == port {
@@ -283,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_policy_comment_survives_as_allow_comment_source() {
+    async fn network_policy_snapshot_preserves_comments_and_refreshes_denies() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let home = dir.path().join("home-user");
         let project_root = dir.path().join("repo");
@@ -317,6 +324,26 @@ mod tests {
             Some(Verdict::allowed(VerdictSource::policy_with_comment(
                 "trusted policy file"
             )))
+        );
+
+        policy
+            .network
+            .direct
+            .deny
+            .push(NetworkRule::new("example.com", 443, "new deny"));
+
+        let path = policy_dir.join("policy.json");
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        atomic_write_policy(&path, &policy, None, None, None).expect("update policy");
+
+        std::fs::File::open(&path)
+            .expect("open policy")
+            .set_modified(original_mtime)
+            .expect("preserve original policy mtime");
+
+        assert_eq!(
+            store.network_verdict("example.com", 443, &ctx, false).await,
+            Some(Verdict::denied(VerdictSource::policy()))
         );
     }
 

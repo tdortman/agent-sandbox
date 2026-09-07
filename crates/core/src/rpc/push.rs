@@ -21,18 +21,25 @@ pub enum PendingSummary {
     Network {
         /// Identifier of the pending request.
         id: String,
+
         /// Remote host, when known.
         host: Option<String>,
+
         /// Remote port, when known.
         port: Option<u16>,
+
         /// Connection scheme (e.g. `tcp`, `udp`), when known.
         scheme: Option<String>,
+
         /// The URL being contacted, if any.
         url: Option<String>,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -41,16 +48,22 @@ pub enum PendingSummary {
     Http {
         /// Identifier of the pending request.
         id: PendingHttpId,
+
         /// The HTTP request that triggered the permission check.
         request: HttpRequest,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Sandbox session the request belongs to, if any.
         sandbox_session_id: Option<String>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -59,12 +72,16 @@ pub enum PendingSummary {
     Elevation {
         /// Identifier of the pending request.
         id: String,
+
         /// Command line of the process to be spawned, if known.
         argv: Option<Vec<String>>,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -73,14 +90,19 @@ pub enum PendingSummary {
     Filesystem {
         /// Identifier of the pending request.
         id: String,
+
         /// The path being accessed, if known.
         path: Option<PathBuf>,
+
         /// The kind of filesystem access requested, if known.
         access: Option<FileAccess>,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -89,16 +111,22 @@ pub enum PendingSummary {
     Resource {
         /// Identifier of the pending request.
         id: String,
+
         /// The kind of resource being accessed.
         resource_kind: ResourceKind,
+
         /// The resource path or identifier, if any.
         path: Option<PathBuf>,
+
         /// The kind of resource access requested, if known.
         access: Option<ResourceAccess>,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -107,16 +135,22 @@ pub enum PendingSummary {
     Dbus {
         /// Identifier of the pending request.
         id: String,
+
         /// The D-Bus target (bus, service, interface, …) being accessed.
         target: DbusTarget,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Sandbox session the request belongs to, if any.
         sandbox_session_id: Option<String>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -133,20 +167,28 @@ pub enum UiPush {
     NetworkRequest {
         /// Identifier of the request.
         id: String,
+
         /// Remote host, when known.
         host: Option<String>,
+
         /// Remote port, when known.
         port: Option<u16>,
+
         /// Connection scheme (e.g. `tcp`, `udp`), when known.
         scheme: Option<String>,
+
         /// The URL being contacted, if any.
         url: Option<String>,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -155,16 +197,22 @@ pub enum UiPush {
     HttpRequest {
         /// Identifier of the request.
         id: PendingHttpId,
+
         /// The HTTP request that triggered the permission check.
         request: HttpRequest,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Sandbox session the request belongs to, if any.
         sandbox_session_id: Option<String>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -173,14 +221,19 @@ pub enum UiPush {
     ElevationRequest {
         /// Identifier of the request.
         id: String,
+
         /// Command line of the process to be spawned, if known.
         argv: Option<Vec<String>>,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -189,16 +242,22 @@ pub enum UiPush {
     FilesystemRequest {
         /// Identifier of the request.
         id: String,
+
         /// The path being accessed.
         path: PathBuf,
+
         /// The kind of filesystem access requested.
         access: FileAccess,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -207,18 +266,25 @@ pub enum UiPush {
     ResourceRequest {
         /// Identifier of the request.
         id: String,
+
         /// The kind of resource being accessed.
         kind: ResourceKind,
+
         /// The resource path or identifier.
         path: PathBuf,
+
         /// The kind of resource access requested.
         access: ResourceAccess,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },
@@ -227,16 +293,22 @@ pub enum UiPush {
     DbusRequest {
         /// Identifier of the request.
         id: String,
+
         /// The D-Bus target (bus, service, interface, …) being accessed.
         target: DbusTarget,
+
         /// Working directory of the requesting process.
         cwd: Option<PathBuf>,
+
         /// Home directory of the requesting process.
         home: Option<PathBuf>,
+
         /// Project root of the requesting process, if any.
         project_root: Option<PathBuf>,
+
         /// Sandbox session the request belongs to, if any.
         sandbox_session_id: Option<String>,
+
         /// Cargo package that made the request, if attributed.
         package: Option<String>,
     },

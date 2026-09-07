@@ -6,7 +6,7 @@ use agent_sandbox_core::{
     AttributionToken, CheckReply, FlowProtocol, FlowRegistration, HttpCheckReply, HttpRequest,
     NetworkFlowKey, NetworkFlowSelector, ProcessIds, ProxyConnectionId, ProxyRequestId,
     ProxySessionReply, ProxySessionToken, ResolvedRequestContext, SocketIdentity, scheme_for,
-    socket_owner::validate_socket_identity,
+    socket_owner::{validate_socket_identity, validate_socket_identity_with_hint},
 };
 use tokio::sync::oneshot;
 
@@ -119,6 +119,7 @@ impl PolicyStore {
     pub async fn register_network_flow(
         &self,
         registration: FlowRegistration,
+        owner_fd_hint: Option<u32>,
     ) -> Result<(), PolicydError> {
         let now = Instant::now();
         let owner = registration.owner();
@@ -148,6 +149,7 @@ impl PolicyStore {
 
             if existing.attribution_token.is_none() {
                 existing.registration = registration;
+                existing.owner_fd_hint = owner_fd_hint;
                 existing.context = context;
             }
 
@@ -162,6 +164,7 @@ impl PolicyStore {
 
         inner.proxy_flows.insert(key, ProxyFlowState {
             owner,
+            owner_fd_hint,
             registration,
             context,
             attribution_token: None,
@@ -324,6 +327,7 @@ impl PolicyStore {
             session: proxy_session.clone(),
             request: request_id,
         };
+
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
         {
@@ -398,6 +402,7 @@ impl PolicyStore {
             session: proxy_session.clone(),
             request: request_id,
         };
+
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
         {
@@ -617,6 +622,7 @@ impl PolicyStore {
                 registration.context().clone(),
             ),
             owner: new_owner,
+            owner_fd_hint: None,
             context: state.context,
             attribution_token: state.attribution_token,
             connection_id: state.connection_id,
@@ -738,7 +744,7 @@ impl PolicyStore {
         proxy_session: &ProxySessionToken,
         attribution_token: &AttributionToken,
     ) -> Result<(String, u16, ResolvedRequestContext, FlowProtocol), PolicydError> {
-        let (flow, registration, expected_owner, context) = {
+        let (flow, registration, expected_owner, owner_fd_hint, context) = {
             let mut inner = self.inner.lock().await;
             prune_flows(&mut inner.proxy_flows, Instant::now());
             validate_session(&inner, proxy_session)?;
@@ -751,6 +757,7 @@ impl PolicyStore {
                 flow.clone(),
                 state.registration.clone(),
                 state.owner,
+                state.owner_fd_hint,
                 state.context.clone(),
             );
             drop(inner);
@@ -759,7 +766,9 @@ impl PolicyStore {
 
         let identity_valid = tokio::time::timeout(
             self.args.approval_timeout,
-            tokio::task::spawn_blocking(move || validate_socket_identity(expected_owner)),
+            tokio::task::spawn_blocking(move || {
+                validate_socket_identity_with_hint(expected_owner, owner_fd_hint)
+            }),
         )
         .await
         .map_err(|_| proxy_error("socket owner revalidation timed out"))?
@@ -881,7 +890,7 @@ mod tests {
         );
 
         store
-            .register_network_flow(registration)
+            .register_network_flow(registration, None)
             .await
             .expect("register flow");
 
@@ -936,7 +945,7 @@ mod tests {
         );
 
         store
-            .register_network_flow(registration)
+            .register_network_flow(registration, None)
             .await
             .expect("register flow");
 
@@ -982,12 +991,15 @@ mod tests {
         .expect("valid flow");
 
         store
-            .register_network_flow(FlowRegistration::new(
-                flow.clone(),
-                owner,
-                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
-                FlowContext::default(),
-            ))
+            .register_network_flow(
+                FlowRegistration::new(
+                    flow.clone(),
+                    owner,
+                    NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                    FlowContext::default(),
+                ),
+                None,
+            )
             .await
             .expect("register flow");
 
@@ -1116,12 +1128,15 @@ mod tests {
         .expect("valid flow");
 
         store
-            .register_network_flow(FlowRegistration::new(
-                flow.clone(),
-                owner,
-                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
-                FlowContext::default(),
-            ))
+            .register_network_flow(
+                FlowRegistration::new(
+                    flow.clone(),
+                    owner,
+                    NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                    FlowContext::default(),
+                ),
+                None,
+            )
             .await
             .expect("register flow");
 
@@ -1271,12 +1286,15 @@ mod tests {
         let migrated_owner = test_udp_owner(migrated_source).await;
 
         store
-            .register_network_flow(FlowRegistration::new(
-                migrated_flow.clone(),
-                migrated_owner,
-                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
-                FlowContext::default(),
-            ))
+            .register_network_flow(
+                FlowRegistration::new(
+                    migrated_flow.clone(),
+                    migrated_owner,
+                    NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                    FlowContext::default(),
+                ),
+                None,
+            )
             .await
             .expect("register migrated flow");
 
@@ -1423,12 +1441,15 @@ mod tests {
         .expect("valid flow");
 
         store
-            .register_network_flow(FlowRegistration::new(
-                vanished_flow.clone(),
-                test_owner(),
-                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
-                FlowContext::default(),
-            ))
+            .register_network_flow(
+                FlowRegistration::new(
+                    vanished_flow.clone(),
+                    test_owner(),
+                    NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                    FlowContext::default(),
+                ),
+                None,
+            )
             .await
             .expect("register vanished flow");
 
@@ -1491,13 +1512,16 @@ mod tests {
     async fn released_tcp_tuple_can_be_registered_by_a_new_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(&dir);
+
         let session = store
             .open_proxy_session(1)
             .await
             .expect("open session")
             .proxy_session;
+
         let first = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first TCP socket");
         let source = first.local_addr().expect("source address");
+
         let owner = || match resolve_owner_snapshot(
             SocketProtocol::Tcp,
             SocketTuple::from_local(source.ip(), source.port()),
@@ -1505,6 +1529,7 @@ mod tests {
             OwnerResolution::Unique(snapshot) => snapshot.identity(),
             resolution => panic!("expected unique TCP socket owner: {resolution:?}"),
         };
+
         let flow = NetworkFlowKey::try_new(
             FlowProtocol::Tcp,
             source.ip(),
@@ -1513,37 +1538,67 @@ mod tests {
             443,
         )
         .expect("flow");
+
         let registration = FlowRegistration::new(
             flow.clone(),
             owner(),
             NormalizedPolicyHost::parse("example.com").expect("host"),
             FlowContext::default(),
         );
+
         store
-            .register_network_flow(registration.clone())
+            .register_network_flow(
+                registration.clone(),
+                Some(std::os::fd::AsRawFd::as_raw_fd(&first).cast_unsigned()),
+            )
             .await
             .expect("register first socket");
+
         let connection_id = ProxyConnectionId::new();
+
         let first_claim = store
             .claim_network_flow(session.clone(), flow.clone(), connection_id)
             .await
             .expect("claim first socket");
+
+        store
+            .flow_for_check(&session, &first_claim.attribution_token)
+            .await
+            .expect("live hinted owner must validate");
+
+        store
+            .register_network_flow(registration.clone(), Some(u32::MAX))
+            .await
+            .expect("an advisory hint must not change registration identity");
+
         drop(first);
         let _second = std::net::TcpListener::bind(source).expect("reuse released TCP endpoint");
+
         let replacement = FlowRegistration::new(
             flow.clone(),
             owner(),
             NormalizedPolicyHost::parse("example.com").expect("host"),
             FlowContext::default(),
         );
+
         assert_ne!(registration.owner(), replacement.owner());
+
         assert!(
             store
-                .register_network_flow(replacement.clone())
+                .flow_for_check(&session, &first_claim.attribution_token)
+                .await
+                .is_err(),
+            "a descriptor hint must not preserve authorization after its socket closes"
+        );
+
+        assert!(
+            store
+                .register_network_flow(replacement.clone(), None)
                 .await
                 .is_err(),
             "a live claim must not change ownership"
         );
+
         store
             .release_network_flow(
                 session.clone(),
@@ -1552,19 +1607,24 @@ mod tests {
             )
             .await
             .expect("release first socket");
+
         store
-            .register_network_flow(replacement)
+            .register_network_flow(replacement, None)
             .await
             .expect("register replacement socket without waiting for expiry");
+
         let second_claim = store
             .claim_network_flow(session.clone(), flow.clone(), ProxyConnectionId::new())
             .await
             .expect("claim replacement socket");
+
         assert_eq!(second_claim.flow, flow);
+
         assert_ne!(
             second_claim.attribution_token,
             first_claim.attribution_token
         );
+
         assert!(
             store
                 .check_network_flow(
@@ -1719,12 +1779,15 @@ mod tests {
         .expect("valid flow");
 
         store
-            .register_network_flow(FlowRegistration::new(
-                flow.clone(),
-                owner,
-                NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
-                FlowContext::default(),
-            ))
+            .register_network_flow(
+                FlowRegistration::new(
+                    flow.clone(),
+                    owner,
+                    NormalizedPolicyHost::parse("1.1.1.1").expect("valid host"),
+                    FlowContext::default(),
+                ),
+                None,
+            )
             .await
             .expect("register flow");
 

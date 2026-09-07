@@ -1,0 +1,64 @@
+//! Rama http protocol implementation and low level utilities.
+//!
+//! # Cancel safety
+//!
+//! Futures returned by this crate senders are cancel safe: dropping a future before it
+//! completes is the supported way to cancel the operation. See the
+//! documentation on individual futures — for example `SendRequest::send_request`
+//! in `client::conn::http1` and `client::conn::http2` — for the protocol-
+//! specific behavior on cancellation.
+//!
+//! # Rama
+//!
+//! Crate used by the end-user `rama` crate and `rama` crate authors alike.
+//!
+//! Learn more about `rama`:
+//!
+//! - Github: <https://github.com/plabayo/rama>
+//! - Book: <https://ramaproxy.org/book/>
+//!
+//! ## rama-http-core
+//!
+//! ### Features
+//!
+//! - HTTP/1 and HTTP/2
+//! - Asynchronous design
+//! - Leading in performance
+//! - Tested and **correct**
+//! - Extensive production use
+//! - [Client](client/index.html) and [Server](server/index.html) APIs
+
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/plabayo/rama/main/docs/img/rama_logo.svg"
+)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/plabayo/rama/main/docs/img/rama_logo.svg"
+)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(test, allow(clippy::float_cmp))]
+#![cfg_attr(feature = "unstable", expect(clippy::allow_attributes))]
+#![allow(unreachable_pub)]
+#![expect(
+    clippy::panic,
+    clippy::unreachable,
+    reason = "vendored from upstream `hyper`/`h2`: matches upstream invariant-violation panicking style and macro-internal `#[allow]` attrs"
+)]
+
+pub mod body;
+pub mod informational;
+
+mod common;
+
+mod error;
+pub use self::error::{Error, Result};
+
+pub mod h2;
+
+pub mod service;
+
+mod headers;
+
+pub(crate) mod proto;
+
+pub mod client;
+pub mod server;

@@ -72,16 +72,20 @@ fn graphical_env() -> HashMap<String, String> {
 
 fn pick_with_backends(title: &str, options: &[&str]) -> Option<String> {
     let env = graphical_env();
+
     match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {
         Some("qt-dialog") => {
             let binary = resolve_qt_dialog(&env)?;
             qt_dialog_select(&binary, title, options, &env)
         }
+
         Some("zenity") => {
             let binary = resolve_zenity(&env)?;
             zenity_select(&binary, title, options, &env)
         }
+
         Some("none") => None,
+
         Some(_) | None => {
             if let Some(binary) = resolve_qt_dialog(&env)
                 && let Some(choice) = qt_dialog_select(&binary, title, options, &env)
@@ -98,16 +102,20 @@ fn pick_with_backends(title: &str, options: &[&str]) -> Option<String> {
 
 fn input_with_backends(title: &str, default_text: &str) -> Option<String> {
     let env = graphical_env();
+
     match env.get("AGENT_SANDBOX_UI_BACKEND").map(String::as_str) {
         Some("qt-dialog") => {
             let binary = resolve_qt_dialog(&env)?;
             qt_dialog_input(&binary, title, default_text, &env)
         }
+
         Some("zenity") => {
             let binary = resolve_zenity(&env)?;
             zenity_input(&binary, title, default_text, &env)
         }
+
         Some("none") => None,
+
         Some(_) | None => {
             if let Some(binary) = resolve_qt_dialog(&env)
                 && let Some(input) = qt_dialog_input(&binary, title, default_text, &env)

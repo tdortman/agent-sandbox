@@ -15,6 +15,9 @@ udp_ports="${11:-}"
 action="${12:-up}"
 
 ports='80,443,8008,8080,8443'
+if [[ -n "${AGENT_SANDBOX_EXTRA_HTTPS_PORTS:-}" ]]; then
+  ports+=",${AGENT_SANDBOX_EXTRA_HTTPS_PORTS}"
+fi
 
 # Space- or comma-separated intercepted UDP ports; empty means HTTP/3 is off.
 udp_ports="${udp_ports//,/ }"

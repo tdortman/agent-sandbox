@@ -11,6 +11,7 @@ let
     proxyNetworkMessage
     proxyRulesMessage
     proxyCredentialsMessage
+    proxyClientIdentitiesMessage
     upstreamCidrMessage
     proxyGidMessage
     proxyAltPortsMessage
@@ -19,6 +20,41 @@ let
     duplicatePackageNameMessage
   ];
   contract =
+    assert builtins.all
+      (
+        port:
+        !(builtins.tryEval (
+          builtins.deepSeq
+            (mkNixosSystem { agent-sandbox.network.httpProxy.extraHttpsPorts = [ port ]; })
+            .config.agent-sandbox.network.httpProxy.extraHttpsPorts
+            true
+        )).success
+      )
+      [
+        0
+        53
+        80
+        853
+        8008
+        8080
+        65536
+      ];
+    assert
+      !(builtins.tryEval (
+        builtins.deepSeq
+          (mkNixosSystem { agent-sandbox.network.httpProxy.h2cUpstreamOrigins = [ "https://example.test" ]; })
+          .config.agent-sandbox.network.httpProxy.h2cUpstreamOrigins
+          true
+      )).success;
+    assert
+      (builtins.fromJSON
+        (mkNixosSystem {
+          agent-sandbox.network = {
+            enable = true;
+            httpProxy.extraHttpsPorts = [ 9443 ];
+          };
+        }).config.environment.etc."agent-sandbox/https-ports.json".text
+      ) == [ 9443 ];
     assert expectFailure socketPathMessage {
       agent-sandbox = {
         gates.filesystem.enable = true;
@@ -106,6 +142,20 @@ let
         caPrivateKeyFile = "relative/proxy-ca.key";
       };
     };
+
+    assert expectFailure proxyClientIdentitiesMessage {
+      agent-sandbox.network.httpProxy.upstreamClientIdentitiesFile = "relative/identities.json";
+    };
+
+    assert
+      !(builtins.tryEval (
+        let
+          system = mkNixosSystem {
+            agent-sandbox.network.httpProxy.http3.upstreamHandshakeTimeoutMs = 0;
+          };
+        in
+        builtins.deepSeq system.config.agent-sandbox.network.httpProxy.http3.upstreamHandshakeTimeoutMs true
+      )).success;
 
     assert expectFailure upstreamCidrMessage {
       agent-sandbox.network.httpProxy.upstreamAllowCidrs = [ "192.0.2.0" ];
@@ -374,6 +424,10 @@ let
       validSystem.config.systemd.services.agent-sandbox-policy.serviceConfig.ExecStart;
 
     assert validSystem.config.agent-sandbox.network.httpProxy.http3.enable == false;
+    assert validSystem.config.agent-sandbox.network.httpProxy.http3.upstreamHandshakeTimeoutMs == 2000;
+    assert
+      builtins.stringLength validSystem.config.systemd.services.agent-sandbox-proxy.serviceConfig.ExecStart
+      > 0;
     assert failedModuleMessages validSystem == [ ];
 
     assert
@@ -496,6 +550,7 @@ let
       system = pkgs.stdenv.hostPlatform.system;
     };
   proxyAltPortsMessage = "agent-sandbox.network.httpProxy.http3.altUdpPorts requires http3.enable";
+  proxyClientIdentitiesMessage = "agent-sandbox HTTP proxy upstreamClientIdentitiesFile must use an absolute path";
   proxyCredentialsMessage = "agent-sandbox HTTP proxy CA certificate and key must be supplied together and use absolute paths";
   proxyGidMessage = "agent-sandbox.network.httpProxy.gid must be nonzero when explicitly configured";
   proxyNetworkMessage = "agent-sandbox.network.httpProxy.enable requires network.enable";
@@ -519,6 +574,7 @@ let
           caPrivateKeyFile = "/run/credentials/proxy-ca.key";
           gid = 1;
           upstreamAllowCidrs = [ "192.0.2.0/24" ];
+          upstreamClientIdentitiesFile = "/run/secrets/proxy-identities.json";
         };
       };
 

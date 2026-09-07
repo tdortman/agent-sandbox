@@ -152,7 +152,10 @@ mod tests {
             FlowContext::default(),
         );
 
-        let request = RpcRequest::RegisterNetworkFlow { registration };
+        let request = RpcRequest::RegisterNetworkFlow {
+            registration,
+            owner_fd_hint: None,
+        };
 
         assert!(
             ensure_allowed(SocketRole::Sandbox, &request).is_ok(),

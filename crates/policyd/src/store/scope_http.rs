@@ -10,7 +10,7 @@ use agent_sandbox_core::{
 use super::{
     decisions::DecisionAction,
     http::{http_context, target_for_request},
-    scope_apply::{ScopeApplyError, ScopeLadder, ScopePersistFlags},
+    scope_apply::{ScopeApplyError, ScopeLadder},
     state::apply_bucket,
     types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
 };
@@ -149,6 +149,7 @@ impl PolicyStore {
         }
 
         let context = http_context(&ctx);
+
         // HTTP invalidation is broader than the ladder's merged-policy flag:
         // every persistent write also drops the HTTP verdict cache, so this
         // caller clears both caches itself after the ladder's write and the
@@ -171,7 +172,6 @@ impl PolicyStore {
                     session_id: session_id.as_deref(),
                     package: ctx.package.as_deref(),
                     paths: &ctx.paths,
-                    flags: ScopePersistFlags::new(false, false),
                     project_log: None,
                     project_package_log: None,
                 },
@@ -198,11 +198,6 @@ impl PolicyStore {
         };
 
         if scope_path.is_some() {
-            self.merged_cache
-                .lock()
-                .map(|mut cache| cache.entries.clear())
-                .ok();
-
             let mut inner = self.inner.lock().await;
             Self::clear_http_verdict_cache_locked(&mut inner);
         }
@@ -690,6 +685,7 @@ mod tests {
             "project_package HTTP approval missing from {policy_path:?}"
         );
     }
+
     fn direct_target() -> HttpRuleTarget {
         HttpRuleTarget {
             url: HttpUrl::parse("https://example.com/api").expect("valid URL"),
@@ -702,6 +698,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("create home");
+
         let store = PolicyStore::new(crate::store::test_args(
             dir.path().join("host.sock"),
             dir.path().join("sandbox.sock"),
@@ -768,6 +765,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("create home");
+
         let store = PolicyStore::new(crate::store::test_args(
             dir.path().join("host.sock"),
             dir.path().join("sandbox.sock"),

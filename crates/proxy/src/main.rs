@@ -17,6 +17,7 @@ use agent_sandbox_proxy::{
         ListenConfig, MAX_ACTIVE_CHECKS, canonical_http10_origin, destination_for_stream,
         run_tcp_listener,
     },
+    upstream_tls::UpstreamClientIdentities,
 };
 use clap::Parser;
 use rama_core::{
@@ -55,6 +56,16 @@ struct Args {
     #[arg(long = "http3-alt-port", value_name = "PORT")]
     http3_alt_ports: Vec<u16>,
 
+    /// Maximum time for an upstream QUIC TLS handshake, in milliseconds.
+    #[arg(long, env = "AGENT_SANDBOX_PROXY_HTTP3_UPSTREAM_HANDSHAKE_TIMEOUT_MS",
+        default_value_t = 2_000, value_parser = clap::value_parser!(u64).range(1..))]
+    http3_upstream_handshake_timeout_ms: u64,
+
+    /// JSON file mapping exact HTTPS origins to client certificate and key
+    /// paths.
+    #[arg(long, env = "AGENT_SANDBOX_PROXY_UPSTREAM_CLIENT_IDENTITIES")]
+    upstream_client_identities: Option<PathBuf>,
+
     #[arg(long)]
     init_ech_state_only: bool,
 
@@ -89,6 +100,10 @@ struct Args {
     #[arg(long = "http10-upstream-origin", value_name = "ORIGIN")]
     http10_upstream_origins: Vec<String>,
 
+    /// Exact HTTP origins that require cleartext HTTP/2 prior knowledge.
+    #[arg(long = "h2c-upstream-origin", value_name = "ORIGIN")]
+    h2c_upstream_origins: Vec<String>,
+
     #[arg(
         long,
         env = "AGENT_SANDBOX_ECH_STATE_DIR",
@@ -103,6 +118,9 @@ async fn main() -> Result<(), BoxError> {
     // would corrupt structured log parsing. The default would enable colours
     // whenever `NO_COLOR` is unset, so pin them off explicitly.
     tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with_ansi(false)
         .with_target(false)
         .without_time()
@@ -122,6 +140,13 @@ async fn main() -> Result<(), BoxError> {
 
     let issuer = load_ca_issuer(&args)?;
     let ech = load_downstream_ech(&args)?;
+    let upstream_client_identities = Arc::new(
+        args.upstream_client_identities
+            .as_deref()
+            .map(UpstreamClientIdentities::load)
+            .transpose()?
+            .unwrap_or_default(),
+    );
 
     let policy = Arc::new(
         PolicySession::open(
@@ -142,6 +167,10 @@ async fn main() -> Result<(), BoxError> {
         let config = Http3Config {
             listen_port: args.http3_listen_port,
             alt_ports: args.http3_alt_ports.clone(),
+            upstream_handshake_timeout: Duration::from_millis(
+                args.http3_upstream_handshake_timeout_ms,
+            ),
+            upstream_client_identities: upstream_client_identities.clone(),
             #[cfg(debug_assertions)]
             test_destination: args.test_destination,
             #[cfg(not(debug_assertions))]
@@ -172,7 +201,8 @@ async fn main() -> Result<(), BoxError> {
         Http3Backend::alt_svc,
     );
 
-    let listener_config = load_listener_config(&args, issuer, alt_svc, ech)?;
+    let listener_config =
+        load_listener_config(&args, issuer, alt_svc, ech, upstream_client_identities)?;
 
     #[cfg(debug_assertions)]
     let listener_config = {
@@ -235,6 +265,7 @@ fn load_listener_config(
     issuer: CertificateIssuer,
     alt_svc: Arc<AltSvcStore>,
     ech: Option<DownstreamEch>,
+    upstream_client_identities: Arc<UpstreamClientIdentities>,
 ) -> Result<ListenConfig, BoxError> {
     let websocket_http11_urls = args
         .websocket_http11_urls
@@ -258,6 +289,19 @@ fn load_listener_config(
         .collect::<Result<Vec<_>, _>>()
         .map(Arc::new)?;
 
+    let h2c_upstream_origins = args
+        .h2c_upstream_origins
+        .iter()
+        .map(|origin| {
+            let canonical = agent_sandbox_proxy::tcp_backend::canonical_h2c_origin(origin)?;
+            if http10_upstream_origins.contains(&canonical) {
+                return Err("an origin cannot require both HTTP/1.0 and h2c".into());
+            }
+            Ok(canonical)
+        })
+        .collect::<Result<Vec<_>, BoxError>>()?;
+    let h2c_upstream_origins = Arc::new(h2c_upstream_origins);
+
     #[cfg(debug_assertions)]
     let transparent = args.test_destination.is_none();
 
@@ -272,6 +316,8 @@ fn load_listener_config(
         alt_svc,
         websocket_http11_urls,
         http10_upstream_origins,
+        h2c_upstream_origins,
+        upstream_client_identities,
         #[cfg(debug_assertions)]
         destination_resolver: args
             .test_destination
@@ -292,6 +338,31 @@ mod tests {
     use clap::Parser;
 
     use super::Args;
+
+    #[test]
+    fn args_configure_upstream_tls() {
+        let args = Args::try_parse_from([
+            "agent-sandbox-proxy",
+            "--http3-upstream-handshake-timeout-ms",
+            "15000",
+            "--upstream-client-identities",
+            "/run/secrets/proxy-identities.json",
+        ])
+        .expect("upstream TLS arguments");
+        assert_eq!(args.http3_upstream_handshake_timeout_ms, 15000);
+        assert_eq!(
+            args.upstream_client_identities.as_deref(),
+            Some(std::path::Path::new("/run/secrets/proxy-identities.json"))
+        );
+        assert!(
+            Args::try_parse_from([
+                "agent-sandbox-proxy",
+                "--http3-upstream-handshake-timeout-ms",
+                "0"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn args_disable_http3_by_default() {

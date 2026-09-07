@@ -26,7 +26,6 @@ impl super::types::PolicyStore {
         F: FnOnce(ApprovalScope, Option<PathBuf>) -> RpcReply,
     {
         let _ = self.export_policy_files(paths.clone());
-
         Self::audit(action.audit_verb(), audit.0, audit.1, audit.2);
 
         let policy_path = match (paths.home(), paths.project_root()) {

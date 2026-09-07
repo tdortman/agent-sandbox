@@ -22,7 +22,14 @@ pub async fn dispatch(
 ) -> Result<RpcReply, PolicydError> {
     auth::ensure_allowed(role, &req)?;
 
-    if matches!(&req, RpcRequest::RegisterNetworkFlow { .. }) && peer.uid != 0 {
+    if matches!(
+        &req,
+        RpcRequest::RegisterNetworkFlow { .. }
+            | RpcRequest::BindNetworkRevocation { .. }
+            | RpcRequest::ObserveNetworkGrants { .. }
+            | RpcRequest::PublishNetworkGrants
+    ) && peer.uid != 0
+    {
         return Err(PolicydError::UnauthorizedRequest);
     }
 
@@ -81,6 +88,58 @@ mod tests {
             NormalizedPolicyHost::parse("example.com").expect("valid test policy host"),
             FlowContext::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn network_publication_requires_root_host_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&dir);
+        let client = PolicyStore::new_client_handle(writer());
+        for role in [
+            SocketRole::Host,
+            SocketRole::Sandbox,
+            SocketRole::Proxy,
+            SocketRole::UiFd,
+        ] {
+            for uid in [0, 1000] {
+                for request in [
+                    RpcRequest::BindNetworkRevocation {
+                        path: dir.path().join("missing-map"),
+                    },
+                    RpcRequest::ObserveNetworkGrants {
+                        program: dir.path().join("program"),
+                        pins: dir.path().join("pins"),
+                        pid: std::process::id(),
+                        cgroup: 1,
+                        endpoints: vec![],
+                        dns: dir.path().join("dns"),
+                    },
+                    RpcRequest::PublishNetworkGrants,
+                ] {
+                    let result = dispatch(
+                        &store,
+                        &client,
+                        ClientPeer {
+                            pid: std::process::id(),
+                            uid,
+                            gid: 0,
+                        },
+                        role,
+                        request,
+                    )
+                    .await;
+                    if role == SocketRole::Host && uid == 0 {
+                        assert!(matches!(result, Err(PolicydError::Io(_))));
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(PolicydError::UnauthorizedRequest
+                                | PolicydError::UnauthorizedUiFdRequest)
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -156,6 +215,7 @@ mod tests {
             SocketRole::Sandbox,
             RpcRequest::RegisterNetworkFlow {
                 registration: test_registration(),
+                owner_fd_hint: None,
             },
         )
         .await;

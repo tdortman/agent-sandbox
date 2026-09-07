@@ -235,9 +235,11 @@ pub(super) async fn serve_webtransport(input: WebTransportServeInput) -> Result<
 
     if let Err(error) = sessions.set(&binding, &normalized).await {
         sessions.remove(downstream_stream_id).await;
+
         upstream
             .unregister_webtransport_session(upstream_session_id)
             .await;
+
         stop_datagram_task(datagram_task).await;
         stop_h3_tasks(tasks).await;
         return Err(error);
@@ -248,6 +250,7 @@ pub(super) async fn serve_webtransport(input: WebTransportServeInput) -> Result<
             upstream
                 .unregister_webtransport_session(upstream_session_id)
                 .await;
+
             stop_datagram_task(datagram_task).await;
             stop_h3_tasks(tasks).await;
             sessions.remove(downstream_stream_id).await;
@@ -279,6 +282,7 @@ pub(super) async fn serve_webtransport(input: WebTransportServeInput) -> Result<
         upstream
             .unregister_webtransport_session(upstream_session_id)
             .await;
+
         stop_datagram_task(datagram_task).await;
         stop_h3_tasks(tasks).await;
         sessions.remove(downstream_stream_id).await;
@@ -1382,6 +1386,7 @@ fn encode_relay_capsules(
     validate_connect_udp: bool,
 ) -> Result<Vec<Bytes>, BoxError> {
     let mut encoded = Vec::new();
+
     for capsule in decoder.push(chunk)? {
         let payload = if validate_connect_udp && capsule.kind == session::DATAGRAM_CAPSULE_TYPE {
             let payload = session::decode_connect_udp_datagram(&capsule.payload)?;
@@ -1389,8 +1394,10 @@ fn encode_relay_capsules(
         } else {
             capsule.payload
         };
+
         encoded.push(session::encode_capsule(capsule.kind, &payload));
     }
+
     Ok(encoded)
 }
 

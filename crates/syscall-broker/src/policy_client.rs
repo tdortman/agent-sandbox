@@ -212,6 +212,7 @@ mod tests {
                     // SAFETY: restoring the values captured in `set`; tests run
                     // single-threaded and every key is restored on drop.
                     Some(value) => unsafe { std::env::set_var(key, value) },
+
                     // SAFETY: as above; the key was captured by `set`.
                     None => unsafe { std::env::remove_var(key) },
                 }

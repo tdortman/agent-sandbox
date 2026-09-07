@@ -73,9 +73,11 @@ fn main() {
         .unwrap_or_default();
 
     let home_path = home.as_deref().map(Path::new);
+
     for rule in &mut static_allow {
         rule.path = expand_home_path(&rule.path, home_path);
     }
+
     eprintln!("agent-sandbox-fs-arm: starting filesystem monitor...");
 
     // Connect to policyd and request monitor startup.

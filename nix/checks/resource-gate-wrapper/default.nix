@@ -31,6 +31,14 @@ let
   resourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
     package = pkgs.hello;
     binary = "hello";
+
+    dbus = {
+      enable = true;
+      socketDirectory = "/run/user";
+      upstreamAddress = null;
+    };
+
+    dbusProxyPkg = pkgs.hello;
     devicePaths = [ "/dev/agent-sandbox-regression-device" ];
     fsArmPkg = pkgs.hello;
     policyContext = true;
@@ -97,6 +105,15 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
   grep -F -q -- '--ro-bind-try /tmp/resource-gate-regression-sandbox.sock' rg-wrapper.sh \
     || fail "resource-gate: missing sandbox policy socket ro-bind-try"
 
+  # Both buses use relays, never a bind of the raw host system socket.
+  grep -F -q -- 'for _asbx_dbus_bus in session system; do' rg-wrapper.sh \
+    || fail "D-Bus: both bus relays must start"
+  grep -F -q -- '--setenv DBUS_SYSTEM_BUS_ADDRESS "unix:path=$_asbx_dbus_dir/system.sock"' rg-wrapper.sh \
+    || fail "D-Bus: missing system relay address"
+  if grep -F -q -- '--ro-bind /run/dbus/system_bus_socket' rg-wrapper.sh; then
+    fail "D-Bus: raw system bus must not be exposed"
+  fi
+
   # --- Non-resource-gate mode assertions ---
 
   # 9. Broad --tmpfs /run IS present in non-resource-gate mode.
@@ -117,6 +134,53 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
   # 12. /tmp is sandbox-private in both dynamic wrappers.
   grep -F -q -- '--tmpfs /tmp' nrg-wrapper.sh \
     || fail "non-resource-gate: missing --tmpfs /tmp"
+
+  # Execute the generated relay setup with socket-producing stand-ins.
+  ${pkgs.python3}/bin/python3 - <<'PY'
+  import json, os, pathlib, subprocess, tempfile
+
+  wrapper = pathlib.Path("rg-wrapper.sh").read_text()
+  start = wrapper.index('_asbx_dbus_root=')
+  end = wrapper.index('RUNTIME_ARGS+=(--setenv DBUS_SYSTEM_BUS_ADDRESS', start)
+  setup = wrapper[start:wrapper.index('\n', end)]
+  with tempfile.TemporaryDirectory() as directory:
+      root = pathlib.Path(directory)
+      mock = root / "relay"
+      mock.write_text("#!${pkgs.python3}/bin/python3\n" + """
+  import json, os, pathlib, signal, socket, sys
+  args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+  bus = args['--bus']
+  pathlib.Path(os.environ['LOG_DIR'], bus).write_text(json.dumps(dict(args, pid=os.getpid())))
+  if os.environ.get('FAIL_BUS') == bus:
+      sys.exit(1)
+  listener = socket.socket(socket.AF_UNIX)
+  listener.bind(args['--listen'])
+  listener.listen()
+  signal.pause()
+  """)
+      mock.chmod(0o755)
+      setup = setup.replace('/run/user', str(root / 'sockets'))
+      setup = setup.replace('${pkgs.hello}/bin/agent-sandbox-dbus-proxy', str(mock))
+      for override, failure in [(None, ""), ("unix:path=/custom-system-bus", ""), (None, "system")]:
+          env = dict(os.environ, LOG_DIR=str(root), DBUS_SESSION_BUS_ADDRESS="unix:path=/session-bus", FAIL_BUS=failure)
+          env.pop('DBUS_SYSTEM_BUS_ADDRESS', None)
+          if override:
+              env['DBUS_SYSTEM_BUS_ADDRESS'] = override
+          script = 'set -eu\nRUNTIME_ARGS=()\n_agent_sandbox_cwd=/\n_agent_sandbox_home=/\n_agent_sandbox_project_root=/\n_agent_sandbox_session_id=test\n'
+          script += setup + '\nprintf "%s\\n" "''${RUNTIME_ARGS[@]}"\n'
+          result = subprocess.run(['bash', '-c', script], env=env, text=True, capture_output=True, timeout=10)
+          assert result.returncode == (1 if failure else 0), result.stderr
+          for bus in ['session', 'system']:
+              args = json.loads((root / bus).read_text())
+              expected = "unix:path=/session-bus" if bus == 'session' else override or "unix:path=/run/dbus/system_bus_socket"
+              assert args['--upstream-address'] == expected, args
+              assert args['--sandbox-session-id'] == 'test', args
+              assert not pathlib.Path(args['--listen']).parent.exists(), args
+              assert not pathlib.Path('/proc', str(args['pid'])).exists(), args
+              if not failure:
+                  assert 'DBUS_' + bus.upper() + '_BUS_ADDRESS\nunix:path=' + args['--listen'] in result.stdout, result.stdout
+  print("PASS: both bus addresses, upstream override, and cleanup on success/failure")
+  PY
 
   echo "PASS: resource-gate wrapper regression guard satisfied"
   touch $out

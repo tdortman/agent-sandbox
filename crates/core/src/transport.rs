@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 pub enum FlowProtocol {
     /// TCP transport.
     Tcp,
+
     /// UDP transport.
     Udp,
 }
@@ -37,14 +38,50 @@ impl FlowProtocol {
 /// single source for broker bypass, nfq flow routing, policyd check
 /// classification, and cli URL rendering.
 #[must_use]
-pub const fn scheme_for(protocol: FlowProtocol, port: u16) -> &'static str {
+pub fn scheme_for(protocol: FlowProtocol, port: u16) -> &'static str {
     match (protocol, port) {
         (FlowProtocol::Tcp, 80 | 8008 | 8080) => "http",
         (FlowProtocol::Tcp, 443 | 8443) => "https",
         (FlowProtocol::Udp, 443) => "http3",
+        (FlowProtocol::Tcp, port) if extra_https_ports().contains(&port) => "https",
         (FlowProtocol::Tcp, _) => "tcp",
         (FlowProtocol::Udp, _) => "udp",
     }
+}
+
+/// Extra HTTPS ports from the host-owned configuration, shared by every gate.
+/// Missing configuration keeps the built-in ports. Invalid configuration fails
+/// closed rather than letting a gate disagree with the transparent route.
+fn extra_https_ports() -> &'static [u16] {
+    static PORTS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    PORTS.get_or_init(|| {
+        let path = std::path::PathBuf::from("/etc/agent-sandbox/https-ports.json");
+        // Like the proxy's destination override, available only to debug fixtures.
+        #[cfg(debug_assertions)]
+        let path = std::env::var_os("AGENT_SANDBOX_TEST_HTTPS_PORTS_FILE")
+            .map_or(path, std::path::PathBuf::from);
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                parse_extra_https_ports(&bytes).expect("invalid host HTTPS port configuration")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("cannot read host HTTPS port configuration: {error}"),
+        }
+    })
+}
+
+fn parse_extra_https_ports(bytes: &[u8]) -> Result<Vec<u16>, String> {
+    let ports: Vec<u16> = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if ports
+        .iter()
+        .any(|port| matches!(port, 0 | 53 | 80 | 8008 | 8080 | 853))
+    {
+        return Err(
+            "extra HTTPS ports must be nonzero and cannot replace HTTP or DNS-over-TLS ports"
+                .into(),
+        );
+    }
+    Ok(ports)
 }
 
 /// Whether a flow is routed to the transparent proxy as an HTTP(S) service
@@ -59,6 +96,7 @@ pub fn is_http_service_port(protocol: FlowProtocol, port: u16) -> bool {
 pub enum FlowOwner {
     /// The transparent proxy backend decodes and authorises the flow.
     ProxyBackend,
+
     /// The packet classifier consults policy directly for this flow.
     DirectPolicy,
 }
@@ -70,6 +108,7 @@ pub enum FlowOwner {
 pub struct NetworkOwnership {
     /// Whether sandbox flows are routed through the transparent proxy.
     pub proxy_mode: bool,
+
     /// UDP ports registered for the transparent HTTP/3 proxy. Only consulted
     /// by the packet classifier; the syscall gate skips every UDP target in
     /// proxy mode because the packet filter owns that decision.
@@ -136,6 +175,50 @@ mod tests {
     };
 
     use super::{FlowOwner, FlowProtocol, NetworkOwnership, is_http_service_port, scheme_for};
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn configured_https_ports_share_routing_and_gate_classification() {
+        const TEST_ENV: &str = "AGENT_SANDBOX_TEST_HTTPS_PORTS_FILE";
+        if std::env::var_os(TEST_ENV).is_some() {
+            let owner = ownership(true, &[]);
+            assert_eq!(scheme_for(FlowProtocol::Tcp, 9443), "https");
+            assert!(is_http_service_port(FlowProtocol::Tcp, 9443));
+            assert_eq!(
+                owner.flow_owner(FlowProtocol::Tcp, "192.0.2.1".parse().unwrap(), 9443),
+                FlowOwner::ProxyBackend
+            );
+            assert!(owner.syscall_gate_skips("tcp", "example.test", 9443, None));
+            assert!(!ownership(false, &[]).syscall_gate_skips("tcp", "example.test", 9443, None));
+            assert_eq!(scheme_for(FlowProtocol::Tcp, 10443), "tcp");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ports.json");
+        std::fs::write(&path, "[9443]").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transport::tests::configured_https_ports_share_routing_and_gate_classification",
+            ])
+            .env(TEST_ENV, path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn extra_https_configuration_rejects_conflicting_ports() {
+        assert_eq!(super::parse_extra_https_ports(b"[9443,10443]").unwrap(), [
+            9443, 10443
+        ]);
+        for config in [
+            "[0]", "[53]", "[80]", "[8008]", "[8080]", "[853]", "[65536]", "bad",
+        ] {
+            assert!(super::parse_extra_https_ports(config.as_bytes()).is_err());
+        }
+    }
+
     #[test]
     fn scheme_table_matches_the_intercepted_proxy_ports() {
         for port in [80, 8008, 8080] {
@@ -194,6 +277,7 @@ mod tests {
             ),
             FlowOwner::ProxyBackend
         );
+
         assert_eq!(
             owner.flow_owner(
                 FlowProtocol::Udp,
@@ -233,17 +317,20 @@ mod tests {
         // Mismatched host or port falls through to the mode rules, which in
         // direct mode gate every non-DNS target.
         let direct = ownership(false, &[]);
+
         assert!(!direct.syscall_gate_skips("udp", "169.254.100.2", 53, Some(dns)));
         assert!(!direct.syscall_gate_skips("udp", "169.254.100.1", 54, Some(dns)));
 
         // Proxy mode: service ports and every UDP target skip the gate.
         assert!(owner.syscall_gate_skips("tcp", "93.184.216.34", 443, None));
+
         assert!(owner.syscall_gate_skips("tcp", "example.com", 8443, None));
         assert!(owner.syscall_gate_skips("udp", "93.184.216.34", 9999, None));
         assert!(!owner.syscall_gate_skips("tcp", "93.184.216.34", 853, None));
 
         // Direct mode gates everything except the DNS endpoint.
         let direct = ownership(false, &[]);
+
         assert!(!direct.syscall_gate_skips("tcp", "93.184.216.34", 443, None));
         assert!(!direct.syscall_gate_skips("udp", "93.184.216.34", 9999, None));
         assert!(direct.syscall_gate_skips("udp", "169.254.100.1", 53, Some(dns)));

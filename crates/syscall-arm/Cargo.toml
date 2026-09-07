@@ -9,8 +9,8 @@ name = "agent-sandbox-syscall-arm"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-syscall = { path = "../syscall" }
-agent-sandbox-sysutil = { path = "../sysutil" }
+agent-sandbox-syscall.workspace = true
+agent-sandbox-sysutil.workspace = true
 
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "process", "signal"] }

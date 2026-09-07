@@ -9,6 +9,10 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+agent-sandbox-core = { path = "crates/core" }
+agent-sandbox-syscall = { path = "crates/syscall" }
+agent-sandbox-sysutil = { path = "crates/sysutil" }
+aya = "0.14.0"
 base64 = "0.23.0"
 bytes = "1.12.1"
 caps = "0.5.6"
@@ -179,6 +183,7 @@ warnings = "deny"
 missing_docs = "warn"  # Every public symbol documented
 
 [patch.crates-io]
+rama-http-core = { path = "vendor/rama-http-core-0.3.0" }
 quinn = { path = "vendor/quinn-0.11.11" }
 quinn-proto = { path = "vendor/quinn-proto-0.11.16" }
 rustls = { path = "vendor/rustls-0.23.43" }

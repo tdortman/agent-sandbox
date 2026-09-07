@@ -33,6 +33,7 @@ pub enum ScopeTarget {
     Project {
         /// Resolved policy file path.
         policy_path: PathBuf,
+
         /// Project root the policy file belongs to.
         project_root: PathBuf,
     },
@@ -43,8 +44,10 @@ pub enum ScopeTarget {
     ProjectPackage {
         /// Resolved policy file path.
         policy_path: PathBuf,
+
         /// Project root the policy file belongs to.
         project_root: PathBuf,
+
         /// Attributed package name.
         package: String,
     },
@@ -56,6 +59,7 @@ pub enum ScopeTarget {
     Global {
         /// Resolved policy file path.
         policy_path: PathBuf,
+
         /// Home directory the policy file lives under.
         home: PathBuf,
     },
@@ -67,8 +71,10 @@ pub enum ScopeTarget {
     GlobalPackage {
         /// Resolved policy file path.
         policy_path: PathBuf,
+
         /// Home directory the policy file lives under.
         home: PathBuf,
+
         /// Attributed package name.
         package: String,
     },
@@ -78,14 +84,19 @@ pub enum ScopeTarget {
 pub struct ScopeContext<'a> {
     /// The wire-level scope being resolved.
     pub scope: ApprovalScope,
+
     /// Requested session id, required for session scope.
     pub session_id: Option<&'a str>,
+
     /// Home directory, required for global scopes.
     pub home: Option<&'a str>,
+
     /// Project root, required for project scopes.
     pub project_root: Option<&'a str>,
+
     /// Attributed package name, required for package scopes.
     pub package: Option<&'a str>,
+
     /// Currently active session ids against which a session scope is validated.
     pub active_session_ids: &'a HashSet<String>,
 }

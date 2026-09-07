@@ -3,6 +3,7 @@ use agent_sandbox_core::{
 };
 
 use super::PolicyStore;
+
 impl PolicyStore {
     /// Check a D-Bus target against declarative rules, then route unknown
     /// capabilities through the typed approval path.

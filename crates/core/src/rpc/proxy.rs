@@ -305,6 +305,7 @@ impl<'de> Deserialize<'de> for ProxyConnectionId {
         Self::parse(&value).map_err(D::Error::custom)
     }
 }
+
 /// Canonical lowercase hyphenated `UUIDv7` request identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProxyRequestId(Uuid);
@@ -508,12 +509,16 @@ capability_token!(AttributionToken);
 pub struct NetworkFlowKey {
     /// Transport protocol of the flow.
     pub protocol: FlowProtocol,
+
     /// Source IP address.
     pub source_ip: IpAddr,
+
     /// Source port.
     pub source_port: NonZeroU16,
+
     /// Destination IP address.
     pub destination_ip: IpAddr,
+
     /// Destination port.
     pub destination_port: NonZeroU16,
 }
@@ -601,10 +606,13 @@ impl NetworkFlowKey {
 pub struct NetworkFlowSelector {
     /// Transport protocol of the flow.
     pub protocol: FlowProtocol,
+
     /// Source IP address.
     pub source_ip: IpAddr,
+
     /// Source port.
     pub source_port: NonZeroU16,
+
     /// Destination port.
     pub destination_port: NonZeroU16,
 }
@@ -894,10 +902,13 @@ impl<'de> Deserialize<'de> for FlowContext {
 pub struct FlowRegistration {
     /// The network flow being registered.
     pub flow: NetworkFlowKey,
+
     /// The identity of the process and socket that owns the flow.
     pub owner: SocketIdentity,
+
     /// The normalized policy host that approved the flow.
     pub policy_host: NormalizedPolicyHost,
+
     /// Sandbox paths and session identity associated with the flow.
     pub ctx: FlowContext,
 }

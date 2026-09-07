@@ -6,7 +6,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache};
+use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache, network_revocation::NetworkPolicyRevocation};
 use tracing::{debug, info, warn};
 
 use crate::flow::NfqState;
@@ -46,6 +46,7 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
 
     info!(socket = %push_socket.display(), trusted_uid, "push socket listener bound");
     let cache = Arc::clone(&state.dns_cache);
+    let revocation = state.network_revocation.clone();
 
     std::thread::Builder::new()
         .name("dns-push-listener".to_string())
@@ -84,7 +85,9 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
                     continue;
                 };
 
-                apply_push_mapping(&cache, &entry);
+                if let Err(error) = apply_push_mapping(&cache, revocation.as_deref(), &entry) {
+                    warn!(%error, "cannot revoke network grants before DNS push");
+                }
             }
         })
         .expect("spawn push socket listener");
@@ -149,14 +152,23 @@ fn recv_datagram_with_creds(
 }
 
 /// Apply a validated push mapping to the in-memory DNS cache.
-fn apply_push_mapping(cache: &Arc<std::sync::Mutex<DnsCache>>, entry: &PushMapping) {
+fn apply_push_mapping(
+    cache: &Arc<std::sync::Mutex<DnsCache>>,
+    revocation: Option<&NetworkPolicyRevocation>,
+    entry: &PushMapping,
+) -> std::io::Result<()> {
     if entry.host.is_empty() {
-        return;
+        return Ok(());
     }
-
-    if let Ok(mut cache) = cache.lock() {
-        cache.remember_ephemeral(&entry.ip, &entry.host, entry.ttl.min(DEFAULT_MAX_TTL));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| std::io::Error::other("DNS cache lock poisoned"))?;
+    if let Some(guard) = revocation {
+        guard.revoke()?;
     }
+    cache.remember_ephemeral(&entry.ip, &entry.host, entry.ttl.min(DEFAULT_MAX_TTL));
+    drop(cache);
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -183,7 +195,7 @@ mod tests {
             ttl: 300,
         };
 
-        apply_push_mapping(&state.dns_cache, &entry);
+        apply_push_mapping(&state.dns_cache, None, &entry).expect("apply mapping");
 
         assert_eq!(
             state
@@ -236,7 +248,7 @@ mod tests {
 
             let line = std::str::from_utf8(&buf[..n]).expect("utf8");
             let entry: PushMapping = serde_json::from_str(line.trim()).expect("json");
-            apply_push_mapping(&cache, &entry);
+            apply_push_mapping(&cache, None, &entry).expect("apply mapping");
             true
         });
 

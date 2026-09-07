@@ -26,12 +26,14 @@ use serde::{Deserialize, Serialize};
 use crate::{merge_policy::ProjectPolicyContext, rpc::RequestContext};
 
 /// Shared session context for policyd and enforcement daemons.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContext {
     /// Process working directory, if known.
     pub cwd: Option<PathBuf>,
+
     /// User home directory, if known.
     pub home: Option<PathBuf>,
+
     /// Git project root, if known.
     pub project_root: Option<PathBuf>,
 }
@@ -56,14 +58,24 @@ fn read_session_context() -> SessionContext {
 
 fn write_session_context(path: &Path, ctx: &SessionContext) -> std::io::Result<()> {
     use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+    if let Ok(data) = std::fs::read(path)
+        && serde_json::from_slice::<SessionContext>(&data).is_ok_and(|current| current == *ctx)
+    {
+        return Ok(());
+    }
+
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+
     std::fs::create_dir_all(parent)?;
+
     let mut temporary = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o666))
         .tempfile_in(parent)?;
+
     serde_json::to_writer_pretty(&mut temporary, ctx)?;
     temporary.write_all(b"\n")?;
     temporary.persist(path).map_err(|error| error.error)?;
@@ -184,6 +196,7 @@ impl From<&SandboxPaths> for SessionContext {
 pub struct ProcessIds {
     /// Process id, or `0` when unknown.
     pub pid: u32,
+
     /// User id, or `0` when unknown.
     pub uid: u32,
 }
@@ -233,10 +246,13 @@ impl ProcessIds {
 pub struct ResolvedRequestContext {
     /// Resolved cwd, home, and project root.
     pub paths: SandboxPaths,
+
     /// Process id and user id from wire or peer cred.
     pub ids: ProcessIds,
+
     /// Sandbox session this request belongs to, if any.
     pub sandbox_session_id: Option<String>,
+
     /// Server-derived package attribution, if validated against the session.
     pub package: Option<String>,
 }
@@ -265,17 +281,49 @@ impl ResolvedRequestContext {
 /// Values and keys are decoded lossily as UTF-8.
 #[must_use]
 pub fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {
+    read_proc_environ_where(pid, |_| true)
+}
+
+fn read_context_environ(pid: u32) -> std::collections::HashMap<String, String> {
+    read_proc_environ_where(pid, |key| {
+        matches!(
+            key,
+            b"AGENT_SANDBOX_CWD"
+                | b"AGENT_SANDBOX_HOME"
+                | b"AGENT_SANDBOX_PROJECT_ROOT"
+                | b"AGENT_SANDBOX_SESSION_ID"
+                | b"HOME"
+        )
+    })
+}
+
+fn read_proc_environ_where(
+    pid: u32,
+    include: impl Fn(&[u8]) -> bool,
+) -> std::collections::HashMap<String, String> {
     let path = format!("/proc/{pid}/environ");
 
     let Ok(raw) = std::fs::read(&path) else {
         return std::collections::HashMap::new();
     };
 
+    parse_environ_where(&raw, include)
+}
+
+pub(crate) fn parse_environ_where(
+    raw: &[u8],
+    include: impl Fn(&[u8]) -> bool,
+) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
 
     for item in raw.split(|&b| b == 0) {
         if let Some(eq) = item.iter().position(|&b| b == b'=') {
             let (key, value) = item.split_at(eq);
+
+            if !include(key) {
+                continue;
+            }
+
             let value = &value[1..];
 
             env.insert(
@@ -329,20 +377,24 @@ pub fn home_from_uid(uid: Option<u32>) -> Option<String> {
 pub struct PeerCredentials {
     /// Process id of the peer, when the platform reports one.
     pub pid: u32,
+
     /// Real user id of the peer.
     pub uid: u32,
+
     /// Real group id of the peer, or `-1` when it does not fit in an `i32`.
     pub gid: i32,
 }
 
 /// Cwd / home / `project_root` resolved from a process's environment and
 /// `/proc`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProcContext {
     /// Current working directory claim from the process environment.
     pub cwd: Option<PathBuf>,
+
     /// Home directory claim.
     pub home: Option<PathBuf>,
+
     /// Discovered repository root, when inside a git work tree.
     pub project_root: Option<PathBuf>,
 }
@@ -377,31 +429,15 @@ pub fn peer_context(pid: u32, uid: Option<u32>) -> ProcContext {
         return ProcContext::default();
     }
 
-    let env = read_proc_environ(pid);
+    let env = read_context_environ(pid);
 
-    let mut cwd = env
-        .get("AGENT_SANDBOX_CWD")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| read_proc_cwd(pid));
-
-    let home = env
-        .get("AGENT_SANDBOX_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from));
-
-    let mut project_root = env
-        .get("AGENT_SANDBOX_PROJECT_ROOT")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-
-    if project_root.is_none() {
-        let project =
-            ProjectPolicyContext::new(home.as_deref().map(Path::new), cwd.as_deref(), None);
-
-        project_root = project.project_root().map(Path::to_path_buf);
-    }
+    let ProcContext {
+        mut cwd,
+        mut home,
+        project_root,
+    } = context_path_claims(&env);
+    cwd = cwd.or_else(|| read_proc_cwd(pid));
+    home = home.or_else(|| uid.and_then(|u| home_from_uid(Some(u))).map(PathBuf::from));
 
     if cwd.is_none()
         && let Some(root) = project_root.as_deref()
@@ -416,6 +452,19 @@ pub fn peer_context(pid: u32, uid: Option<u32>) -> ProcContext {
     }
 }
 
+pub(crate) fn context_path_claims(env: &std::collections::HashMap<String, String>) -> ProcContext {
+    let path = |name: &str| {
+        env.get(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    ProcContext {
+        cwd: path("AGENT_SANDBOX_CWD"),
+        home: path("AGENT_SANDBOX_HOME"),
+        project_root: path("AGENT_SANDBOX_PROJECT_ROOT"),
+    }
+}
+
 /// Full daemon-side resolution for a request that names a process.
 ///
 /// Trust level: `/proc`, persisted session file, and daemon env. The uid and
@@ -425,19 +474,24 @@ pub fn peer_context(pid: u32, uid: Option<u32>) -> ProcContext {
 pub fn daemon_context(pid: Option<u32>) -> ResolvedRequestContext {
     let pid = pid.unwrap_or(0);
     let ids = ProcessIds::new(pid, proc_uid(pid).unwrap_or(0));
+    let env = ids.pid().map(read_context_environ).unwrap_or_default();
 
-    ResolvedRequestContext::new(
-        resolve_daemon_paths(ids),
-        ids,
-        sandbox_session_id_from_pid(pid),
-    )
+    let session_id = env
+        .get("AGENT_SANDBOX_SESSION_ID")
+        .filter(|value| !value.is_empty())
+        .cloned();
+
+    ResolvedRequestContext::new(resolve_daemon_paths(ids, &env), ids, session_id)
 }
 
 /// Peer process paths from `SO_PEERCRED` + `/proc`.
-fn peer_sandbox_paths(ids: ProcessIds) -> SandboxPaths {
+fn peer_sandbox_paths(
+    ids: ProcessIds,
+    env: &std::collections::HashMap<String, String>,
+) -> SandboxPaths {
     let ctx = ids
         .pid()
-        .map_or_else(ProcContext::default, context_from_pid);
+        .map_or_else(ProcContext::default, |pid| context_from_pid(pid, env));
 
     let home = ctx.home.clone().or_else(|| {
         ids.uid()
@@ -472,23 +526,15 @@ fn resolve_sandbox_paths(
         .or_else(|| std::env::var("AGENT_SANDBOX_HOME").ok().map(PathBuf::from))
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from));
 
-    let mut project_root: Option<PathBuf> = peer_project.or(file.project_root).or_else(|| {
+    let project_root: Option<PathBuf> = peer_project.or(file.project_root).or_else(|| {
         std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
             .ok()
             .map(PathBuf::from)
     });
 
-    if project_root.is_none() || home.is_none() {
-        let project =
-            ProjectPolicyContext::new(home.as_deref(), cwd.as_deref(), project_root.as_deref());
-
-        if project_root.is_none() {
-            project_root = project.project_root().map(PathBuf::from);
-        }
-
-        if home.is_none() {
-            home = project.home_hint().map(PathBuf::from);
-        }
+    if home.is_none() {
+        let project = ProjectPolicyContext::new(None, cwd.as_deref(), project_root.as_deref());
+        home = project.home_hint().map(PathBuf::from);
     }
 
     SandboxPaths::new(
@@ -499,8 +545,11 @@ fn resolve_sandbox_paths(
 }
 
 /// Full daemon-side resolution (peer + file + env).
-fn resolve_daemon_paths(ids: ProcessIds) -> SandboxPaths {
-    let peer = peer_sandbox_paths(ids);
+fn resolve_daemon_paths(
+    ids: ProcessIds,
+    env: &std::collections::HashMap<String, String>,
+) -> SandboxPaths {
+    let peer = peer_sandbox_paths(ids, env);
 
     resolve_sandbox_paths(
         peer.cwd_path(),
@@ -519,7 +568,7 @@ pub fn persist_session_paths(paths: &SandboxPaths) {
 }
 
 /// Cwd / home / `project_root` from a process's environment and `/proc`.
-fn context_from_pid(pid: u32) -> ProcContext {
+fn context_from_pid(pid: u32, env: &std::collections::HashMap<String, String>) -> ProcContext {
     if pid == 0 {
         return ProcContext {
             cwd: None,
@@ -527,8 +576,6 @@ fn context_from_pid(pid: u32) -> ProcContext {
             project_root: None,
         };
     }
-
-    let env = read_proc_environ(pid);
 
     let cwd = env
         .get("AGENT_SANDBOX_CWD")
@@ -603,6 +650,7 @@ pub fn sandbox_session_id_from_pid(pid: u32) -> Option<String> {
     }
 
     let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+
     raw.rsplit(|&byte| byte == 0)
         .find_map(|entry| entry.strip_prefix(b"AGENT_SANDBOX_SESSION_ID="))
         .filter(|value| !value.is_empty())
@@ -679,6 +727,34 @@ mod tests {
     use crate::SessionContext;
 
     #[test]
+    fn captured_path_claims_share_environment_parsing_rules() {
+        let raw = b"broken\0HOME=/publisher-home\0AGENT_SANDBOX_HOME=/old\0AGENT_SANDBOX_HOME=/target\0AGENT_SANDBOX_CWD=/work=a\0AGENT_SANDBOX_PROJECT_ROOT=/project\xff\0AGENT_SANDBOX_SESSION_ID=old\0AGENT_SANDBOX_SESSION_ID=\0";
+        let parsed = super::parse_environ_where(raw, |_| true);
+        let claims = super::context_path_claims(&parsed);
+        assert_eq!(claims.home.as_deref(), Some(Path::new("/target")));
+        assert_eq!(claims.cwd.as_deref(), Some(Path::new("/work=a")));
+        assert_eq!(
+            claims.project_root.as_deref(),
+            Some(Path::new("/project\u{fffd}"))
+        );
+        assert_eq!(
+            parsed.get("AGENT_SANDBOX_SESSION_ID").map(String::as_str),
+            Some("")
+        );
+        let filtered = super::parse_environ_where(raw, |key| key == b"AGENT_SANDBOX_HOME");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered.get("AGENT_SANDBOX_HOME"),
+            parsed.get("AGENT_SANDBOX_HOME")
+        );
+        let only_home = super::parse_environ_where(b"HOME=/publisher-home\0", |_| true);
+        assert_eq!(
+            super::context_path_claims(&only_home),
+            super::ProcContext::default()
+        );
+    }
+
+    #[test]
     fn sandbox_paths_merged_with_prefers_explicit_values() {
         let base = SandboxPaths::new("/cwd", "/home", "/project");
         let merged = base.merged_with(None, Some("/alt-home".into()), None);
@@ -741,29 +817,57 @@ mod tests {
         let directory = tempfile::tempdir().expect("context directory");
         let path = directory.path().join("context.json");
         super::write_session_context(&path, &SessionContext::default()).expect("initial context");
+        use std::os::unix::fs::MetadataExt;
+
+        let original = std::fs::File::open(&path).expect("hold original inode");
+        super::write_session_context(&path, &SessionContext::default()).expect("unchanged context");
+
+        assert_eq!(
+            original.metadata().unwrap().ino(),
+            std::fs::metadata(&path).unwrap().ino(),
+            "unchanged context must not replace the file"
+        );
+
+        std::fs::write(&path, b"invalid JSON").expect("invalidate context");
+        super::write_session_context(&path, &SessionContext::default()).expect("repair context");
+
+        assert_eq!(
+            serde_json::from_slice::<SessionContext>(&std::fs::read(&path).unwrap()).unwrap(),
+            SessionContext::default()
+        );
+
         let start = std::sync::Barrier::new(5);
+
         std::thread::scope(|scope| {
             for index in 0..4 {
                 let path = &path;
                 let start = &start;
+
                 scope.spawn(move || {
                     let value = Some(std::path::PathBuf::from(format!("writer-{index}")));
+
                     let context = SessionContext {
                         cwd: value.clone(),
                         home: value.clone(),
                         project_root: value,
                     };
+
                     start.wait();
+
                     for _ in 0..100 {
                         super::write_session_context(path, &context).expect("atomic context write");
                     }
                 });
             }
+
             start.wait();
+
             for _ in 0..400 {
                 let data = std::fs::read(&path).expect("read published context");
+
                 let context: SessionContext =
                     serde_json::from_slice(&data).expect("complete JSON snapshot");
+
                 assert_eq!(context.cwd, context.home);
                 assert_eq!(context.home, context.project_root);
             }
@@ -779,25 +883,51 @@ mod tests {
 
         for session in [None, Some(""), Some("session=with=equals")] {
             let mut command = Command::new("sh");
+
             command
                 .args(["-c", "printf ready; read ignored"])
+                .env("AGENT_SANDBOX_CWD", "/context/cwd")
+                .env("AGENT_SANDBOX_HOME", "/context/home")
+                .env("AGENT_SANDBOX_PROJECT_ROOT", "/context/project")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped());
+
             command.env_remove("AGENT_SANDBOX_SESSION_ID");
+
             if let Some(value) = session {
                 command.env("AGENT_SANDBOX_SESSION_ID", value);
             }
+
             let mut child = command.spawn().expect("spawn environment owner");
+
             child
                 .stdout
                 .take()
                 .expect("readiness pipe")
                 .read_exact(&mut [0; 5])
                 .expect("child initialized");
+
             let actual = super::sandbox_session_id_from_pid(child.id());
+            let resolved = daemon_context(Some(child.id()));
             child.kill().expect("stop environment owner");
             child.wait().expect("reap environment owner");
             assert_eq!(actual.as_deref(), session.filter(|value| !value.is_empty()));
+            assert_eq!(resolved.sandbox_session_id, actual);
+
+            assert_eq!(
+                resolved.paths.cwd(),
+                Some(std::path::Path::new("/context/cwd"))
+            );
+
+            assert_eq!(
+                resolved.paths.home(),
+                Some(std::path::Path::new("/context/home"))
+            );
+
+            assert_eq!(
+                resolved.paths.project_root(),
+                Some(std::path::Path::new("/context/project"))
+            );
         }
     }
 

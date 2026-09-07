@@ -248,12 +248,14 @@ impl UiClient {
         loop {
             match self.session().await {
                 Ok(()) => {}
+
                 Err(UiCliError::Register(err)) => {
                     // A rejected registration is permanent: retrying cannot
                     // help and each attempt logs a policyd dispatch error.
                     warn!(error = %err, "registration rejected; exiting");
                     return Ok(());
                 }
+
                 Err(err) => warn!(error = %err, "disconnected; retrying"),
             }
 

@@ -9,9 +9,9 @@ name = "agent-sandbox-syscall-broker"
 path = "src/main.rs"
 
 [dependencies]
-agent-sandbox-core = { path = "../core" }
-agent-sandbox-syscall = { path = "../syscall" }
-agent-sandbox-sysutil = { path = "../sysutil" }
+agent-sandbox-core.workspace = true
+agent-sandbox-syscall.workspace = true
+agent-sandbox-sysutil.workspace = true
 
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true

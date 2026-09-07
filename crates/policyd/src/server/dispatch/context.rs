@@ -15,7 +15,7 @@ pub(super) fn resolve_request_context(
     role: SocketRole,
 
     ctx: &RequestContext,
-) -> ResolvedRequestContext {
+) -> std::io::Result<ResolvedRequestContext> {
     if role == SocketRole::Sandbox
         && let Some(sandbox_session_id) = ctx.sandbox_session_id.clone()
     {
@@ -25,7 +25,7 @@ pub(super) fn resolve_request_context(
                 uid: peer.uid,
             },
             &sandbox_session_id,
-        );
+        )?;
     }
 
     let resolved = ResolvedRequestContext::new(
@@ -34,13 +34,13 @@ pub(super) fn resolve_request_context(
         ctx.sandbox_session_id.clone(),
     );
 
-    store.resolve_context_with_peer(
+    Ok(store.resolve_context_with_peer(
         &resolved,
         Some(TrustedPeer {
             pid: peer.pid,
             uid: peer.uid,
         }),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -111,7 +111,8 @@ mod tests {
             },
             SocketRole::Sandbox,
             &ctx,
-        );
+        )
+        .expect("resolve context");
 
         assert_eq!(ctx.ids, ProcessIds::new(peer_pid, socket_uid));
         assert_eq!(ctx.paths.home_path(), expected_home);

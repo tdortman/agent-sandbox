@@ -194,6 +194,7 @@ let
       pkgs.iproute2
       pkgs.nftables
       pkgs.procps # sysctl
+      pkgs.util-linux # unshare
     ];
 
     script = netnsUpScript;
@@ -266,6 +267,21 @@ let
       "/var/lib/agent-sandbox"
     ];
   };
+  nfqLauncher = pkgs.writeShellScript "agent-sandbox-nfq-with-owner" ''
+    set -eu
+    pins=/run/agent-sandbox/owner-hints
+    ${pkgs.coreutils}/bin/mkdir -p "$pins"
+    # The service's private mount namespace owns these fresh pins. The query
+    # process owns every observer link, so all detach together when it exits.
+    if ${pkgs.util-linux}/bin/mount -t bpf bpf "$pins"; then
+      ${pkgs.coreutils}/bin/mkdir -p "$pins/maps"
+      if ${pkgs.bpftools}/bin/bpftool prog loadall ${ownerHintBpfObject} "$pins" pinmaps "$pins/maps"; then
+        exec ${sandboxPkg}/bin/agent-sandbox-nfq --owner-hints "$pins" "$@"
+      fi
+    fi
+    echo "kernel ownership hints unavailable; continuing with iterator" >&2
+    exec ${sandboxPkg}/bin/agent-sandbox-nfq "$@"
+  '';
   nfqReadyPath = "/run/agent-sandbox/nfq-ready";
   # The DNS forwarder runs on the host and listens on the veth gateway. It
   # forwards raw DNS queries to the upstream resolver (configured via
@@ -397,6 +413,18 @@ let
     hosts: files dns
     networks: files
   '';
+  ownerBpfObject = pkgs.runCommand "agent-sandbox-owner-bpf.o" { } ''
+    ${pkgs.llvmPackages.clang-unwrapped}/bin/clang -O2 -g -target bpf \
+      -I${pkgs.libbpf}/include \
+      -I${pkgs.linuxHeaders}/include \
+      -c ${./owner}/resolve.bpf.c -o "$out"
+  '';
+  ownerHintBpfObject = pkgs.runCommand "agent-sandbox-owner-hint-bpf.o" { } ''
+    ${pkgs.llvmPackages.clang-unwrapped}/bin/clang -O2 -g -target bpf -mcpu=v4 \
+      -I${pkgs.libbpf}/include \
+      -I${pkgs.linuxHeaders}/include \
+      -c ${./owner}/hint.bpf.c -o "$out"
+  '';
   packageEffectiveName =
     value:
     if value.name != null then
@@ -485,8 +513,18 @@ let
             "--http10-upstream-origin"
             origin
           ]) runtime.httpProxy.http10UpstreamOrigins
+          ++ lib.concatMap (origin: [
+            "--h2c-upstream-origin"
+            origin
+          ]) runtime.httpProxy.h2cUpstreamOrigins
+          ++ lib.optionals (runtime.httpProxy.upstreamClientIdentitiesFile != null) [
+            "--upstream-client-identities"
+            runtime.httpProxy.upstreamClientIdentitiesFile
+          ]
           ++ lib.optionals runtime.httpProxy.http3.enable [
             "--enable-http3-backend"
+            "--http3-upstream-handshake-timeout-ms"
+            (toString runtime.httpProxy.http3.upstreamHandshakeTimeoutMs)
             "--http3-listen-port"
             (toString runtime.httpProxy.http3.udpPort)
           ]
@@ -527,7 +565,9 @@ let
       pkgs.systemd
     ];
 
-    text = builtins.readFile ./proxy-tproxy-route.sh;
+    text =
+      "export AGENT_SANDBOX_EXTRA_HTTPS_PORTS=${lib.escapeShellArg (portSet runtime.httpProxy.extraHttpsPorts)}\n"
+      + builtins.readFile ./proxy-tproxy-route.sh;
   };
   proxyUser = "agent-sandbox-proxy";
   readinessMarkerPkg = pkgs.writeShellApplication {
@@ -549,73 +589,77 @@ in
 lib.mkIf policyEnabled (
   lib.mkMerge [
     {
-      environment.etc."agent-sandbox/policy.json".text = builtins.toJSON (
-        {
-          network = {
-            direct = {
-              allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
-              deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+      environment.etc = {
+        "agent-sandbox/https-ports.json".text = builtins.toJSON cfg.httpProxy.extraHttpsPorts;
+
+        "agent-sandbox/policy.json".text = builtins.toJSON (
+          {
+            network = {
+              direct = {
+                allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
+                deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+              };
+
+              http = {
+                allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
+                deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
+              };
             };
 
-            http = {
-              allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
-              deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
+            sudo = {
+              allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
+              deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
             };
-          };
+          }
+          // lib.optionalAttrs rootCfg.policy.dbus.enable {
+            dbus = {
+              allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
+              deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
+            };
+          }
+          //
+            lib.optionalAttrs
+              (
+                config.agent-sandbox.gates.filesystem.enable
+                || rootCfg.policy.filesystem.declarativeAllow != [ ]
+                || rootCfg.policy.filesystem.declarativeDeny != [ ]
+              )
+              {
+                filesystem = {
+                  allow = [
+                    {
+                      access = "all";
+                      path = "/nix/store";
+                    }
+                  ]
+                  ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
 
-          sudo = {
-            allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
-            deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
-          };
-        }
-        // lib.optionalAttrs rootCfg.policy.dbus.enable {
-          dbus = {
-            allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
-            deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
-          };
-        }
-        //
-          lib.optionalAttrs
-            (
-              config.agent-sandbox.gates.filesystem.enable
-              || rootCfg.policy.filesystem.declarativeAllow != [ ]
-              || rootCfg.policy.filesystem.declarativeDeny != [ ]
-            )
-            {
-              filesystem = {
-                allow = [
-                  {
-                    access = "all";
-                    path = "/nix/store";
-                  }
-                ]
-                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
-
-                deny = [
-                  {
-                    access = "all";
-                    path = "~/.config/agent-sandbox";
-                  }
-                  {
-                    access = "all";
-                    path = "./.agent-sandbox";
-                  }
-                ]
-                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
-              };
-            }
-        //
-          lib.optionalAttrs
-            (
-              rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
-            )
-            {
-              resources = {
-                allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
-                deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
-              };
-            }
-      );
+                  deny = [
+                    {
+                      access = "all";
+                      path = "~/.config/agent-sandbox";
+                    }
+                    {
+                      access = "all";
+                      path = "./.agent-sandbox";
+                    }
+                  ]
+                  ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
+                };
+              }
+          //
+            lib.optionalAttrs
+              (
+                rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
+              )
+              {
+                resources = {
+                  allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
+                  deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
+                };
+              }
+        );
+      };
 
       networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
 
@@ -715,6 +759,8 @@ lib.mkIf policyEnabled (
         // lib.optionalAttrs (runtime.uiBackend == "zenity") {
           AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
         };
+
+        restartTriggers = [ config.environment.etc."agent-sandbox/https-ports.json".source ];
       };
     }
 
@@ -862,7 +908,9 @@ lib.mkIf policyEnabled (
 
             ExecStart = lib.escapeShellArgs (
               [
-                "${sandboxPkg}/bin/agent-sandbox-nfq"
+                (toString nfqLauncher)
+                "--owner-iterator"
+                (toString ownerBpfObject)
                 "--queue"
                 (toString runtime.queueNumber)
                 "--policy-socket"
@@ -901,6 +949,7 @@ lib.mkIf policyEnabled (
           };
 
           environment.AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
+          restartTriggers = [ config.environment.etc."agent-sandbox/https-ports.json".source ];
         };
       }
       // lib.optionalAttrs cfg.httpProxy.enable {
@@ -977,6 +1026,8 @@ lib.mkIf policyEnabled (
             REQUESTS_CA_BUNDLE = proxyBundlePath;
             SSL_CERT_FILE = proxyBundlePath;
           };
+
+          restartTriggers = [ config.environment.etc."agent-sandbox/https-ports.json".source ];
         };
 
         agent-sandbox-proxy-firewall = {

@@ -4,6 +4,7 @@
 //! policyd, and relays approved requests through isolated upstream
 //! connections.
 mod doh;
+
 mod semantic;
 mod tls;
 pub(crate) mod upstream;
@@ -71,6 +72,7 @@ use crate::{
 
 /// The maximum number of concurrent in-flight policy checks per proxy.
 pub const MAX_ACTIVE_CHECKS: usize = 256;
+
 pub(crate) const POLICY_DENIED_BODY: &str = "blocked by agent-sandbox policy\n";
 
 #[derive(Debug)]
@@ -149,6 +151,20 @@ pub fn canonical_http10_origin(value: &str) -> Result<String, BoxError> {
     ))
 }
 
+/// Validate an exact cleartext HTTP/2 upstream origin.
+///
+/// # Errors
+/// Rejects HTTPS, wildcards, zero ports and non-origin URL components.
+pub fn canonical_h2c_origin(value: &str) -> Result<String, BoxError> {
+    let origin = canonical_http10_origin(value)?;
+    if !origin.starts_with("http://") || origin.ends_with(":0") || value.contains('*') {
+        return Err(BoxError::from_static_str(
+            "h2c requires an exact HTTP origin with a nonzero port",
+        ));
+    }
+    Ok(origin)
+}
+
 #[derive(Clone)]
 pub(crate) struct FlowState {
     destination: SocketAddr,
@@ -160,6 +176,7 @@ pub(crate) struct FlowState {
     alt_svc: Arc<AltSvcStore>,
     websocket_http11_urls: Arc<Vec<HttpUrl>>,
     http10_upstream_origins: Arc<Vec<String>>,
+    h2c_upstream_origins: Arc<Vec<String>>,
     upstream_clients: Arc<UpstreamClients>,
 }
 
@@ -356,20 +373,34 @@ fn policy_denied_response() -> Response {
 pub struct ListenConfig {
     /// The TCP port to listen on (0 requests an ephemeral port).
     pub listen_port: u16,
+
     /// Whether the listener uses transparent (`IP_TRANSPARENT`) interception.
     pub transparent: bool,
+
     /// The certificate issuer serving downstream SNI names.
     pub issuer: CertificateIssuer,
+
     /// Optional ECH key material shared with the HTTP/3 leg.
     pub ech: Option<DownstreamEch>,
+
     /// The Alt-Svc store shared with the HTTP/3 leg.
     pub alt_svc: Arc<AltSvcStore>,
+
     /// Upstream URL patterns forced to HTTP/1.x WebSocket upgrades.
     pub websocket_http11_urls: Arc<Vec<HttpUrl>>,
+
     /// Upstream origins canonicalised for HTTP/1.0 relays.
     pub http10_upstream_origins: Arc<Vec<String>>,
+
+    /// Exact cleartext origins using HTTP/2 prior knowledge.
+    pub h2c_upstream_origins: Arc<Vec<String>>,
+
+    /// Client credentials scoped to exact upstream HTTPS origins.
+    pub upstream_client_identities: Arc<crate::upstream_tls::UpstreamClientIdentities>,
+
     /// Resolves the original destination of each accepted connection.
     pub destination_resolver: DestinationResolver,
+
     /// Test-only: force TLS termination regardless of destination port.
     pub test_tls: bool,
 
@@ -384,8 +415,9 @@ pub struct ListenConfig {
 async fn build_upstream_clients(
     policy: &Arc<PolicySession>,
     claim: &FlowClaim,
+    identities: Arc<crate::upstream_tls::UpstreamClientIdentities>,
 ) -> Result<Arc<UpstreamClients>, BoxError> {
-    match UpstreamClients::new() {
+    match UpstreamClients::new(identities) {
         Ok(clients) => Ok(Arc::new(clients)),
 
         Err(error) => {
@@ -415,6 +447,8 @@ fn build_listener_service(
         let alt_svc = listener_config.alt_svc.clone();
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
+        let h2c_upstream_origins = listener_config.h2c_upstream_origins.clone();
+        let upstream_client_identities = listener_config.upstream_client_identities.clone();
         let shutdown = shutdown.clone();
 
         #[cfg(debug_assertions)]
@@ -430,6 +464,8 @@ fn build_listener_service(
         let ech = listener_config.ech.clone();
 
         async move {
+            // Forward small TLS and HTTP writes without waiting for peer ACKs.
+            stream.stream.set_nodelay(true)?;
             let peer: SocketAddr = stream.peer_addr()?.into();
             let destination = destination_resolver(&stream, listen_port)?;
             let destination_ip = destination.ip();
@@ -439,11 +475,14 @@ fn build_listener_service(
             let claim = policy.claim(flow).await?;
 
             let state = {
-                let upstream_clients = build_upstream_clients(&policy, &claim).await?;
+                let upstream_clients =
+                    build_upstream_clients(&policy, &claim, upstream_client_identities).await?;
 
                 FlowState {
                     destination,
-                    tls: test_tls || matches!(destination.port(), 443 | 8443),
+                    tls: test_tls
+                        || agent_sandbox_core::scheme_for(FlowProtocol::Tcp, destination.port())
+                            == "https",
                     active_checks: active_checks.clone(),
                     policy: policy.clone(),
                     claim: claim.clone(),
@@ -451,6 +490,7 @@ fn build_listener_service(
                     alt_svc: alt_svc.clone(),
                     websocket_http11_urls: websocket_http11_urls.clone(),
                     http10_upstream_origins,
+                    h2c_upstream_origins,
                     upstream_clients,
                 }
             };
@@ -502,7 +542,7 @@ fn build_listener_service(
             let mut http_server = HttpServer::auto(executor.clone());
             http_server.h2_mut().set_enable_connect_protocol();
             let http = http_server.service(request_service);
-            let fallback_http = HttpPeekRouter::new_http1(http.clone());
+            let fallback_http = HttpPeekRouter::new(http.clone());
 
             // Clone the shared listener configuration per connection so the
             // certificate resolver can fall back to the destination address
@@ -607,6 +647,7 @@ async fn check_http_policy(
         ip_fallback,
         state.authority_fallback_port(),
     )?;
+
     let target = request_target(request);
 
     let path = target
@@ -615,7 +656,6 @@ async fn check_http_policy(
         .to_owned();
 
     let scheme = if state.tls { "https" } else { "http" };
-
     let raw_query = request.uri().query().map(|query| query.to_string());
     semantic_http_version(request.version())?;
 
@@ -659,17 +699,14 @@ async fn proxy_request(
 ) -> Result<Response, BoxError> {
     let websocket = is_websocket_upgrade_request(&request);
     let downstream_version = request.version();
-
     if blocked_http_request(&request) {
         return Err(Box::new(PolicyDenied));
     }
 
     let response_context = ResponseVersionAdaptCtx::from_request(&request);
     let doh = is_doh_request(&request);
-
     let (semantic_request, check, authority, path) =
         check_http_policy(&request, &state, &shutdown).await?;
-
     if !check.ok || !check.verdict.allowed {
         info!(
             %authority, %path, method = %request.method().as_str(),
@@ -695,7 +732,6 @@ async fn proxy_request(
         websocket,
     )
     .await?;
-
     let response_status = response.status();
     let response_version = response.version();
 
@@ -1056,6 +1092,29 @@ mod tests {
             context: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.stream).poll_shutdown(context)
+        }
+    }
+
+    #[test]
+    fn h2c_origins_are_exact_cleartext_authorities() {
+        assert_eq!(
+            super::canonical_h2c_origin("http://EXAMPLE.test/").unwrap(),
+            "http://example.test:80"
+        );
+        assert_eq!(
+            super::canonical_h2c_origin("http://[::1]:8080").unwrap(),
+            "http://[::1]:8080"
+        );
+        for origin in [
+            "https://example.test",
+            "http://*.example.test",
+            "http://example.test:0",
+            "http://example.test/path",
+            "http://example.test?query",
+            "http://user@example.test",
+            "http://example.test#fragment",
+        ] {
+            assert!(super::canonical_h2c_origin(origin).is_err(), "{origin}");
         }
     }
 
@@ -1426,7 +1485,8 @@ mod tests {
             alt_svc: Arc::new(AltSvcStore::new(Vec::new())),
             websocket_http11_urls: Arc::new(Vec::new()),
             http10_upstream_origins: Arc::new(Vec::new()),
-            upstream_clients: Arc::new(UpstreamClients::new()?),
+            h2c_upstream_origins: Arc::new(Vec::new()),
+            upstream_clients: Arc::new(UpstreamClients::new(Arc::default())?),
         })
     }
 

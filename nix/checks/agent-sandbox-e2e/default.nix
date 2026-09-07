@@ -878,37 +878,45 @@ let
                 dbus = {
                   enable = true;
 
-                  declarativeAllow = [
-                    {
-                      comment = "VM module serialization allow";
+                  declarativeAllow =
+                    map
+                      (bus: {
+                        comment = "VM module serialization allow";
 
-                      target = {
-                        bus = "session";
-                        destination = "org.freedesktop.DBus";
-                        interface = "org.freedesktop.DBus";
-                        member = "ListNames";
-                        messageKind = "method_call";
-                        objectPath = "/org/freedesktop/DBus";
-                        signature = "";
-                      };
-                    }
-                  ];
+                        target = {
+                          inherit bus;
+                          destination = "org.freedesktop.DBus";
+                          interface = "org.freedesktop.DBus";
+                          member = "ListNames";
+                          messageKind = "method_call";
+                          objectPath = "/org/freedesktop/DBus";
+                          signature = "";
+                        };
+                      })
+                      [
+                        "session"
+                        "system"
+                      ];
 
-                  declarativeDeny = [
-                    {
-                      comment = "VM module serialization deny";
+                  declarativeDeny =
+                    map
+                      (bus: {
+                        comment = "VM module serialization deny";
 
-                      target = {
-                        bus = "session";
-                        destination = "org.freedesktop.DBus";
-                        interface = "org.freedesktop.DBus";
-                        member = "GetId";
-                        messageKind = "method_call";
-                        objectPath = "/org/freedesktop/DBus";
-                        signature = "";
-                      };
-                    }
-                  ];
+                        target = {
+                          inherit bus;
+                          destination = "org.freedesktop.DBus";
+                          interface = "org.freedesktop.DBus";
+                          member = "GetId";
+                          messageKind = "method_call";
+                          objectPath = "/org/freedesktop/DBus";
+                          signature = "";
+                        };
+                      })
+                      [
+                        "session"
+                        "system"
+                      ];
 
                   socketDirectory = "/var/lib/agent-sandbox-test/dbus-runtime";
                   upstreamAddress = "unix:path=/run/user/1000/bus";
@@ -1570,7 +1578,7 @@ let
       sandbox_shell(resource, "sandbox-resource-bash", "dd if=/dev/agent-sandbox-denied-device of=/dev/null bs=1 count=1 status=none", expect_success=False)
 
       # D-Bus relay: the configured upstream overrides a bad caller address,
-      # allowed ListNames succeeds, GetId is denied, and the system bus is hidden.
+      # both buses enforce capability policy, and raw host socket access is denied.
       dbus.wait_for_unit("agent-sandbox-policy.service")
       sandbox_shell(
           dbus,
@@ -1602,6 +1610,19 @@ let
           "sandbox-dbus-bash",
           "! timeout 2 socat - UNIX-CONNECT:/run/dbus/system_bus_socket",
           wrapper=("env", "XDG_RUNTIME_DIR=/run/user/1000", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"),
+      )
+
+      sandbox_shell(
+          dbus,
+          "sandbox-dbus-bash",
+          "dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames | grep -q array",
+          wrapper=session_wrapper,
+      )
+      sandbox_shell(
+          dbus,
+          "sandbox-dbus-bash",
+          "dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId 2>&1 | grep -q org.freedesktop.DBus.Error.AccessDenied",
+          wrapper=session_wrapper,
       )
 
       # Direct transport policy: declared TCP and UDP ports are reachable,

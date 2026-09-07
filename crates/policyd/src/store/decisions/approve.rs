@@ -1271,7 +1271,6 @@ mod tests {
         let home = dir.path().join("home");
         let project = home.join("project");
         std::fs::create_dir_all(&project).expect("create project dir");
-
         let pending_id = "fs-scoped-deny".to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -1885,6 +1884,7 @@ mod tests {
                 project_root: "/repo".into(),
                 package: None,
                 launcher_pid: 0,
+                launcher_start_ticks: 0,
             },
         );
 
@@ -2063,6 +2063,7 @@ mod tests {
                 project_root: "/repo".into(),
                 package: None,
                 launcher_pid: 0,
+                launcher_start_ticks: 0,
             },
         );
 

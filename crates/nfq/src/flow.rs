@@ -5,15 +5,20 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, SyncSender, TrySendError},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowOwner, FlowRegistration, NetworkFlowKey, NetworkOwnership,
-    NormalizedPolicyHost, OwnerSnapshot, SandboxPaths, SocketIdentity, lookup_dns_cache,
-    mappings_from_response, sandbox_session_id_from_pid,
+    NormalizedPolicyHost, OwnerResolution, OwnerSnapshot, SandboxPaths, SocketIdentity,
+    lookup_dns_cache, mappings_from_response, network_revocation::NetworkPolicyRevocation,
+    sandbox_session_id_from_pid, socket_owner::KernelOwnerResolver,
 };
 use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
@@ -40,13 +45,31 @@ struct ApprovedFlow {
 
 pub struct NfqState {
     pub(crate) dns_cache: Arc<std::sync::Mutex<DnsCache>>,
+    pub(crate) network_revocation: Option<Arc<NetworkPolicyRevocation>>,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     pub(crate) approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
+    approved_bindings_writer: Option<(SyncSender<()>, JoinHandle<()>)>,
     approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, ApprovedFlow>>>,
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
     pub(crate) nft_binary: String,
     ownership: NetworkOwnership,
+    kernel_owner: Option<KernelOwnerResolver>,
+}
+
+impl Drop for NfqState {
+    fn drop(&mut self) {
+        let Some((sender, worker)) = self.approved_bindings_writer.take() else {
+            return;
+        };
+
+        drop(sender);
+        if worker.join().is_err()
+            && let Ok(bindings) = self.approved_bindings.lock()
+        {
+            let _ = bindings.save();
+        }
+    }
 }
 
 impl NfqState {
@@ -65,9 +88,11 @@ impl NfqState {
 
         let approved_bindings = ApprovedBindings::load(&approved_bindings_path);
 
-        Self {
+        let mut state = Self {
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
+            network_revocation: None,
+            approved_bindings_writer: None,
             approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path,
             attribution: Arc::new(Mutex::new(attribution::SessionAttribution::load(
@@ -83,6 +108,89 @@ impl NfqState {
                     .filter_map(|port| port.trim().parse::<u16>().ok())
                     .collect(),
             },
+            kernel_owner: cli.owner_iterator.as_ref().and_then(|directory| {
+                match KernelOwnerResolver::open(directory) {
+                    Ok(mut resolver) => {
+                        if let Some(pins) = &cli.owner_hints {
+                            match resolver.enable_hints(pins) {
+                                Ok(()) => info!("kernel ownership hints enabled"),
+                                Err(error) => warn!(%error, "kernel ownership hints unavailable; using iterator"),
+                            }
+                        }
+                        info!(path = %directory.display(), "kernel socket ownership enabled");
+                        Some(resolver)
+                    }
+                    Err(error) => {
+                        warn!(%error, "kernel socket ownership unavailable; using procfs");
+                        None
+                    }
+                }
+            }),
+        };
+        state.start_approved_bindings_writer();
+        state
+    }
+
+    pub(crate) fn enable_network_revocation(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let guard = NetworkPolicyRevocation::open(path)?;
+        let has_attribution = !self
+            .attribution
+            .lock()
+            .map_err(|_| std::io::Error::other("hostname attribution lock poisoned"))?
+            .is_empty();
+        let has_disk_cache = match std::fs::symlink_metadata(&self.cache_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        // ponytail: existing aliases disable the file-only snapshot; compile
+        // hostname attribution before admitting these contexts.
+        if has_attribution || has_disk_cache {
+            guard.revoke()?;
+        }
+        if let Some(previous) = &self.network_revocation {
+            previous.revoke()?;
+        }
+        self.network_revocation = Some(Arc::new(guard));
+        Ok(())
+    }
+
+    fn start_approved_bindings_writer(&mut self) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let approved_bindings = Arc::clone(&self.approved_bindings);
+        let Ok(worker) = thread::Builder::new()
+            .name("agent-sandbox-nfq-bindings".to_string())
+            .spawn(move || {
+                while receiver.recv().is_ok() {
+                    // ponytail: O(n) snapshot; use incremental persistence for large hint tables.
+                    let snapshot = match approved_bindings.lock() {
+                        Ok(bindings) => bindings.clone(),
+                        Err(_) => continue,
+                    };
+                    let _ = snapshot.save();
+                }
+            })
+        else {
+            return;
+        };
+
+        self.approved_bindings_writer = Some((sender, worker));
+    }
+
+    pub(crate) fn notify_approved_bindings(&self) {
+        let save_synchronously = match self.approved_bindings_writer.as_ref() {
+            None => true,
+            Some((sender, _)) => match sender.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => false,
+                Err(TrySendError::Disconnected(())) => true,
+            },
+        };
+
+        if save_synchronously && let Ok(bindings) = self.approved_bindings.lock() {
+            let _ = bindings.save();
         }
     }
 
@@ -130,6 +238,14 @@ impl NfqState {
             return ip.to_string();
         };
 
+        if let Some(guard) = &self.network_revocation
+            && let Err(error) = guard.revoke()
+        {
+            // Use the observed hostname for this request, but do not retain
+            // attribution that could outlive the watched disk cache.
+            warn!(%error, "cannot revoke network grants before retaining disk DNS mapping");
+            return host;
+        }
         if let Ok(mut cache) = self.dns_cache.lock() {
             cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
         }
@@ -236,7 +352,7 @@ fn register_proxy_flow(
     state: &NfqState,
     meta: packet::PacketMeta,
     owner: Option<OwnerSnapshot>,
-    register: &mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>,
+    register: &mut dyn FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool>,
 ) -> Verdict {
     let Some(owner) = owner else {
         warn!(
@@ -285,7 +401,7 @@ fn register_proxy_flow(
         FlowContext::new(SandboxPaths::default(), session_id),
     );
 
-    match register(registration) {
+    match register(registration, Some(owner.fd_number())) {
         Ok(true) if remember_approved_flow(state, &flow, owner.identity()) => {
             info!(
                 protocol = meta.protocol.as_str(),
@@ -325,7 +441,7 @@ pub fn handle_packet_payload_with_registration(
     state: &NfqState,
     payload: &[u8],
     check: &mut dyn FnMut(policy::CheckDestinationArgs<'_>) -> std::io::Result<bool>,
-    register: Option<&mut dyn FnMut(FlowRegistration) -> std::io::Result<bool>>,
+    register: Option<&mut dyn FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool>>,
 ) -> (Verdict, Option<packet::PacketMeta>) {
     // Try IPv4 first, then IPv6.
     let meta = packet::parse_ipv4(payload).or_else(|| packet::parse_ipv6(payload));
@@ -348,6 +464,12 @@ pub fn handle_packet_payload_with_registration(
         let mappings = mappings_from_response(udp_data);
 
         if !mappings.is_empty() {
+            if let Some(guard) = &state.network_revocation
+                && let Err(error) = guard.revoke()
+            {
+                warn!(%error, "cannot revoke network grants before DNS reply");
+                return (Verdict::Drop, Some(meta));
+            }
             if let Ok(mut cache) = state.dns_cache.lock() {
                 for m in &mappings {
                     cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
@@ -384,10 +506,31 @@ pub fn handle_packet_payload_with_registration(
     // enforce HTTP policy per request. All other destinations stay on the
     // ordinary kernel route and are checked synchronously below.
 
-    let source_owner = owner::owner_snapshot(meta.protocol, meta.src_ip, meta.src_port);
+    let source_owner = match owner::owner_resolution(
+        state.kernel_owner.as_ref(),
+        meta.protocol,
+        if meta.protocol == packet::TransportProtocol::Tcp {
+            agent_sandbox_core::SocketTuple::new(
+                meta.src_ip,
+                meta.src_port,
+                meta.dst_ip,
+                meta.dst_port,
+            )
+        } else {
+            agent_sandbox_core::SocketTuple::from_local(meta.src_ip, meta.src_port)
+        },
+    ) {
+        OwnerResolution::Unique(owner) => Some(owner),
+        OwnerResolution::Missing => None,
+        OwnerResolution::Ambiguous => {
+            warn!(src = %meta.src_ip, port = meta.src_port, "rejecting ambiguous socket ownership");
+            return (
+                policy::nft_reject_and_repeat(&state.nft_binary, meta.dst_ip, meta.dst_port),
+                Some(meta),
+            );
+        }
+    };
     let src_pid = source_owner.map(OwnerSnapshot::pid_value);
-
-    let session_id = src_pid.and_then(sandbox_session_id_from_pid);
 
     let proxy_flow = matches!(
         state
@@ -416,6 +559,7 @@ pub fn handle_packet_payload_with_registration(
         return (verdict, Some(meta));
     }
 
+    let session_id = src_pid.and_then(sandbox_session_id_from_pid);
     let allowed = match policy::transport_check(state, meta, src_pid, session_id.as_deref(), check)
     {
         TransportCheck::Rejected(verdict) => return (verdict, Some(meta)),
@@ -453,10 +597,11 @@ pub fn handle_packet(
         ))
     };
 
-    let mut register = |registration: FlowRegistration| {
+    let mut register = |registration: FlowRegistration, owner_fd_hint: Option<u32>| {
         runtime.block_on(policy::register_network_flow(
             &mut policy_client.borrow_mut(),
             registration,
+            owner_fd_hint,
             timeout,
         ))
     };
@@ -512,15 +657,54 @@ pub mod tests {
             approved_bindings: Arc::new(std::sync::Mutex::new(ApprovedBindings::load(
                 &approved_bindings_path,
             ))),
+            network_revocation: None,
+            approved_bindings_writer: None,
             approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
             dns_server_ip: DNS_IP,
             nft_binary: "false".to_string(),
+            kernel_owner: None,
             ownership: NetworkOwnership {
                 proxy_mode: false,
                 udp_proxy_ports: vec![443],
             },
         }
+    }
+
+    #[test]
+    fn approved_binding_writer_drains_on_state_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-sandbox-nfq-drain-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut state = state_for_tests();
+        state.approved_bindings = Arc::new(std::sync::Mutex::new(ApprovedBindings::load(&path)));
+        state.start_approved_bindings_writer();
+        assert!(state.approved_bindings_writer.is_some());
+
+        for index in 0..64 {
+            let ip = format!("192.0.2.{}", index + 1);
+            let host = format!("host-{index}.example");
+            {
+                let mut bindings = state.approved_bindings.lock().expect("lock bindings");
+                bindings.record(&host, &ip);
+            }
+            state.notify_approved_bindings();
+        }
+
+        drop(state);
+
+        let persisted = ApprovedBindings::load(&path);
+        for index in 0..64 {
+            let ip = format!("192.0.2.{}", index + 1);
+            let host = format!("host-{index}.example");
+            assert_eq!(persisted.aliases(&ip), vec![host]);
+        }
+        std::fs::remove_file(path).expect("remove test bindings");
     }
 
     #[test]
@@ -580,7 +764,7 @@ pub mod tests {
     }
 
     #[test]
-    fn proxy_mode_registers_public_flow_without_transport_check() {
+    fn proxy_mode_drops_tcp_flow_with_mismatched_destination() {
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
 
@@ -621,14 +805,14 @@ pub mod tests {
 
         let registration = std::cell::RefCell::new(None);
 
-        let mut register = |flow: FlowRegistration| {
+        let mut register = |flow: FlowRegistration, owner_fd_hint: Option<u32>| {
             assert_eq!(
                 check_count.get(),
                 0,
                 "proxy registration must precede transport fallback checks"
             );
 
-            *registration.borrow_mut() = Some(flow);
+            *registration.borrow_mut() = Some((flow, owner_fd_hint));
             Ok(true)
         };
 
@@ -639,27 +823,12 @@ pub mod tests {
             Some(&mut register),
         );
 
-        assert_eq!(verdict, Verdict::Accept);
-
-        assert_eq!(
-            check_count.get(),
-            0,
-            "proxy mode must defer transport checks to decoded HTTP or fallback"
+        assert_eq!(verdict, Verdict::Drop);
+        assert_eq!(check_count.get(), 0);
+        assert!(
+            registration.into_inner().is_none(),
+            "a socket with a different destination cannot authorize proxy registration"
         );
-
-        let registration = registration
-            .into_inner()
-            .expect("proxy mode must register the flow");
-
-        assert_eq!(registration.flow.protocol, FlowProtocol::Tcp);
-        assert_eq!(registration.flow.source_ip, client_addr.ip());
-
-        assert_eq!(
-            registration.flow.destination_ip,
-            "93.184.216.34".parse::<Ipv4Addr>().expect("valid IPv4")
-        );
-
-        assert_eq!(registration.policy_host.to_string(), "example.test");
     }
 
     #[test]
@@ -667,6 +836,12 @@ pub mod tests {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind udp socket");
 
         let client_addr = socket.local_addr().expect("socket address");
+        let expected_owner = owner::owner_snapshot(
+            packet::TransportProtocol::Udp,
+            client_addr.ip(),
+            client_addr.port(),
+        )
+        .expect("resolve UDP owner");
         let mut state = state_for_tests();
         state.ownership.proxy_mode = true;
 
@@ -698,14 +873,14 @@ pub mod tests {
 
         let registration = std::cell::RefCell::new(None);
 
-        let mut register = |flow: FlowRegistration| {
+        let mut register = |flow: FlowRegistration, owner_fd_hint: Option<u32>| {
             assert_eq!(
                 check_count.get(),
                 0,
                 "UDP proxy registration must bypass the transport check"
             );
 
-            *registration.borrow_mut() = Some(flow);
+            *registration.borrow_mut() = Some((flow, owner_fd_hint));
             Ok(true)
         };
 
@@ -723,9 +898,11 @@ pub mod tests {
             "HTTP/3 must reach decoded HTTP policy without network.direct"
         );
 
-        let registration = registration
+        let (registration, owner_fd_hint) = registration
             .into_inner()
             .expect("UDP proxy flow must register before HTTP policy");
+
+        assert_eq!(owner_fd_hint, Some(expected_owner.fd_number()));
 
         assert_eq!(registration.flow.protocol, FlowProtocol::Udp);
         assert_eq!(registration.flow.source_ip, client_addr.ip());
@@ -769,7 +946,7 @@ pub mod tests {
         };
 
         let registration_count = std::cell::Cell::new(0_u32);
-        let mut register = |_: FlowRegistration| {
+        let mut register = |_: FlowRegistration, _: Option<u32>| {
             registration_count.set(registration_count.get() + 1);
             Ok(true)
         };
@@ -825,7 +1002,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let mut register = |_: FlowRegistration| {
+        let mut register = |_: FlowRegistration, _: Option<u32>| {
             registration_count.set(registration_count.get() + 1);
             Ok(true)
         };
@@ -890,7 +1067,7 @@ pub mod tests {
             Ok(false)
         };
 
-        let mut register = |_: FlowRegistration| {
+        let mut register = |_: FlowRegistration, _: Option<u32>| {
             registration_count.set(registration_count.get() + 1);
             Ok(false)
         };
@@ -968,7 +1145,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| Ok(true);
 
-        let mut register = |_: FlowRegistration| Ok(true);
+        let mut register = |_: FlowRegistration, _: Option<u32>| Ok(true);
 
         let (verdict, _) = handle_packet_payload_with_registration(
             &state,
@@ -1007,7 +1184,7 @@ pub mod tests {
 
         let registration_count = std::cell::Cell::new(0_u32);
 
-        let mut register = |_: FlowRegistration| {
+        let mut register = |_: FlowRegistration, _: Option<u32>| {
             registration_count.set(registration_count.get() + 1);
             Ok(true)
         };
@@ -1084,7 +1261,7 @@ pub mod tests {
 
         let registration_count = std::cell::Cell::new(0_u32);
 
-        let mut register = |_: FlowRegistration| {
+        let mut register = |_: FlowRegistration, _: Option<u32>| {
             registration_count.set(registration_count.get() + 1);
             Ok(true)
         };
