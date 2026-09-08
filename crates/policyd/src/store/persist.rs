@@ -258,7 +258,7 @@ fn union_http_methods(
         }
     }
 
-    let rule = HttpRule::new(merged.into_methods(), target.url.to_string(), label);
+    let rule = HttpRule::from_url(merged.into_methods(), &target.url, Some(label.to_owned()));
 
     if let Some(index) = insert_index {
         retained.insert(index, rule);

@@ -1889,7 +1889,10 @@ let
       # to later requests from the same package without a prompt.
       approval.succeed("test -f /home/user/.agent-sandbox/packages/sandbox-approve-bash.json")
       approval.succeed(
-          "grep -F -q 'http://169.254.100.1:8008/allowed' /home/user/.agent-sandbox/packages/sandbox-approve-bash.json"
+          "grep -F -q '\"url\": \"http://169.254.100.1/allowed\"' /home/user/.agent-sandbox/packages/sandbox-approve-bash.json"
+      )
+      approval.succeed(
+          "grep -F -q '\"port\": 8008' /home/user/.agent-sandbox/packages/sandbox-approve-bash.json"
       )
       approval.succeed(
           package_cmd("sandbox-approve-bash", "curl --fail --silent --show-error --max-time 15 http://169.254.100.1:8008/allowed | grep -q allowed-get")

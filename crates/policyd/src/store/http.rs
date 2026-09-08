@@ -664,17 +664,23 @@ mod tests {
 
         let mut policy = Policy::default();
 
-        policy.network.http.allow.push(HttpRule::new(
-            vec!["GET".to_owned()],
-            "https://api.example.com/v1",
-            "allow GET",
-        ));
+        policy.network.http.allow.push(
+            HttpRule::new(
+                vec!["GET".to_owned()],
+                "https://api.example.com/v1",
+                "allow GET",
+            )
+            .expect("valid rule"),
+        );
 
-        policy.network.http.deny.push(HttpRule::new(
-            vec!["POST".to_owned()],
-            "https://api.example.com/v1/private",
-            "deny POST",
-        ));
+        policy.network.http.deny.push(
+            HttpRule::new(
+                vec!["POST".to_owned()],
+                "https://api.example.com/v1/private",
+                "deny POST",
+            )
+            .expect("valid rule"),
+        );
 
         atomic_write_policy(&policy_path, &policy, None, None, None).expect("write policy");
 

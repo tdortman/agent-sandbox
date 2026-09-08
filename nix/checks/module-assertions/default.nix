@@ -103,6 +103,116 @@ let
         ];
       };
     };
+    assert
+      let
+        json = builtins.fromJSON system.config.environment.etc."agent-sandbox/policy.json".text;
+        system = mkNixosSystem {
+          agent-sandbox.network = {
+            enable = true;
+
+            httpProxy = {
+              enable = true;
+
+              declarativeAllow = [
+                {
+                  allMethods = true;
+                  url = "https://api.example.com/v1";
+                }
+                {
+                  allMethods = true;
+                  url = "https://api.example.com:8080/v1";
+                }
+                {
+                  allMethods = true;
+                  port = 8443;
+                  url = "https://api.example.com/v1";
+                }
+                {
+                  allMethods = true;
+                  port = 8443;
+                  url = "https://api.example.com:8443/v1";
+                }
+              ];
+            };
+          };
+        };
+      in
+      json.network.http.allow == [
+        {
+          methods = [ ];
+          port = 443;
+          url = "https://api.example.com/v1";
+        }
+        {
+          methods = [ ];
+          port = 8080;
+          url = "https://api.example.com/v1";
+        }
+        {
+          methods = [ ];
+          port = 8443;
+          url = "https://api.example.com/v1";
+        }
+        {
+          methods = [ ];
+          port = 8443;
+          url = "https://api.example.com/v1";
+        }
+      ];
+
+    assert
+      !(builtins.tryEval (
+        let
+          system = mkNixosSystem {
+            agent-sandbox.network = {
+              enable = true;
+
+              httpProxy = {
+                enable = true;
+
+                declarativeAllow = [
+                  {
+                    allMethods = true;
+                    port = 9443;
+                    url = "https://api.example.com:8443/v1";
+                  }
+                ];
+              };
+            };
+          };
+        in
+        system.config.environment.etc."agent-sandbox/policy.json".text
+      )).success;
+
+    assert
+      let
+        json =
+          builtins.fromJSON
+            system.config.environment.etc."agent-sandbox/packages/http-ports.json".text;
+        system = mkNixosSystem {
+          agent-sandbox.packages = [
+            {
+              package = pkgs.hello;
+              name = "http-ports";
+
+              policy.network.http.allow = [
+                {
+                  allMethods = true;
+                  port = 8443;
+                  url = "https://api.example.com/v1";
+                }
+              ];
+            }
+          ];
+        };
+      in
+      json.network.http.allow == [
+        {
+          methods = [ ];
+          port = 8443;
+          url = "https://api.example.com/v1";
+        }
+      ];
 
     assert expectFailure proxyCredentialsMessage {
       agent-sandbox.network.httpProxy.caCertificateFile = "/run/credentials/proxy-ca.crt";

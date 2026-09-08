@@ -142,6 +142,12 @@ let
         description = "HTTP method token list to match; empty means all methods only with allMethods = true.";
       };
 
+      port = lib.mkOption {
+        type = lib.types.nullOr (lib.types.ints.between 1 65535);
+        default = null;
+        description = "Explicit TCP port for this rule (1-65535). When null, the port derives from the URL authority, else the scheme default (80 for HTTP, 443 for HTTPS). A URL-embedded port and an explicit port must agree; generated policy always emits a numeric port with a port-less URL.";
+      };
+
       url = lib.mkOption {
         type = httpUrlType;
         description = "Absolute HTTP(S) URL to match.";

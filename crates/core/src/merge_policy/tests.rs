@@ -458,11 +458,9 @@ fn http_merge_removes_only_exact_opposite_target() {
     let mut allow = empty_policy();
 
     allow.network.http = HttpSection {
-        allow: vec![HttpRule::new(
-            vec![],
-            "https://example.com/api",
-            "all methods",
-        )],
+        allow: vec![
+            HttpRule::new(vec![], "https://example.com/api", "all methods").expect("valid rule"),
+        ],
         deny: vec![],
     };
 
@@ -470,11 +468,10 @@ fn http_merge_removes_only_exact_opposite_target() {
 
     deny.network.http = HttpSection {
         allow: vec![],
-        deny: vec![HttpRule::new(
-            vec!["GET".into()],
-            "https://example.com/api",
-            "GET only",
-        )],
+        deny: vec![
+            HttpRule::new(vec!["GET".into()], "https://example.com/api", "GET only")
+                .expect("valid rule"),
+        ],
     };
 
     let merged = merge_layers(&[allow, deny]);
@@ -486,19 +483,15 @@ fn http_merge_removes_only_exact_opposite_target() {
 fn http_merge_removes_an_exact_equal_target() {
     let mut allow = empty_policy();
 
-    allow.network.http.allow = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://example.com/api",
-        "allow",
-    )];
+    allow.network.http.allow = vec![
+        HttpRule::new(vec!["GET".into()], "https://example.com/api", "allow").expect("valid rule"),
+    ];
 
     let mut deny = empty_policy();
 
-    deny.network.http.deny = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://example.com/api",
-        "deny",
-    )];
+    deny.network.http.deny = vec![
+        HttpRule::new(vec!["GET".into()], "https://example.com/api", "deny").expect("valid rule"),
+    ];
 
     let merged = merge_layers(&[allow, deny]);
     assert!(merged.network.http.allow.is_empty());
@@ -509,19 +502,15 @@ fn http_merge_removes_an_exact_equal_target() {
 fn http_merge_unions_methods_for_same_url() {
     let mut first = empty_policy();
 
-    first.network.http.allow = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://example.com/api",
-        "GET",
-    )];
+    first.network.http.allow = vec![
+        HttpRule::new(vec!["GET".into()], "https://example.com/api", "GET").expect("valid rule"),
+    ];
 
     let mut second = empty_policy();
 
-    second.network.http.allow = vec![HttpRule::new(
-        vec!["POST".into()],
-        "https://example.com/api",
-        "POST",
-    )];
+    second.network.http.allow = vec![
+        HttpRule::new(vec!["POST".into()], "https://example.com/api", "POST").expect("valid rule"),
+    ];
 
     let merged = merge_layers(&[first, second]);
     assert_eq!(merged.network.http.allow.len(), 1);
@@ -536,19 +525,16 @@ fn http_merge_unions_methods_for_same_url() {
 fn http_merge_deny_covers_allow_path_and_methods() {
     let mut allow = empty_policy();
 
-    allow.network.http.allow = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://example.com/api/v1",
-        "allow",
-    )];
+    allow.network.http.allow = vec![
+        HttpRule::new(vec!["GET".into()], "https://example.com/api/v1", "allow")
+            .expect("valid rule"),
+    ];
 
     let mut deny = empty_policy();
 
-    deny.network.http.deny = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://example.com/api",
-        "deny",
-    )];
+    deny.network.http.deny = vec![
+        HttpRule::new(vec!["GET".into()], "https://example.com/api", "deny").expect("valid rule"),
+    ];
 
     let merged = merge_layers(&[allow, deny]);
     assert!(merged.network.http.allow.is_empty());
@@ -558,19 +544,20 @@ fn http_merge_deny_covers_allow_path_and_methods() {
 fn http_merge_partial_method_deny_keeps_allow() {
     let mut allow = empty_policy();
 
-    allow.network.http.allow = vec![HttpRule::new(
-        vec!["GET".into(), "POST".into()],
-        "https://example.com/api",
-        "allow",
-    )];
+    allow.network.http.allow = vec![
+        HttpRule::new(
+            vec!["GET".into(), "POST".into()],
+            "https://example.com/api",
+            "allow",
+        )
+        .expect("valid rule"),
+    ];
 
     let mut deny = empty_policy();
 
-    deny.network.http.deny = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://example.com/api",
-        "deny",
-    )];
+    deny.network.http.deny = vec![
+        HttpRule::new(vec!["GET".into()], "https://example.com/api", "deny").expect("valid rule"),
+    ];
 
     let merged = merge_layers(&[allow, deny]);
     assert_eq!(merged.network.http.allow.len(), 1);
@@ -596,19 +583,25 @@ fn direct_merge_keeps_partially_overlapping_globs() {
 fn http_glob_deny_covers_concrete_allow() {
     let mut allow = empty_policy();
 
-    allow.network.http.allow = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://api.github.com/repos/owner/repo",
-        "allow",
-    )];
+    allow.network.http.allow = vec![
+        HttpRule::new(
+            vec!["GET".into()],
+            "https://api.github.com/repos/owner/repo",
+            "allow",
+        )
+        .expect("valid rule"),
+    ];
 
     let mut deny = empty_policy();
 
-    deny.network.http.deny = vec![HttpRule::new(
-        vec!["GET".into()],
-        "https://api.github.com/repos/*/*",
-        "deny",
-    )];
+    deny.network.http.deny = vec![
+        HttpRule::new(
+            vec!["GET".into()],
+            "https://api.github.com/repos/*/*",
+            "deny",
+        )
+        .expect("valid rule"),
+    ];
 
     let merged = merge_layers(&[allow, deny]);
     assert!(merged.network.http.allow.is_empty());

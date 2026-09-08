@@ -130,14 +130,13 @@ fn merge_http_rules(layers: &[Policy], allow_rules: bool) -> Vec<HttpRule> {
 
     merged
         .into_iter()
-        .map(|(url, (methods, comment))| HttpRule {
-            methods: methods
+        .map(|(url, (methods, comment))| {
+            let methods = methods
                 .to_methods()
                 .into_iter()
                 .map(|method| method.as_str().to_owned())
-                .collect(),
-            url: url.to_string(),
-            comment,
+                .collect();
+            HttpRule::from_url(methods, &url, comment)
         })
         .collect()
 }

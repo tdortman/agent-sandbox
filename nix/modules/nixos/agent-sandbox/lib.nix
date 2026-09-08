@@ -153,9 +153,59 @@ let
         || (rule.allMethods && (rule.methods == null || builtins.length rule.methods == 0))
       )
       "agent-sandbox HTTP rule at ${rule.url} must set exactly one of a non-empty methods list or allMethods = true (allMethods cannot be combined with methods)";
+    let
+      asteriskSuffix = " *";
+      bareUrl = if hasAsterisk then lib.removeSuffix asteriskSuffix rule.url else rule.url;
+      defaultPort = if scheme == "https" then 443 else 80;
+      effectivePort =
+        if explicitPort != null && urlPort != null && explicitPort != urlPort then
+          throw "agent-sandbox HTTP rule at ${rule.url} has conflicting ports: URL port ${toString urlPort} differs from explicit port ${toString explicitPort}"
+        else if explicitPort != null then
+          explicitPort
+        else if urlPort != null then
+          urlPort
+        else
+          defaultPort;
+      explicitPort = rule.port or null;
+      hasAsterisk = lib.hasSuffix asteriskSuffix rule.url;
+      host =
+        if urlMatch == null then
+          throw "agent-sandbox HTTP rule url must be an absolute HTTP(S) URL with valid glob syntax and no fragment, got: ${rule.url}"
+        else
+          builtins.elemAt urlMatch 0;
+      normalizedPortDigits =
+        if portDigits == null then
+          null
+        else
+          let
+            normalized = builtins.match "0*([1-9][0-9]*|0)" portDigits;
+          in
+          if normalized == null then
+            throw "agent-sandbox HTTP rule url must use a port between 1 and 65535, got: ${rule.url}"
+          else
+            builtins.elemAt normalized 0;
+      path = builtins.elemAt urlMatch 2;
+      portDigits =
+        if portWithColon == null then
+          null
+        else
+          builtins.substring 1 (builtins.stringLength portWithColon - 1) portWithColon;
+      portWithColon = builtins.elemAt urlMatch 1;
+      scheme = if lib.hasPrefix "https://" rule.url then "https" else "http";
+      strippedBare = "${scheme}://${host}${if path == null then "" else path}";
+      strippedUrl = if hasAsterisk then "${strippedBare} *" else strippedBare;
+      urlMatch = builtins.match "^https?://([[][0-9A-Fa-f:.]+[]]|[^/:@#[:space:]]+)(:[0-9]{1,5})?(/[^#[:space:]]*)?$" bareUrl;
+      urlPort = if normalizedPortDigits == null then null else builtins.fromJSON normalizedPortDigits;
+    in
+    assert lib.assertMsg (explicitPort == null || (explicitPort >= 1 && explicitPort <= 65535))
+      "agent-sandbox HTTP rule at ${rule.url} must set port between 1 and 65535 when explicitly configured, got: ${toString explicitPort}";
+    assert lib.assertMsg (
+      urlPort == null || (urlPort >= 1 && urlPort <= 65535)
+    ) "agent-sandbox HTTP rule url must use a port between 1 and 65535, got: ${rule.url}";
     {
-      inherit (rule) url;
       methods = if rule.allMethods then [ ] else rule.methods;
+      port = effectivePort;
+      url = strippedUrl;
     }
     // lib.optionalAttrs (rule.comment != null) {
       inherit (rule) comment;

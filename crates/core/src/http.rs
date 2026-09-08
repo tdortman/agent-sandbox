@@ -986,7 +986,28 @@ impl HttpRuleTarget {
     /// violates the `OPTIONS *` restriction.
     pub fn from_rule(rule: &HttpRule) -> Result<Self, HttpParseError> {
         let method = HttpMethodMatcher::from_methods(&rule.methods)?;
-        let url = HttpUrl::parse_pattern(&rule.url)?;
+        if matches!(embedded_rule_port(&rule.url), Ok(None))
+            && let Ok(base) = HttpUrl::parse_pattern(&rule.url)
+            && rule.port.get() == base.scheme.default_port()
+            && base.authority.port() == rule.port
+        {
+            return Self::new(method, base);
+        }
+        let (normalized, effective) = HttpRule::normalize_url_and_port(&rule.url, Some(rule.port))?;
+        let normalized_url = HttpUrl::parse_pattern(&normalized)?;
+        let url = if effective.get() == normalized_url.scheme.default_port() {
+            if normalized_url.authority.port() != effective {
+                return Err(HttpParseError::InvalidPort);
+            }
+            normalized_url
+        } else {
+            let effective_raw = inject_rule_port(&normalized, effective)?;
+            let effective_url = HttpUrl::parse_pattern(&effective_raw)?;
+            if effective_url.authority.port() != effective {
+                return Err(HttpParseError::InvalidPort);
+            }
+            effective_url
+        };
         Self::new(method, url)
     }
 
@@ -1040,18 +1061,32 @@ impl<'de> Deserialize<'de> for HttpRuleTarget {
 }
 
 /// Raw JSON/Nix policy rule. Validate before matching or persistence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRule {
     /// The HTTP methods the rule matches. An empty list matches all methods.
-    #[serde(default)]
     pub methods: Vec<String>,
 
-    /// The rule's URL, which may contain glob metacharacters.
+    /// The rule's URL, which may contain glob metacharacters, without an
+    /// embedded authority port. [`Self::port`] is authoritative.
     pub url: String,
+
+    /// Authoritative effective port (nonzero). [`Self::url`] never contains
+    /// an embedded port; legacy embedded ports are stripped on read.
+    pub port: NonZeroU16,
 
     /// Optional human-readable comment associated with the rule.
     pub comment: Option<String>,
+}
+
+impl Default for HttpRule {
+    fn default() -> Self {
+        Self {
+            methods: Vec::new(),
+            url: String::new(),
+            port: NonZeroU16::new(443).expect("443 is nonzero"),
+            comment: None,
+        }
+    }
 }
 
 impl Serialize for HttpRule {
@@ -1063,37 +1098,254 @@ impl Serialize for HttpRule {
         struct Wire<'a> {
             methods: &'a [String],
             url: &'a str,
-
+            port: NonZeroU16,
             #[serde(skip_serializing_if = "Option::is_none")]
             comment: &'a Option<String>,
         }
-
         Wire {
             methods: &self.methods,
             url: &self.url,
+            port: self.port,
             comment: &self.comment,
         }
         .serialize(serializer)
     }
 }
-
+impl<'de> Deserialize<'de> for HttpRule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            methods: Vec<String>,
+            url: String,
+            #[serde(default)]
+            port: Option<NonZeroU16>,
+            #[serde(default)]
+            comment: Option<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let (url, port) =
+            Self::normalize_url_and_port(&wire.url, wire.port).map_err(D::Error::custom)?;
+        Ok(Self {
+            methods: wire.methods,
+            url,
+            port,
+            comment: wire.comment,
+        })
+    }
+}
 impl HttpRule {
-    /// Construct a raw rule from its parts, always attaching a comment.
-    pub fn new(methods: Vec<String>, url: impl Into<String>, comment: impl Into<String>) -> Self {
+    /// Normalize a raw rule URL and optional explicit port into canonical
+    /// storage form (stripped URL, authoritative port).
+    /// Legacy URLs without `port` derive the embedded port or scheme default.
+    /// Explicit `port` with an embedded port must match; matching embedded
+    /// ports are stripped. A URL without an embedded port plus an explicit
+    /// nondefault port is valid and matches only that port.
+    /// # Errors
+    /// Returns an [`HttpParseError`] when the URL is invalid or when an
+    /// explicit port conflicts with an embedded port.
+    pub fn normalize_url_and_port(
+        url: &str,
+        port: Option<NonZeroU16>,
+    ) -> Result<(String, NonZeroU16), HttpParseError> {
+        let (normalized, effective, _) = Self::normalize_inner(url, port)?;
+        Ok((normalized, effective))
+    }
+
+    fn normalize_inner(
+        url: &str,
+        port: Option<NonZeroU16>,
+    ) -> Result<(String, NonZeroU16, HttpScheme), HttpParseError> {
+        let parsed = HttpUrl::parse_pattern(url)?;
+        let scheme = parsed.scheme;
+        let scheme_default =
+            NonZeroU16::new(scheme.default_port()).ok_or(HttpParseError::InvalidPort)?;
+        let embedded = embedded_rule_port(url)?;
+        let effective = match (embedded, port) {
+            (Some(embedded), Some(explicit)) if embedded != explicit => {
+                return Err(HttpParseError::InvalidPort);
+            }
+            (Some(embedded), _) => embedded,
+            (None, Some(explicit)) => explicit,
+            (None, None) => scheme_default,
+        };
+        let normalized = match embedded {
+            Some(_) => strip_rule_port(url)?,
+            None => url.to_owned(),
+        };
+        Ok((normalized, effective, scheme))
+    }
+
+    /// Construct a raw rule, deriving the authoritative port from the URL and
+    /// normalizing the URL to stripped form.
+    /// # Errors
+    /// Returns an [`HttpParseError`] when the URL is invalid.
+    pub fn new(
+        methods: Vec<String>,
+        url: impl Into<String>,
+        comment: impl Into<String>,
+    ) -> Result<Self, HttpParseError> {
+        let url = url.into();
+        let (url, port) = Self::normalize_url_and_port(&url, None)?;
+        Ok(Self {
+            methods,
+            url,
+            port,
+            comment: Some(comment.into()),
+        })
+    }
+
+    /// Construct a raw rule with an explicit port, normalizing away a matching
+    /// embedded port.
+    /// # Errors
+    /// Returns an [`HttpParseError`] when the URL is invalid or when the
+    /// explicit port conflicts with an embedded port.
+    pub fn new_with_port(
+        methods: Vec<String>,
+        url: impl Into<String>,
+        port: NonZeroU16,
+        comment: impl Into<String>,
+    ) -> Result<Self, HttpParseError> {
+        let url = url.into();
+        let (url, port) = Self::normalize_url_and_port(&url, Some(port))?;
+        Ok(Self {
+            methods,
+            url,
+            port,
+            comment: Some(comment.into()),
+        })
+    }
+
+    /// Construct a rule from a validated effective URL without re-parsing user
+    /// input. Used at production boundaries where `url` is already validated.
+    #[must_use]
+    pub fn from_url(methods: Vec<String>, url: &HttpUrl, comment: Option<String>) -> Self {
+        let port = url.authority.port();
+        let effective = url.to_string();
+        let url = strip_rule_port(&effective).unwrap_or(effective);
         Self {
             methods,
-            url: url.into(),
-            comment: Some(comment.into()),
+            url,
+            port,
+            comment,
         }
     }
 
-    /// Parse this rule into a typed, validated policy target.
+    /// Parse this rule into a typed, validated policy target using the
+    /// authoritative port.
     /// # Errors
-    ///
     /// Returns an [`HttpParseError`] when this rule's method or URL is invalid.
     pub fn target(&self) -> Result<HttpRuleTarget, HttpParseError> {
         HttpRuleTarget::from_rule(self)
     }
+}
+fn rule_authority_end(raw: &str, authority_start: usize) -> usize {
+    if raw.ends_with(" *") {
+        raw.len() - 2
+    } else {
+        raw[authority_start..]
+            .find(['/', '?', '#'])
+            .map_or(raw.len(), |offset| authority_start + offset)
+    }
+}
+fn parse_port_str(raw: &str) -> Result<NonZeroU16, HttpParseError> {
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(HttpParseError::InvalidAuthority);
+    }
+    let port: u16 = raw.parse().map_err(|_| HttpParseError::InvalidPort)?;
+    NonZeroU16::new(port).ok_or(HttpParseError::InvalidPort)
+}
+fn embedded_rule_port(raw: &str) -> Result<Option<NonZeroU16>, HttpParseError> {
+    let Some(authority_start) = raw.find("://").map(|index| index + 3) else {
+        return Err(HttpParseError::InvalidUrl);
+    };
+    let authority_end = rule_authority_end(raw, authority_start);
+    let authority = &raw[authority_start..authority_end];
+    if authority.is_empty() {
+        return Err(HttpParseError::InvalidAuthority);
+    }
+    if let Some(bracketed) = authority.strip_prefix('[')
+        && let Some(close) = bracketed.find(']')
+    {
+        let inside = &bracketed[..close];
+        if inside.contains(':') {
+            let after = &bracketed[close + 1..];
+            if after.is_empty() {
+                return Ok(None);
+            }
+            let port_str = after
+                .strip_prefix(':')
+                .ok_or(HttpParseError::InvalidAuthority)?;
+            if port_str.is_empty() {
+                return Err(HttpParseError::InvalidAuthority);
+            }
+            return parse_port_str(port_str).map(Some);
+        }
+    }
+    if let Some(colon) = authority.rfind(':') {
+        let port_str = &authority[colon + 1..];
+        if port_str.is_empty() {
+            return Err(HttpParseError::InvalidAuthority);
+        }
+        return parse_port_str(port_str).map(Some);
+    }
+    Ok(None)
+}
+fn strip_rule_port(raw: &str) -> Result<String, HttpParseError> {
+    let authority_start = raw
+        .find("://")
+        .map(|index| index + 3)
+        .ok_or(HttpParseError::InvalidUrl)?;
+    let authority_end = rule_authority_end(raw, authority_start);
+    let authority = &raw[authority_start..authority_end];
+    let colon = if authority.starts_with('[') {
+        if let Some(close) = authority.find(']') {
+            let inside = &authority[1..close];
+            if inside.contains(':') {
+                let colon = authority_start + close + 1;
+                if raw.as_bytes().get(colon) != Some(&b':') {
+                    return Err(HttpParseError::InvalidAuthority);
+                }
+                colon
+            } else {
+                authority
+                    .rfind(':')
+                    .map(|offset| authority_start + offset)
+                    .ok_or(HttpParseError::InvalidAuthority)?
+            }
+        } else {
+            return Err(HttpParseError::InvalidAuthority);
+        }
+    } else {
+        authority
+            .rfind(':')
+            .map(|offset| authority_start + offset)
+            .ok_or(HttpParseError::InvalidAuthority)?
+    };
+    let mut stripped = String::with_capacity(raw.len() - (authority_end - colon));
+    stripped.push_str(&raw[..colon]);
+    stripped.push_str(&raw[authority_end..]);
+    Ok(stripped)
+}
+fn inject_rule_port(normalized: &str, port: NonZeroU16) -> Result<String, HttpParseError> {
+    let authority_start = normalized
+        .find("://")
+        .map(|index| index + 3)
+        .ok_or(HttpParseError::InvalidUrl)?;
+    let authority_end = rule_authority_end(normalized, authority_start);
+    if embedded_rule_port(normalized)?.is_some() {
+        return Err(HttpParseError::InvalidPort);
+    }
+    let mut effective = String::with_capacity(normalized.len() + 6);
+    effective.push_str(&normalized[..authority_end]);
+    effective.push(':');
+    effective.push_str(&port.to_string());
+    effective.push_str(&normalized[authority_end..]);
+    Ok(effective)
 }
 
 /// Context dimensions that HTTP verdicts must never cross.
@@ -1437,7 +1689,8 @@ mod tests {
             vec!["GET".into()],
             "https://github.com/**/releases/**",
             "GitHub releases",
-        );
+        )
+        .expect("valid rule");
 
         let target = rule.target().expect("valid URL pattern");
 
@@ -1458,9 +1711,9 @@ mod tests {
             "https://*.github.com/repos/*/*",
             "GitHub repositories",
         )
+        .expect("valid rule")
         .target()
         .expect("valid URL pattern");
-
         let matching =
             HttpRequest::parse_absolute("GET", "https://api.github.com/repos/owner/repo")
                 .expect("valid request");
@@ -1475,9 +1728,8 @@ mod tests {
 
     #[test]
     fn url_glob_star_stays_within_path_segment() {
-        let single = HttpRule::new(vec![], "https://example.com/a/*/c", "");
-        let double = HttpRule::new(vec![], "https://example.com/a/**/c", "");
-
+        let single = HttpRule::new(vec![], "https://example.com/a/*/c", "").expect("valid rule");
+        let double = HttpRule::new(vec![], "https://example.com/a/**/c", "").expect("valid rule");
         let one =
             HttpRequest::parse_absolute("GET", "https://example.com/a/b/c").expect("valid request");
 
@@ -1488,10 +1740,10 @@ mod tests {
         assert!(!single.target().expect("valid rule").matches(&nested));
         assert!(double.target().expect("valid rule").matches(&nested));
     }
-
     #[test]
     fn url_globset_supports_question_mark_classes_and_alternates() {
-        let question = HttpRule::new(vec![], "https://example.com/file?.txt", "");
+        let question =
+            HttpRule::new(vec![], "https://example.com/file?.txt", "").expect("valid rule");
 
         let question_request = HttpRequest::parse_absolute("GET", "https://example.com/file1.txt")
             .expect("valid request");
@@ -1503,7 +1755,8 @@ mod tests {
                 .matches(&question_request)
         );
 
-        let class = HttpRule::new(vec![], "https://[ab].example.com/{one,two}/file", "");
+        let class = HttpRule::new(vec![], "https://[ab].example.com/{one,two}/file", "")
+            .expect("valid rule");
 
         let class_request = HttpRequest::parse_absolute("GET", "https://a.example.com/two/file")
             .expect("valid request");
@@ -1521,10 +1774,10 @@ mod tests {
                 .matches(&wrong_class_request)
         );
     }
-
     #[test]
     fn url_globset_escapes_match_literal_metacharacters() {
-        let rule = HttpRule::new(vec![], r"https://example.com/file\*.txt", "");
+        let rule =
+            HttpRule::new(vec![], r"https://example.com/file\*.txt", "").expect("valid rule");
 
         let literal = HttpRequest::parse_absolute("GET", "https://example.com/file*.txt")
             .expect("valid request");
@@ -1535,10 +1788,9 @@ mod tests {
         assert!(rule.target().expect("valid rule").matches(&literal));
         assert!(!rule.target().expect("valid rule").matches(&wildcard));
     }
-
     #[test]
     fn url_globset_escapes_ipv6_authority_brackets() {
-        let rule = HttpRule::new(vec![], "https://[::1]/file?.txt", "");
+        let rule = HttpRule::new(vec![], "https://[::1]/file?.txt", "").expect("valid rule");
 
         let matching =
             HttpRequest::parse_absolute("GET", "https://[::1]/file1.txt").expect("valid request");
@@ -1550,11 +1802,10 @@ mod tests {
     fn concrete_request_url_accepts_literal_wildcards() {
         let request = HttpRequest::parse_absolute("GET", "https://example.com/files/*.txt")
             .expect("valid request");
-
         let target = HttpRule::new(vec![], "https://example.com/files/*.txt", "")
+            .expect("valid rule")
             .target()
             .expect("valid URL glob");
-
         assert!(target.matches(&request));
     }
 
@@ -1588,14 +1839,13 @@ mod tests {
         let canonical: HttpRule =
             serde_json::from_str(r#"{"methods":["POST","GET"],"url":"https://example.com"}"#)
                 .expect("canonical methods");
-
         assert_eq!(canonical.methods, vec!["POST", "GET"]);
-
+        assert_eq!(canonical.url, "https://example.com");
+        assert_eq!(canonical.port.get(), 443);
         assert_eq!(
             serde_json::to_string(&canonical).expect("serialize canonical"),
-            r#"{"methods":["POST","GET"],"url":"https://example.com"}"#
+            r#"{"methods":["POST","GET"],"url":"https://example.com","port":443}"#
         );
-
         assert!(
             serde_json::from_str::<HttpRule>(r#"{"method":"GET","url":"https://example.com"}"#)
                 .is_err()
@@ -1607,9 +1857,9 @@ mod tests {
         let rule = HttpRule {
             methods: vec!["OPTIONS".into()],
             url: "https://example.com *".into(),
+            port: NonZeroU16::new(443).expect("default port"),
             comment: None,
         };
-
         let target = rule.target().expect("valid asterisk rule");
         assert!(matches!(target.url.target, HttpTarget::Asterisk));
         assert_eq!(target.url.to_string(), "https://example.com *");
@@ -1618,6 +1868,7 @@ mod tests {
         let invalid = HttpRule {
             methods: vec!["GET".into()],
             url: "https://example.com *".into(),
+            port: NonZeroU16::new(443).expect("default port"),
             comment: None,
         };
 
@@ -1629,6 +1880,7 @@ mod tests {
         let wildcard = HttpRule {
             methods: vec![],
             url: "https://example.com *".into(),
+            port: NonZeroU16::new(443).expect("default port"),
             comment: None,
         };
 
@@ -1683,6 +1935,7 @@ mod tests {
             "https://api.github.com/repos/*/*",
             "GitHub repositories",
         )
+        .expect("valid rule")
         .target()
         .expect("valid URL glob");
 
@@ -1694,6 +1947,151 @@ mod tests {
             json,
             r#"{"method":"GET","url":"https://api.github.com/repos/*/*"}"#
         );
+    }
+    #[test]
+    fn http_rule_port_serde_normalizes_and_rejects_conflicts() {
+        let legacy: HttpRule =
+            serde_json::from_str(r#"{"methods":["GET"],"url":"https://example.com/*"}"#)
+                .expect("legacy rule");
+        assert_eq!(legacy.url, "https://example.com/*");
+        assert_eq!(legacy.port.get(), 443);
+        let legacy_embedded: HttpRule =
+            serde_json::from_str(r#"{"methods":[],"url":"https://example.com:8443/*"}"#)
+                .expect("legacy embedded port");
+        assert_eq!(legacy_embedded.url, "https://example.com/*");
+        assert_eq!(legacy_embedded.port.get(), 8443);
+        let legacy_default_embedded: HttpRule =
+            serde_json::from_str(r#"{"methods":[],"url":"https://example.com:443/*"}"#)
+                .expect("legacy default embedded");
+        assert_eq!(legacy_default_embedded.url, "https://example.com/*");
+        assert_eq!(legacy_default_embedded.port.get(), 443);
+        let http_default: HttpRule =
+            serde_json::from_str(r#"{"methods":[],"url":"http://example.com/*"}"#)
+                .expect("http default");
+        assert_eq!(http_default.port.get(), 80);
+        let matching: HttpRule = serde_json::from_str(
+            r#"{"methods":["GET"],"url":"https://example.com:443/*","port":443}"#,
+        )
+        .expect("matching explicit");
+        assert_eq!(matching.url, "https://example.com/*");
+        assert_eq!(matching.port.get(), 443);
+        assert!(
+            serde_json::from_str::<HttpRule>(
+                r#"{"methods":[],"url":"https://example.com:8443/*","port":443}"#
+            )
+            .is_err(),
+            "conflicting ports must be rejected"
+        );
+        let explicit: HttpRule = serde_json::from_str(
+            r#"{"methods":["GET"],"url":"https://example.com/*","port":8443}"#,
+        )
+        .expect("explicit nondefault");
+        assert_eq!(explicit.url, "https://example.com/*");
+        assert_eq!(explicit.port.get(), 8443);
+        let json = serde_json::to_string(&explicit).expect("serialize explicit");
+        assert_eq!(
+            json,
+            r#"{"methods":["GET"],"url":"https://example.com/*","port":8443}"#
+        );
+        let decoded: HttpRule = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(decoded, explicit);
+        assert!(
+            serde_json::from_str::<HttpRule>(
+                r#"{"methods":[],"url":"https://example.com/*","port":0}"#
+            )
+            .is_err(),
+            "zero port must be rejected"
+        );
+        let derived =
+            HttpRule::new(vec![], "https://example.com:8443/path", "").expect("derive port");
+        assert_eq!(derived.url, "https://example.com/path");
+        assert_eq!(derived.port.get(), 8443);
+        assert!(
+            HttpRule::new_with_port(
+                vec![],
+                "https://example.com:8443/*",
+                NonZeroU16::new(443).expect("nonzero"),
+                "",
+            )
+            .is_err(),
+            "new_with_port conflict must fail"
+        );
+    }
+    #[test]
+    fn http_rule_port_target_matches_actual_port() {
+        let default_rule = HttpRule::new_with_port(
+            vec!["GET".into()],
+            "https://example.com/*",
+            NonZeroU16::new(443).expect("nonzero"),
+            "",
+        )
+        .expect("default rule");
+        let default_target = default_rule.target().expect("valid target");
+        let default_req =
+            HttpRequest::parse_absolute("GET", "https://example.com/allow").expect("request");
+        let nondefault_req =
+            HttpRequest::parse_absolute("GET", "https://example.com:8443/allow").expect("request");
+        assert!(default_target.matches(&default_req));
+        assert!(!default_target.matches(&nondefault_req));
+        let custom = HttpRule::new_with_port(
+            vec![],
+            "https://example.com/*",
+            NonZeroU16::new(8443).expect("nonzero"),
+            "",
+        )
+        .expect("custom rule");
+        let custom_target = custom.target().expect("valid target");
+        assert_eq!(custom_target.url.to_string(), "https://example.com:8443/*");
+        assert!(custom_target.matches(&nondefault_req));
+        assert!(!custom_target.matches(&default_req));
+        let wild = HttpRule::new_with_port(
+            vec![],
+            "https://*.example.com/repos/*",
+            NonZeroU16::new(8443).expect("nonzero"),
+            "",
+        )
+        .expect("wildcard rule");
+        let wild_target = wild.target().expect("valid target");
+        let wild_match =
+            HttpRequest::parse_absolute("GET", "https://api.example.com:8443/repos/owner")
+                .expect("request");
+        let wild_wrong_port =
+            HttpRequest::parse_absolute("GET", "https://api.example.com/repos/owner")
+                .expect("request");
+        assert!(wild_target.matches(&wild_match));
+        assert!(!wild_target.matches(&wild_wrong_port));
+        let v6 = HttpRule::new_with_port(
+            vec![],
+            "https://[::1]/file?.txt",
+            NonZeroU16::new(8443).expect("nonzero"),
+            "",
+        )
+        .expect("ipv6 rule");
+        let v6_target = v6.target().expect("valid target");
+        let v6_match =
+            HttpRequest::parse_absolute("GET", "https://[::1]:8443/file1.txt").expect("request");
+        let v6_wrong =
+            HttpRequest::parse_absolute("GET", "https://[::1]/file1.txt").expect("request");
+        assert!(v6_target.matches(&v6_match));
+        assert!(!v6_target.matches(&v6_wrong));
+        let asterisk = HttpRule::new_with_port(
+            vec!["OPTIONS".into()],
+            "https://example.com *",
+            NonZeroU16::new(8443).expect("nonzero"),
+            "",
+        )
+        .expect("asterisk rule");
+        let asterisk_target = asterisk.target().expect("valid target");
+        assert_eq!(
+            asterisk_target.url.to_string(),
+            "https://example.com:8443 *"
+        );
+        let asterisk_req =
+            HttpRequest::from_parts("OPTIONS", "https", "example.com:8443", "*").expect("request");
+        let asterisk_wrong =
+            HttpRequest::from_parts("OPTIONS", "https", "example.com", "*").expect("request");
+        assert!(asterisk_target.matches(&asterisk_req));
+        assert!(!asterisk_target.matches(&asterisk_wrong));
     }
 
     #[test]

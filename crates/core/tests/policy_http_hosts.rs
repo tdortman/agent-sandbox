@@ -27,7 +27,8 @@ fn host_normalization_flows_into_http_and_direct_policy_keys() {
         vec!["GET".into()],
         "https://BÜCHER.Example.:443/api/*",
         "IDNA HTTP rule",
-    );
+    )
+    .expect("valid rule");
 
     let target = http_rule.target().expect("valid HTTP policy rule");
 

@@ -189,6 +189,7 @@ Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields suppo
       "allow": [{
         "methods": ["GET"],
         "url": "https://api.example.com/models",
+        "port": 443,
         "comment": "Model listing"
       }],
       "deny": []

@@ -15,6 +15,26 @@ let
     inherit lib;
     inherit (inputs) jail-nix;
   };
+  asteriskRuleJson = agentSandboxLib.httpRuleJson {
+    allMethods = false;
+    comment = null;
+    methods = [ "OPTIONS" ];
+    port = null;
+    url = "https://example.com *";
+  };
+  conflictingPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          port = 9443;
+          url = "https://api.example.com:8443/v1";
+        }
+      ];
+    };
+  };
   declarativeHttpContract =
     assert
       validPolicyJson.network.direct == {
@@ -26,6 +46,7 @@ let
         {
           comment = "API access";
           methods = [ ];
+          port = 443;
           url = "https://api.example.com/v1";
         }
       ];
@@ -33,6 +54,7 @@ let
       validPolicyJson.network.http.deny == [
         {
           methods = [ "POST" ];
+          port = 443;
           url = "https://api.example.com/v1/private";
         }
       ];
@@ -54,16 +76,62 @@ let
       validPortJson.network.http.allow == [
         {
           methods = [ ];
-          url = "https://api.example.com:65535/v1";
+          port = 65535;
+          url = "https://api.example.com/v1";
         }
       ];
     assert
       validPaddedPortJson.network.http.allow == [
         {
           methods = [ ];
-          url = "https://api.example.com:080/v1";
+          port = 80;
+          url = "https://api.example.com/v1";
         }
       ];
+    assert
+      validFullGlobJson.network.http.allow == [
+        {
+          methods = [ ];
+          port = 443;
+          url = "https://[ab].example.com/{one,two}/file?.txt";
+        }
+      ];
+    assert
+      validIpv6PortJson.network.http.allow == [
+        {
+          methods = [ ];
+          port = 8443;
+          url = "https://[::1]/v1";
+        }
+      ];
+    assert
+      explicitPortJson.network.http.allow == [
+        {
+          methods = [ ];
+          port = 8443;
+          url = "https://api.example.com/v1";
+        }
+      ];
+    assert
+      explicitPortJson.network.http.deny == [
+        {
+          methods = [ ];
+          port = 8443;
+          url = "https://api.example.com/v1/private";
+        }
+      ];
+    assert
+      asteriskRuleJson == {
+        methods = [ "OPTIONS" ];
+        port = 443;
+        url = "https://example.com *";
+      };
+    assert
+      !(builtins.tryEval conflictingPortSystem.config.environment.etc."agent-sandbox/policy.json".text)
+      .success;
+    assert
+      !(builtins.tryEval explicitZeroPortSystem.config.environment.etc."agent-sandbox/policy.json".text)
+      .success;
     assert
       (builtins.tryEval validFullGlobSystem.config.environment.etc."agent-sandbox/policy.json".text)
       .success;
@@ -91,6 +159,43 @@ let
     assert lib.hasInfix "--init-ech-state-only" proxyInitSource;
     assert lib.hasInfix "agent-sandbox-proxy" (toString initService.serviceConfig.ExecStart);
     true;
+  explicitPortJson =
+    builtins.fromJSON
+      explicitPortSystem.config.environment.etc."agent-sandbox/policy.json".text;
+  explicitPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          port = 8443;
+          url = "https://api.example.com/v1";
+        }
+      ];
+
+      declarativeDeny = [
+        {
+          allMethods = true;
+          port = 8443;
+          url = "https://api.example.com:8443/v1/private";
+        }
+      ];
+    };
+  };
+  explicitZeroPortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          port = 0;
+          url = "https://api.example.com/v1";
+        }
+      ];
+    };
+  };
   invalidFragmentSystem = mkNixosSystem {
     agent-sandbox.network.httpProxy = {
       enable = true;
@@ -336,6 +441,9 @@ let
     dynamic = false;
     proxy = true;
   };
+  validFullGlobJson =
+    builtins.fromJSON
+      validFullGlobSystem.config.environment.etc."agent-sandbox/policy.json".text;
   validFullGlobSystem = mkNixosSystem {
     agent-sandbox.network.httpProxy = {
       enable = true;
@@ -344,6 +452,21 @@ let
         {
           allMethods = true;
           url = "https://[ab].example.com/{one,two}/file?.txt";
+        }
+      ];
+    };
+  };
+  validIpv6PortJson =
+    builtins.fromJSON
+      validIpv6PortSystem.config.environment.etc."agent-sandbox/policy.json".text;
+  validIpv6PortSystem = mkNixosSystem {
+    agent-sandbox.network.httpProxy = {
+      enable = true;
+
+      declarativeAllow = [
+        {
+          allMethods = true;
+          url = "https://[::1]:8443/v1";
         }
       ];
     };
