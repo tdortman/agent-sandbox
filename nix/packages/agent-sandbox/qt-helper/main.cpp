@@ -205,7 +205,7 @@ static int runReview() {
     if (scope->count() == 0 || scope->itemData(0).toString() != "once") return EXIT_FAILURE;
     auto* scopeLayout = new QFormLayout();
     scopeLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    scopeLayout->addRow(structured ? "Allow for:" : "Scope:", scope);
+    scopeLayout->addRow("Scope:", scope);
     layout->addLayout(scopeLayout);
 
     QWidget* targets = nullptr;
