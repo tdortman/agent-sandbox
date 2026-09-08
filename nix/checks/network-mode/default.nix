@@ -630,8 +630,17 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   grep -F -q -- 'RUNTIME_ARGS+=(--tmpfs /var/lib/agent-sandbox/proxy)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not mask proxy state"
   for wrapper in "$static_proxy" "$dynamic_proxy"; do
-    if grep -F -q -- '/etc/ssl/certs/ca-bundle.crt' "$wrapper"; then
-      fail "proxy wrapper must not bind or reference the symlinked system CA path"
+    grep -F -q -- 'for _asbx_system_ca in /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt; do' "$wrapper" \
+      || fail "proxy wrapper does not resolve both system trust store paths"
+    grep -F -q -- 'RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/proxy-ca-bundle.pem "$_asbx_system_ca_target")' "$wrapper" \
+      || fail "proxy wrapper does not bind the proxy CA bundle over the system trust store"
+    if grep -F -q -- '--ro-bind /run/agent-sandbox/proxy-ca-bundle.pem /etc/ssl/certs/' "$wrapper"; then
+      fail "proxy wrapper must bind the resolved system CA target, not the symlinked path"
+    fi
+  done
+  for wrapper in "$static_direct" "$dynamic_direct"; do
+    if grep -F -q -- '_asbx_system_ca_target' "$wrapper"; then
+      fail "direct wrapper must not rewrite the system trust store"
     fi
   done
   grep -F -q -- '--ro-bind-try /run/agent-sandbox/proxy-ca-bundle.pem /run/agent-sandbox/proxy-ca-bundle.pem' "$static_proxy" \

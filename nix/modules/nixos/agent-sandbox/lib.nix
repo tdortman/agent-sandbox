@@ -848,6 +848,7 @@ in
             (builtinCombinators.set-env "CURL_CA_BUNDLE" proxyTrustBundle)
             (builtinCombinators.set-env "NODE_EXTRA_CA_CERTS" proxyTrustBundle)
           ])
+          (builtinCombinators.add-runtime proxySystemTrustScript)
         ];
       policyScript =
         lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
@@ -964,6 +965,23 @@ in
             RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
           '';
       proxyMode = runtime != null && runtime.httpProxy.enable;
+      proxySystemTrustScript = lib.optionalString proxyMode ''
+        # Tools that ignore the *_CA_BUNDLE variables (git, Go, rustls) read
+        # the system trust store directly, and an inherited host environment
+        # can override those variables, so point the system store at the same
+        # bundle too. Resolve each path first: bwrap cannot mount onto a
+        # symlink destination.
+        _asbx_system_ca_targets=()
+        for _asbx_system_ca in /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt; do
+          _asbx_system_ca_target="$(readlink -f -- "$_asbx_system_ca" 2>/dev/null)" || continue
+          [[ -f "$_asbx_system_ca_target" ]] || continue
+          if [[ " ''${_asbx_system_ca_targets[*]} " == *" $_asbx_system_ca_target "* ]]; then
+            continue
+          fi
+          _asbx_system_ca_targets+=("$_asbx_system_ca_target")
+          RUNTIME_ARGS+=(--ro-bind ${proxyTrustBundle} "$_asbx_system_ca_target")
+        done
+      '';
       proxyTrustBundle = "/run/agent-sandbox/proxy-ca-bundle.pem";
       proxyTrustScript = lib.optionalString proxyMode ''
         [[ -f ${proxyTrustBundle} ]] || {
@@ -972,6 +990,7 @@ in
         }
         RUNTIME_ARGS+=(--tmpfs /var/lib/agent-sandbox/proxy)
         RUNTIME_ARGS+=(--ro-bind ${proxyTrustBundle} ${proxyTrustBundle})
+        ${proxySystemTrustScript}
         RUNTIME_ARGS+=(--setenv SSL_CERT_FILE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE ${proxyTrustBundle})
