@@ -251,7 +251,7 @@ mod tests {
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-        let keys = crate::http3::hpke::ECH_SUPPORTED_SUITES
+        let keys = crate::http3::ECH_SUPPORTED_SUITES
             .iter()
             .map(|hpke| {
                 rustls::server::ech::EchKeys::new(
@@ -279,7 +279,7 @@ mod tests {
         // the sandbox DNS rewrite distributes) and connects to the inner name.
         let config = rustls::client::EchConfig::new(
             rustls::pki_types::EchConfigListBytes::from(state.config_list.as_slice()),
-            crate::http3::hpke::ECH_SUPPORTED_SUITES,
+            crate::http3::ECH_SUPPORTED_SUITES,
         )
         .expect("client ECH configuration");
 

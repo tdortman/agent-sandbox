@@ -43,7 +43,7 @@ impl DownstreamEch {
     /// Returns the first rustls error produced while building an
     /// `EchKeys` value for a supported HPKE suite.
     pub fn ech_keys(&self) -> Result<Vec<rustls::server::ech::EchKeys>, BoxError> {
-        crate::http3::hpke::ECH_SUPPORTED_SUITES
+        crate::http3::ECH_SUPPORTED_SUITES
             .iter()
             .map(|hpke| {
                 rustls::server::ech::EchKeys::new(

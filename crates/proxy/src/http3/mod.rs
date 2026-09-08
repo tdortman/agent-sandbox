@@ -15,7 +15,6 @@ mod association;
 mod connection_id;
 mod datagram;
 mod ech;
-pub mod hpke;
 mod relay;
 mod session;
 pub use session::{Capsule, CapsuleDecoder, SessionError};
@@ -35,12 +34,26 @@ use std::{
 
 use agent_sandbox_core::ProxyConnectionId;
 use h3::error::Code;
+use rustls::crypto::{
+    aws_lc_rs::hpke::{DH_KEM_X25519_HKDF_SHA256_AES_128, DH_KEM_X25519_HKDF_SHA256_AES_256},
+    hpke::Hpke,
+};
 use socket::TransparentUdpSocket;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::{
     alt_svc::AltSvcStore, cert::CertificateIssuer, ech_state::DownstreamEch, policy::PolicySession,
 };
+
+/// The HPKE suites this proxy offers for ECH, in preference order.
+///
+/// Both roles come from rustls's HPKE provider, which this build already
+/// compiles for certificate signing. The TLS crypto provider stays `ring`:
+/// every rustls config here is built with `builder_with_provider`.
+pub static ECH_SUPPORTED_SUITES: &[&dyn Hpke] = &[
+    DH_KEM_X25519_HKDF_SHA256_AES_128,
+    DH_KEM_X25519_HKDF_SHA256_AES_256,
+];
 
 /// Owner of one locally-issued QUIC connection-ID route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,7 +534,23 @@ fn varint(code: Code) -> quinn::VarInt {
 mod tests {
     use agent_sandbox_core::ProxyConnectionId;
 
-    use super::{ConnectionIdOwner, ConnectionIdRegistry};
+    use super::{ConnectionIdOwner, ConnectionIdRegistry, ECH_SUPPORTED_SUITES};
+
+    #[test]
+    fn ech_supported_suites_are_x25519_aes_gcm() {
+        use rustls::internal::msgs::enums::{HpkeAead, HpkeKem};
+
+        assert_eq!(ECH_SUPPORTED_SUITES.len(), 2);
+
+        for hpke in ECH_SUPPORTED_SUITES {
+            let suite = hpke.suite();
+            assert_eq!(suite.kem, HpkeKem::DHKEM_X25519_HKDF_SHA256);
+            assert!(matches!(
+                suite.sym.aead_id,
+                HpkeAead::AES_128_GCM | HpkeAead::AES_256_GCM
+            ));
+        }
+    }
 
     fn owner(stable_id: usize) -> ConnectionIdOwner {
         ConnectionIdOwner {

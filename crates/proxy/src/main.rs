@@ -114,6 +114,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    agent_sandbox_proxy::install_process_crypto_provider();
+
     // Logs are captured to files by the harness and journald; ANSI styling
     // would corrupt structured log parsing. The default would enable colours
     // whenever `NO_COLOR` is unset, so pin them off explicitly.

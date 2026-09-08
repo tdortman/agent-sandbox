@@ -37,7 +37,7 @@ use hickory_proto::{
 use rustls::{client::EchConfig, pki_types::EchConfigListBytes};
 use tracing::warn;
 
-use super::{BoxError, hpke::ECH_SUPPORTED_SUITES};
+use super::{BoxError, ECH_SUPPORTED_SUITES};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_TTL_SECONDS: u32 = 60;

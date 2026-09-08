@@ -34,7 +34,7 @@ rcgen = { workspace = true, features = ["aws_lc_rs"] }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rustls = { workspace = true, features = ["ring", "std"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "ring", "std"] }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = {

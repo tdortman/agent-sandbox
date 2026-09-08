@@ -327,7 +327,7 @@ impl Http3Client {
 
         let config = rustls::client::EchConfig::new(
             rustls::pki_types::EchConfigListBytes::from(config_list),
-            agent_sandbox_proxy::http3::hpke::ECH_SUPPORTED_SUITES,
+            agent_sandbox_proxy::http3::ECH_SUPPORTED_SUITES,
         )
         .expect("proxy ECH configuration is supported");
 

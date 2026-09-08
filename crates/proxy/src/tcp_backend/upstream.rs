@@ -753,6 +753,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_negotiates_and_reuses_connections_with_mtls() {
+        crate::install_process_crypto_provider();
+
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use rama_core::{Service, extensions::ExtensionsRef, rt::Executor, service::service_fn};
@@ -918,6 +920,8 @@ mod tests {
 
     #[test]
     fn upstream_advertises_ecdsa_before_rsa() {
+        crate::install_process_crypto_provider();
+
         use rama_core::conversion::RamaTryFrom;
 
         let config = <rustls::ClientConfig as RamaTryFrom<

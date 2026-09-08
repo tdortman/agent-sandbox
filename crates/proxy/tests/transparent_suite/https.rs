@@ -138,6 +138,8 @@ fn transparent_https_conflicting_sni_and_host_are_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http2_downstream_falls_back_to_http11_without_alpn() {
+    agent_sandbox_proxy::install_process_crypto_provider();
+
     let harness = TransparentHarness::start_tls_without_alpn(loopback(IpVersion::V4)).await;
     let origin = format!("https://localhost:{}/allow", harness.origin.address.port());
 
@@ -234,7 +236,7 @@ async fn transparent_https_ech_offer_is_decrypted_over_tcp() {
 
     let config = rustls::client::EchConfig::new(
         rustls::pki_types::EchConfigListBytes::from(config_list),
-        agent_sandbox_proxy::http3::hpke::ECH_SUPPORTED_SUITES,
+        agent_sandbox_proxy::http3::ECH_SUPPORTED_SUITES,
     )
     .expect("proxy ECH configuration is supported");
 

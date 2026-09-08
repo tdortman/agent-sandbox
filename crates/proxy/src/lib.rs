@@ -9,6 +9,16 @@
 //! `Alt-Svc` mappings; [`semantic`] owns protocol-independent request and
 //! response values shared by both backends.
 
+/// Install `ring` as the process-level rustls crypto provider.
+///
+/// Compiling both the `ring` and `aws_lc_rs` rustls features stops rustls
+/// from inferring a provider from crate features, while rama's TLS builders
+/// still ask for the process-level default. Every rustls config in this crate
+/// selects `ring` explicitly, so the default keeps rama aligned with them.
+pub fn install_process_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub mod alt_svc;
 
 pub mod cert;
