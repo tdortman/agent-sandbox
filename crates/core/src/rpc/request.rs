@@ -71,16 +71,6 @@ impl RequestContext {
         ProcessIds::from_options(self.pid, self.uid)
     }
 
-    /// Overwrite this context's `cwd`, `home`, and `project_root` from
-    /// `paths`, returning the updated context.
-    #[must_use]
-    pub fn with_paths(mut self, paths: &SandboxPaths) -> Self {
-        self.cwd = paths.cwd_path();
-        self.home = paths.home_path();
-        self.project_root = paths.project_root_path();
-        self
-    }
-
     /// Build a context from sandbox `paths` and process `ids`, leaving the
     /// session id unset.
     #[must_use]

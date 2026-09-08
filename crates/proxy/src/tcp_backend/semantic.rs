@@ -71,7 +71,7 @@ impl SemanticRequestBody {
         let terminal = inner.is_end_stream();
 
         if terminal {
-            let _ = semantic.finish();
+            let _ = semantic.terminate();
         }
 
         Self {

@@ -733,16 +733,6 @@ impl NormalizedPolicyHost {
         Ok(Self(NormalizedPolicyHostValue::Dns(dns.into_boxed_str())))
     }
 
-    /// Returns the DNS hostname when this host is a DNS name, or `None` when it
-    /// is an IP literal.
-    #[must_use]
-    pub fn dns_name(&self) -> Option<&str> {
-        match &self.0 {
-            NormalizedPolicyHostValue::Dns(name) => Some(name),
-            NormalizedPolicyHostValue::Ip(_) => None,
-        }
-    }
-
     /// Returns the IP address when this host is an IP literal, or `None` when
     /// it is a DNS name.
     #[must_use]
@@ -751,12 +741,6 @@ impl NormalizedPolicyHost {
             NormalizedPolicyHostValue::Ip(ip) => Some(*ip),
             NormalizedPolicyHostValue::Dns(_) => None,
         }
-    }
-
-    /// Returns `true` when this host is an IP literal.
-    #[must_use]
-    pub const fn is_ip(&self) -> bool {
-        self.ip().is_some()
     }
 }
 
@@ -840,12 +824,6 @@ impl FlowContext {
     #[must_use]
     pub fn sandbox_session_id(&self) -> Option<&str> {
         self.sandbox_session_id.as_deref()
-    }
-
-    /// Returns an owned clone of the sandbox session ID, if any.
-    #[must_use]
-    pub fn sandbox_session_id_owned(&self) -> Option<String> {
-        self.sandbox_session_id.clone()
     }
 
     /// Consumes the context, returning its paths and optional session ID.

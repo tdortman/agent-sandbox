@@ -160,19 +160,6 @@ impl RawQuery {
 /// carries it unchanged into policy requests.
 pub type SessionMetadata = CoreHttpSessionMetadata;
 
-/// Terminal state for a streamed request body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestTerminal {
-    /// The request body stream completed normally.
-    Complete,
-
-    /// The request was cancelled.
-    Cancellation,
-
-    /// The request body failed terminally.
-    Error(TerminalError),
-}
-
 /// Validates request body chunks without buffering them.
 ///
 /// Production pushes each chunk and forwards it immediately, so the queue
@@ -189,7 +176,7 @@ pub struct BoundedRequestBody {
 impl BoundedRequestBody {
     /// Create an empty request body validator.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn empty() -> Self {
         Self {
             max_chunk_bytes: 16 * 1024,
             trailers: false,
@@ -197,20 +184,6 @@ impl BoundedRequestBody {
         }
     }
 
-    /// Create an empty request body validator.
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self::new()
-    }
-}
-
-impl Default for BoundedRequestBody {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BoundedRequestBody {
     /// # Errors
     /// Returns [`BodyError`] when the body is terminal or the chunk exceeds
     /// the configured chunk bound.
@@ -239,12 +212,6 @@ impl BoundedRequestBody {
 
         self.trailers = true;
         Ok(())
-    }
-
-    /// # Errors
-    /// Returns [`BodyError::AfterTerminal`] when the body is already terminal.
-    pub const fn finish(&mut self) -> Result<(), BodyError> {
-        self.terminate()
     }
 
     /// # Errors
@@ -853,7 +820,7 @@ mod tests {
         let mut body = BoundedRequestBody::empty();
         body.set_trailers().expect("trailers");
         assert_eq!(body.set_trailers(), Err(BodyError::TrailersAlreadySet));
-        body.finish().expect("finish");
+        body.terminate().expect("terminate");
         assert_eq!(body.push_chunk(&[1]), Err(BodyError::AfterTerminal));
     }
 }
