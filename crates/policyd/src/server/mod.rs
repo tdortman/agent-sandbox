@@ -433,27 +433,29 @@ mod tests {
 
         assert!(matches!(&reply, RpcReply::RegisterUi(r) if r.ok));
 
-        let mut sandbox_conn = RpcConnection::connect(&args.sandbox_socket)
-            .await
-            .expect("connect sandbox socket");
-
-        sandbox_conn
-            .write_request(&RpcRequest::Check {
-                host: Some("example.com".into()),
-                connect_host: Some("93.184.216.34".into()),
-                port: Some(443),
-                scheme: "tcp".into(),
-                url: Some("tcp://example.com:443".into()),
-                ctx: RequestContext {
-                    cwd: Some("/workspace".into()),
-                    home: Some("/home/user".into()),
-                    project_root: Some("/workspace".into()),
-                    sandbox_session_id: Some("s1".into()),
-                    ..Default::default()
-                },
-            })
-            .await
-            .expect("write Check");
+        // Drive the approval directly with an unattributed context (no pid,
+        // like a root-daemon report): approvals from real RPC peers carry
+        // the peer pid and freeze first, which no test process can satisfy.
+        // The push path to the RPC-registered UI is identical either way.
+        let check = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .request_network_approval_with_aliases(
+                        "example.com".into(),
+                        443,
+                        "tcp".into(),
+                        "tcp://example.com:443".into(),
+                        ResolvedRequestContext::new(
+                            SandboxPaths::new("/workspace", "/home/user", "/workspace"),
+                            ProcessIds::from_options(None, Some(nix::unistd::getuid().as_raw())),
+                            Some("s1".into()),
+                        ),
+                        Vec::new(),
+                    )
+                    .await
+            }
+        });
 
         let pushed =
             tokio::time::timeout(std::time::Duration::from_secs(1), ui_conn.read_message())
@@ -473,6 +475,7 @@ mod tests {
             "expected network push, got: {pushed:?}"
         );
 
+        check.abort();
         server_task.abort();
     }
 

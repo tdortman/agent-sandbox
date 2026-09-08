@@ -837,13 +837,13 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
-        FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
-        SocketIdentity, SocketInode, VerdictSource,
+        FlowClaimReply, FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity,
+        SandboxPaths, SocketIdentity, SocketInode,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
 
     use super::*;
-    use crate::store::types::{Pending, PolicyStore};
+    use crate::store::types::PolicyStore;
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
         PolicyStore::new(crate::store::test_args(
@@ -966,8 +966,13 @@ mod tests {
         assert_eq!(claim.flow, flow);
     }
 
-    #[tokio::test]
-    async fn check_network_flow_requests_deferred_transport_approval_and_honors_cancellation() {
+    async fn claimed_udp_flow() -> (
+        Arc<PolicyStore>,
+        ProxySessionToken,
+        FlowClaimReply,
+        tempfile::TempDir,
+        std::net::UdpSocket,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
 
@@ -1008,67 +1013,42 @@ mod tests {
             .await
             .expect("claim flow");
 
-        let request_id = ProxyRequestId::new();
-        let task_store = store.clone();
-        let task_session = session.clone();
-        let attribution_token = claim.attribution_token.clone();
+        (store, session, claim, dir, socket)
+    }
 
-        let task = tokio::spawn(async move {
-            task_store
-                .check_network_flow(task_session, request_id, attribution_token)
-                .await
-        });
+    #[tokio::test]
+    async fn check_network_flow_blocks_when_sandbox_cannot_freeze() {
+        // The downstream handshake already completed, so the owner runs its
+        // own timers during the prompt. The check fails closed when the
+        // sandbox cannot be frozen (no agent cgroup scope covers a test
+        // process) instead of holding the connection open unfrozen.
+        let (store, session, claim, _dir, _socket) = claimed_udp_flow().await;
 
-        let pending_id = {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let inner = store.inner.lock().await;
-                if let Some((id, Pending::Network(pending))) =
-                    inner.pending.pending.iter().find(|(id, pending)| {
-                        id.starts_with("net:") && matches!(pending, Pending::Network(_))
-                    })
-                {
-                    assert_eq!(pending.scheme, "http3");
-                    break id.clone();
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "raw transport check never created pending approval"
-                );
-                drop(inner);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-
-        store
-            .finish_network(
-                &pending_id,
-                true,
-                VerdictSource::policy_with_comment("test"),
-                None,
-            )
-            .await;
-
-        let reply = task
+        let reply = store
+            .check_network_flow(session, ProxyRequestId::new(), claim.attribution_token)
             .await
-            .expect("check task should not panic")
-            .expect("check should succeed");
+            .expect("check should return a verdict");
 
         assert!(
-            reply.verdict.allowed,
-            "expected allowed reply, got {reply:?}"
+            !reply.verdict.allowed,
+            "expected blocked reply, got {reply:?}"
         );
-
-        assert_eq!(
-            reply.verdict.source,
-            VerdictSource::policy_with_comment("test"),
-            "raw fallback must use the transport policy verdict"
-        );
-
         assert!(
-            store.inner.lock().await.pending.network_futures.is_empty(),
-            "finished transport approval must release its waiter"
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("freeze")),
+            "block reason must name the freeze, got {reply:?}"
         );
+        assert!(
+            store.inner.lock().await.pending.pending.is_empty(),
+            "failed freeze must not create an approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_network_flow_honors_cancellation() {
+        let (store, session, claim, _dir, _socket) = claimed_udp_flow().await;
 
         let canceled_request_id = ProxyRequestId::new();
 
@@ -1077,12 +1057,20 @@ mod tests {
             .await
             .expect("cancel check");
 
+        // A pre-canceled check returns before attribution or freezing.
         let canceled = store
             .check_network_flow(session, canceled_request_id, claim.attribution_token)
             .await
             .expect("canceled check should return a verdict");
 
         assert!(!canceled.verdict.allowed, "canceled check must be blocked");
+        assert!(
+            canceled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancelled")),
+            "block reason must name the cancellation, got {canceled:?}"
+        );
     }
 
     async fn test_udp_owner(source: std::net::SocketAddr) -> SocketIdentity {

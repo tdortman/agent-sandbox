@@ -220,6 +220,24 @@ impl PolicyStore {
             return reply;
         }
 
+        // Freeze the owner while the approval pends so its own timers stop:
+        // a slow verdict must never time the connection out from under the
+        // prompt. This covers every network approval (direct transport
+        // checks and proxy flows alike). Unattributed flows have nobody to
+        // freeze and keep today's prompt behavior; a failed freeze fails
+        // closed without creating an approval.
+        let _freeze_hold = match ctx.ids.pid() {
+            None => None,
+            Some(pid) => match self.cgroup_freeze.acquire(Some(pid), ctx.ids.uid()) {
+                Ok(hold) => hold,
+                Err(error) => {
+                    return CheckReply::blocked(format!(
+                        "agent-sandbox: cannot freeze sandbox for network approval: {error}",
+                    ));
+                }
+            },
+        };
+
         let identity = NetworkRequestIdentity {
             host: &policy_host,
             port,

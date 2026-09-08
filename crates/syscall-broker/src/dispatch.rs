@@ -146,7 +146,7 @@ pub async fn dispatch_notification_with_mode(
         ResponsePlan::Continue
     } else if should_bypass_network_policy(&network_policy, &facts) {
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
-        // also delegates only its transparent service ports.
+        // delegates every TCP and UDP target to the packet filter and proxy.
         ResponsePlan::Continue
     } else if static_policy_allows(&facts, static_allow) {
         match facts {
@@ -327,21 +327,15 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_bypasses_tcp_proxy_ports_and_all_udp() {
-        assert!(should_bypass_network_policy(
-            &bypass(true, None),
-            &target("tcp", "192.0.2.10", 443)
-        ));
-
-        assert!(should_bypass_network_policy(
-            &bypass(true, None),
-            &target("tcp", "192.0.2.10", 80)
-        ));
-
-        assert!(!should_bypass_network_policy(
-            &bypass(true, None),
-            &target("tcp", "192.0.2.10", 853)
-        ));
+    fn proxy_mode_bypasses_all_tcp_and_all_udp() {
+        // Every TCP flow registers for the proxy (the proxy sniffs HTTP
+        // apart from raw TCP), so the gate skips them all.
+        for port in [80, 443, 853, 9443] {
+            assert!(should_bypass_network_policy(
+                &bypass(true, None),
+                &target("tcp", "192.0.2.10", port)
+            ));
+        }
 
         // The proxy-mode packet filter queues new UDP flows (except DNS to
         // the forwarder) for one deduped transport check per host:port, so

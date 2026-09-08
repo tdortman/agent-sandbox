@@ -805,6 +805,16 @@ let
 
               network = {
                 enable = true;
+
+                # Raw TCP echo for the passthrough happy path: the proxy
+                # sniffs non-HTTP bytes and splices after this rule allows.
+                declarativeAllow = [
+                  {
+                    host = "169.254.100.1";
+                    port = 18084;
+                  }
+                ];
+
                 dnsForwardTarget = "169.254.100.1:5353";
 
                 httpProxy = {
@@ -829,26 +839,52 @@ let
               policy.uiBackend = "none";
             };
 
-            networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [ 8008 ];
+            networking.firewall.interfaces.asbx-test-host.allowedTCPPorts = [
+              8008
+              18084
+              18085
+            ];
 
-            systemd.services.agent-sandbox-vm-dns = {
-              after = [ "agent-sandbox-netns.service" ];
-              requires = [ "agent-sandbox-netns.service" ];
-              wantedBy = [ "multi-user.target" ];
+            systemd.services = {
+              agent-sandbox-vm-dns = {
+                after = [ "agent-sandbox-netns.service" ];
+                requires = [ "agent-sandbox-netns.service" ];
+                wantedBy = [ "multi-user.target" ];
 
-              serviceConfig = {
-                ExecStart = lib.escapeShellArgs [
-                  "${pkgs.dnsmasq}/bin/dnsmasq"
-                  "--keep-in-foreground"
-                  "--no-resolv"
-                  "--no-hosts"
-                  "--bind-interfaces"
-                  "--listen-address=169.254.100.1"
-                  "--port=5353"
-                  "--user=sandbox"
-                ];
+                serviceConfig = {
+                  ExecStart = lib.escapeShellArgs [
+                    "${pkgs.dnsmasq}/bin/dnsmasq"
+                    "--keep-in-foreground"
+                    "--no-resolv"
+                    "--no-hosts"
+                    "--bind-interfaces"
+                    "--listen-address=169.254.100.1"
+                    "--port=5353"
+                    "--user=sandbox"
+                  ];
 
-                Restart = "on-failure";
+                  Restart = "on-failure";
+                };
+              };
+
+              agent-sandbox-vm-tcp-18084 = {
+                wantedBy = [ "multi-user.target" ];
+
+                serviceConfig = {
+                  ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18084,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                  Restart = "on-failure";
+                  User = "sandbox";
+                };
+              };
+
+              agent-sandbox-vm-tcp-18085 = {
+                wantedBy = [ "multi-user.target" ];
+
+                serviceConfig = {
+                  ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18085,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+                  Restart = "on-failure";
+                  User = "sandbox";
+                };
               };
             };
           }
@@ -1883,6 +1919,60 @@ let
           "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/allowed'"
       )
 
+      # Raw TCP passthrough: non-HTTP bytes on an unusual port take the
+      # checked splice instead of the HTTP path. Port 18084 has a
+      # declarative rule, so this completes with no prompt at all.
+      approval.wait_for_unit("agent-sandbox-vm-tcp-18084.service")
+      approval.wait_for_unit("agent-sandbox-vm-tcp-18085.service")
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "printf passthrough-ok | socat -T 10 - TCP4:169.254.100.1:18084 | grep -q passthrough-ok")
+      )
+      approval.succeed(
+          "test \"$(runuser -u sandbox -- agent-sandbox-approve pending | grep -c -F '169.254.100.1:18084')\" = 0"
+      )
+
+      # A frozen clock still ticks, so the assertions below pin the
+      # mechanism (cgroup.freeze reads 1 mid-prompt), not the absence of
+      # time: the freeze stops fail-fast spins and holds the connection
+      # open, and the client recovers on thaw. Port 18085 has no rule.
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "printf freeze-probe | socat - TCP4:169.254.100.1:18085", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q '169.254.100.1:18085'"
+      )
+      approval.wait_until_succeeds(
+          "pid=$(pgrep -f '^[^ ]*socat .*TCP4:169.254.100.1:18085' | head -1); "
+          "scope=$(awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup); "
+          "test \"$(cat /sys/fs/cgroup$scope/cgroup.freeze)\" = 1"
+      )
+      approval.succeed("sleep 10")
+      tcp_id = approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"network\" && $5 == \"169.254.100.1:18085\" {print $1; exit}'"
+      ).strip()
+      assert "net:" in tcp_id, tcp_id
+      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {tcp_id} once")
+      approval.wait_until_succeeds("grep -q freeze-probe /tmp/approve-bg.out")
+
+      # HTTP approvals freeze the same way. /unlisted has no rule for this
+      # package, so it prompts; the delayed approval still completes.
+      approval.succeed(
+          package_cmd("sandbox-approve-bash", "curl --silent --show-error --max-time 30 http://169.254.100.1:8008/unlisted", background=True)
+      )
+      approval.wait_until_succeeds(
+          "runuser -u sandbox -- agent-sandbox-approve pending | grep -F -q 'http://169.254.100.1:8008/unlisted'"
+      )
+      approval.wait_until_succeeds(
+          "pid=$(pgrep -f '^[^ ]*curl .*8008/unlisted' | head -1); "
+          "scope=$(awk -F: '$1 == 0 {print $3}' /proc/$pid/cgroup); "
+          "test \"$(cat /sys/fs/cgroup$scope/cgroup.freeze)\" = 1"
+      )
+      approval.succeed("sleep 10")
+      http_id = approval.succeed(
+          "runuser -u sandbox -- agent-sandbox-approve pending | awk -F'\\t' '$2 == \"http\" && $5 ~ /unlisted/ {print $1; exit}'"
+      ).strip()
+      approval.succeed(f"runuser -u sandbox -- agent-sandbox-approve approve {http_id} once")
+      approval.wait_until_succeeds("grep -q unlisted-get /tmp/approve-bg.out")
       # Resource pending attribution: an unlisted socket connect pends with
       # the package attributed, and a project_package approval persists the
       # rule to the package-specific project file.

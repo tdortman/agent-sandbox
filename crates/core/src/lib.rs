@@ -17,6 +17,7 @@ pub mod policy;
 pub mod rpc;
 pub mod rpc_client;
 pub mod scope_target;
+pub mod sniff;
 pub mod socket_owner;
 pub mod transport;
 pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
@@ -65,7 +66,8 @@ pub use rpc::{
 };
 pub use rpc_client::{PersistentRpcClient, RpcClientError, RpcConnection, policy_rpc};
 pub use scope_target::{ScopeContext, ScopeTarget};
+pub use sniff::{TcpSniff, is_quic_initial, sniff_tcp};
 pub use socket_owner::{
     OwnerResolution, OwnerSnapshot, SocketProtocol, SocketTuple, resolve_owner_snapshot,
 };
-pub use transport::{FlowOwner, NetworkOwnership, is_http_service_port, scheme_for};
+pub use transport::{FlowOwner, NetworkOwnership, scheme_for};

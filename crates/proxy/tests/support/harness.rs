@@ -110,7 +110,6 @@ struct Http3Options {
 #[derive(Default)]
 struct HarnessOptions {
     tls: bool,
-    configured_tls_port: bool,
     advertise_http11_alpn: bool,
     keep_alive: bool,
     h2c: bool,
@@ -183,16 +182,6 @@ impl TransparentHarness {
     pub async fn start_tls(ip: IpAddr) -> Self {
         Self::start_inner(ip, 0, HarnessOptions {
             tls: true,
-            advertise_http11_alpn: true,
-            ..HarnessOptions::default()
-        })
-        .await
-    }
-
-    pub async fn start_configured_tls_port(ip: IpAddr) -> Self {
-        Self::start_inner(ip, 0, HarnessOptions {
-            tls: true,
-            configured_tls_port: true,
             advertise_http11_alpn: true,
             ..HarnessOptions::default()
         })
@@ -317,7 +306,6 @@ impl TransparentHarness {
     async fn start_inner(ip: IpAddr, origin_port: u16, options: HarnessOptions) -> Self {
         let HarnessOptions {
             tls,
-            configured_tls_port,
             advertise_http11_alpn,
             keep_alive,
             h2c,
@@ -383,13 +371,8 @@ impl TransparentHarness {
             &destination.to_string(),
         ]);
 
-        if configured_tls_port {
-            let ports = root.path().join("https-ports.json");
-            std::fs::write(&ports, format!("[{}]", origin.address.port())).unwrap();
-            proxy_command.env("AGENT_SANDBOX_TEST_HTTPS_PORTS_FILE", ports);
-        } else if tls {
-            proxy_command.arg("--test-tls");
-        }
+        // The proxy sniffs the stream to tell TLS apart from plaintext, so
+        // no port configuration is needed even for TLS on a random port.
 
         if h2c {
             proxy_command.args([

@@ -149,23 +149,17 @@ prior knowledge without HTTP/1 fallback. They cannot also be listed under
 HTTP/1 `Upgrade: h2c` remains rejected. Each request still requires HTTP policy
 approval, including requests on an existing HTTP/2 connection.
 
-To intercept HTTPS on additional TCP ports:
-
-```nix
-agent-sandbox.network.httpProxy.extraHttpsPorts = [ 9443 10443 ];
-```
-
-Ports 443 and 8443 remain enabled. The module writes the shared host configuration
-to `/etc/agent-sandbox/https-ports.json` and adds the ports to the transparent
-routes and fail-closed rules. The syscall gate, NFQUEUE, policy daemon and proxy
-read the same list. The module restarts the affected services when it changes;
-relaunch existing sandboxes so their brokers also load the new list. Ports used
-for HTTP or DNS cannot be reassigned. This setting does not grant access.
+Every TCP connection is intercepted regardless of port: NFQUEUE registers the
+flow for the transparent proxy, which peeks at the first stream bytes to tell
+TLS and HTTP apart from raw TCP. HTTP(S) takes the decoding policy path;
+anything else is spliced end to end after one `tcp://host:port` policy check.
+UDP keeps one configured intercept port (a socket must bind each port),
+but the first payload byte decides: only QUIC long headers take the
+HTTP/3 path, everything else takes the direct transport check.
 
 The TCP proxy forwards informational responses such as `103 Early Hints` on
 HTTP/1.1 and HTTP/2 before the final response. It forwards at most 16 upstream
-interim responses per request and omits them for HTTP/1.0 clients. The Rama patch is described in
-[vendor/README.md](vendor/README.md).
+interim responses per request and omits them for HTTP/1.0 clients.
 
 ## Policy
 

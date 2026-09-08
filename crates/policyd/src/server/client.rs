@@ -300,14 +300,14 @@ mod tests {
 
     use agent_sandbox_core::{
         AttributionToken, FlowContext, FlowProtocol, FlowRegistration, HttpRequest, NetworkFlowKey,
-        NormalizedPolicyHost, ProxyConnectionId, ProxyReplyBody, ProxyRequestId, RpcConnection,
-        RpcReply, RpcRequest,
+        NormalizedPolicyHost, ProxyConnectionId, ProxyReplyBody, ProxyRequestId, RequestContext,
+        RpcConnection, RpcReply, RpcRequest,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
     use tokio::net::UnixListener;
 
     use super::{SocketRole, handle_client};
-    use crate::store::{PolicyStore, ProxyCheckId};
+    use crate::store::PolicyStore;
 
     #[tokio::test]
     async fn sequential_proxy_rpcs_preserve_reply_ids_and_session_lease() {
@@ -401,78 +401,64 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            // EOF and pipelining during an approval must both cancel the
-            // pending check. A pipelined second request must never dispatch.
-            for pipeline in [false, true] {
-                let mut pending = RpcConnection::connect(&path).await.unwrap();
-                let (stream, _) = listener.accept().await.unwrap();
-                let task = tokio::spawn(handle_client(store.clone(), stream, SocketRole::Proxy));
-                let request_id = ProxyRequestId::new();
-                let key = ProxyCheckId {
-                    session: session.proxy_session.clone(),
-                    request: request_id,
-                };
-                pending
-                    .write_request(&RpcRequest::CheckNetworkFlow {
-                        proxy_session: session.proxy_session.clone(),
-                        request_id,
-                        attribution_token: claim.attribution_token.clone(),
-                    })
-                    .await
-                    .unwrap();
-                loop {
-                    if store
-                        .inner
-                        .lock()
-                        .await
-                        .pending
-                        .network_futures
-                        .values()
-                        .flatten()
-                        .any(|waiter| waiter.proxy.as_ref() == Some(&key))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                let second_id = ProxyRequestId::new();
-                if pipeline {
-                    pending
-                        .write_request(&RpcRequest::CancelCheck {
-                            proxy_session: session.proxy_session.clone(),
-                            request_id: second_id,
-                        })
-                        .await
-                        .unwrap();
-                } else {
-                    drop(pending);
-                }
-                task.await.unwrap().unwrap();
-                loop {
-                    if !store
-                        .inner
-                        .lock()
-                        .await
-                        .pending
-                        .network_futures
-                        .values()
-                        .flatten()
-                        .any(|waiter| waiter.proxy.as_ref() == Some(&key))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                let inner = store.inner.lock().await;
-                assert!(
-                    !inner.proxy_cancellations.contains_key(&ProxyCheckId {
-                        session: session.proxy_session.clone(),
-                        request: second_id,
-                    }),
-                    "pipelined request must not dispatch"
-                );
-                drop(inner);
-            }
+            // Proxy network checks freeze the owner during approval, which no
+            // test process can satisfy: the check fails closed over the wire
+            // with its request id preserved. The session lease connection
+            // carries no RPCs, so this uses a fresh worker connection.
+            let mut worker = RpcConnection::connect(&path)
+                .await
+                .expect("connect worker RPC");
+            let (stream, _) = listener.accept().await.expect("accept worker RPC");
+            let worker_task =
+                tokio::spawn(handle_client(store.clone(), stream, SocketRole::Proxy));
+            let request_id = ProxyRequestId::new();
+            let reply = worker
+                .request(RpcRequest::CheckNetworkFlow {
+                    proxy_session: session.proxy_session.clone(),
+                    request_id,
+                    attribution_token: claim.attribution_token.clone(),
+                })
+                .await
+                .expect("network check must reply");
+            assert!(
+                matches!(&reply, RpcReply::Proxy(reply)
+                    if reply.request_id == request_id
+                    && matches!(&reply.reply, ProxyReplyBody::NetworkFlow(check)
+                        if !check.verdict.allowed
+                            && check.error.as_deref().is_some_and(|error| error.contains("freeze")))),
+                "unfreezable proxy check must fail closed, got {reply:?}"
+            );
+            drop(worker);
+            worker_task
+                .await
+                .expect("worker task joins")
+                .expect("no worker error");
+            // The shared approval path freezes too: a direct check from a
+            // real peer fails closed without creating an approval.
+            let mut sandbox = RpcConnection::connect(&path)
+                .await
+                .expect("connect sandbox RPC");
+            let (stream, _) = listener.accept().await.expect("accept sandbox RPC");
+            let task = tokio::spawn(handle_client(store.clone(), stream, SocketRole::Sandbox));
+            let reply = sandbox
+                .request(RpcRequest::Check {
+                    host: Some("1.1.1.1".into()),
+                    connect_host: Some("1.1.1.1".into()),
+                    port: Some(443),
+                    scheme: "udp".into(),
+                    url: Some("udp://1.1.1.1:443".into()),
+                    ctx: RequestContext::default(),
+                })
+                .await
+                .expect("direct check must reply");
+            assert!(
+                matches!(&reply, RpcReply::Check(check)
+                    if !check.verdict.allowed
+                        && check.error.as_deref().is_some_and(|error| error.contains("freeze"))),
+                "unfreezable direct check must fail closed, got {reply:?}"
+            );
+            drop(sandbox);
+            task.await.expect("client task joins").expect("no client error");
             // An RPC connection ending must not own the session lease.
             assert!(store.open_proxy_session(u64::MAX).await.is_err());
             drop(lease);

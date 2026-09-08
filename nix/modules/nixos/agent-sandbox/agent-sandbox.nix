@@ -687,25 +687,6 @@ in
           description = "HTTP(S) URL rules denied even when another policy allows them.";
         };
 
-        extraHttpsPorts = lib.mkOption {
-          type = lib.types.listOf (
-            lib.types.addCheck lib.types.port (
-              port:
-              !(builtins.elem port [
-                0
-                53
-                80
-                8008
-                8080
-                853
-              ])
-            )
-          );
-
-          default = [ ];
-          description = "Additional TCP ports intercepted as HTTPS, alongside 443 and 8443. Relaunch existing sandboxes after changing this list.";
-        };
-
         gid = lib.mkOption {
           type = lib.types.nullOr lib.types.int;
           default = null;

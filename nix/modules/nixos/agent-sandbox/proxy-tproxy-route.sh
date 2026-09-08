@@ -14,10 +14,16 @@ nfq_ready="${10}"
 udp_ports="${11:-}"
 action="${12:-up}"
 
-ports='80,443,8008,8080,8443'
-if [[ -n "${AGENT_SANDBOX_EXTRA_HTTPS_PORTS:-}" ]]; then
-  ports+=",${AGENT_SANDBOX_EXTRA_HTTPS_PORTS}"
-fi
+# Ports do not identify protocols, so TCP needs no port list: every SYN is
+# queued, NFQUEUE registers the flow for the proxy, and the proxy peeks at
+# the stream to tell HTTP(S) apart from raw TCP. Established segments skip
+# the queue via their SYN-only match and stay entirely in the kernel.
+#
+# UDP still needs its intercept ports (one bound socket per port), but the
+# first payload byte decides: only QUIC long headers steer to the HTTP/3
+# backend. Anything else on those ports takes the ordinary route and the
+# direct policy path.
+quic_match='@th,64,8 & 0x80 == 0x80'
 
 # Space- or comma-separated intercepted UDP ports; empty means HTTP/3 is off.
 udp_ports="${udp_ports//,/ }"
@@ -40,9 +46,23 @@ reject_rule() {
   fi
 }
 
-udp_mark_rule() {
+udp_steer_restore_rule() {
   [[ -n "$udp_ports" ]] || return 0
-  echo "udp dport $(udp_set) meta mark set $mark"
+  # Established flows keep their handshake mark via conntrack: post-handshake
+  # 1-RTT datagrams use short headers that no payload match can see, so the
+  # mark saved at handshake time is restored here, in the kernel, with no
+  # userspace round trip.
+  echo "udp dport $(udp_set) ct state established,related ct mark != 0 meta mark set ct mark"
+}
+
+udp_steer_connmark_rule() {
+  [[ -n "$udp_ports" ]] || return 0
+  # Remember QUIC flows on the conntrack entry. Unconditional on purpose:
+  # NFQUEUE verdict marks only become visible to later hooks, so a save
+  # that reads the packet mark here would always read zero. Dropped flows
+  # never confirm their entry, and non-QUIC datagrams never match the
+  # payload gate, so nothing else can gain the mark this way.
+  echo "udp dport $(udp_set) $quic_match ct mark set $mark"
 }
 
 queue_rule() {
@@ -53,8 +73,10 @@ queue_rule() {
   # serialises the NFQUEUE at tens of milliseconds per packet. After
   # registration, marked UDP datagrams use the local route table instead of
   # output NAT, preserving the original destination metadata for the proxy.
+  # Non-QUIC datagrams skip the queue here (the sandbox table still queues
+  # them once for the direct transport check).
 
-  echo "udp dport $(udp_set) ct state new,untracked counter queue num $queue_number"
+  echo "udp dport $(udp_set) $quic_match ct state new,untracked counter queue num $queue_number"
 
 }
 
@@ -62,7 +84,7 @@ tproxy_rules() {
   [[ -n "$udp_ports" ]] || return 0
   local port
   for port in "${udp_port_array[@]}"; do
-    echo "udp dport $port counter tproxy to :$port meta mark set $mark"
+    echo "udp dport $port $quic_match counter tproxy to :$port meta mark set $mark"
   done
 }
 
@@ -72,8 +94,8 @@ output_redirect_rules() {
   for port in "${udp_port_array[@]}"; do
     # Marked datagrams were accepted by NFQUEUE and already use the local
     # route table; redirecting them would hide the original destination
-    # from the proxy. Only unmarked UDP falls back to the local redirect.
-    echo "udp dport $port meta mark != $mark counter redirect to :$port"
+    # from the proxy. Only unmarked QUIC falls back to the local redirect.
+    echo "udp dport $port $quic_match meta mark != $mark counter redirect to :$port"
   done
 }
 
@@ -109,13 +131,17 @@ fail_closed() {
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
      ct status dnat return
-     tcp dport { $ports } reject with tcp reset
+     ip daddr 127.0.0.0/8 return
+     ip6 daddr ::1 return
+     tcp dport != 53 reject with tcp reset
      tcp dport 853 reject with tcp reset
      $udp_reject
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
-     tcp dport { $ports } reject with tcp reset
+     ip daddr 127.0.0.2 return
+     ip6 daddr ::2 return
+     tcp dport != 53 reject with tcp reset
      tcp dport 853 reject with tcp reset
      $udp_reject
    }
@@ -156,24 +182,42 @@ nft -f - <<EOF
      type route hook output priority mangle; policy accept;
      meta skuid $proxy_uid return
      ct status dnat return
+     # Loopback never traverses the proxy; the packet filter checks it
+     # direct. Plain DNS stays direct; DoT has no policy path.
+     ip daddr 127.0.0.0/8 return
+     ip6 daddr ::1 return
+     tcp dport 53 return
     tcp dport 853 reject with tcp reset
     $(reject_rule)
-    tcp dport { $ports } counter meta mark set $mark queue num $queue_number
+    # Every TCP SYN is queued exactly once. NFQUEUE registers the flow for
+    # the proxy; direct flows (loopback, DNS) never reach the queue.
+    # Established segments match nothing here and stay in the kernel.
+    # NOTE: an NFQUEUE verdict continues traversal at the next hook, not
+    # the next rule, so nothing below the queue rule may depend on the
+    # verdict. Steering state therefore precedes the queue.
+    tcp dport != 53 tcp flags & (syn | ack) == syn counter meta mark set $mark queue num $queue_number
+    $(udp_steer_restore_rule)
+    $(udp_steer_connmark_rule)
     $(queue_rule)
-    $(udp_mark_rule)
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
+     # The loopback handoff DNATs later; never steal it for the proxy.
+     ip daddr 127.0.0.2 return
+     ip6 daddr ::2 return
+     tcp dport 53 return
      tcp dport 853 reject with tcp reset
      $(reject_rule)
-     tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark
+     tcp dport != 53 counter tproxy to :$listen_port meta mark set $mark
      $(tproxy_rules)
    }
 
   chain output_redirect {
     type nat hook output priority 5; policy accept;
     meta skuid $proxy_uid return
-    tcp dport { $ports } counter redirect to :$listen_port
+    ip daddr 127.0.0.0/8 return
+    ip6 daddr ::1 return
+    tcp dport != 53 counter redirect to :$listen_port
     $(output_redirect_rules)
   }
  }

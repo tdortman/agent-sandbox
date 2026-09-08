@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    flow::{NfqState, handle_packet, mark_accepted_proxy_udp},
+    flow::{NfqState, apply_proxy_mark, handle_packet},
     packet,
 };
 
@@ -121,7 +121,7 @@ pub async fn run_queue(
                 let (verdict, meta) =
                     handle_packet(&state, &mut client, timeout, &message, &runtime);
 
-                mark_accepted_proxy_udp(&state, &mut message, verdict, meta);
+                apply_proxy_mark(&state, &mut message, verdict, meta);
                 message.set_verdict(verdict);
                 (index, message, client)
             });

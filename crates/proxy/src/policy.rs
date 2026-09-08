@@ -15,10 +15,10 @@ use std::{
 };
 
 use agent_sandbox_core::{
-    AttributionToken, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest, NetworkFlowKey,
-    NetworkFlowSelector, NormalizedPolicyHost, PersistentRpcClient, ProxyConnectionId, ProxyReply,
-    ProxyReplyBody, ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcClientError,
-    RpcConnection, RpcReply, RpcRequest,
+    AttributionToken, CheckReply, FlowClaimReply, FlowProtocol, HttpCheckReply, HttpRequest,
+    NetworkFlowKey, NetworkFlowSelector, NormalizedPolicyHost, PersistentRpcClient,
+    ProxyConnectionId, ProxyReply, ProxyReplyBody, ProxyRequestId, ProxySessionReply,
+    ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest,
 };
 use rama_core::error::{BoxError, BoxErrorExt};
 use tokio::sync::{Notify, Semaphore};
@@ -335,6 +335,75 @@ impl PolicySession {
         Ok(check)
     }
 
+    /// Ask policyd for a connection-level decision on a claimed flow whose
+    /// stream carries no HTTP to decode (raw TCP passthrough).
+    ///
+    /// The check runs under one concurrency permit and is cancelled when the
+    /// proxy shuts down before the decision arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the permit is unavailable, the policy RPC fails
+    /// or has an unexpected reply, or the proxy shuts down while the
+    /// decision is pending.
+    pub async fn check_network_flow_cancellable(
+        self: &Arc<Self>,
+        attribution_token: AttributionToken,
+        active_checks: &Arc<Semaphore>,
+        shutdown: &Arc<Notify>,
+    ) -> Result<CheckReply, PolicyError> {
+        let _permit = active_checks
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PolicyError::TooManyActiveChecks)?;
+
+        let request_id = ProxyRequestId::new();
+        let mut pending = PendingPolicyCheck::new(Arc::clone(self), request_id);
+
+        let check = tokio::select! {
+            result = self.check_network_flow(request_id, attribution_token) => result?,
+            () = shutdown.notified() => {
+                self.cancel(request_id).await?;
+                pending.disarm();
+                return Err(PolicyError::Shutdown);
+            }
+        };
+
+        pending.disarm();
+        Ok(check)
+    }
+
+    /// Ask policyd for a connection-level decision on a claimed flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy RPC fails or has an unexpected reply.
+    pub async fn check_network_flow(
+        &self,
+        request_id: ProxyRequestId,
+        attribution_token: AttributionToken,
+    ) -> Result<CheckReply, PolicyError> {
+        self.rpc(
+            RpcRequest::CheckNetworkFlow {
+                proxy_session: self.token.clone(),
+                request_id,
+                attribution_token,
+            },
+            |reply| match reply {
+                RpcReply::Proxy(ProxyReply {
+                    request_id: reply_request_id,
+                    reply,
+                }) if reply_request_id == request_id => match reply {
+                    ProxyReplyBody::NetworkFlow(check) => Ok(check),
+                    ProxyReplyBody::Error(error) => Err(PolicyError::Rpc(error.error)),
+                    _ => Err(PolicyError::UnexpectedReply("check_network_flow")),
+                },
+                _ => Err(PolicyError::UnexpectedReply("check_network_flow")),
+            },
+        )
+        .await
+    }
+
     /// Cancel a pending HTTP approval request.
     ///
     /// # Errors
@@ -604,13 +673,14 @@ pub(crate) mod test_support {
         path::PathBuf,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
     use agent_sandbox_core::{
-        HttpCheckReply, HttpRequest, ProxyReply, ProxyRequestId, ProxySessionReply,
-        ProxySessionToken, RpcReply, SimpleOkReply, Verdict, VerdictSource,
+        AttributionToken, CheckReply, FlowClaimReply, HttpCheckReply, HttpRequest, NetworkFlowKey,
+        NormalizedPolicyHost, ProxyReply, ProxyRequestId, ProxySessionReply, ProxySessionToken,
+        RpcReply, SimpleOkReply, Verdict, VerdictSource,
     };
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -637,17 +707,28 @@ pub(crate) mod test_support {
     impl FakePolicy {
         /// Start the fake service on a fresh socket in a temporary directory.
         pub fn start() -> Self {
+            Self::start_with_network_verdict(true)
+        }
+
+        /// Start the fake service whose connection-level network checks deny.
+        pub fn start_denying_network() -> Self {
+            Self::start_with_network_verdict(false)
+        }
+
+        fn start_with_network_verdict(allow_network: bool) -> Self {
             let dir = tempfile::tempdir().expect("temporary directory");
             let socket = dir.path().join("policy.sock");
             let listener = UnixListener::bind(&socket).expect("bind fake policy socket");
             let (events_tx, events) = mpsc::unbounded_channel();
             let release_checks = Arc::new(Notify::new());
             let connections = Arc::new(AtomicUsize::new(0));
+            let deny_network = Arc::new(AtomicBool::new(!allow_network));
             let task = tokio::spawn(serve(
                 listener,
                 events_tx,
                 release_checks.clone(),
                 connections.clone(),
+                deny_network,
             ));
 
             Self {
@@ -666,6 +747,7 @@ pub(crate) mod test_support {
         events: mpsc::UnboundedSender<FakePolicyEvent>,
         release_checks: Arc<Notify>,
         connections: Arc<AtomicUsize>,
+        deny_network: Arc<AtomicBool>,
     ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -675,7 +757,13 @@ pub(crate) mod test_support {
             connections.fetch_add(1, Ordering::SeqCst);
             let events = events.clone();
             let release_checks = release_checks.clone();
-            tokio::spawn(serve_connection(stream, events, release_checks));
+            let deny_network = deny_network.clone();
+            tokio::spawn(serve_connection(
+                stream,
+                events,
+                release_checks,
+                deny_network,
+            ));
         }
     }
 
@@ -683,6 +771,7 @@ pub(crate) mod test_support {
         stream: tokio::net::UnixStream,
         events: mpsc::UnboundedSender<FakePolicyEvent>,
         release_checks: Arc<Notify>,
+        deny_network: Arc<AtomicBool>,
     ) {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -722,6 +811,34 @@ pub(crate) mod test_support {
                         )),
                     )))
                 }
+
+                Some("claim_network_flow") => {
+                    let flow: NetworkFlowKey = field(&value, "flow");
+
+                    Some(RpcReply::FlowClaim(FlowClaimReply {
+                        ok: true,
+                        attribution_token: AttributionToken::from_bytes([2; 32]),
+                        flow,
+                        policy_host: NormalizedPolicyHost::parse("example.test")
+                            .expect("static policy host"),
+                    }))
+                }
+
+                Some("check_network_flow") => {
+                    let _ = events.send(FakePolicyEvent::Check);
+                    let allowed = !deny_network.load(Ordering::SeqCst);
+
+                    Some(RpcReply::Proxy(ProxyReply::from_reply(
+                        field(&value, "request_id"),
+                        RpcReply::Check(if allowed {
+                            CheckReply::allowed(VerdictSource::policy())
+                        } else {
+                            CheckReply::denied(VerdictSource::policy())
+                        }),
+                    )))
+                }
+
+                Some("release_network_flow") => Some(RpcReply::Simple(SimpleOkReply { ok: true })),
 
                 Some("cancel_check") => {
                     let _ = events.send(FakePolicyEvent::Cancel);

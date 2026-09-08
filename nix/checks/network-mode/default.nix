@@ -430,12 +430,18 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   if grep -E -q -- '"(ssl_insecure|upstream_cert)=[^"]*"' ${networkModuleSource}; then
     fail "proxy service must not override wrapper-owned TLS options"
   fi
-  grep -F -q -- 'tcp dport { $ports } counter meta mark set $mark queue num $queue_number' ${proxyTproxyRouteSource} \
-    || fail "TPROXY route must queue TCP service ports for policy attribution"
-  grep -F -q -- 'tcp dport { $ports } counter tproxy to :$listen_port meta mark set $mark' ${proxyTproxyRouteSource} \
+  grep -F -q -- 'tcp dport != 53 tcp flags & (syn | ack) == syn counter meta mark set $mark queue num $queue_number' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must queue every TCP SYN for proxy registration"
+  grep -F -q -- 'tcp dport != 53 counter tproxy to :$listen_port meta mark set $mark' ${proxyTproxyRouteSource} \
     || fail "TPROXY route must redirect transparent TCP flows"
-  grep -F -q -- 'echo "udp dport $(udp_set) meta mark set $mark"' ${proxyTproxyRouteSource} \
-    || fail "TPROXY route must mark configured UDP flows"
+  grep -F -q -- 'tcp dport != 53 counter redirect to :$listen_port' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must redirect unmarked TCP to the proxy listener"
+  grep -F -q -- "quic_match='@th,64,8 & 0x80 == 0x80'" ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must sniff QUIC by payload instead of assuming UDP ports"
+  grep -F -q -- 'echo "udp dport $(udp_set) ct state established,related ct mark != 0 meta mark set ct mark"' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must restore verdict marks for established UDP without userspace"
+  grep -F -q -- 'ip daddr 127.0.0.0/8 return' ${proxyTproxyRouteSource} \
+    || fail "TPROXY route must leave loopback on the direct policy path"
   grep -F -q -- 'udp_reject="udp dport { 853, $(udp_elements) } reject"' ${proxyTproxyRouteSource} \
     || fail "TPROXY fail-closed UDP reject must flatten configured proxy ports"
   grep -F -q -- '++ [ "cleanup" ]' ${networkModuleSource} \

@@ -202,19 +202,20 @@ pub struct SeccompNotifResp {
 /// Network mediation mode selected by the trusted launcher.
 ///
 /// `Direct` preserves transport policy RPC checks. `Proxy` lets the
-/// transparent proxy own only the configured HTTP(S) service-port
-/// `AF_INET`/`AF_INET6` connect/send decisions; other network destinations
-/// remain gated by seccomp user notification. Unix resources and filesystem
-/// mediation remain unchanged in both modes.
+/// transparent proxy own every TCP and UDP `AF_INET`/`AF_INET6`
+/// connect/send decision (TCP is sniffed into HTTP or passthrough, UDP is
+/// transport-checked per flow); other network destinations remain gated by
+/// seccomp user notification. Unix resources and filesystem mediation remain
+/// unchanged in both modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum NetworkMode {
     /// Direct mediation: network transport policy checks are performed
     /// through the normal `Check` RPC, with no transparent proxy.
     Direct,
 
-    /// Proxy mediation: the transparent proxy owns only the configured
-    /// HTTP(S) service-port `AF_INET`/`AF_INET6` connect/send decisions;
-    /// other network destinations stay gated by seccomp user notification.
+    /// Proxy mediation: the transparent proxy owns every TCP and UDP
+    /// `AF_INET`/`AF_INET6` connect/send decision; other network
+    /// destinations stay gated by seccomp user notification.
     Proxy,
 }
 

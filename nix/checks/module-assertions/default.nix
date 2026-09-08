@@ -20,25 +20,6 @@ let
     duplicatePackageNameMessage
   ];
   contract =
-    assert builtins.all
-      (
-        port:
-        !(builtins.tryEval (
-          builtins.deepSeq
-            (mkNixosSystem { agent-sandbox.network.httpProxy.extraHttpsPorts = [ port ]; })
-            .config.agent-sandbox.network.httpProxy.extraHttpsPorts
-            true
-        )).success
-      )
-      [
-        0
-        53
-        80
-        853
-        8008
-        8080
-        65536
-      ];
     assert
       !(builtins.tryEval (
         builtins.deepSeq
@@ -46,15 +27,6 @@ let
           .config.agent-sandbox.network.httpProxy.h2cUpstreamOrigins
           true
       )).success;
-    assert
-      (builtins.fromJSON
-        (mkNixosSystem {
-          agent-sandbox.network = {
-            enable = true;
-            httpProxy.extraHttpsPorts = [ 9443 ];
-          };
-        }).config.environment.etc."agent-sandbox/https-ports.json".text
-      ) == [ 9443 ];
     assert expectFailure socketPathMessage {
       agent-sandbox = {
         gates.filesystem.enable = true;

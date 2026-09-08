@@ -1561,9 +1561,17 @@ async fn choose_target_level(
 }
 
 fn network_prompt_scheme(transport: &str, port: u16) -> &str {
+    // A bare "udp" transport is never claimed to be QUIC: proxied QUIC
+    // never prompts at the transport layer, so a UDP prompt is always a
+    // direct flow. Only an explicit "http3" transport keeps the https
+    // rendering with its QUIC hint.
+    if transport == "udp" {
+        return "udp";
+    }
+
     let protocol = match transport {
         "tcp" => FlowProtocol::Tcp,
-        "udp" | "http3" => FlowProtocol::Udp,
+        "http3" => FlowProtocol::Udp,
         // "http"/"https" inputs are already schemes, not transport hints.
         _ => return transport,
     };
@@ -1578,7 +1586,7 @@ fn network_prompt_scheme(transport: &str, port: u16) -> &str {
 }
 
 fn network_prompt_with_transport_hint(base: String, transport: &str, port: u16) -> String {
-    if (transport == "udp" || transport == "http3") && port == 443 {
+    if transport == "http3" && port == 443 {
         format!("{base} (HTTP/3 over QUIC)")
     } else {
         base
@@ -1719,13 +1727,15 @@ mod tests {
     }
 
     #[test]
-    fn network_prompt_scheme_uses_registered_http_service_ports() {
-        assert_eq!(network_prompt_scheme("tcp", 80), "http");
-        assert_eq!(network_prompt_scheme("tcp", 8008), "http");
-        assert_eq!(network_prompt_scheme("tcp", 8080), "http");
-        assert_eq!(network_prompt_scheme("tcp", 443), "https");
-        assert_eq!(network_prompt_scheme("tcp", 8443), "https");
-        assert_eq!(network_prompt_scheme("udp", 443), "https");
+    fn network_prompt_scheme_does_not_infer_protocol_from_tcp_ports() {
+        // Ports do not identify protocols: TCP prompts render as tcp://
+        // until the proxy decodes the stream and prompts per request.
+        for port in [80, 443, 8008, 8080, 8443, 853, 9443] {
+            assert_eq!(network_prompt_scheme("tcp", port), "tcp");
+        }
+
+        // A bare UDP transport is never claimed to be QUIC either.
+        assert_eq!(network_prompt_scheme("udp", 443), "udp");
         assert_eq!(network_prompt_scheme("udp", 853), "udp");
     }
 

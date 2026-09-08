@@ -336,11 +336,16 @@ let
         ip6 daddr ${runtime.hostIp6} tcp dport 53 accept
         # NDP only: neighbor and router discovery for the veth gateway.
         icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
-        # Reject denied destinations from transient reject sets
+        # Reject denied destinations from transient reject sets. UDP flows
+        # claimed for the transparent proxy carry its mark and skip these:
+        # the proxy enforces their policy per request, and a denied direct
+        # flow must not poison a later proxy flow to the same destination.
+        # TCP stays unconditional: ambiguous owners fail fast here, and no
+        # legitimate proxy TCP flow can be listed.
         ip daddr . tcp dport @reject_v4 reject with tcp reset
-        ip daddr . udp dport @reject_v4 reject
+        ip daddr . udp dport @reject_v4 meta mark != ${proxyMark} reject
         ip6 daddr . tcp dport @reject_v6 reject with tcp reset
-        ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
+        ip6 daddr . udp dport @reject_v6 meta mark != ${proxyMark} reject with icmpv6 type port-unreachable
         # Encrypted DNS transports have no policy-controlled resolver path.
         tcp dport 853 reject with tcp reset
         ${lib.optionalString (
@@ -536,6 +541,9 @@ let
       }
     '';
   };
+  # Packet mark claiming a flow for the transparent proxy. Shared with
+  # proxy-tproxy-route.sh (its $mark argument); both sides must agree.
+  proxyMark = "51820";
   proxyPolicyLauncher = pkgs.writeShellApplication {
     name = "agent-sandbox-policy-launch";
     runtimeInputs = [ proxyGroupLookupPkg ];
@@ -565,9 +573,7 @@ let
       pkgs.systemd
     ];
 
-    text =
-      "export AGENT_SANDBOX_EXTRA_HTTPS_PORTS=${lib.escapeShellArg (portSet runtime.httpProxy.extraHttpsPorts)}\n"
-      + builtins.readFile ./proxy-tproxy-route.sh;
+    text = builtins.readFile ./proxy-tproxy-route.sh;
   };
   proxyUser = "agent-sandbox-proxy";
   readinessMarkerPkg = pkgs.writeShellApplication {
@@ -589,77 +595,73 @@ in
 lib.mkIf policyEnabled (
   lib.mkMerge [
     {
-      environment.etc = {
-        "agent-sandbox/https-ports.json".text = builtins.toJSON cfg.httpProxy.extraHttpsPorts;
+      environment.etc."agent-sandbox/policy.json".text = builtins.toJSON (
+        {
+          network = {
+            direct = {
+              allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
+              deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+            };
 
-        "agent-sandbox/policy.json".text = builtins.toJSON (
-          {
-            network = {
-              direct = {
-                allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
-                deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+            http = {
+              allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
+              deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
+            };
+          };
+
+          sudo = {
+            allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
+            deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
+          };
+        }
+        // lib.optionalAttrs rootCfg.policy.dbus.enable {
+          dbus = {
+            allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
+            deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
+          };
+        }
+        //
+          lib.optionalAttrs
+            (
+              config.agent-sandbox.gates.filesystem.enable
+              || rootCfg.policy.filesystem.declarativeAllow != [ ]
+              || rootCfg.policy.filesystem.declarativeDeny != [ ]
+            )
+            {
+              filesystem = {
+                allow = [
+                  {
+                    access = "all";
+                    path = "/nix/store";
+                  }
+                ]
+                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
+
+                deny = [
+                  {
+                    access = "all";
+                    path = "~/.config/agent-sandbox";
+                  }
+                  {
+                    access = "all";
+                    path = "./.agent-sandbox";
+                  }
+                ]
+                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
               };
-
-              http = {
-                allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
-                deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
+            }
+        //
+          lib.optionalAttrs
+            (
+              rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
+            )
+            {
+              resources = {
+                allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
+                deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
               };
-            };
-
-            sudo = {
-              allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
-              deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
-            };
-          }
-          // lib.optionalAttrs rootCfg.policy.dbus.enable {
-            dbus = {
-              allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
-              deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
-            };
-          }
-          //
-            lib.optionalAttrs
-              (
-                config.agent-sandbox.gates.filesystem.enable
-                || rootCfg.policy.filesystem.declarativeAllow != [ ]
-                || rootCfg.policy.filesystem.declarativeDeny != [ ]
-              )
-              {
-                filesystem = {
-                  allow = [
-                    {
-                      access = "all";
-                      path = "/nix/store";
-                    }
-                  ]
-                  ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
-
-                  deny = [
-                    {
-                      access = "all";
-                      path = "~/.config/agent-sandbox";
-                    }
-                    {
-                      access = "all";
-                      path = "./.agent-sandbox";
-                    }
-                  ]
-                  ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
-                };
-              }
-          //
-            lib.optionalAttrs
-              (
-                rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
-              )
-              {
-                resources = {
-                  allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
-                  deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
-                };
-              }
-        );
-      };
+            }
+      );
 
       networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
 
@@ -760,7 +762,6 @@ lib.mkIf policyEnabled (
           AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
         };
 
-        restartTriggers = [ config.environment.etc."agent-sandbox/https-ports.json".source ];
       };
     }
 
@@ -949,7 +950,6 @@ lib.mkIf policyEnabled (
           };
 
           environment.AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
-          restartTriggers = [ config.environment.etc."agent-sandbox/https-ports.json".source ];
         };
       }
       // lib.optionalAttrs cfg.httpProxy.enable {
@@ -1027,7 +1027,6 @@ lib.mkIf policyEnabled (
             SSL_CERT_FILE = proxyBundlePath;
           };
 
-          restartTriggers = [ config.environment.etc."agent-sandbox/https-ports.json".source ];
         };
 
         agent-sandbox-proxy-firewall = {

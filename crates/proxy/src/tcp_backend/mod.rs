@@ -5,6 +5,7 @@
 //! connections.
 mod doh;
 
+mod peek;
 mod semantic;
 mod tls;
 pub(crate) mod upstream;
@@ -20,7 +21,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use agent_sandbox_core::{FlowProtocol, HttpCheckReply, HttpUrl};
+use agent_sandbox_core::{FlowProtocol, HttpCheckReply, HttpUrl, TcpSniff};
 use doh::{is_doh_request, rewrite_doh_response};
 use nix::sys::socket::{getsockopt, sockopt};
 use rama_core::{
@@ -470,9 +471,30 @@ fn build_listener_service(
             let destination = destination_resolver(&stream, listen_port)?;
             let destination_ip = destination.ip();
             let source = peer;
-            info!(%peer, %source, %destination, "accepted transparent proxy stream");
             let flow = flow_key(FlowProtocol::Tcp, source, destination)?;
             let claim = policy.claim(flow).await?;
+
+            // Ports do not identify protocols: peek at the stream to tell
+            // HTTP(S) apart from raw TCP. The peek is non-consuming, so the
+            // classified bytes stay queued for whichever path runs next.
+            let sniff = peek::peek_protocol(&stream).await;
+            if !matches!(sniff, TcpSniff::Tls | TcpSniff::Http) {
+                let result = serve_passthrough(
+                    stream,
+                    &policy,
+                    &claim,
+                    destination,
+                    &active_checks,
+                    &shutdown,
+                )
+                .await;
+                if let Err(error) = &result {
+                    error!(%error, %destination, "raw TCP passthrough failed");
+                }
+                let release_result = policy.release(&claim).await;
+                release_result?;
+                return result;
+            }
 
             let state = {
                 let upstream_clients =
@@ -480,9 +502,7 @@ fn build_listener_service(
 
                 FlowState {
                     destination,
-                    tls: test_tls
-                        || agent_sandbox_core::scheme_for(FlowProtocol::Tcp, destination.port())
-                            == "https",
+                    tls: test_tls || matches!(sniff, TcpSniff::Tls),
                     active_checks: active_checks.clone(),
                     policy: policy.clone(),
                     claim: claim.clone(),
@@ -568,6 +588,51 @@ fn build_listener_service(
             result
         }
     }))
+}
+
+/// Splice a non-HTTP stream end to end after one connection-level policy
+/// check.
+///
+/// The flow was already claimed and its bytes peeked: anything reaching here
+/// is raw TCP (SSH, Postgres, SMTP, ...), so there is no request to decode.
+/// Policy sees the same `tcp://host:port` check the direct path would have
+/// made. Denied streams close quietly; there is no HTTP channel to explain
+/// the denial over.
+///
+/// # Errors
+///
+/// Returns a `BoxError` when the policy check fails, the upstream dial
+/// fails, or the splice itself errors.
+async fn serve_passthrough(
+    stream: TcpStream,
+    policy: &Arc<PolicySession>,
+    claim: &FlowClaim,
+    destination: SocketAddr,
+    active_checks: &Arc<Semaphore>,
+    shutdown: &Arc<Notify>,
+) -> Result<(), BoxError> {
+    let check = policy
+        .check_network_flow_cancellable(claim.attribution_token.clone(), active_checks, shutdown)
+        .await?;
+
+    if !check.verdict.allowed {
+        info!(%destination, "raw TCP passthrough denied by policy");
+        return Ok(());
+    }
+
+    let upstream = tokio::net::TcpStream::connect(destination).await?;
+    upstream.set_nodelay(true)?;
+    let mut downstream: tokio::net::TcpStream = stream.into();
+    let mut upstream = upstream;
+
+    tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {
+            result?;
+        }
+        () = shutdown.notified() => {}
+    }
+
+    Ok(())
 }
 
 /// Resolve the original destination of a transparent connection.
@@ -1457,6 +1522,128 @@ mod tests {
         );
 
         assert_eq!(POLICY_DENIED_BODY, "blocked by agent-sandbox policy\n");
+    }
+
+    #[tokio::test]
+    async fn passthrough_splices_raw_tcp_after_policy_allow() {
+        let fake = FakePolicy::start();
+        let policy = Arc::new(
+            PolicySession::open(fake.socket.clone(), Duration::from_secs(2))
+                .await
+                .expect("open policy session"),
+        );
+
+        // Raw upstream that echoes one message back.
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo");
+        let echo_addr = echo.local_addr().expect("echo address");
+        tokio::spawn(async move {
+            let (mut server, _) = echo.accept().await.expect("accept echo");
+            // Answer slower than the client half-closes: the relay must
+            // hold the connection open for in-flight bytes instead of
+            // resetting it when the first direction ends.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let (mut reader, mut writer) = server.split();
+            let _ = tokio::io::copy(&mut reader, &mut writer).await;
+        });
+
+        // Downstream pair standing in for an intercepted client stream.
+        let ingress = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ingress");
+        let ingress_addr = ingress.local_addr().expect("ingress address");
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(ingress_addr)
+                .await
+                .expect("connect")
+        });
+        let (downstream, client_addr) = ingress.accept().await.expect("accept");
+        let mut client = client.await.expect("client connects");
+
+        let flow =
+            crate::policy::flow_key(FlowProtocol::Tcp, client_addr, echo_addr).expect("flow key");
+        let claim = policy.claim(flow).await.expect("claim flow");
+        let active_checks = Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS));
+        let shutdown = Arc::new(Notify::new());
+
+        let serving = super::serve_passthrough(
+            rama_tcp::TcpStream::new(downstream),
+            &policy,
+            &claim,
+            echo_addr,
+            &active_checks,
+            &shutdown,
+        );
+        let exchanging = async {
+            client
+                .write_all(b"SSH-2.0-OpenSSH\r\n")
+                .await
+                .expect("write banner");
+            client.shutdown().await.expect("half-close write side");
+            let mut echoed = [0_u8; 17];
+            timeout(Duration::from_secs(2), client.read_exact(&mut echoed))
+                .await
+                .expect("echo timeout")
+                .expect("read echo");
+            assert_eq!(&echoed, b"SSH-2.0-OpenSSH\r\n");
+            drop(client);
+        };
+
+        timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async { serving.await.expect("passthrough splices") },
+                exchanging
+            )
+        })
+        .await
+        .expect("passthrough timeout");
+    }
+
+    #[tokio::test]
+    async fn passthrough_closes_quietly_when_policy_denies() {
+        let fake = FakePolicy::start_denying_network();
+        let policy = Arc::new(
+            PolicySession::open(fake.socket.clone(), Duration::from_secs(2))
+                .await
+                .expect("open policy session"),
+        );
+
+        let ingress = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ingress");
+        let ingress_addr = ingress.local_addr().expect("ingress address");
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(ingress_addr)
+                .await
+                .expect("connect")
+        });
+        let (downstream, client_addr) = ingress.accept().await.expect("accept");
+        let mut client = client.await.expect("client connects");
+        let destination = SocketAddr::from(([192, 0, 2, 1], 22));
+
+        let flow =
+            crate::policy::flow_key(FlowProtocol::Tcp, client_addr, destination).expect("flow key");
+        let claim = policy.claim(flow).await.expect("claim flow");
+
+        super::serve_passthrough(
+            rama_tcp::TcpStream::new(downstream),
+            &policy,
+            &claim,
+            destination,
+            &Arc::new(Semaphore::new(MAX_ACTIVE_CHECKS)),
+            &Arc::new(Notify::new()),
+        )
+        .await
+        .expect("denial closes quietly");
+
+        // No HTTP status line to read: the stream just ends.
+        let mut drained = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut drained))
+            .await
+            .expect("close timeout")
+            .expect("read close");
+        assert!(drained.is_empty(), "denied streams carry no bytes");
     }
 
     async fn flow_state(

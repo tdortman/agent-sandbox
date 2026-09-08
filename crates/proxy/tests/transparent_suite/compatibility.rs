@@ -263,13 +263,13 @@ async fn http10_clients_do_not_receive_interim_heads() {
 }
 
 #[test]
-fn configured_https_port_uses_tls_and_https_policy() {
+fn sniffed_tls_uses_tls_and_https_policy() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("build test runtime");
     runtime.block_on(async {
-        let harness = TransparentHarness::start_configured_tls_port(loopback(IpVersion::V4)).await;
+        let harness = TransparentHarness::start_tls(loopback(IpVersion::V4)).await;
         assert!(![443, 8443].contains(&harness.origin.address.port()));
         let response = harness.tls_raw_request(
             &format!(
