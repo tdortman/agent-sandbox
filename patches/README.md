@@ -1,21 +1,14 @@
-# Vendored crates and dependency patches
+# Dependency patches
 
-This directory describes every crate this project uses in patched form and
-holds the patch file for each crate that is generated rather than committed.
-
-Two shapes exist:
-
-- **Committed sources** live under `vendor/<name>-<version>/`, some with
-  project-local patches. The directory name includes the upstream version.
-- **Generated sources** are described by a patch file in this directory and
-  materialized into `vendor/` by `scripts/materialize-vendor.sh`, which builds
-  them from a published `.crate` archive or a git checkout at the revision
-  pinned in `Cargo.toml`. The dev shell runs it on entry; the Nix derivation
-  runs it with the sources it already fetched. Generated directories are
-  gitignored.
+Every patched dependency is described here by one patch file. Nothing under
+`vendor/` is committed: `scripts/materialize-vendor.sh` builds each directory
+from its upstream source, either a published `.crate` archive whose sha256 is
+pinned in the script, or a git checkout at the revision pinned in `Cargo.toml`.
+The dev shell runs the script on entry; the Nix derivation runs it with the
+sources it already fetched. Generated directories are gitignored.
 
 This file summarises the high-level changes in each crate compared to its
-original upstream release; unchanged crates are listed as-is.
+original upstream release.
 
 ## h3 0.0.8 (generated)
 
@@ -90,7 +83,10 @@ Generated from `patches/rustls-0.23.43.patch` by
   rama keep resolving to it unchanged) until upstream offers an
   equivalent API.
 
-## rama-http-core 0.3.0
+## rama-http-core 0.4.0 (generated)
+
+Generated from `patches/rama-http-core-0.4.0.patch` by
+`scripts/materialize-vendor.sh`.
 
 The high-level HTTP services previously exposed only the final response. This
 patch lets the TCP proxy relay informational responses while the origin is still
@@ -114,6 +110,8 @@ The proxy's `transparent_suite/compatibility.rs` tests exercise the wire behavio
 including early hints before a gated final response, uploads, and h2c streaming.
 Remove this patch once upstream Rama exposes equivalent interim response
 forwarding on both server protocols and its HTTP/2 client, then rerun those tests.
+Upstream 0.4.0 still ships neither that forwarding nor `is_unprocessed`, so the
+patch is rebased onto 0.4.0 unchanged.
 
 HTTP/2 recovery also preserves whether a stream was above a remote GOAWAY's
 last-stream ID. The public `h2::Error::is_unprocessed()` reports this case and

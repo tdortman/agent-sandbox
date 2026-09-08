@@ -170,7 +170,7 @@ async fn transparent_http2_downstream_falls_back_to_http11_without_alpn() {
         .extensions()
         .insert(TargetHttpVersion(Version::HTTP_2));
 
-    let connection = timeout(Duration::from_secs(5), client.connect(request))
+    let connection = timeout(Duration::from_secs(5), Box::pin(client.connect(request)))
         .await
         .expect("connect through proxy timed out")
         .expect("connect through proxy");

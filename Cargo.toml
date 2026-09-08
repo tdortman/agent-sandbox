@@ -26,12 +26,12 @@ libc = "0.2.189"
 nfq-updated = "0.2.6"
 nix = "0.31.3"
 
-rama-dns = { version = "0.3.0", default-features = false }
-rama-http = { version = "0.3.0", default-features = false }
-rama-http-core = { version = "0.3.0", default-features = false }
-rama-net = { version = "0.3.0", default-features = false, features = ["std"] }
-rama-tcp = "0.3.0"
-rama-tls = { version = "0.3.0", default-features = false }
+rama-dns = { version = "0.4.0", default-features = false }
+rama-http = { version = "0.4.0", default-features = false }
+rama-http-core = { version = "0.4.0", default-features = false }
+rama-net = { version = "0.4.0", default-features = false, features = ["std"] }
+rama-tcp = "0.4.0"
+rama-tls = { version = "0.4.0", default-features = false }
 rcgen = { version = "0.14.8", features = ["pem", "ring", "x509-parser"] }
 ring = "0.17.14"
 rustls = { version = "0.23.42", default-features = false }
@@ -69,17 +69,17 @@ default-features = false
 features = ["futures-io", "runtime-tokio", "rustls-ring"]
 
 [workspace.dependencies.rama-core]
-version = "0.3.0"
+version = "0.4.0"
 default-features = false
 features = ["std"]
 
 [workspace.dependencies.rama-http-backend]
-version = "0.3.0"
+version = "0.4.0"
 default-features = false
 features = ["tls"]
 
 [workspace.dependencies.rama-tls-rustls]
-version = "0.3.0"
+version = "0.4.0"
 default-features = false
 features = ["http", "ring"]
 
@@ -182,7 +182,7 @@ warnings = "deny"
 missing_docs = "warn"  # Every public symbol documented
 
 [patch.crates-io]
-rama-http-core = { path = "vendor/rama-http-core-0.3.0" }
+rama-http-core = { path = "vendor/rama-http-core-0.4.0" }
 quinn = { path = "vendor/quinn-0.11.11" }
 quinn-proto = { path = "vendor/quinn-proto-0.11.16" }
 rustls = { path = "vendor/rustls-0.23.43" }

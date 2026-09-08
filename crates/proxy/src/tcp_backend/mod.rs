@@ -29,6 +29,7 @@ use rama_core::{
     bytes::Bytes,
     error::{BoxError, BoxErrorExt},
     extensions::ExtensionsRef,
+    io::{PrefixedIo, ReplayReader},
     matcher::{match_fn, service::MatcherServicePair},
     rt::Executor,
     service::service_fn,
@@ -475,9 +476,9 @@ fn build_listener_service(
             let claim = policy.claim(flow).await?;
 
             // Ports do not identify protocols: peek at the stream to tell
-            // HTTP(S) apart from raw TCP. The peek is non-consuming, so the
-            // classified bytes stay queued for whichever path runs next.
-            let sniff = peek::peek_protocol(&stream).await;
+            // HTTP(S) apart from raw TCP. The peek replays the classified
+            // bytes to whichever path runs next.
+            let (sniff, stream) = peek::peek_protocol(stream).await;
             if !matches!(sniff, TcpSniff::Tls | TcpSniff::Http) {
                 let result = serve_passthrough(
                     stream,
@@ -604,7 +605,7 @@ fn build_listener_service(
 /// Returns a `BoxError` when the policy check fails, the upstream dial
 /// fails, or the splice itself errors.
 async fn serve_passthrough(
-    stream: TcpStream,
+    stream: PrefixedIo<ReplayReader, TcpStream>,
     policy: &Arc<PolicySession>,
     claim: &FlowClaim,
     destination: SocketAddr,
@@ -622,7 +623,7 @@ async fn serve_passthrough(
 
     let upstream = tokio::net::TcpStream::connect(destination).await?;
     upstream.set_nodelay(true)?;
-    let mut downstream: tokio::net::TcpStream = stream.into();
+    let mut downstream = stream;
     let mut upstream = upstream;
 
     tokio::select! {
@@ -1093,8 +1094,8 @@ mod tests {
     };
 
     use super::{
-        Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, Request,
-        ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
+        Body, FlowState, HttpUrl, MAX_ACTIVE_CHECKS, POLICY_DENIED_BODY, PrefixedIo, ReplayReader,
+        Request, ResponseVersionAdaptCtx, StatusCode, TargetHttpVersion, TlsServerName, Version,
         adapt_http10_response, adapt_response_version, blocked_http_request,
         canonical_http10_origin, check_http_policy, force_websocket_http11,
         is_websocket_upgrade_request, is_websocket_upgrade_response, policy_denied_response,
@@ -1105,6 +1106,17 @@ mod tests {
         policy::{FlowClaim, PolicySession, test_support::FakePolicy},
         tcp_backend::upstream::UpstreamClients,
     };
+
+    /// Wrap a raw downstream socket the way `peek_protocol` does, with no
+    /// bytes held back, for tests that call the passthrough splice directly.
+    fn plain_passthrough_stream(
+        stream: tokio::net::TcpStream,
+    ) -> PrefixedIo<ReplayReader, rama_tcp::TcpStream> {
+        PrefixedIo::new(
+            ReplayReader::new(Bytes::new()),
+            rama_tcp::TcpStream::new(stream),
+        )
+    }
 
     struct TestIo {
         stream: DuplexStream,
@@ -1568,7 +1580,7 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
 
         let serving = super::serve_passthrough(
-            rama_tcp::TcpStream::new(downstream),
+            plain_passthrough_stream(downstream),
             &policy,
             &claim,
             echo_addr,
@@ -1627,7 +1639,7 @@ mod tests {
         let claim = policy.claim(flow).await.expect("claim flow");
 
         super::serve_passthrough(
-            rama_tcp::TcpStream::new(downstream),
+            plain_passthrough_stream(downstream),
             &policy,
             &claim,
             destination,

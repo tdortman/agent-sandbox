@@ -23,6 +23,7 @@ cd "$root"
 # crate <name> <version> <sha256(.crate)> <patch>
 # git   <name> <version> <subdir> <url> <rev> <patch>
 entries=(
+  "crate rama-http-core 0.4.0 bd832563002979754e619537a0d5861b1f1c8dfb505b71c314ccd781b2697324 patches/rama-http-core-0.4.0.patch"
   "crate rustls 0.23.43 0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06 patches/rustls-0.23.43.patch"
   "crate quinn 0.11.11 0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8 patches/quinn-0.11.11.patch"
   "crate quinn-proto 0.11.16 2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560 patches/quinn-proto-0.11.16.patch"

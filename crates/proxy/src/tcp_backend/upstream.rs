@@ -18,14 +18,19 @@ use rama_core::{
 };
 use rama_dns::client::DnsConnectorLayer;
 use rama_http::{
-    Body, Request, Response, StreamingBody, Version, body::Frame, conn::TargetHttpVersion,
+    Body, Request, Response, StreamingBody, Version,
+    body::Frame,
+    conn::{FallbackHttpVersion, TargetHttpVersion},
 };
 use rama_http_backend::client::{
-    BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnector, HttpPooledConnectorConfig,
+    BasicHttpConId, BindBodyToConn, HttpClientService, HttpConnectRequestAdapter, HttpConnector,
+    HttpPooledConnectorConfig,
 };
 use rama_net::{
     address::{Host, HostWithPort},
-    client::{ConnectorTarget, EstablishedClientConnection, pool::MultiplexedConnection},
+    client::{
+        ConnectRequest, ConnectorTarget, EstablishedClientConnection, pool::MultiplexedConnection,
+    },
 };
 use rama_tcp::client::service::TcpConnector;
 use rama_tls::client::{NegotiatedTlsParameters, TlsClientConfig};
@@ -259,15 +264,19 @@ impl<S> TlsAlpnConnector<S> {
     }
 }
 
-impl<S, C> Service<Request> for TlsAlpnConnector<S>
+impl<S, C> Service<ConnectRequest> for TlsAlpnConnector<S>
 where
-    S: Service<Request, Output = EstablishedClientConnection<C, Request>, Error: Into<BoxError>>,
+    S: Service<
+            ConnectRequest,
+            Output = EstablishedClientConnection<C, ConnectRequest>,
+            Error: Into<BoxError>,
+        >,
     C: ExtensionsRef + Send + 'static,
 {
     type Error = BoxError;
-    type Output = EstablishedClientConnection<C, Request>;
+    type Output = EstablishedClientConnection<C, ConnectRequest>;
 
-    async fn serve(&self, request: Request) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, request: ConnectRequest) -> Result<Self::Output, Self::Error> {
         let http10_target = request
             .extensions()
             .get_ref::<TargetHttpVersion>()
@@ -284,20 +293,23 @@ where
                 .insert(TargetHttpVersion(Version::HTTP_11));
         }
 
-        // The URI has already been rebuilt from the policy-approved origin.
-        if let Some(authority) = request.uri().authority() {
-            let origin = format!(
-                "{}://{authority}",
-                request.uri().scheme_str().unwrap_or("http")
-            );
-            if let Some(resolver) = self.identities.resolver(&origin)? {
-                TlsClientConfig::new()
-                    .with_modify_rustls_config(move |mut config| {
-                        config.client_auth_cert_resolver = resolver.clone();
-                        Ok(config)
-                    })
-                    .write_to(request.extensions());
-            }
+        // The authority has already been rebuilt from the policy-approved
+        // origin by the HTTP connect request adapter.
+        let origin = format!(
+            "{}://{}",
+            request
+                .application_protocol
+                .as_ref()
+                .map_or("http", rama_net::Protocol::as_str),
+            request.authority
+        );
+        if let Some(resolver) = self.identities.resolver(&origin)? {
+            TlsClientConfig::new()
+                .with_modify_rustls_config(move |mut config| {
+                    config.client_auth_cert_resolver = resolver.clone();
+                    Ok(config)
+                })
+                .write_to(request.extensions());
         }
 
         let established = self.inner.serve(request).await.map_err(Into::into)?;
@@ -396,7 +408,7 @@ fn build_upstream_client(
     });
     let connector =
         DnsConnectorLayer::new().into_layer(TcpConnector::default().with_connector(options));
-    let connector = rama_core::service::service_fn(move |request: Request| {
+    let connector = rama_core::service::service_fn(move |request: ConnectRequest| {
         let connector = connector.clone();
         async move {
             let connection = connector.serve(request).await?;
@@ -411,11 +423,17 @@ fn build_upstream_client(
     let connector = TlsConnector::auto(connector).with_base_config(TlsClientConfig::default_http());
     let connector = TlsAlpnConnector::new(connector, identities);
 
-    let connector = rama_http::layer::version_adapter::RequestVersionAdapter::new(connector)
-        .with_default_version(Version::HTTP_11);
+    let connector = HttpConnector::new(connector, Executor::default());
+    let connector = HttpPooledConnectorConfig::default().try_build_connector(connector)?;
+    let connector = HttpConnectRequestAdapter::new(connector);
 
-    let client = HttpConnector::new(connector, Executor::default());
-    let client = HttpPooledConnectorConfig::default().build_connector(client)?;
+    // Version resolution is a property of the connector input in rama 0.4: the
+    // TLS connector records the ALPN-negotiated version on the connection, and
+    // a per-request `FallbackHttpVersion` covers origins that negotiate no
+    // ALPN at all.
+    let client =
+        rama_core::layer::MapErrLayer::new(rama_net::client::ConnectionError::into_box_error)
+            .into_layer(connector);
     Ok(BoxService::new(client))
 }
 
@@ -542,6 +560,13 @@ pub async fn send_upstream_request(
     request
         .headers_mut()
         .insert("host", upstream_authority.parse()?);
+
+    // An HTTPS origin that negotiates no ALPN must fall back to HTTP/1.1
+    // instead of attempting an HTTP/2 handshake that can never complete. An
+    // explicit target version still wins over this fallback.
+    request
+        .extensions()
+        .insert(FallbackHttpVersion(Version::HTTP_11));
 
     if let Some(version) = upstream_version {
         request.extensions().insert(TargetHttpVersion(version));

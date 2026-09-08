@@ -19,6 +19,10 @@ let
   # them and the generated vendor directories have to be built here.
   patchedCrateArchives = [
     (pkgs.fetchurl {
+      url = "https://static.crates.io/crates/rama-http-core/rama-http-core-0.4.0.crate";
+      hash = "sha256-vYMlYwApeXVOYZU3oNWGGx8cjftQW3HDFMzXgbJpcyQ=";
+    })
+    (pkgs.fetchurl {
       url = "https://static.crates.io/crates/quinn/quinn-0.11.11.crate";
       hash = "sha256-DBpB5De2u9SJNyzUlx3hKOhchV9WxX8oPSD/AWz3wKg=";
     })

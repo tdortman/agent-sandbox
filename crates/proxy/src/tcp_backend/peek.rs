@@ -3,19 +3,26 @@
 //! A TCP `SYN` carries no payload, so the routing decision cannot happen in
 //! NFQUEUE: every TCP flow is accepted for the proxy, and the proxy peeks at
 //! the first stream bytes to tell HTTP(S) apart from raw TCP. The peek uses
-//! `MSG_PEEK`, so classified bytes stay queued for the HTTP stack or the
-//! passthrough splice. Only a bounded prefix is copied into userspace.
+//! rama's fail-fast peek loop, which copies at most a bounded prefix into
+//! memory and replays it to whichever path runs next, so the classified bytes
+//! reach the HTTP stack or the passthrough splice unchanged.
 //!
-//! Overhead is one `recv` per new connection in the common case: streams
-//! whose first byte already rules out TLS and HTTP (`SSH-...`, Postgres,
-//! ...) are decided immediately, and TLS/HTTP need at most a few more bytes
-//! from the first segment. Only server-first protocols (no client bytes)
-//! wait out the deadline.
+//! The peek stops as soon as the first bytes decide the protocol. Streams
+//! whose first byte already rules out TLS and HTTP (`SSH-...`, Postgres, ...)
+//! are decided immediately; TLS and HTTP need at most a few more bytes from
+//! the first segment. Only server-first protocols (no client bytes) wait out
+//! the deadline.
 
-use std::{os::fd::AsRawFd, time::Duration};
+use std::time::Duration;
 
 use agent_sandbox_core::{TcpSniff, sniff_tcp};
-use nix::sys::socket::MsgFlags;
+use rama_core::{
+    bytes::Bytes,
+    io::{
+        PrefixedIo, ReplayReader,
+        peek::{PeekVerdict, peek_input_until_verdict_with_options},
+    },
+};
 use rama_tcp::TcpStream;
 
 /// Bytes held back for classification: covers the longest HTTP method
@@ -26,40 +33,38 @@ const PEEK_LEN: usize = 16;
 /// protocol (SMTP greeting, MySQL handshake, ...).
 const PEEK_DEADLINE: Duration = Duration::from_millis(500);
 
-/// Poll interval while waiting for the first bytes to arrive.
-const PEEK_POLL: Duration = Duration::from_millis(5);
+/// Classify a downstream stream by peeking at its first bytes.
+///
+/// Returns the classification together with the stream whose peeked bytes are
+/// replayed ahead of the socket. `TcpSniff::Unknown` means the deadline
+/// expired with nothing classifiable, which the caller treats as raw
+/// passthrough.
+pub async fn peek_protocol(
+    mut stream: TcpStream,
+) -> (TcpSniff, PrefixedIo<ReplayReader, TcpStream>) {
+    let mut buffer = [0_u8; PEEK_LEN];
 
-/// Classify a downstream stream by peeking at (not consuming) its first
-/// bytes. Returns `TcpSniff::Unknown` when the deadline expires with
-/// nothing classifiable, which the caller treats as raw passthrough.
-pub async fn peek_protocol(stream: &TcpStream) -> TcpSniff {
-    let fd = stream.as_raw_fd();
-    let deadline = tokio::time::Instant::now() + PEEK_DEADLINE;
-    let mut buf = [0_u8; PEEK_LEN];
-    let mut filled = 0_usize;
+    let output = peek_input_until_verdict_with_options(
+        &mut stream,
+        &mut buffer,
+        0,
+        Some(PEEK_DEADLINE),
+        None,
+        |prefix: &[u8]| match sniff_tcp(prefix) {
+            TcpSniff::Tls => PeekVerdict::Match(TcpSniff::Tls),
+            TcpSniff::Http => PeekVerdict::Match(TcpSniff::Http),
+            TcpSniff::NeedMore => PeekVerdict::NeedMore,
+            TcpSniff::Unknown => PeekVerdict::Reject,
+        },
+    )
+    .await;
 
-    loop {
-        // `MSG_PEEK` returns the same leading bytes on every call, so peek
-        // the whole buffer and keep the latest length: resuming at
-        // `buf[filled..]` would re-append the prefix as duplicates.
-        match nix::sys::socket::recv(fd, &mut buf, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
-            Ok(0) | Err(_) => {}
-            Ok(read) => {
-                filled = read;
-            }
-        }
+    let replay = ReplayReader::new(Bytes::copy_from_slice(&buffer[..output.peek_size]));
 
-        match sniff_tcp(&buf[..filled]) {
-            TcpSniff::NeedMore => {}
-            decided => return decided,
-        }
-
-        if filled >= buf.len() || tokio::time::Instant::now() >= deadline {
-            return TcpSniff::Unknown;
-        }
-
-        tokio::time::sleep(PEEK_POLL).await;
-    }
+    (
+        output.data.unwrap_or(TcpSniff::Unknown),
+        PrefixedIo::new(replay, stream),
+    )
 }
 
 #[cfg(test)]
@@ -84,7 +89,7 @@ mod tests {
             client
         });
         let (downstream, _) = listener.accept().await.expect("accept");
-        let sniff = peek_protocol(&TcpStream::new(downstream)).await;
+        let (sniff, _) = peek_protocol(TcpStream::new(downstream)).await;
         let _ = client.await;
         sniff
     }
@@ -123,7 +128,7 @@ mod tests {
         });
         let (downstream, _) = listener.accept().await.expect("accept");
         let started = Instant::now();
-        let sniff = peek_protocol(&TcpStream::new(downstream)).await;
+        let (sniff, _) = peek_protocol(TcpStream::new(downstream)).await;
         assert_eq!(sniff, TcpSniff::Unknown);
         assert!(
             started.elapsed() >= PEEK_DEADLINE,
@@ -149,7 +154,7 @@ mod tests {
             client
         });
         let (downstream, _) = listener.accept().await.expect("accept");
-        let sniff = peek_protocol(&TcpStream::new(downstream)).await;
+        let (sniff, _) = peek_protocol(TcpStream::new(downstream)).await;
         let _ = client.await;
         assert_eq!(sniff, TcpSniff::Http);
     }

@@ -1,0 +1,526 @@
+diff -ruN a/src/h2/error.rs b/src/h2/error.rs
+--- a/src/h2/error.rs
++++ b/src/h2/error.rs
+@@ -29,7 +29,8 @@
+     Reset(StreamId, Reason, Initiator),
+ 
+     /// A GO_AWAY frame was received or sent.
+-    GoAway(Bytes, Reason, Initiator),
++    // The final flag is true only for streams above a remote GOAWAY limit.
++    GoAway(Bytes, Reason, Initiator, bool),
+ 
+     /// The user created an error from a bare Reason.
+     Reason(Reason),
+@@ -51,13 +52,23 @@
+     /// action taken by the peer (i.e. a protocol error).
+     pub fn reason(&self) -> Option<Reason> {
+         match self.kind {
+-            Kind::Reset(_, reason, _) | Kind::GoAway(_, reason, _) | Kind::Reason(reason) => {
++            Kind::Reset(_, reason, _) | Kind::GoAway(_, reason, ..) | Kind::Reason(reason) => {
+                 Some(reason)
+             }
+             _ => None,
+         }
+     }
+ 
++    /// Whether the peer guarantees this request was not processed.
++    /// This does not guarantee that the caller can replay its request body.
++    pub fn is_unprocessed(&self) -> bool {
++        matches!(
++            self.kind,
++            Kind::Reset(_, Reason::REFUSED_STREAM, Initiator::Remote)
++                | Kind::GoAway(_, _, Initiator::Remote, true)
++        )
++    }
++
+     /// Returns true if the error is an io::Error
+     pub fn is_io(&self) -> bool {
+         matches!(self.kind, Kind::Io(..))
+@@ -114,7 +125,7 @@
+     pub fn is_remote(&self) -> bool {
+         matches!(
+             self.kind,
+-            Kind::GoAway(_, _, Initiator::Remote) | Kind::Reset(_, _, Initiator::Remote)
++            Kind::GoAway(_, _, Initiator::Remote, _) | Kind::Reset(_, _, Initiator::Remote)
+         )
+     }
+ 
+@@ -124,7 +135,7 @@
+     pub fn is_library(&self) -> bool {
+         matches!(
+             self.kind,
+-            Kind::GoAway(_, _, Initiator::Library) | Kind::Reset(_, _, Initiator::Library)
++            Kind::GoAway(_, _, Initiator::Library, _) | Kind::Reset(_, _, Initiator::Library)
+         )
+     }
+ }
+@@ -136,8 +147,8 @@
+                 proto::Error::Reset(stream_id, reason, initiator) => {
+                     Kind::Reset(stream_id, reason, initiator)
+                 }
+-                proto::Error::GoAway(debug_data, reason, initiator) => {
+-                    Kind::GoAway(debug_data, reason, initiator)
++                proto::Error::GoAway(debug_data, reason, initiator, unprocessed) => {
++                    Kind::GoAway(debug_data, reason, initiator, unprocessed)
+                 }
+                 proto::Error::Io(kind, inner) => {
+                     Kind::Io(inner.map_or_else(|| kind.into(), |inner| io::Error::new(kind, inner)))
+@@ -185,15 +196,15 @@
+             Kind::Reset(_, reason, Initiator::Remote) => {
+                 return write!(fmt, "stream error received: {reason}");
+             }
+-            Kind::GoAway(ref debug_data, reason, Initiator::User) => {
++            Kind::GoAway(ref debug_data, reason, Initiator::User, _) => {
+                 write!(fmt, "connection error sent by user: {reason}")?;
+                 debug_data
+             }
+-            Kind::GoAway(ref debug_data, reason, Initiator::Library) => {
++            Kind::GoAway(ref debug_data, reason, Initiator::Library, _) => {
+                 write!(fmt, "connection error detected: {reason}")?;
+                 debug_data
+             }
+-            Kind::GoAway(ref debug_data, reason, Initiator::Remote) => {
++            Kind::GoAway(ref debug_data, reason, Initiator::Remote, _) => {
+                 write!(fmt, "connection error received: {reason}")?;
+                 debug_data
+             }
+diff -ruN a/src/h2/proto/connection.rs b/src/h2/proto/connection.rs
+--- a/src/h2/proto/connection.rs
++++ b/src/h2/proto/connection.rs
+@@ -263,7 +263,7 @@
+ 
+         match (ours, theirs) {
+             (Reason::NO_ERROR, Reason::NO_ERROR) => Ok(()),
+-            (ours, Reason::NO_ERROR) => Err(Error::GoAway(Bytes::new(), ours, initiator)),
++            (ours, Reason::NO_ERROR) => Err(Error::GoAway(Bytes::new(), ours, initiator, false)),
+             // If both sides reported an error, give their
+             // error back to th user. We assume our error
+             // was a consequence of their error, and less
+@@ -475,7 +475,7 @@
+             // Attempting to read a frame resulted in a connection level
+             // error. This is handled by setting a GOAWAY frame followed by
+             // terminating the connection.
+-            Err(Error::GoAway(debug_data, reason, initiator)) => {
++            Err(Error::GoAway(debug_data, reason, initiator, _)) => {
+                 self.handle_go_away(reason, debug_data, initiator);
+                 Ok(())
+             }
+@@ -542,7 +542,7 @@
+     }
+ 
+     fn handle_go_away(&mut self, reason: Reason, debug_data: Bytes, initiator: Initiator) {
+-        let e = Error::GoAway(debug_data.clone(), reason, initiator);
++        let e = Error::GoAway(debug_data.clone(), reason, initiator, false);
+         // GoAway(NO_ERROR) is a clean graceful shutdown — not an error.
+         if reason == Reason::NO_ERROR {
+             tracing::trace!(error = ?e, "Connection::poll; connection closing gracefully (GoAway NO_ERROR)");
+diff -ruN a/src/h2/proto/error.rs b/src/h2/proto/error.rs
+--- a/src/h2/proto/error.rs
++++ b/src/h2/proto/error.rs
+@@ -11,7 +11,8 @@
+ #[derive(Clone, Debug)]
+ pub enum Error {
+     Reset(StreamId, Reason, Initiator),
+-    GoAway(Bytes, Reason, Initiator),
++    // The final flag is true only for streams above a remote GOAWAY limit.
++    GoAway(Bytes, Reason, Initiator, bool),
+     Io(io::ErrorKind, Option<String>),
+     User(UserError),
+ }
+@@ -31,13 +32,13 @@
+ impl Error {
+     pub(crate) fn is_local(&self) -> bool {
+         match *self {
+-            Self::Reset(_, _, initiator) | Self::GoAway(_, _, initiator) => initiator.is_local(),
++            Self::Reset(_, _, initiator) | Self::GoAway(_, _, initiator, _) => initiator.is_local(),
+             Self::Io(..) | Self::User(_) => true,
+         }
+     }
+ 
+     pub(crate) fn user_go_away(reason: Reason) -> Self {
+-        Self::GoAway(Bytes::new(), reason, Initiator::User)
++        Self::GoAway(Bytes::new(), reason, Initiator::User, false)
+     }
+ 
+     pub(crate) fn library_reset(stream_id: StreamId, reason: Reason) -> Self {
+@@ -45,11 +46,11 @@
+     }
+ 
+     pub(crate) fn library_go_away(reason: Reason) -> Self {
+-        Self::GoAway(Bytes::new(), reason, Initiator::Library)
++        Self::GoAway(Bytes::new(), reason, Initiator::Library, false)
+     }
+ 
+     pub(crate) fn library_go_away_data(reason: Reason, debug_data: impl Into<Bytes>) -> Self {
+-        Self::GoAway(debug_data.into(), reason, Initiator::Library)
++        Self::GoAway(debug_data.into(), reason, Initiator::Library, false)
+     }
+ 
+     pub(crate) fn remote_reset(stream_id: StreamId, reason: Reason) -> Self {
+@@ -57,7 +58,7 @@
+     }
+ 
+     pub(crate) fn remote_go_away(debug_data: Bytes, reason: Reason) -> Self {
+-        Self::GoAway(debug_data, reason, Initiator::Remote)
++        Self::GoAway(debug_data, reason, Initiator::Remote, false)
+     }
+ }
+ 
+@@ -77,7 +78,7 @@
+ impl fmt::Display for Error {
+     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+         match *self {
+-            Self::Reset(_, reason, _) | Self::GoAway(_, reason, _) => reason.fmt(fmt),
++            Self::Reset(_, reason, _) | Self::GoAway(_, reason, ..) => reason.fmt(fmt),
+             Self::Io(_, Some(ref inner)) => inner.fmt(fmt),
+             Self::Io(kind, None) => io::Error::from(kind).fmt(fmt),
+             Self::User(ref err) => err.fmt(fmt),
+diff -ruN a/src/h2/proto/streams/state.rs b/src/h2/proto/streams/state.rs
+--- a/src/h2/proto/streams/state.rs
++++ b/src/h2/proto/streams/state.rs
+@@ -469,9 +469,9 @@
+     ) -> Result<Option<Reason>, crate::h2::Error> {
+         match self.inner {
+             Inner::Closed(
+-                Cause::Error(Error::Reset(_, reason, _) | Error::GoAway(_, reason, _))
++                Cause::Error(Error::Reset(_, reason, _) | Error::GoAway(_, reason, ..))
+                 | Cause::ErrorAfterEndStream(
+-                    Error::Reset(_, reason, _) | Error::GoAway(_, reason, _),
++                    Error::Reset(_, reason, _) | Error::GoAway(_, reason, _, _),
+                 )
+                 | Cause::ScheduledLibraryReset(reason),
+             ) => Ok(Some(reason)),
+diff -ruN a/src/h2/proto/streams/streams.rs b/src/h2/proto/streams/streams.rs
+--- a/src/h2/proto/streams/streams.rs
++++ b/src/h2/proto/streams/streams.rs
+@@ -946,7 +946,12 @@
+         self.store.for_each(|stream| {
+             if stream.id > last_stream_id && peer.is_local_init(stream.id) {
+                 counts.transition(stream, |counts, stream| {
+-                    actions.recv.handle_error(&err, &mut *stream);
++                    // Only these streams are guaranteed unprocessed by the peer.
++                    let mut unprocessed = err.clone();
++                    if let Error::GoAway(_, _, _, ref mut retryable) = unprocessed {
++                        *retryable = true;
++                    }
++                    actions.recv.handle_error(&unprocessed, &mut *stream);
+                     actions.send.handle_error(send_buffer, stream, counts);
+                 })
+             }
+diff -ruN a/src/informational.rs b/src/informational.rs
+--- a/src/informational.rs
++++ b/src/informational.rs
+@@ -0,0 +1,84 @@
++//! Bounded interim response delivery from a service to its HTTP connection.
++use std::{
++    collections::VecDeque,
++    sync::{Arc, Mutex},
++    task::{Context, Poll, Waker},
++};
++
++use rama_core::extensions::Extension;
++use rama_http_types::{Response, StatusCode};
++
++#[derive(Debug, Default)]
++struct State {
++    queue: VecDeque<Response<()>>,
++    count: usize,
++    closed: bool,
++    waker: Option<Waker>,
++}
++
++/// Request extension for sending at most 16 interim responses before the final
++/// head.
++#[derive(Clone, Debug, Extension)]
++#[extension(tags(http))]
++pub struct InformationalSender(Arc<Mutex<State>>, bool);
++
++impl InformationalSender {
++    pub(crate) fn new(local_continue: bool) -> Self {
++        Self(Arc::new(Mutex::new(State::default())), local_continue)
++    }
++
++    /// Queue an informational head. Invalid status codes and framing are
++    /// rejected. Local HTTP/1 Continue responses are counted but not
++    /// duplicated.
++    ///
++    /// # Errors
++    /// Fails for invalid heads, more than 16 heads, or a completed response.
++    pub fn send(&self, response: Response<()>) -> crate::Result<()> {
++        let invalid = !response.status().is_informational()
++            || response.status() == StatusCode::SWITCHING_PROTOCOLS
++            || response.headers().contains_key("content-length")
++            || response.headers().contains_key("transfer-encoding");
++        let mut state = self.0.lock().expect("informational lock");
++        if invalid {
++            state.count = 17;
++            if let Some(waker) = state.waker.take() {
++                waker.wake();
++            }
++            return Err(crate::Error::new_user_unsupported_status_code()
++                .with_display("invalid or excessive informational response"));
++        }
++        if state.closed {
++            return Err(crate::Error::new_user_unsupported_status_code()
++                .with_display("invalid or excessive informational response"));
++        }
++        state.count = state.count.saturating_add(1);
++        if state.count <= 16 && !(self.1 && response.status() == StatusCode::CONTINUE) {
++            state.queue.push_back(response);
++        }
++        if let Some(waker) = state.waker.take() {
++            waker.wake();
++        }
++        if state.count > 16 {
++            return Err(crate::Error::new_user_unsupported_status_code()
++                .with_display("invalid or excessive informational response"));
++        }
++        Ok(())
++    }
++
++    pub(crate) fn poll(&self, cx: &mut Context<'_>) -> Poll<crate::Result<Response<()>>> {
++        let mut state = self.0.lock().expect("informational lock");
++        if state.count > 16 {
++            return Poll::Ready(Err(crate::Error::new_user_unsupported_status_code()
++                .with_display("invalid or excessive informational response")));
++        }
++        if let Some(head) = state.queue.pop_front() {
++            return Poll::Ready(Ok(head));
++        }
++        state.waker = Some(cx.waker().clone());
++        Poll::Pending
++    }
++
++    pub(crate) fn close(&self) {
++        self.0.lock().expect("informational lock").closed = true;
++    }
++}
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -58,6 +58,7 @@
+ )]
+ 
+ pub mod body;
++pub mod informational;
+ 
+ mod common;
+ 
+diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
+--- a/src/proto/h1/conn.rs
++++ b/src/proto/h1/conn.rs
+@@ -571,6 +571,23 @@
+         self.io.has_buffered_write()
+     }
+ 
++    pub(crate) fn write_informational(&mut self, head: rama_http_types::Response<()>) {
++        if self.state.version == Version::HTTP_10 { return; }
++        let buf = self.io.headers_buf();
++        buf.extend_from_slice(b"HTTP/1.1 ");
++        buf.extend_from_slice(head.status().as_str().as_bytes());
++        buf.extend_from_slice(b" ");
++        buf.extend_from_slice(head.status().canonical_reason().unwrap_or("").as_bytes());
++        buf.extend_from_slice(b"\r\n");
++        for (name, value) in head.headers() {
++            buf.extend_from_slice(name.as_str().as_bytes());
++            buf.extend_from_slice(b": ");
++            buf.extend_from_slice(value.as_bytes());
++            buf.extend_from_slice(b"\r\n");
++        }
++        buf.extend_from_slice(b"\r\n");
++    }
++
+     pub(crate) fn write_head(&mut self, head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
+         if let Some(encoder) = self.encode_head(head, body) {
+             self.state.writing = if !encoder.is_eof() {
+diff -ruN a/src/proto/h1/dispatch.rs b/src/proto/h1/dispatch.rs
+--- a/src/proto/h1/dispatch.rs
++++ b/src/proto/h1/dispatch.rs
+@@ -51,6 +51,8 @@
+     -> crate::Result<()>;
+     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
+     fn should_poll(&self) -> bool;
++    fn poll_informational(&mut self, _cx: &mut Context<'_>) -> Poll<crate::Result<Response<()>>> { Poll::Pending }
++
+ }
+ 
+ pub(crate) struct Server<S, B>
+@@ -59,6 +61,7 @@
+ {
+     in_flight: Option<Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send + 'static>>>,
+     pub(crate) service: S,
++    informational: Option<crate::informational::InformationalSender>,
+     _phantom: PhantomData<fn() -> B>,
+ }
+ 
+@@ -396,7 +399,11 @@
+                 && self.conn.can_write_head()
+                 && self.dispatch.should_poll()
+             {
+-                if let Some(msg) = ready!(Pin::new(&mut self.dispatch).poll_msg(cx)) {
++                let message = Pin::new(&mut self.dispatch).poll_msg(cx);
++                while let Poll::Ready(head) = self.dispatch.poll_informational(cx) {
++                    self.conn.write_informational(head?);
++                }
++                if let Some(msg) = ready!(message) {
+                     let (head, body) = msg.map_err(crate::Error::new_user_service)?;
+ 
+                     let body_type = if body.is_end_stream() {
+@@ -607,6 +614,7 @@
+     pub(crate) fn new(service: S) -> Self {
+         Self {
+             in_flight: None,
++            informational: None,
+             service,
+             _phantom: PhantomData,
+         }
+@@ -669,6 +677,14 @@
+         *req.headers_mut() = msg.headers;
+         *req.version_mut() = msg.version;
+         req.set_extensions(msg.extensions);
++        // The body reader sends Continue locally for HTTP/1.1 expectations.
++        // Count upstream Continue heads but do not deliver them twice.
++        let local_continue = req.version() == rama_http_types::Version::HTTP_11
++            && req.headers().get("expect").is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"));
++        let informational = crate::informational::InformationalSender::new(local_continue);
++        req.extensions().insert(informational.clone());
++        self.informational = Some(informational);
++
+         let fut = {
+             let svc = self.service.clone();
+             async move { svc.serve(req).await }
+@@ -677,6 +693,13 @@
+         Ok(())
+     }
+ 
++    fn poll_informational(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<Response<()>>> {
++        let Some(sender) = &self.informational else { return Poll::Pending; };
++        let result = sender.poll(cx);
++        if result.is_pending() && self.in_flight.is_none() { sender.close(); }
++        result
++    }
++
+     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+         if self.in_flight.is_some() {
+             Poll::Pending
+diff -ruN a/src/proto/h2/client.rs b/src/proto/h2/client.rs
+--- a/src/proto/h2/client.rs
++++ b/src/proto/h2/client.rs
+@@ -496,6 +496,7 @@
+ where
+     B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+ {
++    informational: Option<rama_http_types::proto::h1::ext::informational::OnInformational>,
+     is_connect: bool,
+     eos: bool,
+     fut: ResponseFuture,
+@@ -700,6 +701,7 @@
+             send_when: SendWhen {
+                 when: ResponseFutMap {
+                     fut: f.fut,
++                    informational: f.informational,
+                     ping: Some(ping),
+                     send_stream: Some(send_stream),
+                     exec: self.executor.clone(),
+@@ -726,6 +728,7 @@
+     {
+         #[pin]
+         fut: ResponseFuture,
++        informational: Option<rama_http_types::proto::h1::ext::informational::OnInformational>,
+         #[pin]
+         ping: Option<Recorder>,
+         #[pin]
+@@ -760,6 +763,12 @@
+     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         let mut this = self.as_mut().project();
+ 
++        while let Some(head) = ready!(this.fut.poll_informational(cx)) {
++            match head {
++                Ok(head) => if let Some(callback) = this.informational.as_ref() { callback.call(head); },
++                Err(error) => return Poll::Ready(Err((crate::Error::new_h2(error), None))),
++            }
++        }
+         let result = ready!(this.fut.poll(cx));
+ 
+         let Some((ping, send_stream)) = this.ping.take().zip(this.send_stream.take()) else {
+@@ -890,6 +899,7 @@
+                         continue;
+                     }
+ 
++                    let informational = req.extensions().get_ref::<rama_http_types::proto::h1::ext::informational::OnInformational>().cloned();
+                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
+                         Ok(ok) => ok,
+                         Err(err) => {
+@@ -903,6 +913,7 @@
+                     };
+ 
+                     let f = FutCtx {
++                        informational,
+                         is_connect,
+                         eos,
+                         fut,
+diff -ruN a/src/proto/h2/server.rs b/src/proto/h2/server.rs
+--- a/src/proto/h2/server.rs
++++ b/src/proto/h2/server.rs
+@@ -287,6 +287,8 @@
+                         network.protocol.version = version_as_protocol_version(req.version()),
+                     );
+ 
++                    let informational = crate::informational::InformationalSender::new(false);
++                    req.extensions().insert(informational.clone());
+                     let serve_fut = {
+                         let service = service.clone();
+                         async move { service.serve(req).await }
+@@ -294,6 +296,7 @@
+ 
+                     let fut = H2Stream::new(
+                         serve_fut,
++                        informational,
+                         connect_parts,
+                         respond,
+                         self.date_header,
+@@ -356,6 +359,7 @@
+         B::Error: Into<BoxError>,
+     {
+         reply: SendResponse<SendBuf<B::Data>>,
++        informational: crate::informational::InformationalSender,
+         #[pin]
+         state: H2StreamState<F, B>,
+         date_header: bool,
+@@ -400,6 +404,7 @@
+ {
+     fn new(
+         fut: F,
++        informational: crate::informational::InformationalSender,
+         connect_parts: Option<ConnectParts>,
+         respond: SendResponse<SendBuf<B::Data>>,
+         date_header: bool,
+@@ -408,6 +413,7 @@
+     ) -> Self {
+         Self {
+             reply: respond,
++            informational,
+             state: H2StreamState::Service { fut, connect_parts },
+             date_header,
+             is_head,
+@@ -443,7 +449,11 @@
+                     fut: h,
+                     connect_parts,
+                 } => {
+-                    let res = match h.poll(cx) {
++                    let result = h.poll(cx);
++                    while let Poll::Ready(head) = me.informational.poll(cx) {
++                        me.reply.send_informational(head?).map_err(crate::Error::new_h2)?;
++                    }
++                    let res = match result {
+                         Poll::Ready(Ok(r)) => r,
+                         Poll::Pending => {
+                             // Response is not yet ready, so we want to check if the client has sent a
+@@ -464,6 +474,7 @@
+                         }
+                     };
+ 
++                    me.informational.close();
+                     let (head, body) = res.into_parts();
+                     let mut res = Response::from_parts(head, ());
+                     super::strip_connection_headers(

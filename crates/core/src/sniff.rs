@@ -6,7 +6,7 @@
 //!
 //! - TCP: a `SYN` carries no payload, so NFQUEUE cannot classify it. Every TCP
 //!   `SYN` is queued, the flow is registered for the proxy, and the proxy peeks
-//!   (without consuming, via `MSG_PEEK`) at the first stream bytes to decide
+//!   at the first stream bytes (replaying them to the chosen path) to decide
 //!   between the HTTP(S) path and a raw passthrough.
 //! - UDP: the first datagram already carries its payload, so NFQUEUE checks for
 //!   a QUIC long header directly. Per-port socket binds still steer UDP to the
@@ -27,8 +27,8 @@ pub enum TcpSniff {
 
 /// Classify the first bytes of a downstream TCP stream.
 ///
-/// Pure prefix match, safe to call on every `MSG_PEEK` refill: `NeedMore`
-/// means "wait for more bytes", anything else is final.
+/// Pure prefix match, safe to call on every peek refill: `NeedMore` means
+/// "wait for more bytes", anything else is final.
 #[must_use]
 pub fn sniff_tcp(prefix: &[u8]) -> TcpSniff {
     let Some(&first) = prefix.first() else {

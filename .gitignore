@@ -11,5 +11,6 @@ __pycache__
 /vendor/h3-webtransport/
 /vendor/quinn-0.11.11/
 /vendor/quinn-proto-0.11.16/
+/vendor/rama-http-core-0.4.0/
 /vendor/rustls-0.23.43/
 /vendor/.stamps/
