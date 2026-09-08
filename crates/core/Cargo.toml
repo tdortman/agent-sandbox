@@ -14,7 +14,7 @@ idna.workspace = true
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "poll", "socket", "user"] }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

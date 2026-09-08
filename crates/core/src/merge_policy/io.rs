@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashMap,
-    io::Read as _,
+    io::{Read as _, Write as _},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -49,7 +50,6 @@ pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>
     expand_policy_paths(&mut policy, home, project_root);
     policy
 }
-
 fn load_policy_inner(path: &Path, project_root: Option<&Path>) -> std::io::Result<Option<Policy>> {
     if let Some(root) = project_root
         && let Ok(canonical_path) = path.canonicalize()
@@ -80,7 +80,160 @@ fn load_policy_inner(path: &Path, project_root: Option<&Path>) -> std::io::Resul
         .take((MAX_POLICY_JSON_BYTES + 1) as u64)
         .read_to_string(&mut data)?;
 
-    parse_policy(&data).map(Some)
+    let policy = parse_policy(&data).map(Some)?;
+    maybe_migrate_policy_file(&read_path, &data);
+    Ok(policy)
+}
+
+fn is_nix_store_path(path: &Path) -> bool {
+    path.starts_with("/nix/store")
+}
+
+/// Best-effort on-load upgrade of legacy HTTP rules to `{url, port}` form.
+///
+/// Never alters the returned in-memory policy: failures only skip the rewrite
+/// and emit a warning. Skips immutable `/nix/store` files, invalid documents,
+/// files with any malformed HTTP rule, and files needing no change. The target
+/// is re-read just before `rename`; a mismatch with the observed bytes skips
+/// the write. A concurrent writer can still slip between that recheck and
+/// `rename`, so the check narrows but does not eliminate the race.
+fn maybe_migrate_policy_file(read_path: &Path, original_data: &str) {
+    if is_nix_store_path(read_path) {
+        return;
+    }
+
+    let Some(migrated) = compute_migrated_policy_bytes(original_data) else {
+        return;
+    };
+
+    if migrated.len() > MAX_POLICY_JSON_BYTES {
+        return;
+    }
+
+    match write_bytes_atomically_if_unchanged(read_path, &migrated, original_data.as_bytes()) {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(path = %read_path.display(), %error, "policy HTTP migration write failed");
+        }
+    }
+}
+
+/// Insert missing HTTP ports without changing any existing JSON bytes.
+/// Invalid rules prevent the entire rewrite. Borrowed raw values identify
+/// insertion points without reserializing strings, numbers, or object keys.
+fn compute_migrated_policy_bytes(data: &str) -> Option<Vec<u8>> {
+    type Object<'a> = HashMap<String, &'a serde_json::value::RawValue>;
+    let root: Object<'_> = serde_json::from_str(data).ok()?;
+    let network: Object<'_> = serde_json::from_str(root.get("network")?.get()).ok()?;
+    let http: Object<'_> = serde_json::from_str(network.get("http")?.get()).ok()?;
+    let mut insertions = Vec::new();
+
+    for section in ["allow", "deny"] {
+        let Some(rules) = http.get(section) else {
+            continue;
+        };
+        if rules.get() == "null" {
+            continue;
+        }
+        let rules: Vec<&serde_json::value::RawValue> = serde_json::from_str(rules.get()).ok()?;
+        for rule in rules {
+            let parsed: HttpRule = serde_json::from_str(rule.get()).ok()?;
+            parsed.target().ok()?;
+            let fields: Object<'_> = serde_json::from_str(rule.get()).ok()?;
+            if fields.contains_key("port") {
+                continue;
+            }
+            let url = fields.get("url")?.get();
+            let url_start = url.as_ptr() as usize - rule.get().as_ptr() as usize;
+            let prefix = &rule.get()[..url_start];
+            // Copy the URL member's colon spacing and the object's indentation.
+            let colon = &prefix[prefix.rfind('"')? + 1..];
+            let first_key = rule.get().find('"')?;
+            let spacing = &rule.get()[1..first_key];
+            let insertion = format!(",{spacing}\"port\"{colon}{}", parsed.port);
+            let offset = url.as_ptr() as usize - data.as_ptr() as usize + url.len();
+            insertions.push((offset, insertion));
+        }
+    }
+    if insertions.is_empty() {
+        return None;
+    }
+    insertions.sort_unstable_by_key(|(offset, _)| *offset);
+    let added_bytes: usize = insertions.iter().map(|(_, text)| text.len()).sum();
+    let mut migrated = Vec::with_capacity(data.len() + added_bytes);
+    let mut start = 0;
+    for (offset, text) in insertions {
+        migrated.extend_from_slice(&data.as_bytes()[start..offset]);
+        migrated.extend_from_slice(text.as_bytes());
+        start = offset;
+    }
+    migrated.extend_from_slice(&data.as_bytes()[start..]);
+    Some(migrated)
+}
+
+/// Atomically replace `target` with `bytes` via a unique temp file.
+///
+/// The temp name is unique (`O_CREAT|O_EXCL`) so a predictable
+/// `<name>.tmp` symlink planted in an untrusted directory cannot redirect a
+/// privileged write. Original mode and ownership are applied before `rename`;
+/// the parent directory must already exist.
+fn write_bytes_atomically(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = stage_bytes_atomically(target, bytes)?;
+    tmp.persist(target).map(|_| ()).map_err(|error| error.error)
+}
+
+/// Stage `bytes` in a unique temp file, then replace `target` only when its
+/// current bytes still equal `expected`.
+///
+/// The recheck happens after staging (metadata applied, bytes synced) and just
+/// before `rename`, minimizing the window in which an external edit could be
+/// clobbered. Returns `Ok(false)` without renaming on mismatch. A concurrent
+/// writer can still slip between the recheck and `rename`.
+fn write_bytes_atomically_if_unchanged(
+    target: &Path,
+    bytes: &[u8],
+    expected: &[u8],
+) -> std::io::Result<bool> {
+    let tmp = stage_bytes_atomically(target, bytes)?;
+    let current = std::fs::read(target)?;
+    if current != expected {
+        return Ok(false);
+    }
+    tmp.persist(target)
+        .map(|_| true)
+        .map_err(|error| error.error)
+}
+
+fn stage_bytes_atomically(target: &Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy path has no parent directory",
+        )
+    })?;
+    let original = std::fs::metadata(target).ok();
+    let original_mode = original.as_ref().map(|meta| meta.mode() & 0o7777);
+    let original_owner = original.as_ref().map(|meta| (meta.uid(), meta.gid()));
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    if let Some((uid, gid)) = original_owner {
+        let staged = tmp.as_file().metadata()?;
+        if (staged.uid(), staged.gid()) != (uid, gid) {
+            nix::unistd::fchown(
+                tmp.as_file(),
+                Some(nix::unistd::Uid::from_raw(uid)),
+                Some(nix::unistd::Gid::from_raw(gid)),
+            )
+            .map_err(std::io::Error::from)?;
+        }
+    }
+    if let Some(mode) = original_mode {
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    tmp.as_file_mut().write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    Ok(tmp)
 }
 
 /// Parse a policy snapshot using the same size, schema, and rule limits as file
@@ -367,22 +520,11 @@ pub fn atomic_write_policy(
     project_root: Option<&Path>,
 ) -> std::io::Result<()> {
     let target = resolve_policy_write_path(path, project_root)?;
-
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    let tmp = target.with_file_name(format!(
-        "{}.tmp",
-        target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("policy.json")
-    ));
-
     let json = policy_json(&sorted_policy(&contracted_policy(data, home), home))? + "\n";
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &target)?;
+    write_bytes_atomically(&target, json.as_bytes())?;
 
     if let Some(uid) = resolve_owner_uid(path, home, owner_uid) {
         chown_policy_path(path, uid);
@@ -829,5 +971,266 @@ mod tests {
             loaded.filesystem.allow[1].path,
             Path::new("/home/user/.local/share/foo")
         );
+    }
+
+    #[test]
+    fn http_migration_preserves_inline_json_bytes() {
+        let tmp = tempfile::tempdir().expect("create policy directory");
+        let path = tmp.path().join("policy.json");
+        let raw = r#" {"extra":{"z":1e+02,"a":"λ"},"network":{"http":{"deny":[{"url":"http://example.com:8080/*","methods":[]}],"allow":[{ "comment":"keep \"quoted\"", "methods":["GET"], "url" : "https:\/\/example.com\/api" }]}}} "#;
+        let expected = r#" {"extra":{"z":1e+02,"a":"λ"},"network":{"http":{"deny":[{"url":"http://example.com:8080/*","port":8080,"methods":[]}],"allow":[{ "comment":"keep \"quoted\"", "methods":["GET"], "url" : "https:\/\/example.com\/api", "port" : 443 }]}}} "#;
+        std::fs::write(&path, raw).expect("write legacy policy");
+        let loaded = load_policy(&path, None, None);
+        assert_eq!(loaded.network.http.deny[0].port.get(), 8080);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read migrated policy"),
+            expected
+        );
+        let reloaded = load_policy(&path, None, None);
+        assert_eq!(reloaded.network.http.allow[0].port.get(), 443);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read unchanged policy"),
+            expected
+        );
+    }
+
+    #[test]
+    fn http_migration_preserves_crlf_tabs_and_escaped_keys() {
+        let tmp = tempfile::tempdir().expect("create policy directory");
+        let path = tmp.path().join("policy.json");
+        let raw = "{\r\n\t\"network\": {\"http\": {\"allow\": [{\r\n\t\t\"u\\u0072l\": \"https://[::1]:8443/*\",\r\n\t\t\"methods\": []\r\n\t}]}}\r\n}\r\n";
+        let expected = "{\r\n\t\"network\": {\"http\": {\"allow\": [{\r\n\t\t\"u\\u0072l\": \"https://[::1]:8443/*\",\r\n\t\t\"port\": 8443,\r\n\t\t\"methods\": []\r\n\t}]}}\r\n}\r\n";
+        std::fs::write(&path, raw).expect("write legacy policy");
+        let loaded = load_policy(&path, None, None);
+        assert_eq!(loaded.network.http.allow[0].port.get(), 8443);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read migrated policy"),
+            expected
+        );
+    }
+
+    #[test]
+    fn http_migration_adds_default_and_custom_ports() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("policy.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "https://example.com/api" } ],
+            "deny": [ { "methods": ["GET"], "url": "https://example.com:8443/api" } ]
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&path, raw).expect("write file");
+
+        let loaded = load_policy(&path, None, None);
+        assert_eq!(loaded.network.http.allow.len(), 1);
+        assert_eq!(loaded.network.http.allow[0].url, "https://example.com/api");
+        assert_eq!(loaded.network.http.allow[0].port.get(), 443);
+        assert_eq!(loaded.network.http.deny.len(), 1);
+        assert_eq!(loaded.network.http.deny[0].url, "https://example.com/api");
+        assert_eq!(loaded.network.http.deny[0].port.get(), 8443);
+
+        let migrated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read file"))
+                .expect("valid JSON");
+        let allow = &migrated["network"]["http"]["allow"][0];
+        assert_eq!(allow["url"], "https://example.com/api");
+        assert_eq!(allow["port"], 443);
+        let deny = &migrated["network"]["http"]["deny"][0];
+        assert_eq!(deny["url"], "https://example.com:8443/api");
+        assert_eq!(deny["port"], 8443);
+    }
+
+    #[test]
+    fn http_migration_handles_ipv6_and_globs() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("policy.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [
+              { "methods": [], "url": "https://[::1]/file?.txt" },
+              { "methods": [], "url": "http://[::1]:8080/path" },
+              { "methods": [], "url": "https://*.github.com/repos/*/*" },
+              { "methods": [], "url": "https://example.com:443/api" }
+            ],
+            "deny": []
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&path, raw).expect("write file");
+
+        let loaded = load_policy(&path, None, None);
+        assert_eq!(loaded.network.http.allow.len(), 4);
+        assert_eq!(loaded.network.http.allow[0].port.get(), 443);
+        assert_eq!(loaded.network.http.allow[1].port.get(), 8080);
+        assert_eq!(loaded.network.http.allow[1].url, "http://[::1]/path");
+        assert_eq!(loaded.network.http.allow[2].port.get(), 443);
+        assert_eq!(loaded.network.http.allow[3].port.get(), 443);
+        assert_eq!(loaded.network.http.allow[3].url, "https://example.com/api");
+
+        let migrated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read file"))
+                .expect("valid JSON");
+        assert_eq!(migrated["network"]["http"]["allow"][1]["port"], 8080);
+        assert_eq!(
+            migrated["network"]["http"]["allow"][1]["url"],
+            "http://[::1]:8080/path"
+        );
+    }
+
+    #[test]
+    fn http_migration_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("policy.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "https://example.com/api" } ],
+            "deny": []
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&path, raw).expect("write file");
+
+        let _ = load_policy(&path, None, None);
+        let after_first = std::fs::read(&path).expect("read file");
+        assert!(compute_migrated_policy_bytes(&String::from_utf8_lossy(&after_first)).is_none());
+
+        let _ = load_policy(&path, None, None);
+        let after_second = std::fs::read(&path).expect("read file");
+        assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn http_migration_preserves_non_http_fields() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("policy.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "https://example.com:8443/api", "comment": "keep me" } ],
+            "deny": []
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [ { "path": "/srv/data", "access": "read" } ], "deny": [] },
+          "resources": { "allow": [], "deny": [] },
+          "extra_top": { "note": "preserve" }
+        }"#;
+        std::fs::write(&path, raw).expect("write file");
+
+        let loaded = load_policy(&path, None, None);
+        assert_eq!(loaded.network.http.allow.len(), 1);
+        assert_eq!(loaded.filesystem.allow.len(), 1);
+
+        let migrated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read file"))
+                .expect("valid JSON");
+        let rule = &migrated["network"]["http"]["allow"][0];
+        assert_eq!(rule["url"], "https://example.com:8443/api");
+        assert_eq!(rule["port"], 8443);
+        assert_eq!(rule["comment"], "keep me");
+        assert_eq!(migrated["extra_top"]["note"], "preserve");
+        assert_eq!(migrated["filesystem"]["allow"][0]["path"], "/srv/data");
+    }
+
+    #[test]
+    fn http_migration_preserves_symlink_and_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let real = tmp.path().join("real.json");
+        let link = tmp.path().join("link.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "https://example.com:8443/api" } ],
+            "deny": []
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&real, raw).expect("write file");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        symlink(&real, &link).expect("symlink");
+
+        let loaded = load_policy(&link, None, None);
+        assert_eq!(loaded.network.http.allow.len(), 1);
+        assert_eq!(loaded.network.http.allow[0].port.get(), 8443);
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("metadata")
+                .file_type()
+                .is_symlink()
+        );
+        let mode = std::fs::metadata(&real)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let migrated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real).expect("read file"))
+                .expect("valid JSON");
+        assert_eq!(migrated["network"]["http"]["allow"][0]["port"], 8443);
+    }
+
+    #[test]
+    fn http_migration_leaves_invalid_policy_untouched() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let bad_url = tmp.path().join("bad-url.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "not-a-url" } ],
+            "deny": [ { "methods": [], "url": "https://example.com/api" } ]
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&bad_url, raw).expect("write file");
+        let _ = load_policy(&bad_url, None, None);
+        assert_eq!(std::fs::read_to_string(&bad_url).expect("read"), raw);
+
+        let conflict = tmp.path().join("conflict.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "https://example.com:8443/api", "port": 9443 } ],
+            "deny": []
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&conflict, raw).expect("write file");
+        let _ = load_policy(&conflict, None, None);
+        assert_eq!(std::fs::read_to_string(&conflict).expect("read"), raw);
+
+        let unknown = tmp.path().join("unknown-field.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] }, "http": {
+            "allow": [ { "methods": [], "url": "https://example.com/api", "priority": 5 } ],
+            "deny": []
+          } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] },
+          "resources": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&unknown, raw).expect("write file");
+        let _ = load_policy(&unknown, None, None);
+        assert_eq!(std::fs::read_to_string(&unknown).expect("read"), raw);
+
+        let no_http = tmp.path().join("no-http.json");
+        let raw = r#"{
+          "network": { "direct": { "allow": [], "deny": [] } },
+          "sudo": { "allow": [], "deny": [] },
+          "filesystem": { "allow": [], "deny": [] }
+        }"#;
+        std::fs::write(&no_http, raw).expect("write file");
+        let _ = load_policy(&no_http, None, None);
+        assert_eq!(std::fs::read_to_string(&no_http).expect("read"), raw);
     }
 }
