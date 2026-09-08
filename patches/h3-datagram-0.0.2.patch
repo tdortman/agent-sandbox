@@ -1,0 +1,303 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,9 +10,7 @@
+ categories = ["network-programming", "web-programming"]
+ license = "MIT"
+ 
+-
+ [dependencies]
+-#h3 = { path = "../h3" }
+ bytes = "1.4"
+ tracing = { version = "0.1.40", optional = true }
+ 
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -1,17 +1,15 @@
+ //! client API
+ 
+-use std::marker::PhantomData;
+-
++use crate::{
++    datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
++    quic_traits::DatagramConnectionExt,
++};
+ use bytes::Buf;
+ use h3::{
+     client::Connection,
+     quic::{self},
+ };
+-
+-use crate::{
+-    datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
+-    quic_traits::DatagramConnectionExt,
+-};
++use std::marker::PhantomData;
+ 
+ impl<B, C> HandleDatagramsExt<C, B> for Connection<C, B>
+ where
+--- a/src/datagram.rs
++++ b/src/datagram.rs
+@@ -38,13 +38,8 @@
+         })?;
+ 
+         //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
+-        // Quarter Stream ID: A variable-length integer that contains the value of the client-initiated bidirectional
+-        // stream that this datagram is associated with divided by four (the division by four stems
+-        // from the fact that HTTP requests are sent on client-initiated bidirectional streams,
+-        // which have stream IDs that are divisible by four). The largest legal QUIC stream ID
+-        // value is 262-1, so the largest legal value of the Quarter Stream ID field is 260-1.
+-        // Receipt of an HTTP/3 Datagram that includes a larger value MUST be treated as an HTTP/3
+-        // connection error of type H3_DATAGRAM_ERROR (0x33).
++        // Quarter Stream ID: A VarInt that contains the value of the client-initiated
++        // bidirectional stream associated with this datagram, divided by four.
+         let stream_id = StreamId::try_from(u64::from(q_stream_id) * 4).map_err(|_| {
+             InternalConnectionError::new(Code::H3_DATAGRAM_ERROR, "invalid stream id".to_string())
+         })?;
+@@ -72,7 +67,7 @@
+         let varint = VarInt::from(self.stream_id) / 4;
+         varint.encode(&mut buffer.as_mut_slice());
+         EncodedDatagram {
+-            stream_id: [0; VarInt::MAX_SIZE],
++            stream_id: buffer,
+             len: varint.size(),
+             pos: 0,
+             payload: self.payload,
+@@ -87,17 +82,17 @@
+ 
+ #[derive(Debug)]
+ pub struct EncodedDatagram<B: Buf> {
+-    /// Encoded datagram stream ID as Varint
++    /// Encoded HTTP Datagram context identifier.
+     stream_id: [u8; VarInt::MAX_SIZE],
+     /// Length of the varint
+     len: usize,
+-    /// Position of the stream_id buffer
++    /// Position of the varint
+     pos: usize,
+-    /// Datagram Payload
++    /// The datagram payload.
+     payload: B,
+ }
+ 
+-/// Implementation of [`Buf`] for [`Datagram`]
++/// Implements `Buf` for an encoded HTTP Datagram.
+ impl<B> Buf for EncodedDatagram<B>
+ where
+     B: Buf,
+--- a/src/datagram_handler.rs
++++ b/src/datagram_handler.rs
+@@ -1,7 +1,6 @@
+ //! Traits which define the user API for datagrams.
+-//! These traits are implemented for the client and server types in the `h3` crate.
+-
+-use std::{error::Error, fmt::Display, future::poll_fn, marker::PhantomData, sync::Arc};
++//! These traits are implemented for the client and server types in the `h3`
++//! crate.
+ 
+ use crate::{
+     datagram::Datagram,
+@@ -13,6 +12,7 @@
+     quic::{self, StreamId},
+     ConnectionState, SharedState,
+ };
++use std::{error::Error, fmt::Display, future::poll_fn, marker::PhantomData, sync::Arc};
+ 
+ /// Gives the ability to send datagrams.
+ #[derive(Debug)]
+@@ -38,12 +38,12 @@
+     H: SendDatagram<B>,
+     B: Buf,
+ {
+-    /// Sends a datagram
++    /// Sends a datagram.
+     pub fn send_datagram(&mut self, data: B) -> Result<(), SendDatagramError> {
+         let encoded_datagram = Datagram::new(self.stream_id, data);
+         match self.handler.send_datagram(encoded_datagram.encode()) {
+             Ok(()) => Ok(()),
+-            Err(e) => Err(self.handle_send_datagram_error(e)),
++            Err(error) => Err(self.handle_send_datagram_error(error)),
+         }
+     }
+ 
+@@ -83,55 +83,57 @@
+ where
+     H: RecvDatagram,
+ {
+-    /// Reads an incoming datagram
++    /// Reads a datagram.
+     pub async fn read_datagram(&mut self) -> Result<Datagram<H::Buffer>, StreamError> {
+         match poll_fn(|cx| self.handler.poll_incoming_datagram(cx)).await {
+             Ok(datagram) => Datagram::decode(datagram)
+-                .map_err(|err| self.handle_connection_error_on_stream(err)),
+-            Err(err) => Err(self.handle_quic_stream_error(
++                .map_err(|error| self.handle_connection_error_on_stream(error)),
++            Err(error) => Err(self.handle_quic_stream_error(
+                 quic::StreamErrorIncoming::ConnectionErrorIncoming {
+-                    connection_error: err,
++                    connection_error: error,
+                 },
+             )),
+         }
+     }
+ }
+ 
++/// Provides the datagram API on an HTTP/3 connection.
+ pub trait HandleDatagramsExt<C, B>: ConnectionState
+ where
+     B: Buf,
+     C: quic::Connection<B> + DatagramConnectionExt<B>,
+ {
+-    /// Sends a datagram
++    /// Sends a datagram.
+     fn get_datagram_sender(&self, stream_id: StreamId)
+         -> DatagramSender<C::SendDatagramHandler, B>;
+-    /// Reads an incoming datagram
++
++    /// Reads an incoming datagram.
+     fn get_datagram_reader(&self) -> DatagramReader<C::RecvDatagramHandler>;
+ }
+ 
+-/// Types of errors when sending a datagram.
++/// Types of errors when sending datagrams.
+ #[derive(Debug)]
+ #[non_exhaustive]
+ pub enum SendDatagramError {
+-    /// The peer is not accepting datagrams on the quic layer
+-    ///
+-    /// This can be because the peer does not support it or disabled it or any other reason.
++    /// The peer does not accept datagrams.
+     #[non_exhaustive]
+     NotAvailable,
+-    /// The datagram is too large to send
++    /// The datagram is too large.
+     #[non_exhaustive]
+     TooLarge,
+-    /// Connection error
++    /// The connection reports an error.
+     #[non_exhaustive]
+     ConnectionError(ConnectionError),
+ }
+ 
+ impl Display for SendDatagramError {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+-            SendDatagramError::NotAvailable => write!(f, "Datagrams are not available"),
+-            SendDatagramError::TooLarge => write!(f, "Datagram is too large"),
+-            SendDatagramError::ConnectionError(e) => write!(f, "Connection error: {}", e),
++            Self::NotAvailable => formatter.write_str("Datagrams are not available"),
++            Self::TooLarge => formatter.write_str("The datagram is too large"),
++            Self::ConnectionError(error) => {
++                write!(formatter, "Connection error: {error}")
++            }
+         }
+     }
+ }
+--- a/src/quic_traits.rs
++++ b/src/quic_traits.rs
+@@ -3,63 +3,55 @@
+ //! This module includes traits and types meant to allow being generic over any
+ //! QUIC implementation.
+ 
+-use core::task;
+-use std::task::Poll;
+-
++use crate::datagram::EncodedDatagram;
+ use bytes::Buf;
++use core::task;
+ use h3::quic::ConnectionErrorIncoming;
++use std::task::Poll;
+ 
+-use crate::datagram::EncodedDatagram;
+-
+-/// Connection Extension trait for a DatagramHandler type defined by the quic implementation
++/// Connection extension trait for datagram handlers.
+ pub trait DatagramConnectionExt<B: Buf> {
+-    /// The type of the Datagram send Handler
++    /// The type of the datagram send handler.
+     type SendDatagramHandler: SendDatagram<B>;
+ 
+-    /// The type of the Datagram receive Handler
++    /// The type of the datagram receive handler.
+     type RecvDatagramHandler: RecvDatagram;
+ 
+-    /// Get the send datagram handler
++    /// Gets the send datagram handler.
+     fn send_datagram_handler(&self) -> Self::SendDatagramHandler;
+ 
+-    /// Get the receive datagram handler
++    /// Gets the receive datagram handler.
+     fn recv_datagram_handler(&self) -> Self::RecvDatagramHandler;
+ }
+ 
+-/// Extends the `Connection` trait for sending datagrams
+-///
+-/// See: <https://www.rfc-editor.org/rfc/rfc9297>
++/// Extends the connection trait for sending datagrams.
+ pub trait SendDatagram<B: Buf> {
+-    /// Send a datagram
++    /// Sends a datagram.
+     fn send_datagram<T: Into<EncodedDatagram<B>>>(
+         &mut self,
+         data: T,
+     ) -> Result<(), SendDatagramErrorIncoming>;
+ }
+ 
+-/// Extends the `Connection` trait for receiving datagrams
+-///
+-/// See: <https://www.rfc-editor.org/rfc/rfc9297>
++/// Extends the connection trait for receiving datagrams.
+ pub trait RecvDatagram {
+-    /// The buffer type
++    /// The buffer type.
+     type Buffer: Buf;
+ 
+-    /// Poll the connection for incoming datagrams.
++    /// Polls the connection for incoming datagrams.
+     fn poll_incoming_datagram(
+         &mut self,
+         cx: &mut task::Context<'_>,
+     ) -> Poll<Result<Self::Buffer, ConnectionErrorIncoming>>;
+ }
+ 
+-/// Types of errors when sending a datagram.
++/// Types of errors when sending datagrams.
+ #[derive(Debug)]
+ pub enum SendDatagramErrorIncoming {
+-    /// The peer is not accepting datagrams
+-    ///
+-    /// This can be because the peer does not support it or disabled it or any other reason.
++    /// The peer does not accept datagrams.
+     NotAvailable,
+-    /// The datagram is too large to send
++    /// The datagram is too large.
+     TooLarge,
+-    /// Connection error
++    /// The connection reports an error.
+     ConnectionError(ConnectionErrorIncoming),
+ }
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -1,17 +1,15 @@
+ //! server API
+ 
+-use std::marker::PhantomData;
+-
++use crate::{
++    datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
++    quic_traits::DatagramConnectionExt,
++};
+ use bytes::Buf;
+ use h3::{
+     quic::{self},
+     server::Connection,
+ };
+-
+-use crate::{
+-    datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
+-    quic_traits::DatagramConnectionExt,
+-};
++use std::marker::PhantomData;
+ 
+ impl<B, C> HandleDatagramsExt<C, B> for Connection<C, B>
+ where

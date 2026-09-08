@@ -1,0 +1,295 @@
+--- a/src/connection/mod.rs
++++ b/src/connection/mod.rs
+@@ -1,6 +1,6 @@
+ use std::{
+     cmp,
+-    collections::VecDeque,
++    collections::{HashMap, VecDeque},
+     convert::TryFrom,
+     fmt, io, mem,
+     net::{IpAddr, SocketAddr},
+@@ -30,8 +30,8 @@
+     },
+     range_set::ArrayRangeSet,
+     shared::{
+-        ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
+-        EndpointEvent, EndpointEventInner,
++        ConnectionEvent, ConnectionEventInner, ConnectionId, ConnectionIdEvent,
++        DatagramConnectionEvent, EcnCodepoint, EndpointEvent, EndpointEventInner,
+     },
+     token::{ResetToken, Token, TokenPayload},
+     transport_parameters::TransportParameters,
+@@ -170,6 +170,12 @@
+     retry_src_cid: Option<ConnectionId>,
+     events: VecDeque<Event>,
+     endpoint_events: VecDeque<EndpointEventInner>,
++    /// Events describing the locally-issued connection IDs accepted by this endpoint.
++    connection_id_events: VecDeque<ConnectionIdEvent>,
++    /// Locally-issued connection IDs indexed by their QUIC sequence number.
++    local_cids: HashMap<u64, ConnectionId>,
++    /// Set after the first authenticated packet has been processed.
++    connection_id_events_started: bool,
+     /// Whether the spin bit is in use for this connection
+     spin_enabled: bool,
+     /// Outgoing spin bit state
+@@ -305,6 +311,16 @@
+             retry_src_cid: None,
+             events: VecDeque::new(),
+             endpoint_events: VecDeque::new(),
++            connection_id_events: VecDeque::new(),
++            local_cids: {
++                let mut local_cids = HashMap::new();
++                local_cids.insert(0, loc_cid);
++                if let Some(pref_addr_cid) = pref_addr_cid {
++                    local_cids.insert(1, pref_addr_cid);
++                }
++                local_cids
++            },
++            connection_id_events_started: false,
+             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
+             spin: false,
+             spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+@@ -407,6 +423,17 @@
+         self.endpoint_events.pop_front().map(EndpointEvent)
+     }
+ 
++    /// Return the next authenticated change to the locally-issued CID set.
++    ///
++    /// The initial local connection IDs are reported after the first
++    /// authenticated packet. Later IDs are reported when they are issued and
++    /// retired IDs are reported only after a valid authenticated
++    /// `RETIRE_CONNECTION_ID` frame has been processed.
++    #[must_use]
++    pub fn poll_connection_id_event(&mut self) -> Option<ConnectionIdEvent> {
++        self.connection_id_events.pop_front()
++    }
++
+     /// Provide control over streams
+     #[must_use]
+     pub fn streams(&mut self) -> Streams<'_> {
+@@ -1141,6 +1168,16 @@
+             }
+             NewIdentifiers(ids, now) => {
+                 self.local_cid_state.new_cids(&ids, now);
++                for frame in &ids {
++                    self.local_cids.insert(frame.sequence, frame.id);
++                    if self.connection_id_events_started {
++                        self.connection_id_events
++                            .push_back(ConnectionIdEvent::Active {
++                                sequence: frame.sequence,
++                                id: frame.id,
++                            });
++                    }
++                }
+                 ids.into_iter().rev().for_each(|frame| {
+                     self.spaces[SpaceId::Data].pending.new_cids.push(frame);
+                 });
+@@ -1171,6 +1208,7 @@
+             match timer {
+                 Timer::Close => {
+                     self.state = State::Drained;
++                    self.queue_removed_connection_ids();
+                     self.endpoint_events.push_back(EndpointEventInner::Drained);
+                 }
+                 Timer::Idle => {
+@@ -1903,7 +1941,12 @@
+         spin: bool,
+         is_1rtt: bool,
+     ) {
++        let first_authenticated_packet = self.total_authed_packets == 0;
+         self.total_authed_packets += 1;
++        if first_authenticated_packet {
++            self.connection_id_events_started = true;
++            self.queue_active_connection_ids();
++        }
+         self.reset_keep_alive(now);
+         self.reset_idle_timeout(now, space_id);
+         self.permit_idle_reset = true;
+@@ -2382,6 +2425,7 @@
+             }
+         }
+         if !was_drained && self.state.is_drained() {
++            self.queue_removed_connection_ids();
+             self.endpoint_events.push_back(EndpointEventInner::Drained);
+             // Close timer may have been started previously, e.g. if we sent a close and got a
+             // stateless reset in response
+@@ -2871,6 +2915,12 @@
+                     let allow_more_cids = self
+                         .local_cid_state
+                         .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
++                    if let Some(id) = self.local_cids.remove(&sequence) {
++                        if self.connection_id_events_started {
++                            self.connection_id_events
++                                .push_back(ConnectionIdEvent::Retired { sequence, id });
++                        }
++                    }
+                     self.endpoint_events
+                         .push_back(EndpointEventInner::RetireConnectionId(
+                             now,
+@@ -3115,6 +3165,31 @@
+         self.peer_params.stateless_reset_token = Some(reset_token);
+     }
+ 
++    fn queue_active_connection_ids(&mut self) {
++        let mut local_cids: Vec<_> = self
++            .local_cids
++            .iter()
++            .map(|(&sequence, &id)| (sequence, id))
++            .collect();
++        local_cids.sort_unstable_by_key(|(sequence, _)| *sequence);
++        self.connection_id_events.extend(local_cids.into_iter().map(
++            |(sequence, id)| ConnectionIdEvent::Active { sequence, id },
++        ));
++    }
++
++    fn queue_removed_connection_ids(&mut self) {
++        if !self.connection_id_events_started {
++            self.local_cids.clear();
++            return;
++        }
++
++        let mut local_cids: Vec<_> = self.local_cids.drain().collect();
++        local_cids.sort_unstable_by_key(|(sequence, _)| *sequence);
++        self.connection_id_events.extend(local_cids.into_iter().map(
++            |(sequence, id)| ConnectionIdEvent::Removed { sequence, id },
++        ));
++    }
++
+     /// Issue an initial set of connection IDs to the peer upon connection
+     fn issue_first_cids(&mut self, now: Instant) {
+         if self.local_cid_state.cid_len() == 0 {
+@@ -3697,6 +3772,7 @@
+         self.close_common();
+         self.error = Some(reason);
+         self.state = State::Drained;
++        self.queue_removed_connection_ids();
+         self.endpoint_events.push_back(EndpointEventInner::Drained);
+     }
+ 
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -81,7 +81,7 @@
+ };
+ 
+ mod shared;
+-pub use crate::shared::{ConnectionEvent, ConnectionId, EcnCodepoint, EndpointEvent};
++pub use crate::shared::{ConnectionEvent, ConnectionId, ConnectionIdEvent, EcnCodepoint, EndpointEvent};
+ 
+ mod transport_error;
+ pub use crate::transport_error::{Code as TransportErrorCode, Error as TransportError};
+--- a/src/shared.rs
++++ b/src/shared.rs
+@@ -4,6 +4,37 @@
+ 
+ use crate::{Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet::PartialDecode};
+ 
++/// A change to the set of locally-issued connection IDs.
++///
++/// These events describe the connection IDs that the local endpoint accepts in
++/// incoming packet headers. `Active` and `Retired` are emitted only after the
++/// connection has processed authenticated protocol state; `Removed` describes
++/// IDs discarded during connection teardown.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ConnectionIdEvent {
++    /// A connection ID was added to the active routing set.
++    Active {
++        /// The sequence number assigned to this connection ID.
++        sequence: u64,
++        /// The newly active connection ID.
++        id: ConnectionId,
++    },
++    /// A peer-authenticated `RETIRE_CONNECTION_ID` removed this ID.
++    Retired {
++        /// The sequence number assigned to this connection ID.
++        sequence: u64,
++        /// The retired connection ID.
++        id: ConnectionId,
++    },
++    /// The connection was torn down and this ID is no longer routable.
++    Removed {
++        /// The sequence number assigned to this connection ID.
++        sequence: u64,
++        /// The removed connection ID.
++        id: ConnectionId,
++    },
++}
++
+ /// Events sent from an Endpoint to a Connection
+ #[derive(Debug)]
+ pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
+--- a/src/tests/mod.rs
++++ b/src/tests/mod.rs
+@@ -1592,6 +1592,73 @@
+ }
+ 
+ #[test]
++fn connection_id_events_track_authenticated_rotation_and_migration() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, server_ch) = pair.connect();
++
++    let initial = drain_connection_id_events(pair.server_conn_mut(server_ch));
++    assert!(initial.iter().any(|event| {
++        matches!(
++            event,
++            ConnectionIdEvent::Active { sequence: 0, .. }
++        )
++    }));
++    assert!(initial.iter().all(|event| {
++        matches!(event, ConnectionIdEvent::Active { .. })
++    }));
++
++    let now = pair.time;
++    pair.server_conn_mut(server_ch).rotate_local_cid(1, now);
++    pair.drive();
++
++    let rotated = drain_connection_id_events(pair.server_conn_mut(server_ch));
++    assert!(rotated
++        .iter()
++        .any(|event| matches!(event, ConnectionIdEvent::Active { sequence, .. } if *sequence > 0)));
++    assert!(rotated
++        .iter()
++        .any(|event| matches!(event, ConnectionIdEvent::Retired { sequence: 0, .. })));
++
++    let client_addr = pair.client.addr;
++    pair.client.addr = SocketAddr::new(
++        Ipv6Addr::LOCALHOST.into(),
++        CLIENT_PORTS.lock().unwrap().next().unwrap(),
++    );
++    pair.client_conn_mut(client_ch).ping();
++    pair.drive();
++    pair.client.addr = client_addr;
++
++    assert!(drain_connection_id_events(pair.server_conn_mut(server_ch)).is_empty());
++}
++
++fn drain_connection_id_events(connection: &mut Connection) -> Vec<ConnectionIdEvent> {
++    let mut events = Vec::new();
++    while let Some(event) = connection.poll_connection_id_event() {
++        events.push(event);
++    }
++    events
++}
++
++#[test]
++fn connection_id_events_report_removed_ids_on_teardown() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (_, server_ch) = pair.connect();
++
++    assert!(!drain_connection_id_events(pair.server_conn_mut(server_ch)).is_empty());
++    let now = pair.time;
++    pair.server_conn_mut(server_ch)
++        .close(now, VarInt(42), Bytes::new());
++    pair.drive();
++
++    let removed = drain_connection_id_events(pair.server_conn_mut(server_ch));
++    assert!(removed
++        .iter()
++        .any(|event| matches!(event, ConnectionIdEvent::Removed { .. })));
++}
++
++#[test]
+ fn cid_retirement() {
+     let _guard = subscribe();
+     let mut pair = Pair::default();

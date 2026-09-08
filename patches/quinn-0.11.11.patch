@@ -1,0 +1,67 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -424,9 +424,9 @@
+ 
+ [[package]]
+ name = "cfg_aliases"
+-version = "0.2.1"
++version = "0.2.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
++checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+ 
+ [[package]]
+ name = "clang-sys"
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -251,7 +251,7 @@
+ version = "2"
+ 
+ [build-dependencies.cfg_aliases]
+-version = "0.2"
++version = "0.2.2"
+ 
+ [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies.web-time]
+ version = "1"
+--- a/src/connection.rs
++++ b/src/connection.rs
+@@ -586,6 +586,25 @@
+         self.0.stable_id()
+     }
+ 
++    /// Return the next authenticated change to the locally-issued CID set.
++    ///
++    /// The returned events describe the connection IDs accepted by this
++    /// endpoint. `Active` events are emitted after authentication and
++    /// `Retired` events only follow a valid peer `RETIRE_CONNECTION_ID` frame.
++    /// `Removed` events describe IDs discarded during connection teardown.
++    ///
++    /// The queue is owned by the connection and should be drained by the
++    /// application that owns this connection. The event's connection is the
++    /// one identified by [`stable_id`](Self::stable_id).
++    #[must_use]
++    pub fn poll_connection_id_event(&self) -> Option<proto::ConnectionIdEvent> {
++        self.0
++            .state
++            .lock("poll_connection_id_event")
++            .inner
++            .poll_connection_id_event()
++    }
++
+     /// Update traffic keys spontaneously
+     ///
+     /// This primarily exists for testing purposes.
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -61,8 +61,9 @@
+ pub use proto::BloomTokenLog;
+ pub use proto::{
+     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
+-    ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
+-    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
++    ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdEvent,
++    ConnectionIdGenerator, ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType,
++    IdleTimeout,
+     MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
+     StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
+     TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,

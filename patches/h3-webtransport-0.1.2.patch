@@ -1,0 +1,302 @@
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -1,11 +1,6 @@
+ //! Provides the server side WebTransport session
+ 
+-use std::{
+-    pin::Pin,
+-    sync::{Arc, Mutex},
+-    task::{Context, Poll},
+-};
+-
++use crate::stream::{BidiStream, RecvStream, SendStream};
+ use bytes::Buf;
+ use futures_util::{future::poll_fn, ready, Future};
+ use h3::{
+@@ -16,24 +11,23 @@
+     ext::Protocol,
+     frame::FrameStream,
+     proto::frame::Frame,
+-    quic::{self, OpenStreams, WriteBuf},
++    quic::{self, OpenStreams, SendStreamUnframed, StreamId, WriteBuf},
+     server::{Connection, RequestStream},
+-    ConnectionState, SharedState,
+-};
+-use h3::{
+-    quic::SendStreamUnframed,
+     stream::{BidiStreamHeader, BufRecvStream, UniStreamHeader},
++    webtransport::SessionId,
++    ConnectionState, SharedState,
+ };
+ use h3_datagram::{
+     datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
+     quic_traits,
+ };
+-use http::{Method, Request, Response, StatusCode};
+-
+-use h3::webtransport::SessionId;
++use http::{HeaderValue, Method, Request, Response, StatusCode};
+ use pin_project_lite::pin_project;
+-
+-use crate::stream::{BidiStream, RecvStream, SendStream};
++use std::{
++    pin::Pin,
++    sync::{Arc, Mutex},
++    task::{Context, Poll},
++};
+ 
+ /// WebTransport session driver.
+ ///
+@@ -50,11 +44,12 @@
+     session_id: SessionId,
+     /// The underlying HTTP/3 connection
+     server_conn: Mutex<Connection<C, B>>,
+-    connect_stream: RequestStream<C::BidiStream, B>,
++    connect_stream_id: StreamId,
++    connect_stream: Option<RequestStream<C::BidiStream, B>>,
+     opener: Mutex<C::OpenStreams>,
+-    /// Shared State
+     ///
+-    /// Shared state is already in server_conn, but with this it is not necessary to lock the mutex
++    /// Shared state is already in server_conn, but with this it is not
++    /// necessary to lock the mutex
+     shared: Arc<SharedState>,
+ }
+ 
+@@ -77,11 +72,23 @@
+ {
+     /// Accepts a *CONNECT* request for establishing a WebTransport session.
+     ///
+-    /// TODO: is the API or the user responsible for validating the CONNECT request?
++    /// TODO: is the API or the user responsible for validating the CONNECT
++    /// request?
+     pub async fn accept(
+         request: Request<()>,
++        stream: RequestStream<C::BidiStream, B>,
++        conn: Connection<C, B>,
++    ) -> Result<Self, StreamError> {
++        let response = default_webtransport_response(&request);
++        Self::accept_with_response(request, stream, conn, response).await
++    }
++
++    /// Accepts a *CONNECT* request with a caller-provided response.
++    pub async fn accept_with_response(
++        request: Request<()>,
+         mut stream: RequestStream<C::BidiStream, B>,
+         mut conn: Connection<C, B>,
++        response: Response<()>,
+     ) -> Result<Self, StreamError> {
+         let shared = conn.inner.shared.clone();
+ 
+@@ -109,8 +116,9 @@
+ 
+         // The peer is responsible for validating our side of the webtransport support.
+         //
+-        // However, it is still advantageous to show a log on the server as (attempting) to
+-        // establish a WebTransportSession without the proper h3 config is usually a mistake.
++        // However, it is still advantageous to show a log on the server as (attempting)
++        // to establish a WebTransportSession without the proper h3 config is
++        // usually a mistake.
+         if !conn.inner.config.settings.enable_webtransport() {
+             tracing::warn!("Server does not support webtransport");
+         }
+@@ -123,38 +131,35 @@
+             tracing::warn!("Server does not support CONNECT");
+         }
+ 
+-        // Respond to the CONNECT request.
+-
+-        //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.3
+-        let response = if validate_wt_connect(&request) {
+-            Response::builder()
+-                // This is the only header that chrome cares about.
+-                .header("sec-webtransport-http3-draft", "draft02")
+-                .status(StatusCode::OK)
+-                .body(())
+-                .unwrap()
++        let mut response = if validate_wt_connect(&request) {
++            response
+         } else {
+-            Response::builder()
+-                .status(StatusCode::BAD_REQUEST)
+-                .body(())
+-                .unwrap()
++            default_webtransport_response(&request)
+         };
+ 
++        ensure_draft_header(&mut response);
+         stream.send_response(response).await?;
+ 
+         let session_id = stream.send_id().into();
++        let connect_stream_id = stream.send_id();
+         let conn_inner = &mut conn.inner.conn;
+         let opener = Mutex::new(conn_inner.opener());
+ 
+         Ok(Self {
+             session_id,
+-            opener,
+             server_conn: Mutex::new(conn),
+-            connect_stream: stream,
++            connect_stream_id,
++            connect_stream: Some(stream),
++            opener,
+             shared,
+         })
+     }
+ 
++    /// Take the HTTP CONNECT stream for Capsule Protocol relay.
++    pub fn take_connect_stream(&mut self) -> Option<RequestStream<C::BidiStream, B>> {
++        self.connect_stream.take()
++    }
++
+     /// Receive a datagram from the client
+     pub fn datagram_reader(&self) -> DatagramReader<C::RecvDatagramHandler> {
+         self.server_conn.lock().unwrap().get_datagram_reader()
+@@ -167,10 +172,52 @@
+         self.server_conn
+             .lock()
+             .unwrap()
+-            .get_datagram_sender(self.connect_stream.send_id())
++            .get_datagram_sender(self.connect_stream_id)
++    }
++
++    /// Sends a datagram for the supplied WebTransport session.
++    pub fn datagram_sender_for(
++        &self,
++        stream_id: StreamId,
++    ) -> DatagramSender<C::SendDatagramHandler, B> {
++        self.server_conn
++            .lock()
++            .expect("WebTransport server connection lock")
++            .get_datagram_sender(stream_id)
++    }
++
++    /// Accepts another WebTransport CONNECT request on this connection.
++    pub async fn accept_request(
++        &self,
++        request: Request<()>,
++        stream: RequestStream<C::BidiStream, B>,
++    ) -> Result<(SessionId, RequestStream<C::BidiStream, B>), StreamError> {
++        let response = default_webtransport_response(&request);
++        self.accept_request_with_response(request, stream, response)
++            .await
++    }
++
++    /// Accepts another WebTransport CONNECT request with a caller-provided
++    /// response.
++    pub async fn accept_request_with_response(
++        &self,
++        request: Request<()>,
++        mut stream: RequestStream<C::BidiStream, B>,
++        response: Response<()>,
++    ) -> Result<(SessionId, RequestStream<C::BidiStream, B>), StreamError> {
++        let mut response = if validate_wt_connect(&request) {
++            response
++        } else {
++            default_webtransport_response(&request)
++        };
++        ensure_draft_header(&mut response);
++        stream.send_response(response).await?;
++        let session_id = stream.send_id().into();
++        Ok((session_id, stream))
+     }
+ 
+-    /// Accept an incoming unidirectional stream from the client, it reads the stream until EOF.
++    /// Accept an incoming unidirectional stream from the client, it reads the
++    /// stream until EOF.
+     pub fn accept_uni(&self) -> AcceptUni<'_, C, B> {
+         AcceptUni {
+             conn: &self.server_conn,
+@@ -409,6 +456,34 @@
+     }
+ }
+ 
++fn ensure_draft_header(response: &mut Response<()>) {
++    if response.status().is_success()
++        && !response
++            .headers()
++            .contains_key("sec-webtransport-http3-draft")
++    {
++        response.headers_mut().insert(
++            "sec-webtransport-http3-draft",
++            HeaderValue::from_static("draft02"),
++        );
++    }
++}
++
++fn default_webtransport_response(request: &Request<()>) -> Response<()> {
++    if validate_wt_connect(request) {
++        Response::builder()
++            .header("sec-webtransport-http3-draft", "draft02")
++            .status(StatusCode::OK)
++            .body(())
++            .expect("valid WebTransport response")
++    } else {
++        Response::builder()
++            .status(StatusCode::BAD_REQUEST)
++            .body(())
++            .expect("valid WebTransport response")
++    }
++}
++
+ fn validate_wt_connect(request: &Request<()>) -> bool {
+     let protocol = request.extensions().get::<Protocol>();
+     matches!((request.method(), protocol), (&Method::CONNECT, Some(p)) if p == &Protocol::WEB_TRANSPORT)
+--- a/src/stream.rs
++++ b/src/stream.rs
+@@ -1,13 +1,42 @@
+-use std::task::Poll;
+-
+ use bytes::{Buf, Bytes};
++use futures_util::future::poll_fn;
+ use h3::{
++    error::{Code, StreamError},
++    frame::FrameStream,
++    proto::frame::Frame,
+     quic::{self, StreamErrorIncoming},
+     stream::BufRecvStream,
++    webtransport::SessionId,
+ };
+ use pin_project_lite::pin_project;
++use std::task::Poll;
+ use tokio::io::ReadBuf;
+ 
++/// Accept an incoming WebTransport bidirectional stream.
++pub async fn accept_bidi<S, B>(stream: S) -> Result<(SessionId, BidiStream<S, B>), StreamError>
++where
++    S: quic::BidiStream<B>,
++    B: Buf,
++{
++    let mut frame_stream = FrameStream::new(BufRecvStream::new(stream));
++    let frame = poll_fn(|context| frame_stream.poll_next(context))
++        .await
++        .map_err(|error| StreamError::StreamError {
++            code: Code::H3_MESSAGE_ERROR,
++            reason: format!("invalid WebTransport stream header: {error:?}"),
++        })?;
++
++    match frame {
++        Some(Frame::WebTransportStream(session_id)) => {
++            Ok((session_id, BidiStream::new(frame_stream.into_inner())))
++        }
++        _ => Err(StreamError::StreamError {
++            code: Code::H3_MESSAGE_ERROR,
++            reason: "missing WebTransport stream header".to_string(),
++        }),
++    }
++}
++
+ pin_project! {
+     /// WebTransport receive stream
+     pub struct RecvStream<S,B> {
+@@ -296,9 +325,8 @@
+     S: quic::BidiStream<B>,
+     B: Buf,
+ {
+-    type SendStream = SendStream<S::SendStream, B>;
+-
+     type RecvStream = RecvStream<S::RecvStream, B>;
++    type SendStream = SendStream<S::SendStream, B>;
+ 
+     fn split(self) -> (Self::SendStream, Self::RecvStream) {
+         let (send, recv) = self.stream.split();

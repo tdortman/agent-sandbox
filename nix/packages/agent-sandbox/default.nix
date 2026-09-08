@@ -7,6 +7,30 @@
   ...
 }:
 let
+  # Checkout of the h3 repository at the revision pinned in Cargo.toml, used by
+  # scripts/materialize-vendor.sh for the h3 crates.
+  h3Source = pkgs.fetchgit {
+    url = "https://github.com/hyperium/h3.git";
+    rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3";
+    hash = "sha256-9s9/OxQm3TTWpcNYK+BUKahro9acdbAqYRBZdnEp1O4=";
+  };
+  # Pristine archives of the crates patched by scripts/materialize-vendor.sh.
+  # The lockfile records them as path dependencies, so cargoLock never fetches
+  # them and the generated vendor directories have to be built here.
+  patchedCrateArchives = [
+    (pkgs.fetchurl {
+      url = "https://static.crates.io/crates/quinn/quinn-0.11.11.crate";
+      hash = "sha256-DBpB5De2u9SJNyzUlx3hKOhchV9WxX8oPSD/AWz3wKg=";
+    })
+    (pkgs.fetchurl {
+      url = "https://static.crates.io/crates/quinn-proto/quinn-proto-0.11.16.crate";
+      hash = "sha256-L0v8AVJiud9jyIRQcs5ZBohT/1hyGAws4vEwOLlw5WA=";
+    })
+    (pkgs.fetchurl {
+      url = "https://static.crates.io/crates/rustls/rustls-0.23.43.crate";
+      hash = "sha256-AoM4bOAqvAFR4XYdCIAt/obBc7C0lK9cvAhldORT2gY=";
+    })
+  ];
   qtDialog = pkgs.stdenv.mkDerivation {
     src = ./qt-helper;
 
@@ -37,6 +61,11 @@ rust.rustPlatform.buildRustPackage {
   inherit (workspacePackage) version;
   inherit src;
   pname = "agent-sandbox";
+
+  postPatch = ''
+    bash scripts/materialize-vendor.sh \
+      ${lib.escapeShellArgs patchedCrateArchives} ${h3Source}
+  '';
 
   nativeBuildInputs = [
     cmake
