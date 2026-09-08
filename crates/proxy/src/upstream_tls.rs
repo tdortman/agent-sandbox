@@ -1,5 +1,9 @@
 //! Client identities scoped to exact upstream HTTPS origins.
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use rama_core::error::{BoxError, BoxErrorExt};
 use rustls::{

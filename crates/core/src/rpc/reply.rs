@@ -243,7 +243,7 @@ pub enum VerdictSource {
         comment: Option<String>,
     },
 
-    /// A verdict granted via an approval scope (once, session, project, …).
+    /// A verdict granted via an approval scope (once, session, project, ...).
     Scope(ApprovalScope),
 
     /// A verdict arrived at because the requesting user matched the policy.

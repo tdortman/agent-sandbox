@@ -509,7 +509,7 @@ fn read_tracee_open_how_flags(host_proc: &HostProc, pid: i32, how_ptr: u64) -> O
 
 /// Classify a blocked syscall that generated an open permission event.
 ///
-/// Layout per `proc_pid_syscall(5)`: `nr arg0 arg1 … arg5 sp pc`, where each
+/// Layout per `proc_pid_syscall(5)`: `nr arg0 arg1 ... arg5 sp pc`, where each
 /// `argN` is the corresponding syscall argument register in ABI order
 /// (`openat(2)`: arg0 `dirfd`, arg1 `pathname`, arg2 `flags`, arg3 `mode`;
 /// `openat2(2)`: arg2 `struct open_how *`; `open(2)`: arg1 `flags`).

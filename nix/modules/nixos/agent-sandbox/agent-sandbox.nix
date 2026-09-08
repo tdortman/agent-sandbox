@@ -103,8 +103,8 @@ let
     Paths masked inside dynamic-FS sandboxes (``gates.filesystem.enable``).
     The wrapper bind-mounts the host root, then overlays these entries so
     the sandbox cannot see their contents: directories become empty tmpfs
-    mounts, files become ``/dev/null``. Use ``~/…`` for paths under the
-    invoking user's ``$HOME``, or ``/…`` for absolute host paths.
+    mounts, files become ``/dev/null``. Use ``~/...`` for paths under the
+    invoking user's ``$HOME``, or ``/...`` for absolute host paths.
   '';
   hiddenPathType = mountPathType;
   http10OriginType = lib.types.addCheck httpUrlType (
@@ -214,8 +214,8 @@ let
     };
   };
   mountPathDescription = ''
-    Each entry must be an absolute path: `~/…` under the invoking user's `$HOME`
-    (for example `"~/.agents"`), or `/…` on the host (for example `"/run/user/1000"`).
+    Each entry must be an absolute path: `~/...` under the invoking user's `$HOME`
+    (for example `"~/.agents"`), or `/...` on the host (for example `"/run/user/1000"`).
   '';
   mountPathType = lib.types.addCheck lib.types.str (
     path:
@@ -447,7 +447,7 @@ let
     || lib.any packageHasPolicy cfg.packages;
   policyPathDescription = ''
     Each path must start with ~/ under the invoking user's $HOME (for example
-    "~/.agents"), /… on the host (for example "/run/user/1000"), or ./ for
+    "~/.agents"), /... on the host (for example "/run/user/1000"), or ./ for
     project-relative paths.
   '';
   policyPathType = lib.types.addCheck lib.types.str (
@@ -1006,7 +1006,7 @@ in
         ``approve`` prepends an agent-sandbox guard to the sandbox PATH so
         that plain ``sudo`` inside the agent routes through policyd, and the
         approved command runs as root on the host (not inside bubblewrap).
-        Host-side ``agent-sandbox-ui`` may approve. v1: ``sudo <cmd> [args…]``
+        Host-side ``agent-sandbox-ui`` may approve. v1: ``sudo <cmd> [args...]``
         only. ``-u`` / ``-E`` and similar flags are not supported. The
         host's ``/run/wrappers`` tree is hidden inside the sandbox.
       '';

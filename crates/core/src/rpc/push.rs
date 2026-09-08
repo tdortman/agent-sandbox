@@ -136,7 +136,7 @@ pub enum PendingSummary {
         /// Identifier of the pending request.
         id: String,
 
-        /// The D-Bus target (bus, service, interface, …) being accessed.
+        /// The D-Bus target (bus, service, interface, ...) being accessed.
         target: DbusTarget,
 
         /// Working directory of the requesting process.
@@ -294,7 +294,7 @@ pub enum UiPush {
         /// Identifier of the request.
         id: String,
 
-        /// The D-Bus target (bus, service, interface, …) being accessed.
+        /// The D-Bus target (bus, service, interface, ...) being accessed.
         target: DbusTarget,
 
         /// Working directory of the requesting process.
