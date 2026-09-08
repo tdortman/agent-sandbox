@@ -27,11 +27,14 @@ quic_match='@th,64,8 & 0x80 == 0x80'
 
 # Space- or comma-separated intercepted UDP ports; empty means HTTP/3 is off.
 udp_ports="${udp_ports//,/ }"
-read -r -a udp_port_array <<< "$udp_ports"
+read -r -a udp_port_array <<<"$udp_ports"
 
 udp_elements() {
   [[ ${#udp_port_array[@]} -gt 0 ]] || return 1
-  printf '%s' "$(IFS=','; echo "${udp_port_array[*]}")"
+  printf '%s' "$(
+    IFS=','
+    echo "${udp_port_array[*]}"
+  )"
 }
 
 udp_set() {
@@ -133,12 +136,15 @@ fail_closed() {
      ct status dnat return
      ip daddr 127.0.0.0/8 return
      ip6 daddr ::1 return
+     fib daddr type local return
      tcp dport != 53 reject with tcp reset
      tcp dport 853 reject with tcp reset
      $udp_reject
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
+     iifname != "lo" return
+     fib daddr type local return
      ip daddr 127.0.0.2 return
      ip6 daddr ::2 return
      tcp dport != 53 reject with tcp reset
@@ -186,6 +192,8 @@ nft -f - <<EOF
      # direct. Plain DNS stays direct; DoT has no policy path.
      ip daddr 127.0.0.0/8 return
      ip6 daddr ::1 return
+     # The loopback BPF bridge binds IPv6 listeners to the local veth address.
+     fib daddr type local return
      tcp dport 53 return
     tcp dport 853 reject with tcp reset
     $(reject_rule)
@@ -202,7 +210,10 @@ nft -f - <<EOF
    }
    chain prerouting {
      type filter hook prerouting priority mangle; policy accept;
-     # The loopback handoff DNATs later; never steal it for the proxy.
+    # Only locally routed flows belong to the proxy. Bridge ingress still
+    # carries the veth destination here; its loopback DNAT runs later.
+    iifname != "lo" return
+    meta mark != $mark return
      ip daddr 127.0.0.2 return
      ip6 daddr ::2 return
      tcp dport 53 return
@@ -215,8 +226,10 @@ nft -f - <<EOF
   chain output_redirect {
     type nat hook output priority 5; policy accept;
     meta skuid $proxy_uid return
+    ct status dnat return
     ip daddr 127.0.0.0/8 return
     ip6 daddr ::1 return
+    fib daddr type local return
     tcp dport != 53 counter redirect to :$listen_port
     $(output_redirect_rules)
   }
