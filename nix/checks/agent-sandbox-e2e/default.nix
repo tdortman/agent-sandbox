@@ -310,6 +310,152 @@ let
       content = policy;
       path = "/home/user/.config/agent-sandbox/policy.json";
     };
+  loopbackPorts = {
+    tcpPorts = [
+      18089
+      18090
+    ];
+
+    udpPorts = [
+      18092
+      18093
+    ];
+  };
+  loopbackServices = {
+    agent-sandbox-vm-loopback-host = {
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${pkgs.python3}/bin/python"
+          "-m"
+          "http.server"
+          "18089"
+          "--bind"
+          "127.0.0.1"
+        ];
+
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback-sandbox = {
+      after = [ "agent-sandbox-netns.service" ];
+      requires = [ "agent-sandbox-netns.service" ];
+
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${pkgs.python3}/bin/python"
+          "-m"
+          "http.server"
+          "18090"
+          "--bind"
+          "127.0.0.1"
+        ];
+
+        NetworkNamespacePath = "/run/netns/agent-sandbox";
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback-udp-host = {
+      serviceConfig = {
+        ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18092,bind=127.0.0.1,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback-udp-sandbox = {
+      after = [ "agent-sandbox-netns.service" ];
+      requires = [ "agent-sandbox-netns.service" ];
+
+      serviceConfig = {
+        ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18093,bind=127.0.0.1,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+        NetworkNamespacePath = "/run/netns/agent-sandbox";
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback-udp6-host = {
+      after = [ "agent-sandbox-loopback.service" ];
+      requires = [ "agent-sandbox-loopback.service" ];
+
+      serviceConfig = {
+        ExecStart = "${pkgs.socat}/bin/socat UDP6-RECVFROM:18092,bind=[::1],fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback-udp6-sandbox = {
+      after = [ "agent-sandbox-loopback.service" ];
+      requires = [ "agent-sandbox-loopback.service" ];
+
+      serviceConfig = {
+        ExecStart = "${pkgs.socat}/bin/socat UDP6-RECVFROM:18093,bind=[::1],fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+        NetworkNamespacePath = "/run/netns/agent-sandbox";
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback6-host = {
+      after = [ "agent-sandbox-loopback.service" ];
+      requires = [ "agent-sandbox-loopback.service" ];
+
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${pkgs.python3}/bin/python"
+          "-m"
+          "http.server"
+          "18089"
+          "--bind"
+          "::1"
+        ];
+
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    agent-sandbox-vm-loopback6-sandbox = {
+      after = [ "agent-sandbox-loopback.service" ];
+      requires = [ "agent-sandbox-loopback.service" ];
+
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${pkgs.python3}/bin/python"
+          "-m"
+          "http.server"
+          "18090"
+          "--bind"
+          "::1"
+        ];
+
+        NetworkNamespacePath = "/run/netns/agent-sandbox";
+        Restart = "on-failure";
+        User = "sandbox";
+      };
+
+      wantedBy = [ "multi-user.target" ];
+    };
+  };
   mkBash =
     name: options:
     options
@@ -487,6 +633,7 @@ let
               ];
             };
 
+            loopback = loopbackPorts;
             vethHost = "asbx-test-host";
             vethNetns = "asbx-test-ns";
           };
@@ -512,7 +659,7 @@ let
           ];
         };
 
-        systemd.services = {
+        systemd.services = loopbackServices // {
           agent-sandbox-vm-dns = {
             after = [ "agent-sandbox-netns.service" ];
             requires = [ "agent-sandbox-netns.service" ];
@@ -1040,18 +1187,7 @@ let
                   ];
 
                   dnsForwardTarget = "169.254.100.1:5353";
-
-                  loopback = {
-                    tcpPorts = [
-                      18089
-                      18090
-                    ];
-
-                    udpPorts = [
-                      18092
-                      18093
-                    ];
-                  };
+                  loopback = loopbackPorts;
                 };
 
                 packages = directNetworkPackages;
@@ -1062,7 +1198,7 @@ let
                 };
               };
 
-              systemd.services = {
+              systemd.services = loopbackServices // {
                 agent-sandbox-vm-dns = {
                   after = [ "agent-sandbox-netns.service" ];
                   requires = [ "agent-sandbox-netns.service" ];
@@ -1083,134 +1219,6 @@ let
                     ];
 
                     Restart = "on-failure";
-                  };
-                };
-
-                agent-sandbox-vm-loopback-host = {
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = lib.escapeShellArgs [
-                      "${pkgs.python3}/bin/python"
-                      "-m"
-                      "http.server"
-                      "18089"
-                      "--bind"
-                      "127.0.0.1"
-                    ];
-
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback-sandbox = {
-                  after = [ "agent-sandbox-netns.service" ];
-                  requires = [ "agent-sandbox-netns.service" ];
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = lib.escapeShellArgs [
-                      "${pkgs.python3}/bin/python"
-                      "-m"
-                      "http.server"
-                      "18090"
-                      "--bind"
-                      "127.0.0.1"
-                    ];
-
-                    NetworkNamespacePath = "/run/netns/agent-sandbox";
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback-udp-host = {
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18092,bind=127.0.0.1,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback-udp-sandbox = {
-                  after = [ "agent-sandbox-netns.service" ];
-                  requires = [ "agent-sandbox-netns.service" ];
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18093,bind=127.0.0.1,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    NetworkNamespacePath = "/run/netns/agent-sandbox";
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback-udp6-host = {
-                  after = [ "agent-sandbox-loopback.service" ];
-                  requires = [ "agent-sandbox-loopback.service" ];
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = "${pkgs.socat}/bin/socat UDP6-RECVFROM:18092,bind=[::1],fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback-udp6-sandbox = {
-                  after = [ "agent-sandbox-loopback.service" ];
-                  requires = [ "agent-sandbox-loopback.service" ];
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = "${pkgs.socat}/bin/socat UDP6-RECVFROM:18093,bind=[::1],fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
-                    NetworkNamespacePath = "/run/netns/agent-sandbox";
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback6-host = {
-                  after = [ "agent-sandbox-loopback.service" ];
-                  requires = [ "agent-sandbox-loopback.service" ];
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = lib.escapeShellArgs [
-                      "${pkgs.python3}/bin/python"
-                      "-m"
-                      "http.server"
-                      "18089"
-                      "--bind"
-                      "::1"
-                    ];
-
-                    Restart = "on-failure";
-                    User = "sandbox";
-                  };
-                };
-
-                agent-sandbox-vm-loopback6-sandbox = {
-                  after = [ "agent-sandbox-loopback.service" ];
-                  requires = [ "agent-sandbox-loopback.service" ];
-                  wantedBy = [ "multi-user.target" ];
-
-                  serviceConfig = {
-                    ExecStart = lib.escapeShellArgs [
-                      "${pkgs.python3}/bin/python"
-                      "-m"
-                      "http.server"
-                      "18090"
-                      "--bind"
-                      "::1"
-                    ];
-
-                    NetworkNamespacePath = "/run/netns/agent-sandbox";
-                    Restart = "on-failure";
-                    User = "sandbox";
                   };
                 };
 
@@ -1430,6 +1438,37 @@ let
 
       def sandbox_exec(node, package, *args, wrapper=(), expect_success=True):
           return sandbox_command(node, [package, *args], wrapper=wrapper, expect_success=expect_success)
+
+      def check_loopback_bridge(node, package, wrapper=()):
+          node.wait_for_unit("agent-sandbox-loopback.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback-host.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback-sandbox.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback6-host.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback6-sandbox.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback-udp-host.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback-udp-sandbox.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback-udp6-host.service")
+          node.wait_for_unit("agent-sandbox-vm-loopback-udp6-sandbox.service")
+          node.succeed("curl --fail --silent --max-time 5 http://127.0.0.1:18089/ >/dev/null")
+          node.succeed("curl --fail --silent --max-time 5 http://127.0.0.1:18090/ >/dev/null")
+          sandbox_shell(node, package, "curl --fail --silent --max-time 5 http://127.0.0.1:18089/ >/dev/null", wrapper=wrapper)
+          sandbox_shell(node, package, "curl --fail --silent --max-time 5 http://127.0.0.1:18090/ >/dev/null", wrapper=wrapper)
+          node.succeed("printf host-udp | timeout 5 ${pkgs.socat}/bin/socat - UDP4:127.0.0.1:18092 | grep -q host-udp")
+          node.succeed("printf sandbox-udp | timeout 5 ${pkgs.socat}/bin/socat - UDP4:127.0.0.1:18093 | grep -q sandbox-udp")
+          node.succeed("systemctl restart agent-sandbox-vm-loopback-udp-host.service; sleep 0.2")
+          sandbox_shell(node, package, "printf host-udp | timeout 5 socat - UDP4:127.0.0.1:18092 | grep -q host-udp", wrapper=wrapper)
+          node.succeed("systemctl restart agent-sandbox-vm-loopback-udp-sandbox.service; sleep 0.2")
+          sandbox_shell(node, package, "printf sandbox-udp | timeout 5 socat - UDP4:127.0.0.1:18093 | grep -q sandbox-udp", wrapper=wrapper)
+          node.succeed("curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18089/' >/dev/null")
+          node.succeed("curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18090/' >/dev/null")
+          sandbox_shell(node, package, "curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18089/' >/dev/null", wrapper=wrapper)
+          sandbox_shell(node, package, "curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18090/' >/dev/null", wrapper=wrapper)
+          node.succeed("printf host-udp6 | timeout 5 ${pkgs.socat}/bin/socat - 'UDP6:[::1]:18092' | grep -q host-udp6")
+          node.succeed("printf sandbox-udp6 | timeout 5 ${pkgs.socat}/bin/socat - 'UDP6:[::1]:18093' | grep -q sandbox-udp6")
+          node.succeed("systemctl restart agent-sandbox-vm-loopback-udp6-host.service; sleep 0.2")
+          sandbox_shell(node, package, "printf host-udp6 | timeout 5 socat - 'UDP6:[::1]:18092' | grep -q host-udp6", wrapper=wrapper)
+          node.succeed("systemctl restart agent-sandbox-vm-loopback-udp6-sandbox.service; sleep 0.2")
+          sandbox_shell(node, package, "printf sandbox-udp6 | timeout 5 socat - 'UDP6:[::1]:18093' | grep -q sandbox-udp6", wrapper=wrapper)
 
       start_all()
       session_wrapper = (
@@ -1678,35 +1717,7 @@ let
       direct.wait_for_open_port(18086)
       direct.wait_for_open_port(18087)
       direct.wait_for_open_port(18088)
-      direct.wait_for_unit("agent-sandbox-loopback.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback-host.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback-sandbox.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback6-host.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback6-sandbox.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback-udp-host.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback-udp-sandbox.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback-udp6-host.service")
-      direct.wait_for_unit("agent-sandbox-vm-loopback-udp6-sandbox.service")
-      direct.succeed("curl --fail --silent --max-time 5 http://127.0.0.1:18089/ >/dev/null")
-      direct.succeed("curl --fail --silent --max-time 5 http://127.0.0.1:18090/ >/dev/null")
-      sandbox_shell(direct, "sandbox-direct-bash", "curl --fail --silent --max-time 5 http://127.0.0.1:18089/ >/dev/null")
-      sandbox_shell(direct, "sandbox-direct-bash", "curl --fail --silent --max-time 5 http://127.0.0.1:18090/ >/dev/null")
-      direct.succeed("printf host-udp | timeout 5 ${pkgs.socat}/bin/socat - UDP4:127.0.0.1:18092 | grep -q host-udp")
-      direct.succeed("printf sandbox-udp | timeout 5 ${pkgs.socat}/bin/socat - UDP4:127.0.0.1:18093 | grep -q sandbox-udp")
-      direct.succeed("systemctl restart agent-sandbox-vm-loopback-udp-host.service; sleep 0.2")
-      sandbox_shell(direct, "sandbox-direct-bash", "printf host-udp | timeout 5 socat - UDP4:127.0.0.1:18092 | grep -q host-udp")
-      direct.succeed("systemctl restart agent-sandbox-vm-loopback-udp-sandbox.service; sleep 0.2")
-      sandbox_shell(direct, "sandbox-direct-bash", "printf sandbox-udp | timeout 5 socat - UDP4:127.0.0.1:18093 | grep -q sandbox-udp")
-      direct.succeed("curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18089/' >/dev/null")
-      direct.succeed("curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18090/' >/dev/null")
-      sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18089/' >/dev/null")
-      sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --fail --silent --max-time 5 'http://[::1]:18090/' >/dev/null")
-      direct.succeed("printf host-udp6 | timeout 5 ${pkgs.socat}/bin/socat - 'UDP6:[::1]:18092' | grep -q host-udp6")
-      direct.succeed("printf sandbox-udp6 | timeout 5 ${pkgs.socat}/bin/socat - 'UDP6:[::1]:18093' | grep -q sandbox-udp6")
-      direct.succeed("systemctl restart agent-sandbox-vm-loopback-udp6-host.service; sleep 0.2")
-      sandbox_shell(direct, "sandbox-direct-bash", "printf host-udp6 | timeout 5 socat - 'UDP6:[::1]:18092' | grep -q host-udp6")
-      direct.succeed("systemctl restart agent-sandbox-vm-loopback-udp6-sandbox.service; sleep 0.2")
-      sandbox_shell(direct, "sandbox-direct-bash", "printf sandbox-udp6 | timeout 5 socat - 'UDP6:[::1]:18093' | grep -q sandbox-udp6")
+      check_loopback_bridge(direct, "sandbox-direct-bash")
       sandbox_shell(direct, "sandbox-direct-bash", "curl --fail --silent --show-error --max-time 15 http://169.254.100.1:18080/readonly-file | grep -q readonly-file-marker")
       sandbox_exec(direct, "sandbox-direct-curl", "--silent", "--show-error", "--max-time", "5", "http://169.254.100.1:18081/readonly-file", expect_success=False)
       sandbox_shell(direct, "sandbox-direct-bash", "printf udp-ok | timeout 5 socat - UDP4:169.254.100.1:18082 | grep -q udp-ok")
@@ -1724,6 +1735,7 @@ let
       proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
       proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
       proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+      check_loopback_bridge(proxy, "sandbox-proxy-bash", wrapper=session_wrapper)
       print(proxy.succeed("ip netns exec agent-sandbox sh -c 'ip rule show; ip route show table 51820' || true"))
       print(proxy.succeed("systemctl show --property=MainPID,ActiveState,SubState,ExecMainCode,ExecMainStatus agent-sandbox-proxy.service; systemctl --no-pager --full status agent-sandbox-proxy.service || true"))
       print(proxy.succeed("ip netns exec agent-sandbox sh -c 'cat /proc/net/tcp; cat /proc/net/tcp6'"))
