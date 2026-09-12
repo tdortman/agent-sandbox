@@ -487,17 +487,6 @@ pub const fn notification_arch_valid(notif: &SeccompNotif) -> bool {
     notif.data.arch == agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE
 }
 
-/// Verify that a notification id is still valid before responding.
-///
-/// The kernel returns `EINVAL` when the id was recycled or the tracee died.
-///
-/// # Errors
-///
-/// Returns an error if the `SECCOMP_IOCTL_NOTIF_ID_VALID` ioctl fails.
-pub fn notif_id_valid(listener_fd: i32, mut id: u64) -> io::Result<()> {
-    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &mut id)
-}
-
 /// Receive a seccomp notification from the listener fd.
 ///
 /// # Errors
@@ -514,6 +503,10 @@ pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
 /// `val` is the syscall return value and `error` is the negative errno to
 /// inject. `flags` may request `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
 ///
+/// The kernel validates the notification id while holding the filter lock, so
+/// a stale id is rejected here with `ENOENT` without a preceding
+/// `SECCOMP_IOCTL_NOTIF_ID_VALID` round trip on the per-syscall hot path.
+///
 /// # Errors
 ///
 /// Returns an error if the notification id is stale or the
@@ -525,8 +518,6 @@ pub fn send_response(
     error: i32,
     flags: u32,
 ) -> io::Result<()> {
-    notif_id_valid(listener_fd, id)?;
-
     let mut resp = SeccompNotifResp {
         id,
         val,
@@ -550,10 +541,9 @@ pub fn send_response(
 ///
 /// # Errors
 ///
-/// Returns an error if the `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails.
+/// Returns an error if the notification id is stale or the
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails.
 pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::Result<()> {
-    notif_id_valid(listener_fd, id)?;
-
     let mut addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
@@ -1550,8 +1540,15 @@ fn read_tracee_open_path(notif: &SeccompNotif) -> io::Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    // Read up to PATH_MAX (4096) bytes, then truncate at the first NUL.
-    let bytes = read_tracee_bytes(notif.pid, path_arg, 4096)?;
+    // Read a short prefix first: nearly every pathname fits, and the copy is
+    // paid on every open notification. Only a prefix that fills the buffer
+    // without a terminator needs the full PATH_MAX read.
+    const SHORT_PATH: usize = 256;
+    const PATH_MAX: usize = 4096;
+    let mut bytes = read_tracee_bytes(notif.pid, path_arg, SHORT_PATH)?;
+    if bytes.len() == SHORT_PATH && !bytes.contains(&0) {
+        bytes = read_tracee_bytes(notif.pid, path_arg, PATH_MAX)?;
+    }
 
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
 
