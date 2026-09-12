@@ -141,9 +141,17 @@ async fn main() -> std::io::Result<()> {
     // listener-fd holder, it returns ENOSYS to the tracee. We set a flag and
     // SIGCONT on the first loop iteration.
     let mut child_was_resumed = false;
+    let mut notifications_since_exit_check: u32 = 0;
 
     loop {
-        propagate_child_exit(cli.child_pid);
+        // A `wait4` per trapped syscall is pure overhead: the child's death
+        // also surfaces as a withdrawn notification (`ENOENT`), which is where
+        // the status is propagated immediately. The periodic check below is a
+        // safety net for a child that dies without an outstanding notification.
+        if notifications_since_exit_check >= EXIT_CHECK_INTERVAL {
+            notifications_since_exit_check = 0;
+            propagate_child_exit(cli.child_pid);
+        }
 
         if !child_was_resumed {
             if let Some(pid) = cli.child_pid {
@@ -159,10 +167,17 @@ async fn main() -> std::io::Result<()> {
         }
 
         let notif = match recv_notification(cli.listener_fd) {
-            Ok(notif) => notif,
+            Ok(notif) => {
+                notifications_since_exit_check += 1;
+                notif
+            }
             Err(err) => match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
+                Some(libc::EINTR) => {
+                    propagate_child_exit(cli.child_pid);
+                    continue;
+                }
                 Some(libc::EAGAIN) => {
+                    propagate_child_exit(cli.child_pid);
                     time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -180,6 +195,7 @@ async fn main() -> std::io::Result<()> {
                     // If the child has truly exited, propagate_child_exit() above
                     // propagates its status. Brief backoff so a signal-storm won't
                     // spin the loop.
+                    propagate_child_exit(cli.child_pid);
                     debug!("notification withdrawn before processing");
                     time::sleep(Duration::from_millis(1)).await;
                     continue;
@@ -213,6 +229,12 @@ async fn main() -> std::io::Result<()> {
         .await;
     }
 }
+
+/// Notifications processed between two `wait4` checks of the sandboxed child.
+///
+/// The child's exit is normally observed on the `ENOENT` withdrawn-notification
+/// path, so this interval only bounds how long a silent exit can go unnoticed.
+const EXIT_CHECK_INTERVAL: u32 = 32;
 
 fn log_notification_response(result: std::io::Result<()>) {
     if let Err(err) = result {

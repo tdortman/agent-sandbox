@@ -1406,6 +1406,27 @@ const DEVICE_BYPASS: &[&str] = &[
     "/dev/tty",
 ];
 
+/// Whether the open flags prove the syscall cannot reach an existing device
+/// node, which is the only target class this gate covers.
+///
+/// `O_DIRECTORY` only opens a directory, and `O_CREAT|O_EXCL` fails with
+/// `EEXIST` on anything that already exists, including a device node and a
+/// symlink. Skipping classification for those saves the tracee memory read and
+/// the type `stat` that every other open pays. `openat2` is classified
+/// normally: its flags live behind a pointer, so proving the same thing would
+/// cost the read it is meant to avoid.
+fn open_flags_prove_not_a_device(notif: &SeccompNotif) -> bool {
+    let flags = match i64::from(notif.data.nr) {
+        nr::OPENAT => syscall_i32_arg(notif.data.args[2]),
+        nr::OPEN => syscall_i32_arg(notif.data.args[1]),
+
+        // creat() takes no flags and truncates an existing path.
+        _ => return false,
+    };
+
+    flags & libc::O_DIRECTORY != 0 || (flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0)
+}
+
 /// Check whether `path` refers to a block or character device by examining
 /// the file type via `stat`. A missing path (`ENOENT`/`ENOTDIR`) is a
 /// definitively non-device target (e.g. `open(O_CREAT)` of a new file), so it
@@ -1434,6 +1455,10 @@ fn device_file_type(path: &Path) -> Option<bool> {
 /// If the tracee path cannot be read, or `stat` is inconclusive on a
 /// non-`/dev` path, the open is allowed to continue so fanotify can gate it.
 fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
+    if open_flags_prove_not_a_device(notif) {
+        return None;
+    }
+
     let Ok(Some(raw_path)) = read_tracee_open_path(notif) else {
         return None;
     };
@@ -1662,7 +1687,8 @@ mod tests {
         SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
         SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg, device_file_type,
         hex_encode_lower, is_at_fdcwd, is_device_bypass, is_device_node_for_resource_gate,
-        notification_arch_valid, parse_msghdr_target, parse_sockaddr, resolve_open_path,
+        notification_arch_valid, open_flags_prove_not_a_device, parse_msghdr_target, parse_sockaddr,
+        resolve_open_path,
         resolve_tracee_path, scheme_for_socket_type, target_from_notification, tracee_fd_path,
         tracee_open_dir_base,
     };
@@ -1986,6 +2012,33 @@ mod tests {
             target.path,
             fs::canonicalize("/dev/ptmx").expect("canonical device")
         );
+    }
+
+    #[test]
+    fn open_flags_that_cannot_reach_a_device_skip_classification() {
+        let openat = |flags: i32| SeccompNotif {
+            data: SeccompData {
+                nr: i32::try_from(nr::OPENAT).expect("openat nr"),
+                args: [at_fdcwd_arg(), 0, flags as u64, 0, 0, 0],
+                ..SeccompData::default()
+            },
+            ..SeccompNotif::default()
+        };
+
+        assert!(open_flags_prove_not_a_device(&openat(
+            libc::O_RDONLY | libc::O_DIRECTORY
+        )));
+        assert!(open_flags_prove_not_a_device(&openat(
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+        )));
+        assert!(open_flags_prove_not_a_device(&openat(libc::O_TMPFILE | libc::O_RDWR)));
+
+        // A create that may open an existing path, and a plain open, are
+        // classified normally.
+        assert!(!open_flags_prove_not_a_device(&openat(
+            libc::O_WRONLY | libc::O_CREAT
+        )));
+        assert!(!open_flags_prove_not_a_device(&openat(libc::O_RDWR)));
     }
 
     #[test]
