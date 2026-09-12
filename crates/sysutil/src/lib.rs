@@ -232,6 +232,29 @@ pub fn mkdirat(dir: impl AsFd, path: &CStr, mode: libc::mode_t) -> io::Result<()
     })
 }
 
+/// Create a filesystem node relative to a trusted directory descriptor.
+///
+/// # Errors
+/// Returns the kernel error from `mknodat(2)`, including `EPERM` for device
+/// nodes, which the sandbox holds no capability to create.
+pub fn mknodat(
+    dir: impl AsFd,
+    path: &CStr,
+    mode: libc::mode_t,
+    device: libc::dev_t,
+) -> io::Result<()> {
+    // SAFETY: the descriptor and NUL-terminated path remain live for the call.
+    syscall_ok(unsafe {
+        libc::syscall(
+            libc::SYS_mknodat,
+            dir.as_fd().as_raw_fd(),
+            path.as_ptr(),
+            mode,
+            device,
+        )
+    })
+}
+
 fn syscall_ok(result: libc::c_long) -> io::Result<()> {
     if result == 0 {
         Ok(())

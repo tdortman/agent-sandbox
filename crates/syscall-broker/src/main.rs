@@ -26,7 +26,7 @@ use agent_sandbox_syscall_broker::{
     send_response,
 };
 use agent_sandbox_sysutil::{
-    connect_raw, ftruncate, linkat, mkdirat, renameat, sendmsg_raw, sendto_raw,
+    connect_raw, ftruncate, linkat, mkdirat, mknodat, renameat, sendmsg_raw, sendto_raw,
     set_raw_fd_nonblocking, symlinkat, truncate, unlinkat,
 };
 use clap::Parser;
@@ -383,6 +383,15 @@ fn emulate_filesystem_mutation(
         FilesystemMutation::Rmdir { dir, path } => {
             let path = cstring(path)?;
             unlinkat(dir, &path, libc::AT_REMOVEDIR)
+        }
+        FilesystemMutation::Mknod {
+            dir,
+            path,
+            mode,
+            device,
+        } => {
+            let path = cstring(path)?;
+            mknodat(dir, &path, *mode as libc::mode_t, *device as libc::dev_t)
         }
     };
 

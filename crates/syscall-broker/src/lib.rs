@@ -66,6 +66,14 @@ pub fn target_from_notification(notif: &SeccompNotif) -> io::Result<Option<Sysca
             Ok(Some(SyscallTarget::Errno(libc::ENOSYS)))
         }
 
+        // A file handle names a file without a path, so neither the path policy
+        // nor the device classification can see the target. Obtaining one also
+        // needs CAP_DAC_READ_SEARCH, which the sandbox never holds, so the API
+        // is reported as absent rather than mapped onto a path check.
+        nr::NAME_TO_HANDLE_AT | nr::OPEN_BY_HANDLE_AT => {
+            Ok(Some(SyscallTarget::Errno(libc::ENOSYS)))
+        }
+
         _ => Ok(target_from_filesystem_mutation(notif)),
     }
 }
@@ -371,6 +379,21 @@ pub enum FilesystemMutation {
 
         /// Directory pathname bytes.
         path: Vec<u8>,
+    },
+
+    /// Create a filesystem node (regular file, FIFO, socket, device).
+    Mknod {
+        /// Parent directory descriptor.
+        dir: OwnedFd,
+
+        /// Node pathname bytes.
+        path: Vec<u8>,
+
+        /// Requested mode, including the file type bits.
+        mode: u32,
+
+        /// Device number for device nodes.
+        device: u64,
     },
 }
 
@@ -1270,6 +1293,64 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     ))
 }
 
+/// Whether the node to create already exists, so the kernel would fail the
+/// syscall with `EEXIST` and no policy request is warranted.
+fn node_already_exists(dir: &OwnedFd, raw: &[u8], path: &Path) -> bool {
+    if raw.starts_with(b"/") {
+        return std::fs::symlink_metadata(path).is_ok();
+    }
+
+    let mut candidate = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
+    candidate.extend_from_slice(raw);
+
+    std::fs::symlink_metadata(PathBuf::from(std::ffi::OsString::from_vec(candidate))).is_ok()
+}
+
+fn mknod_target(
+    notif: &SeccompNotif,
+    dirfd: u64,
+    ptr: u64,
+    mode: u32,
+    device: u64,
+) -> io::Result<SyscallTarget> {
+    let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
+
+    if raw.is_empty() {
+        return Ok(SyscallTarget::Errno(libc::ENOENT));
+    }
+
+    if node_already_exists(&dir, &raw, &path) {
+        return Ok(SyscallTarget::Errno(libc::EEXIST));
+    }
+
+    Ok(filesystem_target(
+        vec![(
+            normalize_captured_path(&dir, &raw, &path),
+            FileAccess::Write,
+        )],
+        FilesystemMutation::Mknod {
+            dir,
+            path: raw,
+            mode,
+            device,
+        },
+    ))
+}
+
+fn target_from_mknod(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
+    let mode = u32::try_from(notif.data.args[1]).unwrap_or(0);
+    let device = notif.data.args[2];
+
+    mknod_target(notif, at_fdcwd_arg(), notif.data.args[0], mode, device)
+}
+
+fn target_from_mknodat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
+    let mode = u32::try_from(notif.data.args[2]).unwrap_or(0);
+    let device = notif.data.args[3];
+
+    mknod_target(notif, notif.data.args[0], notif.data.args[1], mode, device)
+}
+
 fn mkdir_target(
     notif: &SeccompNotif,
     dirfd: u64,
@@ -1282,15 +1363,7 @@ fn mkdir_target(
         return Ok(SyscallTarget::Errno(libc::ENOENT));
     }
 
-    let exists = if raw.starts_with(b"/") {
-        std::fs::symlink_metadata(&path).is_ok()
-    } else {
-        let mut candidate = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
-        candidate.extend_from_slice(&raw);
-        std::fs::symlink_metadata(PathBuf::from(std::ffi::OsString::from_vec(candidate))).is_ok()
-    };
-
-    if exists {
+    if node_already_exists(&dir, &raw, &path) {
         return Ok(SyscallTarget::Errno(libc::EEXIST));
     }
 
@@ -1345,6 +1418,8 @@ fn target_from_filesystem_mutation(notif: &SeccompNotif) -> Option<SyscallTarget
         nr::FTRUNCATE => target_from_ftruncate(notif),
         nr::MKDIR => target_from_mkdir(notif),
         nr::MKDIRAT => target_from_mkdirat(notif),
+        nr::MKNOD => target_from_mknod(notif),
+        nr::MKNODAT => target_from_mknodat(notif),
         nr::RMDIR => target_from_rmdir(notif),
         _ => return None,
     };
@@ -2015,11 +2090,36 @@ mod tests {
     }
 
     #[test]
+    fn handle_lookups_are_refused_before_classification() {
+        for syscall in [nr::NAME_TO_HANDLE_AT, nr::OPEN_BY_HANDLE_AT] {
+            let notif = SeccompNotif {
+                data: SeccompData {
+                    nr: i32::try_from(syscall).expect("syscall number"),
+                    ..SeccompData::default()
+                },
+                ..SeccompNotif::default()
+            };
+
+            match target_from_notification(&notif) {
+                Ok(Some(SyscallTarget::Errno(errno))) => assert_eq!(errno, libc::ENOSYS),
+                other => panic!("handle lookup {syscall} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn open_flags_that_cannot_reach_a_device_skip_classification() {
+        let flags_arg = |flags: i32| {
+            let mut bytes = [0u8; 8];
+            bytes[..4].copy_from_slice(&flags.to_le_bytes());
+
+            u64::from_le_bytes(bytes)
+        };
+
         let openat = |flags: i32| SeccompNotif {
             data: SeccompData {
                 nr: i32::try_from(nr::OPENAT).expect("openat nr"),
-                args: [at_fdcwd_arg(), 0, flags as u64, 0, 0, 0],
+                args: [at_fdcwd_arg(), 0, flags_arg(flags), 0, 0, 0],
                 ..SeccompData::default()
             },
             ..SeccompNotif::default()
