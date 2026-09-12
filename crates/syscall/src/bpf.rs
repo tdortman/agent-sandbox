@@ -10,7 +10,10 @@
 
 use std::collections::BTreeMap;
 
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
+};
 
 // `seccompiler::sock_filter` and `libc::sock_filter` are both `#[repr(C)]`
 // with the same field layout (code: u16, jt: u8, jf: u8, k: u32), so a
@@ -25,19 +28,32 @@ const _SOCK_FILTER_LAYOUTS_MATCH: () = assert!(
 /// Build a seccomp BPF program from a set of syscall numbers.
 ///
 /// The filter returns [`SeccompAction::UserNotif`] for every syscall
-/// listed in `syscalls` on both `x86_64` and aarch64. Any other syscall is
-/// allowed. The filter also validates `struct seccomp_data.arch` against
-/// the target architecture, killing the process on a mismatch.
+/// listed in `syscalls` on both `x86_64` and aarch64, except that
+/// `open`/`openat` with flags proving no device node is reachable are
+/// allowed in-kernel with no notification round trip (see
+/// [`open_notify_rules`]). Any other syscall is allowed. The filter also
+/// validates `struct seccomp_data.arch` against the target architecture,
+/// killing the process on a mismatch.
 /// # Panics
 /// Panics if seccomp filter construction fails or the compiled BPF program
 /// exceeds [`seccompiler::BPF_MAX_LEN`].
 #[must_use]
 pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
-    // An empty rule vector means "match this syscall regardless of its
-    // arguments", which is what we want for the agent's pass-through
-    // notification model.
-    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
-        syscalls.iter().map(|&nr| (nr, Vec::new())).collect();
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
+    for &nr in syscalls {
+        // `open` takes flags as args[1] and `openat` as args[2].
+        let rule = if nr == crate::policy::nr::OPEN {
+            open_notify_rules(1)
+        } else if nr == crate::policy::nr::OPENAT {
+            open_notify_rules(2)
+        } else {
+            // An empty rule vector means "match this syscall regardless of
+            // its arguments", which is what the agent's pass-through
+            // notification model wants for everything else.
+            Vec::new()
+        };
+        rules.insert(nr, rule);
+    }
 
     SeccompFilter::new(
         rules,
@@ -48,6 +64,50 @@ pub fn build_filter(syscalls: &std::collections::BTreeSet<i64>) -> BpfProgram {
     .expect("seccomp filter construction is total for non-empty rule maps")
     .try_into()
     .expect("seccomp filter length is bounded by seccompiler::BPF_MAX_LEN")
+}
+
+/// Notify rules for an open-family syscall whose flags are a direct register
+/// argument: trap unless the flags prove no device node is reachable.
+///
+/// This is the in-kernel form of the broker's `open_flags_prove_not_a_device`
+/// predicate, kept identical so verdicts never differ by layer: `O_DIRECTORY`
+/// only opens a directory, and `O_CREAT|O_EXCL` fails with `EEXIST` on
+/// anything that already exists, so neither can reach an existing device
+/// node (the only target class the open gate covers) and both are allowed
+/// without waking the broker. The predicate's negation is a disjunction
+/// (`O_DIRECTORY` clear and `O_CREAT` clear, or `O_DIRECTORY` clear and
+/// `O_EXCL` clear), so it takes two rules; a syscall matching either rule
+/// notifies, and anything else falls through to the filter's default allow.
+fn open_notify_rules(flags_arg: u8) -> Vec<SeccompRule> {
+    let dir_clear = || {
+        SeccompCondition::new(
+            flags_arg,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(u64::from(libc::O_DIRECTORY as u32)),
+            0,
+        )
+        .expect("open flag conditions use a valid arg index")
+    };
+    let creat_clear = SeccompCondition::new(
+        flags_arg,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(u64::from(libc::O_CREAT as u32)),
+        0,
+    )
+    .expect("open flag conditions use a valid arg index");
+    let excl_clear = SeccompCondition::new(
+        flags_arg,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(u64::from(libc::O_EXCL as u32)),
+        0,
+    )
+    .expect("open flag conditions use a valid arg index");
+    vec![
+        SeccompRule::new(vec![dir_clear(), creat_clear])
+            .expect("an open notify rule always carries conditions"),
+        SeccompRule::new(vec![dir_clear(), excl_clear])
+            .expect("an open notify rule always carries conditions"),
+    ]
 }
 
 const fn target_arch() -> TargetArch {
