@@ -9,6 +9,8 @@
 //! `unsafe` syscall code.
 
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::CStr,
     io::{self, Read, Seek, SeekFrom},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
@@ -288,15 +290,53 @@ fn tracee_process_id(thread_id: u32) -> io::Result<u32> {
 /// # Errors
 /// Returns the kernel error from either step or from resolving the thread ID.
 pub fn dup_tracee_fd(thread_id: u32, fd: i32) -> io::Result<OwnedFd> {
-    let pidfd = match pidfd_open_with_flags(thread_id, libc::PIDFD_THREAD) {
-        Ok(pidfd) => pidfd,
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
-            pidfd_open(tracee_process_id(thread_id)?)?
+    PIDFD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= PIDFD_CACHE_CAPACITY {
+            cache.clear();
         }
-        Err(error) => return Err(error),
-    };
+        if let Some(pidfd) = cache.get(&thread_id)
+            && let Ok(dup) = pidfd_getfd(pidfd, fd)
+        {
+            return Ok(dup);
+        }
+        cache.remove(&thread_id);
+        let pidfd = open_thread_pidfd(thread_id)?;
+        let dup = pidfd_getfd(&pidfd, fd)?;
+        cache.insert(thread_id, pidfd);
+        Ok(dup)
+    })
+}
 
-    pidfd_getfd(&pidfd, fd)
+// Cached pidfds by notifying thread ID, so repeated syscalls from one
+// tracee pay `pidfd_open` once instead of on every notification. Each
+// thread keeps its own cache; the broker classifies on one thread and
+// emulates sockets on another, and sharing nothing keeps both paths
+// lock-free.
+//
+// A pidfd pins its exact task, so pid reuse can never alias entries: a
+// dead task's `pidfd_getfd` fails, the entry is dropped, and the next call
+// opens a fresh pidfd. The capacity bound keeps short-lived build
+// processes from accumulating dead entries.
+thread_local! {
+    static PIDFD_CACHE: RefCell<HashMap<u32, OwnedFd>> = RefCell::new(HashMap::new());
+}
+
+/// Maximum cached pidfds before the cache is dropped wholesale. Reopening
+/// after a clear costs one `pidfd_open` per live task; clearing is rare
+/// against hundreds of thousands of cache hits in a removal storm.
+const PIDFD_CACHE_CAPACITY: usize = 512;
+
+/// Open a pidfd for the exact notifying task, falling back to the
+/// thread-group leader where the kernel predates thread pidfds.
+fn open_thread_pidfd(thread_id: u32) -> io::Result<OwnedFd> {
+    match pidfd_open_with_flags(thread_id, libc::PIDFD_THREAD) {
+        Ok(pidfd) => Ok(pidfd),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            pidfd_open(tracee_process_id(thread_id)?)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn fd_from_syscall(raw: libc::c_long) -> io::Result<OwnedFd> {

@@ -1031,27 +1031,33 @@ fn tracee_dir_handle(pid: u32, dirfd: u64) -> io::Result<OwnedFd> {
     agent_sandbox_sysutil::dup_tracee_fd(pid, fd)
 }
 
-fn capture_path(
-    notif: &SeccompNotif,
-    dirfd: u64,
-    ptr: u64,
-) -> io::Result<(OwnedFd, Vec<u8>, PathBuf)> {
+fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<(OwnedFd, Vec<u8>)> {
     let raw = read_raw_path(notif.pid, ptr)?;
 
     if raw.is_empty() {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
 
-    let path = path_from_raw(&raw);
-
-    if path.is_absolute() {
-        return Ok((open_path_handle(Path::new("/"))?, raw, path));
+    if path_from_raw(&raw).is_absolute() {
+        return Ok((open_path_handle(Path::new("/"))?, raw));
     }
 
-    let dir = tracee_dir_handle(notif.pid, dirfd)?;
+    Ok((tracee_dir_handle(notif.pid, dirfd)?, raw))
+}
+
+/// Broker-side absolute path for a captured relative name, resolved through
+/// the pinned directory handle. Only the policy fallback for unresolvable
+/// targets needs this string: anything that exists canonicalizes through
+/// its own handle instead, so the per-syscall hot path skips this readlink.
+fn capture_fallback_path(dir: &OwnedFd, raw: &[u8]) -> io::Result<PathBuf> {
+    let path = path_from_raw(raw);
+
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
     let base = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
-    let resolved = base.join(path);
-    Ok((dir, raw, resolved))
+    Ok(base.join(path))
 }
 
 fn two_path_target(
@@ -1062,17 +1068,17 @@ fn two_path_target(
     new_ptr: u64,
     operation: impl FnOnce(OwnedFd, Vec<u8>, OwnedFd, Vec<u8>) -> FilesystemMutation,
 ) -> io::Result<SyscallTarget> {
-    let (old_dir, old, old_check) = capture_path(notif, old_dirfd, old_ptr)?;
-    let (new_dir, new, new_check) = capture_path(notif, new_dirfd, new_ptr)?;
+    let (old_dir, old) = capture_path(notif, old_dirfd, old_ptr)?;
+    let (new_dir, new) = capture_path(notif, new_dirfd, new_ptr)?;
 
     Ok(filesystem_target(
         vec![
             (
-                normalize_captured_path(&old_dir, &old, &old_check),
+                normalize_captured_path(&old_dir, &old)?,
                 FileAccess::ReadWrite,
             ),
             (
-                normalize_captured_path(&new_dir, &new, &new_check),
+                normalize_captured_path(&new_dir, &new)?,
                 FileAccess::ReadWrite,
             ),
         ],
@@ -1159,14 +1165,15 @@ fn target_from_linkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let target = read_raw_path(notif.pid, notif.data.args[0])?;
-    let (link_dir, link, resolved) = capture_path(notif, at_fdcwd_arg(), notif.data.args[1])?;
+    let (link_dir, link) = capture_path(notif, at_fdcwd_arg(), notif.data.args[1])?;
+    let resolved = capture_fallback_path(&link_dir, &link)?;
     let target_path = resolve_symlink_target_path(&target, &resolved);
 
     Ok(filesystem_target(
         vec![
             (normalize_path(&target_path), FileAccess::Read),
             (
-                normalize_captured_path(&link_dir, &link, &resolved),
+                normalize_captured_path(&link_dir, &link)?,
                 FileAccess::Write,
             ),
         ],
@@ -1180,14 +1187,15 @@ fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let target = read_raw_path(notif.pid, notif.data.args[0])?;
-    let (link_dir, link, resolved) = capture_path(notif, notif.data.args[1], notif.data.args[2])?;
+    let (link_dir, link) = capture_path(notif, notif.data.args[1], notif.data.args[2])?;
+    let resolved = capture_fallback_path(&link_dir, &link)?;
     let target_path = resolve_symlink_target_path(&target, &resolved);
 
     Ok(filesystem_target(
         vec![
             (normalize_path(&target_path), FileAccess::Read),
             (
-                normalize_captured_path(&link_dir, &link, &resolved),
+                normalize_captured_path(&link_dir, &link)?,
                 FileAccess::Write,
             ),
         ],
@@ -1217,10 +1225,10 @@ fn single_path_target(
     operation: impl FnOnce(OwnedFd, Vec<u8>) -> FilesystemMutation,
     access: FileAccess,
 ) -> io::Result<SyscallTarget> {
-    let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
+    let (dir, raw) = capture_path(notif, dirfd, ptr)?;
 
     Ok(filesystem_target(
-        vec![(normalize_captured_path(&dir, &raw, &path), access)],
+        vec![(normalize_captured_path(&dir, &raw)?, access)],
         operation(dir, raw),
     ))
 }
@@ -1253,16 +1261,13 @@ fn target_from_unlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 }
 
 fn target_from_truncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
-    let (dir, raw, path) = capture_path(notif, at_fdcwd_arg(), notif.data.args[0])?;
+    let (dir, raw) = capture_path(notif, at_fdcwd_arg(), notif.data.args[0])?;
 
     let len = i64::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
 
     Ok(filesystem_target(
-        vec![(
-            normalize_captured_path(&dir, &raw, &path),
-            FileAccess::Write,
-        )],
+        vec![(normalize_captured_path(&dir, &raw)?, FileAccess::Write)],
         FilesystemMutation::Truncate {
             dir,
             path: raw,
@@ -1295,9 +1300,9 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 /// Whether the node to create already exists, so the kernel would fail the
 /// syscall with `EEXIST` and no policy request is warranted.
-fn node_already_exists(dir: &OwnedFd, raw: &[u8], path: &Path) -> bool {
+fn node_already_exists(dir: &OwnedFd, raw: &[u8]) -> bool {
     if raw.starts_with(b"/") {
-        return std::fs::symlink_metadata(path).is_ok();
+        return std::fs::symlink_metadata(path_from_raw(raw)).is_ok();
     }
 
     let mut candidate = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
@@ -1313,21 +1318,18 @@ fn mknod_target(
     mode: u32,
     device: u64,
 ) -> io::Result<SyscallTarget> {
-    let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
+    let (dir, raw) = capture_path(notif, dirfd, ptr)?;
 
     if raw.is_empty() {
         return Ok(SyscallTarget::Errno(libc::ENOENT));
     }
 
-    if node_already_exists(&dir, &raw, &path) {
+    if node_already_exists(&dir, &raw) {
         return Ok(SyscallTarget::Errno(libc::EEXIST));
     }
 
     Ok(filesystem_target(
-        vec![(
-            normalize_captured_path(&dir, &raw, &path),
-            FileAccess::Write,
-        )],
+        vec![(normalize_captured_path(&dir, &raw)?, FileAccess::Write)],
         FilesystemMutation::Mknod {
             dir,
             path: raw,
@@ -1357,21 +1359,18 @@ fn mkdir_target(
     ptr: u64,
     mode: u32,
 ) -> io::Result<SyscallTarget> {
-    let (dir, raw, path) = capture_path(notif, dirfd, ptr)?;
+    let (dir, raw) = capture_path(notif, dirfd, ptr)?;
 
     if raw.is_empty() {
         return Ok(SyscallTarget::Errno(libc::ENOENT));
     }
 
-    if node_already_exists(&dir, &raw, &path) {
+    if node_already_exists(&dir, &raw) {
         return Ok(SyscallTarget::Errno(libc::EEXIST));
     }
 
     Ok(filesystem_target(
-        vec![(
-            normalize_captured_path(&dir, &raw, &path),
-            FileAccess::Write,
-        )],
+        vec![(normalize_captured_path(&dir, &raw)?, FileAccess::Write)],
         FilesystemMutation::Mkdir {
             dir,
             path: raw,
@@ -1433,7 +1432,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalize_path_handle(path, open_path_handle(path))
 }
 
-fn normalize_captured_path(dir: &OwnedFd, raw: &[u8], path: &Path) -> PathBuf {
+fn normalize_captured_path(dir: &OwnedFd, raw: &[u8]) -> io::Result<PathBuf> {
     let fd = nix::fcntl::openat(
         dir,
         Path::new(std::ffi::OsStr::from_bytes(raw)),
@@ -1442,7 +1441,27 @@ fn normalize_captured_path(dir: &OwnedFd, raw: &[u8], path: &Path) -> PathBuf {
     )
     .map_err(io::Error::from);
 
-    normalize_path_handle(path, fd)
+    match fd {
+        Ok(fd) => {
+            if let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+                && resolved.is_absolute()
+                && !resolved
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .ends_with(b" (deleted)")
+            {
+                return Ok(resolved);
+            }
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return capture_fallback_path(dir, raw);
+        }
+        Err(_) => {}
+    }
+
+    // Anonymous descriptors and unlinked handles have no canonical pathname.
+    let path = capture_fallback_path(dir, raw)?;
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 fn normalize_path_handle(path: &Path, fd: io::Result<OwnedFd>) -> PathBuf {
@@ -1762,10 +1781,9 @@ mod tests {
         SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SeccompData, SeccompNotif,
         SockaddrTarget, SyscallTarget, UnixAddress, at_fdcwd_arg, device_file_type,
         hex_encode_lower, is_at_fdcwd, is_device_bypass, is_device_node_for_resource_gate,
-        notification_arch_valid, open_flags_prove_not_a_device, parse_msghdr_target, parse_sockaddr,
-        resolve_open_path,
-        resolve_tracee_path, scheme_for_socket_type, target_from_notification, tracee_fd_path,
-        tracee_open_dir_base,
+        notification_arch_valid, open_flags_prove_not_a_device, parse_msghdr_target,
+        parse_sockaddr, resolve_open_path, resolve_tracee_path, scheme_for_socket_type,
+        target_from_notification, tracee_fd_path, tracee_open_dir_base,
     };
 
     #[test]
@@ -2131,7 +2149,9 @@ mod tests {
         assert!(open_flags_prove_not_a_device(&openat(
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
         )));
-        assert!(open_flags_prove_not_a_device(&openat(libc::O_TMPFILE | libc::O_RDWR)));
+        assert!(open_flags_prove_not_a_device(&openat(
+            libc::O_TMPFILE | libc::O_RDWR
+        )));
 
         // A create that may open an existing path, and a plain open, are
         // classified normally.
