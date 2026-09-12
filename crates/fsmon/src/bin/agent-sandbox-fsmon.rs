@@ -44,9 +44,8 @@ fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
 
 use clap::Parser;
 use nix::{
-    dir::Dir,
-    fcntl::{AtFlags, OFlag, openat, readlinkat},
-    sys::stat::{FileStat, Mode, SFlag, fstat, fstatat},
+    fcntl::{OFlag, openat, readlinkat},
+    sys::stat::{Mode, SFlag, fstat},
 };
 
 #[derive(Parser, Debug)]
@@ -55,7 +54,7 @@ use nix::{
     version,
     about = "fanotify filesystem policy monitor that brokers open() calls to policyd",
     long_about = r#"fanotify-based filesystem monitor that runs in the host mount namespace.
-Given a target sandbox PID, it joins the sandbox mount namespace, marks every mount that overlaps the sandbox's working directory/home/project, and processes permission events for open/open-exec/access requests.
+Given a target sandbox PID, it joins the sandbox mount namespace, marks every mount that overlaps the sandbox's working directory/home/project, and processes permission events for open and exec requests.
 Each event is forwarded to policyd over a Unix domain socket and the verdict (allow/deny) is written back to the kernel via the fanotify response fd.
 
 Normally spawned by policyd in response to an "agent-sandbox-fs-arm" request, not invoked directly.
@@ -118,7 +117,7 @@ struct Cli {
 
 // fanotify constants and event structs come from `agent_sandbox_sysutil`.
 use agent_sandbox_sysutil::{
-    FAN_ACCESS_PERM, FAN_ALLOW, FAN_DENY, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM, FAN_PRE_ACCESS,
+    FAN_ALLOW, FAN_DENY, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM,
 };
 
 /// Host procfs directory opened before `setns` into a sandbox mount namespace.
@@ -171,36 +170,6 @@ impl HostProc {
             &self.dir,
             Path::new(&format!("self/fd/{fd}")),
         )?))
-    }
-
-    fn metadata(&self, pid: i32, leaf: &str) -> io::Result<FileStat> {
-        Ok(fstatat(
-            &self.dir,
-            &Self::relative_path(pid, leaf),
-            AtFlags::empty(),
-        )?)
-    }
-
-    fn numeric_entries(&self, pid: i32, leaf: &str) -> io::Result<Vec<i32>> {
-        let dir = Dir::openat(
-            &self.dir,
-            &Self::relative_path(pid, leaf),
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )?;
-
-        let entries = dir
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                std::str::from_utf8(entry.file_name().to_bytes())
-                    .ok()?
-                    .parse()
-                    .ok()
-            })
-            .collect();
-
-        Ok(entries)
     }
 
     fn read_memory(&self, pid: i32, addr: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -450,18 +419,6 @@ fn resolve_blocked_open_path(
     })
 }
 
-fn fdinfo_flags(host_proc: &HostProc, pid: i32, fd_name: &str) -> io::Result<i32> {
-    let content = host_proc.read_to_string(pid, &format!("fdinfo/{fd_name}"))?;
-
-    let flags = content
-        .lines()
-        .find_map(|line| line.strip_prefix("flags:"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing fdinfo flags"))?
-        .trim();
-
-    i32::from_str_radix(flags, 8).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
 /// Read bytes from a tracee's address space via `process_vm_readv`, falling
 /// back to `/proc/<pid>/mem` when the syscall is unavailable.
 fn read_tracee_bytes(host_proc: &HostProc, pid: i32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -565,58 +522,12 @@ fn parse_open_syscall_access(
     }
 }
 
-fn process_fd_access(host_proc: &HostProc, pid: i32, event_fd: &impl AsFd) -> Option<FileAccess> {
-    if pid <= 0 {
-        return None;
-    }
-
-    let event_meta = fstat(event_fd).ok()?;
-    let mut access = None;
-
-    for fd in host_proc.numeric_entries(pid, "fd").ok()? {
-        let fd_name = fd.to_string();
-
-        let Ok(meta) = host_proc.metadata(pid, &format!("fd/{fd_name}")) else {
-            continue;
-        };
-
-        if meta.st_dev != event_meta.st_dev || meta.st_ino != event_meta.st_ino {
-            continue;
-        }
-
-        let Ok(flags) = fdinfo_flags(host_proc, pid, &fd_name) else {
-            continue;
-        };
-
-        let fd_access = open_flags_to_file_access(flags);
-
-        access = Some(access.map_or(fd_access, |current: FileAccess| {
-            current.combine_observed(fd_access)
-        }));
-
-        if access == Some(FileAccess::ReadWrite) {
-            return access;
-        }
-    }
-
-    access
-}
-
 fn event_fd_has_type(event_fd: &impl AsFd, file_type: SFlag) -> bool {
     fstat(event_fd).is_ok_and(|meta| SFlag::from_bits_truncate(meta.st_mode).contains(file_type))
 }
 
 /// Translate a fanotify event mask to the corresponding `FileAccess`.
 fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i32) -> FileAccess {
-    if mask & FAN_PRE_ACCESS != 0 {
-        return process_fd_access(host_proc, pid, event_fd).unwrap_or(FileAccess::ReadWrite);
-    }
-
-    // ACCESS means read/opendir; must win over EXEC traverse on combined masks.
-    if mask & FAN_ACCESS_PERM != 0 {
-        return FileAccess::Read;
-    }
-
     if mask & FAN_OPEN_EXEC_PERM != 0 {
         // Execute would miss read_write allow rules (e.g. global `./.git`).
         if event_fd_has_type(event_fd, SFlag::S_IFDIR) {
@@ -646,21 +557,14 @@ fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i3
     FileAccess::All
 }
 
-struct MountpointMarks {
-    saw_pre_access_mark: bool,
-    home_covered: bool,
-}
-
-/// Mark each mount point, skipping synthetic filesystem types.
-/// Returns a [`MountpointMarks`] struct indicating whether a pre-access mark
-/// was seen and whether the home directory is covered.
+/// Mark each mount point, skipping synthetic filesystem types. Returns whether
+/// a marked mount covers the home directory.
 fn mark_mountpoints(
     fan_fd: impl std::os::fd::AsFd,
     mounts: &[MountRecord],
     home_covering_mount: Option<&Path>,
     cli_home: Option<&Path>,
-) -> MountpointMarks {
-    let mut saw_pre_access_mark = false;
+) -> bool {
     let mut home_covered = false;
 
     for mount in mounts {
@@ -691,13 +595,12 @@ fn mark_mountpoints(
         let mp_cstr =
             CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
 
-        match agent_sandbox_sysutil::fanotify_mark(&fan_fd, &mp_cstr, true) {
-            Ok(actual_mask) => {
-                saw_pre_access_mark |= actual_mask & FAN_PRE_ACCESS != 0;
+        match agent_sandbox_sysutil::fanotify_mark(&fan_fd, &mp_cstr) {
+            Ok(()) => {
                 if home_covering_mount == Some(mount.mount_point.as_path()) {
                     home_covered = true;
                 }
-                tracing::debug!(path = %mount.mount_point.display(), mask = %format_args!("{actual_mask:x}"), "marked mountpoint");
+                tracing::debug!(path = %mount.mount_point.display(), "marked mountpoint");
             }
 
             Err(e) => {
@@ -720,10 +623,7 @@ fn mark_mountpoints(
         }
     }
 
-    MountpointMarks {
-        saw_pre_access_mark,
-        home_covered,
-    }
+    home_covered
 }
 
 /// Immutable cgroup identity captured from the sandbox root before `setns`.
@@ -756,7 +656,6 @@ fn run_event_loop(
     fan_fd: &std::os::fd::OwnedFd,
     self_pid: i32,
     sandbox_cgroup: &SandboxCgroup,
-    saw_pre_access_mark: bool,
     host_proc: &HostProc,
     ctx: &agent_sandbox_core::RequestContext,
     socket_path: &Path,
@@ -802,11 +701,7 @@ fn run_event_loop(
                 break;
             };
 
-            if meta.fd >= 0
-                && meta.mask
-                    & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_PRE_ACCESS | FAN_ACCESS_PERM)
-                    != 0
-            {
+            if meta.fd >= 0 && meta.mask & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) != 0 {
                 let event_fd = take_fanotify_event_fd(meta.fd).expect("event fd");
 
                 if try_fast_path_allow(
@@ -815,7 +710,6 @@ fn run_event_loop(
                     &event_fd,
                     self_pid,
                     sandbox_cgroup,
-                    saw_pre_access_mark,
                     host_proc,
                     &mut pid_cgroup_cache,
                 ) {
@@ -931,7 +825,7 @@ fn main() {
     });
 
     // Open fanotify fd.
-    let (fan_fd, fanotify_reports_tid) = agent_sandbox_sysutil::fanotify_init_pre_content()
+    let (fan_fd, fanotify_reports_tid) = agent_sandbox_sysutil::fanotify_init_content()
         .unwrap_or_else(|e| {
             eprintln!("agent-sandbox-fsmon: fanotify_init failed: {e}");
             process::exit(1);
@@ -984,10 +878,7 @@ fn main() {
         .and_then(|home| deepest_covering_mount(&mounts, home))
         .map(Path::to_path_buf);
 
-    let MountpointMarks {
-        saw_pre_access_mark,
-        home_covered,
-    } = mark_mountpoints(
+    let home_covered = mark_mountpoints(
         &fan_fd,
         &mounts,
         home_covering_mount.as_deref(),
@@ -1027,7 +918,6 @@ fn main() {
         &fan_fd,
         self_pid,
         &sandbox_cgroup,
-        saw_pre_access_mark,
         &host_proc,
         &ctx,
         socket_path,
@@ -1052,7 +942,6 @@ fn try_fast_path_allow(
     event_fd: &OwnedFd,
     self_pid: i32,
     sandbox_cgroup: &SandboxCgroup,
-    saw_pre_access_mark: bool,
     host_proc: &HostProc,
     pid_cgroup_cache: &mut HashSet<i32>,
 ) -> bool {
@@ -1080,19 +969,6 @@ fn try_fast_path_allow(
                 return true;
             }
         }
-    }
-
-    if saw_pre_access_mark
-        && meta.mask & FAN_ACCESS_PERM != 0
-        && event_fd_has_type(event_fd, SFlag::S_IFREG)
-    {
-        respond(fan_fd, event_fd, FAN_ALLOW);
-        return true;
-    }
-
-    if meta.mask & FAN_PRE_ACCESS != 0 {
-        respond(fan_fd, event_fd, FAN_ALLOW);
-        return true;
     }
 
     false
@@ -1272,19 +1148,9 @@ mod tests {
     }
 
     #[test]
-    fn mask_to_access_prefers_exec_and_read_events() {
+    fn mask_to_access_maps_open_and_exec_events() {
         let host_proc = test_host_proc();
         let event_fd = test_event_file();
-
-        assert_eq!(
-            mask_to_access(
-                &host_proc,
-                FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM,
-                &event_fd,
-                -1,
-            ),
-            FileAccess::Read
-        );
 
         assert_eq!(
             mask_to_access(&host_proc, FAN_OPEN_EXEC_PERM, &event_fd, -1),
@@ -1292,81 +1158,9 @@ mod tests {
         );
 
         assert_eq!(
-            mask_to_access(&host_proc, FAN_ACCESS_PERM, &event_fd, -1),
-            FileAccess::Read
-        );
-
-        assert_eq!(
             mask_to_access(&host_proc, FAN_OPEN_PERM, &event_fd, -1),
             FileAccess::ReadWrite
         );
-    }
-
-    #[test]
-    fn mask_to_access_access_perm_beats_open_perm() {
-        let host_proc = test_host_proc();
-        let event_fd = test_event_file();
-
-        // Combined open events carry both masks. ACCESS means read/opendir;
-        // do not let a failed OPEN syscall parse downgrade to read_write.
-        assert_eq!(
-            mask_to_access(&host_proc, FAN_OPEN_PERM | FAN_ACCESS_PERM, &event_fd, -1,),
-            FileAccess::Read
-        );
-    }
-
-    #[test]
-    fn unavailable_opener_never_uses_another_threads_read_access() {
-        let host_proc = test_host_proc();
-        let path = std::env::temp_dir().join(format!("fsmon-opener-{}", process::id()));
-        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).expect("create FIFO");
-        let reader_path = path.clone();
-        let (send, receive) = std::sync::mpsc::channel();
-
-        let reader = std::thread::spawn(move || {
-            send.send(nix::unistd::gettid().as_raw())
-                .expect("send opener tid");
-
-            File::open(reader_path).expect("open FIFO for reading")
-        });
-
-        let reader_tid = receive.recv().expect("receive opener tid");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut reader_access = None;
-
-        while std::time::Instant::now() < deadline {
-            if let Ok(content) = host_proc.read_to_string(reader_tid, "syscall") {
-                reader_access = parse_open_syscall_access(&host_proc, reader_tid, &content);
-
-                if reader_access.is_some() {
-                    break;
-                }
-            }
-
-            std::thread::yield_now();
-        }
-
-        let opener_access = syscall_lookup(&host_proc, reader_tid, parse_open_syscall_access);
-
-        let access = mask_to_access(
-            &host_proc,
-            FAN_OPEN_PERM,
-            &test_event_file(),
-            nix::unistd::gettid().as_raw(),
-        );
-
-        let release = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("release blocked FIFO reader");
-
-        drop(reader.join().expect("join reader"));
-        drop(release);
-        fs::remove_file(path).expect("remove FIFO");
-        assert_eq!(reader_access, Some(FileAccess::Read));
-        assert_eq!(opener_access, Some(FileAccess::Read));
-        assert_eq!(access, FileAccess::ReadWrite);
     }
 
     #[test]
@@ -1391,42 +1185,6 @@ mod tests {
             FileAccess::ReadWrite
         );
 
-        std::fs::remove_file(path).expect("remove temp file");
-    }
-
-    #[test]
-    fn pre_access_without_fd_flags_stays_conservative() {
-        let host_proc = test_host_proc();
-        let event_fd = test_event_file();
-
-        assert_eq!(
-            mask_to_access(&host_proc, FAN_PRE_ACCESS, &event_fd, -1),
-            FileAccess::ReadWrite
-        );
-    }
-
-    #[test]
-    fn process_fd_access_combines_read_and_write_descriptors_into_read_write() {
-        let host_proc = test_host_proc();
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
-
-        let path = std::env::temp_dir().join(format!(
-            "agent-sandbox-fsmon-test-rw-{}",
-            std::process::id()
-        ));
-
-        std::fs::write(&path, b"x").expect("seed temp file");
-
-        let access = {
-            let read_file = File::open(&path).expect("open read-only temp file");
-            let _write_file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .expect("open write-only temp file");
-            process_fd_access(&host_proc, pid, &read_file)
-        };
-
-        assert_eq!(access, Some(FileAccess::ReadWrite));
         std::fs::remove_file(path).expect("remove temp file");
     }
 

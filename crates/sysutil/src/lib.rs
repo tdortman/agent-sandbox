@@ -472,12 +472,12 @@ pub fn clear_ambient_capabilities() -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// fanotify. nix 0.31 fanotify is partial and does not cover the custom
-// FAN_PRE_ACCESS mask, so init/mark stay as raw syscalls behind safe wrappers.
+// fanotify. nix 0.31 fanotify is partial, so init/mark stay as raw syscalls
+// behind safe wrappers.
 // ---------------------------------------------------------------------------
 
 /// `fanotify_init` flags.
-const FAN_CLASS_PRE_CONTENT: u32 = libc::FAN_CLASS_PRE_CONTENT;
+const FAN_CLASS_CONTENT: u32 = libc::FAN_CLASS_CONTENT;
 
 const FAN_CLOEXEC: u32 = libc::FAN_CLOEXEC;
 
@@ -486,17 +486,11 @@ const FAN_MARK_ADD: u32 = libc::FAN_MARK_ADD;
 
 const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
 
-/// Permission event masks.
+/// Permission event mask for opening a file.
 pub const FAN_OPEN_PERM: u64 = libc::FAN_OPEN_PERM;
 
 /// Permission event mask for opening a file for executable execution.
 pub const FAN_OPEN_EXEC_PERM: u64 = libc::FAN_OPEN_EXEC_PERM;
-
-/// Permission event mask for file access (read/write/traverse).
-pub const FAN_ACCESS_PERM: u64 = libc::FAN_ACCESS_PERM;
-
-/// Pre-content access mask. Not exported by libc, matches the kernel UAPI.
-pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
 /// fanotify response value permitting the requested access.
 pub const FAN_ALLOW: u32 = 0x01;
@@ -504,20 +498,17 @@ pub const FAN_ALLOW: u32 = 0x01;
 /// fanotify response value denying the requested access.
 pub const FAN_DENY: u32 = 0x02;
 
-/// Open a fanotify fd suitable for pre-content permission events.
+/// Open a fanotify fd suitable for open permission events.
 ///
 /// Returns `(fd, reports_tid)` where `reports_tid` is true when the kernel
 /// honours `FAN_REPORT_TID` and `meta.pid` is the opener thread id.
 ///
 /// # Errors
 /// Returns an error if fanotify cannot be initialised on any flag combination.
-pub fn fanotify_init_pre_content() -> io::Result<(OwnedFd, bool)> {
+pub fn fanotify_init_content() -> io::Result<(OwnedFd, bool)> {
     for (flags, reports_tid) in [
-        (
-            FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC | libc::FAN_REPORT_TID,
-            true,
-        ),
-        (FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC, false),
+        (FAN_CLASS_CONTENT | FAN_CLOEXEC | libc::FAN_REPORT_TID, true),
+        (FAN_CLASS_CONTENT | FAN_CLOEXEC, false),
     ] {
         // SAFETY: `fanotify_init(unsigned int flags, unsigned int event_f_flags)`
         // with event_f_flags=0. The returned fd is owned exclusively by us.
@@ -546,17 +537,18 @@ pub fn fanotify_init_pre_content() -> io::Result<(OwnedFd, bool)> {
     ))
 }
 
-/// Add a fanotify mark on a mount point path. Returns the mask actually
-/// applied (without `FAN_PRE_ACCESS` when the kernel rejects it).
+/// Add a fanotify mark on a mount point path for open and exec permission
+/// events.
+///
+/// Opening is the only filesystem event that needs a policy request: every way
+/// of reading or writing a file has to open it first, and the kernel reports
+/// the requested access mode with the open event. Per-read access events would
+/// instead block every read on a response that can only allow it.
 ///
 /// # Errors
-/// Returns an error if the mark cannot be applied after the fallback attempt.
-pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr, try_pre_access: bool) -> io::Result<u64> {
-    let mask = if try_pre_access {
-        FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM | FAN_PRE_ACCESS
-    } else {
-        FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM
-    };
+/// Returns an error if the mark cannot be applied.
+pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
+    let mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
 
     // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
     // int dirfd, const char *pathname)`. The fd and path are live for the call.
@@ -572,16 +564,10 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr, try_pre_access: bool) -> io
     };
 
     if ret == 0 {
-        return Ok(mask);
+        return Ok(());
     }
 
-    let err = io::Error::last_os_error();
-
-    if try_pre_access && matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
-        return fanotify_mark(fan_fd, path, false);
-    }
-
-    Err(err)
+    Err(io::Error::last_os_error())
 }
 
 /// Kernel `struct fanotify_event_metadata`.
