@@ -11,7 +11,7 @@ Run agent CLIs inside a bubblewrap jail on NixOS. Unknown operations block until
 | Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
 | Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
 | Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |
-| D-Bus      | Filtered session-bus access through a per-sandbox relay.                                                                                        |
+| D-Bus      | Filtered session and system bus access through a per-sandbox relay.                                                                             |
 
 ## Binary cache
 
@@ -176,7 +176,7 @@ The policy layers load in this order. Denies take precedence across all layers:
 The package layers apply only to sessions attributed to that package. Runtime decisions apply after the file layers. The global, global package, project, and project package scopes write their rule back to a policy file; the once and session scopes keep the decision in memory for the current request or
 session.
 
-Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields support [globset syntax](https://docs.rs/globset/0.4.19/globset/#syntax). Matching uses globset's `literal_separator` mode: `*` and `?` do not match `/`, use `**` for recursive path matching. Policy files are write-protected, including writes through hardlinks.
+Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields support [globset syntax](https://docs.rs/globset/0.4.19/globset/#syntax). Matching uses globset's `literal_separator` mode: `*` and `?` do not match `/`, use `**` for recursive path matching. Policy files are read-and-write protected, including accesses through hardlinks.
 
 ```json
 {
@@ -239,9 +239,7 @@ Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields suppo
 
 ## D-Bus
 
-Set `agent-sandbox.policy.dbus.enable = true` to expose a filtered **session bus**. This requires `gates.resources.enable`, which blocks direct host IPC socket connections. The wrapper gives each sandbox its own relay and sets `DBUS_SESSION_BUS_ADDRESS` to that relay. Policyd checks destination, object path, interface, member, message kind, signature, and file-descriptor metadata.
-
-The system bus is not proxied. A dynamic filesystem jail may still make `/run/dbus` visible because it binds the host root, but the resource gate rejects connect and send operations to `/run/dbus/*`, `/run/systemd/*`, and protected abstract D-Bus or systemd sockets. The relay also blocks name ownership, unrestricted match rules, and monitor activation.
+Set `agent-sandbox.policy.dbus.enable = true` to expose filtered dbus sockets. This requires `gates.resources.enable`, which blocks direct host IPC socket connections. The wrapper gives each sandbox its own relay and sets `DBUS_SESSION_BUS_ADDRESS` to that relay. Policyd checks destination, object path, interface, member, message kind, signature, and file-descriptor metadata. Systemd sockets are automatically rejected, to prevent sandbox escapes through means like `systemd-run`.
 
 ## Approval UI
 
