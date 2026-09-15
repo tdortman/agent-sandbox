@@ -21,9 +21,9 @@ use agent_sandbox_core::{
 };
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    FilesystemMutation, FilesystemTarget, NetworkMode, PersistentPolicyClient, ResourceTarget,
-    SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, normalize_path, recv_notification, send_addfd,
-    send_response,
+    FilesystemMutation, FilesystemTarget, MutationDir, NetworkMode, PersistentPolicyClient,
+    ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, init_root_handle,
+    normalize_path, recv_notification, send_addfd, send_response,
 };
 use agent_sandbox_sysutil::{
     connect_raw, ftruncate, linkat, mkdirat, mknodat, renameat, sendmsg_raw, sendto_raw,
@@ -122,6 +122,7 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    init_root_handle()?;
     let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
@@ -322,12 +323,12 @@ fn emulate_filesystem_mutation(
         CString::new(bytes).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
     }
 
-    fn path_at(dir: &OwnedFd, path: &[u8]) -> Vec<u8> {
+    fn path_at(dir: &MutationDir, path: &[u8]) -> Vec<u8> {
         if path.starts_with(b"/") {
             return path.to_vec();
         }
 
-        let mut resolved = format!("/proc/self/fd/{}", dir.as_raw_fd()).into_bytes();
+        let mut resolved = format!("/proc/self/fd/{}", dir.as_fd().as_raw_fd()).into_bytes();
         resolved.push(b'/');
         resolved.extend_from_slice(path);
         resolved

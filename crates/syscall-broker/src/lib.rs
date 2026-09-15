@@ -11,10 +11,11 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess};
@@ -282,13 +283,13 @@ pub enum FilesystemMutation {
     /// Rename one captured path to another.
     Rename {
         /// Source directory descriptor.
-        old_dir: OwnedFd,
+        old_dir: MutationDir,
 
         /// Source pathname bytes.
         old: Vec<u8>,
 
         /// Destination directory descriptor.
-        new_dir: OwnedFd,
+        new_dir: MutationDir,
 
         /// Destination pathname bytes.
         new: Vec<u8>,
@@ -300,13 +301,13 @@ pub enum FilesystemMutation {
     /// Create a hard link.
     Link {
         /// Source directory descriptor.
-        old_dir: OwnedFd,
+        old_dir: MutationDir,
 
         /// Source pathname bytes.
         old: Vec<u8>,
 
         /// Destination directory descriptor.
-        new_dir: OwnedFd,
+        new_dir: MutationDir,
 
         /// Destination pathname bytes.
         new: Vec<u8>,
@@ -321,7 +322,7 @@ pub enum FilesystemMutation {
         target: Vec<u8>,
 
         /// Link directory descriptor.
-        link_dir: OwnedFd,
+        link_dir: MutationDir,
 
         /// Link pathname bytes.
         link: Vec<u8>,
@@ -330,7 +331,7 @@ pub enum FilesystemMutation {
     /// Remove a directory entry.
     Unlink {
         /// Parent directory descriptor.
-        dir: OwnedFd,
+        dir: MutationDir,
 
         /// Entry pathname bytes.
         path: Vec<u8>,
@@ -342,7 +343,7 @@ pub enum FilesystemMutation {
     /// Truncate a named file.
     Truncate {
         /// Captured cwd descriptor.
-        dir: OwnedFd,
+        dir: MutationDir,
 
         /// Captured pathname bytes.
         path: Vec<u8>,
@@ -363,7 +364,7 @@ pub enum FilesystemMutation {
     /// Create a directory.
     Mkdir {
         /// Parent directory descriptor.
-        dir: OwnedFd,
+        dir: MutationDir,
 
         /// Directory pathname bytes.
         path: Vec<u8>,
@@ -375,7 +376,7 @@ pub enum FilesystemMutation {
     /// Remove a directory.
     Rmdir {
         /// Parent directory descriptor.
-        dir: OwnedFd,
+        dir: MutationDir,
 
         /// Directory pathname bytes.
         path: Vec<u8>,
@@ -384,7 +385,7 @@ pub enum FilesystemMutation {
     /// Create a filesystem node (regular file, FIFO, socket, device).
     Mknod {
         /// Parent directory descriptor.
-        dir: OwnedFd,
+        dir: MutationDir,
 
         /// Node pathname bytes.
         path: Vec<u8>,
@@ -1013,6 +1014,52 @@ fn path_from_raw(raw: &[u8]) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec()))
 }
 
+/// Directory argument for an emulated filesystem syscall.
+#[derive(Debug)]
+pub enum MutationDir {
+    /// Directory handle pinned at capture time; captured names are relative.
+    Handle(OwnedFd),
+    /// The captured name is absolute and the kernel ignores the directory.
+    Root,
+}
+
+impl AsFd for MutationDir {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Handle(fd) => fd.as_fd(),
+            Self::Root => ROOT
+                .get()
+                .expect("init_root_handle must be called before filesystem mediation")
+                .as_fd(),
+        }
+    }
+}
+
+static ROOT: OnceLock<OwnedFd> = OnceLock::new();
+
+fn root_handle() -> &'static OwnedFd {
+    ROOT.get()
+        .expect("init_root_handle must be called before filesystem mediation")
+}
+
+/// Open the process-wide root descriptor used for absolute captured names.
+///
+/// Must be called once at startup before the notification loop;
+/// `MutationDir::Root` only borrows this handle and never opens a descriptor
+/// per notification.
+///
+/// # Errors
+///
+/// Returns any error from opening `/`.
+pub fn init_root_handle() -> io::Result<()> {
+    if ROOT.get().is_some() {
+        return Ok(());
+    }
+    let fd = open_path_handle(Path::new("/"))?;
+    let _ = ROOT.set(fd);
+    Ok(())
+}
+
 fn open_path_handle(path: &Path) -> io::Result<OwnedFd> {
     nix::fcntl::open(
         path,
@@ -1036,7 +1083,7 @@ fn tracee_dir_handle(pid: u32, dirfd: u64) -> io::Result<OwnedFd> {
     agent_sandbox_sysutil::dup_tracee_fd(pid, fd)
 }
 
-fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<(OwnedFd, Vec<u8>)> {
+fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<(MutationDir, Vec<u8>)> {
     let raw = read_raw_path(notif.pid, ptr)?;
 
     if raw.is_empty() {
@@ -1044,24 +1091,27 @@ fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<(Owned
     }
 
     if path_from_raw(&raw).is_absolute() {
-        return Ok((open_path_handle(Path::new("/"))?, raw));
+        return Ok((MutationDir::Root, raw));
     }
 
-    Ok((tracee_dir_handle(notif.pid, dirfd)?, raw))
+    Ok((
+        MutationDir::Handle(tracee_dir_handle(notif.pid, dirfd)?),
+        raw,
+    ))
 }
 
 /// Broker-side absolute path for a captured relative name, resolved through
 /// the pinned directory handle. Only the policy fallback for unresolvable
 /// targets needs this string: anything that exists canonicalizes through
 /// its own handle instead, so the per-syscall hot path skips this readlink.
-fn capture_fallback_path(dir: &OwnedFd, raw: &[u8]) -> io::Result<PathBuf> {
+fn capture_fallback_path(dir: &MutationDir, raw: &[u8]) -> io::Result<PathBuf> {
     let path = path_from_raw(raw);
 
     if path.is_absolute() {
         return Ok(path);
     }
 
-    let base = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+    let base = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_fd().as_raw_fd()))?;
     Ok(base.join(path))
 }
 
@@ -1071,7 +1121,7 @@ fn two_path_target(
     old_ptr: u64,
     new_dirfd: u64,
     new_ptr: u64,
-    operation: impl FnOnce(OwnedFd, Vec<u8>, OwnedFd, Vec<u8>) -> FilesystemMutation,
+    operation: impl FnOnce(MutationDir, Vec<u8>, MutationDir, Vec<u8>) -> FilesystemMutation,
 ) -> io::Result<SyscallTarget> {
     let (old_dir, old) = capture_path(notif, old_dirfd, old_ptr)?;
     let (new_dir, new) = capture_path(notif, new_dirfd, new_ptr)?;
@@ -1227,7 +1277,7 @@ fn single_path_target(
     notif: &SeccompNotif,
     dirfd: u64,
     ptr: u64,
-    operation: impl FnOnce(OwnedFd, Vec<u8>) -> FilesystemMutation,
+    operation: impl FnOnce(MutationDir, Vec<u8>) -> FilesystemMutation,
     access: FileAccess,
 ) -> io::Result<SyscallTarget> {
     let (dir, raw) = capture_path(notif, dirfd, ptr)?;
@@ -1305,12 +1355,12 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 /// Whether the node to create already exists, so the kernel would fail the
 /// syscall with `EEXIST` and no policy request is warranted.
-fn node_already_exists(dir: &OwnedFd, raw: &[u8]) -> bool {
+fn node_already_exists(dir: &MutationDir, raw: &[u8]) -> bool {
     if raw.starts_with(b"/") {
         return std::fs::symlink_metadata(path_from_raw(raw)).is_ok();
     }
 
-    let mut candidate = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
+    let mut candidate = format!("/proc/self/fd/{}/", dir.as_fd().as_raw_fd()).into_bytes();
     candidate.extend_from_slice(raw);
 
     std::fs::symlink_metadata(PathBuf::from(std::ffi::OsString::from_vec(candidate))).is_ok()
@@ -1437,7 +1487,60 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalize_path_handle(path, open_path_handle(path))
 }
 
-fn normalize_captured_path(dir: &OwnedFd, raw: &[u8]) -> io::Result<PathBuf> {
+/// True only for absolute names with no empty, `.`, or `..` components.
+/// Without this check a name like `/allowed/../denied/x` would be trusted as
+/// canonical and match the wrong rule.
+fn is_lexically_normal(raw: &[u8]) -> bool {
+    if !raw.starts_with(b"/") {
+        return false;
+    }
+    for component in raw.split(|byte| *byte == b'/').skip(1) {
+        if component.is_empty() || component == b"." || component == b".." {
+            return false;
+        }
+    }
+    true
+}
+
+fn openat2_no_symlinks(path: &Path) -> io::Result<OwnedFd> {
+    nix::fcntl::openat2(
+        root_handle(),
+        path,
+        nix::fcntl::OpenHow::new()
+            .flags(nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC)
+            .resolve(nix::fcntl::ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )
+    .map_err(io::Error::from)
+}
+
+/// Canonicalize a captured path against its pinned directory.
+///
+/// Fast path: an absolute, lexically normal captured name proved symlink-free
+/// by `RESOLVE_NO_SYMLINKS` is already canonical, so it is returned without
+/// `readlink` and without a `format!` allocation. `RESOLVE_NO_SYMLINKS`
+/// failing with `ELOOP` means a symlink (or magic link) was traversed, so the
+/// captured name is *not* canonical and the `openat` + `readlink` +
+/// `canonicalize` body below runs unchanged; `ENOSYS`/`EINVAL` mean the kernel
+/// or the flags are unsupported, so fall through to the same body; any other
+/// error (for example `ENOENT`/`ENOTDIR` on a name that does not exist yet)
+/// means there is no alias to resolve, which is exactly what that body returns
+/// via `capture_fallback_path` for absolute names.
+fn normalize_captured_path(dir: &MutationDir, raw: &[u8]) -> io::Result<PathBuf> {
+    let candidate = path_from_raw(raw);
+    if candidate.is_absolute() && is_lexically_normal(raw) {
+        match openat2_no_symlinks(&candidate) {
+            Ok(fd) => {
+                drop(fd);
+                return Ok(candidate);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ELOOP | libc::ENOSYS | libc::EINVAL)
+                ) => {}
+            Err(_) => return Ok(candidate),
+        }
+    }
     let fd = nix::fcntl::openat(
         dir,
         Path::new(std::ffi::OsStr::from_bytes(raw)),
@@ -2446,5 +2549,60 @@ mod tests {
     fn parse_msghdr_target_handles_null_name() {
         let bytes = [0u8; 56];
         assert_eq!(parse_msghdr_target(&bytes), None);
+    }
+
+    #[test]
+    fn normalize_captured_path_fast_path_proves_symlink_free() {
+        use std::os::unix::ffi::OsStrExt;
+
+        super::init_root_handle().expect("init root handle");
+        let root =
+            std::env::temp_dir().join(format!("broker-normalize-fast-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::create_dir_all(root.join("target")).expect("create target dir");
+        fs::create_dir_all(root.join("sub")).expect("create sub dir");
+        let target_file = root.join("target").join("sub");
+        fs::write(&target_file, b"target").expect("write target file");
+        let plain = root.join("plain");
+        fs::write(&plain, b"plain").expect("write plain file");
+        std::os::unix::fs::symlink(&target_file, root.join("link")).expect("create link");
+
+        let link = root.join("link");
+        let link_raw = link.as_os_str().as_bytes().to_vec();
+        let resolved_link = super::normalize_captured_path(&super::MutationDir::Root, &link_raw)
+            .expect("normalize link");
+        assert_eq!(
+            resolved_link, target_file,
+            "symlink access path must resolve, not trust the captured name"
+        );
+        assert_ne!(
+            resolved_link, link,
+            "fast path must not return a symlinked name unchanged"
+        );
+
+        let plain_raw = plain.as_os_str().as_bytes().to_vec();
+        let resolved_plain = super::normalize_captured_path(&super::MutationDir::Root, &plain_raw)
+            .expect("normalize plain");
+        assert_eq!(
+            resolved_plain, plain,
+            "symlink-free absolute name must return without readlink"
+        );
+
+        let dotdot = root.join("sub").join("..").join("plain");
+        let dotdot_raw = dotdot.as_os_str().as_bytes().to_vec();
+        let resolved_dotdot =
+            super::normalize_captured_path(&super::MutationDir::Root, &dotdot_raw)
+                .expect("normalize dotdot");
+        assert_eq!(
+            resolved_dotdot, plain,
+            "non-normal name must canonicalize rather than trust the captured string"
+        );
+        assert_ne!(
+            resolved_dotdot, dotdot,
+            "non-normal name must not be returned unchanged"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
     }
 }

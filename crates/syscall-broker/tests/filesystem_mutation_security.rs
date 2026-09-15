@@ -8,9 +8,14 @@ use std::{ffi::CString, os::fd::AsRawFd, path::PathBuf};
 use agent_sandbox_core::FileAccess;
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    FilesystemMutation, FilesystemTarget, SeccompData, SeccompNotif, SyscallTarget,
-    target_from_notification,
+    FilesystemMutation, FilesystemTarget, MutationDir, SeccompData, SeccompNotif, SyscallTarget,
+    init_root_handle, target_from_notification,
 };
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn ensure_root_handle() {
+    init_root_handle().expect("init root handle");
+}
 
 fn as_seccomp_nr(raw: i64) -> i32 {
     i32::try_from(raw).expect("syscall number fits in seccomp_data.nr")
@@ -55,6 +60,7 @@ fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn rename_and_link_register_all_mutation_endpoints() {
+    ensure_root_handle();
     let rename_checks = filesystem_checks(&notif_with_path_args(nr::RENAME, &[
         "/repo/old.txt",
         "/repo/new.txt",
@@ -87,6 +93,7 @@ fn rename_and_link_register_all_mutation_endpoints() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn symlink_checks_target_read_and_linkpath_write() {
+    ensure_root_handle();
     let symlink_checks = filesystem_checks(&notif_with_path_args(nr::SYMLINK, &[
         "/tmp/target",
         "/tmp/link",
@@ -105,6 +112,7 @@ fn symlink_checks_target_read_and_linkpath_write() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn single_path_mutation_syscalls_require_write_access() {
+    ensure_root_handle();
     for (syscall_nr, path) in [(nr::UNLINK, "/tmp/gone"), (nr::TRUNCATE, "/tmp/file")] {
         let checks = filesystem_checks(&notif_with_path_args(syscall_nr, &[path]));
 
@@ -119,6 +127,7 @@ fn single_path_mutation_syscalls_require_write_access() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn mkdir_skips_policy_only_when_target_exists() {
+    ensure_root_handle();
     let current_dir = std::env::current_dir().expect("current directory");
     let existing = current_dir.to_string_lossy();
 
@@ -152,6 +161,7 @@ fn mkdir_skips_policy_only_when_target_exists() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn long_multicomponent_path_classifies_full_endpoint() {
+    ensure_root_handle();
     let mut long = String::from("/tmp");
     while long.len() <= 256 {
         long.push_str("/abcdefghijklmno");
@@ -167,6 +177,7 @@ fn long_multicomponent_path_classifies_full_endpoint() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn unterminated_path_max_buffer_is_enametoolong() {
+    ensure_root_handle();
     let len = libc::PATH_MAX as usize;
     let buf = vec![b'a'; len];
     let ptr = buf.as_ptr() as u64;
@@ -190,6 +201,7 @@ fn unterminated_path_max_buffer_is_enametoolong() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_mutation_captures_tracee_cwd() {
+    ensure_root_handle();
     let notif = notif_with_path_args(nr::UNLINK, &["relative-path"]);
     let target = target_from_notification(&notif).expect("classify relative unlink");
     let current_dir = std::env::current_dir().expect("current directory");
@@ -209,6 +221,10 @@ fn relative_mutation_captures_tracee_cwd() {
 
     assert_eq!(path, b"relative-path");
 
+    let MutationDir::Handle(dir) = dir else {
+        panic!("relative unlink must pin a directory handle");
+    };
+
     assert_eq!(
         std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
             .expect("read captured cwd"),
@@ -219,6 +235,7 @@ fn relative_mutation_captures_tracee_cwd() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_mutation_resolves_live_symlink_targets() {
+    ensure_root_handle();
     let cwd = std::env::current_dir().expect("current directory");
     let root = cwd.join(format!("broker-relative-{}", std::process::id()));
     std::fs::create_dir(&root).expect("temporary directory");
@@ -247,6 +264,7 @@ fn relative_mutation_resolves_live_symlink_targets() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_unlinkat_accepts_zero_extended_at_fdcwd() {
+    ensure_root_handle();
     let mut notif = notif_with_path_args(nr::UNLINKAT, &["relative-path"]);
     notif.data.args[1] = notif.data.args[0];
     notif.data.args[0] = u64::from(libc::AT_FDCWD.cast_unsigned());
@@ -262,6 +280,7 @@ fn relative_unlinkat_accepts_zero_extended_at_fdcwd() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_renameat2_accepts_zero_extended_at_fdcwd() {
+    ensure_root_handle();
     let mut notif = notif_with_path_args(nr::RENAMEAT2, &["old-path", "new-path"]);
     let old = notif.data.args[0];
     let new = notif.data.args[1];
