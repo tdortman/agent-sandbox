@@ -151,23 +151,40 @@ fn mkdir_skips_policy_only_when_target_exists() {
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
-fn filesystem_mutation_captures_path_before_policy() {
-    let original = CString::new("/tmp/agent-sandbox-stable-path").expect("nul-free path");
-    let swapped = CString::new("/tmp/agent-sandbox-swapped-path").expect("nul-free path");
-    let mut notif = notif_with_path_args(nr::UNLINK, &[original.to_string_lossy().as_ref()]);
-    let target = target_from_notification(&notif).expect("classify unlink");
-    notif.data.args[0] = swapped.as_ptr().cast::<u8>() as u64;
-    assert_eq!(notif.data.args[0], swapped.as_ptr().cast::<u8>() as u64);
+fn long_multicomponent_path_classifies_full_endpoint() {
+    let mut long = String::from("/tmp");
+    while long.len() <= 256 {
+        long.push_str("/abcdefghijklmno");
+    }
+    let notif = notif_with_path_args(nr::UNLINK, &[&long]);
+    assert_eq!(
+        filesystem_checks(&notif),
+        vec![(PathBuf::from(&long), FileAccess::Write)],
+        "path beyond the 256-byte prefix must authorize the full endpoint"
+    );
+}
 
-    let Some(SyscallTarget::Filesystem(FilesystemTarget {
-        operation: FilesystemMutation::Unlink { path, .. },
-        ..
-    })) = target
-    else {
-        panic!("expected captured unlink");
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn unterminated_path_max_buffer_is_enametoolong() {
+    let len = libc::PATH_MAX as usize;
+    let buf = vec![b'a'; len];
+    let ptr = buf.as_ptr() as u64;
+    let notif = SeccompNotif {
+        pid: std::process::id(),
+        data: SeccompData {
+            nr: as_seccomp_nr(nr::UNLINK),
+            args: [ptr, 0, 0, 0, 0, 0],
+            ..SeccompData::default()
+        },
+        ..SeccompNotif::default()
     };
 
-    assert_eq!(path, original.as_bytes());
+    let target = target_from_notification(&notif).expect("classify unterminated path");
+    assert!(
+        matches!(target, Some(SyscallTarget::Errno(libc::ENAMETOOLONG))),
+        "PATH_MAX bytes without NUL must be ENAMETOOLONG, not a truncated authorization"
+    );
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

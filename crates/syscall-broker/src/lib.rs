@@ -990,7 +990,11 @@ fn read_raw_path(pid: u32, ptr: u64) -> io::Result<Vec<u8>> {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }
 
-    let bytes = read_tracee_bytes(pid, ptr, libc::PATH_MAX as usize)?;
+    const SHORT_PATH: usize = 256;
+    let mut bytes = read_tracee_bytes(pid, ptr, SHORT_PATH)?;
+    if bytes.len() == SHORT_PATH && !bytes.contains(&0) {
+        bytes = read_tracee_bytes(pid, ptr, libc::PATH_MAX as usize)?;
+    }
 
     let end = bytes
         .iter()
@@ -1001,7 +1005,8 @@ fn read_raw_path(pid: u32, ptr: u64) -> io::Result<Vec<u8>> {
         return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     }
 
-    Ok(bytes[..end].to_vec())
+    bytes.truncate(end);
+    Ok(bytes)
 }
 
 fn path_from_raw(raw: &[u8]) -> PathBuf {
