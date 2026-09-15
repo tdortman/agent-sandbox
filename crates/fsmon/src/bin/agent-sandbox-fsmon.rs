@@ -2,7 +2,7 @@
 //! mark each mountpoint, then event-loop handling permission events.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     ffi::CString,
     fs,
     fs::File,
@@ -18,6 +18,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process,
+    sync::{Arc, Condvar, Mutex},
 };
 
 use agent_sandbox_core::{
@@ -662,31 +663,90 @@ impl SandboxCgroup {
     }
 }
 
+/// Permission events answered at the same time, bounded because each worker is
+/// an independent event consumer rather than a CPU thread.
+///
+/// Answering one permission event at a time serialised parallel filesystem
+/// work: every sandboxed process waited for the single event being handled,
+/// so concurrent read-only opens ran at the monitor's service rate instead of
+/// the filesystem's. Each worker instead owns a policy client and runtime and
+/// blocks on the shared queue, so independent opens are mediated
+/// concurrently. The bound avoids wakeup contention: workers beyond the event
+/// rate only add condvar wakeups.
+const WORKER_LIMIT: usize = 4;
+
+/// Jobs waiting for a worker, bounded so a burst of permission events cannot
+/// grow memory without limit: the reader blocks when the queue is full
+/// (backpressure).
+const QUEUE_LIMIT: usize = 256;
+
+/// One fanotify permission event handed from the reader to a worker.
+///
+/// Carries only parsed fields plus the event fd, never a borrow of the read
+/// buffer, so the reader reuses its buffer while workers run.
+struct Job {
+    mask: u64,
+    pid: i32,
+    event_fd: OwnedFd,
+}
+
+/// Read-only state every fsmon worker shares.
+struct Shared {
+    fan_fd: OwnedFd,
+    self_pid: i32,
+    sandbox_cgroup: SandboxCgroup,
+    host_proc: HostProc,
+    ctx: agent_sandbox_core::RequestContext,
+    socket_path: PathBuf,
+    static_allow: StaticPolicyAllow,
+}
+
+/// Bounded hand-off from the reader to the workers: the reader blocks when
+/// full, workers block on the condvar when empty.
+type JobQueue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
+
 /// Event loop: read fanotify events and forward to policyd for allow/deny
 /// verdicts.
+///
+/// The reader only reads batches, parses the event framing, and enqueues
+/// permission events; a dedicated pool of `WORKER_LIMIT` workers (the reader
+/// does not double as a worker) answers them. fsmon runs until it is killed.
 fn run_event_loop(
-    fan_fd: &std::os::fd::OwnedFd,
+    fan_fd: std::os::fd::OwnedFd,
     self_pid: i32,
-    sandbox_cgroup: &SandboxCgroup,
-    host_proc: &HostProc,
-    ctx: &agent_sandbox_core::RequestContext,
+    sandbox_cgroup: SandboxCgroup,
+    host_proc: HostProc,
+    ctx: agent_sandbox_core::RequestContext,
     socket_path: &Path,
-    static_allow: &StaticPolicyAllow,
+    static_allow: StaticPolicyAllow,
 ) -> ! {
     use std::os::fd::AsFd;
 
+    let shared = Arc::new(Shared {
+        fan_fd,
+        self_pid,
+        sandbox_cgroup,
+        host_proc,
+        ctx,
+        socket_path: socket_path.to_path_buf(),
+        static_allow,
+    });
+    let queue: JobQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+
+    for _ in 0..std::thread::available_parallelism()
+        .map_or(1, |parallelism| parallelism.get().min(WORKER_LIMIT))
+        .max(1)
+    {
+        let shared = Arc::clone(&shared);
+        let queue = Arc::clone(&queue);
+        std::thread::spawn(move || worker(&shared, &queue));
+    }
+
     let mut buf = vec![0u8; 4096];
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-
-    let mut pid_cgroup_cache = HashSet::new();
-    let mut rpc = MonitorClient::new(socket_path);
+    let mut batch = Vec::new();
 
     loop {
-        let n = match nix::unistd::read(fan_fd.as_fd(), &mut buf) {
+        let n = match nix::unistd::read(shared.fan_fd.as_fd(), &mut buf) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!("agent-sandbox-fsmon: read from fanotify fd: {e}");
@@ -715,76 +775,147 @@ fn run_event_loop(
 
             if meta.fd >= 0 && meta.mask & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) != 0 {
                 let event_fd = take_fanotify_event_fd(meta.fd).expect("event fd");
-
-                if try_fast_path_allow(
-                    fan_fd,
-                    &meta,
-                    &event_fd,
-                    self_pid,
-                    sandbox_cgroup,
-                    host_proc,
-                    &mut pid_cgroup_cache,
-                ) {
-                    offset += event_len;
-                    continue;
-                }
-
-                let path = match resolve_blocked_open_path(host_proc, meta.pid, &event_fd)
-                    .ok_or(FAN_DENY)
-                {
-                    Ok(path) => path,
-                    Err(verdict) => {
-                        tracing::warn!(
-                            pid = meta.pid,
-                            "path resolution failed, denying (fail-closed)"
-                        );
-                        respond(fan_fd, &event_fd, verdict);
-                        offset += event_len;
-                        continue;
-                    }
-                };
-
-                if !open_needs_access_lookup(meta.mask, &path, static_allow) {
-                    respond(fan_fd, &event_fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-
-                let access = normalize_directory_traverse_access(
-                    Path::new(&path),
-                    mask_to_access(host_proc, meta.mask, &event_fd, meta.pid),
-                );
-
-                if static_allow.allows(Path::new(&path), access) {
-                    respond(fan_fd, &event_fd, FAN_ALLOW);
-                    offset += event_len;
-                    continue;
-                }
-
-                tracing::debug!(%path, ?access, pid = meta.pid, "filesystem check");
-                let mut event_ctx = ctx.clone();
-                event_ctx.pid = u32::try_from(meta.pid).ok();
-
-                let reply =
-                    runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
-
-                let verdict = match &reply {
-                    Ok(r) if r.verdict.allowed => FAN_ALLOW,
-                    _ => FAN_DENY,
-                };
-
-                if verdict == FAN_DENY {
-                    tracing::info!(%path, ?access, "denied by policy");
-                }
-
-                respond(fan_fd, &event_fd, verdict);
+                batch.push(Job {
+                    mask: meta.mask,
+                    pid: meta.pid,
+                    event_fd,
+                });
             } else if meta.fd >= 0 {
                 let _ = take_fanotify_event_fd(meta.fd);
             }
 
             offset += event_len;
         }
+
+        if !batch.is_empty() {
+            enqueue(&queue, &mut batch);
+        }
     }
+}
+
+/// Serve queued permission events until killed, with worker-local RPC state.
+///
+/// Each worker owns its policy client, tokio runtime, and pid cgroup cache;
+/// only the read-only [`Shared`] state and the queue are shared.
+fn worker(shared: &Shared, queue: &JobQueue) -> ! {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let mut rpc = MonitorClient::new(shared.socket_path.clone());
+    let mut pid_cgroup_cache = HashSet::new();
+
+    loop {
+        let job = dequeue(queue);
+        handle_permission_event(shared, job, &mut rpc, &runtime, &mut pid_cgroup_cache);
+    }
+}
+
+/// Enqueue a read batch with one lock acquisition, blocking while the queue is
+/// full (backpressure: no unbounded growth, no busy spin).
+///
+/// One lock and one wakeup per batch instead of per event: the reader is the
+/// only producer, and a per-event hand-off made it the next serialisation
+/// point after the workers took over the verdict work.
+fn enqueue(queue: &JobQueue, batch: &mut Vec<Job>) {
+    let incoming = std::mem::take(batch);
+    let mut jobs = queue.0.lock().unwrap_or_else(|poison| poison.into_inner());
+    while jobs.len() + incoming.len() > QUEUE_LIMIT {
+        jobs = queue
+            .1
+            .wait(jobs)
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
+    jobs.extend(incoming);
+    drop(jobs);
+    queue.1.notify_all();
+}
+/// Dequeue a job, blocking on the condvar while the queue is empty. The
+/// `while` loop guards against spurious wakeups; every push is followed by a
+/// notify under the same lock, so no wakeup is lost.
+fn dequeue(queue: &JobQueue) -> Job {
+    let mut jobs = queue.0.lock().unwrap_or_else(|poison| poison.into_inner());
+    while jobs.is_empty() {
+        jobs = queue
+            .1
+            .wait(jobs)
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
+    let job = jobs.pop_front().expect("queued job");
+    drop(jobs);
+    // Wake a reader blocked on a full queue; a no-op when nobody waits.
+    queue.1.notify_one();
+    job
+}
+
+/// Answer one queued permission event: the former inline event-loop body,
+/// unchanged. Every path responds exactly once; unresolvable paths fail
+/// closed (`FAN_DENY`) with the same log messages as before.
+fn handle_permission_event(
+    shared: &Shared,
+    job: Job,
+    rpc: &mut MonitorClient,
+    runtime: &tokio::runtime::Runtime,
+    pid_cgroup_cache: &mut HashSet<i32>,
+) {
+    let Job {
+        mask,
+        pid,
+        event_fd,
+    } = job;
+
+    if try_fast_path_allow(
+        &shared.fan_fd,
+        pid,
+        &event_fd,
+        shared.self_pid,
+        &shared.sandbox_cgroup,
+        &shared.host_proc,
+        pid_cgroup_cache,
+    ) {
+        return;
+    }
+
+    let path = match resolve_blocked_open_path(&shared.host_proc, pid, &event_fd).ok_or(FAN_DENY) {
+        Ok(path) => path,
+        Err(verdict) => {
+            tracing::warn!(pid, "path resolution failed, denying (fail-closed)");
+            respond(&shared.fan_fd, &event_fd, verdict);
+            return;
+        }
+    };
+
+    if !open_needs_access_lookup(mask, &path, &shared.static_allow) {
+        respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+        return;
+    }
+
+    let access = normalize_directory_traverse_access(
+        Path::new(&path),
+        mask_to_access(&shared.host_proc, mask, &event_fd, pid),
+    );
+
+    if shared.static_allow.allows(Path::new(&path), access) {
+        respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+        return;
+    }
+
+    tracing::debug!(%path, ?access, pid, "filesystem check");
+    let mut event_ctx = shared.ctx.clone();
+    event_ctx.pid = u32::try_from(pid).ok();
+
+    let reply = runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
+
+    let verdict = match &reply {
+        Ok(r) if r.verdict.allowed => FAN_ALLOW,
+        _ => FAN_DENY,
+    };
+
+    if verdict == FAN_DENY {
+        tracing::info!(%path, ?access, "denied by policy");
+    }
+
+    respond(&shared.fan_fd, &event_fd, verdict);
 }
 
 /// Join the mount namespace of `target_pid`, refusing when it is our own.
@@ -927,13 +1058,13 @@ fn main() {
     });
 
     run_event_loop(
-        &fan_fd,
+        fan_fd,
         self_pid,
-        &sandbox_cgroup,
-        &host_proc,
-        &ctx,
+        sandbox_cgroup,
+        host_proc,
+        ctx,
         socket_path,
-        &static_allow,
+        static_allow,
     );
 }
 
@@ -950,33 +1081,33 @@ fn main() {
 /// auto-allowed.
 fn try_fast_path_allow(
     fan_fd: &OwnedFd,
-    meta: &FanotifyEventMetadata,
+    pid: i32,
     event_fd: &OwnedFd,
     self_pid: i32,
     sandbox_cgroup: &SandboxCgroup,
     host_proc: &HostProc,
     pid_cgroup_cache: &mut HashSet<i32>,
 ) -> bool {
-    if meta.pid == self_pid {
+    if pid == self_pid {
         respond(fan_fd, event_fd, FAN_ALLOW);
         return true;
     }
 
-    if pid_cgroup_cache.insert(meta.pid) {
+    if pid_cgroup_cache.insert(pid) {
         // First observation of this pid: classify its cgroup membership.
-        let process_pid = host_proc.thread_group_id(meta.pid).unwrap_or(meta.pid);
+        let process_pid = host_proc.thread_group_id(pid).unwrap_or(pid);
 
         match sandbox_cgroup.contains(host_proc, process_pid) {
             Some(true) => {}
 
             Some(false) => {
-                pid_cgroup_cache.remove(&meta.pid);
+                pid_cgroup_cache.remove(&pid);
                 respond(fan_fd, event_fd, FAN_ALLOW);
                 return true;
             }
 
             None => {
-                pid_cgroup_cache.remove(&meta.pid);
+                pid_cgroup_cache.remove(&pid);
                 respond(fan_fd, event_fd, FAN_DENY);
                 return true;
             }
