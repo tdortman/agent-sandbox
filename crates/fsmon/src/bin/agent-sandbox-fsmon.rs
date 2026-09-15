@@ -116,9 +116,7 @@ struct Cli {
 }
 
 // fanotify constants and event structs come from `agent_sandbox_sysutil`.
-use agent_sandbox_sysutil::{
-    FAN_ALLOW, FAN_DENY, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM,
-};
+use agent_sandbox_sysutil::{FAN_ALLOW, FAN_DENY, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM};
 
 /// Host procfs directory opened before `setns` into a sandbox mount namespace.
 ///
@@ -557,6 +555,20 @@ fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i3
     FileAccess::All
 }
 
+/// Whether the blocked open's access mode must be recovered from the tracee.
+///
+/// A static rule granting read-write (or all) access covers every access a
+/// non-exec open can request, so the verdict is already known and
+/// `/proc/<pid>/syscall` need not be read. Execute events and narrower grants
+/// still need the real flags: a read-only grant must not admit a write.
+fn open_needs_access_lookup(mask: u64, path: &str, static_allow: &StaticPolicyAllow) -> bool {
+    if mask & FAN_OPEN_EXEC_PERM != 0 {
+        return true;
+    }
+
+    !static_allow.allows_literal(Path::new(path), FileAccess::ReadWrite)
+}
+
 /// Mark each mount point, skipping synthetic filesystem types. Returns whether
 /// a marked mount covers the home directory.
 fn mark_mountpoints(
@@ -732,7 +744,7 @@ fn run_event_loop(
                     }
                 };
 
-                if static_allow.allows_literal(Path::new(&path), FileAccess::All) {
+                if !open_needs_access_lookup(meta.mask, &path, static_allow) {
                     respond(fan_fd, &event_fd, FAN_ALLOW);
                     offset += event_len;
                     continue;
@@ -986,6 +998,51 @@ mod tests {
 
     fn test_event_file() -> File {
         File::open("/dev/null").expect("open event fixture")
+    }
+
+    fn static_allow(rule: &str) -> StaticPolicyAllow {
+        let path = std::env::temp_dir().join(format!("fsmon-static-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("{{\"filesystem\": {{\"allow\": [{rule}]}}}}"),
+        )
+        .expect("write policy fixture");
+        let allow = StaticPolicyAllow::load(&path, None);
+        std::fs::remove_file(&path).expect("remove policy fixture");
+        allow
+    }
+
+    #[test]
+    fn read_write_grant_skips_access_lookup_for_non_exec_opens_only() {
+        let read_write = static_allow(r#"{"path": "/srv/project", "access": "read_write"}"#);
+        assert!(!open_needs_access_lookup(
+            FAN_OPEN_PERM,
+            "/srv/project/file",
+            &read_write
+        ));
+        assert!(open_needs_access_lookup(
+            FAN_OPEN_PERM,
+            "/srv/elsewhere/file",
+            &read_write
+        ));
+        assert!(open_needs_access_lookup(
+            FAN_OPEN_EXEC_PERM,
+            "/srv/project/tool",
+            &read_write
+        ));
+
+        let all = static_allow(r#"{"path": "/srv/project", "access": "all"}"#);
+        assert!(!open_needs_access_lookup(
+            FAN_OPEN_PERM,
+            "/srv/project/file",
+            &all
+        ));
+
+        let read_only = static_allow(r#"{"path": "/srv/project", "access": "read"}"#);
+        assert!(
+            open_needs_access_lookup(FAN_OPEN_PERM, "/srv/project/file", &read_only),
+            "a read-only grant must not admit a write without the tracee's flags"
+        );
     }
 
     #[test]
