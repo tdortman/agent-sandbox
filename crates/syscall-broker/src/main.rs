@@ -13,6 +13,10 @@ use std::{
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -109,8 +113,30 @@ struct Cli {
     child_pid: Option<i32>,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::io::Result<()> {
+/// Notifications served at the same time, bounded because each worker is a
+/// separate notification consumer rather than a CPU thread.
+///
+/// One loop made the broker a serialisation point: every sandboxed process
+/// waited for the single notification being handled, so parallel filesystem
+/// work (builds, installers, checkouts) ran at the broker's service rate
+/// instead of the filesystem's. Each worker instead owns a policy client and
+/// blocks in `SECCOMP_IOCTL_NOTIF_RECV`, and the kernel hands each
+/// notification to exactly one waiter.
+const WORKER_LIMIT: usize = 4;
+
+/// State every broker worker shares.
+struct Shared {
+    policy_socket: PathBuf,
+    static_allow: StaticPolicyAllow,
+    sandbox_session_id: Option<String>,
+    listener_fd: i32,
+    timeout: Duration,
+    network_policy: dispatch::NetworkPolicyBypass,
+    child_pid: Option<i32>,
+    child_resumed: AtomicBool,
+}
+
+fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -127,20 +153,55 @@ async fn main() -> std::io::Result<()> {
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
-    let mut policy_client = PersistentPolicyClient::new_trusted(cli.policy_socket.clone());
 
     let project_root = std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
         .ok()
         .map(PathBuf::from);
 
-    let static_allow = StaticPolicyAllow::load(Path::new(EXPORTED_POLICY_PATH), project_root);
+    let shared = Arc::new(Shared {
+        policy_socket: cli.policy_socket.clone(),
+        static_allow: StaticPolicyAllow::load(Path::new(EXPORTED_POLICY_PATH), project_root),
+        sandbox_session_id: cli.sandbox_session_id.clone(),
+        listener_fd: cli.listener_fd,
+        timeout,
+        network_policy: dispatch::NetworkPolicyBypass {
+            ownership: NetworkOwnership {
+                proxy_mode: network_mode == NetworkMode::Proxy,
+                udp_proxy_ports: Vec::new(),
+            },
+            dns_endpoint,
+        },
+        child_pid: cli.child_pid,
+        child_resumed: AtomicBool::new(false),
+    });
 
-    // Don't SIGCONT the child until the broker is inside its notification
-    // loop and ready to receive. The child traps from the first openat onward
-    // (dynamic linker), and if the kernel finds a USER_NOTIF filter with no
-    // listener-fd holder, it returns ENOSYS to the tracee. We set a flag and
-    // SIGCONT on the first loop iteration.
-    let mut child_was_resumed = false;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |parallelism| parallelism.get().min(WORKER_LIMIT))
+        .max(1);
+
+    let mut handles = Vec::with_capacity(workers - 1);
+    for _ in 1..workers {
+        let shared = Arc::clone(&shared);
+        handles.push(std::thread::spawn(move || serve(&shared)));
+    }
+
+    let result = serve(&shared);
+    for handle in handles {
+        let _ = handle.join();
+    }
+    result
+}
+
+/// Serve seccomp notifications until the supervised child exits.
+///
+/// # Errors
+///
+/// Returns an error when the worker runtime or policy client cannot be set up.
+fn serve(shared: &Shared) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut policy_client = PersistentPolicyClient::new_trusted(shared.policy_socket.clone());
     let mut notifications_since_exit_check: u32 = 0;
 
     loop {
@@ -150,35 +211,38 @@ async fn main() -> std::io::Result<()> {
         // safety net for a child that dies without an outstanding notification.
         if notifications_since_exit_check >= EXIT_CHECK_INTERVAL {
             notifications_since_exit_check = 0;
-            propagate_child_exit(cli.child_pid);
+            propagate_child_exit(shared.child_pid);
         }
 
-        if !child_was_resumed {
-            if let Some(pid) = cli.child_pid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGCONT,
-                );
+        // Don't SIGCONT the child until the broker is inside its notification
+        // loop and ready to receive. The child traps from the first openat
+        // onward (dynamic linker), and if the kernel finds a USER_NOTIF filter
+        // with no listener-fd holder, it returns ENOSYS to the tracee. The
+        // first worker to get here resumes the child, once.
+        if !shared.child_resumed.swap(true, Ordering::AcqRel)
+            && let Some(pid) = shared.child_pid
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGCONT,
+            );
 
-                debug!(child_pid = pid, "resumed sandboxed child");
-            }
-
-            child_was_resumed = true;
+            debug!(child_pid = pid, "resumed sandboxed child");
         }
 
-        let notif = match recv_notification(cli.listener_fd) {
+        let notif = match recv_notification(shared.listener_fd) {
             Ok(notif) => {
                 notifications_since_exit_check += 1;
                 notif
             }
             Err(err) => match err.raw_os_error() {
                 Some(libc::EINTR) => {
-                    propagate_child_exit(cli.child_pid);
+                    propagate_child_exit(shared.child_pid);
                     continue;
                 }
                 Some(libc::EAGAIN) => {
-                    propagate_child_exit(cli.child_pid);
-                    time::sleep(Duration::from_millis(50)).await;
+                    propagate_child_exit(shared.child_pid);
+                    runtime.block_on(async { time::sleep(Duration::from_millis(50)).await });
                     continue;
                 }
                 Some(libc::ENOENT) => {
@@ -195,37 +259,30 @@ async fn main() -> std::io::Result<()> {
                     // If the child has truly exited, propagate_child_exit() above
                     // propagates its status. Brief backoff so a signal-storm won't
                     // spin the loop.
-                    propagate_child_exit(cli.child_pid);
+                    propagate_child_exit(shared.child_pid);
                     debug!("notification withdrawn before processing");
-                    time::sleep(Duration::from_millis(1)).await;
+                    runtime.block_on(async { time::sleep(Duration::from_millis(1)).await });
                     continue;
                 }
                 _ => {
-                    propagate_child_exit(cli.child_pid);
+                    propagate_child_exit(shared.child_pid);
                     warn!(error = %err, "seccomp notification receive failed");
-                    time::sleep(Duration::from_millis(50)).await;
+                    runtime.block_on(async { time::sleep(Duration::from_millis(50)).await });
                     continue;
                 }
             },
         };
 
-        dispatch::dispatch_notification_with_mode(
-            &cli.policy_socket,
+        runtime.block_on(dispatch::dispatch_notification_with_mode(
+            &shared.policy_socket,
             &mut policy_client,
-            &static_allow,
-            cli.sandbox_session_id.as_deref(),
-            cli.listener_fd,
+            &shared.static_allow,
+            shared.sandbox_session_id.as_deref(),
+            shared.listener_fd,
             &notif,
-            timeout,
-            dispatch::NetworkPolicyBypass {
-                ownership: NetworkOwnership {
-                    proxy_mode: network_mode == NetworkMode::Proxy,
-                    udp_proxy_ports: Vec::new(),
-                },
-                dns_endpoint,
-            },
-        )
-        .await;
+            shared.timeout,
+            shared.network_policy.clone(),
+        ));
     }
 }
 
