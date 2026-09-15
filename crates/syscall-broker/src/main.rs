@@ -133,7 +133,6 @@ async fn main() -> std::io::Result<()> {
         .map(PathBuf::from);
 
     let static_allow = StaticPolicyAllow::load(Path::new(EXPORTED_POLICY_PATH), project_root);
-    let filesystem_worker = dispatch::start_filesystem_worker(cli.listener_fd)?;
 
     // Don't SIGCONT the child until the broker is inside its notification
     // loop and ready to receive. The child traps from the first openat onward
@@ -224,7 +223,6 @@ async fn main() -> std::io::Result<()> {
                 },
                 dns_endpoint,
             },
-            &filesystem_worker,
         )
         .await;
     }
