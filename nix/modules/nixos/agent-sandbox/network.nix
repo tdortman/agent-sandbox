@@ -674,6 +674,13 @@ in
                       access = "all";
                       path = "/nix/store";
                     }
+                    {
+                      # The wrapper's own session context, read once per
+                      # sandboxed command. Read-only: nothing inside the
+                      # sandbox may rewrite the context it is judged by.
+                      access = "read";
+                      path = "/run/agent-sandbox/session-context.json";
+                    }
                   ]
                   ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
 

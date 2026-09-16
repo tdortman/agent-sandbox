@@ -556,6 +556,10 @@ let
             }
             {
               access = "read";
+              path = "/run/agent-sandbox/session-context.json";
+            }
+            {
+              access = "read";
               path = "~/.config/agent-sandbox";
             }
             {
