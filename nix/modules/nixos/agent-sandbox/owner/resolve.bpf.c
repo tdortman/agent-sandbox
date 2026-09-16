@@ -142,6 +142,16 @@ static __always_inline int emit_read_failure(struct bpf_iter__task_file *ctx,
 
 SEC("iter/task_file")
 int asbx_owners(struct bpf_iter__task_file *ctx) {
+    struct task_struct *task = ctx->task;
+    struct file *file = ctx->file;
+    /* The iterator pins the file and inode. Most descriptors are not sockets;
+     * reject them before looking up the per-query map. */
+    struct inode *inode = file ? file->f_inode : NULL;
+    if (task && file && inode &&
+        ((inode->i_mode & S_IFMT) != S_IFSOCK || (file->f_mode & FMODE_PATH))) {
+        return 0;
+    }
+
     __u32 key = 0;
     const struct owner_query *query = bpf_map_lookup_elem(&queries, &key);
     if (!query) {
@@ -149,24 +159,17 @@ int asbx_owners(struct bpf_iter__task_file *ctx) {
     }
 
     struct owner_record record = {.nonce = query->nonce};
-    struct task_struct *task = ctx->task;
     if (!task) {
         record.complete = 1;
         return emit_record(ctx, &record);
     }
 
-    struct file *file = ctx->file;
     if (!file) {
         return 0;
     }
 
-    /* The iterator holds a file reference, which also pins its inode. */
-    struct inode *inode = file->f_inode;
     if (!inode) {
         return emit_read_failure(ctx, query);
-    }
-    if ((inode->i_mode & S_IFMT) != S_IFSOCK || (file->f_mode & FMODE_PATH)) {
-        return 0;
     }
 
     struct socket *socket = NULL;
