@@ -8,7 +8,7 @@ Run agent CLIs inside a bubblewrap jail on NixOS. Unknown operations block until
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Network    | Per-sandbox network namespace and outbound TCP/UDP checks.                                                                                      |
 | HTTP proxy | Optional HTTP/1.0, HTTP/1.1, HTTP/2 and HTTP/3 inspection, including WebSocket upgrade relay and WebTransport, through the transparent proxy.   |
-| Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. |
+| Filesystem | Static bubblewrap mount isolation when `gates.filesystem.enable` is disabled; enabling it switches to dynamic fanotify approval for file opens. `gates.filesystem.ignoreStaticAllows` skips the monitor for statically allowed files that nothing can write. |
 | Resources  | Unix-socket operations and device access under `/dev`. `connect` and `send` are separate permissions.                                           |
 | Sudo       | Approval before a command runs as root on the host. A rule such as `["bash"]` grants unrestricted root execution.                               |
 | D-Bus      | Filtered session and system bus access through a per-sandbox relay.                                                                             |
@@ -156,6 +156,16 @@ anything else is spliced end to end after one `tcp://host:port` policy check.
 UDP keeps one configured intercept port (a socket must bind each port),
 but the first payload byte decides: only QUIC long headers take the
 HTTP/3 path, everything else takes the direct transport check.
+
+`agent-sandbox.network.verdictGate.enable` adds a kernel-side decision path on
+top of that. The NFQUEUE daemon publishes each replayable destination verdict
+into a map pinned per sandbox namespace, and reuses it instead of asking
+policyd again for the same destination. Denials are enforced by a
+`cgroup/connect4` and `cgroup/connect6` program, which fails the connection
+before any packet exists. Entries carry the generation of the decision set
+they were published under, so withdrawing a grant retires every cached verdict
+with one write. A missing or stale entry falls back to the userspace path, and
+hostname-derived and one-time approvals are never cached.
 
 The TCP proxy forwards informational responses such as `103 Early Hints` on
 HTTP/1.1 and HTTP/2 before the final response. It forwards at most 16 upstream
