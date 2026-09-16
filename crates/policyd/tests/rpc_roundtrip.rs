@@ -26,6 +26,7 @@ fn test_args(root: &Path) -> PolicydArgs {
         ui_spawn_cmd: None,
         package_declarative: Vec::new(),
         fs_monitor_cmd: None,
+        fs_ignore_static_allows: true,
         syscall_broker_cmd: None,
     }
 }

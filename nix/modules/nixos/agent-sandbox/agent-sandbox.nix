@@ -576,21 +576,44 @@ in
     enable = lib.mkEnableOption "jail.nix bubblewrap sandbox + optional network policy for AI agent CLIs";
 
     gates = {
-      filesystem.enable = lib.mkEnableOption ''
-        kernel-mediated dynamic filesystem access approval via fanotify.
-        Controls filesystem access at runtime using path-based allow/deny rules.
-        The first process inside each sandbox becomes agent-sandbox-fs-arm,
-        Dynamic filesystem mode traps unsupported directory/device/metadata,
-        timestamp, and fallocate mutations before tracee-pointer classification.
-        Approved rename, link, symlink, unlink, truncate, and directory
-        mutations are emulated by the broker using captured syscall arguments;
-        the original syscall is not continued after approval. Denied mutations
-        fail closed. Use static bubblewrap mounts and predeclared writable
-        directories for workloads such as package installs. Static bubblewrap
-        mounts remain the structural read-only/read-write boundary.
-        Disabled by default. When disabled, no fs-arm helper or fsmon process
-        is used and there is no kernel-level filesystem mediation.
-      '';
+      filesystem = {
+        enable = lib.mkEnableOption ''
+          kernel-mediated dynamic filesystem access approval via fanotify.
+          Controls filesystem access at runtime using path-based allow/deny rules.
+          The first process inside each sandbox becomes agent-sandbox-fs-arm,
+          Dynamic filesystem mode traps unsupported directory/device/metadata,
+          timestamp, and fallocate mutations before tracee-pointer classification.
+          Approved rename, link, symlink, unlink, truncate, and directory
+          mutations are emulated by the broker using captured syscall arguments;
+          the original syscall is not continued after approval. Denied mutations
+          fail closed. Use static bubblewrap mounts and predeclared writable
+          directories for workloads such as package installs. Static bubblewrap
+          mounts remain the structural read-only/read-write boundary.
+          Disabled by default. When disabled, no fs-arm helper or fsmon process
+          is used and there is no kernel-level filesystem mediation.
+        '';
+
+        ignoreStaticAllows = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+
+          description = ''
+            Let the filesystem monitor install fanotify ignore marks for files
+            that are statically allowed and admit no denied access: the path
+            must allow read statically, and either the covering mount is
+            read-only, the inode carries no write mode bits, or write is
+            statically allowed too. Repeat opens of such files then generate no
+            permission event, removing one userspace round trip per open.
+
+            What it does not cover: a runtime deny for a path that was
+            statically allowed is not re-evaluated while the mark lives, which
+            is why fsmon flushes all marks when the exported policy changes and
+            when it stops. Disable for a strict event-per-open posture where
+            every open wakes the monitor even when the verdict is statically
+            known.
+          '';
+        };
+      };
 
       resources.enable = lib.mkEnableOption ''
         seccomp-backed resource gates for all AF_UNIX sockets and
@@ -837,6 +860,18 @@ in
         type = lib.types.int;
         default = 0;
         description = "NFQUEUE number used by nftables and agent-sandbox-nfq.";
+      };
+
+      verdictGate.enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+
+        description = ''
+          Fail denied destinations in the kernel at connect time from the published
+          verdict map, before any packet exists. Enforcement is only as fresh as the
+          last published entry: a stale entry is ignored by generation, so the
+          fallback is the ordinary userspace policy path.
+        '';
       };
 
       vethHost = lib.mkOption {
@@ -1161,5 +1196,12 @@ in
         };
       })
     ];
+
+    systemd.services.agent-sandbox-policy.environment = lib.mkIf cfg.gates.filesystem.enable {
+      # policyd reads this for its --fs-ignore-static-allows flag and
+      # forwards it on the fsmon command line.
+      AGENT_SANDBOX_FS_IGNORE_STATIC_ALLOWS =
+        if cfg.gates.filesystem.ignoreStaticAllows then "true" else "false";
+    };
   };
 }

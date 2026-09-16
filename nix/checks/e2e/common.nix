@@ -22,6 +22,7 @@ rec {
       "f /var/lib/agent-sandbox-test/readonly-file 0666 root root - readonly-file-marker"
       "f /var/lib/agent-sandbox-test/readwrite-file 0644 sandbox users - original"
       "f /var/lib/agent-sandbox-test/dynamic-read 0666 sandbox users - dynamic-read-marker"
+      "f /var/lib/agent-sandbox-test/dynamic-unwritable 0444 root root - dynamic-unwritable-marker"
       "f /var/lib/agent-sandbox-test/dynamic-write 0666 sandbox users - original"
       "f /var/lib/agent-sandbox-test/dynamic-denied 0666 sandbox users - denied-marker"
       "f /var/lib/agent-sandbox-test/dynamic-unlisted 0666 sandbox users - unlisted-marker"
@@ -146,6 +147,7 @@ rec {
       {
         "allow": [
           { "path": "/var/lib/agent-sandbox-test/dynamic-read", "access": "read" },
+          { "path": "/var/lib/agent-sandbox-test/dynamic-unwritable", "access": "read" },
           { "path": "/var/lib/agent-sandbox-test/dynamic-write", "access": "all" },
           { "path": "/var/lib/agent-sandbox-test/dynamic-denied", "access": "all" },
           { "path": "/var/lib/agent-sandbox-test/dynamic-mutations", "access": "all" }

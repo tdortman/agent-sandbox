@@ -131,6 +131,22 @@ struct Cli {
     #[arg(long, value_name = "PATH", env = "AGENT_SANDBOX_FS_MONITOR_CMD")]
     fs_monitor_cmd: Option<PathBuf>,
 
+    /// Whether the spawned "agent-sandbox-fsmon" installs fanotify ignore
+    /// marks for statically allowed files, so repeat opens of them generate
+    /// no permission event. Set from
+    /// `agent-sandbox.gates.filesystem.ignoreStaticAllows` via the
+    /// `AGENT_SANDBOX_FS_IGNORE_STATIC_ALLOWS` service environment and
+    /// forwarded as `--fs-ignore-static-allows` on the fsmon command line.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        env = "AGENT_SANDBOX_FS_IGNORE_STATIC_ALLOWS",
+        action = clap::ArgAction::Set,
+        default_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
+    fs_ignore_static_allows: bool,
+
     /// Path to the "agent-sandbox-syscall-broker" binary. If unset, the daemon
     /// falls back to the env var `AGENT_SANDBOX_SYSCALL_BROKER_CMD`. Used when
     /// an "agent-sandbox-syscall-arm" request needs a host-side seccomp
@@ -194,6 +210,7 @@ async fn main() -> Result<(), PolicydError> {
         ui_spawn_cmd: cli.ui_spawn_cmd,
         package_declarative: cli.package_declarative,
         fs_monitor_cmd: cli.fs_monitor_cmd,
+        fs_ignore_static_allows: cli.fs_ignore_static_allows,
         syscall_broker_cmd: cli.syscall_broker_cmd,
     };
 
@@ -243,6 +260,7 @@ mod tests {
         assert_eq!(cli.ui_spawn_cmd, None);
         assert!(cli.package_declarative.is_empty());
         assert_eq!(cli.fs_monitor_cmd, None);
+        assert!(cli.fs_ignore_static_allows);
         assert_eq!(cli.syscall_broker_cmd, None);
     }
 
@@ -271,6 +289,8 @@ mod tests {
             "codex=/etc/test/packages/codex.json",
             "--fs-monitor-cmd",
             "/bin/test-fsmon",
+            "--fs-ignore-static-allows",
+            "false",
             "--syscall-broker-cmd",
             "/bin/test-broker",
         ])
@@ -307,6 +327,7 @@ mod tests {
         ]);
 
         assert_eq!(cli.fs_monitor_cmd, Some(PathBuf::from("/bin/test-fsmon")));
+        assert!(!cli.fs_ignore_static_allows);
 
         assert_eq!(
             cli.syscall_broker_cmd,

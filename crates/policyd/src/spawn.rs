@@ -398,6 +398,7 @@ mod tests {
             ui_spawn_cmd: Some("/bin/agent-sandbox-ui".into()),
             package_declarative: Vec::new(),
             fs_monitor_cmd: None,
+            fs_ignore_static_allows: true,
             syscall_broker_cmd: None,
         };
 

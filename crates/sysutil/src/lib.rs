@@ -18,7 +18,10 @@ use std::{
 };
 
 use nix::{
-    sys::socket::{SockaddrStorage, getpeername},
+    sys::{
+        signal::{SigHandler, Signal},
+        socket::{SockaddrStorage, getpeername},
+    },
     unistd::Pid,
 };
 
@@ -547,7 +550,15 @@ const FAN_CLOEXEC: u32 = libc::FAN_CLOEXEC;
 /// `fanotify_mark` flags.
 const FAN_MARK_ADD: u32 = libc::FAN_MARK_ADD;
 
+const FAN_MARK_REMOVE: u32 = libc::FAN_MARK_REMOVE;
+
 const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
+
+const FAN_MARK_IGNORED_SURV_MODIFY: u32 = libc::FAN_MARK_IGNORED_SURV_MODIFY;
+
+const FAN_MARK_EVICTABLE: u32 = libc::FAN_MARK_EVICTABLE;
+
+const FAN_MARK_IGNORE: u32 = libc::FAN_MARK_IGNORE;
 
 /// Permission event mask for opening a file.
 pub const FAN_OPEN_PERM: u64 = libc::FAN_OPEN_PERM;
@@ -620,6 +631,73 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
             libc::SYS_fanotify_mark,
             fan_fd.as_fd().as_raw_fd(),
             i64::from(FAN_MARK_ADD | FAN_MARK_MOUNT),
+            mask,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+        )
+    };
+
+    if ret == 0 {
+        return Ok(());
+    }
+
+    Err(io::Error::last_os_error())
+}
+
+/// Add a fanotify ignore mask on the inode at `path` for open and exec
+/// permission events.
+///
+/// An ignored inode generates no permission event, so future opens of it need
+/// no userspace verdict. The mark survives watched-inode modification
+/// (`FAN_MARK_IGNORED_SURV_MODIFY`) and may be reclaimed under memory pressure
+/// (`FAN_MARK_EVICTABLE`); losing it to reclaim only costs a future event,
+/// never a wrong verdict.
+///
+/// # Errors
+/// Returns an error if the ignore mask cannot be applied.
+pub fn fanotify_mark_ignore(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
+    let mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
+
+    // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
+    // int dirfd, const char *pathname)`. The fd and path are live for the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_fanotify_mark,
+            fan_fd.as_fd().as_raw_fd(),
+            i64::from(
+                FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY | FAN_MARK_EVICTABLE,
+            ),
+            mask,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+        )
+    };
+
+    if ret == 0 {
+        return Ok(());
+    }
+
+    Err(io::Error::last_os_error())
+}
+
+/// Remove a fanotify ignore mask previously added with
+/// [`fanotify_mark_ignore`].
+///
+/// Removal carries the same ignore-mask flag family that added the mark, or
+/// the kernel rejects or misfiles the request.
+///
+/// # Errors
+/// Returns an error if the ignore mask cannot be removed.
+pub fn fanotify_unmark_ignore(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
+    let mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
+
+    // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
+    // int dirfd, const char *pathname)`. The fd and path are live for the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_fanotify_mark,
+            fan_fd.as_fd().as_raw_fd(),
+            i64::from(FAN_MARK_REMOVE | FAN_MARK_IGNORE),
             mask,
             libc::AT_FDCWD,
             path.as_ptr(),
@@ -860,6 +938,26 @@ pub fn set_raw_fd_nonblocking(fd: i32) -> io::Result<()> {
 
     let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
     fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
+/// Install a process-wide handler for `SIGTERM` and `SIGINT`.
+///
+/// The handler runs in signal context, so it may only do async-signal-safe
+/// work such as storing to an atomic. Closing a file descriptor is enough to
+/// drop fanotify marks, so a daemon that installs this can flush and report
+/// before it exits.
+///
+/// # Errors
+/// Returns the kernel error when either signal cannot be installed.
+pub fn install_shutdown_signals(handler: extern "C" fn(libc::c_int)) -> io::Result<()> {
+    for signal in [Signal::SIGTERM, Signal::SIGINT] {
+        // SAFETY: `signal(2)` only installs `handler`, which the caller
+        // guarantees is async-signal-safe.
+        unsafe { nix::sys::signal::signal(signal, SigHandler::Handler(handler)) }
+            .map_err(io::Error::from)?;
+    }
+
     Ok(())
 }
 

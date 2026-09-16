@@ -127,6 +127,13 @@ impl PolicyStore {
         }
 
         command.arg("--static-policy").arg(&self.args.export_json);
+        command
+            .arg("--fs-ignore-static-allows")
+            .arg(if self.args.fs_ignore_static_allows {
+                "true"
+            } else {
+                "false"
+            });
         let static_allow_input = static_allow.clone();
         let home_for_expand = home.clone();
         let project_root_for_expand = project_root.clone();

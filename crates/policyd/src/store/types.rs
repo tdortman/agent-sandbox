@@ -185,6 +185,11 @@ pub struct PolicydArgs {
     /// Path to the agent-sandbox-fsmon binary.
     pub fs_monitor_cmd: Option<PathBuf>,
 
+    /// Whether the spawned filesystem monitor installs fanotify ignore marks
+    /// for statically allowed files. Passed through as
+    /// `--fs-ignore-static-allows` on the fsmon command line.
+    pub fs_ignore_static_allows: bool,
+
     /// Path to the agent-sandbox-syscall-broker binary.
     pub syscall_broker_cmd: Option<PathBuf>,
 }

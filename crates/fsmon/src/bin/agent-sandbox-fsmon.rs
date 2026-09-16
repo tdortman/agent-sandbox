@@ -18,7 +18,11 @@ use std::{
     },
     path::{Path, PathBuf},
     process,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use agent_sandbox_core::{
@@ -27,7 +31,8 @@ use agent_sandbox_core::{
 };
 use agent_sandbox_fsmon::MonitorClient;
 use agent_sandbox_sysutil::{
-    FanotifyEventMetadata, FanotifyResponse, fanotify_response_bytes, take_fanotify_event_fd,
+    FanotifyEventMetadata, FanotifyResponse, fanotify_mark_ignore, fanotify_response_bytes,
+    fanotify_unmark_ignore, take_fanotify_event_fd,
 };
 
 fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
@@ -46,6 +51,7 @@ fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
 use clap::Parser;
 use nix::{
     fcntl::{OFlag, openat, readlinkat},
+    poll::{PollFd, PollFlags, PollTimeout, poll},
     sys::stat::{Mode, SFlag, fstat},
 };
 
@@ -114,6 +120,15 @@ struct Cli {
         default_value = EXPORTED_POLICY_PATH
     )]
     static_policy: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        action = clap::ArgAction::Set,
+        default_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
+    fs_ignore_static_allows: bool,
 }
 
 // fanotify constants and event structs come from `agent_sandbox_sysutil`.
@@ -570,6 +585,159 @@ fn open_needs_access_lookup(mask: u64, path: &str, static_allow: &StaticPolicyAl
     !static_allow.allows_literal(Path::new(path), FileAccess::ReadWrite)
 }
 
+/// Whether an ignore mark is sound for `path` opened under `mask`.
+///
+/// An ignore mask suppresses every future open of the inode, so it is only
+/// sound where no access the policy denies can actually succeed: the event
+/// must be an open-permission event, the path must allow read statically, and
+/// either nothing can write the inode (read-only mount or no write mode bits)
+/// or write is statically allowed too.
+fn ignore_mark_eligible(
+    static_allow: &StaticPolicyAllow,
+    mask: u64,
+    path: &Path,
+    mode_writable: bool,
+    mount_readonly: bool,
+) -> bool {
+    if mask & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) == 0 {
+        return false;
+    }
+
+    if mask & !(FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) != 0 {
+        return false;
+    }
+
+    if !static_allow.allows(path, FileAccess::Read) {
+        return false;
+    }
+
+    if static_allow.allows(path, FileAccess::ReadWrite) {
+        return true;
+    }
+
+    if !mode_writable {
+        return true;
+    }
+
+    mount_readonly
+}
+
+/// Install an ignore mark for a statically allowed open when the full
+/// predicate holds. Best effort: a failed mark leaves the event path
+/// unchanged, and the tracked set stops growing at `IGNORE_MARK_CAP`.
+fn maybe_mark_static_allow(shared: &Shared, mask: u64, path: &str, event_fd: &OwnedFd) {
+    if !shared.ignore_static_allows {
+        return;
+    }
+
+    let fs_path = Path::new(path);
+    // An unwritable mode is the common sound case (immutable store files);
+    // assume writable when the inode cannot be statted so a failed check
+    // never marks.
+    let mode_writable = fstat(event_fd.as_fd()).is_ok_and(|stat| stat.st_mode & 0o222 != 0);
+    let mount_readonly = nix::sys::statvfs::statvfs(fs_path)
+        .is_ok_and(|fs| fs.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY));
+
+    if !ignore_mark_eligible(
+        &shared.static_allow,
+        mask,
+        fs_path,
+        mode_writable,
+        mount_readonly,
+    ) {
+        return;
+    }
+
+    let Ok(cstr) = CString::new(path) else {
+        return;
+    };
+    let (already_marked, at_capacity) = {
+        let marked = shared
+            .marked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        (marked.contains(fs_path), marked.len() >= IGNORE_MARK_CAP)
+    };
+
+    if already_marked {
+        return;
+    }
+
+    if at_capacity {
+        if !shared.cap_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                cap = IGNORE_MARK_CAP,
+                "ignore-mark set full; no further paths will be marked",
+            );
+        }
+        return;
+    }
+
+    match fanotify_mark_ignore(&shared.fan_fd, &cstr) {
+        Ok(()) => {
+            let tracked = {
+                let mut marked = shared
+                    .marked
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+
+                // The set can fill between the check above and here, so the
+                // bound is enforced where the insert happens as well.
+                if marked.len() < IGNORE_MARK_CAP {
+                    marked.insert(fs_path.to_path_buf())
+                } else {
+                    false
+                }
+            };
+
+            if tracked {
+                shared.stats.marks_added.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%path, %error, "ignore mark failed; events for this path keep flowing");
+        }
+    }
+}
+
+/// Remove every tracked ignore mark. Entries leave the set whether or not
+/// their unmark succeeds, so a failed unmark cannot wedge future flushes.
+fn flush_ignore_marks(shared: &Shared) {
+    let paths: Vec<PathBuf> = shared
+        .marked
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .drain()
+        .collect();
+    let mut flushed = 0_u64;
+
+    for path in &paths {
+        flushed += 1;
+        let Ok(cstr) = CString::new(path.as_os_str().as_bytes()) else {
+            continue;
+        };
+
+        if let Err(error) = fanotify_unmark_ignore(&shared.fan_fd, &cstr) {
+            tracing::warn!(path = %path.display(), %error, "failed to remove ignore mark");
+        }
+    }
+
+    if flushed > 0 {
+        shared
+            .stats
+            .marks_flushed
+            .fetch_add(flushed, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot key for the static policy export: mtime plus length, so a rewrite
+/// within mtime granularity still invalidates. `None` when unreadable.
+fn policy_snapshot_key(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 /// Mark each mount point, skipping synthetic filesystem types. Returns whether
 /// a marked mount covers the home directory.
 fn mark_mountpoints(
@@ -690,7 +858,12 @@ struct Job {
     event_fd: OwnedFd,
 }
 
-/// Read-only state every fsmon worker shares.
+/// Shared state every fsmon worker reads, plus the ignore-mark set.
+///
+/// `marked` is the only lock-guarded member: workers insert after installing
+/// an ignore mark, and the reader drains it on policy change and shutdown. The
+/// lock is only taken on statically allowed opens, never on the policyd path;
+/// the counters use lock-free atomics.
 struct Shared {
     fan_fd: OwnedFd,
     self_pid: i32,
@@ -699,6 +872,59 @@ struct Shared {
     ctx: agent_sandbox_core::RequestContext,
     socket_path: PathBuf,
     static_allow: StaticPolicyAllow,
+    ignore_static_allows: bool,
+    static_policy_path: PathBuf,
+    marked: Mutex<HashSet<PathBuf>>,
+    cap_warned: AtomicBool,
+    stats: FsmonStats,
+}
+
+/// Maximum tracked ignore-marked paths. Marking stops (with one warning)
+/// instead of growing without bound.
+const IGNORE_MARK_CAP: usize = 65536;
+
+/// How often the reader re-stats the static policy export for changes.
+const POLICY_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the reader logs the decision counters.
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long the reader waits for a fanotify event before running its periodic
+/// work. Bounds how long an idle sandbox takes to observe a shutdown request or
+/// a static-policy change.
+const READ_POLL_MILLIS: u16 = 1000;
+
+/// Set by the terminate handler; the reader loop flushes ignore marks, logs
+/// the final counters, and exits on its next iteration.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Decision counters. Relaxed atomics: workers bump them on the hot path
+/// while the reader samples them for the periodic log line, with no locking.
+#[derive(Debug, Default)]
+struct FsmonStats {
+    /// Permission events handled.
+    events: AtomicU64,
+    /// Answers that needed no policyd call (fast path and static allows).
+    local_answers: AtomicU64,
+    /// Answers that called policyd.
+    policyd_calls: AtomicU64,
+    /// Ignore marks installed.
+    marks_added: AtomicU64,
+    /// Tracked paths released by a flush.
+    marks_flushed: AtomicU64,
+}
+
+/// Log the decision counters as one structured line.
+fn log_stats(stats: &FsmonStats, reason: &str) {
+    tracing::info!(
+        events = stats.events.load(Ordering::Relaxed),
+        local_answers = stats.local_answers.load(Ordering::Relaxed),
+        policyd_calls = stats.policyd_calls.load(Ordering::Relaxed),
+        marks_added = stats.marks_added.load(Ordering::Relaxed),
+        marks_flushed = stats.marks_flushed.load(Ordering::Relaxed),
+        reason,
+        "fsmon decisions",
+    );
 }
 
 /// Bounded hand-off from the reader to the workers: the reader blocks when
@@ -710,7 +936,10 @@ type JobQueue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
 ///
 /// The reader only reads batches, parses the event framing, and enqueues
 /// permission events; a dedicated pool of `WORKER_LIMIT` workers (the reader
-/// does not double as a worker) answers them. fsmon runs until it is killed.
+/// does not double as a worker) answers them. On the same cadence it polls
+/// the static policy export for changes (flushing ignore marks when it
+/// changed) and logs the decision counters. A terminate request makes the
+/// reader flush the marks, log the final counters, and return.
 fn run_event_loop(
     fan_fd: std::os::fd::OwnedFd,
     self_pid: i32,
@@ -719,7 +948,9 @@ fn run_event_loop(
     ctx: agent_sandbox_core::RequestContext,
     socket_path: &Path,
     static_allow: StaticPolicyAllow,
-) -> ! {
+    ignore_static_allows: bool,
+    static_policy_path: PathBuf,
+) {
     use std::os::fd::AsFd;
 
     let shared = Arc::new(Shared {
@@ -730,6 +961,11 @@ fn run_event_loop(
         ctx,
         socket_path: socket_path.to_path_buf(),
         static_allow,
+        ignore_static_allows,
+        static_policy_path,
+        marked: Mutex::new(HashSet::new()),
+        cap_warned: AtomicBool::new(false),
+        stats: FsmonStats::default(),
     });
     let queue: JobQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
 
@@ -744,12 +980,49 @@ fn run_event_loop(
 
     let mut buf = vec![0u8; 4096];
     let mut batch = Vec::new();
+    let mut last_policy_check = Instant::now();
+    let mut last_policy_key = policy_snapshot_key(&shared.static_policy_path);
+    let mut last_stats_log = Instant::now();
 
     loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            tracing::info!("shutdown requested; flushing ignore marks");
+            flush_ignore_marks(&shared);
+            log_stats(&shared.stats, "shutdown");
+            return;
+        }
+
+        // Poll rather than block in `read`: the terminate handler only sets a
+        // flag, and the kernel restarts an interrupted read, so an idle sandbox
+        // would never observe the request or reach its periodic work.
+        match poll(
+            &mut [PollFd::new(
+                shared.fan_fd.as_fd(),
+                PollFlags::POLLIN,
+            )],
+            PollTimeout::from(READ_POLL_MILLIS),
+        ) {
+            Ok(0) => {
+                run_periodic_work(
+                    &shared,
+                    &mut last_policy_check,
+                    &mut last_policy_key,
+                    &mut last_stats_log,
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => {
+                eprintln!("agent-sandbox-fsmon: poll fanotify fd: {error}");
+                continue;
+            }
+        }
+
         let n = match nix::unistd::read(shared.fan_fd.as_fd(), &mut buf) {
             Ok(n) => n,
-            Err(e) => {
-                eprintln!("agent-sandbox-fsmon: read from fanotify fd: {e}");
+            Err(error) => {
+                eprintln!("agent-sandbox-fsmon: read from fanotify fd: {error}");
                 continue;
             }
         };
@@ -790,13 +1063,47 @@ fn run_event_loop(
         if !batch.is_empty() {
             enqueue(&queue, &mut batch);
         }
+
+        run_periodic_work(
+            &shared,
+            &mut last_policy_check,
+            &mut last_policy_key,
+            &mut last_stats_log,
+        );
+    }
+}
+
+/// Work that must happen even when no event arrives: retire ignore marks after
+/// the static policy changed, and log the decision counters.
+fn run_periodic_work(
+    shared: &Shared,
+    last_policy_check: &mut Instant,
+    last_policy_key: &mut Option<(SystemTime, u64)>,
+    last_stats_log: &mut Instant,
+) {
+    if last_policy_check.elapsed() >= POLICY_POLL_INTERVAL {
+        *last_policy_check = Instant::now();
+        let key = policy_snapshot_key(&shared.static_policy_path);
+        if key != *last_policy_key {
+            *last_policy_key = key;
+            tracing::info!(
+                path = %shared.static_policy_path.display(),
+                "static policy changed; flushing ignore marks",
+            );
+            flush_ignore_marks(shared);
+        }
+    }
+
+    if last_stats_log.elapsed() >= STATS_LOG_INTERVAL {
+        *last_stats_log = Instant::now();
+        log_stats(&shared.stats, "interval");
     }
 }
 
 /// Serve queued permission events until killed, with worker-local RPC state.
 ///
 /// Each worker owns its policy client, tokio runtime, and pid cgroup cache;
-/// only the read-only [`Shared`] state and the queue are shared.
+/// only the [`Shared`] state and the queue are shared.
 fn worker(shared: &Shared, queue: &JobQueue) -> ! {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -848,9 +1155,10 @@ fn dequeue(queue: &JobQueue) -> Job {
     job
 }
 
-/// Answer one queued permission event: the former inline event-loop body,
-/// unchanged. Every path responds exactly once; unresolvable paths fail
-/// closed (`FAN_DENY`) with the same log messages as before.
+/// Answer one queued permission event, counting the decision and installing an
+/// ignore mark for statically allowed opens. Every path responds exactly once;
+/// unresolvable paths fail closed (`FAN_DENY`) with the same log messages as
+/// before.
 fn handle_permission_event(
     shared: &Shared,
     job: Job,
@@ -864,6 +1172,10 @@ fn handle_permission_event(
         event_fd,
     } = job;
 
+    shared.stats.events.fetch_add(1, Ordering::Relaxed);
+
+    // The fast path answers from process identity (self pid, non-sandbox
+    // cgroup), not from static policy, so no ignore mark applies here.
     if try_fast_path_allow(
         &shared.fan_fd,
         pid,
@@ -873,6 +1185,7 @@ fn handle_permission_event(
         &shared.host_proc,
         pid_cgroup_cache,
     ) {
+        shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -881,12 +1194,15 @@ fn handle_permission_event(
         Err(verdict) => {
             tracing::warn!(pid, "path resolution failed, denying (fail-closed)");
             respond(&shared.fan_fd, &event_fd, verdict);
+            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
 
     if !open_needs_access_lookup(mask, &path, &shared.static_allow) {
         respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+        shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
+        maybe_mark_static_allow(shared, mask, &path, &event_fd);
         return;
     }
 
@@ -897,8 +1213,12 @@ fn handle_permission_event(
 
     if shared.static_allow.allows(Path::new(&path), access) {
         respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+        shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
+        maybe_mark_static_allow(shared, mask, &path, &event_fd);
         return;
     }
+
+    shared.stats.policyd_calls.fetch_add(1, Ordering::Relaxed);
 
     tracing::debug!(%path, ?access, pid, "filesystem check");
     let mut event_ctx = shared.ctx.clone();
@@ -1057,6 +1377,13 @@ fn main() {
         process::exit(1);
     });
 
+    // Ask the reader loop to flush ignore marks and exit on SIGTERM/SIGINT.
+    // Closing the fanotify fd would drop the marks anyway; the explicit flush
+    // keeps the unmark path exercised and the counters exact.
+    if let Err(error) = agent_sandbox_sysutil::install_shutdown_signals(request_shutdown) {
+        tracing::warn!(%error, "cannot install shutdown signals; ignore marks will not be flushed");
+    }
+
     run_event_loop(
         fan_fd,
         self_pid,
@@ -1065,7 +1392,15 @@ fn main() {
         ctx,
         socket_path,
         static_allow,
+        cli.fs_ignore_static_allows,
+        cli.static_policy,
     );
+}
+
+/// Note a terminate request for the reader loop. Runs in signal context:
+/// only a lock-free atomic store.
+extern "C" fn request_shutdown(_signum: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 /// Fast-path allow checks that do not need a policyd RPC.
@@ -1428,5 +1763,264 @@ mod tests {
                 Some(environment)
             );
         }
+    }
+
+    fn static_allow_named(test: &str, rule: &str) -> StaticPolicyAllow {
+        let path =
+            std::env::temp_dir().join(format!("fsmon-static-{}-{test}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("{{\"filesystem\": {{\"allow\": [{rule}]}}}}"),
+        )
+        .expect("write policy fixture");
+        let allow = StaticPolicyAllow::load(&path, None);
+        std::fs::remove_file(&path).expect("remove policy fixture");
+        allow
+    }
+
+    fn test_shared(test: &str, rule: &str, ignore_static_allows: bool) -> Shared {
+        let fan_fd = OwnedFd::from(File::open("/dev/null").expect("open fanotify fd stand-in"));
+        Shared {
+            fan_fd,
+            self_pid: i32::try_from(process::id()).expect("pid fits in i32"),
+            sandbox_cgroup: SandboxCgroup("test.scope".to_string()),
+            host_proc: test_host_proc(),
+            ctx: agent_sandbox_core::RequestContext::default(),
+            socket_path: PathBuf::from("/tmp/fsmon-test.sock"),
+            static_allow: static_allow_named(test, rule),
+            ignore_static_allows,
+            static_policy_path: PathBuf::from("/tmp/fsmon-test-policy.json"),
+            marked: Mutex::new(HashSet::new()),
+            cap_warned: AtomicBool::new(false),
+            stats: FsmonStats::default(),
+        }
+    }
+
+    fn read_only_fixture(test: &str) -> (PathBuf, OwnedFd) {
+        let path = std::env::temp_dir().join(format!("fsmon-mark-{test}-{}", std::process::id()));
+        std::fs::write(&path, b"immutable").expect("write mark fixture");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .expect("chmod mark fixture");
+        let event_fd = OwnedFd::from(File::open(&path).expect("open mark fixture"));
+        (path, event_fd)
+    }
+
+    #[test]
+    fn ignore_mark_needs_open_event_read_allow_and_a_write_bar() {
+        let allow = static_allow_named("eligible", r#"{"path": "/srv/project", "access": "read"}"#);
+        let path = Path::new("/srv/project/file");
+
+        assert!(ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM,
+            path,
+            false,
+            false
+        ));
+        assert!(ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM,
+            path,
+            false,
+            false
+        ));
+        assert!(ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM,
+            path,
+            true,
+            true
+        ));
+
+        // Writable inode on a writable mount under a read-only grant: a denied
+        // write open could succeed at the VFS layer, so the event must keep
+        // flowing.
+        assert!(!ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM,
+            path,
+            true,
+            false
+        ));
+
+        // No open-permission bit, or bits outside the open family.
+        assert!(!ignore_mark_eligible(&allow, 0, path, false, false));
+        assert!(!ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM | 0x0000_0004,
+            path,
+            false,
+            false
+        ));
+
+        // A path the static snapshot denies is never marked.
+        assert!(!ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM,
+            Path::new("/srv/elsewhere/file"),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn ignore_mark_disabled_leaves_the_set_empty() {
+        let shared = test_shared(
+            "disabled",
+            r#"{"path": "/srv/project", "access": "read"}"#,
+            false,
+        );
+        let (path, event_fd) = read_only_fixture("disabled");
+
+        maybe_mark_static_allow(&shared, FAN_OPEN_PERM, "/srv/project/file", &event_fd);
+        std::fs::remove_file(&path).expect("remove mark fixture");
+
+        assert!(
+            shared
+                .marked
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty()
+        );
+        assert_eq!(shared.stats.marks_added.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ignore_mark_failure_is_best_effort() {
+        // The stand-in fd is not a fanotify fd, so the mark syscall fails;
+        // the event path must be unchanged: nothing tracked, nothing counted.
+        let shared = test_shared(
+            "best-effort",
+            r#"{"path": "/srv/project", "access": "read"}"#,
+            true,
+        );
+        let (path, event_fd) = read_only_fixture("best-effort");
+
+        maybe_mark_static_allow(&shared, FAN_OPEN_PERM, "/srv/project/file", &event_fd);
+        std::fs::remove_file(&path).expect("remove mark fixture");
+
+        assert!(
+            shared
+                .marked
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty()
+        );
+        assert_eq!(shared.stats.marks_added.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ignore_mark_write_allow_covers_writable_inodes() {
+        let allow = static_allow_named(
+            "write-allow",
+            r#"{"path": "/srv/project", "access": "read_write"}"#,
+        );
+
+        assert!(ignore_mark_eligible(
+            &allow,
+            FAN_OPEN_PERM,
+            Path::new("/srv/project/file"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn ignore_mark_set_stops_at_cap() {
+        let shared = test_shared("cap", r#"{"path": "/srv/project", "access": "read"}"#, true);
+        let (path, event_fd) = read_only_fixture("cap");
+        std::fs::remove_file(&path).expect("remove mark fixture");
+
+        shared
+            .marked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .extend((0..IGNORE_MARK_CAP).map(|i| PathBuf::from(format!("/srv/filler/{i}"))));
+
+        maybe_mark_static_allow(&shared, FAN_OPEN_PERM, "/srv/project/file", &event_fd);
+        maybe_mark_static_allow(&shared, FAN_OPEN_PERM, "/srv/project/other", &event_fd);
+
+        assert!(shared.cap_warned.load(Ordering::Relaxed));
+        assert_eq!(
+            shared
+                .marked
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len(),
+            IGNORE_MARK_CAP
+        );
+        assert_eq!(shared.stats.marks_added.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_ignore_marks_drains_and_counts() {
+        let shared = test_shared(
+            "flush",
+            r#"{"path": "/srv/project", "access": "read"}"#,
+            true,
+        );
+
+        shared
+            .marked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .extend([
+                PathBuf::from("/srv/project/a"),
+                PathBuf::from("/srv/project/b"),
+            ]);
+
+        flush_ignore_marks(&shared);
+
+        assert!(
+            shared
+                .marked
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty()
+        );
+        assert_eq!(shared.stats.marks_flushed.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn policy_snapshot_key_tracks_rewrites() {
+        let path = std::env::temp_dir().join(format!("fsmon-policy-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"filesystem": {"allow": []}}"#).expect("write policy");
+        let before = policy_snapshot_key(&path);
+
+        assert!(before.is_some());
+
+        std::fs::write(
+            &path,
+            r#"{"filesystem": {"allow": [{"path": "/x", "access": "read"}]}}"#,
+        )
+        .expect("rewrite policy");
+        let after = policy_snapshot_key(&path);
+
+        std::fs::remove_file(&path).expect("remove policy");
+
+        assert!(after.is_some());
+        assert_ne!(before, after);
+        assert_eq!(policy_snapshot_key(&path), None);
+    }
+
+    #[test]
+    fn ignore_static_allows_defaults_to_true() {
+        use clap::Parser;
+
+        let cli =
+            Cli::try_parse_from(["agent-sandbox-fsmon", "--pid", "1"]).expect("defaults parse");
+
+        assert!(cli.fs_ignore_static_allows);
+
+        let cli = Cli::try_parse_from([
+            "agent-sandbox-fsmon",
+            "--pid",
+            "1",
+            "--fs-ignore-static-allows",
+            "false",
+        ])
+        .expect("explicit disable parses");
+
+        assert!(!cli.fs_ignore_static_allows);
     }
 }

@@ -33,6 +33,14 @@ pkgs.testers.runNixOSTest (_: {
 
           policy = {
             exportedNix = "/var/lib/agent-sandbox/exported-policy.nix";
+
+            filesystem.declarativeAllow = [
+              {
+                access = "read";
+                path = "/var/lib/agent-sandbox-test/dynamic-unwritable";
+              }
+            ];
+
             interactiveApproval = false;
             uiBackend = "none";
           };
@@ -42,9 +50,15 @@ pkgs.testers.runNixOSTest (_: {
 
   testScript = ''
     import shlex
+    import re
 
     def command(*args):
         return shlex.join(str(arg) for arg in args)
+
+    def counter(field, line):
+        match = re.search(field + r"=(\d+)", line)
+        assert match, f"{field} missing from {line}"
+        return int(match.group(1))
 
     def sandbox_command(node, args, *, wrapper=(), expect_success=True):
         line = command("runuser", "-u", "sandbox", "--", *wrapper, *args)
@@ -180,5 +194,26 @@ pkgs.testers.runNixOSTest (_: {
         "test -z \"$AWS_SECRET_ACCESS_KEY\" && test -z \"$OPENAI_API_KEY\"",
         env=("env", "AWS_SECRET_ACCESS_KEY=secret", "OPENAI_API_KEY=secret"),
     )
+    # The ignore-mark fast path: a statically allowed file that nothing can
+    # write stops generating permission events. Read the unwritable fixture
+    # twice, then let every monitor report its counters and check the totals.
+    sandbox_shell(
+        dynamic,
+        "sandbox-dynamic-bash",
+        "grep -q dynamic-unwritable-marker /var/lib/agent-sandbox-test/dynamic-unwritable "
+        "&& grep -q dynamic-unwritable-marker /var/lib/agent-sandbox-test/dynamic-unwritable",
+    )
+    dynamic.succeed("pgrep -f '^/nix/store/[^ ]*/bin/agent-sandbox-fsmon' | xargs -r kill -TERM")
+    dynamic.wait_until_succeeds(
+        "! pgrep -f '^/nix/store/[^ ]*/bin/agent-sandbox-fsmon'", timeout=60
+    )
+    counters = dynamic.succeed(
+        "journalctl -u agent-sandbox-policy.service --no-pager | grep 'fsmon decisions' | grep 'reason=\"shutdown\"'"
+    )
+    print(counters)
+    added = sum(counter("marks_added", line) for line in counters.splitlines())
+    flushed = sum(counter("marks_flushed", line) for line in counters.splitlines())
+    assert added > 0, f"no ignore marks were installed: {counters}"
+    assert flushed == added, f"flush did not release every mark: {counters}"
   '';
 })
