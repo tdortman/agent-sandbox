@@ -96,6 +96,7 @@ name = "agent-sandbox-nfq"
 version = "0.56.1"
 dependencies = [
  "agent-sandbox-core",
+ "agent-sandbox-sysutil",
  "clap",
  "hickory-proto",
  "nfq-updated",

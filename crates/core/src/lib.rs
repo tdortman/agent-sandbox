@@ -20,6 +20,7 @@ pub mod scope_target;
 pub mod sniff;
 pub mod socket_owner;
 pub mod transport;
+pub mod verdict_map;
 pub use approved_bindings::{APPROVED_BINDINGS_PATH, APPROVED_BINDINGS_TTL_SECS, ApprovedBindings};
 pub use context::{
     PeerCredentials, ProcContext, ProcessIds, ResolvedRequestContext, SandboxPaths, SessionContext,

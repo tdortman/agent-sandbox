@@ -14,6 +14,7 @@ mod packet;
 mod policy;
 mod push;
 mod queue;
+mod verdict_cache;
 use std::time::Duration;
 
 use clap::Parser;

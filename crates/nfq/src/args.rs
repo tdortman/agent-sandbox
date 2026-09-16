@@ -110,6 +110,20 @@ pub struct Cli {
     /// DNS forwarder).
     #[arg(long, value_name = "UID", default_value_t = 0)]
     pub(crate) push_trusted_uid: u32,
+
+    /// Directory holding the pinned verdict maps (`verdicts` and
+    /// `namespace_state`) produced by the Nix module. When absent or
+    /// unreadable the daemon skips the verdict cache and consults policyd
+    /// for every flow, exactly as without the flag.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub(crate) verdict_map: Option<PathBuf>,
+
+    /// UID of the transparent proxy in the sandbox namespace, published in
+    /// the namespace state so the in-kernel gate exempts the proxy's own
+    /// upstream sockets. When absent the cache stays off rather than
+    /// guessing.
+    #[arg(long, value_name = "UID")]
+    pub(crate) proxy_uid: Option<u32>,
 }
 
 #[cfg(test)]
@@ -137,6 +151,8 @@ mod tests {
             cli.push_socket,
             PathBuf::from("/run/agent-sandbox/dns-push.sock")
         );
+        assert_eq!(cli.verdict_map, None);
+        assert_eq!(cli.proxy_uid, None);
     }
 
     #[test]
@@ -155,6 +171,10 @@ mod tests {
             "192.0.2.1",
             "--push-socket",
             "/run/test/dns-push.sock",
+            "--verdict-map",
+            "/run/test/verdict-maps",
+            "--proxy-uid",
+            "1234",
         ])
         .expect("explicit launch facts parse");
 
@@ -169,5 +189,10 @@ mod tests {
         );
 
         assert_eq!(cli.push_socket, PathBuf::from("/run/test/dns-push.sock"));
+        assert_eq!(
+            cli.verdict_map,
+            Some(PathBuf::from("/run/test/verdict-maps"))
+        );
+        assert_eq!(cli.proxy_uid, Some(1234));
     }
 }

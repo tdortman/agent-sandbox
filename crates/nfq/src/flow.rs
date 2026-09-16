@@ -17,14 +17,17 @@ use agent_sandbox_core::{
     APPROVED_BINDINGS_PATH, ApprovedBindings, DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache,
     FlowContext, FlowOwner, FlowRegistration, NetworkFlowKey, NetworkOwnership,
     NormalizedPolicyHost, OwnerResolution, OwnerSnapshot, SandboxPaths, SocketIdentity,
-    is_quic_initial, lookup_dns_cache, mappings_from_response,
+    VerdictSource, is_quic_initial, lookup_dns_cache, mappings_from_response,
     network_revocation::NetworkPolicyRevocation, sandbox_session_id_from_pid,
     socket_owner::KernelOwnerResolver,
 };
 use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
 
-use crate::{args::Cli, attribution, owner, packet, policy, policy::TransportCheck};
+use crate::{
+    args::Cli, attribution, owner, packet, policy, policy::TransportCheck, verdict_cache,
+    verdict_cache::{VerdictCache, open_verdict_cache},
+};
 
 /// Packet mark used by the transparent proxy's local routing table.
 const PROXY_MARK: u32 = 51820;
@@ -47,6 +50,9 @@ struct ApprovedFlow {
 pub struct NfqState {
     pub(crate) dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     pub(crate) network_revocation: Option<Arc<NetworkPolicyRevocation>>,
+    pub(crate) verdict_cache: Option<Arc<dyn VerdictCache>>,
+    pub(crate) verdict_netns: u64,
+    pub(crate) verdict_proxy_uid: u32,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     pub(crate) approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
     approved_bindings_writer: Option<(SyncSender<()>, JoinHandle<()>)>,
@@ -89,7 +95,12 @@ impl NfqState {
 
         let approved_bindings = ApprovedBindings::load(&approved_bindings_path);
 
+        let (verdict_cache, verdict_netns, verdict_proxy_uid) = open_verdict_cache(cli);
+
         let mut state = Self {
+            verdict_cache,
+            verdict_netns,
+            verdict_proxy_uid,
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
             network_revocation: None,
@@ -156,7 +167,61 @@ impl NfqState {
             previous.revoke()?;
         }
         self.network_revocation = Some(Arc::new(guard));
+        // The same event retires cached destination verdicts: block new flows,
+        // bump the generation so every published entry goes inert without a
+        // scan, then unblock once the new state is published.
+        self.invalidate_verdict_cache();
         Ok(())
+    }
+
+    /// Cached transport verdict for one packet's destination, if the cache is
+    /// armed and holds a current entry. A miss or stale generation returns
+    /// `None` so the caller consults policyd exactly as without the cache.
+    pub(crate) fn cached_transport_verdict(&self, meta: packet::PacketMeta) -> Option<u8> {
+        let cache = self.verdict_cache.as_ref()?;
+        if self.verdict_netns == 0 {
+            return None;
+        }
+        cache.cached_verdict(&verdict_cache::dest_key(self.verdict_netns, meta))
+    }
+
+    /// Record one policyd answer in the verdict cache when it is replayable.
+    /// A fresh approval the cache refuses to publish still clears that
+    /// destination, so a stale deny cannot shadow the approval.
+    pub(crate) fn publish_transport_verdict(
+        &self,
+        meta: packet::PacketMeta,
+        allowed: bool,
+        source: Option<&VerdictSource>,
+        hostname: &str,
+        dst_ip: &str,
+    ) {
+        let Some(cache) = self.verdict_cache.as_ref() else {
+            return;
+        };
+        if self.verdict_netns == 0 {
+            return;
+        }
+        let key = verdict_cache::dest_key(self.verdict_netns, meta);
+        match verdict_cache::replayable_verdict(allowed, source, hostname, dst_ip) {
+            Some(verdict) => cache.publish_verdict(&key, verdict),
+            None if allowed && source.is_some() => cache.clear_verdict(&key),
+            None => {}
+        }
+    }
+
+    /// Retire every cached destination verdict for this namespace. Best
+    /// effort: failures are logged inside the cache and never reach the
+    /// packet loop.
+    pub(crate) fn invalidate_verdict_cache(&self) {
+        if let Some(cache) = &self.verdict_cache {
+            debug!(
+                netns = self.verdict_netns,
+                proxy_uid = self.verdict_proxy_uid,
+                "retiring cached destination verdicts"
+            );
+            cache.invalidate();
+        }
     }
 
     fn start_approved_bindings_writer(&mut self) {
@@ -247,6 +312,9 @@ impl NfqState {
             warn!(%error, "cannot revoke network grants before retaining disk DNS mapping");
             return host;
         }
+        // A new hostname mapping can move an approval to another address, so
+        // cached destination verdicts retire with the grants.
+        self.invalidate_verdict_cache();
         if let Ok(mut cache) = self.dns_cache.lock() {
             cache.remember_ephemeral(ip, &host, DEFAULT_MAX_TTL);
         }
@@ -465,7 +533,7 @@ fn register_proxy_flow(
 pub fn handle_packet_payload_with_registration(
     state: &NfqState,
     payload: &[u8],
-    check: &mut dyn FnMut(policy::CheckDestinationArgs<'_>) -> std::io::Result<bool>,
+    check: &mut dyn FnMut(policy::CheckDestinationArgs<'_>) -> policy::DestinationVerdict,
     register: Option<&mut dyn FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool>>,
 ) -> (Verdict, Option<packet::PacketMeta>) {
     // Try IPv4 first, then IPv6.
@@ -495,6 +563,9 @@ pub fn handle_packet_payload_with_registration(
                 warn!(%error, "cannot revoke network grants before DNS reply");
                 return (Verdict::Drop, Some(meta));
             }
+            // Fresh DNS answers retire cached destination verdicts with the
+            // grants they were decided under.
+            state.invalidate_verdict_cache();
             if let Ok(mut cache) = state.dns_cache.lock() {
                 for m in &mappings {
                     cache.remember_ephemeral(&m.ip, &m.hostname, m.ttl.min(DEFAULT_MAX_TTL));
@@ -667,6 +738,16 @@ pub mod tests {
 
     pub const DNS_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 100, 1));
 
+    /// Policyd-style allow from the static policy layers for injected checks.
+    pub fn policy_allow() -> policy::DestinationVerdict {
+        policy::DestinationVerdict::allowed(agent_sandbox_core::VerdictSource::policy())
+    }
+
+    /// Policyd-style deny for injected checks.
+    pub fn policy_deny() -> policy::DestinationVerdict {
+        policy::DestinationVerdict::denied(agent_sandbox_core::VerdictSource::policy())
+    }
+
     pub fn state_for_tests() -> NfqState {
         state_for_tests_with_attribution_path(None)
     }
@@ -697,6 +778,9 @@ pub mod tests {
                 &approved_bindings_path,
             ))),
             network_revocation: None,
+            verdict_cache: None,
+            verdict_netns: 0,
+            verdict_proxy_uid: 0,
             approved_bindings_writer: None,
             approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
@@ -788,7 +872,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
@@ -839,7 +923,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let registration = std::cell::RefCell::new(None);
@@ -908,7 +992,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let mut register = |_flow: FlowRegistration, _owner_fd_hint: Option<u32>| Ok(true);
@@ -945,7 +1029,7 @@ pub mod tests {
         // stays that way: nothing pre-marks it, and the verdict adds no
         // mark for unregistered flows.
         let direct = build_loopback_tcp_syn_packet();
-        let mut check = |_args: policy::CheckDestinationArgs<'_>| Ok(true);
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| policy_allow();
         let (verdict, meta) =
             handle_packet_payload_with_registration(&state, &direct, &mut check, None);
 
@@ -1025,7 +1109,7 @@ pub mod tests {
         let check_count = std::cell::Cell::new(0_u32);
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
         let registration_count = std::cell::Cell::new(0_u32);
         let mut register = |_: FlowRegistration, _: Option<u32>| {
@@ -1081,7 +1165,7 @@ pub mod tests {
         let check_count = std::cell::Cell::new(0_u32);
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(false)
+            policy_deny()
         };
         let registration_count = std::cell::Cell::new(0_u32);
         let mut register = |_: FlowRegistration, _: Option<u32>| {
@@ -1148,7 +1232,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(false)
+            policy_deny()
         };
 
         let registration = std::cell::RefCell::new(None);
@@ -1222,7 +1306,7 @@ pub mod tests {
         let check_count = std::cell::Cell::new(0_u32);
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let registration_count = std::cell::Cell::new(0_u32);
@@ -1279,7 +1363,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let mut register = |_: FlowRegistration, _: Option<u32>| {
@@ -1344,7 +1428,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(false)
+            policy_deny()
         };
 
         let mut register = |_: FlowRegistration, _: Option<u32>| {
@@ -1423,7 +1507,7 @@ pub mod tests {
         );
         packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
 
-        let mut check = |_args: policy::CheckDestinationArgs<'_>| Ok(true);
+        let mut check = |_args: policy::CheckDestinationArgs<'_>| policy_allow();
 
         let mut register = |_: FlowRegistration, _: Option<u32>| Ok(true);
 
@@ -1459,7 +1543,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(false)
+            policy_deny()
         };
 
         let registration_count = std::cell::Cell::new(0_u32);
@@ -1506,7 +1590,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
@@ -1536,7 +1620,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             check_count.set(check_count.get() + 1);
-            Ok(false)
+            policy_deny()
         };
 
         let registration_count = std::cell::Cell::new(0_u32);
@@ -1583,7 +1667,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         // First check: policy consulted.
@@ -1592,7 +1676,7 @@ pub mod tests {
         assert_eq!(v1, Verdict::Accept);
         assert_eq!(call_count.get(), 1);
 
-        // Second check: policy consulted again (no NFQ-side verdict cache).
+        // Second check: policy consulted again (verdict cache disarmed here).
         let (v2, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v2, Verdict::Accept);
@@ -1985,7 +2069,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
@@ -2017,7 +2101,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
@@ -2049,7 +2133,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
@@ -2071,7 +2155,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
@@ -2093,7 +2177,7 @@ pub mod tests {
 
         let mut check = |_args: policy::CheckDestinationArgs<'_>| {
             call_count.set(call_count.get() + 1);
-            Ok(true)
+            policy_allow()
         };
 
         let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);

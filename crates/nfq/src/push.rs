@@ -9,7 +9,10 @@ use std::{path::Path, sync::Arc};
 use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache, network_revocation::NetworkPolicyRevocation};
 use tracing::{debug, info, warn};
 
-use crate::flow::NfqState;
+use crate::{
+    flow::NfqState,
+    verdict_cache::VerdictCache,
+};
 
 /// Background thread that consumes `{"ip","host","ttl"}` lines from the DNS
 /// forwarder's push socket and inserts them into the in-memory cache. The
@@ -47,6 +50,7 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
     info!(socket = %push_socket.display(), trusted_uid, "push socket listener bound");
     let cache = Arc::clone(&state.dns_cache);
     let revocation = state.network_revocation.clone();
+    let verdicts = state.verdict_cache.clone();
 
     std::thread::Builder::new()
         .name("dns-push-listener".to_string())
@@ -85,7 +89,7 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
                     continue;
                 };
 
-                if let Err(error) = apply_push_mapping(&cache, revocation.as_deref(), &entry) {
+                if let Err(error) = apply_push_mapping(&cache, revocation.as_deref(), verdicts.as_deref(), &entry) {
                     warn!(%error, "cannot revoke network grants before DNS push");
                 }
             }
@@ -155,6 +159,7 @@ fn recv_datagram_with_creds(
 fn apply_push_mapping(
     cache: &Arc<std::sync::Mutex<DnsCache>>,
     revocation: Option<&NetworkPolicyRevocation>,
+    verdicts: Option<&dyn VerdictCache>,
     entry: &PushMapping,
 ) -> std::io::Result<()> {
     if entry.host.is_empty() {
@@ -165,6 +170,12 @@ fn apply_push_mapping(
         .map_err(|_| std::io::Error::other("DNS cache lock poisoned"))?;
     if let Some(guard) = revocation {
         guard.revoke()?;
+    }
+    // A pushed mapping can move an approval to another address, so cached
+    // destination verdicts retire with the grants. Best effort: the mapping
+    // itself is applied even if the advisory cache cannot be reached.
+    if let Some(verdicts) = verdicts {
+        verdicts.invalidate();
     }
     cache.remember_ephemeral(&entry.ip, &entry.host, entry.ttl.min(DEFAULT_MAX_TTL));
     drop(cache);
@@ -195,7 +206,7 @@ mod tests {
             ttl: 300,
         };
 
-        apply_push_mapping(&state.dns_cache, None, &entry).expect("apply mapping");
+        apply_push_mapping(&state.dns_cache, None, None, &entry).expect("apply mapping");
 
         assert_eq!(
             state
@@ -248,7 +259,7 @@ mod tests {
 
             let line = std::str::from_utf8(&buf[..n]).expect("utf8");
             let entry: PushMapping = serde_json::from_str(line.trim()).expect("json");
-            apply_push_mapping(&cache, None, &entry).expect("apply mapping");
+            apply_push_mapping(&cache, None, None, &entry).expect("apply mapping");
             true
         });
 

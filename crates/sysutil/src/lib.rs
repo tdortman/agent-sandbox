@@ -711,6 +711,47 @@ pub fn fanotify_unmark_ignore(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> 
     Err(io::Error::last_os_error())
 }
 
+/// Look up one map element, writing the value into `value`.
+///
+/// Returns `Ok(false)` when the key is absent (`ENOENT`) and `Ok(true)` when
+/// the kernel filled `value`. The attribute buffer mirrors
+/// [`bpf_map_update`]: map fd, key pointer, value pointer.
+///
+/// # Errors
+/// Returns the kernel error for an invalid map, key, or value, other than a
+/// missing key.
+pub fn bpf_map_lookup(map: BorrowedFd<'_>, key: &[u8], value: &mut [u8]) -> io::Result<bool> {
+    let mut attr = [0_u8; 32];
+    attr[..4].copy_from_slice(&map.as_raw_fd().to_ne_bytes());
+    attr[8..16].copy_from_slice(&(key.as_ptr() as usize).to_ne_bytes());
+    attr[16..24].copy_from_slice(&(value.as_mut_ptr() as usize).to_ne_bytes());
+    // SAFETY: BPF_MAP_LOOKUP_ELEM reads map_fd, key, and value from this live
+    // attr buffer; the key/value slices outlive the call.
+    let ret = unsafe { libc::syscall(libc::SYS_bpf, 1, attr.as_mut_ptr(), attr.len()) };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOENT) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+/// Delete one map element. Deleting a missing key reports `ENOENT`.
+///
+/// # Errors
+/// Returns the kernel error for an invalid map or key.
+pub fn bpf_map_delete(map: BorrowedFd<'_>, key: &[u8]) -> io::Result<()> {
+    let mut attr = [0_u8; 32];
+    attr[..4].copy_from_slice(&map.as_raw_fd().to_ne_bytes());
+    attr[8..16].copy_from_slice(&(key.as_ptr() as usize).to_ne_bytes());
+    // SAFETY: BPF_MAP_DELETE_ELEM reads map_fd and key from this live attr
+    // buffer; the key slice outlives the call.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_bpf, 3, attr.as_mut_ptr(), attr.len()) })?;
+    Ok(())
+}
+
 /// Kernel `struct fanotify_event_metadata`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -939,6 +980,33 @@ pub fn set_raw_fd_nonblocking(fd: i32) -> io::Result<()> {
     let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
     fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
+}
+
+/// Read the network namespace cookie of a socket (`SO_NETNS_COOKIE`).
+///
+/// The cookie is stable for the lifetime of the namespace, so a daemon that
+/// runs inside a sandbox namespace can read it once and key kernel maps by it.
+///
+/// # Errors
+/// Returns the kernel error when the socket option cannot be read.
+pub fn netns_cookie(socket: BorrowedFd<'_>) -> io::Result<u64> {
+    let mut value = 0_u64;
+    let mut length = u32::try_from(std::mem::size_of::<u64>()).map_err(io::Error::other)?;
+
+    // SAFETY: `getsockopt` writes at most `length` bytes into `value`, which
+    // outlives the call, and reports the written size back through `length`.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NETNS_COOKIE,
+            std::ptr::from_mut(&mut value).cast(),
+            std::ptr::from_mut(&mut length),
+        )
+    };
+
+    syscall_ok(libc::c_long::from(result))?;
+    Ok(value)
 }
 
 /// Install a process-wide handler for `SIGTERM` and `SIGINT`.
