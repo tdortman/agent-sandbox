@@ -88,6 +88,18 @@ pkgs.testers.runNixOSTest (_: {
     proxy.wait_for_unit("agent-sandbox-proxy.service", timeout=120)
     proxy.wait_for_unit("agent-sandbox-proxy-route.service", timeout=120)
     proxy.wait_for_unit("agent-sandbox-nfq.service", timeout=120)
+    # The in-kernel verdict gate: the object loads and pins, the attach leaves
+    # no fail-soft diagnostic behind, and nfq opens both pinned maps. nfq only
+    # reports the cache as enabled after the map types and sizes match the Rust
+    # layout contract, so this line is the C and Rust layouts agreeing.
+    proxy.succeed("test -e /sys/fs/bpf/agent-sandbox-verdict/verdicts")
+    proxy.succeed("test -e /sys/fs/bpf/agent-sandbox-verdict/namespace_state")
+    proxy.succeed(
+        "! journalctl --no-pager -b -u agent-sandbox-verdict-gate.service | grep -q 'continuing without kernel-side denial'"
+    )
+    proxy.succeed(
+        "journalctl --no-pager -b -u agent-sandbox-nfq.service | grep -q 'verdict cache enabled'"
+    )
     check_loopback_bridge(proxy, "sandbox-proxy-bash", wrapper=session_wrapper)
     print(proxy.succeed("ip netns exec agent-sandbox sh -c 'ip rule show; ip route show table 51820' || true"))
     print(proxy.succeed("systemctl show --property=MainPID,ActiveState,SubState,ExecMainCode,ExecMainStatus agent-sandbox-proxy.service; systemctl --no-pager --full status agent-sandbox-proxy.service || true"))

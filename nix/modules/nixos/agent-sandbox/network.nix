@@ -269,6 +269,14 @@ let
   };
   nfqLauncher = pkgs.writeShellScript "agent-sandbox-nfq-with-owner" ''
     set -eu
+    proxy_args=()
+    ${lib.optionalString verdictGateEnabled ''
+      if proxy_uid=$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg proxyUser} 2>/dev/null); then
+        proxy_args=(--proxy-uid "$proxy_uid")
+      else
+        echo "agent-sandbox verdict gate: cannot resolve proxy uid; verdict cache stays off" >&2
+      fi
+    ''}
     pins=/run/agent-sandbox/owner-hints
     ${pkgs.coreutils}/bin/mkdir -p "$pins"
     # The service's private mount namespace owns these fresh pins. The query
@@ -276,11 +284,11 @@ let
     if ${pkgs.util-linux}/bin/mount -t bpf bpf "$pins"; then
       ${pkgs.coreutils}/bin/mkdir -p "$pins/maps"
       if ${pkgs.bpftools}/bin/bpftool prog loadall ${ownerHintBpfObject} "$pins" pinmaps "$pins/maps"; then
-        exec ${sandboxPkg}/bin/agent-sandbox-nfq --owner-hints "$pins" "$@"
+        exec ${sandboxPkg}/bin/agent-sandbox-nfq --owner-hints "$pins" "$@" ''${proxy_args[@]}
       fi
     fi
     echo "kernel ownership hints unavailable; continuing with iterator" >&2
-    exec ${sandboxPkg}/bin/agent-sandbox-nfq "$@"
+    exec ${sandboxPkg}/bin/agent-sandbox-nfq "$@" ''${proxy_args[@]}
   '';
   nfqReadyPath = "/run/agent-sandbox/nfq-ready";
   # The DNS forwarder runs on the host and listens on the veth gateway. It
@@ -590,642 +598,701 @@ let
   rootCfg = config.agent-sandbox;
   runtime = agentSandboxLib.mkRuntime { inherit rootCfg; };
   sandboxPkg = flake.package "agent-sandbox";
+  verdictBpfObject =
+    pkgs.runCommand "agent-sandbox-verdict-gate-bpf.o"
+      {
+        nativeBuildInputs = [
+          pkgs.libbpf
+          pkgs.linuxHeaders
+          pkgs.llvmPackages.clang-unwrapped
+        ];
+      }
+      ''
+        ${pkgs.llvmPackages.clang-unwrapped}/bin/clang -O2 -g -target bpf \
+          -I${pkgs.libbpf}/include \
+          -I${pkgs.linuxHeaders}/include \
+          -c ${./policy/gate.bpf.c} \
+          -o "$out"
+      '';
+  verdictBpfScript = pkgs.replaceVars ./policy/bpf.sh {
+    inherit verdictMapDir;
+    bpfObject = verdictBpfObject;
+  };
+  verdictGateBpfPkg = mkNetnsLauncher {
+    name = "agent-sandbox-verdict-gate-bpf";
 
+    runtimeInputs = [
+      pkgs.bpftools
+      pkgs.coreutils
+    ];
+
+    script = verdictBpfScript;
+  };
+  verdictGateEnabled = cfg.verdictGate.enable;
+  verdictMapDir = "/sys/fs/bpf/agent-sandbox-verdict";
 in
-lib.mkIf policyEnabled (
-  lib.mkMerge [
-    {
-      environment.etc."agent-sandbox/policy.json".text = builtins.toJSON (
-        {
-          network = {
-            direct = {
-              allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
-              deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+{
+  config = lib.mkIf policyEnabled (
+    lib.mkMerge [
+      {
+        environment.etc."agent-sandbox/policy.json".text = builtins.toJSON (
+          {
+            network = {
+              direct = {
+                allow = map (r: { inherit (r) host port; }) (cfg.declarativeAllow ++ loopbackPolicyRules);
+                deny = map (r: { inherit (r) host port; }) cfg.declarativeDeny;
+              };
+
+              http = {
+                allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
+                deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
+              };
             };
 
-            http = {
-              allow = map httpRuleJson cfg.httpProxy.declarativeAllow;
-              deny = map httpRuleJson cfg.httpProxy.declarativeDeny;
+            sudo = {
+              allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
+              deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
             };
-          };
+          }
+          // lib.optionalAttrs rootCfg.policy.dbus.enable {
+            dbus = {
+              allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
+              deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
+            };
+          }
+          //
+            lib.optionalAttrs
+              (
+                config.agent-sandbox.gates.filesystem.enable
+                || rootCfg.policy.filesystem.declarativeAllow != [ ]
+                || rootCfg.policy.filesystem.declarativeDeny != [ ]
+              )
+              {
+                filesystem = {
+                  allow = [
+                    {
+                      access = "all";
+                      path = "/nix/store";
+                    }
+                  ]
+                  ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
 
-          sudo = {
-            allow = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeAllow;
-            deny = map (r: { inherit (r) argv; }) rootCfg.policy.sudo.declarativeDeny;
-          };
-        }
-        // lib.optionalAttrs rootCfg.policy.dbus.enable {
-          dbus = {
-            allow = map dbusRuleJson rootCfg.policy.dbus.declarativeAllow;
-            deny = map dbusRuleJson rootCfg.policy.dbus.declarativeDeny;
-          };
-        }
-        //
-          lib.optionalAttrs
-            (
-              config.agent-sandbox.gates.filesystem.enable
-              || rootCfg.policy.filesystem.declarativeAllow != [ ]
-              || rootCfg.policy.filesystem.declarativeDeny != [ ]
-            )
-            {
-              filesystem = {
-                allow = [
-                  {
-                    access = "all";
-                    path = "/nix/store";
-                  }
-                ]
-                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
+                  deny = [
+                    {
+                      access = "all";
+                      path = "~/.config/agent-sandbox";
+                    }
+                    {
+                      access = "all";
+                      path = "./.agent-sandbox";
+                    }
+                  ]
+                  ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
+                };
+              }
+          //
+            lib.optionalAttrs
+              (
+                rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
+              )
+              {
+                resources = {
+                  allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
+                  deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
+                };
+              }
+        );
 
-                deny = [
-                  {
-                    access = "all";
-                    path = "~/.config/agent-sandbox";
-                  }
-                  {
-                    access = "all";
-                    path = "./.agent-sandbox";
-                  }
-                ]
-                ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeDeny;
-              };
-            }
-        //
-          lib.optionalAttrs
-            (
-              rootCfg.policy.resources.declarativeAllow != [ ] || rootCfg.policy.resources.declarativeDeny != [ ]
-            )
-            {
-              resources = {
-                allow = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeAllow;
-                deny = map (r: { inherit (r) access kind path; }) rootCfg.policy.resources.declarativeDeny;
-              };
-            }
-      );
+        networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
 
-      networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
+        systemd.services.agent-sandbox-policy = {
+          description = "Policy daemon for agent-sandbox";
+          before = lib.optionals cfg.enable [ "agent-sandbox-nfq.service" ];
 
-      systemd.services.agent-sandbox-policy = {
-        description = "Policy daemon for agent-sandbox";
-        before = lib.optionals cfg.enable [ "agent-sandbox-nfq.service" ];
+          after =
+            lib.optionals cfg.enable [
+              "agent-sandbox-dns.service"
+              "agent-sandbox-netns.service"
+            ]
+            ++ [ "network.target" ];
 
-        after =
-          lib.optionals cfg.enable [
+          requires = lib.optionals cfg.enable [
             "agent-sandbox-dns.service"
             "agent-sandbox-netns.service"
-          ]
-          ++ [ "network.target" ];
-
-        requires = lib.optionals cfg.enable [
-          "agent-sandbox-dns.service"
-          "agent-sandbox-netns.service"
-        ];
-
-        wantedBy = [ "multi-user.target" ];
-
-        serviceConfig = {
-          Type = "simple";
-
-          ExecStart = lib.escapeShellArgs (
-            [
-              (
-                if runtime.httpProxy.enable then
-                  "${proxyPolicyLauncher}/bin/agent-sandbox-policy-launch"
-                else
-                  "${sandboxPkg}/bin/agent-sandbox-policyd"
-              )
-              "--socket"
-              runtime.policySocket
-              "--sandbox-socket"
-              runtime.sandboxPolicySocket
-              "--declarative"
-              "/etc/agent-sandbox/policy.json"
-              "--export-json"
-              runtime.exportedJson
-              "--approval-timeout"
-              (toString runtime.approvalTimeout)
-            ]
-            ++ lib.concatMap (value: [
-              "--package-declarative"
-              "${packageEffectiveName value}=/etc/agent-sandbox/packages/${packageEffectiveName value}.json"
-            ]) (lib.filter packageHasPolicy rootCfg.packages)
-            ++ lib.optionals (!runtime.interactiveApproval) [
-              "--no-interactive-approval"
-            ]
-            ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
-              "--ui-spawn-cmd"
-              "${sandboxPkg}/bin/agent-sandbox-ui"
-            ]
-            ++ lib.optionals runtime.httpProxy.enable [
-              "--proxy-socket"
-              runtime.httpProxy.socketPath
-            ]
-            ++ lib.optionals (runtime.exportedNix != "") [
-              "--export-nix"
-              runtime.exportedNix
-            ]
-            ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
-              "--fs-monitor-cmd"
-              "${sandboxPkg}/bin/agent-sandbox-fsmon"
-            ]
-            ++
-              lib.optionals
-                (
-                  (config.agent-sandbox.gates.syscalls.enable && config.agent-sandbox.network.enable)
-                  || config.agent-sandbox.gates.resources.enable
-                  || config.agent-sandbox.gates.filesystem.enable
-                )
-                [
-                  "--syscall-broker-cmd"
-                  "${sandboxPkg}/bin/agent-sandbox-syscall-broker"
-                ]
-          );
-
-          ExecStopPost = "+${sandboxPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
-          Restart = "on-failure";
-          RuntimeDirectory = "agent-sandbox";
-          RuntimeDirectoryPreserve = "yes";
-          StateDirectory = "agent-sandbox";
-        };
-
-        environment = {
-          AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
-          AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
-          AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
-          AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
-          AGENT_SANDBOX_UI_BACKEND = runtime.uiBackend;
-        }
-        // lib.optionalAttrs (runtime.httpProxy.enable && runtime.httpProxy.gid != null) {
-          AGENT_SANDBOX_PROXY_GID_OVERRIDE = toString runtime.httpProxy.gid;
-        }
-        // lib.optionalAttrs (runtime.uiBackend == "zenity") {
-          AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
-        };
-
-      };
-    }
-
-    (lib.mkIf cfg.enable {
-      boot = {
-        kernel.sysctl = {
-          "net.ipv4.conf.all.rp_filter" = 0;
-          "net.ipv4.conf.default.rp_filter" = 0;
-          "net.ipv4.ip_forward" = 1;
-          "net.ipv6.conf.all.forwarding" = 1;
-        };
-
-        kernelModules = lib.optionals cfg.httpProxy.enable [
-          "nf_tproxy_ipv4"
-          "nf_tproxy_ipv6"
-        ];
-      };
-
-      environment.etc = {
-        "agent-sandbox/nsswitch.conf".text = nsswitchConfText;
-        "agent-sandbox/resolv.conf".text = resolvConfText;
-      }
-      // lib.optionalAttrs cfg.httpProxy.enable {
-        "agent-sandbox/proxy-upstream-cidrs.json" = {
-          mode = "0644";
-          text = builtins.toJSON cfg.httpProxy.upstreamAllowCidrs;
-        };
-      };
-
-      # Runtime nft INPUT accepts are not enough when the host firewall has its own
-      # later input chains. Open bridge ports declaratively on the veth interface.
-      networking.firewall.interfaces.${runtime.network.vethHost} = {
-        allowedTCPPorts = lib.mkAfter ([ 53 ] ++ loopbackTcpPorts);
-        allowedUDPPorts = lib.mkAfter ([ 53 ] ++ loopbackUdpPorts);
-      };
-
-      security.wrappers.agent-sandbox-enter = {
-        # setns(CLONE_NEWNET) needs CAP_SYS_ADMIN; CAP_NET_ADMIN alone is insufficient.
-        capabilities = "cap_sys_admin,cap_net_admin+ep";
-        group = "root";
-        owner = "root";
-        setgid = false;
-        setuid = false;
-        source = "${sandboxPkg}/bin/agent-sandbox-enter";
-      };
-
-      systemd.services = {
-        agent-sandbox-dns = {
-          description = "DNS forwarder for agent-sandbox (forwards raw DNS and records IP→hostname cache)";
-
-          before = [
-            "agent-sandbox-nfq.service"
-            "agent-sandbox-policy.service"
           ];
-
-          after = [
-            "agent-sandbox-netns.service"
-            "network.target"
-            "systemd-resolved.service"
-          ]
-          ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
-
-          requires = [
-            "agent-sandbox-netns.service"
-          ]
-          ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
 
           wantedBy = [ "multi-user.target" ];
 
-          serviceConfig = networkDaemonHardening // {
+          serviceConfig = {
             Type = "simple";
 
             ExecStart = lib.escapeShellArgs (
               [
-                "${sandboxPkg}/bin/agent-sandbox-dns-forwarder"
-                "--listen-host"
-                runtime.hostIp
-                "--listen-port"
-                "53"
-                "--forward-target"
-                runtime.dnsForwardTarget
-                "--cache-path"
-                "/run/agent-sandbox/dns-cache.json"
-                "--push-socket"
-                "/run/agent-sandbox/dns-push.sock"
+                (
+                  if runtime.httpProxy.enable then
+                    "${proxyPolicyLauncher}/bin/agent-sandbox-policy-launch"
+                  else
+                    "${sandboxPkg}/bin/agent-sandbox-policyd"
+                )
+                "--socket"
+                runtime.policySocket
+                "--sandbox-socket"
+                runtime.sandboxPolicySocket
+                "--declarative"
+                "/etc/agent-sandbox/policy.json"
+                "--export-json"
+                runtime.exportedJson
+                "--approval-timeout"
+                (toString runtime.approvalTimeout)
               ]
-              ++ lib.optionals cfg.httpProxy.enable [
-                "--cache-client-ip"
-                runtime.network.netnsIp
-                "--ech-config-path"
-                "${proxyStateDir}/ech-config-list"
+              ++ lib.concatMap (value: [
+                "--package-declarative"
+                "${packageEffectiveName value}=/etc/agent-sandbox/packages/${packageEffectiveName value}.json"
+              ]) (lib.filter packageHasPolicy rootCfg.packages)
+              ++ lib.optionals (!runtime.interactiveApproval) [
+                "--no-interactive-approval"
               ]
-              ++ lib.optional cfg.httpProxy.enable "--suppress-https-svcb"
+              ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
+                "--ui-spawn-cmd"
+                "${sandboxPkg}/bin/agent-sandbox-ui"
+              ]
+              ++ lib.optionals runtime.httpProxy.enable [
+                "--proxy-socket"
+                runtime.httpProxy.socketPath
+              ]
+              ++ lib.optionals (runtime.exportedNix != "") [
+                "--export-nix"
+                runtime.exportedNix
+              ]
+              ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
+                "--fs-monitor-cmd"
+                "${sandboxPkg}/bin/agent-sandbox-fsmon"
+              ]
+              ++
+                lib.optionals
+                  (
+                    (config.agent-sandbox.gates.syscalls.enable && config.agent-sandbox.network.enable)
+                    || config.agent-sandbox.gates.resources.enable
+                    || config.agent-sandbox.gates.filesystem.enable
+                  )
+                  [
+                    "--syscall-broker-cmd"
+                    "${sandboxPkg}/bin/agent-sandbox-syscall-broker"
+                  ]
             );
 
-            KillMode = "control-group";
-            LimitNOFILE = 2048;
-            MemoryMax = "256M";
+            ExecStopPost = "+${sandboxPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
             Restart = "on-failure";
             RuntimeDirectory = "agent-sandbox";
             RuntimeDirectoryPreserve = "yes";
-            TasksMax = 512;
-          };
-
-          bindsTo = [ "agent-sandbox-netns.service" ];
-        };
-
-        agent-sandbox-netns = {
-          before = [
-            "agent-sandbox-dns.service"
-            "agent-sandbox-nfq.service"
-            "agent-sandbox-policy.service"
-          ];
-
-          after = [ "network-pre.target" ];
-          wantedBy = [ "multi-user.target" ];
-
-          serviceConfig = networkNamespaceSetupHardening // {
-            Type = "oneshot";
-            ExecStart = "${netnsUpPkg}/bin/agent-sandbox-netns-up";
-            ExecStop = "${netnsDownPkg}/bin/agent-sandbox-netns-down";
-            RemainAfterExit = true;
-          };
-        };
-
-        agent-sandbox-nfq = {
-          description = "Transport-layer policy enforcer inside agent-sandbox netns";
-
-          after = [
-            "agent-sandbox-dns.service"
-            "agent-sandbox-netns.service"
-            "agent-sandbox-policy.service"
-          ];
-
-          requires = [
-            "agent-sandbox-dns.service"
-            "agent-sandbox-netns.service"
-            "agent-sandbox-policy.service"
-          ];
-
-          wantedBy = [ "multi-user.target" ];
-
-          serviceConfig = networkDaemonHardening // {
-            Type = "simple";
-
-            ExecStart = lib.escapeShellArgs (
-              [
-                (toString nfqLauncher)
-                "--owner-iterator"
-                (toString ownerBpfObject)
-                "--queue"
-                (toString runtime.queueNumber)
-                "--policy-socket"
-                runtime.sandboxPolicySocket
-                "--policy-timeout"
-                (toString runtime.policyTimeout)
-                "--nft-binary"
-                "${pkgs.nftables}/bin/nft"
-                "--dns-server-ip"
-                runtime.hostIp
-                "--push-socket"
-                "/run/agent-sandbox/dns-push.sock"
-              ]
-              ++ lib.optionals cfg.httpProxy.enable [
-                "--proxy-mode"
-                "--ready-file"
-                nfqReadyPath
-              ]
-              ++ lib.optionals (cfg.httpProxy.enable && cfg.httpProxy.http3.enable) [
-                "--udp-proxy-ports"
-                http3UdpPortsComma
-              ]
-            );
-
-            ExecStartPre = lib.optionals cfg.httpProxy.enable [
-              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${nfqReadyPath}"
-            ];
-
-            ExecStopPost = lib.optionals cfg.httpProxy.enable [
-              "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${nfqReadyPath}"
-            ];
-
-            NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
-            RuntimeDirectory = "agent-sandbox";
-            RuntimeDirectoryPreserve = "yes";
-          };
-
-          environment.AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
-        };
-      }
-      // lib.optionalAttrs cfg.httpProxy.enable {
-        agent-sandbox-proxy = {
-          description = "Fail-closed transparent HTTP interceptor";
-          before = [ "agent-sandbox-proxy-route.service" ];
-
-          after = [
-            "agent-sandbox-dns.service"
-            "agent-sandbox-netns.service"
-            "agent-sandbox-policy.service"
-            "agent-sandbox-proxy-firewall.service"
-            "agent-sandbox-proxy-init.service"
-          ];
-
-          wants = [ "agent-sandbox-proxy-route.service" ];
-
-          requires = [
-            "agent-sandbox-dns.service"
-            "agent-sandbox-netns.service"
-            "agent-sandbox-policy.service"
-            "agent-sandbox-proxy-firewall.service"
-            "agent-sandbox-proxy-init.service"
-          ];
-
-          wantedBy = [ "multi-user.target" ];
-
-          serviceConfig = networkDaemonHardening // {
-            Type = "simple";
-
-            AmbientCapabilities = [
-              "CAP_NET_ADMIN"
-            ]
-            ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
-
-            BindReadOnlyPaths = [ "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf" ];
-
-            CapabilityBoundingSet = [
-              "CAP_NET_ADMIN"
-            ]
-            ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
-
-            ExecStart = "${proxyLaunchPkg}/bin/agent-sandbox-proxy-launch";
-
-            ExecStartPre = [
-              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${proxyReadyPath}"
-            ];
-
-            ExecStopPost = [
-              "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${proxyReadyPath}"
-            ];
-
-            Group = proxyGroup;
-            NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
-
-            ReadOnlyPaths = [
-              proxyBundlePath
-              "/run/agent-sandbox"
-            ];
-
-            ReadWritePaths = [ proxyStateDir ];
-            Restart = "always";
-            RestartSec = 1;
-            RuntimeDirectory = "agent-sandbox";
-            RuntimeDirectoryMode = "0755";
-            RuntimeDirectoryPreserve = "yes";
-            User = proxyUser;
+            StateDirectory = "agent-sandbox";
           };
 
           environment = {
-            AGENT_SANDBOX_PROXY_SESSION_READY = proxyReadyPath;
-            AGENT_SANDBOX_PROXY_SOCKET = runtime.httpProxy.socketPath;
-            CURL_CA_BUNDLE = proxyBundlePath;
-            REQUESTS_CA_BUNDLE = proxyBundlePath;
-            SSL_CERT_FILE = proxyBundlePath;
+            AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
+            AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
+            AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
+            AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
+            AGENT_SANDBOX_UI_BACKEND = runtime.uiBackend;
+          }
+          // lib.optionalAttrs (runtime.httpProxy.enable && runtime.httpProxy.gid != null) {
+            AGENT_SANDBOX_PROXY_GID_OVERRIDE = toString runtime.httpProxy.gid;
+          }
+          // lib.optionalAttrs (runtime.uiBackend == "zenity") {
+            AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
           };
 
         };
+      }
 
-        agent-sandbox-proxy-firewall = {
-          description = "Restrictive egress firewall for agent-sandbox transparent proxy";
-          before = [ "agent-sandbox-proxy.service" ];
+      (lib.mkIf cfg.enable {
+        boot = {
+          kernel.sysctl = {
+            "net.ipv4.conf.all.rp_filter" = 0;
+            "net.ipv4.conf.default.rp_filter" = 0;
+            "net.ipv4.ip_forward" = 1;
+            "net.ipv6.conf.all.forwarding" = 1;
+          };
 
-          after = [
-            "agent-sandbox-netns.service"
-            "agent-sandbox-proxy-init.service"
-            "network.target"
+          kernelModules = lib.optionals cfg.httpProxy.enable [
+            "nf_tproxy_ipv4"
+            "nf_tproxy_ipv6"
           ];
+        };
 
-          requires = [
-            "agent-sandbox-netns.service"
-            "agent-sandbox-proxy-init.service"
-          ];
-
-          wantedBy = [ "multi-user.target" ];
-          partOf = [ "agent-sandbox-proxy.service" ];
-
-          serviceConfig = networkSetupHardening // {
-            Type = "oneshot";
-
-            ExecStart = lib.escapeShellArgs (
-              [
-                "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-                proxyUser
-                proxyGroup
-                runtime.hostIp
-                proxyCidrsPath
-                "agent_sandbox_proxy"
-              ]
-              ++ [
-                (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
-              ]
-            );
-
-            ExecStopPost = lib.escapeShellArgs (
-              [
-                "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-                proxyUser
-                proxyGroup
-                runtime.hostIp
-                proxyCidrsPath
-                "agent_sandbox_proxy"
-              ]
-              ++ [
-                (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
-              ]
-              ++ [ "cleanup" ]
-            );
-
-            NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
-            RemainAfterExit = true;
+        environment.etc = {
+          "agent-sandbox/nsswitch.conf".text = nsswitchConfText;
+          "agent-sandbox/resolv.conf".text = resolvConfText;
+        }
+        // lib.optionalAttrs cfg.httpProxy.enable {
+          "agent-sandbox/proxy-upstream-cidrs.json" = {
+            mode = "0644";
+            text = builtins.toJSON cfg.httpProxy.upstreamAllowCidrs;
           };
         };
 
-        agent-sandbox-proxy-init = {
-          description = "Initialize agent-sandbox interception CA";
+        # Runtime nft INPUT accepts are not enough when the host firewall has its own
+        # later input chains. Open bridge ports declaratively on the veth interface.
+        networking.firewall.interfaces.${runtime.network.vethHost} = {
+          allowedTCPPorts = lib.mkAfter ([ 53 ] ++ loopbackTcpPorts);
+          allowedUDPPorts = lib.mkAfter ([ 53 ] ++ loopbackUdpPorts);
+        };
 
-          before = [
-            "agent-sandbox-proxy-firewall.service"
-            "agent-sandbox-proxy.service"
-          ];
+        security.wrappers.agent-sandbox-enter = {
+          # setns(CLONE_NEWNET) needs CAP_SYS_ADMIN; CAP_NET_ADMIN alone is insufficient.
+          capabilities = "cap_sys_admin,cap_net_admin+ep";
+          group = "root";
+          owner = "root";
+          setgid = false;
+          setuid = false;
+          source = "${sandboxPkg}/bin/agent-sandbox-enter";
+        };
 
-          after = [
-            "agent-sandbox-netns.service"
-            "network-pre.target"
-          ];
+        systemd.services = {
+          agent-sandbox-dns = {
+            description = "DNS forwarder for agent-sandbox (forwards raw DNS and records IP→hostname cache)";
 
+            before = [
+              "agent-sandbox-nfq.service"
+              "agent-sandbox-policy.service"
+            ];
+
+            after = [
+              "agent-sandbox-netns.service"
+              "network.target"
+              "systemd-resolved.service"
+            ]
+            ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
+
+            requires = [
+              "agent-sandbox-netns.service"
+            ]
+            ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
+
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = networkDaemonHardening // {
+              Type = "simple";
+
+              ExecStart = lib.escapeShellArgs (
+                [
+                  "${sandboxPkg}/bin/agent-sandbox-dns-forwarder"
+                  "--listen-host"
+                  runtime.hostIp
+                  "--listen-port"
+                  "53"
+                  "--forward-target"
+                  runtime.dnsForwardTarget
+                  "--cache-path"
+                  "/run/agent-sandbox/dns-cache.json"
+                  "--push-socket"
+                  "/run/agent-sandbox/dns-push.sock"
+                ]
+                ++ lib.optionals cfg.httpProxy.enable [
+                  "--cache-client-ip"
+                  runtime.network.netnsIp
+                  "--ech-config-path"
+                  "${proxyStateDir}/ech-config-list"
+                ]
+                ++ lib.optional cfg.httpProxy.enable "--suppress-https-svcb"
+              );
+
+              KillMode = "control-group";
+              LimitNOFILE = 2048;
+              MemoryMax = "256M";
+              Restart = "on-failure";
+              RuntimeDirectory = "agent-sandbox";
+              RuntimeDirectoryPreserve = "yes";
+              TasksMax = 512;
+            };
+
+            bindsTo = [ "agent-sandbox-netns.service" ];
+          };
+
+          agent-sandbox-netns = {
+            before = [
+              "agent-sandbox-dns.service"
+              "agent-sandbox-nfq.service"
+              "agent-sandbox-policy.service"
+            ];
+
+            after = [ "network-pre.target" ];
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = networkNamespaceSetupHardening // {
+              Type = "oneshot";
+              ExecStart = "${netnsUpPkg}/bin/agent-sandbox-netns-up";
+              ExecStop = "${netnsDownPkg}/bin/agent-sandbox-netns-down";
+              RemainAfterExit = true;
+            };
+          };
+
+          agent-sandbox-nfq = {
+            description = "Transport-layer policy enforcer inside agent-sandbox netns";
+
+            after = [
+              "agent-sandbox-dns.service"
+              "agent-sandbox-netns.service"
+              "agent-sandbox-policy.service"
+            ];
+
+            requires = [
+              "agent-sandbox-dns.service"
+              "agent-sandbox-netns.service"
+              "agent-sandbox-policy.service"
+            ];
+
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = networkDaemonHardening // {
+              Type = "simple";
+
+              ExecStart = lib.escapeShellArgs (
+                [
+                  (toString nfqLauncher)
+                  "--owner-iterator"
+                  (toString ownerBpfObject)
+                  "--queue"
+                  (toString runtime.queueNumber)
+                  "--policy-socket"
+                  runtime.sandboxPolicySocket
+                  "--policy-timeout"
+                  (toString runtime.policyTimeout)
+                  "--nft-binary"
+                  "${pkgs.nftables}/bin/nft"
+                  "--dns-server-ip"
+                  runtime.hostIp
+                  "--push-socket"
+                  "/run/agent-sandbox/dns-push.sock"
+                ]
+                ++ lib.optionals verdictGateEnabled [
+                  "--verdict-map"
+                  verdictMapDir
+                ]
+                ++ lib.optionals cfg.httpProxy.enable [
+                  "--proxy-mode"
+                  "--ready-file"
+                  nfqReadyPath
+                ]
+                ++ lib.optionals (cfg.httpProxy.enable && cfg.httpProxy.http3.enable) [
+                  "--udp-proxy-ports"
+                  http3UdpPortsComma
+                ]
+              );
+
+              ExecStartPre = lib.optionals cfg.httpProxy.enable [
+                "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${nfqReadyPath}"
+              ];
+
+              ExecStopPost = lib.optionals cfg.httpProxy.enable [
+                "${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${nfqReadyPath}"
+              ];
+
+              NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
+              RuntimeDirectory = "agent-sandbox";
+              RuntimeDirectoryPreserve = "yes";
+            };
+
+            environment.AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
+          };
+        }
+        // lib.optionalAttrs cfg.httpProxy.enable {
+          agent-sandbox-proxy = {
+            description = "Fail-closed transparent HTTP interceptor";
+            before = [ "agent-sandbox-proxy-route.service" ];
+
+            after = [
+              "agent-sandbox-dns.service"
+              "agent-sandbox-netns.service"
+              "agent-sandbox-policy.service"
+              "agent-sandbox-proxy-firewall.service"
+              "agent-sandbox-proxy-init.service"
+            ];
+
+            wants = [ "agent-sandbox-proxy-route.service" ];
+
+            requires = [
+              "agent-sandbox-dns.service"
+              "agent-sandbox-netns.service"
+              "agent-sandbox-policy.service"
+              "agent-sandbox-proxy-firewall.service"
+              "agent-sandbox-proxy-init.service"
+            ];
+
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = networkDaemonHardening // {
+              Type = "simple";
+
+              AmbientCapabilities = [
+                "CAP_NET_ADMIN"
+              ]
+              ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
+
+              BindReadOnlyPaths = [ "/etc/agent-sandbox/resolv.conf:/etc/resolv.conf" ];
+
+              CapabilityBoundingSet = [
+                "CAP_NET_ADMIN"
+              ]
+              ++ lib.optional cfg.httpProxy.http3.enable "CAP_NET_BIND_SERVICE";
+
+              ExecStart = "${proxyLaunchPkg}/bin/agent-sandbox-proxy-launch";
+
+              ExecStartPre = [
+                "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${proxyReadyPath}"
+              ];
+
+              ExecStopPost = [
+                "+${readinessMarkerPkg}/bin/agent-sandbox-readiness-marker ${proxyReadyPath}"
+              ];
+
+              Group = proxyGroup;
+              NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
+
+              ReadOnlyPaths = [
+                proxyBundlePath
+                "/run/agent-sandbox"
+              ];
+
+              ReadWritePaths = [ proxyStateDir ];
+              Restart = "always";
+              RestartSec = 1;
+              RuntimeDirectory = "agent-sandbox";
+              RuntimeDirectoryMode = "0755";
+              RuntimeDirectoryPreserve = "yes";
+              User = proxyUser;
+            };
+
+            environment = {
+              AGENT_SANDBOX_PROXY_SESSION_READY = proxyReadyPath;
+              AGENT_SANDBOX_PROXY_SOCKET = runtime.httpProxy.socketPath;
+              CURL_CA_BUNDLE = proxyBundlePath;
+              REQUESTS_CA_BUNDLE = proxyBundlePath;
+              SSL_CERT_FILE = proxyBundlePath;
+            };
+
+          };
+
+          agent-sandbox-proxy-firewall = {
+            description = "Restrictive egress firewall for agent-sandbox transparent proxy";
+            before = [ "agent-sandbox-proxy.service" ];
+
+            after = [
+              "agent-sandbox-netns.service"
+              "agent-sandbox-proxy-init.service"
+              "network.target"
+            ];
+
+            requires = [
+              "agent-sandbox-netns.service"
+              "agent-sandbox-proxy-init.service"
+            ];
+
+            wantedBy = [ "multi-user.target" ];
+            partOf = [ "agent-sandbox-proxy.service" ];
+
+            serviceConfig = networkSetupHardening // {
+              Type = "oneshot";
+
+              ExecStart = lib.escapeShellArgs (
+                [
+                  "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+                  proxyUser
+                  proxyGroup
+                  runtime.hostIp
+                  proxyCidrsPath
+                  "agent_sandbox_proxy"
+                ]
+                ++ [
+                  (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
+                ]
+              );
+
+              ExecStopPost = lib.escapeShellArgs (
+                [
+                  "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+                  proxyUser
+                  proxyGroup
+                  runtime.hostIp
+                  proxyCidrsPath
+                  "agent_sandbox_proxy"
+                ]
+                ++ [
+                  (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
+                ]
+                ++ [ "cleanup" ]
+              );
+
+              NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
+              RemainAfterExit = true;
+            };
+          };
+
+          agent-sandbox-proxy-init = {
+            description = "Initialize agent-sandbox interception CA";
+
+            before = [
+              "agent-sandbox-proxy-firewall.service"
+              "agent-sandbox-proxy.service"
+            ];
+
+            after = [
+              "agent-sandbox-netns.service"
+              "network-pre.target"
+            ];
+
+            requires = [ "agent-sandbox-netns.service" ];
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = networkSetupHardening // {
+              Type = "oneshot";
+
+              ExecStart = lib.escapeShellArgs [
+                "${proxyInitPkg}/bin/agent-sandbox-proxy-init"
+                proxyStateDir
+                proxyBundlePath
+                "/etc/ssl/certs/ca-bundle.crt"
+                "${sandboxPkg}/bin/agent-sandbox-proxy"
+              ];
+
+              ExecStartPost = "${pkgs.coreutils}/bin/chown -R ${proxyUser}:${proxyGroup} ${proxyStateDir}";
+
+              LoadCredential =
+                lib.optionals (proxyCaCertificate != null) [
+                  "proxy-ca-cert:${proxyCaCertificate}"
+                ]
+                ++ lib.optionals (proxyCaPrivateKey != null) [
+                  "proxy-ca-key:${proxyCaPrivateKey}"
+                ];
+
+              RemainAfterExit = true;
+              RuntimeDirectory = "agent-sandbox";
+              RuntimeDirectoryPreserve = "yes";
+              StateDirectory = "agent-sandbox/proxy";
+              StateDirectoryMode = "0700";
+            };
+          };
+
+          agent-sandbox-proxy-route = {
+            description = "Install fail-closed TPROXY routes for the proxy generation";
+
+            after = [
+              "agent-sandbox-proxy-firewall.service"
+              "agent-sandbox-proxy.service"
+            ];
+
+            requires = [
+              "agent-sandbox-proxy-firewall.service"
+              "agent-sandbox-proxy.service"
+            ];
+
+            wantedBy = [ "multi-user.target" ];
+            partOf = [ "agent-sandbox-proxy.service" ];
+
+            serviceConfig = networkSetupHardening // {
+              Type = "oneshot";
+
+              ExecStart = lib.escapeShellArgs (
+                [
+                  "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
+                  "18080"
+                  "51820"
+                  "51820"
+                  "agent_sandbox_proxy_tproxy"
+                  (toString runtime.queueNumber)
+                  proxyUser
+                  "agent-sandbox-proxy.service"
+                  "agent-sandbox-nfq.service"
+                  proxyReadyPath
+                  nfqReadyPath
+                ]
+                ++ lib.optionals runtime.httpProxy.http3.enable [
+                  http3UdpPortsSpace
+                ]
+              );
+
+              ExecStopPost = lib.escapeShellArgs (
+                [
+                  "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
+                  "18080"
+                  "51820"
+                  "51820"
+                  "agent_sandbox_proxy_tproxy"
+                  (toString runtime.queueNumber)
+                  proxyUser
+                  "agent-sandbox-proxy.service"
+                  "agent-sandbox-nfq.service"
+                  proxyReadyPath
+                  nfqReadyPath
+                ]
+                ++ [
+                  (lib.optionalString runtime.httpProxy.http3.enable http3UdpPortsSpace)
+                  "cleanup"
+                ]
+              );
+
+              NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
+              RemainAfterExit = true;
+              Restart = "on-failure";
+              RestartSec = 1;
+              SuccessExitStatus = [ "143" ];
+            };
+
+            bindsTo = [ "agent-sandbox-proxy.service" ];
+          };
+        };
+
+        users = {
+          groups.${proxyGroup} = lib.mkIf cfg.httpProxy.enable { };
+
+          users.${proxyUser} = lib.mkIf cfg.httpProxy.enable {
+            createHome = false;
+            description = "agent-sandbox transparent HTTP proxy";
+            group = proxyGroup;
+            home = "/var/empty";
+            isSystemUser = true;
+          };
+        };
+      })
+
+      (lib.mkIf (cfg.enable && loopbackEnabled) {
+        systemd.services.agent-sandbox-loopback = {
+          description = "Share selected localhost ports with the agent-sandbox network namespace";
+          before = [ "multi-user.target" ];
+          after = [ "agent-sandbox-netns.service" ];
           requires = [ "agent-sandbox-netns.service" ];
           wantedBy = [ "multi-user.target" ];
 
-          serviceConfig = networkSetupHardening // {
+          serviceConfig = {
             Type = "oneshot";
-
-            ExecStart = lib.escapeShellArgs [
-              "${proxyInitPkg}/bin/agent-sandbox-proxy-init"
-              proxyStateDir
-              proxyBundlePath
-              "/etc/ssl/certs/ca-bundle.crt"
-              "${sandboxPkg}/bin/agent-sandbox-proxy"
-            ];
-
-            ExecStartPost = "${pkgs.coreutils}/bin/chown -R ${proxyUser}:${proxyGroup} ${proxyStateDir}";
-
-            LoadCredential =
-              lib.optionals (proxyCaCertificate != null) [
-                "proxy-ca-cert:${proxyCaCertificate}"
-              ]
-              ++ lib.optionals (proxyCaPrivateKey != null) [
-                "proxy-ca-key:${proxyCaPrivateKey}"
-              ];
-
+            ExecStart = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf";
+            ExecStop = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf cleanup";
             RemainAfterExit = true;
-            RuntimeDirectory = "agent-sandbox";
-            RuntimeDirectoryPreserve = "yes";
-            StateDirectory = "agent-sandbox/proxy";
-            StateDirectoryMode = "0700";
           };
         };
+      })
 
-        agent-sandbox-proxy-route = {
-          description = "Install fail-closed TPROXY routes for the proxy generation";
+      (lib.mkIf (cfg.enable && verdictGateEnabled) {
+        systemd.services.agent-sandbox-verdict-gate = {
+          description = "Fail denied sandbox destinations in the kernel from the published verdict map";
 
-          after = [
-            "agent-sandbox-proxy-firewall.service"
-            "agent-sandbox-proxy.service"
+          before = [
+            "agent-sandbox-nfq.service"
+            "multi-user.target"
           ];
 
-          requires = [
-            "agent-sandbox-proxy-firewall.service"
-            "agent-sandbox-proxy.service"
-          ];
-
+          after = [ "agent-sandbox-netns.service" ];
+          requires = [ "agent-sandbox-netns.service" ];
           wantedBy = [ "multi-user.target" ];
-          partOf = [ "agent-sandbox-proxy.service" ];
 
-          serviceConfig = networkSetupHardening // {
+          serviceConfig = {
             Type = "oneshot";
-
-            ExecStart = lib.escapeShellArgs (
-              [
-                "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
-                "18080"
-                "51820"
-                "51820"
-                "agent_sandbox_proxy_tproxy"
-                (toString runtime.queueNumber)
-                proxyUser
-                "agent-sandbox-proxy.service"
-                "agent-sandbox-nfq.service"
-                proxyReadyPath
-                nfqReadyPath
-              ]
-              ++ lib.optionals runtime.httpProxy.http3.enable [
-                http3UdpPortsSpace
-              ]
-            );
-
-            ExecStopPost = lib.escapeShellArgs (
-              [
-                "${proxyTproxyRoutePkg}/bin/agent-sandbox-proxy-tproxy-route"
-                "18080"
-                "51820"
-                "51820"
-                "agent_sandbox_proxy_tproxy"
-                (toString runtime.queueNumber)
-                proxyUser
-                "agent-sandbox-proxy.service"
-                "agent-sandbox-nfq.service"
-                proxyReadyPath
-                nfqReadyPath
-              ]
-              ++ [
-                (lib.optionalString runtime.httpProxy.http3.enable http3UdpPortsSpace)
-                "cleanup"
-              ]
-            );
-
-            NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
+            ExecStart = "${verdictGateBpfPkg}/bin/agent-sandbox-verdict-gate-bpf";
+            ExecStop = "${verdictGateBpfPkg}/bin/agent-sandbox-verdict-gate-bpf cleanup";
             RemainAfterExit = true;
-            Restart = "on-failure";
-            RestartSec = 1;
-            SuccessExitStatus = [ "143" ];
           };
-
-          bindsTo = [ "agent-sandbox-proxy.service" ];
         };
-      };
-
-      users = {
-        groups.${proxyGroup} = lib.mkIf cfg.httpProxy.enable { };
-
-        users.${proxyUser} = lib.mkIf cfg.httpProxy.enable {
-          createHome = false;
-          description = "agent-sandbox transparent HTTP proxy";
-          group = proxyGroup;
-          home = "/var/empty";
-          isSystemUser = true;
-        };
-      };
-    })
-
-    (lib.mkIf (cfg.enable && loopbackEnabled) {
-      systemd.services.agent-sandbox-loopback = {
-        description = "Share selected localhost ports with the agent-sandbox network namespace";
-        before = [ "multi-user.target" ];
-        after = [ "agent-sandbox-netns.service" ];
-        requires = [ "agent-sandbox-netns.service" ];
-        wantedBy = [ "multi-user.target" ];
-
-        serviceConfig = {
-          Type = "oneshot";
-          ExecStart = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf";
-          ExecStop = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf cleanup";
-          RemainAfterExit = true;
-        };
-      };
-    })
-  ]
-)
+      })
+    ]
+  );
+}
