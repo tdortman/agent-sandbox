@@ -106,9 +106,12 @@ struct Cli {
     #[arg(long, value_name = "SECONDS", default_value_t = 305.0)]
     policy_timeout: f64,
 
-    /// PID of the immediate child the broker is supervising. When the child
-    /// exits the broker exits too and the seccomp listener is closed. Optional:
-    /// omit for a broker that runs until its listener fd is revoked.
+    /// PID of the immediate child the broker is supervising. The broker becomes
+    /// a child subreaper, so daemons the sandbox double-forks stay its
+    /// descendants (and readable under Yama `ptrace_scope=1`). When the child
+    /// exits, the broker kills every remaining descendant and exits too,
+    /// closing the seccomp listener. Optional: omit for a broker that runs
+    /// until its listener fd is revoked.
     #[arg(long, value_name = "PID")]
     child_pid: Option<i32>,
 }
@@ -152,6 +155,10 @@ fn main() -> std::io::Result<()> {
     let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
     set_raw_fd_nonblocking(cli.listener_fd)?;
+    if let Some(pid) = cli.child_pid {
+        nix::sys::prctl::set_child_subreaper(true)?;
+        std::thread::spawn(move || supervise_child(pid));
+    }
     let timeout = Duration::from_secs_f64(cli.policy_timeout.max(1.0));
 
     let project_root = std::env::var("AGENT_SANDBOX_PROJECT_ROOT")
@@ -192,7 +199,7 @@ fn main() -> std::io::Result<()> {
     result
 }
 
-/// Serve seccomp notifications until the supervised child exits.
+/// Serve seccomp notifications. `supervise_child` ends the process.
 ///
 /// # Errors
 ///
@@ -202,18 +209,8 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
         .enable_all()
         .build()?;
     let mut policy_client = PersistentPolicyClient::new_trusted(shared.policy_socket.clone());
-    let mut notifications_since_exit_check: u32 = 0;
 
     loop {
-        // A `wait4` per trapped syscall is pure overhead: the child's death
-        // also surfaces as a withdrawn notification (`ENOENT`), which is where
-        // the status is propagated immediately. The periodic check below is a
-        // safety net for a child that dies without an outstanding notification.
-        if notifications_since_exit_check >= EXIT_CHECK_INTERVAL {
-            notifications_since_exit_check = 0;
-            propagate_child_exit(shared.child_pid);
-        }
-
         // Don't SIGCONT the child until the broker is inside its notification
         // loop and ready to receive. The child traps from the first openat
         // onward (dynamic linker), and if the kernel finds a USER_NOTIF filter
@@ -231,17 +228,10 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
         }
 
         let notif = match recv_notification(shared.listener_fd) {
-            Ok(notif) => {
-                notifications_since_exit_check += 1;
-                notif
-            }
+            Ok(notif) => notif,
             Err(err) => match err.raw_os_error() {
-                Some(libc::EINTR) => {
-                    propagate_child_exit(shared.child_pid);
-                    continue;
-                }
+                Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) => {
-                    propagate_child_exit(shared.child_pid);
                     runtime.block_on(async { time::sleep(Duration::from_millis(50)).await });
                     continue;
                 }
@@ -254,18 +244,13 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
                     // process (omp's main thread) is still alive and will
                     // generate more notifications. Exiting would close the
                     // listener fd, turning every future trap into ENOSYS for
-                    // the still-alive child.
-                    //
-                    // If the child has truly exited, propagate_child_exit() above
-                    // propagates its status. Brief backoff so a signal-storm won't
-                    // spin the loop.
-                    propagate_child_exit(shared.child_pid);
+                    // the still-alive child. `supervise_child` owns exit.
+                    // Brief backoff so a signal-storm won't spin the loop.
                     debug!("notification withdrawn before processing");
                     runtime.block_on(async { time::sleep(Duration::from_millis(1)).await });
                     continue;
                 }
                 _ => {
-                    propagate_child_exit(shared.child_pid);
                     warn!(error = %err, "seccomp notification receive failed");
                     runtime.block_on(async { time::sleep(Duration::from_millis(50)).await });
                     continue;
@@ -286,12 +271,6 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
     }
 }
 
-/// Notifications processed between two `wait4` checks of the sandboxed child.
-///
-/// The child's exit is normally observed on the `ENOENT` withdrawn-notification
-/// path, so this interval only bounds how long a silent exit can go unnoticed.
-const EXIT_CHECK_INTERVAL: u32 = 32;
-
 fn log_notification_response(result: std::io::Result<()>) {
     if let Err(err) = result {
         if err.raw_os_error() == Some(libc::ENOENT) {
@@ -309,24 +288,68 @@ fn is_open_family_syscall(nr: i32) -> bool {
     )
 }
 
-fn propagate_child_exit(child_pid: Option<i32>) {
+/// Reap every exit among the broker's children (the supervised child plus the
+/// orphans it adopts as subreaper). Runs on its own thread so an idle listener
+/// cannot delay it. When the supervised child exits, tear the sandbox instance
+/// down and exit with the child's status.
+fn supervise_child(pid: i32) -> ! {
     use nix::{
-        sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+        errno::Errno,
+        sys::wait::{WaitStatus, waitpid},
+    };
+
+    let code = loop {
+        match waitpid(None, None) {
+            Ok(WaitStatus::Exited(reaped, code)) if reaped.as_raw() == pid => break code,
+            Ok(WaitStatus::Signaled(reaped, signal, _)) if reaped.as_raw() == pid => {
+                break 128 + signal as i32;
+            }
+            // An adopted orphan exited: reaping it is all a subreaper owes it.
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(err) => {
+                warn!(error = %err, "waiting for the sandboxed child failed");
+                break 1;
+            }
+        }
+    };
+    kill_descendants();
+    std::process::exit(code);
+}
+
+/// SIGKILL every remaining descendant. Adopted daemons would otherwise outlive
+/// the listener and see `ENOSYS` on every trapped syscall. Killing a child
+/// reparents its children to this subreaper, so repeat until none are left.
+fn kill_descendants() {
+    use nix::{
+        errno::Errno,
+        sys::{
+            signal::{Signal, kill},
+            wait::waitpid,
+        },
         unistd::Pid,
     };
 
-    let Some(pid) = child_pid else {
-        return;
-    };
-
-    match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::Exited(_, code)) => std::process::exit(code),
-
-        Ok(WaitStatus::Signaled(_, signal, _)) => {
-            std::process::exit(128 + signal as i32);
+    loop {
+        // Orphans are adopted by whichever broker thread the kernel picks, so
+        // every task's `children` list counts.
+        for pid in std::fs::read_dir("/proc/self/task")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|children| {
+                children
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse().ok())
+                    .collect::<Vec<i32>>()
+            })
+        {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
         }
 
-        _ => {}
+        if waitpid(None, None) == Err(Errno::ECHILD) {
+            return;
+        }
     }
 }
 

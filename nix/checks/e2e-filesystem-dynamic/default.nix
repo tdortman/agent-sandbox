@@ -26,6 +26,10 @@ pkgs.testers.runNixOSTest (_: {
       lib.recursiveUpdate (installPolicy dynamicPolicy) {
         imports = [ module ];
 
+        # The kernel default, pinned: the broker can read only its own
+        # descendants' syscall arguments.
+        boot.kernel.sysctl."kernel.yama.ptrace_scope" = 1;
+
         agent-sandbox = {
           enable = true;
           gates.filesystem.enable = true;
@@ -163,6 +167,12 @@ pkgs.testers.runNixOSTest (_: {
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "mkdir /var/lib/agent-sandbox-test/dynamic-mutations/directory")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "rmdir /var/lib/agent-sandbox-test/dynamic-mutations/directory")
     dynamic.succeed("test ! -e /var/lib/agent-sandbox-test/dynamic-mutations/directory")
+    # A double-forked daemon stays in the broker's process tree (the broker is
+    # its subreaper), so its mutations are still brokered, and it dies with its
+    # sandbox instance instead of outliving the seccomp listener.
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", "( bash -c 'sleep 0.5; mkdir /var/lib/agent-sandbox-test/dynamic-mutations/daemon-directory' & ); for _ in $(seq 50); do test -d /var/lib/agent-sandbox-test/dynamic-mutations/daemon-directory && exit 0; sleep 0.1; done; exit 1")
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", "( setsid sleep 300 & )")
+    dynamic.fail("pgrep -u sandbox -x sleep")
     # Existing-path mkdir attempts return EEXIST without consulting policy.
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "mkdir -p /var/lib/agent-sandbox-test/dynamic-mutations/denied")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "printf blocked > /var/lib/agent-sandbox-test/dynamic-mutations/rename-denied-source")
