@@ -1362,7 +1362,7 @@ impl SudoRule {
 /// Identity of a filesystem object by inode and device number.
 /// Two paths with the same `InodeIdentity` refer to the same on-disk
 /// object, which means one is a hardlink of the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InodeIdentity {
     /// Inode number of the filesystem object.
     pub inode: u64,
@@ -1535,20 +1535,31 @@ mod dbus_tests {
 /// Default path of the merged policy JSON policyd exports at startup.
 pub const EXPORTED_POLICY_PATH: &str = "/var/lib/agent-sandbox/exported-policy.json";
 
+/// Whether a request path already has every symlink resolved, as a path the
+/// kernel reports for an open file does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathResolution {
+    /// No component is a symlink; canonicalizing would return it unchanged.
+    Canonical,
+    /// The path as a caller wrote it; symlink aliases are resolved live.
+    Unresolved,
+}
+
 /// Static filesystem allow rules from a merged policy snapshot.
 ///
 /// Matches path and access against immutable allow and deny rules. Every
 /// alias-derived grant is confirmed by [`FilesystemRule::matches`]. A matching
-/// deny always wins over an allow in this snapshot.
+/// deny always wins over an allow in this snapshot; deny rule aliases are
+/// resolved when the snapshot is built.
 ///
 /// Callers own snapshot refresh and any checks outside these rules, including
-/// policyd's deny-inode defense. Fsmon refreshes its snapshot during the
-/// session and forwards multiply-linked files to policyd. Session approvals and
+/// policyd's deny-inode defense. Fsmon rebuilds its snapshot every second and
+/// forwards hard links to denied inodes to policyd. Session approvals and
 /// other live verdicts are not cached here.
 pub struct StaticPolicyAllow {
     rules: Vec<StaticRule>,
 
-    deny: Vec<FilesystemRule>,
+    deny: Vec<StaticRule>,
 
     project_root: Option<PathBuf>,
 }
@@ -1559,11 +1570,30 @@ struct StaticRule {
     // The rule path compiled as written.
     literal: Option<CompiledPath>,
 
-    // The rule path compiled with its symlink aliases resolved at load. Only a
-    // prefilter: resolving every rule on every miss costs milliseconds per
-    // open, so hits are confirmed live and a retargeted alias grants nothing
-    // locally (policyd decides it).
+    // The rule path compiled with its symlink aliases resolved at load. For
+    // allows only a prefilter: resolving every rule on every miss costs
+    // milliseconds per open, so hits are confirmed live and a retargeted alias
+    // grants nothing locally (policyd decides it). For denies it is the alias
+    // as of load; callers rebuild the snapshot to follow a retargeted alias.
     alias: Option<CompiledPath>,
+}
+
+impl StaticRule {
+    fn compile(rule: FilesystemRule, project_root: Option<&Path>) -> Self {
+        Self {
+            literal: CompiledPath::compile_raw(&rule.path, project_root).ok(),
+            alias: CompiledPath::compile(&rule.path, project_root).ok(),
+            rule,
+        }
+    }
+
+    fn hits(&self, requested: &Path) -> bool {
+        [&self.literal, &self.alias].into_iter().any(|compiled| {
+            compiled
+                .as_ref()
+                .is_some_and(|compiled| compiled_matches(compiled, requested, false))
+        })
+    }
 }
 
 impl StaticPolicyAllow {
@@ -1591,37 +1621,57 @@ impl StaticPolicyAllow {
     /// Build the evaluator from an already merged policy.
     #[must_use]
     pub fn from_policy(policy: Policy, project_root: Option<PathBuf>) -> Self {
-        let rules = policy
-            .filesystem
-            .allow
-            .into_iter()
-            .map(|rule| StaticRule {
-                literal: CompiledPath::compile_raw(&rule.path, project_root.as_deref()).ok(),
-                alias: CompiledPath::compile(&rule.path, project_root.as_deref()).ok(),
-                rule,
-            })
-            .collect();
+        let compile = |rules: Vec<FilesystemRule>| {
+            rules
+                .into_iter()
+                .map(|rule| StaticRule::compile(rule, project_root.as_deref()))
+                .collect()
+        };
 
         Self {
-            rules,
-            deny: policy.filesystem.deny,
+            rules: compile(policy.filesystem.allow),
+            deny: compile(policy.filesystem.deny),
             project_root,
         }
     }
 
-    /// Whether a deny rule matches, so the request must go to policyd.
-    fn denied(&self, path: &Path, access: FileAccess) -> bool {
-        with_canonical_memo(|| {
-            self.deny
-                .iter()
-                .any(|rule| rule.matches(path, access, self.project_root.as_deref()))
+    /// Whether a deny rule matches, so the request must go to policyd. Deny
+    /// rule aliases are those resolved at load; an unresolved request is
+    /// canonicalized live.
+    fn denied(&self, path: &Path, access: FileAccess, resolution: PathResolution) -> bool {
+        let mut rules = self
+            .deny
+            .iter()
+            .filter(|deny| deny.rule.access.covers(access))
+            .peekable();
+        if rules.peek().is_none() {
+            return false;
+        }
+
+        let requested = normalize_rule_path(path);
+        let canonical = self.canonical_request(path, resolution);
+        rules.any(|deny| {
+            deny.hits(&requested) || canonical.as_ref().is_some_and(|path| deny.hits(path))
         })
+    }
+
+    /// The request with its symlinks resolved, when that differs from the
+    /// path as given.
+    fn canonical_request(&self, path: &Path, resolution: PathResolution) -> Option<PathBuf> {
+        match resolution {
+            PathResolution::Canonical => None,
+            PathResolution::Unresolved => Some(normalize_rule_path(&expand_policy_path(
+                path,
+                None,
+                self.project_root.as_deref(),
+            ))),
+        }
     }
 
     /// Whether the static snapshot allows the given path and access mode.
     #[must_use]
-    pub fn allows(&self, path: &Path, access: FileAccess) -> bool {
-        if self.denied(path, access) {
+    pub fn allows(&self, path: &Path, access: FileAccess, resolution: PathResolution) -> bool {
+        if self.denied(path, access, resolution) {
             return false;
         }
 
@@ -1631,18 +1681,14 @@ impl StaticPolicyAllow {
 
         let project_root = self.project_root.as_deref();
         let requested = normalize_rule_path(path);
-        let canonical = normalize_rule_path(&expand_policy_path(path, None, project_root));
-
-        let hits = |compiled: &Option<CompiledPath>| {
-            compiled.as_ref().is_some_and(|compiled| {
-                compiled_matches(compiled, &requested, false)
-                    || compiled_matches(compiled, &canonical, false)
-            })
-        };
+        let canonical = self.canonical_request(path, resolution);
 
         self.rules.iter().any(|static_rule| {
             static_rule.rule.access.covers(access)
-                && (hits(&static_rule.literal) || hits(&static_rule.alias))
+                && (static_rule.hits(&requested)
+                    || canonical
+                        .as_ref()
+                        .is_some_and(|path| static_rule.hits(path)))
                 && static_rule.rule.matches(path, access, project_root)
         })
     }
@@ -1651,8 +1697,13 @@ impl StaticPolicyAllow {
     /// the allow rules. A miss does not exclude a grant through a live
     /// symlink alias.
     #[must_use]
-    pub fn allows_literal(&self, path: &Path, access: FileAccess) -> bool {
-        self.literal_grant(path, access) && !self.denied(path, access)
+    pub fn allows_literal(
+        &self,
+        path: &Path,
+        access: FileAccess,
+        resolution: PathResolution,
+    ) -> bool {
+        self.literal_grant(path, access) && !self.denied(path, access, resolution)
     }
 
     fn literal_grant(&self, path: &Path, access: FileAccess) -> bool {
@@ -1672,7 +1723,7 @@ impl StaticPolicyAllow {
     pub fn allows_all(&self, checks: &[(PathBuf, FileAccess)]) -> bool {
         checks
             .iter()
-            .all(|(path, access)| self.allows(path, *access))
+            .all(|(path, access)| self.allows(path, *access, PathResolution::Unresolved))
     }
 
     /// Whether the snapshot holds no usable rules (load failed or empty
@@ -1688,8 +1739,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        DeviceAccess, FileAccess, FilesystemRule, Policy, ResourceAccess, ResourceKind,
-        ResourceRule, SocketAccess, StaticPolicyAllow, SudoRule, contract_home_path,
+        DeviceAccess, FileAccess, FilesystemRule, PathResolution, Policy, ResourceAccess,
+        ResourceKind, ResourceRule, SocketAccess, StaticPolicyAllow, SudoRule, contract_home_path,
         contract_project_path, expand_home_path, filesystem_approval_paths,
         open_flags_to_file_access,
     };
@@ -2336,14 +2387,14 @@ mod tests {
         let hook = project.path().join(".git/hooks/pre-commit");
         let config = project.path().join(".git/config");
 
-        assert!(!eval.allows(&hook, FileAccess::Write));
-        assert!(!eval.allows(&hook, FileAccess::ReadWrite));
-        assert!(!eval.allows_literal(&hook, FileAccess::ReadWrite));
+        assert!(!eval.allows(&hook, FileAccess::Write, PathResolution::Unresolved));
+        assert!(!eval.allows(&hook, FileAccess::ReadWrite, PathResolution::Unresolved));
+        assert!(!eval.allows_literal(&hook, FileAccess::ReadWrite, PathResolution::Unresolved));
         assert!(
-            eval.allows(&hook, FileAccess::Read),
+            eval.allows(&hook, FileAccess::Read, PathResolution::Unresolved),
             "deny covers writes only"
         );
-        assert!(eval.allows_literal(&config, FileAccess::ReadWrite));
+        assert!(eval.allows_literal(&config, FileAccess::ReadWrite, PathResolution::Unresolved));
     }
 
     #[test]
@@ -2371,18 +2422,38 @@ mod tests {
         .expect("write policy");
 
         let eval = StaticPolicyAllow::load(&export, None);
-        assert!(eval.allows(Path::new("/home/user/bench/run/f0"), FileAccess::ReadWrite));
-        assert!(eval.allows(Path::new("/readonly"), FileAccess::Read));
+        assert!(eval.allows(
+            Path::new("/home/user/bench/run/f0"),
+            FileAccess::ReadWrite,
+            PathResolution::Unresolved
+        ));
+        assert!(eval.allows(
+            Path::new("/readonly"),
+            FileAccess::Read,
+            PathResolution::Unresolved
+        ));
 
         assert!(
-            !eval.allows(Path::new("/readonly"), FileAccess::Write),
+            !eval.allows(
+                Path::new("/readonly"),
+                FileAccess::Write,
+                PathResolution::Unresolved
+            ),
             "access mode must match"
         );
 
-        assert!(!eval.allows(Path::new("/denied"), FileAccess::Read));
+        assert!(!eval.allows(
+            Path::new("/denied"),
+            FileAccess::Read,
+            PathResolution::Unresolved
+        ));
 
         assert!(
-            !eval.allows(Path::new("/home/user/benchmark"), FileAccess::Read),
+            !eval.allows(
+                Path::new("/home/user/benchmark"),
+                FileAccess::Read,
+                PathResolution::Unresolved
+            ),
             "prefix must not match"
         );
 
@@ -2430,17 +2501,17 @@ mod tests {
         .expect("write policy");
 
         let request_alias = StaticPolicyAllow::load(&export, None);
-        assert!(rule_alias.allows(&first, FileAccess::Read));
-        assert!(request_alias.allows(&alias, FileAccess::Read));
-        assert!(!request_alias.allows(&alias, FileAccess::Write));
+        assert!(rule_alias.allows(&first, FileAccess::Read, PathResolution::Unresolved));
+        assert!(request_alias.allows(&alias, FileAccess::Read, PathResolution::Unresolved));
+        assert!(!request_alias.allows(&alias, FileAccess::Write, PathResolution::Unresolved));
         std::fs::remove_file(&alias).expect("remove alias");
         std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
-        assert!(!rule_alias.allows(&first, FileAccess::Read));
+        assert!(!rule_alias.allows(&first, FileAccess::Read, PathResolution::Unresolved));
         assert!(
-            !rule_alias.allows(&second, FileAccess::Read),
+            !rule_alias.allows(&second, FileAccess::Read, PathResolution::Unresolved),
             "a retargeted rule alias is left to policyd"
         );
-        assert!(!request_alias.allows(&alias, FileAccess::Read));
+        assert!(!request_alias.allows(&alias, FileAccess::Read, PathResolution::Unresolved));
     }
 
     #[test]
@@ -2451,7 +2522,11 @@ mod tests {
         );
 
         assert!(eval.is_empty());
-        assert!(!eval.allows(Path::new("/anything"), FileAccess::Read));
+        assert!(!eval.allows(
+            Path::new("/anything"),
+            FileAccess::Read,
+            PathResolution::Unresolved
+        ));
     }
 
     #[test]

@@ -114,6 +114,9 @@ pub enum RpcReply {
     FilesystemSnapshot {
         /// Filesystem allow and deny rules from all applicable layers.
         filesystem: crate::FilesystemSection,
+        /// Inodes the hard-link deny defense protects. Any other file cannot
+        /// alias a denied file through a hard link.
+        denied_inodes: std::collections::HashSet<crate::InodeIdentity>,
     },
 
     /// HTTP access check result.
@@ -143,10 +146,19 @@ impl<'de> Deserialize<'de> for RpcReply {
     where
         D: Deserializer<'de>,
     {
-        let mut value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(filesystem) = value.get_mut("filesystem") {
-            return serde_json::from_value(filesystem.take())
-                .map(|filesystem| Self::FilesystemSnapshot { filesystem })
+        #[derive(Deserialize)]
+        struct Snapshot {
+            filesystem: crate::FilesystemSection,
+            denied_inodes: std::collections::HashSet<crate::InodeIdentity>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("filesystem").is_some() {
+            return serde_json::from_value(value)
+                .map(|snapshot: Snapshot| Self::FilesystemSnapshot {
+                    filesystem: snapshot.filesystem,
+                    denied_inodes: snapshot.denied_inodes,
+                })
                 .map_err(serde::de::Error::custom);
         }
 

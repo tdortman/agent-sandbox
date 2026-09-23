@@ -155,9 +155,18 @@ mod tests {
                 &serde_json::to_vec(&reply).expect("encode snapshot reply"),
             )
             .expect("decode snapshot reply");
-            let RpcReply::FilesystemSnapshot { filesystem } = reply else {
+            let RpcReply::FilesystemSnapshot {
+                filesystem,
+                denied_inodes,
+            } = reply
+            else {
                 panic!("unexpected reply")
             };
+            // Hard links to the implicitly denied policy file must stay on the
+            // monitor's policyd check path.
+            assert!(denied_inodes.contains(
+                &agent_sandbox_core::InodeIdentity::from_path(&home_policy).expect("policy inode")
+            ));
             assert_eq!(
                 filesystem.allow.iter().any(|rule| rule.matches(
                     &request_path,

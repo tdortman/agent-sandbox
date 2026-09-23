@@ -642,14 +642,15 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
-/// Add an open-permission ignore mask to the inode pinned by the event fd.
+/// Add an ignore mask of permission events to the inode pinned by the event
+/// fd.
 ///
-/// Execute permission events remain mediated independently. Marks may be
-/// reclaimed under memory pressure, which only costs another permission event.
+/// Marks may be reclaimed under memory pressure, which only costs another
+/// permission event.
 ///
 /// # Errors
 /// Returns an error if the ignore mask cannot be applied.
-pub fn fanotify_mark_ignore(fan_fd: impl AsFd, event_fd: impl AsFd) -> io::Result<()> {
+pub fn fanotify_mark_ignore(fan_fd: impl AsFd, event_fd: impl AsFd, mask: u64) -> io::Result<()> {
     // SAFETY: both descriptors are live. With a null pathname, dirfd is the
     // object to mark and does not need to refer to a directory.
     let ret = unsafe {
@@ -659,7 +660,7 @@ pub fn fanotify_mark_ignore(fan_fd: impl AsFd, event_fd: impl AsFd) -> io::Resul
             i64::from(
                 FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY | FAN_MARK_EVICTABLE,
             ),
-            FAN_OPEN_PERM,
+            mask,
             event_fd.as_fd().as_raw_fd(),
             std::ptr::null::<libc::c_char>(),
         )

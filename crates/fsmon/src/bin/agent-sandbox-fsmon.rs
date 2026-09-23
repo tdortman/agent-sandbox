@@ -22,14 +22,14 @@ use std::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use agent_sandbox_core::{
-    FileAccess, FilesystemSection, Policy, ProcessIds, StaticPolicyAllow,
+    FileAccess, InodeIdentity, PathResolution, Policy, ProcessIds, StaticPolicyAllow,
     normalize_directory_traverse_access, open_flags_to_file_access, wire_context,
 };
-use agent_sandbox_fsmon::MonitorClient;
+use agent_sandbox_fsmon::{FilesystemSnapshot, MonitorClient};
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_flush_inode_marks, fanotify_mark_ignore,
     fanotify_response_bytes, take_fanotify_event_fd,
@@ -413,17 +413,31 @@ fn syscall_lookup<T>(
     }
 }
 
-/// Best-effort path for a fanotify permission event: event fd first, then the
-/// blocked tracee's open syscall args.
+/// Path of a fanotify permission event and how far it is resolved.
+struct EventPath {
+    path: String,
+    resolution: PathResolution,
+}
+
+/// Best-effort path for a fanotify permission event: event fd first (the
+/// kernel reports it canonical), then the blocked tracee's open syscall args.
 fn resolve_blocked_open_path(
     host_proc: &HostProc,
     trace_pid: i32,
     event_fd: &OwnedFd,
-) -> Option<String> {
-    resolve_event_path(host_proc, event_fd).ok().or_else(|| {
-        syscall_lookup(host_proc, trace_pid, parse_open_syscall_path)
-            .map(|path| path.to_string_lossy().into_owned())
-    })
+) -> Option<EventPath> {
+    resolve_event_path(host_proc, event_fd)
+        .ok()
+        .map(|path| EventPath {
+            path,
+            resolution: PathResolution::Canonical,
+        })
+        .or_else(|| {
+            syscall_lookup(host_proc, trace_pid, parse_open_syscall_path).map(|path| EventPath {
+                path: path.to_string_lossy().into_owned(),
+                resolution: PathResolution::Unresolved,
+            })
+        })
 }
 
 /// Read bytes from a tracee's address space via `process_vm_readv`, falling
@@ -570,45 +584,80 @@ fn mask_to_access(host_proc: &HostProc, mask: u64, event_fd: &impl AsFd, pid: i3
 /// non-exec open can request, so the verdict is already known and
 /// `/proc/<pid>/syscall` need not be read. Execute events and narrower grants
 /// still need the real flags: a read-only grant must not admit a write.
-fn open_needs_access_lookup(mask: u64, path: &str, static_allow: &StaticPolicyAllow) -> bool {
+fn open_needs_access_lookup(mask: u64, path: &EventPath, static_allow: &StaticPolicyAllow) -> bool {
     if mask & FAN_OPEN_EXEC_PERM != 0 {
         return true;
     }
 
-    !static_allow.allows_literal(Path::new(path), FileAccess::ReadWrite)
+    !static_allow.allows_literal(
+        Path::new(&path.path),
+        FileAccess::ReadWrite,
+        path.resolution,
+    )
 }
 
-/// Regular files with aliases need policyd's deny-inode check. Directory link
-/// counts describe subdirectories, not file hard links.
-fn needs_inode_check(event_fd: &OwnedFd) -> bool {
+/// Hard-linked regular files need policyd's deny-inode check when they alias
+/// a denied inode, or when a link may postdate the denied inode set: `link`
+/// updates the inode's ctime. Directory link counts describe subdirectories,
+/// not file hard links.
+fn needs_inode_check(event_fd: &OwnedFd, policy: &LocalPolicy) -> bool {
     fstat(event_fd).map_or(true, |stat| {
-        SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) && stat.st_nlink != 1
+        let changed_nanos =
+            i128::from(stat.st_ctime) * 1_000_000_000 + i128::from(stat.st_ctime_nsec);
+        SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG)
+            && stat.st_nlink != 1
+            && (changed_nanos >= policy.links_settled_before
+                || policy.snapshot.denied_inodes.contains(&InodeIdentity {
+                    inode: stat.st_ino,
+                    device: stat.st_dev,
+                }))
     })
 }
 
-/// Mark only singleton regular files on read-only superblocks. A read-only
-/// bind or mode bits cannot prevent aliases through a writable mount.
+/// Filesystems stamp ctime from a coarse clock that can trail the realtime
+/// clock, so a link made just after a snapshot request may carry an earlier
+/// ctime. Only inodes changed this long before the request are trusted.
+const CTIME_CLOCK_SLACK: Duration = Duration::from_secs(1);
+
+/// Realtime nanoseconds before which a changed inode is covered by a
+/// snapshot requested at `requested`; 0 trusts no hard-linked inode.
+fn links_settled_before(requested: SystemTime) -> i128 {
+    requested
+        .checked_sub(CTIME_CLOCK_SLACK)
+        .and_then(|settled| settled.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |settled| i128::try_from(settled.as_nanos()).unwrap_or(0))
+}
+
+/// Mark regular files the sandbox can never write: files on read-only
+/// superblocks, and root-owned files without group or other write bits (the
+/// unprivileged sandbox user cannot chmod them, and the group bits cap any
+/// ACL). Every hard link shares the content this open proved readable, and
+/// callers never mark a denied inode; a policy change flushes the marks.
 fn maybe_mark_static_allow(
     shared: &Shared,
     static_allow: &StaticPolicyAllow,
-    mask: u64,
-    path: &str,
+    path: &EventPath,
     event_fd: &OwnedFd,
 ) {
     let Some(ignore) = &shared.ignore_marks else {
         return;
     };
-    if mask != FAN_OPEN_PERM {
-        return;
-    }
     let Ok(stat) = fstat(event_fd) else {
         return;
     };
-    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG)
-        || stat.st_nlink != 1
-        || !ignore.readonly_devices.contains(&stat.st_dev)
-        || !static_allow.allows(Path::new(path), FileAccess::Read)
-    {
+    let sandbox_read_only = ignore.readonly_devices.contains(&stat.st_dev)
+        || (stat.st_uid == 0 && stat.st_mode & 0o022 == 0);
+    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) || !sandbox_read_only {
+        return;
+    }
+    let mut ignored = 0;
+    if static_allow.allows(Path::new(&path.path), FileAccess::Read, path.resolution) {
+        ignored |= FAN_OPEN_PERM;
+    }
+    if static_allow.allows(Path::new(&path.path), FileAccess::Execute, path.resolution) {
+        ignored |= FAN_OPEN_EXEC_PERM;
+    }
+    if ignored == 0 {
         return;
     }
 
@@ -616,7 +665,7 @@ fn maybe_mark_static_allow(
         .marked
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let fs_path = Path::new(path);
+    let fs_path = Path::new(&path.path);
     if marked.contains(fs_path) {
         return;
     }
@@ -631,7 +680,7 @@ fn maybe_mark_static_allow(
     }
 
     // The event pins the inode even if its pathname changes.
-    match fanotify_mark_ignore(&shared.fan_fd, event_fd) {
+    match fanotify_mark_ignore(&shared.fan_fd, event_fd, ignored) {
         Ok(()) => {
             marked.insert(fs_path.to_path_buf());
             drop(marked);
@@ -639,7 +688,7 @@ fn maybe_mark_static_allow(
         }
         Err(error) => {
             drop(marked);
-            tracing::debug!(%path, %error, "ignore mark failed; events for this path keep flowing");
+            tracing::debug!(path = %path.path, %error, "ignore mark failed; events for this path keep flowing");
         }
     }
 }
@@ -788,20 +837,39 @@ struct Job {
 }
 
 struct LocalPolicy {
-    filesystem: FilesystemSection,
+    snapshot: FilesystemSnapshot,
     allow: StaticPolicyAllow,
+    /// Realtime nanoseconds; hard-linked inodes with a later ctime may have
+    /// gained a link the snapshot's denied inode set does not reflect.
+    links_settled_before: i128,
 }
 
 impl LocalPolicy {
-    fn new(filesystem: FilesystemSection, project_root: Option<PathBuf>) -> Self {
+    /// Build from the snapshot requested at `requested`. Without a snapshot
+    /// no local grant applies and every hard-linked file goes to policyd.
+    fn new(
+        snapshot: Option<FilesystemSnapshot>,
+        requested: SystemTime,
+        project_root: Option<PathBuf>,
+    ) -> Self {
+        let links_settled_before = if snapshot.is_some() {
+            links_settled_before(requested)
+        } else {
+            0
+        };
+        let snapshot = snapshot.unwrap_or_default();
         let allow = StaticPolicyAllow::from_policy(
             Policy {
-                filesystem: filesystem.clone(),
+                filesystem: snapshot.filesystem.clone(),
                 ..Policy::default()
             },
             project_root,
         );
-        Self { filesystem, allow }
+        Self {
+            snapshot,
+            allow,
+            links_settled_before,
+        }
     }
 }
 
@@ -996,27 +1064,29 @@ fn refresh_policy(shared: &Shared) {
     let mut rpc = MonitorClient::new(shared.socket_path.clone());
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         std::thread::sleep(POLICY_POLL_INTERVAL);
-        let filesystem = runtime
+        let requested = SystemTime::now();
+        let snapshot = runtime
             .block_on(rpc.filesystem_snapshot(shared.ctx.clone()))
-            .unwrap_or_else(|error| {
+            .inspect_err(|error| {
                 tracing::warn!(%error, "filesystem snapshot unavailable; disabling local grants");
-                FilesystemSection::default()
-            });
-        if shared
+            })
+            .ok();
+        let next = LocalPolicy::new(snapshot, requested, shared.ctx.project_root.clone());
+        // Rebuild even an unchanged snapshot: deny rule symlink aliases are
+        // resolved once per build. Only a rule change revokes ignore marks.
+        let changed = shared
             .policy
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-            .filesystem
-            == filesystem
-        {
-            continue;
-        }
-        let next = LocalPolicy::new(filesystem, shared.ctx.project_root.clone());
+            .snapshot
+            != next.snapshot;
         let mut policy = shared
             .policy
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        flush_or_stop_sandbox(shared);
+        if changed {
+            flush_or_stop_sandbox(shared);
+        }
         *policy = next;
     }
 }
@@ -1144,26 +1214,30 @@ fn handle_permission_event(
         }
     };
 
-    let inode_check = needs_inode_check(&event_fd);
     let access = {
         let policy = shared
             .policy
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
+        let inode_check = needs_inode_check(&event_fd, &policy);
         if !inode_check && !open_needs_access_lookup(mask, &path, &policy.allow) {
-            maybe_mark_static_allow(shared, &policy.allow, mask, &path, &event_fd);
             respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+            maybe_mark_static_allow(shared, &policy.allow, &path, &event_fd);
             drop(policy);
             shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let access = normalize_directory_traverse_access(
-            Path::new(&path),
+            Path::new(&path.path),
             mask_to_access(&shared.host_proc, mask, &event_fd, pid),
         );
-        if !inode_check && policy.allow.allows(Path::new(&path), access) {
-            maybe_mark_static_allow(shared, &policy.allow, mask, &path, &event_fd);
+        if !inode_check
+            && policy
+                .allow
+                .allows(Path::new(&path.path), access, path.resolution)
+        {
             respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+            maybe_mark_static_allow(shared, &policy.allow, &path, &event_fd);
             drop(policy);
             shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1174,11 +1248,11 @@ fn handle_permission_event(
 
     shared.stats.policyd_calls.fetch_add(1, Ordering::Relaxed);
 
-    tracing::debug!(%path, ?access, pid, "filesystem check");
+    tracing::debug!(path = %path.path, ?access, pid, "filesystem check");
     let mut event_ctx = shared.ctx.clone();
     event_ctx.pid = u32::try_from(pid).ok();
 
-    let reply = runtime.block_on(rpc.check_filesystem(Path::new(&path), access, event_ctx));
+    let reply = runtime.block_on(rpc.check_filesystem(Path::new(&path.path), access, event_ctx));
 
     let verdict = match &reply {
         Ok(r) if r.verdict.allowed => FAN_ALLOW,
@@ -1186,7 +1260,7 @@ fn handle_permission_event(
     };
 
     if verdict == FAN_DENY {
-        tracing::info!(%path, ?access, "denied by policy");
+        tracing::info!(path = %path.path, ?access, "denied by policy");
     }
 
     respond(&shared.fan_fd, &event_fd, verdict);
@@ -1314,11 +1388,14 @@ fn main() {
         .build()
         .expect("tokio runtime");
     let mut rpc = MonitorClient::new(cli.socket.clone());
-    let filesystem = runtime.block_on(rpc.filesystem_snapshot(ctx.clone())).unwrap_or_else(|error| {
-        tracing::warn!(%error, "initial filesystem snapshot unavailable; disabling local grants");
-        FilesystemSection::default()
-    });
-    let policy = LocalPolicy::new(filesystem, cli.project_root.clone());
+    let requested = SystemTime::now();
+    let snapshot = runtime
+        .block_on(rpc.filesystem_snapshot(ctx.clone()))
+        .inspect_err(|error| {
+            tracing::warn!(%error, "initial filesystem snapshot unavailable; disabling local grants");
+        })
+        .ok();
+    let policy = LocalPolicy::new(snapshot, requested, cli.project_root.clone());
     drop(runtime);
 
     // setns into the target mount namespace before marking its mounts.
@@ -1471,35 +1548,42 @@ mod tests {
         allow
     }
 
+    fn canonical(path: &str) -> EventPath {
+        EventPath {
+            path: path.to_owned(),
+            resolution: PathResolution::Canonical,
+        }
+    }
+
     #[test]
     fn read_write_grant_skips_access_lookup_for_non_exec_opens_only() {
         let read_write = static_allow(r#"{"path": "/srv/project", "access": "read_write"}"#);
         assert!(!open_needs_access_lookup(
             FAN_OPEN_PERM,
-            "/srv/project/file",
+            &canonical("/srv/project/file"),
             &read_write
         ));
         assert!(open_needs_access_lookup(
             FAN_OPEN_PERM,
-            "/srv/elsewhere/file",
+            &canonical("/srv/elsewhere/file"),
             &read_write
         ));
         assert!(open_needs_access_lookup(
             FAN_OPEN_EXEC_PERM,
-            "/srv/project/tool",
+            &canonical("/srv/project/tool"),
             &read_write
         ));
 
         let all = static_allow(r#"{"path": "/srv/project", "access": "all"}"#);
         assert!(!open_needs_access_lookup(
             FAN_OPEN_PERM,
-            "/srv/project/file",
+            &canonical("/srv/project/file"),
             &all
         ));
 
         let read_only = static_allow(r#"{"path": "/srv/project", "access": "read"}"#);
         assert!(
-            open_needs_access_lookup(FAN_OPEN_PERM, "/srv/project/file", &read_only),
+            open_needs_access_lookup(FAN_OPEN_PERM, &canonical("/srv/project/file"), &read_only),
             "a read-only grant must not admit a write without the tracee's flags"
         );
     }

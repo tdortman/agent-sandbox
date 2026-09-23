@@ -221,9 +221,9 @@ pub async fn handle(
             ))
         }
 
-        RpcRequest::FilesystemSnapshot { ctx } => Ok(RpcReply::FilesystemSnapshot {
-            filesystem: store.merged_for_worker(&resolve(&ctx)?).filesystem,
-        }),
+        RpcRequest::FilesystemSnapshot { ctx } => {
+            Ok(store.filesystem_snapshot(&resolve(&ctx)?).await)
+        }
 
         RpcRequest::Elevate { argv, ctx } => {
             if argv.is_empty() {

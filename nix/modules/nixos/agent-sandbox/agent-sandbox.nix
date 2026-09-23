@@ -598,11 +598,11 @@ in
           default = true;
 
           description = ''
-            Let the filesystem monitor skip repeat open events for statically
-            readable, single-link regular files on read-only filesystems.
-            Read-only bind mounts and file mode bits do not qualify. Execute
-            permission events remain enabled, and multiply-linked files go to
-            policyd for deny-inode checks.
+            Let the filesystem monitor skip repeat open and execute events for
+            statically allowed regular files the sandbox cannot write: files on
+            read-only filesystems, and root-owned files without group or other
+            write permission, such as the Nix store. Read-only bind mounts do
+            not qualify. Hard links to a denied file go to policyd.
 
             The monitor requests current merged filesystem rules every second
             and flushes ignore marks before replacing its local snapshot. A

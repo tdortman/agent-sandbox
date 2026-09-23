@@ -8,7 +8,7 @@ use agent_sandbox_core::{
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
     ResourceRuleKey, SocketAccess, Verdict, contains_glob_syntax, discover_git_project_root,
     expand_policy_path, host_pattern_matches, normalize_directory_traverse_access, normalize_host,
-    with_canonical_memo,
+    rpc::RpcReply, with_canonical_memo,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -284,6 +284,22 @@ fn session_filesystem_bucket_matches_allow(
 }
 
 impl PolicyStore {
+    /// Merged filesystem rules plus the inodes the hard-link deny defense
+    /// protects, so a privileged monitor can answer every other hard-linked
+    /// file without a per-open check.
+    pub(crate) async fn filesystem_snapshot(&self, ctx: &ResolvedRequestContext) -> RpcReply {
+        let merged = self.merged_for_worker(ctx);
+        let fingerprint = Self::blocking(|| {
+            Self::deny_fingerprint(&merged, ctx.paths.home(), ctx.paths.project_root())
+        });
+        RpcReply::FilesystemSnapshot {
+            denied_inodes: self
+                .with_deny_inode_cache(&fingerprint, |cache| cache.inodes.keys().copied().collect())
+                .await,
+            filesystem: merged.filesystem,
+        }
+    }
+
     pub(crate) async fn filesystem_policy_denied(
         &self,
         path: &Path,
@@ -429,41 +445,45 @@ impl PolicyStore {
         access: FileAccess,
         fingerprint: &[DenyFingerprint],
     ) -> bool {
-        let needs_rebuild = {
+        self.with_deny_inode_cache(fingerprint, |cache| {
+            Self::is_denied_by_inode(path, access, cache)
+        })
+        .await
+    }
+
+    /// Run `f` on the deny inode cache built for `fingerprint`. Rebuilds run
+    /// under the single-flight guard, which `f` also holds, so a concurrent
+    /// rebuild for another sandbox cannot swap the cache underneath it.
+    async fn with_deny_inode_cache<T>(
+        &self,
+        fingerprint: &[DenyFingerprint],
+        f: impl FnOnce(&DenyInodeCache) -> T,
+    ) -> T {
+        let _rebuild_guard = self.deny_inode_rebuild.lock().await;
+
+        let stale = {
             let inner = self.inner.lock().await;
             Self::fingerprint_changed(&inner.deny_inode_cache, fingerprint)
         };
 
-        if needs_rebuild {
-            // Single-flight: concurrent checks wait here instead of each
-            // launching a full recursive walk of every denied directory.
-            let _rebuild_guard = self.deny_inode_rebuild.lock().await;
+        if stale {
+            let fp = fingerprint.to_vec();
 
-            let still_stale = {
-                let inner = self.inner.lock().await;
-                Self::fingerprint_changed(&inner.deny_inode_cache, fingerprint)
-            };
+            // The walk can hit disk for a long time; keep it off the
+            // async runtime so other requests stay responsive.
+            match tokio::task::spawn_blocking(move || Self::rebuild_deny_inode_cache(fp)).await {
+                Ok(new_cache) => {
+                    self.inner.lock().await.deny_inode_cache = new_cache;
+                }
 
-            if still_stale {
-                let fp = fingerprint.to_vec();
-
-                // The walk can hit disk for a long time; keep it off the
-                // async runtime so other requests stay responsive.
-                match tokio::task::spawn_blocking(move || Self::rebuild_deny_inode_cache(fp)).await
-                {
-                    Ok(new_cache) => {
-                        self.inner.lock().await.deny_inode_cache = new_cache;
-                    }
-
-                    Err(err) => {
-                        tracing::error!(error = %err, "deny inode cache rebuild panicked");
-                    }
+                Err(err) => {
+                    tracing::error!(error = %err, "deny inode cache rebuild panicked");
                 }
             }
         }
 
         let inner = self.inner.lock().await;
-        Self::is_denied_by_inode(path, access, &inner.deny_inode_cache)
+        f(&inner.deny_inode_cache)
     }
 
     /// Compute a fingerprint for the deny rules: one `DenyFingerprint` per
