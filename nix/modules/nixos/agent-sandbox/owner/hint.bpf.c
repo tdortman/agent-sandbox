@@ -231,14 +231,20 @@ static __always_inline struct file *read_descriptor(struct fdtable *table, __u32
     return file;
 }
 
-static __always_inline bool has_single_reference(const struct file *file) {
+static __always_inline bool has_single_reference(const struct file *file, __u32 *fence) {
     /* file_ref_t encodes one live reference as zero. Any duplicate descriptor,
      * transferred descriptor or temporary external reference takes fallback. */
-    return __atomic_load_n(&file->f_ref.refcnt.counter, __ATOMIC_ACQUIRE) == 0;
+    __s64 counter = file->f_ref.refcnt.counter;
+    /* The verifier rejects acquire loads through an untrusted file pointer.
+     * BPF xchg on map memory is fully ordered (x86 xchg, arm64 SWPAL), so
+     * no later load of the proof moves ahead of this refcount load. */
+    __sync_lock_test_and_set(fence, 0);
+    return counter == 0;
 }
 
 static __always_inline bool prove_hint(struct task_struct *task, const struct connect_hint *hint,
-                                       const struct endpoint *expected, __u32 *uid) {
+                                       const struct endpoint *expected, __u32 *uid,
+                                       __u32 *fence) {
     __u64 start_boot_ns;
     if (task->tgid != hint->owner.pid ||
         BPF_CORE_READ_INTO(&start_boot_ns, task, group_leader, start_boottime) ||
@@ -259,7 +265,7 @@ static __always_inline bool prove_hint(struct task_struct *task, const struct co
         return false;
     }
     file = bpf_rdonly_cast(file, bpf_core_type_id_kernel(struct file));
-    if (!has_single_reference(file) || (file->f_mode & FMODE_PATH)) {
+    if (!has_single_reference(file, fence) || (file->f_mode & FMODE_PATH)) {
         return false;
     }
 
@@ -282,7 +288,7 @@ static __always_inline bool prove_hint(struct task_struct *task, const struct co
     }
 
     if (task->files != files || files->fdt != table || read_descriptor(table, hint->fd) != file ||
-        !has_single_reference(file)) {
+        !has_single_reference(file, fence)) {
         return false;
     }
     /* Re-look up after the proof; a concurrent share permanently removed it. */
@@ -327,7 +333,7 @@ int owner_hint(struct bpf_raw_tracepoint_args *ctx) {
     }
 
     __u32 uid;
-    if (prove_hint(task, &hint, &key, &uid)) {
+    if (prove_hint(task, &hint, &key, &uid, &out->pad)) {
         *out = (struct hint_result){
             .nonce = query->nonce,
             .inode = hint.inode,
