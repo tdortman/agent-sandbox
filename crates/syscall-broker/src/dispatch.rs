@@ -50,6 +50,24 @@ fn static_policy_allows(facts: &NormalizedNotification, static_allow: &StaticPol
     !static_allow.is_empty() && static_allow.allows_all(&target.checks)
 }
 
+/// Whether the target is a Unix socket path that does not exist. Emulating the
+/// syscall would fail with `ENOENT` after any verdict, so answering locally
+/// skips a policyd round trip on every libc nscd probe. The broker never
+/// continues the syscall, so a socket created afterwards is still gated.
+fn missing_unix_socket(facts: &NormalizedNotification) -> bool {
+    let NormalizedNotification::Target {
+        target: SyscallTarget::Resource(target),
+    } = facts
+    else {
+        return false;
+    };
+
+    target.kind == ResourceKind::UnixSocket
+        && target.path.is_absolute()
+        && std::fs::metadata(&target.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
     client: &mut PersistentPolicyClient,
@@ -112,6 +130,8 @@ pub async fn dispatch_notification_with_mode(
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // delegates every TCP and UDP target to the packet filter and proxy.
         ResponsePlan::Continue
+    } else if missing_unix_socket(&facts) {
+        ResponsePlan::deny(libc::ENOENT)
     } else if static_policy_allows(&facts, static_allow) {
         match facts {
             NormalizedNotification::Target {
