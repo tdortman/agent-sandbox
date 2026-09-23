@@ -176,6 +176,7 @@ fn handle_claim_flow(
             attribution_token: AttributionToken::from_bytes([2; 32]),
             flow,
             policy_host: NormalizedPolicyHost::parse("localhost").expect("valid policy host"),
+            owner_cgroup: None,
         })
     }
 }

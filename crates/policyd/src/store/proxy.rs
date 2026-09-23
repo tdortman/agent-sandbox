@@ -209,6 +209,7 @@ impl PolicyStore {
         state.claimed_at = Some(now);
         state.last_check = now;
         let policy_host = state.registration.policy_host().clone();
+        let owner_pid = state.owner.pid().get();
         drop(inner);
 
         Ok(agent_sandbox_core::FlowClaimReply {
@@ -216,6 +217,7 @@ impl PolicyStore {
             attribution_token,
             flow,
             policy_host,
+            owner_cgroup: super::freeze::process_cgroup(owner_pid).ok(),
         })
     }
 
@@ -303,11 +305,14 @@ impl PolicyStore {
         let policy_host = state.registration.policy_host().clone();
         drop(inner);
 
+        // UDP sniffing reads a datagram that already arrived, so no deadline
+        // needs the owner's freezer state.
         Ok(agent_sandbox_core::FlowClaimReply {
             ok: true,
             attribution_token,
             flow: candidate,
             policy_host,
+            owner_cgroup: None,
         })
     }
 

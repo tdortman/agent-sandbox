@@ -585,6 +585,12 @@ pub struct FlowClaimReply {
 
     /// The normalized policy host matched for the flow.
     pub policy_host: NormalizedPolicyHost,
+
+    /// Cgroup directory of the process that opened the flow. Policyd freezes
+    /// it during approvals, so the proxy excludes frozen time from protocol
+    /// sniffing deadlines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_cgroup: Option<std::path::PathBuf>,
 }
 
 /// Result of a network-flow access check carried on an untyped wire body.

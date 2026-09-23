@@ -212,19 +212,7 @@ fn cgroup_for_pid(pid: u32, expected_uid: Option<u32>) -> Result<PathBuf, Cgroup
         }
     }
 
-    let proc_path = format!("/proc/{pid}/cgroup");
-
-    let contents = fs::read_to_string(&proc_path)
-        .map_err(|source| CgroupFreezeError::ProcessCgroup { pid, source })?;
-
-    let Some(relative) = contents.lines().find_map(|line| {
-        let (hierarchy, path) = line.split_once("::")?;
-        (hierarchy == "0").then_some(path)
-    }) else {
-        return Err(CgroupFreezeError::NotCgroupV2 { pid });
-    };
-
-    let path = Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/'));
+    let path = process_cgroup(pid)?;
 
     if !is_agent_scope(&path) {
         return Err(CgroupFreezeError::UnmanagedScope { pid, path });
@@ -235,6 +223,21 @@ fn cgroup_for_pid(pid: u32, expected_uid: Option<u32>) -> Result<PathBuf, Cgroup
     }
 
     Ok(path)
+}
+
+/// The cgroup v2 directory `pid` belongs to.
+pub(super) fn process_cgroup(pid: u32) -> Result<PathBuf, CgroupFreezeError> {
+    let contents = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .map_err(|source| CgroupFreezeError::ProcessCgroup { pid, source })?;
+
+    let Some(relative) = contents.lines().find_map(|line| {
+        let (hierarchy, path) = line.split_once("::")?;
+        (hierarchy == "0").then_some(path)
+    }) else {
+        return Err(CgroupFreezeError::NotCgroupV2 { pid });
+    };
+
+    Ok(Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/')))
 }
 
 fn process_uid(pid: u32) -> Result<u32, CgroupFreezeError> {

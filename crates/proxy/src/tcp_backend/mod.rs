@@ -478,7 +478,7 @@ fn build_listener_service(
             // Ports do not identify protocols: peek at the stream to tell
             // HTTP(S) apart from raw TCP. The peek replays the classified
             // bytes to whichever path runs next.
-            let (sniff, stream) = peek::peek_protocol(stream).await;
+            let (sniff, stream) = peek::peek_protocol(stream, claim.owner_cgroup.as_deref()).await;
             if !matches!(sniff, TcpSniff::Tls | TcpSniff::Http) {
                 let result = serve_passthrough(
                     stream,
@@ -1679,6 +1679,7 @@ mod tests {
                     NonZeroU16::new(8080).expect("destination port"),
                 ),
                 policy_host: NormalizedPolicyHost::parse("localhost").expect("policy host"),
+                owner_cgroup: None,
             },
             ech: None,
             alt_svc: Arc::new(AltSvcStore::new(Vec::new())),

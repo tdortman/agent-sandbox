@@ -39,6 +39,9 @@ pub struct FlowClaim {
 
     /// The normalized policy host assigned to the flow.
     pub policy_host: NormalizedPolicyHost,
+
+    /// Cgroup directory of the process that opened the flow, when known.
+    pub owner_cgroup: Option<PathBuf>,
 }
 
 /// A long-lived policy session bound to one policyd instance.
@@ -467,6 +470,7 @@ fn decode_flow_claim(
         attribution_token,
         flow,
         policy_host,
+        owner_cgroup,
     }) = reply
     {
         Ok(FlowClaim {
@@ -474,6 +478,7 @@ fn decode_flow_claim(
             connection_id,
             flow,
             policy_host,
+            owner_cgroup,
         })
     } else {
         Err(PolicyError::UnexpectedReply(operation))
@@ -821,6 +826,7 @@ pub(crate) mod test_support {
                         flow,
                         policy_host: NormalizedPolicyHost::parse("example.test")
                             .expect("static policy host"),
+                        owner_cgroup: None,
                     }))
                 }
 
