@@ -8,6 +8,7 @@ use agent_sandbox_core::{
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
     ResourceRuleKey, SocketAccess, Verdict, contains_glob_syntax, discover_git_project_root,
     expand_policy_path, host_pattern_matches, normalize_directory_traverse_access, normalize_host,
+    with_canonical_memo,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -250,16 +251,18 @@ pub(super) fn filesystem_rules_match_allow(
     access: FileAccess,
     ctx_root: Option<&Path>,
 ) -> bool {
-    let roots = project_roots_for_allow(ctx_root, path);
+    with_canonical_memo(|| {
+        let roots = project_roots_for_allow(ctx_root, path);
 
-    if roots.is_empty() {
-        return rules.iter().any(|rule| rule.matches(path, access, None));
-    }
+        if roots.is_empty() {
+            return rules.iter().any(|rule| rule.matches(path, access, None));
+        }
 
-    roots.iter().any(|root| {
-        rules
-            .iter()
-            .any(|rule| rule.matches(path, access, Some(root)))
+        roots.iter().any(|root| {
+            rules
+                .iter()
+                .any(|rule| rule.matches(path, access, Some(root)))
+        })
     })
 }
 
@@ -394,9 +397,11 @@ impl PolicyStore {
             .sandbox_filesystem_static_allow
             .get(&key)
             .is_some_and(|rules| {
-                rules
-                    .iter()
-                    .any(|rule| rule.matches(path, access, project_root))
+                with_canonical_memo(|| {
+                    rules
+                        .iter()
+                        .any(|rule| rule.matches(path, access, project_root))
+                })
             })
     }
 

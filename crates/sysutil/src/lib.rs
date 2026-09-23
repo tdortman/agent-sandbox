@@ -550,8 +550,6 @@ const FAN_CLOEXEC: u32 = libc::FAN_CLOEXEC;
 /// `fanotify_mark` flags.
 const FAN_MARK_ADD: u32 = libc::FAN_MARK_ADD;
 
-const FAN_MARK_REMOVE: u32 = libc::FAN_MARK_REMOVE;
-
 const FAN_MARK_MOUNT: u32 = libc::FAN_MARK_MOUNT;
 
 const FAN_MARK_IGNORED_SURV_MODIFY: u32 = libc::FAN_MARK_IGNORED_SURV_MODIFY;
@@ -644,22 +642,16 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
-/// Add a fanotify ignore mask on the inode at `path` for open and exec
-/// permission events.
+/// Add an open-permission ignore mask to the inode pinned by the event fd.
 ///
-/// An ignored inode generates no permission event, so future opens of it need
-/// no userspace verdict. The mark survives watched-inode modification
-/// (`FAN_MARK_IGNORED_SURV_MODIFY`) and may be reclaimed under memory pressure
-/// (`FAN_MARK_EVICTABLE`); losing it to reclaim only costs a future event,
-/// never a wrong verdict.
+/// Execute permission events remain mediated independently. Marks may be
+/// reclaimed under memory pressure, which only costs another permission event.
 ///
 /// # Errors
 /// Returns an error if the ignore mask cannot be applied.
-pub fn fanotify_mark_ignore(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
-    let mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
-
-    // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
-    // int dirfd, const char *pathname)`. The fd and path are live for the call.
+pub fn fanotify_mark_ignore(fan_fd: impl AsFd, event_fd: impl AsFd) -> io::Result<()> {
+    // SAFETY: both descriptors are live. With a null pathname, dirfd is the
+    // object to mark and does not need to refer to a directory.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_fanotify_mark,
@@ -667,40 +659,32 @@ pub fn fanotify_mark_ignore(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
             i64::from(
                 FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY | FAN_MARK_EVICTABLE,
             ),
-            mask,
-            libc::AT_FDCWD,
-            path.as_ptr(),
+            FAN_OPEN_PERM,
+            event_fd.as_fd().as_raw_fd(),
+            std::ptr::null::<libc::c_char>(),
         )
     };
-
     if ret == 0 {
         return Ok(());
     }
-
     Err(io::Error::last_os_error())
 }
 
-/// Remove a fanotify ignore mask previously added with
-/// [`fanotify_mark_ignore`].
-///
-/// Removal carries the same ignore-mask flag family that added the mark, or
-/// the kernel rejects or misfiles the request.
+/// Flush all inode marks, including renamed or unlinked ignored inodes.
+/// Mount permission marks are retained.
 ///
 /// # Errors
-/// Returns an error if the ignore mask cannot be removed.
-pub fn fanotify_unmark_ignore(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
-    let mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
-
-    // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
-    // int dirfd, const char *pathname)`. The fd and path are live for the call.
+/// Returns an error if the inode marks cannot be flushed.
+pub fn fanotify_flush_inode_marks(fan_fd: impl AsFd) -> io::Result<()> {
+    // SAFETY: the fd is live; FLUSH ignores mask, dirfd and pathname.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_fanotify_mark,
             fan_fd.as_fd().as_raw_fd(),
-            i64::from(FAN_MARK_REMOVE | FAN_MARK_IGNORE),
-            mask,
+            i64::from(libc::FAN_MARK_FLUSH),
+            0u64,
             libc::AT_FDCWD,
-            path.as_ptr(),
+            std::ptr::null::<libc::c_char>(),
         )
     };
 

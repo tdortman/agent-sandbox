@@ -408,6 +408,12 @@ pub enum RpcRequest {
         ctx: RequestContext,
     },
 
+    /// Fetch current filesystem rules for a privileged monitor.
+    FilesystemSnapshot {
+        /// Sandbox context whose policy layers are merged.
+        ctx: RequestContext,
+    },
+
     /// Start monitoring a filesystem tree for rule violations.
     StartFilesystemMonitor {
         /// Context of the monitoring process.
@@ -607,6 +613,7 @@ impl RpcRequest {
             | Self::CheckResource { ctx, .. }
             | Self::CheckDbus { ctx, .. }
             | Self::StartFilesystemMonitor { ctx, .. }
+            | Self::FilesystemSnapshot { ctx }
             | Self::Elevate { ctx, .. }
             | Self::Approve { ctx, .. }
             | Self::ApproveHost { ctx, .. }

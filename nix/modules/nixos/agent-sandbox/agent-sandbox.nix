@@ -598,19 +598,21 @@ in
           default = true;
 
           description = ''
-            Let the filesystem monitor install fanotify ignore marks for files
-            that are statically allowed and admit no denied access: the path
-            must allow read statically, and either the covering mount is
-            read-only, the inode carries no write mode bits, or write is
-            statically allowed too. Repeat opens of such files then generate no
-            permission event, removing one userspace round trip per open.
+            Let the filesystem monitor skip repeat open events for statically
+            readable, single-link regular files on read-only filesystems.
+            Read-only bind mounts and file mode bits do not qualify. Execute
+            permission events remain enabled, and multiply-linked files go to
+            policyd for deny-inode checks.
 
-            What it does not cover: a runtime deny for a path that was
-            statically allowed is not re-evaluated while the mark lives, which
-            is why fsmon flushes all marks when the exported policy changes and
-            when it stops. Disable for a strict event-per-open posture where
-            every open wakes the monitor even when the verdict is statically
-            known.
+            The monitor requests current merged filesystem rules every second
+            and flushes ignore marks before replacing its local snapshot. A
+            failed refresh disables local grants and flushes marks. Marks also
+            flush on shutdown. If flushing fails, the monitor stops its sandbox
+            rather than leaving stale grants active. Marks require a usable
+            sandbox cgroup.kill descriptor.
+
+            Disable to receive a permission event on every open, including
+            opens the monitor can allow from its current policy snapshot.
           '';
         };
       };

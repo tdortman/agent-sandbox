@@ -5,7 +5,7 @@ use std::{
     io::{Read as _, Write as _},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
 };
 
 use crate::{
@@ -100,6 +100,21 @@ fn is_nix_store_path(path: &Path) -> bool {
 fn maybe_migrate_policy_file(read_path: &Path, original_data: &str) {
     if is_nix_store_path(read_path) {
         return;
+    }
+
+    // Every policy check reloads its layers; re-scanning unchanged bytes for
+    // legacy rules costs more than the rest of the load.
+    static CHECKED: LazyLock<Mutex<HashMap<PathBuf, String>>> = LazyLock::new(Mutex::default);
+
+    if let Ok(mut checked) = CHECKED.lock() {
+        if checked
+            .get(read_path)
+            .is_some_and(|data| data == original_data)
+        {
+            return;
+        }
+
+        checked.insert(read_path.to_path_buf(), original_data.to_owned());
     }
 
     let Some(migrated) = compute_migrated_policy_bytes(original_data) else {

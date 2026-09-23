@@ -3,12 +3,13 @@ use std::path::Path;
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FileAccess, ResolvedRequestContext, ResourceAccess, ResourceKind,
     Verdict, VerdictSource, host_pattern_matches, normalize_directory_traverse_access,
-    normalize_host,
+    normalize_host, with_canonical_memo,
 };
 
 use super::{
     PolicyStore,
     access::{filesystem_rules_match_allow, is_sandbox_infrastructure_path},
+    types::DenyFingerprint,
 };
 
 impl PolicyStore {
@@ -77,21 +78,59 @@ impl PolicyStore {
             return Some(Verdict::allowed(VerdictSource::Infrastructure));
         }
 
-        let merged = self.merged_for_worker(ctx);
         let project_root = ctx.paths.project_root();
         let home = ctx.paths.home();
 
-        let path_denied = merged
-            .filesystem
-            .deny
-            .iter()
-            .any(|rule| rule.matches(path, access, project_root));
-
-        if path_denied {
-            return Some(Verdict::denied(VerdictSource::policy()));
+        /// What the path rules of the merged policy layers decide.
+        enum RuleMatch {
+            Denied,
+            NotDenied {
+                fingerprint: Vec<DenyFingerprint>,
+                grant: RuleGrant,
+            },
         }
 
-        let fingerprint = Self::deny_fingerprint(&merged, home, project_root);
+        enum RuleGrant {
+            Allowed,
+            Unmatched,
+        }
+
+        // One memo spans the load and every match, so rule paths resolved while
+        // expanding the layers are not resolved again while matching them.
+        let rules = Self::blocking(|| {
+            with_canonical_memo(|| {
+                let merged = self.merged_for(ctx);
+
+                if merged
+                    .filesystem
+                    .deny
+                    .iter()
+                    .any(|rule| rule.matches(path, access, project_root))
+                {
+                    return RuleMatch::Denied;
+                }
+
+                let grant = if filesystem_rules_match_allow(
+                    &merged.filesystem.allow,
+                    path,
+                    access,
+                    project_root,
+                ) {
+                    RuleGrant::Allowed
+                } else {
+                    RuleGrant::Unmatched
+                };
+
+                RuleMatch::NotDenied {
+                    fingerprint: Self::deny_fingerprint(&merged, home, project_root),
+                    grant,
+                }
+            })
+        });
+
+        let RuleMatch::NotDenied { fingerprint, grant } = rules else {
+            return Some(Verdict::denied(VerdictSource::policy()));
+        };
 
         if self.deny_inode_denied(path, access, &fingerprint).await {
             return Some(Verdict::denied(VerdictSource::policy()));
@@ -120,7 +159,7 @@ impl PolicyStore {
             return Some(Verdict::allowed(VerdictSource::Static));
         }
 
-        if filesystem_rules_match_allow(&merged.filesystem.allow, path, access, project_root) {
+        if matches!(grant, RuleGrant::Allowed) {
             return Some(Verdict::allowed(VerdictSource::policy()));
         }
 

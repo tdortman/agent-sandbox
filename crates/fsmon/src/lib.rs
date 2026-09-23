@@ -37,6 +37,31 @@ pub struct MonitorClient {
 }
 
 impl MonitorClient {
+    /// Fetch the sandbox's current policy without waiting on user approval.
+    ///
+    /// # Errors
+    /// Returns transport, timeout or unexpected-reply errors.
+    pub async fn filesystem_snapshot(
+        &mut self,
+        ctx: RequestContext,
+    ) -> Result<agent_sandbox_core::FilesystemSection, RpcClientError> {
+        let reply = self
+            .client
+            .request(
+                RpcRequest::FilesystemSnapshot { ctx },
+                Duration::from_secs(1),
+            )
+            .await?;
+        if let RpcReply::FilesystemSnapshot { filesystem } = reply {
+            Ok(filesystem)
+        } else {
+            self.client.invalidate();
+            Err(RpcClientError::UnexpectedReply(
+                "expected filesystem snapshot",
+            ))
+        }
+    }
+
     /// Create a client that connects lazily on its first request.
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {

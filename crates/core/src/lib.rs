@@ -52,7 +52,7 @@ pub use policy::{
     ResourceAccess, ResourceKind, ResourceRule, ResourceRuleKey, ResourceSection, SocketAccess,
     StaticPolicyAllow, SudoRule, SudoSection, contains_glob_syntax, contract_home_path,
     contract_project_path, expand_home_path, expand_policy_path, filesystem_approval_paths,
-    normalize_directory_traverse_access, open_flags_to_file_access,
+    normalize_directory_traverse_access, open_flags_to_file_access, with_canonical_memo,
 };
 pub use rpc::{
     AliasSplit, ApprovalScope, ApprovalTarget, AttributionToken, CheckReply, DbusCheckReply,

@@ -26,10 +26,6 @@ pkgs.testers.runNixOSTest (_: {
       lib.recursiveUpdate (installPolicy dynamicPolicy) {
         imports = [ module ];
 
-        # The kernel default, pinned: the broker can read only its own
-        # descendants' syscall arguments.
-        boot.kernel.sysctl."kernel.yama.ptrace_scope" = 1;
-
         agent-sandbox = {
           enable = true;
           gates.filesystem.enable = true;
@@ -49,12 +45,43 @@ pkgs.testers.runNixOSTest (_: {
             uiBackend = "none";
           };
         };
+
+        # The kernel default, pinned: the broker can read only its own
+        # descendants' syscall arguments.
+        boot.kernel.sysctl."kernel.yama.ptrace_scope" = 1;
+
+        # Read-only superblock fixture for ignore-mark regressions: a tmpfs
+        # remounted read-only reports `ro` in its mountinfo super options, so
+        # fsmon may install inode ignore marks here. A read-only bind or bare
+        # mode bits would still admit aliases through a writable mount.
+        systemd.services.agent-sandbox-vm-ro-frozen = {
+          before = [ "agent-sandbox-policy.service" ];
+          wantedBy = [ "multi-user.target" ];
+
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+
+          script = ''
+            install -d -m 0755 /var/lib/agent-sandbox-test/ro-frozen
+            if ! mountpoint -q /var/lib/agent-sandbox-test/ro-frozen; then
+              mount -t tmpfs -o size=16m tmpfs /var/lib/agent-sandbox-test/ro-frozen
+              printf ro-frozen-marker > /var/lib/agent-sandbox-test/ro-frozen/marker
+              chmod 0444 /var/lib/agent-sandbox-test/ro-frozen/marker
+              mount -o remount,ro /var/lib/agent-sandbox-test/ro-frozen
+            fi
+          '';
+
+          path = [ pkgs.util-linux ];
+        };
       }
     );
 
   testScript = ''
     import shlex
     import re
+    import json
 
     def command(*args):
         return shlex.join(str(arg) for arg in args)
@@ -182,6 +209,9 @@ pkgs.testers.runNixOSTest (_: {
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "mv /var/lib/agent-sandbox-test/dynamic-mutations/denied/secret /var/lib/agent-sandbox-test/dynamic-mutations/moved-from-denied", expect_success=False)
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "rm /var/lib/agent-sandbox-test/dynamic-mutations/denied/secret", expect_success=False)
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "truncate -s 0 /var/lib/agent-sandbox-test/dynamic-mutations/denied/secret", expect_success=False)
+    # A deny nested inside an allowed tree also blocks plain reads: fsmon
+    # answers the allowed tree locally, so it must honour the deny as well.
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", "! cat /var/lib/agent-sandbox-test/dynamic-mutations/denied/secret >/dev/null")
     dynamic.succeed("test -f /var/lib/agent-sandbox-test/dynamic-mutations/rename-denied-source")
     dynamic.succeed("test -f /var/lib/agent-sandbox-test/dynamic-mutations/denied/secret")
     dynamic.succeed("test ! -e /var/lib/agent-sandbox-test/dynamic-mutations/denied/renamed")
@@ -204,15 +234,75 @@ pkgs.testers.runNixOSTest (_: {
         "test -z \"$AWS_SECRET_ACCESS_KEY\" && test -z \"$OPENAI_API_KEY\"",
         env=("env", "AWS_SECRET_ACCESS_KEY=secret", "OPENAI_API_KEY=secret"),
     )
-    # The ignore-mark fast path: a statically allowed file that nothing can
-    # write stops generating permission events. Read the unwritable fixture
-    # twice, then let every monitor report its counters and check the totals.
-    sandbox_shell(
-        dynamic,
-        "sandbox-dynamic-bash",
-        "grep -q dynamic-unwritable-marker /var/lib/agent-sandbox-test/dynamic-unwritable "
-        "&& grep -q dynamic-unwritable-marker /var/lib/agent-sandbox-test/dynamic-unwritable",
+    dynamic.wait_for_unit("agent-sandbox-vm-ro-frozen.service")
+    policy_path = "/home/user/.config/agent-sandbox/policy.json"
+    policy = json.loads(dynamic.succeed(command("cat", policy_path)))
+    frozen = "/var/lib/agent-sandbox-test/ro-frozen/marker"
+    mutable = "/var/lib/agent-sandbox-test/dynamic-mutations/warmed"
+    alias = "/var/lib/agent-sandbox-test/dynamic-mutations/alias"
+    denied_dir = "/var/lib/agent-sandbox-test/dynamic-mutations/denied"
+    dynamic.succeed(command("ln", denied_dir + "/secret", alias))
+    dynamic.succeed("printf warmed > " + mutable + "; chmod 0666 " + mutable)
+    policy["filesystem"]["allow"].append({"path": frozen, "access": "read"})
+
+    def save_policy():
+        dynamic.succeed(
+            command("printf", "%s", json.dumps(policy)) + " > " + policy_path + ".next && "
+            + command("chown", "sandbox:users", policy_path + ".next") + " && "
+            + command("mv", policy_path + ".next", policy_path)
+        )
+
+    save_policy()
+    dynamic.succeed("mkfifo -m 0666 /tmp/fsmon-input")
+    script = (
+        "while read -r token operation path; do "
+        "if [ \"$operation\" = read ]; then cat \"$path\" >/dev/null; "
+        "else printf changed >> \"$path\"; fi; "
+        "status=$?; printf '%s %s\\n' \"$token\" \"$status\"; done"
     )
+    launch = command("runuser", "-u", "sandbox", "--", "sandbox-dynamic-bash", "-c", script)
+    dynamic.succeed(command(
+        "systemd-run", "--unit=fsmon-live", "--service-type=exec",
+        "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin",
+        "sh", "-c", "exec " + launch + " < /tmp/fsmon-input > /tmp/fsmon-output 2>/tmp/fsmon-errors",
+    ))
+    # Keep the pipe open across probes so the same sandbox and monitor survive.
+    dynamic.succeed("sh -c 'exec 3>/tmp/fsmon-input; sleep 300' >/dev/null 2>&1 &")
+    probe_tokens = iter(range(100))
+
+    def probe(path, operation, allowed):
+        token = str(next(probe_tokens))
+        dynamic.succeed(command("printf", "%s\\n", token + " " + operation + " " + path) + " > /tmp/fsmon-input")
+        try:
+            dynamic.wait_until_succeeds(command("grep", "-q", "^" + token + " ", "/tmp/fsmon-output"), timeout=15)
+        except Exception:
+            print(dynamic.succeed("cat /tmp/fsmon-errors"))
+            raise
+        result = dynamic.succeed(command("grep", "^" + token + " ", "/tmp/fsmon-output")).split()[1]
+        assert (result == "0") == allowed, f"{operation} {path}: exit {result}"
+
+    probe(alias, "read", False)
+    probe(alias, "write", False)
+    probe(mutable, "read", True)
+    probe(mutable, "read", True)
+    dynamic.succeed(command("ln", mutable, denied_dir + "/warmed"))
+    probe(mutable, "read", False)
+    probe(mutable, "write", False)
+    probe(frozen, "read", True)
+    probe(frozen, "read", True)
+    policy["filesystem"]["allow"] = [rule for rule in policy["filesystem"]["allow"] if rule["path"] != frozen]
+    save_policy()
+    dynamic.sleep(3)
+    probe(frozen, "read", False)
+    policy["filesystem"]["allow"].append({"path": frozen, "access": "read"})
+    save_policy()
+    dynamic.sleep(3)
+    probe(frozen, "read", True)
+    policy["filesystem"]["deny"].append({"path": frozen, "access": "read"})
+    save_policy()
+    dynamic.sleep(3)
+    probe(frozen, "read", False)
+
     dynamic.succeed("pgrep -f '^/nix/store/[^ ]*/bin/agent-sandbox-fsmon' | xargs -r kill -TERM")
     dynamic.wait_until_succeeds(
         "! pgrep -f '^/nix/store/[^ ]*/bin/agent-sandbox-fsmon'", timeout=60

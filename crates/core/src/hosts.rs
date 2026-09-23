@@ -1,8 +1,13 @@
 //! Hostname normalization and policy host resolution.
 
-use std::{net::IpAddr, path::Path};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    path::Path,
+    sync::{LazyLock, Mutex},
+};
 
-use globset::GlobBuilder;
+use globset::{GlobBuilder, GlobMatcher};
 use hickory_proto::rr::Name;
 use idna::domain_to_ascii;
 use thiserror::Error;
@@ -12,6 +17,34 @@ pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error>
         .backslash_escape(true)
         .literal_separator(true)
         .build()
+}
+
+/// Compile a policy glob, reusing earlier compilations of the same pattern.
+///
+/// Compilation is a pure function of the pattern and builds a regex, which
+/// dominates evaluating a policy that re-reads its rules on every check.
+pub(crate) fn compile_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    static COMPILED: LazyLock<Mutex<HashMap<String, GlobMatcher>>> = LazyLock::new(Mutex::default);
+
+    if let Ok(cache) = COMPILED.lock()
+        && let Some(matcher) = cache.get(pattern)
+    {
+        return Ok(matcher.clone());
+    }
+
+    let matcher = build_glob(pattern)?.compile_matcher();
+
+    if let Ok(mut cache) = COMPILED.lock() {
+        // ponytail: clear at 4096 patterns; use LRU eviction if varied
+        // patterns cause measurable churn.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+
+        cache.insert(pattern.to_owned(), matcher.clone());
+    }
+
+    Ok(matcher)
 }
 
 // Keep complex glob syntax on the existing engine; common forms need no regex.
@@ -30,7 +63,7 @@ pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
         }
     }
 
-    build_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
+    compile_glob(pattern).is_ok_and(|matcher| matcher.is_match(value))
 }
 
 use crate::dns_cache::lookup_dns_cache;

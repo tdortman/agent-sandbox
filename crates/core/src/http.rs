@@ -1,7 +1,13 @@
 //! Typed HTTP request and rule normalization shared by policy, RPC, and
 //! proxies.
 
-use std::{fmt, net::IpAddr, num::NonZeroU16};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::IpAddr,
+    num::NonZeroU16,
+    sync::{LazyLock, Mutex},
+};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -1240,7 +1246,43 @@ impl HttpRule {
     /// # Errors
     /// Returns an [`HttpParseError`] when this rule's method or URL is invalid.
     pub fn target(&self) -> Result<HttpRuleTarget, HttpParseError> {
-        HttpRuleTarget::from_rule(self)
+        #[derive(PartialEq, Eq, Hash)]
+        struct Key {
+            methods: Vec<String>,
+            url: String,
+            port: NonZeroU16,
+        }
+
+        // Parsing is pure and dominates merging a policy that is re-read on
+        // every check.
+        static PARSED: LazyLock<Mutex<HashMap<Key, HttpRuleTarget>>> =
+            LazyLock::new(Mutex::default);
+
+        let key = Key {
+            methods: self.methods.clone(),
+            url: self.url.clone(),
+            port: self.port,
+        };
+
+        if let Ok(cache) = PARSED.lock()
+            && let Some(target) = cache.get(&key)
+        {
+            return Ok(target.clone());
+        }
+
+        let target = HttpRuleTarget::from_rule(self)?;
+
+        if let Ok(mut cache) = PARSED.lock() {
+            // ponytail: clear at 4096 rules; use LRU eviction if varied
+            // rules cause measurable churn.
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+
+            cache.insert(key, target.clone());
+        }
+
+        Ok(target)
     }
 }
 fn rule_authority_end(raw: &str, authority_start: usize) -> usize {

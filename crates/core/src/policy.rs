@@ -4,13 +4,17 @@
 //! Paths can be absolute (`/foo`), home-relative (`~/foo`), or project-relative
 //! (`./foo`). Paths containing glob syntax are compiled with [`globset`].
 
-use std::path::{Path, PathBuf};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+};
 
 use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    hosts::{NetworkRuleKey, build_glob, glob_matches},
+    hosts::{NetworkRuleKey, compile_glob, glob_matches},
     http::HttpRule,
 };
 
@@ -254,7 +258,7 @@ impl CompiledPath {
         let expanded_str = expanded.to_string_lossy();
 
         if contains_glob_syntax(&expanded_str) {
-            let glob = build_glob(&expanded_str)?.compile_matcher();
+            let glob = compile_glob(&expanded_str)?;
             Ok(Self::Glob(glob))
         } else {
             Ok(Self::Prefix(normalize_rule_path(&expanded)))
@@ -298,28 +302,42 @@ fn compiled_matches(
     }
 }
 
-fn path_matches_rule(
-    rule_path: &Path,
-    requested: &Path,
-    project_root: Option<&Path>,
-    require_directory_boundary: bool,
-) -> bool {
-    let requested = normalize_rule_path(requested);
+/// Whether `rule_path` matches `requested` as written, through the rule's
+/// current symlink aliases, or through the request's.
+///
+/// Each form is compiled at most once, and only when the cheaper forms
+/// missed. A malformed glob saved as a rule (user-typed, free-form) cannot
+/// match.
+fn rule_path_matches(rule_path: &Path, requested: &Path, project_root: Option<&Path>) -> bool {
+    let hits = |compiled: &Result<CompiledPath, globset::Error>, path: &Path| {
+        compiled
+            .as_ref()
+            .is_ok_and(|compiled| compiled_matches(compiled, path, false))
+    };
+
+    let normalized = normalize_rule_path(requested);
     let raw = CompiledPath::compile_raw(rule_path, project_root);
 
-    if let Ok(compiled) = raw
-        && compiled_matches(&compiled, &requested, require_directory_boundary)
-    {
+    if hits(&raw, &normalized) {
         return true;
     }
 
-    let Ok(compiled) = CompiledPath::compile(rule_path, project_root) else {
-        // A malformed glob saved as a rule (user-typed, free-form) cannot match.
-        // Previously a panic via .expect; now degrades gracefully.
-        return false;
-    };
+    let alias = CompiledPath::compile(rule_path, project_root);
 
-    compiled_matches(&compiled, &requested, require_directory_boundary)
+    if hits(&alias, &normalized) {
+        return true;
+    }
+
+    // Symlink alias fallback: e.g. /var/run → /run. Falls back to the raw
+    // path if canonicalization fails (socket deleted between checks).
+    let canonical = expand_policy_path(requested, None, project_root);
+
+    if canonical.as_path() == requested {
+        return false;
+    }
+
+    let canonical = normalize_rule_path(&canonical);
+    hits(&raw, &canonical) || hits(&alias, &canonical)
 }
 
 /// One allow or deny rule for a filesystem path.
@@ -363,18 +381,7 @@ impl FilesystemRule {
     /// field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        if path_matches_rule(&self.path, requested, project_root, false) {
-            return true;
-        }
-
-        // Symlink alias fallback: e.g. /var/run → /run. Only runs on a
-        // miss, so the common case (exact path match) is O(1) with no
-        // stat() syscall. Falls back to the raw path if canonicalization
-        // fails (socket deleted between checks).
-        let canonical = expand_policy_path(requested, None, project_root);
-
-        canonical.as_path() != requested
-            && path_matches_rule(&self.path, &canonical, project_root, false)
+        rule_path_matches(&self.path, requested, project_root)
     }
 
     /// Whether this rule matches the given path and access request.
@@ -473,12 +480,12 @@ pub fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
         let base = home_str.trim_end_matches('/');
         let expanded = PathBuf::from(format!("{base}/{rest}"));
 
-        if let Ok(home_canon) = home.canonicalize() {
-            match expanded.canonicalize() {
-                Ok(canonical) if canonical.starts_with(&home_canon) => return canonical,
-                Ok(_) => return path.to_path_buf(),
-                Err(_) if rest.split('/').any(|part| part == "..") => return path.to_path_buf(),
-                Err(_) => return expanded,
+        if let Some(home_canon) = canonicalize_live(home) {
+            match canonicalize_live(&expanded) {
+                Some(canonical) if canonical.starts_with(&home_canon) => return canonical,
+                Some(_) => return path.to_path_buf(),
+                None if rest.split('/').any(|part| part == "..") => return path.to_path_buf(),
+                None => return expanded,
             }
         }
 
@@ -535,10 +542,121 @@ pub fn expand_policy_path(
     // Only canonicalize absolute literal paths. Glob patterns are left as-is
     // since canonicalize would fail on them.
     if s.starts_with('/') && !contains_glob_syntax(&s) {
-        std::fs::canonicalize(&expanded).unwrap_or(expanded)
+        canonicalize_live(&expanded).unwrap_or(expanded)
     } else {
         expanded
     }
+}
+
+thread_local! {
+    static CANONICAL_MEMO: RefCell<Option<HashMap<PathBuf, Option<PathBuf>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Run `f` with symlink resolution in policy path expansion and matching
+/// memoized per path prefix.
+///
+/// Evaluating one request resolves hundreds of rule paths that share most of
+/// their components; resolving each prefix once turns thousands of
+/// `readlink` calls into one `lstat` per distinct path. Results live only
+/// for the duration of `f`, so aliases stay as live as one policy
+/// evaluation. Nested calls share the outermost memo.
+pub fn with_canonical_memo<T>(f: impl FnOnce() -> T) -> T {
+    /// Guard for one `with_canonical_memo` call. Only the call that installed
+    /// the memo owns it and clears it on exit, including on unwind.
+    enum Scope {
+        Owner,
+        Nested,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if matches!(self, Self::Owner) {
+                CANONICAL_MEMO.with(|memo| memo.borrow_mut().take());
+            }
+        }
+    }
+
+    let _scope = CANONICAL_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+
+        if memo.is_some() {
+            return Scope::Nested;
+        }
+
+        *memo = Some(HashMap::new());
+        Scope::Owner
+    });
+
+    f()
+}
+
+/// [`std::fs::canonicalize`], memoized inside [`with_canonical_memo`].
+fn canonicalize_live(path: &Path) -> Option<PathBuf> {
+    CANONICAL_MEMO.with(|memo| match memo.borrow_mut().as_mut() {
+        Some(memo) => memoized_canonicalize(memo, path),
+        None => std::fs::canonicalize(path).ok(),
+    })
+}
+
+/// A plain absolute path (no `.`, `..`, or redundant separators) split into
+/// its parent directory and final name.
+struct PlainPath<'a> {
+    parent: &'a Path,
+    name: &'a std::ffi::OsStr,
+}
+
+impl<'a> PlainPath<'a> {
+    fn split(path: &'a Path) -> Option<Self> {
+        let plain = path.is_absolute()
+            && path
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+            && path.components().collect::<PathBuf>() == path;
+
+        if !plain {
+            return None;
+        }
+
+        Some(Self {
+            parent: path.parent()?,
+            name: path.file_name()?,
+        })
+    }
+}
+
+fn memoized_canonicalize(
+    memo: &mut HashMap<PathBuf, Option<PathBuf>>,
+    path: &Path,
+) -> Option<PathBuf> {
+    if let Some(resolved) = memo.get(path) {
+        return resolved.clone();
+    }
+
+    // A plain path resolves as its resolved parent plus one `lstat`; anything
+    // else takes the full walk.
+    let resolved = match PlainPath::split(path) {
+        Some(PlainPath { parent, name }) => {
+            memoized_canonicalize(memo, parent).and_then(|parent| {
+                let joined = parent.join(name);
+
+                if std::fs::symlink_metadata(&joined)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    std::fs::canonicalize(&joined).ok()
+                } else {
+                    Some(joined)
+                }
+            })
+        }
+
+        None => std::fs::canonicalize(path).ok(),
+    };
+
+    memo.insert(path.to_path_buf(), resolved.clone());
+    resolved
 }
 
 /// Build the ordered list of filesystem paths to present as approval targets.
@@ -895,18 +1013,7 @@ impl ResourceRule {
     /// field.
     #[must_use]
     pub fn path_matches(&self, requested: &Path, project_root: Option<&Path>) -> bool {
-        if path_matches_rule(&self.path, requested, project_root, false) {
-            return true;
-        }
-
-        // Symlink alias fallback: e.g. /var/run → /run. Only runs on a
-        // miss, so the common case (exact path match) is O(1) with no
-        // stat() syscall. Falls back to the raw path if canonicalization
-        // fails (socket deleted between checks).
-        let canonical = expand_policy_path(requested, None, project_root);
-
-        canonical.as_path() != requested
-            && path_matches_rule(&self.path, &canonical, project_root, false)
+        rule_path_matches(&self.path, requested, project_root)
     }
 
     /// Whether this rule matches the given kind, path, and access request.
@@ -1428,83 +1535,135 @@ mod dbus_tests {
 /// Default path of the merged policy JSON policyd exports at startup.
 pub const EXPORTED_POLICY_PATH: &str = "/var/lib/agent-sandbox/exported-policy.json";
 
-/// Static filesystem allow rules loaded from policyd's exported merged
-/// policy snapshot.
+/// Static filesystem allow rules from a merged policy snapshot.
 ///
-/// Enforcement components (fsmon, the syscall broker) answer events whose
-/// (path, access) matches one of these rules locally: policyd would reach
-/// the same verdict from its static policy layers, and the matching code is
-/// the same [`FilesystemRule::matches`] the store uses. Deny rules and every
-/// live verdict (session buckets, approvals, deny-inode cache) are never
-/// replayed locally: anything that does not match is forwarded to policyd, so
-/// runtime approvals keep working and no deny can be bypassed. The snapshot
-/// is loaded once; editing policy files mid-session is out of scope by
-/// design.
+/// Matches path and access against immutable allow and deny rules. Every
+/// alias-derived grant is confirmed by [`FilesystemRule::matches`]. A matching
+/// deny always wins over an allow in this snapshot.
+///
+/// Callers own snapshot refresh and any checks outside these rules, including
+/// policyd's deny-inode defense. Fsmon refreshes its snapshot during the
+/// session and forwards multiply-linked files to policyd. Session approvals and
+/// other live verdicts are not cached here.
 pub struct StaticPolicyAllow {
-    rules: Vec<FilesystemRule>,
+    rules: Vec<StaticRule>,
 
-    // Only syntactic matchers are cached; filesystem aliases stay live.
-    literal_rules: Vec<(CompiledPath, FileAccess)>,
+    deny: Vec<FilesystemRule>,
 
     project_root: Option<PathBuf>,
 }
 
+struct StaticRule {
+    rule: FilesystemRule,
+
+    // The rule path compiled as written.
+    literal: Option<CompiledPath>,
+
+    // The rule path compiled with its symlink aliases resolved at load. Only a
+    // prefilter: resolving every rule on every miss costs milliseconds per
+    // open, so hits are confirmed live and a retargeted alias grants nothing
+    // locally (policyd decides it).
+    alias: Option<CompiledPath>,
+}
+
 impl StaticPolicyAllow {
-    /// Load the filesystem allow rules from a policyd policy export.
+    /// Load the filesystem rules from a policyd policy export.
     ///
     /// Returns an empty evaluator when the file is missing or unparseable;
     /// callers then round-trip every event through policyd.
     #[must_use]
     pub fn load(path: &Path, project_root: Option<PathBuf>) -> Self {
-        let rules = std::fs::read_to_string(path)
+        let policy = std::fs::read_to_string(path)
             .ok()
             .and_then(|content| serde_json::from_str::<Policy>(&content).ok())
-            .map_or_else(
-                || {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "cannot load static policy export; all events will round-trip policyd"
-                    );
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    path = %path.display(),
+                    "cannot load static policy export; all events will round-trip policyd"
+                );
 
-                    Vec::new()
-                },
-                |policy| policy.filesystem.allow,
-            );
+                Policy::default()
+            });
 
-        let literal_rules = rules
-            .iter()
-            .filter_map(|rule| {
-                CompiledPath::compile_raw(&rule.path, project_root.as_deref())
-                    .ok()
-                    .map(|compiled| (compiled, rule.access))
+        Self::from_policy(policy, project_root)
+    }
+
+    /// Build the evaluator from an already merged policy.
+    #[must_use]
+    pub fn from_policy(policy: Policy, project_root: Option<PathBuf>) -> Self {
+        let rules = policy
+            .filesystem
+            .allow
+            .into_iter()
+            .map(|rule| StaticRule {
+                literal: CompiledPath::compile_raw(&rule.path, project_root.as_deref()).ok(),
+                alias: CompiledPath::compile(&rule.path, project_root.as_deref()).ok(),
+                rule,
             })
             .collect();
 
         Self {
             rules,
-            literal_rules,
+            deny: policy.filesystem.deny,
             project_root,
         }
+    }
+
+    /// Whether a deny rule matches, so the request must go to policyd.
+    fn denied(&self, path: &Path, access: FileAccess) -> bool {
+        with_canonical_memo(|| {
+            self.deny
+                .iter()
+                .any(|rule| rule.matches(path, access, self.project_root.as_deref()))
+        })
     }
 
     /// Whether the static snapshot allows the given path and access mode.
     #[must_use]
     pub fn allows(&self, path: &Path, access: FileAccess) -> bool {
-        self.allows_literal(path, access)
-            || self
-                .rules
-                .iter()
-                .any(|rule| rule.matches(path, access, self.project_root.as_deref()))
+        if self.denied(path, access) {
+            return false;
+        }
+
+        if self.literal_grant(path, access) {
+            return true;
+        }
+
+        let project_root = self.project_root.as_deref();
+        let requested = normalize_rule_path(path);
+        let canonical = normalize_rule_path(&expand_policy_path(path, None, project_root));
+
+        let hits = |compiled: &Option<CompiledPath>| {
+            compiled.as_ref().is_some_and(|compiled| {
+                compiled_matches(compiled, &requested, false)
+                    || compiled_matches(compiled, &canonical, false)
+            })
+        };
+
+        self.rules.iter().any(|static_rule| {
+            static_rule.rule.access.covers(access)
+                && (hits(&static_rule.literal) || hits(&static_rule.alias))
+                && static_rule.rule.matches(path, access, project_root)
+        })
     }
 
-    /// Whether a rule grants access without resolving filesystem aliases.
-    /// A miss does not exclude a grant through a live symlink alias.
+    /// Whether a rule grants access without resolving filesystem aliases in
+    /// the allow rules. A miss does not exclude a grant through a live
+    /// symlink alias.
     #[must_use]
     pub fn allows_literal(&self, path: &Path, access: FileAccess) -> bool {
+        self.literal_grant(path, access) && !self.denied(path, access)
+    }
+
+    fn literal_grant(&self, path: &Path, access: FileAccess) -> bool {
         let requested = normalize_rule_path(path);
 
-        self.literal_rules.iter().any(|(compiled, granted)| {
-            granted.covers(access) && compiled_matches(compiled, &requested, false)
+        self.rules.iter().any(|static_rule| {
+            static_rule.rule.access.covers(access)
+                && static_rule
+                    .literal
+                    .as_ref()
+                    .is_some_and(|compiled| compiled_matches(compiled, &requested, false))
         })
     }
 
@@ -2157,6 +2316,37 @@ mod tests {
     }
 
     #[test]
+    fn static_policy_allow_never_grants_what_a_deny_rule_covers() {
+        let project = tempfile::tempdir().expect("project root");
+        std::fs::create_dir_all(project.path().join(".git/hooks")).expect("create hooks");
+        let mut policy = Policy::default();
+
+        policy
+            .filesystem
+            .allow
+            .push(FilesystemRule::new("./.git", FileAccess::ReadWrite, "test"));
+
+        policy.filesystem.deny.push(FilesystemRule::new(
+            "./.git/hooks",
+            FileAccess::Write,
+            "test",
+        ));
+
+        let eval = StaticPolicyAllow::from_policy(policy, Some(project.path().to_path_buf()));
+        let hook = project.path().join(".git/hooks/pre-commit");
+        let config = project.path().join(".git/config");
+
+        assert!(!eval.allows(&hook, FileAccess::Write));
+        assert!(!eval.allows(&hook, FileAccess::ReadWrite));
+        assert!(!eval.allows_literal(&hook, FileAccess::ReadWrite));
+        assert!(
+            eval.allows(&hook, FileAccess::Read),
+            "deny covers writes only"
+        );
+        assert!(eval.allows_literal(&config, FileAccess::ReadWrite));
+    }
+
+    #[test]
     fn static_policy_allow_matches_allow_rules_only() {
         let mut policy = Policy::default();
 
@@ -2246,7 +2436,10 @@ mod tests {
         std::fs::remove_file(&alias).expect("remove alias");
         std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
         assert!(!rule_alias.allows(&first, FileAccess::Read));
-        assert!(rule_alias.allows(&second, FileAccess::Read));
+        assert!(
+            !rule_alias.allows(&second, FileAccess::Read),
+            "a retargeted rule alias is left to policyd"
+        );
         assert!(!request_alias.allows(&alias, FileAccess::Read));
     }
 
@@ -2259,5 +2452,46 @@ mod tests {
 
         assert!(eval.is_empty());
         assert!(!eval.allows(Path::new("/anything"), FileAccess::Read));
+    }
+
+    #[test]
+    fn memoized_expansion_resolves_aliases_like_realpath() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("sub")).expect("create tree");
+        std::fs::write(real.join("sub/file"), "").expect("create file");
+        std::os::unix::fs::symlink(&real, root.join("dir-link")).expect("dir link");
+        std::os::unix::fs::symlink("real/sub/file", root.join("file-link")).expect("file link");
+        std::os::unix::fs::symlink("dir-link/sub", root.join("chain")).expect("chained link");
+
+        let cases = [
+            root.join("dir-link/sub/file"),
+            root.join("file-link"),
+            root.join("chain/file"),
+            root.join("dir-link/../real/sub"),
+            root.join("dir-link/missing"),
+            root.join("real/sub/file/beneath-a-file"),
+        ];
+
+        let plain: Vec<_> = cases
+            .iter()
+            .map(|path| super::expand_policy_path(path, None, None))
+            .collect();
+
+        let memoized: Vec<_> = super::with_canonical_memo(|| {
+            cases
+                .iter()
+                .chain(&cases)
+                .map(|path| super::expand_policy_path(path, None, None))
+                .collect()
+        });
+
+        assert_eq!(memoized[..cases.len()], plain[..]);
+        assert_eq!(memoized[cases.len()..], plain[..]);
+        assert_eq!(
+            plain[0],
+            real.canonicalize().expect("real").join("sub/file")
+        );
     }
 }

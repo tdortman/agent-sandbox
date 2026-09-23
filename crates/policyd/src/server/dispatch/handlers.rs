@@ -221,6 +221,10 @@ pub async fn handle(
             ))
         }
 
+        RpcRequest::FilesystemSnapshot { ctx } => Ok(RpcReply::FilesystemSnapshot {
+            filesystem: store.merged_for_worker(&resolve(&ctx)?).filesystem,
+        }),
+
         RpcRequest::Elevate { argv, ctx } => {
             if argv.is_empty() {
                 return Err(PolicydError::ArgvRequired);

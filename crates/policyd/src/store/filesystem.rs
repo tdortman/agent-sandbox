@@ -113,6 +113,7 @@ impl PolicyStore {
             .arg(peer_pid.to_string())
             .arg("--socket")
             .arg(&socket_str)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
@@ -126,7 +127,6 @@ impl PolicyStore {
             }
         }
 
-        command.arg("--static-policy").arg(&self.args.export_json);
         command
             .arg("--fs-ignore-static-allows")
             .arg(if self.args.fs_ignore_static_allows {

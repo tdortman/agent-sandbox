@@ -1,7 +1,10 @@
 //! Merge policy layers with deny-wins semantics. A deny rule for a key is final
 //! even if a later layer allowed it.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{LazyLock, Mutex},
+};
 
 use crate::{
     hosts::{host_pattern_has_glob, host_pattern_matches},
@@ -20,17 +23,52 @@ use crate::{
 /// Returns the merged policy.
 #[must_use]
 pub fn merge_layers(layers: &[Policy]) -> Policy {
+    // policyd re-merges the same layers on every check. Reuse is sound: the
+    // merge only reads the filesystem to decide whether a deny fully covers an
+    // allow, and a stale answer there either keeps an allow whose deny is
+    // still present (the evaluator checks deny first) or drops a redundant
+    // allow (fails closed).
+    struct Entry {
+        layers: Vec<Policy>,
+        merged: Policy,
+    }
+
+    static MERGED: LazyLock<Mutex<VecDeque<Entry>>> = LazyLock::new(Mutex::default);
+
+    // ponytail: 16 most recent layer sets, linear scan; key by a content hash
+    // if many concurrent contexts cause churn.
+    const CAPACITY: usize = 16;
+
     if layers.is_empty() {
         return Policy::default();
     }
 
-    Policy {
+    if let Ok(cache) = MERGED.lock()
+        && let Some(entry) = cache.iter().find(|entry| entry.layers == layers)
+    {
+        return entry.merged.clone();
+    }
+
+    let merged = Policy {
         network: merge_network(layers),
         sudo: merge_sudo(layers),
         filesystem: merge_filesystem(layers),
         resources: merge_resources(layers),
         dbus: merge_dbus(layers),
+    };
+
+    if let Ok(mut cache) = MERGED.lock() {
+        if cache.len() >= CAPACITY {
+            cache.pop_front();
+        }
+
+        cache.push_back(Entry {
+            layers: layers.to_vec(),
+            merged: merged.clone(),
+        });
     }
+
+    merged
 }
 
 fn dbus_rules_overlap(deny: &DbusRule, allow: &DbusRule) -> bool {

@@ -110,6 +110,12 @@ pub enum RpcReply {
     /// Result of starting or stopping a filesystem monitor.
     FilesystemMonitor(FilesystemMonitorReply),
 
+    /// Current merged filesystem rules for a privileged monitor.
+    FilesystemSnapshot {
+        /// Filesystem allow and deny rules from all applicable layers.
+        filesystem: crate::FilesystemSection,
+    },
+
     /// HTTP access check result.
     HttpCheck(HttpCheckReply),
 
@@ -137,7 +143,12 @@ impl<'de> Deserialize<'de> for RpcReply {
     where
         D: Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(filesystem) = value.get_mut("filesystem") {
+            return serde_json::from_value(filesystem.take())
+                .map(|filesystem| Self::FilesystemSnapshot { filesystem })
+                .map_err(serde::de::Error::custom);
+        }
 
         macro_rules! try_variant {
             ($variant:ident, $ty:ty) => {

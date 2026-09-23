@@ -489,6 +489,10 @@ impl PolicyStore {
     /// Layers are merged with deny-wins semantics: any non-empty `deny`
     /// rule shadows the corresponding `allow` rule across the merged set.
     pub fn merged_for(&self, ctx: &ResolvedRequestContext) -> Policy {
+        agent_sandbox_core::with_canonical_memo(|| self.merge_file_layers(ctx))
+    }
+
+    fn merge_file_layers(&self, ctx: &ResolvedRequestContext) -> Policy {
         let home_path = ctx.paths.home();
         let project_root_path = ctx.paths.project_root();
 
@@ -687,14 +691,18 @@ impl PolicyStore {
     /// Load merged policy from async handlers without blocking the Tokio
     /// runtime.
     pub(crate) fn merged_for_worker(&self, ctx: &ResolvedRequestContext) -> Policy {
-        let ctx = ctx.clone();
+        Self::blocking(|| self.merged_for(ctx))
+    }
 
+    /// Run filesystem-heavy policy work from async handlers without blocking
+    /// the Tokio runtime.
+    pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
         if tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         {
-            tokio::task::block_in_place(|| self.merged_for(&ctx))
+            tokio::task::block_in_place(f)
         } else {
-            self.merged_for(&ctx)
+            f()
         }
     }
 

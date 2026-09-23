@@ -25,6 +25,7 @@ pub async fn dispatch(
     if matches!(
         &req,
         RpcRequest::RegisterNetworkFlow { .. }
+            | RpcRequest::FilesystemSnapshot { .. }
             | RpcRequest::BindNetworkRevocation { .. }
             | RpcRequest::ObserveNetworkGrants { .. }
             | RpcRequest::PublishNetworkGrants
@@ -88,6 +89,92 @@ mod tests {
             NormalizedPolicyHost::parse("example.com").expect("valid test policy host"),
             FlowContext::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn filesystem_snapshots_require_root_and_refresh_trusted_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&dir);
+        let client = PolicyStore::new_client_handle(writer());
+        let home_policy = dir.path().join(".config/agent-sandbox/policy.json");
+        std::fs::create_dir_all(home_policy.parent().expect("parent")).expect("policy directory");
+        let ctx = RequestContext {
+            home: Some(dir.path().to_path_buf()),
+            ..RequestContext::default()
+        };
+        for role in [
+            SocketRole::Host,
+            SocketRole::Sandbox,
+            SocketRole::Proxy,
+            SocketRole::UiFd,
+        ] {
+            for uid in [0, 1000] {
+                let result = dispatch(
+                    &store,
+                    &client,
+                    ClientPeer {
+                        pid: std::process::id(),
+                        uid,
+                        gid: 0,
+                    },
+                    role,
+                    RpcRequest::FilesystemSnapshot { ctx: ctx.clone() },
+                )
+                .await;
+                if uid == 0 && matches!(role, SocketRole::Host | SocketRole::Sandbox) {
+                    assert!(matches!(result, Ok(RpcReply::FilesystemSnapshot { .. })));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(PolicydError::UnauthorizedRequest
+                            | PolicydError::UnauthorizedUiFdRequest)
+                    ));
+                }
+            }
+        }
+        let request_path = dir.path().join("granted");
+        for section in ["allow", "deny"] {
+            let policy = serde_json::json!({"filesystem": {section: [{"path": "~/granted", "access": "read"}]}});
+            let replacement = home_policy.with_extension("new");
+            std::fs::write(&replacement, policy.to_string()).expect("replacement policy");
+            std::fs::rename(replacement, &home_policy).expect("atomic replace");
+            let reply = dispatch(
+                &store,
+                &client,
+                ClientPeer {
+                    pid: std::process::id(),
+                    uid: 0,
+                    gid: 0,
+                },
+                SocketRole::Sandbox,
+                RpcRequest::FilesystemSnapshot { ctx: ctx.clone() },
+            )
+            .await
+            .expect("snapshot");
+            let reply = serde_json::from_slice::<RpcReply>(
+                &serde_json::to_vec(&reply).expect("encode snapshot reply"),
+            )
+            .expect("decode snapshot reply");
+            let RpcReply::FilesystemSnapshot { filesystem } = reply else {
+                panic!("unexpected reply")
+            };
+            assert_eq!(
+                filesystem.allow.iter().any(|rule| rule.matches(
+                    &request_path,
+                    FileAccess::Read,
+                    None
+                )),
+                section == "allow"
+            );
+            assert_eq!(
+                filesystem.deny.iter().any(|rule| rule.matches(
+                    &request_path,
+                    FileAccess::Read,
+                    None
+                )),
+                section == "deny"
+            );
+        }
     }
 
     #[tokio::test]
