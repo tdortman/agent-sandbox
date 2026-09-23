@@ -399,6 +399,13 @@ impl tokio::io::AsyncWrite for QuickAckStream {
     }
 }
 
+/// Upper bound on pooled upstream connections, active and idle, per pool.
+const UPSTREAM_POOL_CONNECTIONS: usize = 1024;
+
+/// Idle pooled connections close after this long, below common server
+/// keep-alive limits.
+const UPSTREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn build_upstream_client(
     identities: Arc<UpstreamClientIdentities>,
 ) -> Result<BoxService<Request, UpstreamConnection, BoxError>, BoxError> {
@@ -424,7 +431,15 @@ fn build_upstream_client(
     let connector = TlsAlpnConnector::new(connector, identities);
 
     let connector = HttpConnector::new(connector, Executor::default());
-    let connector = HttpPooledConnectorConfig::default().try_build_connector(connector)?;
+    let connector = HttpPooledConnectorConfig {
+        // The pool is shared by every intercepted flow, and long responses
+        // (event streams, downloads) hold connections for minutes. Rama's default
+        // of 50 would queue unrelated requests behind them.
+        max_total: UPSTREAM_POOL_CONNECTIONS,
+        idle_timeout: Some(UPSTREAM_IDLE_TIMEOUT),
+        ..HttpPooledConnectorConfig::default()
+    }
+    .try_build_connector(connector)?;
     let connector = HttpConnectRequestAdapter::new(connector);
 
     // Version resolution is a property of the connector input in rama 0.4: the

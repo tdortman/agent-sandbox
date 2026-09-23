@@ -411,24 +411,6 @@ pub struct ListenConfig {
     pub write_bound_ports: Option<(PathBuf, Vec<u16>)>,
 }
 
-/// Build the per-flow upstream client pool, releasing the flow claim when
-/// connector construction fails so policyd does not hold the claim until
-/// the session ends.
-async fn build_upstream_clients(
-    policy: &Arc<PolicySession>,
-    claim: &FlowClaim,
-    identities: Arc<crate::upstream_tls::UpstreamClientIdentities>,
-) -> Result<Arc<UpstreamClients>, BoxError> {
-    match UpstreamClients::new(identities) {
-        Ok(clients) => Ok(Arc::new(clients)),
-
-        Err(error) => {
-            let _ = policy.release(claim).await;
-            Err(error)
-        }
-    }
-}
-
 fn build_listener_service(
     executor: Executor,
     policy: Arc<PolicySession>,
@@ -442,6 +424,13 @@ fn build_listener_service(
         listener_config.ech.as_ref(),
         Ipv4Addr::LOCALHOST.to_string(),
     )?);
+    // One pool for every flow: repeat requests to an origin reuse warm
+    // connections and TLS sessions. Each request is still checked with policyd
+    // before it takes a connection, and the pool key includes the claimed dial
+    // address, so no request reaches a destination its own flow did not claim.
+    let upstream_clients = Arc::new(UpstreamClients::new(
+        listener_config.upstream_client_identities.clone(),
+    )?);
 
     Ok(service_fn(move |stream: TcpStream| {
         let executor = executor.clone();
@@ -450,7 +439,7 @@ fn build_listener_service(
         let websocket_http11_urls = listener_config.websocket_http11_urls.clone();
         let http10_upstream_origins = listener_config.http10_upstream_origins.clone();
         let h2c_upstream_origins = listener_config.h2c_upstream_origins.clone();
-        let upstream_client_identities = listener_config.upstream_client_identities.clone();
+        let upstream_clients = upstream_clients.clone();
         let shutdown = shutdown.clone();
 
         #[cfg(debug_assertions)]
@@ -498,9 +487,6 @@ fn build_listener_service(
             }
 
             let state = {
-                let upstream_clients =
-                    build_upstream_clients(&policy, &claim, upstream_client_identities).await?;
-
                 FlowState {
                     destination,
                     tls: test_tls || matches!(sniff, TcpSniff::Tls),
