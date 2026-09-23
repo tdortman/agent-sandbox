@@ -8,6 +8,8 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     path::{Component, Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use globset::GlobMatcher;
@@ -302,29 +304,87 @@ fn compiled_matches(
     }
 }
 
-/// Whether `rule_path` matches `requested` as written, through the rule's
-/// current symlink aliases, or through the request's.
-///
-/// Each form is compiled at most once, and only when the cheaper forms
-/// missed. A malformed glob saved as a rule (user-typed, free-form) cannot
-/// match.
-fn rule_path_matches(rule_path: &Path, requested: &Path, project_root: Option<&Path>) -> bool {
-    let hits = |compiled: &Result<CompiledPath, globset::Error>, path: &Path| {
-        compiled
-            .as_ref()
-            .is_ok_and(|compiled| compiled_matches(compiled, path, false))
+/// How long a rule path's compiled forms, including its resolved symlink
+/// aliases, are reused before the rule path is resolved again.
+const RULE_PATH_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Distinct rule paths cached before the cache is cleared.
+const RULE_PATH_CACHE_CAP: usize = 16_384;
+
+#[derive(PartialEq, Eq, Hash)]
+struct RulePathKey {
+    rule_path: PathBuf,
+    project_root: Option<PathBuf>,
+}
+
+/// A rule path compiled as written and through its symlink aliases.
+struct CompiledRulePath {
+    compiled: Instant,
+    raw: Option<CompiledPath>,
+    alias: Option<CompiledPath>,
+}
+
+static RULE_PATH_CACHE: LazyLock<Mutex<HashMap<RulePathKey, Arc<CompiledRulePath>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Compile `rule_path` both ways, reusing a compilation younger than
+/// [`RULE_PATH_CACHE_TTL`]. Resolving every rule's aliases on every request
+/// dominated policy evaluation; a stale alias keeps the target the rule had
+/// when it was resolved.
+fn compiled_rule_path(rule_path: &Path, project_root: Option<&Path>) -> Arc<CompiledRulePath> {
+    let key = RulePathKey {
+        rule_path: rule_path.to_path_buf(),
+        project_root: project_root.map(Path::to_path_buf),
     };
 
-    let normalized = normalize_rule_path(requested);
-    let raw = CompiledPath::compile_raw(rule_path, project_root);
-
-    if hits(&raw, &normalized) {
-        return true;
+    if let Ok(cache) = RULE_PATH_CACHE.lock()
+        && let Some(cached) = cache.get(&key)
+        && cached.compiled.elapsed() < RULE_PATH_CACHE_TTL
+    {
+        return Arc::clone(cached);
     }
 
-    let alias = CompiledPath::compile(rule_path, project_root);
+    let compiled = Arc::new(CompiledRulePath {
+        compiled: Instant::now(),
+        raw: CompiledPath::compile_raw(rule_path, project_root).ok(),
+        alias: CompiledPath::compile(rule_path, project_root).ok(),
+    });
+    if let Ok(mut cache) = RULE_PATH_CACHE.lock() {
+        if cache.len() >= RULE_PATH_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, Arc::clone(&compiled));
+    }
+    compiled
+}
 
-    if hits(&alias, &normalized) {
+/// Drop every cached rule path compilation, so the next match resolves rule
+/// aliases again.
+#[cfg(test)]
+fn expire_rule_path_cache() {
+    RULE_PATH_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Whether `rule_path` matches `requested` as written, through the rule's
+/// symlink aliases, or through the request's.
+///
+/// Rule aliases are those of [`compiled_rule_path`]; the request is resolved
+/// live, and only when both rule forms missed it as written. A malformed glob
+/// saved as a rule (user-typed, free-form) cannot match.
+fn rule_path_matches(rule_path: &Path, requested: &Path, project_root: Option<&Path>) -> bool {
+    let hits = |compiled: &Option<CompiledPath>, path: &Path| {
+        compiled
+            .as_ref()
+            .is_some_and(|compiled| compiled_matches(compiled, path, false))
+    };
+
+    let rule = compiled_rule_path(rule_path, project_root);
+    let normalized = normalize_rule_path(requested);
+
+    if hits(&rule.raw, &normalized) || hits(&rule.alias, &normalized) {
         return true;
     }
 
@@ -337,7 +397,7 @@ fn rule_path_matches(rule_path: &Path, requested: &Path, project_root: Option<&P
     }
 
     let canonical = normalize_rule_path(&canonical);
-    hits(&raw, &canonical) || hits(&alias, &canonical)
+    hits(&rule.raw, &canonical) || hits(&rule.alias, &canonical)
 }
 
 /// One allow or deny rule for a filesystem path.
@@ -1571,10 +1631,11 @@ struct StaticRule {
     literal: Option<CompiledPath>,
 
     // The rule path compiled with its symlink aliases resolved at load. For
-    // allows only a prefilter: resolving every rule on every miss costs
-    // milliseconds per open, so hits are confirmed live and a retargeted alias
-    // grants nothing locally (policyd decides it). For denies it is the alias
-    // as of load; callers rebuild the snapshot to follow a retargeted alias.
+    // allows only a prefilter: hits are confirmed by `FilesystemRule::matches`,
+    // whose aliases are at most `RULE_PATH_CACHE_TTL` old, so a retargeted
+    // alias soon grants nothing locally (policyd decides it). For denies it is
+    // the alias as of load; callers rebuild the snapshot to follow a
+    // retargeted alias.
     alias: Option<CompiledPath>,
 }
 
@@ -1741,7 +1802,7 @@ mod tests {
     use super::{
         DeviceAccess, FileAccess, FilesystemRule, PathResolution, Policy, ResourceAccess,
         ResourceKind, ResourceRule, SocketAccess, StaticPolicyAllow, SudoRule, contract_home_path,
-        contract_project_path, expand_home_path, filesystem_approval_paths,
+        contract_project_path, expand_home_path, expire_rule_path_cache, filesystem_approval_paths,
         open_flags_to_file_access,
     };
 
@@ -2506,6 +2567,7 @@ mod tests {
         assert!(!request_alias.allows(&alias, FileAccess::Write, PathResolution::Unresolved));
         std::fs::remove_file(&alias).expect("remove alias");
         std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
+        expire_rule_path_cache();
         assert!(!rule_alias.allows(&first, FileAccess::Read, PathResolution::Unresolved));
         assert!(
             !rule_alias.allows(&second, FileAccess::Read, PathResolution::Unresolved),

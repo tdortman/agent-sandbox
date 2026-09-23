@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -36,13 +37,104 @@ const fn policy_rule_count(policy: &Policy) -> usize {
         + policy.resources.deny.len()
 }
 
+/// How long a loaded policy file is reused while the file itself is unchanged.
+/// Bounds how long a retargeted symlink inside a rule path goes unnoticed; an
+/// edit or atomic replacement of the file invalidates the entry at once.
+const POLICY_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Distinct `load_policy` arguments cached before the cache is cleared.
+const POLICY_CACHE_CAP: usize = 256;
+
+/// Arguments of one `load_policy` call.
+#[derive(PartialEq, Eq, Hash)]
+struct PolicyCacheKey {
+    path: PathBuf,
+    home: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+}
+
+/// Identity and version of the file a policy path resolves to.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct PolicyFileVersion {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: i64,
+    modified_nanos: i64,
+    changed: i64,
+    changed_nanos: i64,
+}
+
+impl PolicyFileVersion {
+    /// `None` when nothing exists at `path`, which is a version too.
+    fn of(path: &Path) -> std::io::Result<Option<Self>> {
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(Some(Self {
+                device: meta.dev(),
+                inode: meta.ino(),
+                size: meta.size(),
+                modified: meta.mtime(),
+                modified_nanos: meta.mtime_nsec(),
+                changed: meta.ctime(),
+                changed_nanos: meta.ctime_nsec(),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+struct CachedPolicy {
+    version: Option<PolicyFileVersion>,
+    loaded: Instant,
+    policy: Policy,
+}
+
+static POLICY_CACHE: LazyLock<Mutex<HashMap<PolicyCacheKey, CachedPolicy>>> =
+    LazyLock::new(Mutex::default);
+
 #[must_use]
 /// Load the merged policy for a path, applying all layered policy files.
 ///
 /// Reads the default system policy and any per-user/per-project policy under
 /// `home`/`project_root`, merges them with deny-wins semantics, and expands
 /// `~` paths against `home`. Returns the default empty policy on error.
+///
+/// Parsing and path expansion are reused for [`POLICY_CACHE_TTL`] while the
+/// file the path resolves to keeps its identity, size, and timestamps.
 pub fn load_policy(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
+    let Ok(version) = PolicyFileVersion::of(path) else {
+        return load_policy_uncached(path, home, project_root);
+    };
+    let key = PolicyCacheKey {
+        path: path.to_path_buf(),
+        home: home.map(Path::to_path_buf),
+        project_root: project_root.map(Path::to_path_buf),
+    };
+
+    if let Ok(cache) = POLICY_CACHE.lock()
+        && let Some(cached) = cache.get(&key)
+        && cached.version == version
+        && cached.loaded.elapsed() < POLICY_CACHE_TTL
+    {
+        return cached.policy.clone();
+    }
+
+    let policy = load_policy_uncached(path, home, project_root);
+    if let Ok(mut cache) = POLICY_CACHE.lock() {
+        if cache.len() >= POLICY_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, CachedPolicy {
+            version,
+            loaded: Instant::now(),
+            policy: policy.clone(),
+        });
+    }
+    policy
+}
+
+fn load_policy_uncached(path: &Path, home: Option<&Path>, project_root: Option<&Path>) -> Policy {
     let Ok(Some(mut policy)) = load_policy_inner(path, project_root) else {
         return Policy::default();
     };
