@@ -134,7 +134,10 @@ impl CertificateIssuer {
             return Ok(certificate);
         }
 
-        let params = CertificateParams::new(vec![server_name])?;
+        let mut params = CertificateParams::new(vec![server_name])?;
+        // RFC 5280 requires the Authority Key Identifier in CA-issued certificates.
+        // Strict verifiers, such as Python 3.13+ by default, reject leaves without it.
+        params.use_authority_key_identifier_extension = true;
         let key_pair = KeyPair::generate_for(match algorithm {
             LeafKeyAlgorithm::EcdsaP256 => &rcgen::PKCS_ECDSA_P256_SHA256,
             LeafKeyAlgorithm::EcdsaP384 => &rcgen::PKCS_ECDSA_P384_SHA384,
@@ -168,7 +171,30 @@ fn normalize_server_name(server_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_server_name;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    use super::{CertificateIssuer, normalize_server_name};
+
+    #[test]
+    fn issued_leaves_carry_authority_key_identifier() {
+        // DER encoding of the id-ce-authorityKeyIdentifier OID, 2.5.29.35.
+        const AUTHORITY_KEY_IDENTIFIER: [u8; 5] = [0x06, 0x03, 0x55, 0x1D, 0x23];
+
+        let ca_key = KeyPair::generate().expect("CA key");
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("CA params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+        let issuer =
+            CertificateIssuer::from_pem(&ca.pem(), &ca_key.serialize_pem()).expect("issuer");
+
+        let leaf = issuer.issue("example.com").expect("leaf");
+        let der = leaf.certificate_chain[0].as_ref();
+        assert!(
+            der.windows(AUTHORITY_KEY_IDENTIFIER.len())
+                .any(|window| window == AUTHORITY_KEY_IDENTIFIER),
+            "strict verifiers reject leaves without an Authority Key Identifier"
+        );
+    }
 
     #[test]
     fn normalizes_sni_names_for_cache_keys() {
