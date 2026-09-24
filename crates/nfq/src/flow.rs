@@ -25,7 +25,10 @@ use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
 
 use crate::{
-    args::Cli, attribution, owner, packet, policy, policy::TransportCheck, verdict_cache,
+    args::Cli,
+    attribution, owner, packet, policy,
+    policy::TransportCheck,
+    verdict_cache,
     verdict_cache::{VerdictCache, open_verdict_cache},
 };
 
@@ -629,9 +632,11 @@ pub fn handle_packet_payload_with_registration(
     let src_pid = source_owner.map(OwnerSnapshot::pid_value);
 
     let mut proxy_flow = matches!(
-        state
-            .ownership
-            .flow_owner(meta.protocol, meta.dst_ip, meta.dst_port),
+        state.ownership.flow_owner(
+            meta.protocol,
+            policy::policy_destination(meta.dst_ip),
+            meta.dst_port
+        ),
         FlowOwner::ProxyBackend
     );
 
@@ -884,6 +889,30 @@ pub mod tests {
             1,
             "loopback must go through policy check, not bypass"
         );
+    }
+
+    #[test]
+    fn proxy_mode_host_localhost_handoff_is_checked_as_localhost() {
+        let mut state = state_for_tests();
+        state.ownership.proxy_mode = true;
+        let mut pkt = build_loopback_tcp_syn_packet();
+        pkt[16..20].copy_from_slice(&[127, 0, 0, 2]);
+        let checked = std::cell::RefCell::new(Vec::new());
+
+        let mut check = |args: policy::CheckDestinationArgs<'_>| {
+            checked.borrow_mut().push(args.dst_ip.to_owned());
+            policy_allow()
+        };
+
+        let mut register = |_flow: FlowRegistration, _owner_fd_hint: Option<u32>| {
+            panic!("host localhost flows must not register for the proxy")
+        };
+
+        let (verdict, _) =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, Some(&mut register));
+
+        assert_eq!(verdict, Verdict::Accept);
+        assert_eq!(checked.into_inner(), ["127.0.0.1"]);
     }
 
     #[test]

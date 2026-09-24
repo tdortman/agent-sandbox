@@ -1,7 +1,10 @@
 //! Persistent policy RPCs, sequential within each NFQUEUE worker. Failed
 //! requests are never replayed.
 
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use agent_sandbox_core::{
     FlowRegistration, PersistentRpcClient, RequestContext, RpcReply, RpcRequest, VerdictSource,
@@ -159,6 +162,21 @@ pub fn is_bypass_traffic(dst_ip: IpAddr, dst_port: u16, dns_server_ip: IpAddr) -
     dst_ip == dns_server_ip && dst_port == 53
 }
 
+/// The destination policy judges. The loopback bridge readdresses host-bound
+/// localhost flows to the handoff addresses `127.0.0.2` and `::2` (see
+/// `loopback/redirect.bpf.c`); policy sees the localhost the client dialled.
+#[must_use]
+pub const fn policy_destination(dst_ip: IpAddr) -> IpAddr {
+    const HANDOFF_V4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+    const HANDOFF_V6: Ipv6Addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2);
+
+    match dst_ip {
+        IpAddr::V4(HANDOFF_V4) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(HANDOFF_V6) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    }
+}
+
 /// Add the destination IP and port to the transient nftables reject set, then
 /// return `Verdict::Repeat` so nftables re-evaluates and rejects the packet.
 ///
@@ -232,7 +250,7 @@ pub fn transport_check(
     session_id: Option<&str>,
     check: &mut dyn FnMut(CheckDestinationArgs<'_>) -> DestinationVerdict,
 ) -> TransportCheck {
-    let dst_ip = meta.dst_ip.to_string();
+    let dst_ip = policy_destination(meta.dst_ip).to_string();
 
     if let Some(cached) = state.cached_transport_verdict(meta) {
         if cached == VERDICT_DENY {
