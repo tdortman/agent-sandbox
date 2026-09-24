@@ -114,9 +114,11 @@ downstream HTTP version. Explicit HTTP/1.0 and WebSocket requirements still appl
 Downstream leaf certificates prefer ECDSA P-256, then P-384, then RSA according
 to the client's advertised support.
 
-## Share localhost ports
+## Share localhost
 
-Select the localhost ports that should be visible from both network namespaces:
+Sandboxed processes reach every TCP and UDP port on host `127.0.0.1` without configuration. Network policy checks each port as `127.0.0.1:<port>`, so an unapproved port prompts like any other destination. A listener in the sandbox's own namespace wins over the host.
+
+Two cases still need a port list. The host can reach sandbox listeners only on listed ports, and IPv6 `::1` is shared only on listed ports:
 
 ```nix
 agent-sandbox.network.loopback = {
@@ -125,7 +127,9 @@ agent-sandbox.network.loopback = {
 };
 ```
 
-Applications and clients keep using `127.0.0.1` or `::1` on either side. A listener in the client's own namespace wins; otherwise the connection or datagram reaches the listener in the other namespace. No process binds the configured ports, so a host and sandbox service can both use the same port.
+Listed ports skip the policy prompt. A listener in the client's own namespace wins; otherwise the connection or datagram reaches the listener in the other namespace. No process binds the configured ports, so a host and sandbox service can both use the same port.
+
+Host services see sandbox connections as coming from `127.0.0.1`. The sandbox's direct connections to the veth gateway (`169.254.100.1`) land on host localhost too, except DNS on port 53.
 
 To let the proxy select HTTP/1.0 for an upstream origin, add its validated canonical origin:
 

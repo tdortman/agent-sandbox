@@ -101,6 +101,13 @@ pkgs.testers.runNixOSTest (_: {
         "journalctl --no-pager -b -u agent-sandbox-nfq.service | grep -q 'verdict cache enabled'"
     )
     check_loopback_bridge(proxy, "sandbox-proxy-bash", wrapper=session_wrapper)
+    # Unlisted host localhost ports: policy decides per port.
+    proxy.wait_for_open_port(18094)
+    proxy.wait_for_open_port(18095)
+    proxy.wait_for_unit("agent-sandbox-vm-localhost-udp-18096.service")
+    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 5 socat - TCP4:127.0.0.1:18094 </dev/null | grep -q host-18094", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "timeout 5 socat - TCP4:127.0.0.1:18095 </dev/null | grep -q host-18095", wrapper=session_wrapper, expect_success=False)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "printf host-udp-18096 | timeout 5 socat - UDP4:127.0.0.1:18096 | grep -q host-udp-18096", wrapper=session_wrapper)
     print(proxy.succeed("ip netns exec agent-sandbox sh -c 'ip rule show; ip route show table 51820' || true"))
     print(proxy.succeed("systemctl show --property=MainPID,ActiveState,SubState,ExecMainCode,ExecMainStatus agent-sandbox-proxy.service; systemctl --no-pager --full status agent-sandbox-proxy.service || true"))
     print(proxy.succeed("ip netns exec agent-sandbox sh -c 'cat /proc/net/tcp; cat /proc/net/tcp6'"))

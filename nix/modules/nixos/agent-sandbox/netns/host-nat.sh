@@ -3,8 +3,6 @@
 set -euo pipefail
 
 HOST_IF="@vethHost@"
-DNS_TARGET_HOST="@dnsTargetHost@"
-ENABLE_LOOPBACK="@enableLoopback@"
 LOOPBACK_HANDOFF_IP6="@loopbackHandoffIp6@"
 
 # Same sysctl as interface-run/veth-setup.sh. Without rp_filter=0, replies to 169.254.100.1
@@ -16,15 +14,9 @@ sysctl -w "net.ipv4.conf.${HOST_IF}.rp_filter=0"
 sysctl -w net.ipv6.conf.all.forwarding=1
 sysctl -w "net.ipv6.conf.${HOST_IF}.forwarding=1"
 
-if [[ "$DNS_TARGET_HOST" == 127.* || "$ENABLE_LOOPBACK" == 1 ]]; then
-  sysctl -w net.ipv4.conf.all.route_localnet=1
-  sysctl -w "net.ipv4.conf.${HOST_IF}.route_localnet=1"
-  echo "agent-sandbox-host-nat: route_localnet enabled for ${HOST_IF}" >&2
-fi
-
-if [[ "$ENABLE_LOOPBACK" == 1 ]]; then
-  ip -6 route replace local "${LOOPBACK_HANDOFF_IP6}/128" dev lo
-fi
+sysctl -w net.ipv4.conf.all.route_localnet=1
+sysctl -w "net.ipv4.conf.${HOST_IF}.route_localnet=1"
+ip -6 route replace local "${LOOPBACK_HANDOFF_IP6}/128" dev lo
 
 # Recreate host tables so INPUT uses priority filter - 200 (before NixOS firewall drops).
 create_family_table() {
@@ -32,6 +24,7 @@ create_family_table() {
   local prerouting_rules="${2:-}"
   local output_rules="${3:-}"
   local postrouting_rules="${4:-}"
+  local input_nat_rules="${5:-}"
   nft delete table "$family" agent_sandbox_host 2>/dev/null || true
 
   nft -f - <<EOF
@@ -48,6 +41,10 @@ table $family agent_sandbox_host {
     type nat hook postrouting priority srcnat; policy accept;
     $postrouting_rules
   }
+  chain input_nat {
+    type nat hook input priority srcnat; policy accept;
+    $input_nat_rules
+  }
   chain input {
     type filter hook input priority filter - 200; policy accept;
     iifname "${HOST_IF}" tcp dport 53 accept
@@ -60,7 +57,8 @@ EOF
 create_family_table ip \
   @hostLoopbackPreroutingRule@ \
   @hostLoopbackOutputRule@ \
-  @hostLoopbackPostroutingRule@
+  @hostLoopbackPostroutingRule@ \
+  @hostLoopbackInputRule@
 create_family_table ip6 \
   @hostLoopbackPreroutingRule6@ \
   @hostLoopbackOutputRule6@ \

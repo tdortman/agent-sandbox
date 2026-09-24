@@ -18,11 +18,6 @@ let
     else
       lib.concatMapStringsSep " || " (port: "port == ${toString port}") ports;
   cfg = config.agent-sandbox.network;
-  dnsTargetHost =
-    let
-      parts = lib.splitString ":" runtime.dnsForwardTarget;
-    in
-    if builtins.length parts > 1 then builtins.elemAt parts 0 else runtime.dnsForwardTarget;
   flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
   hostNatPkg = mkNetnsLauncher {
     name = "agent-sandbox-host-nat";
@@ -36,8 +31,10 @@ let
     script = hostNatScript;
   };
   hostNatScript = pkgs.replaceVars ./netns/host-nat.sh {
-    inherit dnsTargetHost loopbackHandoffIp6;
-    enableLoopback = if loopbackEnabled then "1" else "0";
+    inherit loopbackHandoffIp6;
+    # Host services then see a loopback peer and reply over loopback, so a
+    # wildcard-bound UDP server's reply source matches the conntrack entry.
+    hostLoopbackInputRule = lib.escapeShellArg ''iifname "${runtime.network.vethHost}" ip saddr ${runtime.network.netnsIp} ip daddr 127.0.0.1 ct status dnat snat to 127.0.0.1'';
 
     hostLoopbackOutputRule = lib.escapeShellArg (
       loopbackProtocolRules (
@@ -67,13 +64,9 @@ let
       )
     );
 
-    hostLoopbackPreroutingRule = lib.escapeShellArg (
-      loopbackProtocolRules (
-        protocol: ports:
-        ''iifname "${runtime.network.vethHost}" ip saddr ${runtime.network.netnsIp} ip daddr ${runtime.hostIp} ${protocol} dport { ${portSet ports} } dnat to 127.0.0.1''
-      )
-    );
-
+    # Every sandbox handoff port except the veth DNS forwarder lands on host
+    # localhost; network policy gates each destination inside the sandbox.
+    hostLoopbackPreroutingRule = lib.escapeShellArg ''iifname "${runtime.network.vethHost}" ip saddr ${runtime.network.netnsIp} ip daddr ${runtime.hostIp} meta l4proto { tcp, udp } th dport != 53 dnat to 127.0.0.1'';
     hostLoopbackPreroutingRule6 = lib.escapeShellArg "";
     vethHost = runtime.network.vethHost;
   };
@@ -119,7 +112,6 @@ let
     helperBin = "${loopbackHelperPkg}/bin/agent-sandbox-netns-helper";
     netnsName = runtime.network.netnsName;
   };
-  loopbackEnabled = loopbackPorts != [ ];
   loopbackHandoffIp6 = "::2";
   loopbackHelperPkg = pkgs.stdenv.mkDerivation {
     pname = "agent-sandbox-netns-helper";
@@ -144,9 +136,7 @@ let
     port:
     map (host: { inherit host port; }) [
       "127.0.0.1"
-      runtime.hostIp
       "::1"
-      runtime.hostIp6
       runtime.network.netnsIp6
     ]
   ) loopbackPorts;
@@ -178,10 +168,7 @@ let
     script = netnsDownScript;
   };
   netnsDownScript = pkgs.replaceVars ./netns/down.sh {
-    loopbackRoutingCleanup = lib.optionalString loopbackEnabled ''
-      ip -6 route del local ${loopbackHandoffIp6}/128 dev lo 2>/dev/null || true
-    '';
-
+    inherit loopbackHandoffIp6;
     netnsName = runtime.network.netnsName;
     vethHost = runtime.network.vethHost;
   };
@@ -201,17 +188,10 @@ let
   };
   netnsUpScript = pkgs.replaceVars ./netns/up.sh {
     inherit (runtime) hostIp hostIp6;
-    inherit nftRules;
+    inherit loopbackHandoffIp6 nftRules;
     hostIp6Cidr = "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}";
     hostIpCidr = "${runtime.hostIp}/30";
     hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
-
-    loopbackRoutingSetup = lib.optionalString loopbackEnabled ''
-      ip netns exec "$NETNS" sysctl -w net.ipv4.conf.all.route_localnet=1
-      ip netns exec "$NETNS" sysctl -w "net.ipv4.conf.$NS_IF.route_localnet=1"
-      ip netns exec "$NETNS" ip -6 route replace local ${loopbackHandoffIp6}/128 dev lo
-    '';
-
     netnsIp = runtime.network.netnsIp;
     netnsIp6Cidr = "${runtime.network.netnsIp6}/${toString runtime.network.netnsIp6Prefix}";
     netnsName = runtime.network.netnsName;
@@ -334,9 +314,29 @@ let
         size 1;
       }
 
+      # Host localhost flows leave through the loopback handoff address. Judge
+      # them here, before the handoff DNAT rewrites them to the veth gateway:
+      # nft nat chains all run at the kernel's fixed NAT hook priority (-100),
+      # whatever their own priority.
+      chain handoff {
+        type filter hook output priority -110; policy accept;
+        ct state established,related accept
+        ip daddr 127.0.0.2 ip daddr . tcp dport @reject_v4 reject with tcp reset
+        ip daddr 127.0.0.2 ip daddr . udp dport @reject_v4 reject
+        ip6 daddr ${loopbackHandoffIp6} ip6 daddr . tcp dport @reject_v6 reject with tcp reset
+        ip6 daddr ${loopbackHandoffIp6} ip6 daddr . udp dport @reject_v6 reject with icmpv6 type port-unreachable
+        ip daddr 127.0.0.2 tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
+        ip daddr 127.0.0.2 meta l4proto udp queue num ${toString runtime.queueNumber}
+        ip6 daddr ${loopbackHandoffIp6} tcp flags & (syn | ack) == syn queue num ${toString runtime.queueNumber}
+        ip6 daddr ${loopbackHandoffIp6} meta l4proto udp queue num ${toString runtime.queueNumber}
+      }
+
       chain output {
         type filter hook output priority 0; policy drop;
         ct state established,related accept
+        # Handoff flows were judged by the handoff chain before their DNAT.
+        ct status dnat ip daddr ${runtime.hostIp} accept
+        ct status dnat ip6 daddr ${runtime.hostIp6} accept
         # DNS traffic to the forwarder bypasses NFQUEUE
         ip daddr ${runtime.hostIp} udp dport 53 accept
         ip daddr ${runtime.hostIp} tcp dport 53 accept
@@ -379,47 +379,41 @@ let
         ''}
       }
     }
-    ${lib.optionalString loopbackEnabled ''
-      table ip agent_sandbox_loopback {
-        chain output {
-          type nat hook output priority -190; policy accept;
-          ${loopbackProtocolRules (
-            protocol: ports:
-            "ip daddr 127.0.0.2 ${protocol} dport { ${portSet ports} } dnat to ${runtime.hostIp}"
-          )}
-        }
-        chain postrouting {
-          type nat hook postrouting priority srcnat; policy accept;
-          ${loopbackProtocolRules (
-            protocol: ports:
-            "ip saddr 127.0.0.0/8 ip daddr ${runtime.hostIp} ${protocol} dport { ${portSet ports} } snat to ${runtime.network.netnsIp}"
-          )}
-        }
-        chain prerouting {
-          type nat hook prerouting priority dstnat; policy accept;
-          ${loopbackProtocolRules (
-            protocol: ports:
-            ''iifname "${runtime.network.vethNetns}" ip saddr ${runtime.hostIp} ip daddr ${runtime.network.netnsIp} ${protocol} dport { ${portSet ports} } dnat to 127.0.0.1''
-          )}
-        }
+    # Handoff DNAT only: the packet filter judges these flows in the
+    # agent_sandbox handoff chain first.
+    table ip agent_sandbox_loopback {
+      chain output {
+        type nat hook output priority dstnat; policy accept;
+        ip daddr 127.0.0.2 meta l4proto { tcp, udp } dnat to ${runtime.hostIp}
       }
-      table ip6 agent_sandbox_loopback {
-        chain output {
-          type nat hook output priority -190; policy accept;
-          ${loopbackProtocolRules (
-            protocol: ports:
-            "ip6 daddr ${loopbackHandoffIp6} ${protocol} dport { ${portSet ports} } dnat to ${runtime.hostIp6}"
-          )}
-        }
-        chain postrouting {
-          type nat hook postrouting priority srcnat; policy accept;
-          ${loopbackProtocolRules (
-            protocol: ports:
-            "ip6 daddr ${runtime.hostIp6} ${protocol} dport { ${portSet ports} } snat to ${runtime.network.netnsIp6}"
-          )}
-        }
+      chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 127.0.0.0/8 ip daddr ${runtime.hostIp} meta l4proto { tcp, udp } snat to ${runtime.network.netnsIp}
       }
-    ''}
+      chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ${loopbackProtocolRules (
+          protocol: ports:
+          ''iifname "${runtime.network.vethNetns}" ip saddr ${runtime.hostIp} ip daddr ${runtime.network.netnsIp} ${protocol} dport { ${portSet ports} } dnat to 127.0.0.1''
+        )}
+      }
+    }
+    table ip6 agent_sandbox_loopback {
+      chain output {
+        type nat hook output priority dstnat; policy accept;
+        ${loopbackProtocolRules (
+          protocol: ports:
+          "ip6 daddr ${loopbackHandoffIp6} ${protocol} dport { ${portSet ports} } dnat to ${runtime.hostIp6}"
+        )}
+      }
+      chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ${loopbackProtocolRules (
+          protocol: ports:
+          "ip6 daddr ${runtime.hostIp6} ${protocol} dport { ${portSet ports} } snat to ${runtime.network.netnsIp6}"
+        )}
+      }
+    }
   '';
   # Inside the jail we cannot use nss-resolve (no /run/systemd/resolve). Plain DNS only.
   nsswitchConfText = ''
@@ -840,9 +834,20 @@ in
 
         # Runtime nft INPUT accepts are not enough when the host firewall has its own
         # later input chains. Open bridge ports declaratively on the veth interface.
-        networking.firewall.interfaces.${runtime.network.vethHost} = {
-          allowedTCPPorts = lib.mkAfter ([ 53 ] ++ loopbackTcpPorts);
-          allowedUDPPorts = lib.mkAfter ([ 53 ] ++ loopbackUdpPorts);
+        networking.firewall = {
+          extraCommands = lib.mkIf (!config.networking.nftables.enable) ''
+            iptables -A nixos-fw -i ${runtime.network.vethHost} -d 127.0.0.1 -m conntrack --ctstate DNAT -j nixos-fw-accept
+          '';
+
+          # Sandbox flows DNATed to host localhost may use any port.
+          extraInputRules = lib.mkIf config.networking.nftables.enable ''
+            iifname "${runtime.network.vethHost}" ip daddr 127.0.0.1 ct status dnat accept
+          '';
+
+          interfaces.${runtime.network.vethHost} = {
+            allowedTCPPorts = lib.mkAfter ([ 53 ] ++ loopbackTcpPorts);
+            allowedUDPPorts = lib.mkAfter ([ 53 ] ++ loopbackUdpPorts);
+          };
         };
 
         security.wrappers.agent-sandbox-enter = {
@@ -1262,9 +1267,9 @@ in
         };
       })
 
-      (lib.mkIf (cfg.enable && loopbackEnabled) {
+      (lib.mkIf cfg.enable {
         systemd.services.agent-sandbox-loopback = {
-          description = "Share selected localhost ports with the agent-sandbox network namespace";
+          description = "Share localhost with the agent-sandbox network namespace";
           before = [ "multi-user.target" ];
           after = [ "agent-sandbox-netns.service" ];
           requires = [ "agent-sandbox-netns.service" ];

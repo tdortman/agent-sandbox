@@ -38,7 +38,9 @@ ip netns exec "$NETNS" ip link set "$NS_IF" up
 ip netns exec "$NETNS" ip route replace default via "$HOST_IP"
 ip netns exec "$NETNS" ip -6 route replace default via "$HOST_IP6"
 
-@loopbackRoutingSetup@
+ip netns exec "$NETNS" sysctl -w net.ipv4.conf.all.route_localnet=1
+ip netns exec "$NETNS" sysctl -w "net.ipv4.conf.$NS_IF.route_localnet=1"
+ip netns exec "$NETNS" ip -6 route replace local @loopbackHandoffIp6@/128 dev lo
 
 ip netns exec "$NETNS" nft -f - <<EOF
 @nftRules@

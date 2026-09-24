@@ -806,9 +806,11 @@ in
           default = [ ];
 
           description = ''
-            TCP localhost ports shared between the host and sandbox over IPv4
-            and IPv6. Connections use a listener in the caller's network
-            namespace when one exists, then fall through to the other namespace.
+            TCP localhost ports the host may reach in the sandbox, and IPv6
+            [::1] ports shared in both directions. Listed ports skip the
+            network policy prompt. Connections use a listener in the
+            caller's network namespace when one exists, then fall through to
+            the other namespace.
           '';
         };
 
@@ -817,9 +819,11 @@ in
           default = [ ];
 
           description = ''
-            UDP localhost ports shared between the host and sandbox over IPv4
-            and IPv6. Datagrams use a listener in the caller's network namespace
-            when one exists, then fall through to the other namespace.
+            UDP localhost ports the host may reach in the sandbox, and IPv6
+            [::1] ports shared in both directions. Listed ports skip the
+            network policy prompt. Datagrams use a listener in the caller's
+            network namespace when one exists, then fall through to the other
+            namespace.
           '';
         };
       };

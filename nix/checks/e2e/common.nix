@@ -575,12 +575,24 @@ rec {
                 host = "169.254.100.1";
                 port = 18082;
               }
+              {
+                host = "127.0.0.1";
+                port = 18094;
+              }
+              {
+                host = "127.0.0.1";
+                port = 18096;
+              }
             ];
 
             declarativeDeny = [
               {
                 host = "169.254.100.1";
                 port = 18083;
+              }
+              {
+                host = "127.0.0.1";
+                port = 18095;
               }
             ];
 
@@ -741,6 +753,38 @@ rec {
             preStart = ''
               echo -n 169.254.100.1:4444 > /var/lib/h3-origin/alt-svc
             '';
+          };
+
+          # Host localhost ports outside `loopback.tcpPorts`/`udpPorts`,
+          # reachable only through network policy.
+          agent-sandbox-vm-localhost-18094 = {
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18094,bind=127.0.0.1,fork,reuseaddr SYSTEM:'echo host-18094'";
+              Restart = "on-failure";
+              User = "sandbox";
+            };
+          };
+
+          agent-sandbox-vm-localhost-18095 = {
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18095,bind=127.0.0.1,fork,reuseaddr SYSTEM:'echo host-18095'";
+              Restart = "on-failure";
+              User = "sandbox";
+            };
+          };
+
+          agent-sandbox-vm-localhost-udp-18096 = {
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              ExecStart = "${pkgs.socat}/bin/socat UDP4-RECVFROM:18096,bind=127.0.0.1,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+              Restart = "on-failure";
+              User = "sandbox";
+            };
           };
 
           agent-sandbox-vm-udp-18082 = {

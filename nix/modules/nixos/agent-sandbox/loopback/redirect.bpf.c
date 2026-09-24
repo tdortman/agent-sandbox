@@ -34,21 +34,21 @@ struct {
     __type(value, struct managed_namespace);
 } managed_netns SEC(".maps");
 
-static __always_inline struct managed_namespace* find_namespace(__u64 cookie) {
-    __u32 key = 0;
+#define HOST_NAMESPACE 0
+#define SANDBOX_NAMESPACE 1
+
+static __always_inline struct managed_namespace* namespace_at(__u32 key, __u64 cookie) {
     struct managed_namespace* namespace = bpf_map_lookup_elem(&managed_netns, &key);
 
     if (namespace && namespace->cookie == cookie) return namespace;
-
-    key = 1;
-    namespace = bpf_map_lookup_elem(&managed_netns, &key);
-    if (namespace && namespace->cookie == cookie) return namespace;
-
     return 0;
 }
 
-static __always_inline int namespace_is_managed(struct bpf_sock_addr* ctx) {
-    return find_namespace(bpf_get_netns_cookie(ctx)) != 0;
+static __always_inline struct managed_namespace* find_namespace(__u64 cookie) {
+    struct managed_namespace* namespace = namespace_at(HOST_NAMESPACE, cookie);
+
+    if (namespace) return namespace;
+    return namespace_at(SANDBOX_NAMESPACE, cookie);
 }
 
 static __always_inline int tcp_port_is_shared(__u16 port) {
@@ -65,6 +65,16 @@ static __always_inline int socket_port_is_shared(const struct bpf_sock_addr* ctx
     if (ctx->type == SOCK_STREAM) return tcp_port_is_shared(port);
     if (ctx->type == SOCK_DGRAM) return udp_port_is_shared(port);
     return 0;
+}
+
+/* The sandbox reaches every IPv4 TCP and UDP port on host localhost; network
+ * policy gates each destination. The host reaches only the listed ports. */
+static __always_inline int ipv4_port_is_shared(struct bpf_sock_addr* ctx) {
+    __u64 cookie = bpf_get_netns_cookie(ctx);
+
+    if (namespace_at(SANDBOX_NAMESPACE, cookie))
+        return ctx->type == SOCK_STREAM || ctx->type == SOCK_DGRAM;
+    return namespace_at(HOST_NAMESPACE, cookie) && socket_port_is_shared(ctx);
 }
 
 static __always_inline int ipv6_is(const __u32 address[4], __u32 last_word) {
@@ -88,11 +98,18 @@ static __always_inline void ipv6_copy(__u32 destination[4], const __u32 source[4
 /* Outgoing IPv4 connections: use 127.0.0.2 only when localhost has no listener. */
 static __always_inline int has_local_listener4(struct bpf_sock_addr* ctx) {
     struct bpf_sock_tuple tuple = {};
+    struct bpf_sock* self = ctx->sk;
     struct bpf_sock* sk;
+    __u32 port = ctx->user_port;
+    __u32 self_ip = self->src_ip4;
     int found;
 
+    /* The caller's own address lets a UDP reply find the connected peer that
+     * sent the request; a wildcard lookup only finds unconnected listeners. */
+    tuple.ipv4.saddr = self_ip ? self_ip : LOOPBACK;
+    tuple.ipv4.sport = bpf_htons(self->src_port);
     tuple.ipv4.daddr = LOOPBACK;
-    tuple.ipv4.dport = ctx->user_port;
+    tuple.ipv4.dport = port;
 
     if (ctx->type == SOCK_STREAM) {
         sk = bpf_sk_lookup_tcp(ctx, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
@@ -103,15 +120,14 @@ static __always_inline int has_local_listener4(struct bpf_sock_addr* ctx) {
     if (!sk) return 0;
 
     found =
-        sk->src_port == bpf_ntohs(ctx->user_port) && (sk->src_ip4 == LOOPBACK || sk->src_ip4 == 0);
+        sk->src_port == bpf_ntohs(port) && (sk->src_ip4 == LOOPBACK || sk->src_ip4 == 0);
     bpf_sk_release(sk);
     return found;
 }
 
 static __always_inline int redirect_if_remote4(struct bpf_sock_addr* ctx) {
-    if (!namespace_is_managed(ctx)) return 1;
     if (ctx->user_family != AF_INET || ctx->user_ip4 != LOOPBACK) return 1;
-    if (!socket_port_is_shared(ctx) || has_local_listener4(ctx)) return 1;
+    if (!ipv4_port_is_shared(ctx) || has_local_listener4(ctx)) return 1;
 
     ctx->user_ip4 = HANDOFF;
     return 1;
@@ -128,9 +144,8 @@ int asbx_sendmsg4(struct bpf_sock_addr* ctx) {
 }
 
 static __always_inline int restore_localhost4(struct bpf_sock_addr* ctx) {
-    if (!namespace_is_managed(ctx)) return 1;
     if (ctx->user_family != AF_INET || ctx->user_ip4 != HANDOFF) return 1;
-    if (!socket_port_is_shared(ctx)) return 1;
+    if (!ipv4_port_is_shared(ctx)) return 1;
 
     ctx->user_ip4 = LOOPBACK;
     return 1;
