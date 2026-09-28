@@ -34,6 +34,7 @@ use agent_sandbox_sysutil::{
     set_raw_fd_nonblocking, symlinkat, truncate, unlinkat,
 };
 use clap::Parser;
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use tokio::time;
 use tracing::{debug, info, warn};
 
@@ -151,6 +152,10 @@ fn main() -> std::io::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // The inherited soft limit is 1024 only for `select(2)` compatibility;
+    // the broker polls through epoll and dups tracee fds per notification.
+    let (_, nofile_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
+    setrlimit(Resource::RLIMIT_NOFILE, nofile_hard, nofile_hard)?;
     init_root_handle()?;
     let network_mode = cli.network_mode;
     let dns_endpoint = cli.dns_endpoint;
