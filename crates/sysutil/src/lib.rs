@@ -328,7 +328,13 @@ thread_local! {
 /// Maximum cached pidfds before the cache is dropped wholesale. Reopening
 /// after a clear costs one `pidfd_open` per live task; clearing is rare
 /// against hundreds of thousands of cache hits in a removal storm.
-const PIDFD_CACHE_CAPACITY: usize = 512;
+///
+/// Dead tasks' pidfds stay cached until the next clear, so every broker
+/// worker thread can hold this many descriptors. The bound keeps four
+/// workers' caches under 1024 fds, so a caller left at the default soft
+/// `RLIMIT_NOFILE` still has room for the descriptors each notification
+/// dups instead of failing them with `EMFILE`.
+const PIDFD_CACHE_CAPACITY: usize = 128;
 
 /// Open a pidfd for the exact notifying task, falling back to the
 /// thread-group leader where the kernel predates thread pidfds.
