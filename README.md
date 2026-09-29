@@ -273,3 +273,8 @@ flowchart LR
 ```
 
 The workspace splits shared policy types, policyd, network enforcement, filesystem monitoring, syscall brokering, and command-line tools into crates under `crates/`.
+
+The filesystem monitor uses up to four workers, each reading one permission
+event directly from fanotify before deciding it. The kernel queue holds
+pending events without a userspace dispatch queue. Policy refresh and
+shutdown handling run separately from workers waiting for approval.

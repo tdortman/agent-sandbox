@@ -2,7 +2,7 @@
 //! mark each mountpoint, then event-loop handling permission events.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     ffi::CString,
     fs,
     fs::File,
@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -51,7 +51,6 @@ fn respond(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) {
 use clap::Parser;
 use nix::{
     fcntl::{OFlag, openat, readlinkat},
-    poll::{PollFd, PollFlags, PollTimeout, poll},
     sys::stat::{Mode, SFlag, fstat},
 };
 
@@ -809,27 +808,11 @@ impl SandboxCgroup {
     }
 }
 
-/// Permission events answered at the same time, bounded because each worker is
-/// an independent event consumer rather than a CPU thread.
-///
-/// Answering one permission event at a time serialised parallel filesystem
-/// work: every sandboxed process waited for the single event being handled,
-/// so concurrent read-only opens ran at the monitor's service rate instead of
-/// the filesystem's. Each worker instead owns a policy client and runtime and
-/// blocks on the shared queue, so independent opens are mediated
-/// concurrently. The bound avoids wakeup contention: workers beyond the event
-/// rate only add condvar wakeups.
+/// Maximum concurrent permission decisions. Each worker reads one event from
+/// the bounded kernel queue before answering it, including any approval wait.
 const WORKER_LIMIT: usize = 4;
 
-/// Jobs waiting for a worker, bounded so a burst of permission events cannot
-/// grow memory without limit: the reader blocks when the queue is full
-/// (backpressure).
-const QUEUE_LIMIT: usize = 256;
-
-/// One fanotify permission event handed from the reader to a worker.
-///
-/// Carries only parsed fields plus the event fd, never a borrow of the read
-/// buffer, so the reader reuses its buffer while workers run.
+/// One fanotify permission event owned by a worker until its decision.
 struct Job {
     mask: u64,
     pid: i32,
@@ -902,20 +885,18 @@ const IGNORE_MARK_CAP: usize = 65536;
 /// Interval between fetching the sandbox's current merged filesystem rules.
 const POLICY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How often the reader logs the decision counters.
+/// How often the control loop logs the decision counters.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long the reader waits for a fanotify event before running its periodic
-/// work. Bounds how long an idle sandbox takes to observe a shutdown request or
-/// a static-policy change.
-const READ_POLL_MILLIS: u16 = 1000;
+/// Maximum delay before the control loop observes shutdown or logs counters.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Set by the terminate handler; the reader loop flushes ignore marks, logs
+/// Set by the terminate handler; the control loop flushes ignore marks, logs
 /// the final counters, and exits on its next iteration.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Decision counters. Relaxed atomics: workers bump them on the hot path
-/// while the reader samples them for the periodic log line, with no locking.
+/// while the control loop samples them for the periodic log line.
 #[derive(Debug, Default)]
 struct FsmonStats {
     /// Permission events handled.
@@ -943,33 +924,19 @@ fn log_stats(stats: &FsmonStats, reason: &str) {
     );
 }
 
-/// Bounded hand-off from the reader to the workers: the reader blocks when
-/// full, workers block on the condvar when empty.
-type JobQueue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
-
-/// Event loop: read fanotify events and forward to policyd for allow/deny
-/// verdicts.
-///
-/// The reader only reads batches, parses the event framing, and enqueues
-/// permission events; a dedicated pool of `WORKER_LIMIT` workers (the reader
-/// does not double as a worker) answers them. A separate thread refreshes
-/// policy while the reader logs counters. A terminate request makes the
-/// reader flush the marks, log the final counters, and return.
+/// Run permission readers and policy refresh independently of the control
+/// loop, so shutdown and counters remain responsive even during approval waits.
 fn run_event_loop(shared: Shared) {
     let shared = Arc::new(shared);
-    let queue: JobQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
 
     for _ in 0..std::thread::available_parallelism()
         .map_or(1, |parallelism| parallelism.get().min(WORKER_LIMIT))
         .max(1)
     {
         let shared = Arc::clone(&shared);
-        let queue = Arc::clone(&queue);
-        std::thread::spawn(move || worker(&shared, &queue));
+        std::thread::spawn(move || worker(&shared));
     }
 
-    let mut buf = vec![0u8; 4096];
-    let mut batch = Vec::new();
     let refresh_shared = Arc::clone(&shared);
     std::thread::spawn(move || refresh_policy(&refresh_shared));
     let mut last_stats_log = Instant::now();
@@ -986,76 +953,13 @@ fn run_event_loop(shared: Shared) {
             return;
         }
 
-        // Poll rather than block in `read`: the terminate handler only sets a
-        // flag, and the kernel restarts an interrupted read, so an idle sandbox
-        // would never observe the request or reach its periodic work.
-        match poll(
-            &mut [PollFd::new(shared.fan_fd.as_fd(), PollFlags::POLLIN)],
-            PollTimeout::from(READ_POLL_MILLIS),
-        ) {
-            Ok(0) => {
-                run_periodic_work(&shared, &mut last_stats_log);
-                continue;
-            }
-            Ok(_) => {}
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => {
-                eprintln!("agent-sandbox-fsmon: poll fanotify fd: {error}");
-                continue;
-            }
-        }
-
-        let n = match nix::unistd::read(shared.fan_fd.as_fd(), &mut buf) {
-            Ok(n) => n,
-            Err(error) => {
-                eprintln!("agent-sandbox-fsmon: read from fanotify fd: {error}");
-                continue;
-            }
-        };
-
-        let mut offset = 0;
-
-        while offset + size_of::<FanotifyEventMetadata>() <= n {
-            let Some(meta) = agent_sandbox_sysutil::fanotify_event(&buf[offset..n]) else {
-                break;
-            };
-
-            if meta.metadata_len == 0 {
-                break;
-            }
-
-            if meta.event_len == 0 {
-                break;
-            }
-
-            let Ok(event_len) = usize::try_from(meta.event_len) else {
-                break;
-            };
-
-            if meta.fd >= 0 && meta.mask & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) != 0 {
-                let event_fd = take_fanotify_event_fd(meta.fd).expect("event fd");
-                batch.push(Job {
-                    mask: meta.mask,
-                    pid: meta.pid,
-                    event_fd,
-                });
-            } else if meta.fd >= 0 {
-                let _ = take_fanotify_event_fd(meta.fd);
-            }
-
-            offset += event_len;
-        }
-
-        if !batch.is_empty() {
-            enqueue(&queue, &mut batch);
-        }
-
+        std::thread::sleep(CONTROL_POLL_INTERVAL);
         run_periodic_work(&shared, &mut last_stats_log);
     }
 }
 
-/// Snapshot I/O must not run on the fanotify reader: the monitor's own opens
-/// need that reader to keep draining events.
+/// Snapshot I/O runs independently of the permission workers because the
+/// monitor's own opens can generate permission events.
 fn refresh_policy(shared: &Shared) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1115,65 +1019,51 @@ fn run_periodic_work(shared: &Shared, last_stats_log: &mut Instant) {
     }
 }
 
-/// Serve queued permission events until killed, with worker-local RPC state.
+/// Read and answer permission events until killed, with worker-local RPC state.
 ///
 /// Each worker owns its policy client, tokio runtime, and pid cgroup cache;
-/// only the [`Shared`] state and the queue are shared.
-fn worker(shared: &Shared, queue: &JobQueue) -> ! {
+/// fanotify distributes events through its shared kernel queue.
+fn worker(shared: &Shared) -> ! {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     let mut rpc = MonitorClient::new(shared.socket_path.clone());
     let mut pid_cgroup_cache = HashSet::new();
+    // FAN_REPORT_TID adds no information records. Reading one metadata record
+    // leaves later events available to workers whose policy calls are ready.
+    let mut buf = [0u8; size_of::<FanotifyEventMetadata>()];
 
     loop {
-        let job = dequeue(queue);
+        let length = match nix::unistd::read(&shared.fan_fd, &mut buf) {
+            Ok(length) => length,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => {
+                eprintln!("agent-sandbox-fsmon: read from fanotify fd: {error}");
+                continue;
+            }
+        };
+        let Some(meta) = agent_sandbox_sysutil::fanotify_event(&buf[..length]) else {
+            continue;
+        };
+        let Some(event_fd) = take_fanotify_event_fd(meta.fd) else {
+            continue;
+        };
+        if meta.mask & (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM) == 0 {
+            continue;
+        }
+        let job = Job {
+            mask: meta.mask,
+            pid: meta.pid,
+            event_fd,
+        };
         handle_permission_event(shared, job, &mut rpc, &runtime, &mut pid_cgroup_cache);
     }
 }
 
-/// Enqueue a read batch with one lock acquisition, blocking while the queue is
-/// full (backpressure: no unbounded growth, no busy spin).
-///
-/// One lock and one wakeup per batch instead of per event: the reader is the
-/// only producer, and a per-event hand-off made it the next serialisation
-/// point after the workers took over the verdict work.
-fn enqueue(queue: &JobQueue, batch: &mut Vec<Job>) {
-    let incoming = std::mem::take(batch);
-    let mut jobs = queue.0.lock().unwrap_or_else(|poison| poison.into_inner());
-    while jobs.len() + incoming.len() > QUEUE_LIMIT {
-        jobs = queue
-            .1
-            .wait(jobs)
-            .unwrap_or_else(|poison| poison.into_inner());
-    }
-    jobs.extend(incoming);
-    drop(jobs);
-    queue.1.notify_all();
-}
-/// Dequeue a job, blocking on the condvar while the queue is empty. The
-/// `while` loop guards against spurious wakeups; every push is followed by a
-/// notify under the same lock, so no wakeup is lost.
-fn dequeue(queue: &JobQueue) -> Job {
-    let mut jobs = queue.0.lock().unwrap_or_else(|poison| poison.into_inner());
-    while jobs.is_empty() {
-        jobs = queue
-            .1
-            .wait(jobs)
-            .unwrap_or_else(|poison| poison.into_inner());
-    }
-    let job = jobs.pop_front().expect("queued job");
-    drop(jobs);
-    // Wake a reader blocked on a full queue; a no-op when nobody waits.
-    queue.1.notify_one();
-    job
-}
-
-/// Answer one queued permission event, counting the decision and installing an
-/// ignore mark for statically allowed opens. Every path responds exactly once;
-/// unresolvable paths fail closed (`FAN_DENY`) with the same log messages as
-/// before.
+/// Answer a permission event, counting the decision and installing an ignore
+/// mark for statically allowed opens. Every path responds exactly once;
+/// unresolvable paths fail closed (`FAN_DENY`).
 fn handle_permission_event(
     shared: &Shared,
     job: Job,
@@ -1442,7 +1332,7 @@ fn main() {
 
     let _ = io::stdout().flush();
 
-    // Ask the reader loop to flush ignore marks and exit on SIGTERM/SIGINT.
+    // Ask the control loop to flush ignore marks and exit on SIGTERM/SIGINT.
     // Closing the fanotify fd would drop the marks anyway; the explicit flush
     // keeps the unmark path exercised and the counters exact.
     if let Err(error) = agent_sandbox_sysutil::install_shutdown_signals(request_shutdown) {
@@ -1467,7 +1357,7 @@ fn main() {
     });
 }
 
-/// Note a terminate request for the reader loop. Runs in signal context:
+/// Note a terminate request for the control loop. Runs in signal context:
 /// only a lock-free atomic store.
 extern "C" fn request_shutdown(_signum: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
