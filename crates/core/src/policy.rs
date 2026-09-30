@@ -655,7 +655,13 @@ pub fn with_canonical_memo<T>(f: impl FnOnce() -> T) -> T {
 fn canonicalize_live(path: &Path) -> Option<PathBuf> {
     CANONICAL_MEMO.with(|memo| match memo.borrow_mut().as_mut() {
         Some(memo) => memoized_canonicalize(memo, path),
-        None => std::fs::canonicalize(path).ok(),
+        None => match agent_sandbox_sysutil::is_canonical_path(path) {
+            Ok(true) => Some(path.to_path_buf()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+                None
+            }
+            Ok(false) | Err(_) => std::fs::canonicalize(path).ok(),
+        },
     })
 }
 

@@ -25,6 +25,37 @@ use nix::{
     unistd::Pid,
 };
 
+/// Whether a live kernel lookup proves an absolute path is already canonical.
+///
+/// Relative paths and names with empty, `.` or `..` components return false.
+/// `RESOLVE_NO_SYMLINKS` rejects both symlinks and procfs magic links. The
+/// proof applies to this lookup only; it must not be cached across operations.
+///
+/// # Errors
+/// Returns the lookup error, including `ELOOP` for symlinks and `ENOSYS` or
+/// `EINVAL` when the kernel cannot perform the proof.
+pub fn is_canonical_path(path: &Path) -> io::Result<bool> {
+    let raw = path.as_os_str().as_encoded_bytes();
+    if !raw.starts_with(b"/")
+        || raw
+            .split(|byte| *byte == b'/')
+            .skip(1)
+            .any(|component| component.is_empty() || component == b"." || component == b"..")
+    {
+        return Ok(false);
+    }
+
+    nix::fcntl::openat2(
+        nix::fcntl::AT_FDCWD,
+        path,
+        nix::fcntl::OpenHow::new()
+            .flags(nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC)
+            .resolve(nix::fcntl::ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )
+    .map(|_| true)
+    .map_err(io::Error::from)
+}
+
 /// Run a BPF syscall program with no input context and return its verdict.
 ///
 /// # Errors

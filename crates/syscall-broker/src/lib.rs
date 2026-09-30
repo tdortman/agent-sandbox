@@ -1037,11 +1037,6 @@ impl AsFd for MutationDir {
 
 static ROOT: OnceLock<OwnedFd> = OnceLock::new();
 
-fn root_handle() -> &'static OwnedFd {
-    ROOT.get()
-        .expect("init_root_handle must be called before filesystem mediation")
-}
-
 /// Open the process-wide root descriptor used for absolute captured names.
 ///
 /// Must be called once at startup before the notification loop;
@@ -1487,32 +1482,6 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalize_path_handle(path, open_path_handle(path))
 }
 
-/// True only for absolute names with no empty, `.`, or `..` components.
-/// Without this check a name like `/allowed/../denied/x` would be trusted as
-/// canonical and match the wrong rule.
-fn is_lexically_normal(raw: &[u8]) -> bool {
-    if !raw.starts_with(b"/") {
-        return false;
-    }
-    for component in raw.split(|byte| *byte == b'/').skip(1) {
-        if component.is_empty() || component == b"." || component == b".." {
-            return false;
-        }
-    }
-    true
-}
-
-fn openat2_no_symlinks(path: &Path) -> io::Result<OwnedFd> {
-    nix::fcntl::openat2(
-        root_handle(),
-        path,
-        nix::fcntl::OpenHow::new()
-            .flags(nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC)
-            .resolve(nix::fcntl::ResolveFlag::RESOLVE_NO_SYMLINKS),
-    )
-    .map_err(io::Error::from)
-}
-
 /// Canonicalize a captured path against its pinned directory.
 ///
 /// Fast path: an absolute, lexically normal captured name proved symlink-free
@@ -1527,19 +1496,15 @@ fn openat2_no_symlinks(path: &Path) -> io::Result<OwnedFd> {
 /// via `capture_fallback_path` for absolute names.
 fn normalize_captured_path(dir: &MutationDir, raw: &[u8]) -> io::Result<PathBuf> {
     let candidate = path_from_raw(raw);
-    if candidate.is_absolute() && is_lexically_normal(raw) {
-        match openat2_no_symlinks(&candidate) {
-            Ok(fd) => {
-                drop(fd);
-                return Ok(candidate);
-            }
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ELOOP | libc::ENOSYS | libc::EINVAL)
-                ) => {}
-            Err(_) => return Ok(candidate),
-        }
+    match agent_sandbox_sysutil::is_canonical_path(&candidate) {
+        Ok(true) => return Ok(candidate),
+        Ok(false) => {}
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP | libc::ENOSYS | libc::EINVAL)
+            ) => {}
+        Err(_) => return Ok(candidate),
     }
     let fd = nix::fcntl::openat(
         dir,

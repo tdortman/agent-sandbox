@@ -282,3 +282,8 @@ shutdown handling run separately from workers waiting for approval.
 The syscall broker uses up to two notification consumers, each with its own
 policy client. The kernel dispatches each paused syscall to one consumer.
 Filesystem mutations execute from captured arguments after authorization.
+
+Literal path resolution can use `openat2(RESOLVE_NO_SYMLINKS)` to prove a path
+is already canonical. Aliases and unsupported kernels use the normal resolver.
+The lookup is repeated for each uncached resolution. The proof does not grant
+access or replace deny checks.
