@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 use zbus::{
-    Connection, Guid, MessageStream,
+    Connection, Guid, MatchRule, MessageStream,
     connection::Builder,
     message::{Builder as MessageBuilder, Message, Type},
     zvariant::Fd,
@@ -236,8 +236,17 @@ async fn relay_loop(
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
                 }
-                let target = target_from_message(&client_message, config.bus);
-                let allowed = policy_check(policy, target, config.context.clone(), POLICY_TIMEOUT).await;
+                // Match rules only subscribe this relay's upstream connection;
+                // every delivered signal still passes `policy_check` on the
+                // upstream branch.
+                let allowed = is_match_rule_control(&client_message)
+                    || policy_check(
+                        policy,
+                        target_from_message(&client_message, config.bus),
+                        config.context.clone(),
+                        POLICY_TIMEOUT,
+                    )
+                    .await;
                 if !allowed {
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
@@ -314,7 +323,30 @@ async fn send_access_denied(connection: &Connection, message: &Message) -> Resul
 
 fn is_forbidden_bus_control(message: &Message) -> bool {
     is_bus_method(message, |member| {
-        matches!(member, "RequestName" | "BecomeMonitor" | "AddMatch")
+        matches!(member, "RequestName" | "BecomeMonitor")
+    }) || (is_bus_method(message, |member| member == "AddMatch")
+        && !is_scoped_signal_match(message))
+}
+
+fn is_match_rule_control(message: &Message) -> bool {
+    is_bus_method(message, |member| {
+        matches!(member, "AddMatch" | "RemoveMatch")
+    })
+}
+
+/// Accept signal subscriptions narrowed to a sender or interface.
+///
+/// zbus's parser rejects keys it does not know, including `eavesdrop`, so an
+/// accepted rule cannot observe messages addressed to other connections.
+fn is_scoped_signal_match(message: &Message) -> bool {
+    let body = message.body();
+    let Ok(rule) = body.deserialize::<&str>() else {
+        return false;
+    };
+
+    MatchRule::try_from(rule).is_ok_and(|rule| {
+        rule.msg_type() == Some(Type::Signal)
+            && (rule.sender().is_some() || rule.interface().is_some())
     })
 }
 
@@ -478,5 +510,38 @@ mod tests {
             .expect("message");
 
         assert!(is_forbidden_bus_control(&message));
+    }
+
+    #[test]
+    fn add_match_requires_scoped_signal_rule_without_eavesdrop() {
+        let add_match = |rule: &str| {
+            Message::method_call("/org/freedesktop/DBus", "AddMatch")
+                .expect("builder")
+                .destination("org.freedesktop.DBus")
+                .expect("destination")
+                .interface("org.freedesktop.DBus")
+                .expect("interface")
+                .build(&(rule,))
+                .expect("message")
+        };
+
+        let portal_response = "type='signal',sender='org.freedesktop.portal.Desktop',interface='\
+                               org.freedesktop.portal.Request',member='Response',path='/org/\
+                               freedesktop/portal/desktop/request/1_2/t'";
+        assert!(!is_forbidden_bus_control(&add_match(portal_response)));
+        assert!(!is_forbidden_bus_control(&add_match(
+            "type='signal',interface='org.freedesktop.DBus.Properties'"
+        )));
+
+        for rule in [
+            "type='signal'",
+            "sender='org.freedesktop.portal.Desktop'",
+            "type='method_call',interface='org.example.Interface'",
+            "type='signal',sender='org.freedesktop.portal.Desktop',eavesdrop='true'",
+            "eavesdrop='true',type='signal',interface='org.example.Interface'",
+            "not a match rule",
+        ] {
+            assert!(is_forbidden_bus_control(&add_match(rule)), "{rule}");
+        }
     }
 }

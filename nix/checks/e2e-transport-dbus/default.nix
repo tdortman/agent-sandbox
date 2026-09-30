@@ -195,6 +195,19 @@ pkgs.testers.runNixOSTest (_: {
     sandbox_shell(
         dbus,
         "sandbox-dbus-bash",
+        "dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.AddMatch \"string:type='signal',sender='org.freedesktop.portal.Desktop',interface='org.freedesktop.portal.Request',member='Response'\"",
+        wrapper=session_wrapper,
+    )
+    for rule in ["type='signal'", "type='signal',interface='org.example.Interface',eavesdrop='true'"]:
+        sandbox_shell(
+            dbus,
+            "sandbox-dbus-bash",
+            f"dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.AddMatch {shlex.quote('string:' + rule)} 2>&1 | grep -q org.freedesktop.DBus.Error.AccessDenied",
+            wrapper=session_wrapper,
+        )
+    sandbox_shell(
+        dbus,
+        "sandbox-dbus-bash",
         "! timeout 2 socat - UNIX-CONNECT:/run/dbus/system_bus_socket",
         wrapper=("env", "XDG_RUNTIME_DIR=/run/user/1000", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"),
     )
