@@ -117,16 +117,11 @@ struct Cli {
     child_pid: Option<i32>,
 }
 
-/// Notifications served at the same time, bounded because each worker is a
-/// separate notification consumer rather than a CPU thread.
-///
-/// One loop made the broker a serialisation point: every sandboxed process
-/// waited for the single notification being handled, so parallel filesystem
-/// work (builds, installers, checkouts) ran at the broker's service rate
-/// instead of the filesystem's. Each worker instead owns a policy client and
-/// blocks in `SECCOMP_IOCTL_NOTIF_RECV`, and the kernel hands each
-/// notification to exactly one waiter.
-const WORKER_LIMIT: usize = 4;
+/// Maximum concurrent notification consumers. Each owns a policy client and
+/// blocks in `SECCOMP_IOCTL_NOTIF_RECV`; the kernel hands each notification
+/// to exactly one waiter. Two consumers bound listener contention while
+/// keeping policy requests concurrent.
+const WORKER_LIMIT: usize = 2;
 
 /// State every broker worker shares.
 struct Shared {

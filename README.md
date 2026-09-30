@@ -278,3 +278,7 @@ The filesystem monitor uses up to four workers, each reading one permission
 event directly from fanotify before deciding it. The kernel queue holds
 pending events without a userspace dispatch queue. Policy refresh and
 shutdown handling run separately from workers waiting for approval.
+
+The syscall broker uses up to two notification consumers, each with its own
+policy client. The kernel dispatches each paused syscall to one consumer.
+Filesystem mutations execute from captured arguments after authorization.
