@@ -394,12 +394,32 @@ in
       sudoGuard ? null,
       syscallArmPkg ? null,
       unsafeAliasPrefix ? "unsafe-",
+      unsetEnvVars ? [ ],
     }:
+    assert lib.assertMsg (lib.all (
+      name: builtins.match "[a-zA-Z_][a-zA-Z0-9_]*" name != null
+    ) unsetEnvVars) "agent-sandbox unsetEnvVars entries must be valid environment variable names";
     let
       agentCombinators = import ./combinators.nix {
         inherit lib pkgs policyContextScript;
         nvidiaSetupScript = nvidiaSetupScript true;
       } builtinCombinators;
+      applicationExe = lib.getExe' applicationPackage binName;
+      applicationPackage =
+        if unsetEnvVars == [ ] then
+          package
+        else
+          pkgs.symlinkJoin {
+            inherit (package) meta name;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            paths = [ package ];
+
+            postBuild = ''
+              wrapProgram $out/bin/${lib.escapeShellArg binName} ${
+                lib.concatMapStringsSep " " (name: "--unset ${lib.escapeShellArg name}") unsetEnvVars
+              }
+            '';
+          };
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
       blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
       builtinCombinators = (jail-nix.lib.init pkgs).combinators;
@@ -580,17 +600,17 @@ in
           dynamicInner;
       entryBase =
         if fsArmPkg != null then
-          "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${lib.getExe package}"
+          "${fsArmPkg}/bin/agent-sandbox-fs-arm -- ${applicationExe}"
         else
-          lib.getExe package;
+          applicationExe;
       entryCmd = "${syscallArmPrefix} ${entryBase}";
       entryPackage =
-        if syscallGate || fsArmPkg != null then
+        if syscallGate || fsArmPkg != null || binary != null then
           pkgs.writeShellScriptBin binName ''
             exec ${syscallArmPrefix} ${entryBase} "$@"
           ''
         else
-          package;
+          applicationPackage;
       extraBwrapStr = lib.concatStringsSep " " extraBwrapArgs;
       extraPkgs' =
         extraPkgs
@@ -798,7 +818,6 @@ in
             extraBwrapArgs
             extraPkgs
             fsArmPkg
-            package
             packageName
             policyContext
             policyPkg
@@ -813,6 +832,7 @@ in
             syscallArmPkg
             ;
 
+          package = applicationPackage;
           runtimeReadonlyDirs = runtimeReadonlyDirs';
         }
         ++ lib.optionals (fsArmPkg != null) [
@@ -1040,7 +1060,10 @@ in
       runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
       sandboxPathStr = lib.makeBinPath sandboxPkgsList;
       sandboxPkgsList = lib.unique (
-        [ package ] ++ commonPkgs ++ extraPkgs' ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
+        [ applicationPackage ]
+        ++ commonPkgs
+        ++ extraPkgs'
+        ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
       sandboxedName = "sandboxed-${binName}";
       scopedLauncher =
@@ -1096,7 +1119,7 @@ in
     in
     pkgs.symlinkJoin {
       name = "${lib.getName package}-agent-sandbox";
-      paths = [ package ];
+      paths = [ applicationPackage ];
 
       postBuild = ''
         if [ "${if replaceOriginalBinary then "1" else "0"}" = "1" ]; then

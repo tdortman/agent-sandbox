@@ -46,6 +46,7 @@ Pushes to `main` build the package and publish it to the cache through a pre-pus
 
     packages = [{
       package = inputs.llm-agents.packages.${system}.omp;
+      unsetEnvVars = [ "XDG_DATA_HOME" ];
       readwriteDirs = [ "~/.omp" ];
     }];
   };
@@ -53,6 +54,12 @@ Pushes to `main` build the package and publish it to the cache through a pre-pus
 ```
 
 Use `sudoPolicy = "approve"` to gate sudo. Set `uiBackend = "none"` for headless systems. The full option reference is `nix/modules/nixos/agent-sandbox/agent-sandbox.nix`.
+
+Each package's `unsetEnvVars` removes the named environment variables before
+starting its executable, including through `unsafe-<binary>`. For omp, unsetting
+`XDG_DATA_HOME` keeps its data in `~/.omp/agent`. The default is an empty list.
+This setting leaves the caller's environment and other packages unchanged.
+`blockEnvVars` continues to filter credentials only for sandboxed launches.
 
 For an upstream WebSocket endpoint that does not accept HTTP/2 Extended CONNECT, pin only that URL pattern to HTTP/1.1:
 

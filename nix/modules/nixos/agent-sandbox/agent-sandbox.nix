@@ -405,7 +405,19 @@ let
     unsafeAliasPrefix = lib.mkOption {
       type = lib.types.str;
       default = "unsafe-";
-      description = "Prefix for the unwrapped executable when replaceOriginalBinary is true.";
+      description = "Prefix for the unsandboxed executable when replaceOriginalBinary is true.";
+    };
+
+    unsetEnvVars = lib.mkOption {
+      type = lib.types.listOf (lib.types.strMatching "[a-zA-Z_][a-zA-Z0-9_]*");
+      example = [ "XDG_DATA_HOME" ];
+      default = [ ];
+
+      description = ''
+        Environment variables removed immediately before starting this package's
+        executable, including the unsafe alias. This does not replace
+        ``blockEnvVars``, which filters credentials only for sandboxed launches.
+      '';
     };
   };
   packagePolicyJson =
