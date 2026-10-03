@@ -22,7 +22,6 @@ pkgs.mkShell {
     cargo-nextest
     cmake
     curl
-    gitMinimal
     llvmPackages_22.clang-tools
     pkg-config
     rust.rustPlatform.bindgenHook
