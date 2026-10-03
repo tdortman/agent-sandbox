@@ -20,29 +20,6 @@ let
     duplicatePackageNameMessage
   ];
   contract =
-    assert lib.all
-      (
-        name:
-        !(builtins.tryEval (
-          builtins.deepSeq (map (package: package.unsetEnvVars)
-            (mkNixosSystem {
-              agent-sandbox.packages = [
-                {
-                  package = pkgs.hello;
-                  unsetEnvVars = [ name ];
-                }
-              ];
-            }).config.agent-sandbox.packages
-          ) true
-        )).success
-      )
-      [
-        ""
-        "-x"
-        "X=Y"
-        "X;exit"
-        "X\nY"
-      ];
     assert
       let
         packages =
@@ -50,21 +27,14 @@ let
             agent-sandbox.packages = [
               {
                 package = pkgs.hello;
-
-                unsetEnvVars = [
-                  "XDG_DATA_HOME"
-                  "_TEST_2"
-                ];
+                launchHook = "unset XDG_DATA_HOME";
               }
               { package = pkgs.hello; }
             ];
           }).config.agent-sandbox.packages;
       in
-      (builtins.head packages).unsetEnvVars == [
-        "XDG_DATA_HOME"
-        "_TEST_2"
-      ]
-      && (builtins.elemAt packages 1).unsetEnvVars == [ ];
+      (builtins.head packages).launchHook == "unset XDG_DATA_HOME"
+      && (builtins.elemAt packages 1).launchHook == "";
     assert
       !(builtins.tryEval (
         builtins.deepSeq

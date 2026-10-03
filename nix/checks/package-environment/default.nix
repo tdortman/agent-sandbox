@@ -24,7 +24,10 @@ let
   dynamic = wrap { fsArmPkg = arm; };
   nonReplacing = wrap { replaceOriginalBinary = false; };
   probe = pkgs.writeShellScriptBin "env-probe" ''
-    printf '%s\n' "''${XDG_DATA_HOME-unset}" "''${OMP_TEST_OTHER-unset}" "''${GH_TOKEN-unset}"
+    printf '%s\n' "''${XDG_DATA_HOME-unset}" "''${OMP_TEST_OTHER-unset}" "''${GH_TOKEN-unset}" "''${LD_LIBRARY_PATH-unset}" "''${OMP_TEST_HOOK-unset}"
+    if [ "''${OMP_TEST_HOOK-unset}" != unset ]; then
+      test -r "''${LD_LIBRARY_PATH%%:*}/libstdc++.so.6" || exit 24
+    fi
     printf '<%s>\n' "$@"
     exit 23
   '';
@@ -33,7 +36,7 @@ let
     inherit (inputs) jail-nix;
   };
   static = wrap { };
-  unchanged = wrap { unsetEnvVars = [ ]; };
+  unchanged = wrap { launchHook = ""; };
   wrap =
     extra:
     sandbox.mkWrapPackage pkgs (
@@ -41,7 +44,14 @@ let
         package = probe;
         commonPkgs = [ pkgs.coreutils ];
         exposeWorkingDirectory = false;
-        unsetEnvVars = [ "XDG_DATA_HOME" ];
+
+        launchHook = ''
+          unset XDG_DATA_HOME
+          export LD_LIBRARY_PATH="${
+            lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]
+          }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export OMP_TEST_HOOK="$(printf '%s' "it's $OMP_TEST_OTHER")"
+        '';
       }
       // extra
     );
@@ -64,14 +74,17 @@ pkgs.testers.runNixOSTest {
     start_all()
     machine.wait_for_unit("multi-user.target")
 
-    def check(binary, xdg, token, *, inherited=True):
+    def check(binary, xdg, token, *, inherited=True, hooked=True):
         env = ["env", "OMP_TEST_OTHER=preserved", "GH_TOKEN=test-credential"]
         if inherited:
-            env += ["XDG_DATA_HOME=/home/tester/data with spaces"]
+            env += ["XDG_DATA_HOME=/home/tester/data with spaces", "LD_LIBRARY_PATH=/custom/library path"]
         command = shlex.join(["runuser", "-u", "tester", "--", *env, binary, "two words", "", "*"])
         status, output = machine.execute(command)
         assert status == 23, (binary, status, output)
-        assert output.splitlines() == [xdg, "preserved", token, "<two words>", "<>", "<*>"], (binary, output)
+        library_path = "${lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}" if hooked else ""
+        if inherited:
+            library_path += (":" if library_path else "") + "/custom/library path"
+        assert output.splitlines() == [xdg, "preserved", token, library_path or "unset", "it's preserved" if hooked else "unset", "<two words>", "<>", "<*>"], (binary, output)
 
     for package in ["${static}", "${dynamic}"]:
         check(package + "/bin/env-probe", "unset", "unset")
@@ -79,8 +92,8 @@ pkgs.testers.runNixOSTest {
         check(package + "/bin/unsafe-env-probe", "unset", "test-credential")
         check(package + "/bin/env-probe", "unset", "unset", inherited=False)
 
-    check("${unchanged}/bin/env-probe", "/home/tester/data with spaces", "unset")
-    check("${unchanged}/bin/unsafe-env-probe", "/home/tester/data with spaces", "test-credential")
+    check("${unchanged}/bin/env-probe", "/home/tester/data with spaces", "unset", hooked=False)
+    check("${unchanged}/bin/unsafe-env-probe", "/home/tester/data with spaces", "test-credential", hooked=False)
     check("${nonReplacing}/bin/env-probe", "unset", "test-credential")
     check("${nonReplacing}/bin/sandboxed-env-probe", "unset", "unset")
     check("${alternate}/bin/alternate", "unset", "unset")

@@ -290,6 +290,21 @@ let
       '';
     };
 
+    launchHook = lib.mkOption {
+      type = lib.types.lines;
+      example = "unset XDG_DATA_HOME";
+      default = "";
+
+      description = ''
+        Bash code run immediately before this package's executable, including
+        the unsafe alias. Sandboxed launches run the hook inside the sandbox,
+        after credential filtering. Use it to unset or export environment
+        variables or perform package-specific initialization. The default is
+        empty. This does not replace ``blockEnvVars``, which filters credentials
+        only for sandboxed launches.
+      '';
+    };
+
     name = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -406,18 +421,6 @@ let
       type = lib.types.str;
       default = "unsafe-";
       description = "Prefix for the unsandboxed executable when replaceOriginalBinary is true.";
-    };
-
-    unsetEnvVars = lib.mkOption {
-      type = lib.types.listOf (lib.types.strMatching "[a-zA-Z_][a-zA-Z0-9_]*");
-      example = [ "XDG_DATA_HOME" ];
-      default = [ ];
-
-      description = ''
-        Environment variables removed immediately before starting this package's
-        executable, including the unsafe alias. This does not replace
-        ``blockEnvVars``, which filters credentials only for sandboxed launches.
-      '';
     };
   };
   packagePolicyJson =

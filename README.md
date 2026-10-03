@@ -46,7 +46,10 @@ Pushes to `main` build the package and publish it to the cache through a pre-pus
 
     packages = [{
       package = inputs.llm-agents.packages.${system}.omp;
-      unsetEnvVars = [ "XDG_DATA_HOME" ];
+      launchHook = ''
+        unset XDG_DATA_HOME
+        export LD_LIBRARY_PATH="${lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      '';
       readwriteDirs = [ "~/.omp" ];
     }];
   };
@@ -55,11 +58,13 @@ Pushes to `main` build the package and publish it to the cache through a pre-pus
 
 Use `sudoPolicy = "approve"` to gate sudo. Set `uiBackend = "none"` for headless systems. The full option reference is `nix/modules/nixos/agent-sandbox/agent-sandbox.nix`.
 
-Each package's `unsetEnvVars` removes the named environment variables before
-starting its executable, including through `unsafe-<binary>`. For omp, unsetting
-`XDG_DATA_HOME` keeps its data in `~/.omp/agent`. The default is an empty list.
-This setting leaves the caller's environment and other packages unchanged.
-`blockEnvVars` continues to filter credentials only for sandboxed launches.
+Each package's `launchHook` runs Bash code immediately before its executable,
+including through `unsafe-<binary>`. Sandboxed launches run it inside the sandbox
+after credential filtering. It defaults to an empty string and leaves the caller's
+environment and other packages unchanged. For omp, this example keeps data in
+`~/.omp/agent` and adds the compiler runtime libraries to `LD_LIBRARY_PATH`,
+preserving any existing entries. `blockEnvVars` continues to filter credentials
+only for sandboxed launches.
 
 For an upstream WebSocket endpoint that does not accept HTTP/2 Extended CONNECT, pin only that URL pattern to HTTP/1.1:
 

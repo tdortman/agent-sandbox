@@ -377,6 +377,7 @@ in
       filesystemGate ? false,
       fsArmPkg ? null,
       hiddenPaths ? [ ],
+      launchHook ? "",
       network ? null,
       packageName ? if binary != null then binary else lib.baseNameOf (lib.getExe package),
       policyContext ? false,
@@ -394,11 +395,7 @@ in
       sudoGuard ? null,
       syscallArmPkg ? null,
       unsafeAliasPrefix ? "unsafe-",
-      unsetEnvVars ? [ ],
     }:
-    assert lib.assertMsg (lib.all (
-      name: builtins.match "[a-zA-Z_][a-zA-Z0-9_]*" name != null
-    ) unsetEnvVars) "agent-sandbox unsetEnvVars entries must be valid environment variable names";
     let
       agentCombinators = import ./combinators.nix {
         inherit lib pkgs policyContextScript;
@@ -406,7 +403,7 @@ in
       } builtinCombinators;
       applicationExe = lib.getExe' applicationPackage binName;
       applicationPackage =
-        if unsetEnvVars == [ ] then
+        if launchHook == "" then
           package
         else
           pkgs.symlinkJoin {
@@ -415,9 +412,7 @@ in
             paths = [ package ];
 
             postBuild = ''
-              wrapProgram $out/bin/${lib.escapeShellArg binName} ${
-                lib.concatMapStringsSep " " (name: "--unset ${lib.escapeShellArg name}") unsetEnvVars
-              }
+              wrapProgram $out/bin/${lib.escapeShellArg binName} --run ${lib.escapeShellArg launchHook}
             '';
           };
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
