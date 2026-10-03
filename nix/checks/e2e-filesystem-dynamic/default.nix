@@ -182,6 +182,23 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.succeed("test ! -e /var/lib/agent-sandbox-test/dynamic-mutations/relative-source && test ! -e /var/lib/agent-sandbox-test/dynamic-mutations/relative-renamed")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "ln /var/lib/agent-sandbox-test/dynamic-mutations/renamed /var/lib/agent-sandbox-test/dynamic-mutations/hardlink")
     dynamic.succeed("test -f /var/lib/agent-sandbox-test/dynamic-mutations/hardlink")
+    # Package installers publish O_TMPFILE contents through a tracee fd link.
+    # The source fd belongs to Python, not either mediation daemon.
+    tmpfile_link = """
+    import ctypes, os, sys
+    root, destination = sys.argv[1:]
+    fd = os.open(root, os.O_TMPFILE | os.O_RDWR, 0o600)
+    os.write(fd, b"anonymous-install")
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.linkat(-100, f"/proc/self/fd/{fd}".encode(), -100, destination.encode(), 0x400)
+    if result != 0:
+        raise OSError(ctypes.get_errno(), "linkat")
+    """
+    mutation_root = "/var/lib/agent-sandbox-test/dynamic-mutations"
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", command("python3", "-c", tmpfile_link, mutation_root, mutation_root + "/anonymous-installed"))
+    dynamic.succeed("test \"$(cat " + mutation_root + "/anonymous-installed)\" = anonymous-install")
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", command("python3", "-c", tmpfile_link, mutation_root, mutation_root + "/denied/anonymous-installed"), expect_success=False)
+    dynamic.fail("test -e " + mutation_root + "/denied/anonymous-installed")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "ln -s renamed /var/lib/agent-sandbox-test/dynamic-mutations/symlink")
     dynamic.succeed("test -L /var/lib/agent-sandbox-test/dynamic-mutations/symlink && test \"$(readlink /var/lib/agent-sandbox-test/dynamic-mutations/symlink)\" = renamed")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "truncate -s 0 /var/lib/agent-sandbox-test/dynamic-mutations/renamed")

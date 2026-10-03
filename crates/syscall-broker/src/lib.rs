@@ -316,6 +316,21 @@ pub enum FilesystemMutation {
         flags: u32,
     },
 
+    /// Follow a procfs descriptor link captured from the requesting task.
+    LinkFd {
+        /// Source descriptor pinned through authorization and execution.
+        fd: OwnedFd,
+
+        /// Destination directory descriptor.
+        new_dir: MutationDir,
+
+        /// Destination pathname bytes.
+        new: Vec<u8>,
+
+        /// Original `linkat` flags, including `AT_SYMLINK_FOLLOW`.
+        flags: u32,
+    },
+
     /// Create a symbolic link.
     Symlink {
         /// Link target bytes.
@@ -1197,6 +1212,39 @@ fn target_from_linkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let flags = u32::try_from(notif.data.args[4])
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
 
+    if flags & libc::AT_SYMLINK_FOLLOW as u32 != 0 {
+        let raw = read_raw_path(notif.pid, notif.data.args[1])?;
+        if let Some(source_fd) = proc_self_fd(&raw) {
+            let fd = agent_sandbox_sysutil::dup_tracee_fd(notif.pid, source_fd)?;
+            let mut source = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+            if !source.is_absolute() {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
+            // O_TMPFILE has no directory entry yet. Authorize its backing
+            // directory rather than a procfs alias in another process's fd
+            // table. Ordinary unlinked files cannot be relinked by linkat.
+            if nix::sys::stat::fstat(&fd)?.st_nlink == 0 {
+                source.pop();
+            }
+            let (new_dir, new) = capture_path(notif, notif.data.args[2], notif.data.args[3])?;
+            return Ok(filesystem_target(
+                vec![
+                    (source, FileAccess::ReadWrite),
+                    (
+                        normalize_captured_path(&new_dir, &new)?,
+                        FileAccess::ReadWrite,
+                    ),
+                ],
+                FilesystemMutation::LinkFd {
+                    fd,
+                    new_dir,
+                    new,
+                    flags,
+                },
+            ));
+        }
+    }
+
     two_path_target(
         notif,
         notif.data.args[0],
@@ -1211,6 +1259,16 @@ fn target_from_linkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
             flags,
         },
     )
+}
+
+fn proc_self_fd(raw: &[u8]) -> Option<i32> {
+    let suffix = raw
+        .strip_prefix(b"/proc/self/fd/")
+        .or_else(|| raw.strip_prefix(b"/proc/thread-self/fd/"))?;
+    if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(suffix).ok()?.parse().ok()
 }
 
 fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {

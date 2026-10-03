@@ -437,6 +437,16 @@ fn emulate_filesystem_mutation(
             let new = cstring(new)?;
             linkat(old_dir, &old, new_dir, &new, flags.cast_signed())
         }
+        FilesystemMutation::LinkFd {
+            fd,
+            new_dir,
+            new,
+            flags,
+        } => {
+            let old = cstring(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+            let new = cstring(new)?;
+            linkat(&MutationDir::Root, &old, new_dir, &new, flags.cast_signed())
+        }
         FilesystemMutation::Symlink {
             target,
             link_dir,

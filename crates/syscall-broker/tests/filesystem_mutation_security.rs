@@ -57,6 +57,132 @@ fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
     checks
 }
 
+fn linkat_notif(source: &str, destination: &str, flags: u64) -> SeccompNotif {
+    let mut notif = notif_with_path_args(nr::LINKAT, &[source, destination]);
+    notif.data.args = [
+        i64::from(libc::AT_FDCWD).cast_unsigned(),
+        notif.data.args[0],
+        i64::from(libc::AT_FDCWD).cast_unsigned(),
+        notif.data.args[1],
+        flags,
+        0,
+    ];
+    notif
+}
+
+#[test]
+fn linkat_anonymous_file_checks_backing_directory() {
+    ensure_root_handle();
+    let root = std::env::temp_dir().join(format!("broker-tmpfile-{}", std::process::id()));
+    std::fs::create_dir(&root).expect("temporary directory");
+    let fd = nix::fcntl::open(
+        &root,
+        nix::fcntl::OFlag::O_TMPFILE | nix::fcntl::OFlag::O_RDWR,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("anonymous temporary file");
+    nix::unistd::write(&fd, b"anonymous contents").expect("write source");
+    let source = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let destination = root.join("installed");
+    let notif = linkat_notif(
+        &source,
+        &destination.to_string_lossy(),
+        libc::AT_SYMLINK_FOLLOW as u64,
+    );
+    let Some(SyscallTarget::Filesystem(FilesystemTarget {
+        checks,
+        operation:
+            FilesystemMutation::LinkFd {
+                fd: captured,
+                new_dir,
+                new,
+                flags,
+            },
+    })) = target_from_notification(&notif).expect("classify anonymous source")
+    else {
+        panic!("expected pinned descriptor link");
+    };
+    drop(fd);
+    let captured_path = CString::new(format!("/proc/self/fd/{}", captured.as_raw_fd())).unwrap();
+    agent_sandbox_sysutil::linkat(
+        &MutationDir::Root,
+        &captured_path,
+        &new_dir,
+        &CString::new(new).unwrap(),
+        flags.cast_signed(),
+    )
+    .expect("link pinned anonymous file after original fd closes");
+    let contents = std::fs::read(&destination).expect("installed file");
+    std::fs::remove_dir_all(&root).expect("remove temporary directory");
+    assert_eq!(checks[0], (root, FileAccess::ReadWrite));
+    assert_eq!(checks[1], (destination, FileAccess::ReadWrite));
+    assert_eq!(contents, b"anonymous contents");
+}
+
+#[test]
+fn linkat_named_source_pins_fd_and_checks_actual_path() {
+    ensure_root_handle();
+    let root = std::env::temp_dir().join(format!("broker-link-fd-{}", std::process::id()));
+    std::fs::create_dir(&root).expect("temporary directory");
+    let source = root.join("source");
+    std::fs::write(&source, b"original contents").unwrap();
+    let mut fd: std::os::fd::OwnedFd = std::fs::File::open(&source).unwrap().into();
+    let alias = format!("/proc/thread-self/fd/{}", fd.as_raw_fd());
+    let notif = linkat_notif(
+        &alias,
+        "/unapproved/destination",
+        libc::AT_SYMLINK_FOLLOW as u64,
+    );
+    let Some(SyscallTarget::Filesystem(FilesystemTarget {
+        checks,
+        operation: FilesystemMutation::LinkFd { fd: captured, .. },
+    })) = target_from_notification(&notif).expect("classify named source")
+    else {
+        panic!("expected pinned descriptor link");
+    };
+    nix::unistd::dup2(std::fs::File::open("/dev/null").unwrap(), &mut fd).unwrap();
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut std::fs::File::from(captured), &mut contents).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(contents, "original contents");
+    assert_eq!(checks, vec![
+        (source, FileAccess::ReadWrite),
+        (
+            PathBuf::from("/unapproved/destination"),
+            FileAccess::ReadWrite
+        ),
+    ]);
+}
+
+#[test]
+fn linkat_without_follow_does_not_capture_proc_descriptor() {
+    ensure_root_handle();
+    let fd = std::fs::File::open("/dev/null").unwrap();
+    let alias = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let notif = linkat_notif(&alias, "/unapproved/destination", 0);
+    assert!(matches!(
+        target_from_notification(&notif).unwrap(),
+        Some(SyscallTarget::Filesystem(FilesystemTarget {
+            operation: FilesystemMutation::Link { flags: 0, .. },
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn linkat_missing_proc_descriptor_returns_ebadf_without_policy() {
+    ensure_root_handle();
+    let notif = linkat_notif(
+        "/proc/self/fd/2147483647",
+        "/unapproved/destination",
+        libc::AT_SYMLINK_FOLLOW as u64,
+    );
+    assert!(matches!(
+        target_from_notification(&notif).unwrap(),
+        Some(SyscallTarget::Errno(libc::EBADF))
+    ));
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn rename_and_link_register_all_mutation_endpoints() {
