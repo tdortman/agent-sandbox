@@ -381,7 +381,10 @@ mod tests {
     fn capsule_decoder_handles_split_messages() {
         let encoded = encode_capsule(7, b"payload");
         let mut decoder = CapsuleDecoder::default();
-        assert!(decoder.push(&encoded[..2]).expect("first chunk").is_empty());
+        assert_eq!(
+            decoder.push(&encoded[..2]).expect("first chunk"),
+            Vec::new()
+        );
 
         assert_eq!(decoder.push(&encoded[2..]).expect("second chunk"), [
             Capsule {

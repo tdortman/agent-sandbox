@@ -225,7 +225,8 @@ pub fn capture_nss_peer(program: &Path, peer: &std::os::unix::net::UnixStream) -
         sys::socket::{getsockopt, sockopt},
     };
 
-    // SO_PEERPIDFD names the socket's original peer even after numeric PID reuse.
+    // SO_PEERPIDFD names the socket's original peer even after numeric PID
+    // reuse.
     let peer_pidfd = getsockopt(peer, sockopt::PeerPidfd)?;
     let credentials = getsockopt(peer, sockopt::PeerCredentials)?;
     let pid = u32::try_from(credentials.pid()).map_err(io::Error::other)?;
@@ -452,10 +453,9 @@ mod tests {
             for deny_layer in 0..6 {
                 let mut denied = layers.clone();
                 denied[deny_layer] = Some(deny.to_owned());
-                assert!(
-                    compile_file_network_grants(&denied, &[endpoint])
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    compile_file_network_grants(&denied, &[endpoint]).unwrap(),
+                    Vec::new()
                 );
             }
         }

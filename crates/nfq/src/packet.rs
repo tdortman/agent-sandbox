@@ -685,7 +685,7 @@ mod tests {
         pkt[24..26].copy_from_slice(&8_u16.to_be_bytes());
         let meta = parse_ipv4(&pkt).expect("parse");
         let data = udp_payload(&pkt, &meta).expect("udp_payload");
-        assert!(data.is_empty());
+        assert_eq!(data, b"");
     }
 
     #[test]

@@ -370,7 +370,7 @@ mod tests {
             ));
 
         let pkt = message.to_vec().expect("encode");
-        assert!(mappings_from_response(&pkt).is_empty());
+        assert_eq!(mappings_from_response(&pkt), Vec::new());
     }
 
     #[test]
@@ -478,6 +478,6 @@ mod tests {
         ));
 
         let pkt = message.to_vec().expect("encode");
-        assert!(mappings_from_response(&pkt).is_empty());
+        assert_eq!(mappings_from_response(&pkt), Vec::new());
     }
 }

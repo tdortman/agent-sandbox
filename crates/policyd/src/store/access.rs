@@ -49,14 +49,12 @@ fn sandbox_filesystem_static_allow_key(ctx: &ResolvedRequestContext) -> String {
     let cwd = ctx
         .paths
         .cwd()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|p| p.to_string_lossy().into_owned());
 
     let project_root = ctx
         .paths
         .project_root()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|p| p.to_string_lossy().into_owned());
 
     format!("ctx:{cwd}:{project_root}")
 }
@@ -1204,8 +1202,8 @@ mod tests {
         let empty = Policy::default();
         atomic_write_policy(&policy_path, &empty, None, None, None).expect("clear policy");
 
-        // The merged policy is computed on every call, so removing the deny rule
-        // from disk takes effect immediately.
+        // The merged policy is computed on every call, so removing the deny
+        // rule from disk takes effect immediately.
         assert!(!store.policy_denied("example.com", 443, &ctx));
     }
 
@@ -2318,8 +2316,8 @@ mod tests {
             Vec::new(),
         );
 
-        // Wildcard match: broad pattern stored, concrete query allowed, other bus
-        // rejected.
+        // Wildcard match: broad pattern stored, concrete query allowed, other
+        // bus rejected.
         {
             let mut inner = store.inner.lock().await;
             inner

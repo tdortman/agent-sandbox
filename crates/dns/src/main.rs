@@ -594,7 +594,7 @@ mod tests {
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
         forwarder.suppress_https_svcb = true;
         let filtered = Message::from_vec(&forwarder.sanitize_response(message.to_vec()?)?)?;
-        assert!(filtered.answers.is_empty());
+        assert_eq!(filtered.answers, Vec::new());
         Ok(())
     }
 

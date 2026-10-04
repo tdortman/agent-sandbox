@@ -546,7 +546,7 @@ mod tests {
             .expect("persist deny");
 
         let policy = load_policy(&path, None, None);
-        assert!(policy.dbus.allow.is_empty());
+        assert_eq!(policy.dbus.allow, Vec::new());
         assert_eq!(policy.dbus.deny.len(), 1);
         assert_eq!(policy.dbus.deny[0].target, target);
         assert_eq!(policy.dbus.deny[0].comment.as_deref(), Some("deny"));

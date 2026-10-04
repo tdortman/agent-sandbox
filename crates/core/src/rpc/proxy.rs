@@ -772,10 +772,10 @@ impl<'de> Deserialize<'de> for NormalizedPolicyHost {
     }
 }
 
-impl TryFrom<&str> for NormalizedPolicyHost {
-    type Error = String;
+impl std::str::FromStr for NormalizedPolicyHost {
+    type Err = String;
 
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
 }

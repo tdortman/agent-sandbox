@@ -210,7 +210,8 @@ impl UpstreamClients {
                     && body.body.lock().expect("replay body lock").is_some()
                     && is_unprocessed_h2(error.as_ref()) =>
             {
-                // One retry, preserving the destination, policy context and HTTP version.
+                // One retry, preserving the destination, policy context and
+                // HTTP version.
                 send_connection(self.connect(retry).await?).await
             }
             result => result,
@@ -514,7 +515,8 @@ pub async fn send_upstream_request(
                     }
                 }
 
-                // Errors are also recorded in the sender and terminate the downstream.
+                // Errors are also recorded in the sender and terminate the
+                // downstream.
                 let _ = sender.send(response);
             }),
         );
@@ -837,13 +839,13 @@ mod tests {
                         else {
                             return;
                         };
-                        assert!(
-                            !stream
+                        assert_ne!(
+                            stream
                                 .get_ref()
                                 .1
                                 .peer_certificates()
-                                .expect("client identity")
-                                .is_empty()
+                                .expect("client identity"),
+                            [] as [rustls::pki_types::CertificateDer<'_>; 0]
                         );
                         let stream = rama_tls_rustls::server::TlsStream::new(stream);
                         let service =

@@ -474,7 +474,7 @@ pub(crate) fn context_path_claims(env: &std::collections::HashMap<String, String
 pub fn daemon_context(pid: Option<u32>) -> ResolvedRequestContext {
     let pid = pid.unwrap_or(0);
     let ids = ProcessIds::new(pid, proc_uid(pid).unwrap_or(0));
-    let env = ids.pid().map(read_context_environ).unwrap_or_default();
+    let env = ids.pid().map_or_default(read_context_environ);
 
     let session_id = env
         .get("AGENT_SANDBOX_SESSION_ID")

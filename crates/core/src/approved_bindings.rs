@@ -261,7 +261,7 @@ mod tests {
         let path = dir.path().join("approved-bindings.json");
         let mut bindings = ApprovedBindings::load(&path);
         bindings.record("104.18.32.47", "104.18.32.47");
-        assert!(bindings.aliases("104.18.32.47").is_empty());
+        assert_eq!(bindings.aliases("104.18.32.47"), Vec::<String>::new());
     }
 
     #[test]

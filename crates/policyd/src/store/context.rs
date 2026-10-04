@@ -365,8 +365,9 @@ impl PolicyStore {
         peer: TrustedPeer,
     ) -> ResolvedRequestContext {
         // Host-side helpers (fsmon, syscall-broker) connect to the sandbox
-        // socket as root. Their wire ctx was populated at spawn time (or carries
-        // the tracee pid); peer-based home/cwd would be wrong and breaks UI spawn.
+        // socket as root. Their wire ctx was populated at spawn time (or
+        // carries the tracee pid); peer-based home/cwd would be wrong
+        // and breaks UI spawn.
         if peer.uid == 0 {
             return self.resolve_trusted_context(&ResolvedRequestContext::new(
                 ctx.paths.clone(),
@@ -555,8 +556,7 @@ impl PolicyStore {
             .package
             .as_deref()
             .filter(|name| validate_package_name(name).is_ok())
-            .map(|name| self.package_layer_paths(name, home, project))
-            .unwrap_or_default();
+            .map_or_default(|name| self.package_layer_paths(name, home, project));
         [
             Some(self.args.declarative.clone()),
             package_base,

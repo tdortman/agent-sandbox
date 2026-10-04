@@ -1926,7 +1926,8 @@ fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> (i32, u32) {
         ),
 
         _ => {
-            // openat2: args[2] points to struct open_how { flags, mode, resolve }.
+            // openat2: args[2] points to struct open_how { flags, mode, resolve
+            // }.
             let how_ptr = notif.data.args[2];
 
             if how_ptr == 0 {

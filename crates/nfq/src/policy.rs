@@ -286,8 +286,7 @@ pub fn transport_check(
     let aliases = state
         .approved_bindings
         .lock()
-        .map(|bindings| bindings.aliases(&dst_ip))
-        .unwrap_or_default();
+        .map_or_default(|bindings| bindings.aliases(&dst_ip));
 
     let result = check(CheckDestinationArgs {
         hostname: &hostname,

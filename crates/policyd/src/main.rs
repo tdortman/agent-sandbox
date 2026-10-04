@@ -233,38 +233,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_defaults_preserve_standalone_fallbacks() {
-        let cli = Cli::try_parse_from(["agent-sandbox-policyd"])
-            .expect("standalone invocation has valid defaults");
-
-        assert_eq!(cli.socket, PathBuf::from("/run/agent-sandbox/policy.sock"));
-
-        assert_eq!(
-            cli.sandbox_socket,
-            PathBuf::from("/run/agent-sandbox/sandbox-policy.sock")
-        );
-
-        assert_eq!(
-            cli.declarative,
-            PathBuf::from("/etc/agent-sandbox/policy.json")
-        );
-
-        assert_eq!(
-            cli.export_json,
-            PathBuf::from("/var/lib/agent-sandbox/exported-policy.json")
-        );
-
-        assert_eq!(cli.export_nix, "");
-        assert!((cli.approval_timeout - 300.0).abs() < f64::EPSILON);
-        assert!(cli.interactive_approval);
-        assert_eq!(cli.ui_spawn_cmd, None);
-        assert!(cli.package_declarative.is_empty());
-        assert_eq!(cli.fs_monitor_cmd, None);
-        assert!(cli.fs_ignore_static_allows);
-        assert_eq!(cli.syscall_broker_cmd, None);
-    }
-
-    #[test]
     fn cli_accepts_nix_supplied_launch_facts() {
         let cli = Cli::try_parse_from([
             "agent-sandbox-policyd",

@@ -115,8 +115,8 @@ async fn transparent_http3_alt_endpoint_without_mapping_is_refused() {
         "refused alternative endpoint must not be claimed"
     );
 
-    assert!(events.releases.is_empty());
-    assert!(events.checks.is_empty());
+    assert_eq!(events.releases, Vec::new());
+    assert_eq!(events.checks, Vec::new());
     drop(events);
     assert_eq!(harness.h3_origin().attempts(), 0);
 }

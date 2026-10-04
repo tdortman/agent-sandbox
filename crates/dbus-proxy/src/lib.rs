@@ -75,19 +75,13 @@ pub fn target_from_message(message: &Message, bus: DbusBus) -> DbusTarget {
         Type::Signal => DbusMessageKind::Signal,
     };
 
-    let destination = header
-        .destination()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let destination = header.destination().map_or_default(ToString::to_string);
 
-    let object_path = header.path().map(ToString::to_string).unwrap_or_default();
+    let object_path = header.path().map_or_default(ToString::to_string);
 
-    let interface = header
-        .interface()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let interface = header.interface().map_or_default(ToString::to_string);
 
-    let member = header.member().map(ToString::to_string).unwrap_or_default();
+    let member = header.member().map_or_default(ToString::to_string);
     let signature = header.signature().to_string();
     let fd_count = header.unix_fds().unwrap_or(0);
 

@@ -50,10 +50,10 @@ impl HttpMethod {
     }
 }
 
-impl TryFrom<&str> for HttpMethod {
-    type Error = HttpParseError;
+impl std::str::FromStr for HttpMethod {
+    type Err = HttpParseError;
 
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
 }

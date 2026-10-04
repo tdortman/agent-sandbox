@@ -38,7 +38,7 @@ fn deny_removes_allow_from_earlier_layer() {
     };
 
     let merged = merge_layers(&[low, high]);
-    assert!(merged.network.direct.allow.is_empty());
+    assert_eq!(merged.network.direct.allow, Vec::new());
     assert_eq!(merged.network.direct.deny.len(), 1);
 }
 
@@ -196,8 +196,8 @@ fn load_policy_ignores_top_level_http_rules() {
     .expect("write file");
 
     let policy = load_policy(&path, None, None);
-    assert!(policy.network.http.allow.is_empty());
-    assert!(policy.network.http.deny.is_empty());
+    assert_eq!(policy.network.http.allow, Vec::new());
+    assert_eq!(policy.network.http.deny, Vec::new());
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn filesystem_later_deny_overrides_earlier_allow() {
     };
 
     let merged = merge_layers(&[low, high]);
-    assert!(merged.filesystem.allow.is_empty());
+    assert_eq!(merged.filesystem.allow, Vec::new());
     assert_eq!(merged.filesystem.deny.len(), 1);
 }
 
@@ -342,8 +342,8 @@ fn filesystem_deny_wins_over_allow_at_eval_time() {
 fn policy_without_filesystem_still_loads() {
     let json = r#"{"network":{"direct":{"allow":[],"deny":[]}},"sudo":{"allow":[],"deny":[]}}"#;
     let policy: Policy = serde_json::from_str(json).expect("deserialize policy");
-    assert!(policy.filesystem.allow.is_empty());
-    assert!(policy.filesystem.deny.is_empty());
+    assert_eq!(policy.filesystem.allow, Vec::new());
+    assert_eq!(policy.filesystem.deny, Vec::new());
 }
 
 #[test]
@@ -371,7 +371,7 @@ fn global_deny_beats_project_allow() {
     };
 
     let merged = merge_layers(&[low, high]);
-    assert!(merged.network.direct.allow.is_empty());
+    assert_eq!(merged.network.direct.allow, Vec::new());
     assert_eq!(merged.network.direct.deny.len(), 1);
 }
 
@@ -394,7 +394,7 @@ fn sudo_deny_beats_later_allow() {
     };
 
     let merged = merge_layers(&[low, high]);
-    assert!(merged.sudo.allow.is_empty());
+    assert_eq!(merged.sudo.allow, Vec::new());
     assert_eq!(merged.sudo.deny.len(), 1);
 }
 
@@ -449,7 +449,7 @@ fn filesystem_deny_beats_later_allow() {
     };
 
     let merged = merge_layers(&[low, high]);
-    assert!(merged.filesystem.allow.is_empty());
+    assert_eq!(merged.filesystem.allow, Vec::new());
     assert_eq!(merged.filesystem.deny.len(), 1);
 }
 
@@ -494,7 +494,7 @@ fn http_merge_removes_an_exact_equal_target() {
     ];
 
     let merged = merge_layers(&[allow, deny]);
-    assert!(merged.network.http.allow.is_empty());
+    assert_eq!(merged.network.http.allow, Vec::new());
     assert_eq!(merged.network.http.deny.len(), 1);
 }
 
@@ -537,7 +537,7 @@ fn http_merge_deny_covers_allow_path_and_methods() {
     ];
 
     let merged = merge_layers(&[allow, deny]);
-    assert!(merged.network.http.allow.is_empty());
+    assert_eq!(merged.network.http.allow, Vec::new());
 }
 
 #[test]
@@ -604,6 +604,6 @@ fn http_glob_deny_covers_concrete_allow() {
     ];
 
     let merged = merge_layers(&[allow, deny]);
-    assert!(merged.network.http.allow.is_empty());
+    assert_eq!(merged.network.http.allow, Vec::new());
     assert_eq!(merged.network.http.deny.len(), 1);
 }
