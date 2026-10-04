@@ -1384,11 +1384,74 @@ fn target_from_truncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     ))
 }
 
+fn is_anonymous_memory_file(fd: &OwnedFd) -> io::Result<bool> {
+    use nix::sys::{
+        memfd::{MFdFlags, memfd_create},
+        stat::fstat,
+        statfs::{HUGETLBFS_MAGIC, TMPFS_MAGIC, fstatfs},
+    };
+
+    // Slot zero is shmem; hugepage slots are indexed by the page-size exponent.
+    // These kernel-internal superblocks live for the lifetime of the kernel.
+    static DEVICES: [OnceLock<libc::dev_t>; 64] = [const { OnceLock::new() }; 64];
+    let stat = fstat(fd)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 0 {
+        return Ok(false);
+    }
+    if DEVICES[0]
+        .get()
+        .is_some_and(|device| *device == stat.st_dev)
+    {
+        return Ok(true);
+    }
+
+    let filesystem = fstatfs(fd)?;
+    let huge_shift = match filesystem.filesystem_type() {
+        TMPFS_MAGIC => 0,
+        HUGETLBFS_MAGIC => {
+            let size = u64::try_from(filesystem.block_size())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            if !size.is_power_of_two() {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            size.ilog2()
+        }
+        _ => return Ok(false),
+    };
+    let device = &DEVICES[huge_shift as usize];
+    let expected = if let Some(device) = device.get() {
+        *device
+    } else {
+        let mut flags = MFdFlags::MFD_CLOEXEC;
+        if huge_shift != 0 {
+            flags |= MFdFlags::MFD_HUGETLB
+                | MFdFlags::from_bits_retain(huge_shift << libc::MFD_HUGE_SHIFT);
+        }
+        let probe = memfd_create(c"agent-sandbox-memory", flags)?;
+        let expected = fstat(&probe)?.st_dev;
+        let _ = device.set(expected);
+        expected
+    };
+    Ok(stat.st_dev == expected)
+}
+
 fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let fd = agent_sandbox_sysutil::dup_tracee_fd(
         notif.pid,
         i32::try_from(notif.data.args[0]).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?,
     )?;
+
+    let len = i64::try_from(notif.data.args[1])
+        .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+    // Anonymous memory has no pathname authority. Keep the duplicate for
+    // emulation so an fd-table swap cannot redirect the unchecked operation.
+    if is_anonymous_memory_file(&fd)? {
+        return Ok(filesystem_target(
+            Vec::new(),
+            FilesystemMutation::Ftruncate { fd, len },
+        ));
+    }
 
     let mut path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
 
@@ -1396,9 +1459,6 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     if !path.is_absolute() || path.as_os_str().as_encoded_bytes().ends_with(b" (deleted)") {
         path = normalize_path(&path);
     }
-
-    let len = i64::try_from(notif.data.args[1])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
 
     Ok(filesystem_target(
         vec![(path, FileAccess::Write)],

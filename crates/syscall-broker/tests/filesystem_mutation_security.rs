@@ -3,7 +3,11 @@
 //! Multi-path syscalls register every affected endpoint for
 //! `CheckFilesystem`, and dispatch denies when any endpoint is denied.
 
-use std::{ffi::CString, os::fd::AsRawFd, path::PathBuf};
+use std::{
+    ffi::CString,
+    os::fd::{AsFd, AsRawFd},
+    path::PathBuf,
+};
 
 use agent_sandbox_core::FileAccess;
 use agent_sandbox_syscall::policy::nr;
@@ -55,6 +59,109 @@ fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
     };
 
     checks
+}
+
+fn ftruncate_target(fd: &impl AsFd, len: u64) -> FilesystemTarget {
+    let notif = SeccompNotif {
+        pid: std::process::id(),
+        data: SeccompData {
+            nr: as_seccomp_nr(nr::FTRUNCATE),
+            args: [
+                u64::try_from(fd.as_fd().as_raw_fd()).unwrap(),
+                len,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ..SeccompData::default()
+        },
+        ..SeccompNotif::default()
+    };
+    let Some(SyscallTarget::Filesystem(target)) =
+        target_from_notification(&notif).expect("classify ftruncate")
+    else {
+        panic!("expected pinned filesystem operation");
+    };
+    target
+}
+
+#[test]
+fn ftruncate_memfd_resizes_pinned_memory_without_path_approval() {
+    ensure_root_handle();
+    let mut fd =
+        nix::sys::memfd::memfd_create(c"state table", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+            .expect("anonymous memory file");
+    let target = ftruncate_target(&fd, 8192);
+    assert_eq!(target.checks, Vec::new(), "memory is not a filesystem path");
+    let FilesystemMutation::Ftruncate { fd: captured, len } = target.operation else {
+        panic!("expected pinned ftruncate");
+    };
+    nix::unistd::dup2(std::fs::File::open("/dev/null").unwrap(), &mut fd).unwrap();
+    agent_sandbox_sysutil::ftruncate(&captured, len).expect("resize pinned memory");
+    assert_eq!(nix::sys::stat::fstat(&captured).unwrap().st_size, 8192);
+    assert_eq!(nix::sys::stat::fstat(&fd).unwrap().st_size, 0);
+}
+
+#[test]
+fn ftruncate_memfd_preserves_kernel_seals() {
+    let fd = nix::sys::memfd::memfd_create(
+        c"allocation fd",
+        nix::sys::memfd::MFdFlags::MFD_CLOEXEC | nix::sys::memfd::MFdFlags::MFD_ALLOW_SEALING,
+    )
+    .unwrap();
+    agent_sandbox_sysutil::ftruncate(&fd, 4096).unwrap();
+    let target = ftruncate_target(&fd, 8192);
+    assert_eq!(target.checks, Vec::new());
+    nix::fcntl::fcntl(
+        &fd,
+        nix::fcntl::FcntlArg::F_ADD_SEALS(nix::fcntl::SealFlag::F_SEAL_GROW),
+    )
+    .unwrap();
+    let FilesystemMutation::Ftruncate { fd: captured, len } = target.operation else {
+        panic!("expected pinned ftruncate");
+    };
+    assert_eq!(
+        agent_sandbox_sysutil::ftruncate(&captured, len)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EPERM),
+    );
+    assert_eq!(nix::sys::stat::fstat(&fd).unwrap().st_size, 4096);
+}
+
+#[test]
+fn ftruncate_named_deleted_and_tmpfile_objects_still_require_approval() {
+    ensure_root_handle();
+    for directory in [std::env::temp_dir(), PathBuf::from("/dev/shm")] {
+        let path = directory.join(format!(
+            "memfd:broker-regression-{} (deleted)",
+            std::process::id()
+        ));
+        let fd = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let named = ftruncate_target(&fd, 8192);
+        std::fs::remove_file(&path).unwrap();
+        let deleted = ftruncate_target(&fd, 8192);
+        assert_eq!(named.checks.len(), 1);
+        assert_eq!(named.checks[0].0, path);
+        assert_eq!(named.checks[0].1, FileAccess::Write);
+        assert_eq!(deleted.checks.len(), 1);
+        assert_eq!(deleted.checks[0].1, FileAccess::Write);
+
+        let anonymous = nix::fcntl::open(
+            &directory,
+            nix::fcntl::OFlag::O_TMPFILE | nix::fcntl::OFlag::O_RDWR,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let target = ftruncate_target(&anonymous, 8192);
+        assert_eq!(target.checks.len(), 1);
+        assert_eq!(target.checks[0].1, FileAccess::Write);
+    }
 }
 
 fn linkat_notif(source: &str, destination: &str, flags: u64) -> SeccompNotif {
