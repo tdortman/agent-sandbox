@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Publish the built package to the Cachix binary cache when pushing to
-# main. Skip with `git push --no-verify`.
+# Check every push; publish the built package to Cachix when pushing to main.
 CACHE_NAME="agent-sandbox"
 
 push_to_main=""
@@ -12,10 +11,15 @@ while read -r _local_ref _local_sha remote_ref _remote_sha; do
     fi
 done
 
+cd "$(git rev-parse --show-toplevel)"
+echo "pre-push: running cargo clippy-strict and nix flake check ..." >&2
+cargo clippy-strict
+nix flake check
+
 [[ -n "$push_to_main" ]] || exit 0
 
-if ! command -v nix >/dev/null 2>&1 || ! command -v cachix >/dev/null 2>&1; then
-    echo "pre-push: nix or cachix missing, skipping binary cache push" >&2
+if ! command -v cachix >/dev/null 2>&1; then
+    echo "pre-push: cachix missing, skipping binary cache push" >&2
     exit 0
 fi
 

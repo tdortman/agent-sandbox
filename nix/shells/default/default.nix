@@ -19,6 +19,8 @@ pkgs.mkShell {
   };
 
   nativeBuildInputs = with pkgs; [
+    ast-grep
+    cargo-edit
     cargo-nextest
     cmake
     curl
