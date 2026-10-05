@@ -49,15 +49,15 @@ const FREEZE_POLL: Duration = Duration::from_millis(50);
 /// classification together with the stream whose peeked bytes are replayed
 /// ahead of the socket. `TcpSniff::Unknown` means the deadline expired with
 /// nothing classifiable, which the caller treats as raw passthrough.
-pub async fn peek_protocol(
-    mut stream: TcpStream,
-    owner_cgroup: Option<&Path>,
-) -> (TcpSniff, PrefixedIo<ReplayReader, TcpStream>) {
+pub async fn peek_protocol(mut stream: TcpStream, owner_cgroup: Option<&Path>) -> PeekedProtocol {
     let mut buffer = [0_u8; PEEK_LEN];
 
     if !client_spoke(&stream, owner_cgroup).await {
         let replay = ReplayReader::new(Bytes::new());
-        return (TcpSniff::Unknown, PrefixedIo::new(replay, stream));
+        return PeekedProtocol {
+            sniff: TcpSniff::Unknown,
+            stream: PrefixedIo::new(replay, stream),
+        };
     }
 
     let output = peek_input_until_verdict_with_options(
@@ -77,10 +77,18 @@ pub async fn peek_protocol(
 
     let replay = ReplayReader::new(Bytes::copy_from_slice(&buffer[..output.peek_size]));
 
-    (
-        output.data.unwrap_or(TcpSniff::Unknown),
-        PrefixedIo::new(replay, stream),
-    )
+    PeekedProtocol {
+        sniff: output.data.unwrap_or(TcpSniff::Unknown),
+        stream: PrefixedIo::new(replay, stream),
+    }
+}
+
+/// One classified downstream stream with its replayed bytes.
+pub struct PeekedProtocol {
+    /// The protocol decision for the peeked bytes.
+    pub sniff: TcpSniff,
+    /// The stream with peeked bytes replayed ahead of the socket.
+    pub stream: PrefixedIo<ReplayReader, TcpStream>,
 }
 
 /// Wait without consuming anything until the client sends data or closes.
@@ -134,7 +142,7 @@ mod tests {
             client
         });
         let (downstream, _) = listener.accept().await.expect("accept");
-        let (sniff, _) = peek_protocol(TcpStream::new(downstream), None).await;
+        let sniff = peek_protocol(TcpStream::new(downstream), None).await.sniff;
         let _ = client.await;
         sniff
     }
@@ -173,7 +181,7 @@ mod tests {
         });
         let (downstream, _) = listener.accept().await.expect("accept");
         let started = Instant::now();
-        let (sniff, _) = peek_protocol(TcpStream::new(downstream), None).await;
+        let sniff = peek_protocol(TcpStream::new(downstream), None).await.sniff;
         assert_eq!(sniff, TcpSniff::Unknown);
         assert!(
             started.elapsed() >= PEEK_DEADLINE,
@@ -199,7 +207,7 @@ mod tests {
             client
         });
         let (downstream, _) = listener.accept().await.expect("accept");
-        let (sniff, _) = peek_protocol(TcpStream::new(downstream), None).await;
+        let sniff = peek_protocol(TcpStream::new(downstream), None).await.sniff;
         let _ = client.await;
         assert_eq!(sniff, TcpSniff::Http);
     }
@@ -226,7 +234,9 @@ mod tests {
             client
         });
         let (downstream, _) = listener.accept().await.expect("accept");
-        let (sniff, _) = peek_protocol(TcpStream::new(downstream), Some(cgroup.path())).await;
+        let sniff = peek_protocol(TcpStream::new(downstream), Some(cgroup.path()))
+            .await
+            .sniff;
         let _ = client.await;
         assert_eq!(sniff, TcpSniff::Tls);
     }

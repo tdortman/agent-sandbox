@@ -495,7 +495,7 @@ async fn handle_dbus_unavailable(
         target.member,
     );
 
-    let Some((action, choice)) = choose_action_scope_target(
+    let Some(ReviewedChoice { action, choice }) = choose_action_scope_target(
         &action_title,
         "D-Bus",
         session_id.is_some(),
@@ -741,7 +741,7 @@ async fn network_push_cli_fallback(
     let NetworkPrompt { url, host } = prompt;
     let action_title = format!("{}: {url}", prompt_tag(package));
 
-    let Some((action, choice)) = choose_action_scope_target(
+    let Some(ReviewedChoice { action, choice }) = choose_action_scope_target(
         &action_title,
         url,
         session_id.is_some(),
@@ -920,7 +920,7 @@ async fn handle_http_push(
         return Ok(());
     }
 
-    let Some((action, choice)) = choose_action_scope_target(
+    let Some(ReviewedChoice { action, choice }) = choose_action_scope_target(
         &title,
         "HTTP",
         session_id.is_some(),
@@ -1063,7 +1063,7 @@ async fn handle_elevation_push(
         ApprovalReviewOutcome::Unavailable => {}
     }
 
-    let Some((action, choice)) = choose_action_scope_target(
+    let Some(ReviewedChoice { action, choice }) = choose_action_scope_target(
         &format!("{}: {title}", prompt_tag(package)),
         "sudo",
         session_id.is_some(),
@@ -1205,7 +1205,7 @@ async fn handle_filesystem_push(
         ApprovalReviewOutcome::Unavailable => {}
     }
 
-    let Some((action, choice)) =
+    let Some(ReviewedChoice { action, choice }) =
         choose_filesystem_choice(access, &default_rule_path, session_id.is_some(), package).await?
     else {
         return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
@@ -1228,7 +1228,7 @@ async fn choose_filesystem_choice(
     default_rule_path: &str,
     session_available: bool,
     package: Option<&str>,
-) -> Result<Option<(PromptAction, ScopeOption)>, UiCliError> {
+) -> Result<Option<ReviewedChoice>, UiCliError> {
     choose_action_scope_target(
         &format!("{}: filesystem {access} action?", prompt_tag(package)),
         "filesystem",
@@ -1377,7 +1377,7 @@ async fn resource_push_cli_fallback(
     let display_path = suggest_project_rule_path(path, paths.project_root());
     let action_title = format!("{}: {kind} {access} {display_path}", prompt_tag(package));
 
-    let Some((action, choice)) = choose_action_scope_target(
+    let Some(ReviewedChoice { action, choice }) = choose_action_scope_target(
         &action_title,
         &kind.to_string(),
         session_id.is_some(),
@@ -1424,7 +1424,7 @@ async fn choose_action_scope_target<F, Fut>(
     package_available: bool,
     package: Option<&str>,
     build_target: F,
-) -> Result<Option<(PromptAction, ScopeOption)>, UiCliError>
+) -> Result<Option<ReviewedChoice>, UiCliError>
 where
     F: FnOnce(PromptAction, ApprovalScope) -> Fut,
     Fut: Future<Output = Result<Option<ApprovalTarget>, UiCliError>>,
@@ -1456,12 +1456,15 @@ where
         }
     };
 
-    Ok(Some((action, ScopeOption {
-        label: String::new(),
-        scope,
-        target,
-        comment: None,
-    })))
+    Ok(Some(ReviewedChoice {
+        action,
+        choice: ScopeOption {
+            label: String::new(),
+            scope,
+            target,
+            comment: None,
+        },
+    }))
 }
 
 async fn choose_action(title: &str) -> Result<Option<PromptAction>, UiCliError> {

@@ -146,7 +146,15 @@ pub(crate) type IncomingWebTransportReceiver =
     tokio::sync::mpsc::Receiver<IncomingWebTransportStream>;
 
 type IncomingWebTransportSender = tokio::sync::mpsc::Sender<IncomingWebTransportStream>;
-type UpstreamPoolKey = (String, String, AttributionToken, SocketAddr);
+
+/// Pool identity for one upstream HTTP/3 connection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UpstreamPoolKey {
+    scheme: String,
+    authority: String,
+    security_context: AttributionToken,
+    address: SocketAddr,
+}
 
 /// Pool of upstream HTTP/3 connections keyed by origin and policy context.
 pub struct UpstreamPool {
@@ -238,12 +246,12 @@ impl UpstreamPool {
         authority: &str,
         security_context: Option<&AttributionToken>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let (host, port) = split_authority(authority)?;
-        let addresses = tokio::net::lookup_host((host, port))
+        let parts = split_authority(authority)?;
+        let addresses = tokio::net::lookup_host((parts.host, parts.port))
             .await?
             .collect::<Vec<_>>();
         staggered_connect(addresses, |address| {
-            self.connect_address(scheme, authority, host, address, security_context)
+            self.connect_address(scheme, authority, parts.host, address, security_context)
         })
         .await
     }
@@ -269,10 +277,10 @@ impl UpstreamPool {
         address: SocketAddr,
         security_context: Option<&AttributionToken>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let (host, port) = split_authority(authority)?;
-        let address = SocketAddr::new(address.ip(), port);
+        let parts = split_authority(authority)?;
+        let address = SocketAddr::new(address.ip(), parts.port);
 
-        self.connect_address(scheme, authority, host, address, security_context)
+        self.connect_address(scheme, authority, parts.host, address, security_context)
             .await
     }
 
@@ -284,13 +292,11 @@ impl UpstreamPool {
         address: SocketAddr,
         security_context: Option<&AttributionToken>,
     ) -> Result<Arc<UpstreamConnection>, BoxError> {
-        let pool_key = security_context.map(|security_context| {
-            (
-                scheme.to_owned(),
-                authority.to_owned(),
-                security_context.clone(),
-                address,
-            )
+        let pool_key = security_context.map(|security_context| UpstreamPoolKey {
+            scheme: scheme.to_owned(),
+            authority: authority.to_owned(),
+            security_context: security_context.clone(),
+            address,
         });
 
         if let Some(pool_key) = pool_key.as_ref()
@@ -443,13 +449,18 @@ impl UpstreamPool {
         Ok(client_config)
     }
 }
+/// One origin authority split into its host and port.
+struct AuthorityParts<'a> {
+    host: &'a str,
+    port: u16,
+}
 
 /// Split one origin authority into its host and port.
 ///
 /// # Errors
 ///
 /// Returns an error when the authority has no parseable port.
-fn split_authority(authority: &str) -> Result<(&str, u16), BoxError> {
+fn split_authority(authority: &str) -> Result<AuthorityParts<'_>, BoxError> {
     let host = authority
         .rsplit_once(':')
         .map_or(authority, |(host, _)| host)
@@ -461,7 +472,7 @@ fn split_authority(authority: &str) -> Result<(&str, u16), BoxError> {
         .and_then(|(_, port)| port.parse::<u16>().ok())
         .ok_or_else(|| BoxError::from(format!("origin authority has no port: {authority}")))?;
 
-    Ok((host, port))
+    Ok(AuthorityParts { host, port })
 }
 
 enum UpstreamEvent {

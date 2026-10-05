@@ -38,6 +38,25 @@ use crate::{
     semantic::SemanticRequest,
 };
 
+/// One failed WebTransport route with its human-readable reason.
+struct RouteFailure {
+    session_id: h3::webtransport::SessionId,
+    message: String,
+}
+
+/// One upstream WebTransport stream delivered to its downstream binding.
+struct IncomingStreamDelivery {
+    binding_id: StreamId,
+    stream: IncomingWebTransportStream,
+}
+
+/// One accepted downstream WebTransport session with its stream identities.
+struct AcceptedWebTransportSetup {
+    setup: WebTransportSetup,
+    session_id: h3::webtransport::SessionId,
+    downstream_stream_id: StreamId,
+}
+
 pub(super) struct WebTransportRoute {
     upstream: Arc<crate::http3::upstream::UpstreamConnection>,
     upstream_session_id: h3::webtransport::SessionId,
@@ -356,7 +375,11 @@ pub(super) async fn prepare_webtransport(
         ..
     } = context;
 
-    let (semantic, normalized, downstream_stream) = approve_webtransport_request(
+    let ApprovedWebTransportRequest {
+        semantic,
+        normalized,
+        stream: downstream_stream,
+    } = approve_webtransport_request(
         request,
         stream,
         &state,
@@ -460,6 +483,13 @@ pub(super) async fn prepare_webtransport(
     })
 }
 
+/// One approved WebTransport CONNECT request with its policy target.
+struct ApprovedWebTransportRequest {
+    semantic: SemanticRequest,
+    normalized: agent_sandbox_core::HttpRequest,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+}
+
 async fn approve_webtransport_request(
     request: &http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -468,14 +498,7 @@ async fn approve_webtransport_request(
     origin_port: Option<u16>,
     origin_authority: Option<&str>,
     sessions: &SessionRegistry,
-) -> Result<
-    (
-        SemanticRequest,
-        agent_sandbox_core::HttpRequest,
-        RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    ),
-    BoxError,
-> {
+) -> Result<ApprovedWebTransportRequest, BoxError> {
     // An alternative endpoint changes only the transport. The fallback
     // port for a port-less authority stays the origin's port.
     let fallback_port = origin_port.unwrap_or(state.destination_port);
@@ -512,7 +535,11 @@ async fn approve_webtransport_request(
         return Err(boxed("WebTransport request denied by policy"));
     };
 
-    Ok((semantic, normalized, stream))
+    Ok(ApprovedWebTransportRequest {
+        semantic,
+        normalized,
+        stream,
+    })
 }
 
 struct WebTransportAssociationConfig {
@@ -546,10 +573,10 @@ struct WebTransportAssociation {
     pending_webtransport: PendingWebTransportSessions,
     datagram_router: DatagramRouter,
     resolved_rx: mpsc::UnboundedReceiver<ResolvedRequest>,
-    route_error_rx: mpsc::UnboundedReceiver<(h3::webtransport::SessionId, String)>,
-    route_error_tx: mpsc::UnboundedSender<(h3::webtransport::SessionId, String)>,
-    incoming_rx: mpsc::Receiver<(StreamId, IncomingWebTransportStream)>,
-    incoming_tx: mpsc::Sender<(StreamId, IncomingWebTransportStream)>,
+    route_error_rx: mpsc::UnboundedReceiver<RouteFailure>,
+    route_error_tx: mpsc::UnboundedSender<RouteFailure>,
+    incoming_rx: mpsc::Receiver<IncomingStreamDelivery>,
+    incoming_tx: mpsc::Sender<IncomingStreamDelivery>,
     routes: HashMap<h3::webtransport::SessionId, WebTransportRoute>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     datagram_tasks: Vec<tokio::task::JoinHandle<Result<(), BoxError>>>,
@@ -655,10 +682,10 @@ impl WebTransportAssociation {
                 }
 
                 incoming = self.incoming_rx.recv() => {
-                    let Some((binding_id, stream)) = incoming else {
+                    let Some(delivery) = incoming else {
                         break Err(boxed("upstream WebTransport session closed"));
                     };
-                    if let Err(error) = self.handle_incoming_stream(binding_id, stream).await {
+                    if let Err(error) = self.handle_incoming_stream(delivery.binding_id, delivery.stream).await {
                         warn!(%error, "upstream WebTransport stream rejected");
                     }
                 }
@@ -678,8 +705,8 @@ impl WebTransportAssociation {
                         warn!(%error, "WebTransport bidirectional stream rejected");
                     }
                 }
-                Some((session_id, error)) = self.route_error_rx.recv() => {
-                    self.fail_route(session_id, error).await;
+                Some(failure) = self.route_error_rx.recv() => {
+                    self.fail_route(failure.session_id, failure.message).await;
                 }
                 accepted = self.session.accept_uni() => {
                     let accepted = match accepted {
@@ -697,9 +724,9 @@ impl WebTransportAssociation {
                     }
                 }
                 Some(resolved) = self.resolved_rx.recv() => match resolved {
-                    Ok((request, stream)) => {
+                    Ok(resolved) => {
                         if let Err(error) =
-                            Box::pin(self.handle_request(request, stream)).await
+                            Box::pin(self.handle_request(resolved.request, resolved.stream)).await
                         {
                             warn!(%error, "WebTransport request rejected");
                         }
@@ -929,7 +956,7 @@ impl WebTransportAssociation {
         &self,
         request: http::Request<()>,
         stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    ) -> Result<(WebTransportSetup, h3::webtransport::SessionId, StreamId), BoxError> {
+    ) -> Result<AcceptedWebTransportSetup, BoxError> {
         let WebTransportSetup {
             semantic,
             normalized,
@@ -991,8 +1018,8 @@ impl WebTransportAssociation {
             }
         };
 
-        Ok((
-            WebTransportSetup {
+        Ok(AcceptedWebTransportSetup {
+            setup: WebTransportSetup {
                 semantic,
                 normalized,
                 downstream_stream,
@@ -1006,7 +1033,7 @@ impl WebTransportAssociation {
             },
             session_id,
             downstream_stream_id,
-        ))
+        })
     }
 
     async fn handle_webtransport_request(
@@ -1026,7 +1053,11 @@ impl WebTransportAssociation {
             return Ok(());
         }
 
-        let (setup, session_id, downstream_stream_id) = self
+        let AcceptedWebTransportSetup {
+            setup,
+            session_id,
+            downstream_stream_id,
+        } = self
             .accept_prepared_webtransport_request(request, stream)
             .await?;
 
@@ -1149,7 +1180,10 @@ impl WebTransportAssociation {
                 _ = datagram_cancel.changed() => Ok(()),
             };
             if let Err(error) = &result {
-                let _ = error_tx.send((session_id, error.to_string()));
+                let _ = error_tx.send(RouteFailure {
+                    session_id,
+                    message: error.to_string(),
+                });
             }
             result
         });
@@ -1160,14 +1194,15 @@ impl WebTransportAssociation {
 
         let incoming_task = tokio::spawn(async move {
             while let Some(stream) = upstream_incoming.recv().await {
-                if incoming_tx.send((binding_id, stream)).await.is_err() {
+                let delivery = IncomingStreamDelivery { binding_id, stream };
+                if incoming_tx.send(delivery).await.is_err() {
                     return;
                 }
             }
-            let _ = incoming_error_tx.send((
+            let _ = incoming_error_tx.send(RouteFailure {
                 session_id,
-                "upstream WebTransport session closed".to_owned(),
-            ));
+                message: "upstream WebTransport session closed".to_owned(),
+            });
         });
 
         self.routes.insert(session_id, WebTransportRoute {
@@ -1242,7 +1277,7 @@ fn spawn_webtransport_connect_relay(
     downstream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     upstream: UpstreamRequestStream,
     mut cancel: watch::Receiver<bool>,
-    error_tx: mpsc::UnboundedSender<(h3::webtransport::SessionId, String)>,
+    error_tx: mpsc::UnboundedSender<RouteFailure>,
     session_id: h3::webtransport::SessionId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1255,7 +1290,10 @@ fn spawn_webtransport_connect_relay(
                 || "WebTransport CONNECT relay closed".to_owned(),
                 |error| format!("WebTransport CONNECT relay failed: {error}"),
             );
-            let _ = error_tx.send((session_id, message));
+            let _ = error_tx.send(RouteFailure {
+                session_id,
+                message,
+            });
         }
     })
 }

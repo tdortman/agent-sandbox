@@ -161,37 +161,58 @@ pub struct ApprovalFormResult {
 /// so the user can fix the input and resubmit.
 pub type ReviewValidator = Box<dyn Fn(&ApprovalFormResult) -> Result<(), String> + Send + 'static>;
 
-/// Scope ladder, most specific first: (scope, label, needs session, needs
-/// package).
-const SCOPE_LADDER: [(ApprovalScope, &str, bool, bool); 6] = [
-    (ApprovalScope::Once, "Once", false, false),
-    (ApprovalScope::Session, "This session", true, false),
-    (
-        ApprovalScope::ProjectPackage,
-        "This project, this package",
-        false,
-        true,
-    ),
-    (
-        ApprovalScope::Project,
-        "This project, all packages",
-        false,
-        false,
-    ),
-    (
-        ApprovalScope::GlobalPackage,
-        "All projects, this package",
-        false,
-        true,
-    ),
-    (ApprovalScope::Global, "Everywhere", false, false),
+/// One row of the scope ladder, most specific first.
+struct ScopeLadderEntry {
+    scope: ApprovalScope,
+    label: &'static str,
+    needs_session: bool,
+    needs_package: bool,
+}
+
+const SCOPE_LADDER: [ScopeLadderEntry; 6] = [
+    ScopeLadderEntry {
+        scope: ApprovalScope::Once,
+        label: "Once",
+        needs_session: false,
+        needs_package: false,
+    },
+    ScopeLadderEntry {
+        scope: ApprovalScope::Session,
+        label: "This session",
+        needs_session: true,
+        needs_package: false,
+    },
+    ScopeLadderEntry {
+        scope: ApprovalScope::ProjectPackage,
+        label: "This project, this package",
+        needs_session: false,
+        needs_package: true,
+    },
+    ScopeLadderEntry {
+        scope: ApprovalScope::Project,
+        label: "This project, all packages",
+        needs_session: false,
+        needs_package: false,
+    },
+    ScopeLadderEntry {
+        scope: ApprovalScope::GlobalPackage,
+        label: "All projects, this package",
+        needs_session: false,
+        needs_package: true,
+    },
+    ScopeLadderEntry {
+        scope: ApprovalScope::Global,
+        label: "Everywhere",
+        needs_session: false,
+        needs_package: false,
+    },
 ];
 
 fn scope_label(scope: ApprovalScope) -> &'static str {
     SCOPE_LADDER
         .iter()
-        .find(|(candidate, ..)| *candidate == scope)
-        .map(|(_, label, ..)| *label)
+        .find(|entry| entry.scope == scope)
+        .map(|entry| entry.label)
         .expect("scope ladder covers every scope")
 }
 
@@ -199,12 +220,13 @@ fn scope_label(scope: ApprovalScope) -> &'static str {
 pub fn scope_only_options(session_available: bool, package_available: bool) -> Vec<ScopeOption> {
     SCOPE_LADDER
         .iter()
-        .filter(|(_, _, need_session, need_package)| {
-            (!need_session || session_available) && (!need_package || package_available)
+        .filter(|entry| {
+            (!entry.needs_session || session_available)
+                && (!entry.needs_package || package_available)
         })
-        .map(|(scope, label, ..)| ScopeOption {
-            label: (*label).into(),
-            scope: *scope,
+        .map(|entry| ScopeOption {
+            label: entry.label.into(),
+            scope: entry.scope,
             target: None,
             comment: None,
         })

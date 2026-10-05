@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+
+id: no-tuple-type
+message: tuple type syntax is banned (use a named struct or enum)
+severity: error
+language: Rust
+rule:
+  kind: tuple_type
+  # A direct comma distinguishes tuples from parenthesized generic types.
+  has:
+    regex: ^,$

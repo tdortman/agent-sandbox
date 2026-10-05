@@ -192,7 +192,12 @@ mod tests {
     fn default_syscalls_traps_node_creation_and_handle_lookups() {
         let syscalls = default_syscalls();
 
-        for nr in [nr::MKNOD, nr::MKNODAT, nr::NAME_TO_HANDLE_AT, nr::OPEN_BY_HANDLE_AT] {
+        for nr in [
+            nr::MKNOD,
+            nr::MKNODAT,
+            nr::NAME_TO_HANDLE_AT,
+            nr::OPEN_BY_HANDLE_AT,
+        ] {
             assert!(syscalls.contains(&nr), "missing trap for syscall {nr}");
         }
 

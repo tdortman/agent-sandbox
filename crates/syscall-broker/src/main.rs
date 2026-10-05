@@ -926,21 +926,35 @@ mod tests {
 
         use super::Cli;
 
+        struct EnvDeclaration {
+            argument: &'static str,
+            environment: &'static str,
+        }
+
         let command = Cli::command();
 
-        for (argument, environment) in [
-            ("network_mode", "AGENT_SANDBOX_NETWORK_MODE"),
-            ("dns_endpoint", "AGENT_SANDBOX_DNS_ENDPOINT"),
-            ("sandbox_session_id", "AGENT_SANDBOX_SESSION_ID"),
+        for declaration in [
+            EnvDeclaration {
+                argument: "network_mode",
+                environment: "AGENT_SANDBOX_NETWORK_MODE",
+            },
+            EnvDeclaration {
+                argument: "dns_endpoint",
+                environment: "AGENT_SANDBOX_DNS_ENDPOINT",
+            },
+            EnvDeclaration {
+                argument: "sandbox_session_id",
+                environment: "AGENT_SANDBOX_SESSION_ID",
+            },
         ] {
             let argument = command
                 .get_arguments()
-                .find(|candidate| candidate.get_id().as_str() == argument)
+                .find(|candidate| candidate.get_id().as_str() == declaration.argument)
                 .expect("environment-backed argument should exist");
 
             assert_eq!(
                 argument.get_env().and_then(|value| value.to_str()),
-                Some(environment)
+                Some(declaration.environment)
             );
         }
     }

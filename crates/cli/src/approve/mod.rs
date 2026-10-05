@@ -572,6 +572,11 @@ mod tests {
 
     #[test]
     fn context_arguments_declare_environment_defaults() {
+        struct EnvDeclaration {
+            argument: &'static str,
+            environment: &'static str,
+        }
+
         let command = Cli::command();
 
         for name in ["pending", "approve", "approve-host", "approve-http", "deny"] {
@@ -579,19 +584,28 @@ mod tests {
                 .find_subcommand(name)
                 .expect("context subcommand should exist");
 
-            for (argument, environment) in [
-                ("home", "AGENT_SANDBOX_HOME"),
-                ("cwd", "AGENT_SANDBOX_CWD"),
-                ("project_root", "AGENT_SANDBOX_PROJECT_ROOT"),
+            for declaration in [
+                EnvDeclaration {
+                    argument: "home",
+                    environment: "AGENT_SANDBOX_HOME",
+                },
+                EnvDeclaration {
+                    argument: "cwd",
+                    environment: "AGENT_SANDBOX_CWD",
+                },
+                EnvDeclaration {
+                    argument: "project_root",
+                    environment: "AGENT_SANDBOX_PROJECT_ROOT",
+                },
             ] {
                 let argument = subcommand
                     .get_arguments()
-                    .find(|candidate| candidate.get_id().as_str() == argument)
+                    .find(|candidate| candidate.get_id().as_str() == declaration.argument)
                     .expect("context argument should exist");
 
                 assert_eq!(
                     argument.get_env().and_then(|value| value.to_str()),
-                    Some(environment)
+                    Some(declaration.environment)
                 );
             }
         }

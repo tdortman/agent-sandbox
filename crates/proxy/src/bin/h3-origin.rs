@@ -36,6 +36,12 @@ struct LoggedUdpSocket {
     log: Arc<std::sync::Mutex<std::fs::File>>,
 }
 
+/// One received origin datagram with its source.
+struct ReceivedOriginDatagram {
+    length: usize,
+    source: SocketAddr,
+}
+
 impl LoggedUdpSocket {
     fn new(
         socket: std::net::UdpSocket,
@@ -49,11 +55,11 @@ impl LoggedUdpSocket {
         })
     }
 
-    fn recv_one(&self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+    fn recv_one(&self, buffer: &mut [u8]) -> io::Result<Option<ReceivedOriginDatagram>> {
         match self.inner.get_ref().recv_from(buffer) {
             Ok((length, source)) => {
                 log_line(&self.log, &format!("datagram {length}"));
-                Ok(Some((length, source)))
+                Ok(Some(ReceivedOriginDatagram { length, source }))
             }
 
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -113,10 +119,10 @@ impl quinn::AsyncUdpSocket for LoggedUdpSocket {
             };
 
             match self.recv_one(buffer) {
-                Ok(Some((length, source))) => {
-                    meta.addr = source;
-                    meta.len = length;
-                    meta.stride = length;
+                Ok(Some(datagram)) => {
+                    meta.addr = datagram.source;
+                    meta.len = datagram.length;
+                    meta.stride = datagram.length;
                     meta.ecn = None;
                     meta.dst_ip = None;
                     return Poll::Ready(Ok(1));
@@ -547,7 +553,9 @@ async fn serve_request(
                 .await?;
         }
 
-        let (request_body, request_trailers) = read_request_body(stream).await?;
+        let received = read_request_body(stream).await?;
+        let request_body = received.body;
+        let request_trailers = received.trailers;
 
         let valid = !early_body
             && request_body == b"request-body"
@@ -655,9 +663,15 @@ fn read_alt_svc(path: &Path) -> Option<String> {
     Some(format!("h3=\":{port}\"; persist=1"))
 }
 
+/// One received origin request body with its trailers.
+struct RequestBodyWithTrailers {
+    body: Vec<u8>,
+    trailers: http::HeaderMap,
+}
+
 async fn read_request_body(
     stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-) -> Result<(Vec<u8>, http::HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<RequestBodyWithTrailers, Box<dyn std::error::Error + Send + Sync>> {
     let mut body = Vec::new();
 
     while let Some(mut chunk) = stream.recv_data().await? {
@@ -665,7 +679,7 @@ async fn read_request_body(
     }
 
     let trailers = stream.recv_trailers().await?.unwrap_or_default();
-    Ok((body, trailers))
+    Ok(RequestBodyWithTrailers { body, trailers })
 }
 
 async fn wait_for_gate(gate: &std::path::Path) {

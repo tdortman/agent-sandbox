@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
 };
 
-use agent_sandbox_core::FileAccess;
+use agent_sandbox_core::{FileAccess, policy::FilesystemCheck};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
     FilesystemMutation, FilesystemTarget, MutationDir, SeccompData, SeccompNotif, SyscallTarget,
@@ -51,7 +51,7 @@ fn notif_with_path_args(syscall_nr: i64, paths: &[&str]) -> SeccompNotif {
     }
 }
 
-fn filesystem_checks(notif: &SeccompNotif) -> Vec<(PathBuf, FileAccess)> {
+fn filesystem_checks(notif: &SeccompNotif) -> Vec<FilesystemCheck> {
     let target = target_from_notification(notif).expect("classify notification");
 
     let Some(SyscallTarget::Filesystem(FilesystemTarget { checks, .. })) = target else {
@@ -147,10 +147,10 @@ fn ftruncate_named_deleted_and_tmpfile_objects_still_require_approval() {
         std::fs::remove_file(&path).unwrap();
         let deleted = ftruncate_target(&fd, 8192);
         assert_eq!(named.checks.len(), 1);
-        assert_eq!(named.checks[0].0, path);
-        assert_eq!(named.checks[0].1, FileAccess::Write);
+        assert_eq!(named.checks[0].path, path);
+        assert_eq!(named.checks[0].access, FileAccess::Write);
         assert_eq!(deleted.checks.len(), 1);
-        assert_eq!(deleted.checks[0].1, FileAccess::Write);
+        assert_eq!(deleted.checks[0].access, FileAccess::Write);
 
         let anonymous = nix::fcntl::open(
             &directory,
@@ -160,7 +160,7 @@ fn ftruncate_named_deleted_and_tmpfile_objects_still_require_approval() {
         .unwrap();
         let target = ftruncate_target(&anonymous, 8192);
         assert_eq!(target.checks.len(), 1);
-        assert_eq!(target.checks[0].1, FileAccess::Write);
+        assert_eq!(target.checks[0].access, FileAccess::Write);
     }
 }
 
@@ -221,8 +221,14 @@ fn linkat_anonymous_file_checks_backing_directory() {
     .expect("link pinned anonymous file after original fd closes");
     let contents = std::fs::read(&destination).expect("installed file");
     std::fs::remove_dir_all(&root).expect("remove temporary directory");
-    assert_eq!(checks[0], (root, FileAccess::ReadWrite));
-    assert_eq!(checks[1], (destination, FileAccess::ReadWrite));
+    assert_eq!(checks[0], FilesystemCheck {
+        path: root,
+        access: FileAccess::ReadWrite,
+    });
+    assert_eq!(checks[1], FilesystemCheck {
+        path: destination,
+        access: FileAccess::ReadWrite,
+    });
     assert_eq!(contents, b"anonymous contents");
 }
 
@@ -253,11 +259,14 @@ fn linkat_named_source_pins_fd_and_checks_actual_path() {
     std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(contents, "original contents");
     assert_eq!(checks, vec![
-        (source, FileAccess::ReadWrite),
-        (
-            PathBuf::from("/unapproved/destination"),
-            FileAccess::ReadWrite
-        ),
+        FilesystemCheck {
+            path: source,
+            access: FileAccess::ReadWrite,
+        },
+        FilesystemCheck {
+            path: PathBuf::from("/unapproved/destination"),
+            access: FileAccess::ReadWrite,
+        },
     ]);
 }
 
@@ -302,8 +311,14 @@ fn rename_and_link_register_all_mutation_endpoints() {
     assert_eq!(
         rename_checks,
         vec![
-            (PathBuf::from("/repo/old.txt"), FileAccess::ReadWrite),
-            (PathBuf::from("/repo/new.txt"), FileAccess::ReadWrite),
+            FilesystemCheck {
+                path: PathBuf::from("/repo/old.txt"),
+                access: FileAccess::ReadWrite,
+            },
+            FilesystemCheck {
+                path: PathBuf::from("/repo/new.txt"),
+                access: FileAccess::ReadWrite,
+            },
         ],
         "rename must CheckFilesystem both source and destination with read_write"
     );
@@ -316,8 +331,14 @@ fn rename_and_link_register_all_mutation_endpoints() {
     assert_eq!(
         link_checks,
         vec![
-            (PathBuf::from("/repo/src.txt"), FileAccess::ReadWrite),
-            (PathBuf::from("/repo/dst.txt"), FileAccess::ReadWrite),
+            FilesystemCheck {
+                path: PathBuf::from("/repo/src.txt"),
+                access: FileAccess::ReadWrite,
+            },
+            FilesystemCheck {
+                path: PathBuf::from("/repo/dst.txt"),
+                access: FileAccess::ReadWrite,
+            },
         ],
         "link must CheckFilesystem both source and destination with read_write"
     );
@@ -335,8 +356,14 @@ fn symlink_checks_target_read_and_linkpath_write() {
     assert_eq!(
         symlink_checks,
         vec![
-            (PathBuf::from("/tmp/target"), FileAccess::Read),
-            (PathBuf::from("/tmp/link"), FileAccess::Write),
+            FilesystemCheck {
+                path: PathBuf::from("/tmp/target"),
+                access: FileAccess::Read,
+            },
+            FilesystemCheck {
+                path: PathBuf::from("/tmp/link"),
+                access: FileAccess::Write,
+            },
         ],
         "symlink must CheckFilesystem target read and linkpath write"
     );
@@ -346,12 +373,32 @@ fn symlink_checks_target_read_and_linkpath_write() {
 #[test]
 fn single_path_mutation_syscalls_require_write_access() {
     ensure_root_handle();
-    for (syscall_nr, path) in [(nr::UNLINK, "/tmp/gone"), (nr::TRUNCATE, "/tmp/file")] {
+    struct SyscallCase {
+        nr: libc::c_long,
+        path: &'static str,
+    }
+    for case in [
+        SyscallCase {
+            nr: nr::UNLINK,
+            path: "/tmp/gone",
+        },
+        SyscallCase {
+            nr: nr::TRUNCATE,
+            path: "/tmp/file",
+        },
+    ] {
+        let SyscallCase {
+            nr: syscall_nr,
+            path,
+        } = case;
         let checks = filesystem_checks(&notif_with_path_args(syscall_nr, &[path]));
 
         assert_eq!(
             checks,
-            vec![(PathBuf::from(path), FileAccess::Write)],
+            vec![FilesystemCheck {
+                path: PathBuf::from(path),
+                access: FileAccess::Write,
+            }],
             "syscall {syscall_nr} must require write on the affected path"
         );
     }
@@ -388,7 +435,10 @@ fn mkdir_skips_policy_only_when_target_exists() {
         panic!("missing mkdir must still require policy");
     };
 
-    assert_eq!(checks, vec![(missing, FileAccess::Write)]);
+    assert_eq!(checks, vec![FilesystemCheck {
+        path: missing,
+        access: FileAccess::Write,
+    }]);
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -402,7 +452,10 @@ fn long_multicomponent_path_classifies_full_endpoint() {
     let notif = notif_with_path_args(nr::UNLINK, &[&long]);
     assert_eq!(
         filesystem_checks(&notif),
-        vec![(PathBuf::from(&long), FileAccess::Write)],
+        vec![FilesystemCheck {
+            path: PathBuf::from(&long),
+            access: FileAccess::Write,
+        }],
         "path beyond the 256-byte prefix must authorize the full endpoint"
     );
 }
@@ -447,10 +500,10 @@ fn relative_mutation_captures_tracee_cwd() {
         panic!("expected captured relative unlink");
     };
 
-    assert_eq!(checks, vec![(
-        current_dir.join("relative-path"),
-        FileAccess::Write
-    )]);
+    assert_eq!(checks, vec![FilesystemCheck {
+        path: current_dir.join("relative-path"),
+        access: FileAccess::Write,
+    }]);
 
     assert_eq!(path, b"relative-path");
 
@@ -490,8 +543,14 @@ fn relative_mutation_resolves_live_symlink_targets() {
     std::os::unix::fs::symlink(&second, &alias).expect("retarget alias");
     let after = filesystem_checks(&notif);
     std::fs::remove_dir_all(&root).expect("remove temporary directory");
-    assert_eq!(before, vec![(first, FileAccess::Write)]);
-    assert_eq!(after, vec![(second, FileAccess::Write)]);
+    assert_eq!(before, vec![FilesystemCheck {
+        path: first,
+        access: FileAccess::Write,
+    }]);
+    assert_eq!(after, vec![FilesystemCheck {
+        path: second,
+        access: FileAccess::Write,
+    }]);
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -502,12 +561,12 @@ fn relative_unlinkat_accepts_zero_extended_at_fdcwd() {
     notif.data.args[1] = notif.data.args[0];
     notif.data.args[0] = u64::from(libc::AT_FDCWD.cast_unsigned());
 
-    assert_eq!(filesystem_checks(&notif), vec![(
-        std::env::current_dir()
+    assert_eq!(filesystem_checks(&notif), vec![FilesystemCheck {
+        path: std::env::current_dir()
             .expect("current directory")
             .join("relative-path"),
-        FileAccess::Write,
-    )]);
+        access: FileAccess::Write,
+    }]);
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -522,7 +581,13 @@ fn relative_renameat2_accepts_zero_extended_at_fdcwd() {
     let current_dir = std::env::current_dir().expect("current directory");
 
     assert_eq!(filesystem_checks(&notif), vec![
-        (current_dir.join("old-path"), FileAccess::ReadWrite,),
-        (current_dir.join("new-path"), FileAccess::ReadWrite,),
+        FilesystemCheck {
+            path: current_dir.join("old-path"),
+            access: FileAccess::ReadWrite,
+        },
+        FilesystemCheck {
+            path: current_dir.join("new-path"),
+            access: FileAccess::ReadWrite,
+        },
     ]);
 }

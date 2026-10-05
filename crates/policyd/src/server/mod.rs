@@ -123,10 +123,11 @@ impl PolicyServer {
             ));
         }
 
-        // Host socket: world-accessible like the pre-hardening default. policyd runs
-        // as root, so 0600 would mean only root can connect and the desktop user's
-        // UI/approve CLI could never register. Sensitive ops still bind to
-        // SO_PEERCRED. Sandbox socket: same mode; RPC auth limits it to request ops.
+        // Host socket: world-accessible like the pre-hardening default. policyd
+        // runs as root, so 0600 would mean only root can connect and
+        // the desktop user's UI/approve CLI could never register.
+        // Sensitive ops still bind to SO_PEERCRED. Sandbox socket: same
+        // mode; RPC auth limits it to request ops.
         let host_listener = Self::bind_socket(&host_socket_path, 0o666, None)?;
 
         let sandbox_listener = Self::bind_socket(&sandbox_socket_path, 0o666, None)?;
@@ -221,8 +222,9 @@ mod tests {
         // Allow sockets to be created.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // 1. RegisterUi to host socket without a sandbox session is rejected: otherwise
-        //    any host-local process could subscribe to prompts by path.
+        // 1. RegisterUi to host socket without a sandbox session is rejected:
+        //    otherwise any host-local process could subscribe to prompts by
+        //    path.
         let reply = send_and_recv(&args.host_socket, RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
             ctx: RequestContext::default(),
@@ -235,10 +237,10 @@ mod tests {
             "host RegisterUi without sandbox_session_id must be rejected, got: {reply:?}"
         );
 
-        // 2. RegisterUi to sandbox socket must be REJECTED. The sandbox socket is
-        //    exposed inside the jail; if an attacker could register as the UI on it
-        //    they could approve their own Check/Elevate requests (and Elevate runs
-        //    approved commands as root on the host). See
+        // 2. RegisterUi to sandbox socket must be REJECTED. The sandbox socket
+        //    is exposed inside the jail; if an attacker could register as the
+        //    UI on it they could approve their own Check/Elevate requests (and
+        //    Elevate runs approved commands as root on the host). See
         //    `sandbox_socket_blocks_self_approval_escape` for the full chain.
         let reply = send_and_recv(&args.sandbox_socket, RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
@@ -282,10 +284,10 @@ mod tests {
         // Allow sockets to be created.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // 1. RegisterSandbox to the host socket is accepted. The wrapper performs this
-        //    before the sandbox starts so policy requests are attributed to the
-        //    package. The socket peer is this test process, so the launcher pid must be
-        //    its real parent.
+        // 1. RegisterSandbox to the host socket is accepted. The wrapper
+        //    performs this before the sandbox starts so policy requests are
+        //    attributed to the package. The socket peer is this test process,
+        //    so the launcher pid must be its real parent.
         let pid = std::process::id();
 
         let launcher_pid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -311,10 +313,10 @@ mod tests {
             "host RegisterSandbox must be accepted, got: {reply:?}"
         );
 
-        // 2. RegisterSandbox to the sandbox socket must be REJECTED. The sandbox socket
-        //    is exposed inside the jail; allowing registration there would let a
-        //    malicious agent attribute its own session to any package (or none) and
-        //    forge its identity.
+        // 2. RegisterSandbox to the sandbox socket must be REJECTED. The
+        //    sandbox socket is exposed inside the jail; allowing registration
+        //    there would let a malicious agent attribute its own session to any
+        //    package (or none) and forge its identity.
         let reply = send_and_recv(&args.sandbox_socket, RpcRequest::RegisterSandbox {
             session_id: "sandbox-a".into(),
             package: "omp".into(),
@@ -365,8 +367,8 @@ mod tests {
             "RegisterUi should succeed, got: {reply:?}"
         );
 
-        // 2. On the same connection, Check should be rejected because the connection
-        //    transitioned to UiFd.
+        // 2. On the same connection, Check should be rejected because the
+        //    connection transitioned to UiFd.
         let reply = conn
             .request(RpcRequest::Check {
                 host: None,

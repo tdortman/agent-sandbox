@@ -234,8 +234,8 @@ fn parse_mountinfo_content(content: &str) -> Vec<MountRecord> {
     let mut mounts = Vec::new();
 
     for line in content.lines() {
-        // Format: id parent_id major:minor root mount_point options ... - fstype source
-        // super_options
+        // Format: id parent_id major:minor root mount_point options ... -
+        // fstype source super_options
         let fields: Vec<&str> = line.split(' ').collect();
 
         if fields.len() < 9 {
@@ -508,7 +508,8 @@ fn parse_open_syscall_access(
     let nr: i64 = parts.next()?.parse().ok()?;
 
     if nr <= 0 {
-        // `0` = idle, `-1` = blocked but not in a syscall (`proc_pid_syscall(5)`).
+        // `0` = idle, `-1` = blocked but not in a syscall
+        // (`proc_pid_syscall(5)`).
         return None;
     }
 
@@ -1206,13 +1207,13 @@ fn main() {
     });
 
     // Open fanotify fd.
-    let (fan_fd, fanotify_reports_tid) = agent_sandbox_sysutil::fanotify_init_content()
-        .unwrap_or_else(|e| {
+    let agent_sandbox_sysutil::FanotifyInit { fd, reports_tid } =
+        agent_sandbox_sysutil::fanotify_init_content().unwrap_or_else(|e| {
             eprintln!("agent-sandbox-fsmon: fanotify_init failed: {e}");
             process::exit(1);
         });
 
-    if !fanotify_reports_tid {
+    if !reports_tid {
         eprintln!("agent-sandbox-fsmon: FAN_REPORT_TID is required to identify the opener safely");
         process::exit(1);
     }
@@ -1224,7 +1225,8 @@ fn main() {
         process::exit(1);
     });
 
-    // Read mountinfo through the host procfs before entering the target namespace.
+    // Read mountinfo through the host procfs before entering the target
+    // namespace.
     let mounts = parse_mountinfo_for_pid(&host_proc, cli.pid).unwrap_or_else(|e| {
         eprintln!("agent-sandbox-fsmon: failed to parse target mountinfo: {e}");
         process::exit(1);
@@ -1308,13 +1310,14 @@ fn main() {
         .map(Path::to_path_buf);
 
     let home_covered = mark_mountpoints(
-        &fan_fd,
+        &fd,
         &mounts,
         home_covering_mount.as_deref(),
         cli.home.as_deref(),
     );
 
-    // Before signaling ready, require that at least one marked mount covers --home.
+    // Before signaling ready, require that at least one marked mount covers
+    // --home.
     if let Some(home) = &cli.home
         && !home_covered
     {
@@ -1340,7 +1343,7 @@ fn main() {
     }
 
     run_event_loop(Shared {
-        fan_fd,
+        fan_fd: fd,
         self_pid,
         sandbox_cgroup,
         host_proc,

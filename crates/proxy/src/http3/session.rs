@@ -126,23 +126,24 @@ impl CapsuleDecoder {
         let mut capsules = Vec::new();
 
         while offset < self.buffered.len() {
-            let Some((kind, kind_len)) = decode_varint(&self.buffered[offset..])? else {
+            let Some(kind) = decode_varint(&self.buffered[offset..])? else {
                 break;
             };
 
-            let Some((length, length_len)) = decode_varint(&self.buffered[offset + kind_len..])?
-            else {
+            let Some(length) = decode_varint(&self.buffered[offset + kind.encoded_len..])? else {
                 break;
             };
 
-            if length > MAX_CAPSULE_BYTES as u64 {
+            if length.value > MAX_CAPSULE_BYTES as u64 {
                 return Err(SessionError::CapsuleTooLarge);
             }
 
-            let start = offset + kind_len + length_len;
+            let start = offset + kind.encoded_len + length.encoded_len;
 
             let end = start
-                .checked_add(usize::try_from(length).map_err(|_| SessionError::InvalidCapsule)?)
+                .checked_add(
+                    usize::try_from(length.value).map_err(|_| SessionError::InvalidCapsule)?,
+                )
                 .ok_or(SessionError::InvalidCapsule)?;
 
             if end > self.buffered.len() {
@@ -150,7 +151,7 @@ impl CapsuleDecoder {
             }
 
             capsules.push(Capsule {
-                kind,
+                kind: kind.value,
                 payload: Bytes::copy_from_slice(&self.buffered[start..end]),
             });
 
@@ -216,15 +217,15 @@ pub fn encode_connect_udp_datagram_payload(payload: &[u8]) -> Bytes {
 /// Returns an error when the context identifier is not zero or the payload
 /// exceeds the maximum CONNECT-UDP datagram size.
 pub fn decode_connect_udp_datagram(payload: &[u8]) -> Result<Bytes, SessionError> {
-    let Some((context, context_len)) = decode_varint(payload)? else {
+    let Some(context) = decode_varint(payload)? else {
         return Err(SessionError::InvalidCapsule);
     };
 
-    if context != 0 {
+    if context.value != 0 {
         return Err(SessionError::InvalidDatagramContext);
     }
 
-    let payload = &payload[context_len..];
+    let payload = &payload[context.encoded_len..];
 
     if payload.len() > MAX_CONNECT_UDP_PAYLOAD_BYTES {
         return Err(SessionError::DatagramTooLarge);
@@ -259,11 +260,12 @@ pub fn encode_http_datagram(stream_id: StreamId, payload: &[u8]) -> Result<Bytes
 ///
 /// Returns an error for malformed, oversized, or misdirected datagrams.
 pub fn decode_http_datagram(datagram: &[u8], expected: StreamId) -> Result<Bytes, SessionError> {
-    let Some((quarter_id, prefix_len)) = decode_varint(datagram)? else {
+    let Some(quarter_id) = decode_varint(datagram)? else {
         return Err(SessionError::InvalidDatagramContext);
     };
 
     let stream_id = quarter_id
+        .value
         .checked_mul(4)
         .and_then(|id| StreamId::try_from(id).ok())
         .ok_or(SessionError::InvalidDatagramContext)?;
@@ -272,7 +274,7 @@ pub fn decode_http_datagram(datagram: &[u8], expected: StreamId) -> Result<Bytes
         return Err(SessionError::InvalidDatagramContext);
     }
 
-    let payload = &datagram[prefix_len..];
+    let payload = &datagram[quarter_id.encoded_len..];
 
     if payload.len() > MAX_CONNECT_UDP_PAYLOAD_BYTES {
         return Err(SessionError::DatagramTooLarge);
@@ -320,7 +322,14 @@ impl fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-fn decode_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, SessionError> {
+/// One decoded QUIC variable-length integer with its encoded length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedVarint {
+    value: u64,
+    encoded_len: usize,
+}
+
+fn decode_varint(bytes: &[u8]) -> Result<Option<DecodedVarint>, SessionError> {
     let Some(first) = bytes.first().copied() else {
         return Ok(None);
     };
@@ -340,7 +349,10 @@ fn decode_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, SessionError> {
             .ok_or(SessionError::InvalidCapsule)?;
     }
 
-    Ok(Some((value, length)))
+    Ok(Some(DecodedVarint {
+        value,
+        encoded_len: length,
+    }))
 }
 
 fn encode_varint(value: u64, output: &mut Vec<u8>) {

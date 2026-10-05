@@ -178,23 +178,36 @@ mod tests {
 
     /// Restore process environment mutated by tests that exercise the
     /// sandbox-path resolution fallback.
-    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+    struct EnvEntry {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    struct EnvGuard(Vec<EnvEntry>);
+
+    struct EnvSetting {
+        key: &'static str,
+        value: &'static str,
+    }
 
     #[allow(
         unsafe_code,
         reason = "std::env::set_var is unsafe in edition 2024; test-only"
     )]
     impl EnvGuard {
-        fn set(entries: &[(&'static str, &str)]) -> Self {
+        fn set(entries: &[EnvSetting]) -> Self {
             let previous = entries
                 .iter()
-                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .map(|setting| EnvEntry {
+                    key: setting.key,
+                    previous: std::env::var(setting.key).ok(),
+                })
                 .collect();
 
-            for (key, value) in entries {
+            for setting in entries {
                 // SAFETY: tests run single-threaded within this binary's
                 // test threads, and every key is restored on drop.
-                unsafe { std::env::set_var(key, value) };
+                unsafe { std::env::set_var(setting.key, setting.value) };
             }
 
             Self(previous)
@@ -207,14 +220,14 @@ mod tests {
     )]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
+            for entry in &self.0 {
+                match &entry.previous {
                     // SAFETY: restoring the values captured in `set`; tests run
                     // single-threaded and every key is restored on drop.
-                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    Some(value) => unsafe { std::env::set_var(entry.key, value) },
 
                     // SAFETY: as above; the key was captured by `set`.
-                    None => unsafe { std::env::remove_var(key) },
+                    None => unsafe { std::env::remove_var(entry.key) },
                 }
             }
         }
@@ -223,13 +236,22 @@ mod tests {
     #[test]
     fn request_context_resolves_sandbox_paths_from_environment() {
         let _guard = EnvGuard::set(&[
-            (
-                "AGENT_SANDBOX_SESSION_CONTEXT_PATH",
-                "/nonexistent/agent-sandbox-session-context.json",
-            ),
-            ("AGENT_SANDBOX_CWD", "/work"),
-            ("AGENT_SANDBOX_HOME", "/home/sbx"),
-            ("AGENT_SANDBOX_PROJECT_ROOT", "/work/repo"),
+            EnvSetting {
+                key: "AGENT_SANDBOX_SESSION_CONTEXT_PATH",
+                value: "/nonexistent/agent-sandbox-session-context.json",
+            },
+            EnvSetting {
+                key: "AGENT_SANDBOX_CWD",
+                value: "/work",
+            },
+            EnvSetting {
+                key: "AGENT_SANDBOX_HOME",
+                value: "/home/sbx",
+            },
+            EnvSetting {
+                key: "AGENT_SANDBOX_PROJECT_ROOT",
+                value: "/work/repo",
+            },
         ]);
 
         let ctx = request_context(42, Some("session-a".into()));

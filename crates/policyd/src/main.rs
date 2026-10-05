@@ -3,7 +3,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use agent_sandbox_core::SandboxPaths;
-use agent_sandbox_policyd::{PolicyServer, PolicyStore, PolicydArgs, PolicydError};
+use agent_sandbox_policyd::{
+    PackageDeclarative, PolicyServer, PolicyStore, PolicydArgs, PolicydError,
+};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -87,7 +89,7 @@ struct Cli {
         value_name = "NAME=PATH",
         value_parser = parse_package_declarative
     )]
-    package_declarative: Vec<(String, PathBuf)>,
+    package_declarative: Vec<PackageDeclarative>,
 
     /// Where the merged policy is written as JSON on startup. Consumed by the
     /// bwrap wrapper and by "agent-sandbox-nfq" to bootstrap the in-kernel deny
@@ -160,7 +162,7 @@ struct Cli {
 }
 
 /// Parse a `NAME=PATH` value for `--package-declarative`.
-fn parse_package_declarative(value: &str) -> Result<(String, PathBuf), String> {
+fn parse_package_declarative(value: &str) -> Result<PackageDeclarative, String> {
     let (name, path) = value
         .split_once('=')
         .ok_or_else(|| format!("expected NAME=PATH, got {value:?}"))?;
@@ -169,7 +171,10 @@ fn parse_package_declarative(value: &str) -> Result<(String, PathBuf), String> {
         return Err("package name must not be empty".into());
     }
 
-    Ok((name.to_string(), PathBuf::from(path)))
+    Ok(PackageDeclarative {
+        name: name.to_string(),
+        path: PathBuf::from(path),
+    })
 }
 
 #[tokio::main]
@@ -284,14 +289,14 @@ mod tests {
         assert_eq!(cli.ui_spawn_cmd, Some(PathBuf::from("/bin/test-ui")));
 
         assert_eq!(cli.package_declarative, vec![
-            (
-                "omp".to_string(),
-                PathBuf::from("/etc/test/packages/omp.json")
-            ),
-            (
-                "codex".to_string(),
-                PathBuf::from("/etc/test/packages/codex.json")
-            ),
+            PackageDeclarative {
+                name: "omp".to_string(),
+                path: PathBuf::from("/etc/test/packages/omp.json"),
+            },
+            PackageDeclarative {
+                name: "codex".to_string(),
+                path: PathBuf::from("/etc/test/packages/codex.json"),
+            },
         ]);
 
         assert_eq!(cli.fs_monitor_cmd, Some(PathBuf::from("/bin/test-fsmon")));

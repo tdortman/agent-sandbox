@@ -23,6 +23,54 @@ fn proxy_error(message: impl Into<String>) -> PolicydError {
     PolicydError::Proxy(message.into())
 }
 
+/// Verified flow details for one proxy check: the resolved destination and
+/// context plus the protocol used to derive the prompt scheme.
+struct FlowCheck {
+    host: String,
+    port: u16,
+    ctx: ResolvedRequestContext,
+    protocol: FlowProtocol,
+}
+
+/// Registration snapshots held across rebind validation: the claimed flow's
+/// registration and the pending flow's registration.
+struct RebindRegistrations {
+    claimed: FlowRegistration,
+    pending: FlowRegistration,
+}
+
+/// Claimed UDP flow fixture for proxy tests: the store, session, claim, and
+/// the temp dir and socket that keep the association alive.
+#[cfg(test)]
+struct ClaimedUdpFlow {
+    store: std::sync::Arc<PolicyStore>,
+    session: ProxySessionToken,
+    claim: agent_sandbox_core::FlowClaimReply,
+    dir: tempfile::TempDir,
+    socket: std::net::UdpSocket,
+}
+
+/// Registered and claimed UDP association for proxy tests: the socket, the
+/// flow key, the owning connection, and the attribution token.
+#[cfg(test)]
+struct UdpAssociation {
+    socket: std::net::UdpSocket,
+    flow: NetworkFlowKey,
+    connection_id: ProxyConnectionId,
+    token: AttributionToken,
+}
+
+/// Flow state snapshot held across owner revalidation: the key, the
+/// registration seen before the blocking check, the expected owner, and
+/// the resolved request context.
+struct FlowSnapshot {
+    flow: NetworkFlowKey,
+    registration: FlowRegistration,
+    expected_owner: SocketIdentity,
+    owner_fd_hint: Option<u32>,
+    context: ResolvedRequestContext,
+}
+
 /// Validate the owner identity attached to an NFQ flow registration.
 ///
 /// The check uses process identity only. It does not resolve the UDP tuple,
@@ -123,7 +171,10 @@ impl PolicyStore {
     ) -> Result<(), PolicydError> {
         let now = Instant::now();
         let owner = registration.owner();
-        let (paths, sandbox_session_id) = registration.context().clone().into_parts();
+        let agent_sandbox_core::FlowContext {
+            paths,
+            sandbox_session_id,
+        } = registration.context().clone();
 
         let raw_context = ResolvedRequestContext::new(
             paths,
@@ -359,7 +410,12 @@ impl PolicyStore {
             }
         }
 
-        let (host, port, ctx, protocol) = match self
+        let FlowCheck {
+            host,
+            port,
+            ctx,
+            protocol,
+        } = match self
             .flow_for_check(&proxy_session, &attribution_token)
             .await
         {
@@ -434,7 +490,7 @@ impl PolicyStore {
             }
         }
 
-        let (_host, _port, ctx, _protocol) = match self
+        let FlowCheck { ctx, .. } = match self
             .flow_for_check(&proxy_session, &attribution_token)
             .await
         {
@@ -532,7 +588,7 @@ impl PolicyStore {
         connection_id: ProxyConnectionId,
         flow: NetworkFlowKey,
     ) -> Result<(), PolicydError> {
-        let (old_key, registration, pending_registration) = {
+        let (old_key, registrations) = {
             let mut inner = self.inner.lock().await;
             prune_flows(&mut inner.proxy_flows, Instant::now());
             validate_session(&inner, &proxy_session)?;
@@ -571,13 +627,16 @@ impl PolicyStore {
             validate_rebind_candidate(state, pending)?;
 
             let old_key = old_key.clone();
-            let registrations = (state.registration.clone(), pending.registration.clone());
+            let registrations = RebindRegistrations {
+                claimed: state.registration.clone(),
+                pending: pending.registration.clone(),
+            };
             drop(inner);
-            (old_key, registrations.0, registrations.1)
+            (old_key, registrations)
         };
 
         let new_owner =
-            validate_registered_owner(pending_registration.owner(), self.args.approval_timeout)
+            validate_registered_owner(registrations.pending.owner(), self.args.approval_timeout)
                 .await?;
 
         let mut inner = self.inner.lock().await;
@@ -588,7 +647,7 @@ impl PolicyStore {
             .get(&old_key)
             .ok_or_else(|| proxy_error("flow registration expired"))?;
 
-        if state.registration != registration
+        if state.registration != registrations.claimed
             || state.connection_id != Some(connection_id)
             || state.attribution_token.as_ref() != Some(&attribution_token)
         {
@@ -600,14 +659,14 @@ impl PolicyStore {
             .get(&flow)
             .ok_or_else(|| proxy_error("rebind flow is no longer registered"))?;
 
-        let old_owner = registration.owner();
+        let old_owner = registrations.claimed.owner();
         let pending_owner = pending.registration.owner();
 
         if !same_socket_owner(old_owner, pending_owner) {
             return Err(proxy_error("socket owner changed"));
         }
 
-        if pending.attribution_token.is_some() || pending.registration != pending_registration {
+        if pending.attribution_token.is_some() || pending.registration != registrations.pending {
             return Err(proxy_error("rebind flow changed during validation"));
         }
 
@@ -623,8 +682,8 @@ impl PolicyStore {
             registration: FlowRegistration::new(
                 flow.clone(),
                 new_owner,
-                registration.policy_host().clone(),
-                registration.context().clone(),
+                registrations.claimed.policy_host().clone(),
+                registrations.claimed.context().clone(),
             ),
             owner: new_owner,
             owner_fd_hint: None,
@@ -748,8 +807,8 @@ impl PolicyStore {
         &self,
         proxy_session: &ProxySessionToken,
         attribution_token: &AttributionToken,
-    ) -> Result<(String, u16, ResolvedRequestContext, FlowProtocol), PolicydError> {
-        let (flow, registration, expected_owner, owner_fd_hint, context) = {
+    ) -> Result<FlowCheck, PolicydError> {
+        let snapshot = {
             let mut inner = self.inner.lock().await;
             prune_flows(&mut inner.proxy_flows, Instant::now());
             validate_session(&inner, proxy_session)?;
@@ -758,17 +817,19 @@ impl PolicyStore {
                 .iter()
                 .find(|(_, state)| state.attribution_token.as_ref() == Some(attribution_token))
                 .ok_or_else(|| proxy_error("flow attribution is invalid"))?;
-            let snapshot = (
-                flow.clone(),
-                state.registration.clone(),
-                state.owner,
-                state.owner_fd_hint,
-                state.context.clone(),
-            );
+            let snapshot = FlowSnapshot {
+                flow: flow.clone(),
+                registration: state.registration.clone(),
+                expected_owner: state.owner,
+                owner_fd_hint: state.owner_fd_hint,
+                context: state.context.clone(),
+            };
             drop(inner);
             snapshot
         };
 
+        let expected_owner = snapshot.expected_owner;
+        let owner_fd_hint = snapshot.owner_fd_hint;
         let identity_valid = tokio::time::timeout(
             self.args.approval_timeout,
             tokio::task::spawn_blocking(move || {
@@ -788,20 +849,26 @@ impl PolicyStore {
 
         let state = inner
             .proxy_flows
-            .get_mut(&flow)
+            .get_mut(&snapshot.flow)
             .ok_or_else(|| proxy_error("flow registration expired"))?;
 
-        if state.registration != registration
+        if state.registration != snapshot.registration
             || state.attribution_token.as_ref() != Some(attribution_token)
         {
             return Err(proxy_error("flow claim changed during revalidation"));
         }
 
         state.last_check = Instant::now();
-        let host = registration.policy_host().to_string();
-        let port = registration.flow().destination_port().get();
+        let host = snapshot.registration.policy_host().to_string();
+        let port = snapshot.registration.flow().destination_port().get();
+        let protocol = snapshot.registration.flow().protocol();
         drop(inner);
-        Ok((host, port, context, registration.flow().protocol()))
+        Ok(FlowCheck {
+            host,
+            port,
+            ctx: snapshot.context,
+            protocol,
+        })
     }
 }
 
@@ -842,8 +909,8 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use agent_sandbox_core::{
-        FlowClaimReply, FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity,
-        SandboxPaths, SocketIdentity, SocketInode,
+        FlowContext, FlowProtocol, NormalizedPolicyHost, ProcessIdentity, SandboxPaths,
+        SocketIdentity, SocketInode,
         socket_owner::{OwnerResolution, SocketProtocol, SocketTuple, resolve_owner_snapshot},
     };
 
@@ -970,14 +1037,7 @@ mod tests {
 
         assert_eq!(claim.flow, flow);
     }
-
-    async fn claimed_udp_flow() -> (
-        Arc<PolicyStore>,
-        ProxySessionToken,
-        FlowClaimReply,
-        tempfile::TempDir,
-        std::net::UdpSocket,
-    ) {
+    async fn claimed_udp_flow() -> ClaimedUdpFlow {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(test_store(&dir));
 
@@ -1018,7 +1078,13 @@ mod tests {
             .await
             .expect("claim flow");
 
-        (store, session, claim, dir, socket)
+        ClaimedUdpFlow {
+            store,
+            session,
+            claim,
+            dir,
+            socket,
+        }
     }
 
     #[tokio::test]
@@ -1027,7 +1093,13 @@ mod tests {
         // own timers during the prompt. The check fails closed when the
         // sandbox cannot be frozen (no agent cgroup scope covers a test
         // process) instead of holding the connection open unfrozen.
-        let (store, session, claim, _dir, _socket) = claimed_udp_flow().await;
+        let ClaimedUdpFlow {
+            store,
+            session,
+            claim,
+            dir: _dir,
+            socket: _socket,
+        } = claimed_udp_flow().await;
 
         let reply = store
             .check_network_flow(session, ProxyRequestId::new(), claim.attribution_token)
@@ -1053,7 +1125,13 @@ mod tests {
 
     #[tokio::test]
     async fn check_network_flow_honors_cancellation() {
-        let (store, session, claim, _dir, _socket) = claimed_udp_flow().await;
+        let ClaimedUdpFlow {
+            store,
+            session,
+            claim,
+            dir: _dir,
+            socket: _socket,
+        } = claimed_udp_flow().await;
 
         let canceled_request_id = ProxyRequestId::new();
 
@@ -1101,12 +1179,7 @@ mod tests {
     async fn test_udp_association(
         store: &Arc<PolicyStore>,
         session: &ProxySessionToken,
-    ) -> (
-        std::net::UdpSocket,
-        NetworkFlowKey,
-        ProxyConnectionId,
-        AttributionToken,
-    ) {
+    ) -> UdpAssociation {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let source = socket.local_addr().expect("socket address");
         let owner = test_udp_owner(source).await;
@@ -1140,7 +1213,12 @@ mod tests {
             .await
             .expect("claim flow");
 
-        (socket, flow, connection_id, claim.attribution_token)
+        UdpAssociation {
+            socket,
+            flow,
+            connection_id,
+            token: claim.attribution_token,
+        }
     }
 
     fn test_http_request(authority: &str, path: &str) -> HttpRequest {
@@ -1173,7 +1251,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&store, &session).await;
 
         let denied = store
             .check_http(
@@ -1219,7 +1302,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&store, &session).await;
         let request_id = ProxyRequestId::new();
 
         store
@@ -1261,8 +1349,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_old_socket, old_flow, connection_id, token) =
-            test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            flow: old_flow,
+            connection_id,
+            token,
+        } = test_udp_association(&store, &session).await;
 
         let migrated = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let migrated_source = migrated.local_addr().expect("socket address");
@@ -1335,7 +1427,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&store, &session).await;
         let migrated = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let migrated_source = migrated.local_addr().expect("socket address");
 
@@ -1377,8 +1474,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, old_flow, connection_id, token) =
-            test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            flow: old_flow,
+            connection_id,
+            token,
+        } = test_udp_association(&store, &session).await;
 
         let migrated = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let migrated_source = migrated.local_addr().expect("socket address");
@@ -1417,8 +1518,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, _old_flow, connection_id, token) =
-            test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&store, &session).await;
 
         let vanished = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
         let vanished_source = vanished.local_addr().expect("socket address");
@@ -1486,7 +1591,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&store, &session).await;
 
         let error = store
             .release_network_flow(session.clone(), token.clone(), ProxyConnectionId::new())
@@ -1642,7 +1752,7 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (socket, _flow, _connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation { socket, token, .. } = test_udp_association(&store, &session).await;
         drop(socket);
 
         let error = store
@@ -1669,7 +1779,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, _flow, connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&store, &session).await;
         store.close_proxy_session(1).await;
 
         let error = store
@@ -1715,7 +1830,12 @@ mod tests {
             .expect("open session")
             .proxy_session;
 
-        let (_socket, flow, connection_id, token) = test_udp_association(&store, &session).await;
+        let UdpAssociation {
+            socket: _socket,
+            flow,
+            connection_id,
+            token,
+        } = test_udp_association(&store, &session).await;
 
         {
             let mut inner = store.inner.lock().await;

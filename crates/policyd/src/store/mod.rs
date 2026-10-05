@@ -39,9 +39,10 @@ pub use freeze::cleanup_cgroup_freeze;
 pub(crate) use types::evict_oldest;
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
-    MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, Pending, PendingElevation, PendingFilesystem, PendingHttp,
-    PendingKind, PendingNetwork, PendingResource, PolicyStore, PolicydArgs, ProxyCheckId,
-    ProxyFlowState, ProxySessionState, TrustedPeer, UiClientHandle, UiSessionContext,
+    MAX_PROXY_FLOWS, MAX_RPC_LINE_BYTES, ObservedNetworkGrants, PackageDeclarative, Pending,
+    PendingElevation, PendingFilesystem, PendingHttp, PendingKind, PendingNetwork, PendingResource,
+    PolicyStore, PolicydArgs, ProxyCheckId, ProxyFlowState, ProxySessionState, TrustedPeer,
+    UiClientHandle, UiSessionContext,
 };
 
 #[cfg(test)]

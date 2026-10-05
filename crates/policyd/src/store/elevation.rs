@@ -15,6 +15,14 @@ use super::{
 };
 use crate::error::PolicydError;
 
+/// Trusted elevation binary resolved from an approval's argv: the
+/// canonicalized store path to execute and the `argv[0]` name multi-call
+/// binaries dispatch on.
+struct ResolvedElevationArgv {
+    prog: PathBuf,
+    arg0_name: String,
+}
+
 const ELEVATION_PATH: &str = "/run/current-system/sw/bin";
 
 impl PolicyStore {
@@ -60,7 +68,7 @@ impl PolicyStore {
         ])
     }
 
-    fn resolve_elevation_argv(argv: &[String]) -> Result<(PathBuf, String), PolicydError> {
+    fn resolve_elevation_argv(argv: &[String]) -> Result<ResolvedElevationArgv, PolicydError> {
         let Some(program) = argv.first() else {
             return Err(PolicydError::ArgvRequired);
         };
@@ -110,7 +118,10 @@ impl PolicyStore {
             return Err(PolicydError::ElevationArgvNotAbsolute);
         }
 
-        Ok((canonical, arg0_name))
+        Ok(ResolvedElevationArgv {
+            prog: canonical,
+            arg0_name,
+        })
     }
 
     pub(crate) async fn exec_elevation(
@@ -119,7 +130,7 @@ impl PolicyStore {
         cwd: Option<&Path>,
         home: Option<&Path>,
     ) -> Result<ElevateReply, PolicydError> {
-        let (prog, arg0_name) = Self::resolve_elevation_argv(argv)?;
+        let ResolvedElevationArgv { prog, arg0_name } = Self::resolve_elevation_argv(argv)?;
 
         let work_dir = cwd
             .and_then(|dir| dir.canonicalize().ok())

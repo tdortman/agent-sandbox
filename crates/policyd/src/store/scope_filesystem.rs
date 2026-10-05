@@ -9,7 +9,7 @@ use agent_sandbox_core::{
 
 use super::{
     decisions::DecisionAction, persist::PersistResourceRuleArgs, scope_apply::ScopeLadder,
-    state::apply_bucket, types::PolicyStore,
+    state::apply_bucket, types::PolicyStore, util::ScopeAudit,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 
@@ -103,7 +103,11 @@ impl PolicyStore {
             &paths,
             scope,
             action,
-            (None, None, &audit_detail),
+            ScopeAudit {
+                host: None,
+                port: None,
+                detail: &audit_detail,
+            },
             |scope, policy_path| {
                 RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
                     path,
@@ -287,7 +291,11 @@ impl PolicyStore {
             &paths,
             scope,
             action,
-            (None, None, &audit_detail),
+            ScopeAudit {
+                host: None,
+                port: None,
+                detail: &audit_detail,
+            },
             |scope, policy_path| {
                 RpcReply::ScopeAction(ScopeActionReply::ok_resource(
                     kind,

@@ -125,8 +125,8 @@ impl KernelOwnerResolver {
             }
         }
 
-        // ponytail: serialize scans; use per-thread resolvers if parallel NFQUEUE
-        // queries matter.
+        // ponytail: serialize scans; use per-thread resolvers if parallel
+        // NFQUEUE queries matter.
         let mut state = self
             .state
             .lock()

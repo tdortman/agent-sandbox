@@ -523,7 +523,8 @@ impl PolicyStore {
             return Ok(path);
         }
 
-        // For broader scopes, accept exact match or ancestor path (with boundary).
+        // For broader scopes, accept exact match or ancestor path (with
+        // boundary).
         if path == *pending_path {
             return Ok(path);
         }
@@ -789,7 +790,8 @@ impl PolicyStore {
             return Ok(path);
         }
 
-        // For broader scopes, accept exact match or ancestor path (with boundary).
+        // For broader scopes, accept exact match or ancestor path (with
+        // boundary).
         if path == *pending_path {
             return Ok(path);
         }

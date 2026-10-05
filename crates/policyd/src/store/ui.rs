@@ -46,7 +46,11 @@ pub enum VerdictExit {
     Cancelled,
 }
 
-type UiNotificationTarget = (u64, std::sync::Arc<Mutex<OwnedWriteHalf>>);
+/// UI client to notify: the client id plus the shared writer for its socket.
+struct UiNotificationTarget {
+    id: u64,
+    writer: std::sync::Arc<Mutex<OwnedWriteHalf>>,
+}
 
 impl PolicyStore {
     fn route_for_context(ctx: &ResolvedRequestContext) -> UiRoute {
@@ -241,10 +245,13 @@ impl PolicyStore {
             .ui_clients
             .iter()
             .filter(|(_, c)| session_ids.contains(&c.session_id))
-            .map(|(id, c)| (*id, c.writer.clone()))
+            .map(|(id, c)| UiNotificationTarget {
+                id: *id,
+                writer: c.writer.clone(),
+            })
             .collect();
 
-        targets.sort_unstable_by_key(|(id, _)| *id);
+        targets.sort_unstable_by_key(|target| target.id);
         drop(inner);
         targets
     }
@@ -542,8 +549,8 @@ impl PolicyStore {
             }
         };
 
-        for (id, writer) in targets {
-            let mut w = writer.lock().await;
+        for target in targets {
+            let mut w = target.writer.lock().await;
 
             if w.write_all(line.as_bytes()).await.is_ok() {
                 return true;
@@ -551,7 +558,7 @@ impl PolicyStore {
 
             drop(w);
             let mut inner = self.inner.lock().await;
-            Self::remove_ui_client_locked(&mut inner, *id);
+            Self::remove_ui_client_locked(&mut inner, target.id);
         }
 
         false

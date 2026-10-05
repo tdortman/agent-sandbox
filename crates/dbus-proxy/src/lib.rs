@@ -409,18 +409,30 @@ fn build_raw_body(
 mod tests {
     use std::num::NonZeroU32;
 
+    use serde::{Deserialize, Serialize};
     use zbus::{
         message::Message,
-        zvariant::{Endian, ObjectPath},
+        zvariant::{Endian, ObjectPath, Type},
     };
 
     use super::{DbusBus, is_forbidden_bus_control, rewrite_message, target_from_message};
 
+    /// `org.freedesktop.Secret.Item.GetSecret` reply: session, parameters,
+    /// value, and content type. The derived D-Bus struct signature matches
+    /// the wire layout exactly.
+    #[derive(Debug, Serialize, Deserialize, Type)]
+    struct GetSecretReply<'a> {
+        #[serde(borrow)]
+        session: ObjectPath<'a>,
+        parameters: Vec<u8>,
+        value: Vec<u8>,
+        content_type: String,
+    }
+
     #[test]
     fn rewrite_preserves_get_secret_reply_body() {
-        let session: ObjectPath = "/org/freedesktop/secrets/session/1"
-            .try_into()
-            .expect("session path");
+        let session =
+            ObjectPath::try_from("/org/freedesktop/secrets/session/1").expect("session path");
 
         let call = Message::method_call(
             "/org/freedesktop/secrets/collection/kdewallet/9",
@@ -441,12 +453,12 @@ mod tests {
 
         let reply = Message::method_return(&call.header())
             .expect("builder")
-            .build(&(
-                session.clone(),
-                Vec::<u8>::new(),
-                token.clone(),
-                "text/plain; charset=utf8".to_string(),
-            ))
+            .build(&GetSecretReply {
+                session: session.clone(),
+                parameters: Vec::new(),
+                value: token.clone(),
+                content_type: "text/plain; charset=utf8".to_string(),
+            })
             .expect("reply");
 
         let rewritten = rewrite_message(
@@ -458,16 +470,11 @@ mod tests {
 
         let body = rewritten.body();
 
-        let (r_session, _parameters, r_value, r_content_type): (
-            ObjectPath,
-            Vec<u8>,
-            Vec<u8>,
-            String,
-        ) = body.deserialize().expect("deserialize reply body");
+        let decoded: GetSecretReply<'_> = body.deserialize().expect("deserialize reply body");
 
-        assert_eq!(r_session, session);
-        assert_eq!(r_value, token);
-        assert_eq!(r_content_type, "text/plain; charset=utf8");
+        assert_eq!(decoded.session, session);
+        assert_eq!(decoded.value, token);
+        assert_eq!(decoded.content_type, "text/plain; charset=utf8");
     }
 
     #[test]

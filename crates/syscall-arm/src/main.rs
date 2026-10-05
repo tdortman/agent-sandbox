@@ -179,13 +179,15 @@ fn main() {
 
         ForkResult::Parent { child } => {
             // Parent: drop the write end, read the listener fd number from the
-            // pipe, reopen the actual listener fd file descriptor from the child
-            // via pidfd_open + pidfd_getfd (the child still holds it open while
-            // SIGSTOP'd), then SIGCONT and exec the broker. This replaces the
-            // `sendmsg(SCM_RIGHTS)` handoff, which trapped sendmsg and forced the
-            // broker to be single-arg-only. With the fd-number handoff the broker
-            // never touches SCM_RIGHTS and the listener fd is acquired through
-            // the same pidfd path it already uses for socket emulation.
+            // pipe, reopen the actual listener fd file descriptor from the
+            // child via pidfd_open + pidfd_getfd (the child still
+            // holds it open while SIGSTOP'd), then SIGCONT and exec
+            // the broker. This replaces the `sendmsg(SCM_RIGHTS)`
+            // handoff, which trapped sendmsg and forced the
+            // broker to be single-arg-only. With the fd-number handoff the
+            // broker never touches SCM_RIGHTS and the listener fd
+            // is acquired through the same pidfd path it already
+            // uses for socket emulation.
             drop(write_end);
             let mut pipe = std::fs::File::from(read_end);
             let mut text = Vec::new();
@@ -206,36 +208,40 @@ fn main() {
                 .and_then(|text| text.parse().ok())
                 .unwrap_or_else(|| die("listener fd on handoff pipe was not a decimal integer"));
 
-            // pidfd_open(2): Linux 5.3+. Refer to the child pid so we can dup its
-            // fds without racing /proc.
+            // pidfd_open(2): Linux 5.3+. Refer to the child pid so we can dup
+            // its fds without racing /proc.
             let child_pid = u32::try_from(child.as_raw()).unwrap_or_else(|_| {
                 eprintln!("agent-sandbox-syscall-arm: child pid out of range");
                 process::exit(1);
             });
             let pidfd = pidfd_open(child_pid).unwrap_or_else(|_| die("pidfd_open child failed"));
 
-            // pidfd_getfd(2): Linux 5.6+. Duplicate the child's listener fd into
-            // the parent's fd table. The child is SIGSTOP'd, so the fd is still
-            // valid. We will SIGCONT only after acquiring it.
+            // pidfd_getfd(2): Linux 5.6+. Duplicate the child's listener fd
+            // into the parent's fd table. The child is SIGSTOP'd,
+            // so the fd is still valid. We will SIGCONT only after
+            // acquiring it.
             let listener_fd = pidfd_getfd(&pidfd, listener_fd_number)
                 .unwrap_or_else(|_| die("pidfd_getfd listener fd failed"));
 
-            // pidfd_getfd sets FD_CLOEXEC on the duplicated fd (per the Linux man
-            // page). The parent execs the broker immediately after, which would
-            // close the listener fd during exec, leaving the broker with a stale
-            // fd. Clear FD_CLOEXEC so the listener survives execvp into the broker.
+            // pidfd_getfd sets FD_CLOEXEC on the duplicated fd (per the Linux
+            // man page). The parent execs the broker immediately
+            // after, which would close the listener fd during exec,
+            // leaving the broker with a stale fd. Clear FD_CLOEXEC
+            // so the listener survives execvp into the broker.
             if let Ok(flags) = fcntl(&listener_fd, FcntlArg::F_GETFD) {
                 let _ = fcntl(
                     &listener_fd,
                     FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC),
                 );
             }
-            // Do NOT SIGCONT the child here. The broker must be ready to receive
-            // seccomp notifications before the child resumes, otherwise the child's
-            // first openat (during dynamic linking) traps with no broker listening,
-            // causing ENOSYS. The broker SIGCONTs the child on the first iteration
-            // of its notification loop, ensuring it is inside the loop and the
-            // listener fd is held before the child resumes.
+            // Do NOT SIGCONT the child here. The broker must be ready to
+            // receive seccomp notifications before the child
+            // resumes, otherwise the child's first openat (during
+            // dynamic linking) traps with no broker listening,
+            // causing ENOSYS. The broker SIGCONTs the child on the first
+            // iteration of its notification loop, ensuring it is
+            // inside the loop and the listener fd is held before
+            // the child resumes.
             exec_broker(&listener_fd, child);
         }
     }

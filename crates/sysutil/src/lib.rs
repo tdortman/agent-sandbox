@@ -607,28 +607,41 @@ pub const FAN_ALLOW: u32 = 0x01;
 /// fanotify response value denying the requested access.
 pub const FAN_DENY: u32 = 0x02;
 
+/// Fanotify descriptor and the process identity format reported by the kernel.
+pub struct FanotifyInit {
+    /// Owned descriptor receiving permission events.
+    pub fd: OwnedFd,
+    /// Whether event metadata identifies the opener thread rather than its
+    /// process.
+    pub reports_tid: bool,
+}
+
 /// Open a fanotify fd suitable for open permission events.
 ///
-/// Returns `(fd, reports_tid)` where `reports_tid` is true when the kernel
+/// Returns a descriptor with `reports_tid` true when the kernel
 /// honours `FAN_REPORT_TID` and `meta.pid` is the opener thread id.
 ///
 /// # Errors
 /// Returns an error if fanotify cannot be initialised on any flag combination.
-pub fn fanotify_init_content() -> io::Result<(OwnedFd, bool)> {
+pub fn fanotify_init_content() -> io::Result<FanotifyInit> {
     for (flags, reports_tid) in [
         (FAN_CLASS_CONTENT | FAN_CLOEXEC | libc::FAN_REPORT_TID, true),
         (FAN_CLASS_CONTENT | FAN_CLOEXEC, false),
     ] {
-        // SAFETY: `fanotify_init(unsigned int flags, unsigned int event_f_flags)`
-        // with event_f_flags=0. The returned fd is owned exclusively by us.
+        // SAFETY: `fanotify_init(unsigned int flags, unsigned int
+        // event_f_flags)` with event_f_flags=0. The returned fd is
+        // owned exclusively by us.
         let raw_fd = unsafe { libc::syscall(libc::SYS_fanotify_init, flags, 0u32) };
 
         let fd = i32::try_from(raw_fd)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fanotify fd overflow"))?;
 
         if fd >= 0 {
-            // SAFETY: freshly-returned kernel fd.
-            return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, reports_tid));
+            return Ok(FanotifyInit {
+                // SAFETY: freshly-returned kernel fd.
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                reports_tid,
+            });
         }
 
         let err = io::Error::last_os_error();

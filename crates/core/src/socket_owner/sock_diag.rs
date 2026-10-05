@@ -235,8 +235,8 @@ fn parse_datagram(
 
         let message_sequence = read_u32(datagram, offset + 8)?;
 
-        // The header port ID names the receiver; recvfrom authenticates the kernel
-        // sender.
+        // The header port ID names the receiver; recvfrom authenticates the
+        // kernel sender.
         if message_sequence != sequence {
             return Err(DiagError);
         }
@@ -304,7 +304,8 @@ fn parse_entry(
     let uid = read_u32(payload, 64)?;
 
     let Ok(inode) = SocketInode::new(read_u32(payload, 68)? as u64) else {
-        // TIME_WAIT and request sockets have no owning descriptor, as in procfs.
+        // TIME_WAIT and request sockets have no owning descriptor, as in
+        // procfs.
         return Ok(());
     };
 
@@ -399,13 +400,14 @@ mod tests {
         output
     }
 
-    fn entry_keys(entries: &[SocketTableEntry]) -> Vec<(u32, SocketInode)> {
-        let mut keys: Vec<_> = entries
-            .iter()
-            .map(|entry| (entry.uid, entry.inode))
-            .collect();
+    fn entry_keys(entries: &[SocketTableEntry]) -> Vec<SocketTableEntry> {
+        let mut keys = entries.to_vec();
 
-        keys.sort_unstable();
+        keys.sort_unstable_by(|left, right| {
+            left.uid
+                .cmp(&right.uid)
+                .then_with(|| left.inode.cmp(&right.inode))
+        });
         keys
     }
 

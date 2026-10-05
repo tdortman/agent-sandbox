@@ -412,12 +412,21 @@ fn network_rule_sort_key(rule: &NetworkRule) -> NetworkSortKey {
     NetworkSortKey::new(&rule.host, rule.port)
 }
 
-fn http_rule_sort_key(rule: &HttpRule) -> (String, Vec<String>) {
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct HttpRuleSortKey {
+    url: String,
+    methods: Vec<String>,
+}
+
+fn http_rule_sort_key(rule: &HttpRule) -> HttpRuleSortKey {
     let url = rule
         .target()
         .map_or_else(|_| rule.url.clone(), |target| target.url.to_string());
 
-    (url, rule.methods.clone())
+    HttpRuleSortKey {
+        url,
+        methods: rule.methods.clone(),
+    }
 }
 
 fn sudo_rule_sort_key(rule: &SudoRule) -> Vec<String> {

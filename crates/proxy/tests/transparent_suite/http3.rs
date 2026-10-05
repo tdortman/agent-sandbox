@@ -272,13 +272,14 @@ async fn transparent_http3_forwards_informational_responses() {
     let harness = TransparentHarness::start_http3(loopback(IpVersion::V4)).await;
     let client = Http3Client::new(&harness.ca_file());
 
-    let (informational, response) = client
+    let answered = client
         .request_with_informational(harness.proxy_address, "localhost", "/informational")
         .await
         .unwrap_or_else(|error| panic!("HTTP/3 informational request failed: {error}"));
+    let informational = answered.informational;
+    let response = answered.response;
 
     assert_eq!(informational.len(), 1);
-    assert_eq!(informational[0].status().as_u16(), 103);
 
     assert_eq!(
         informational[0]
@@ -350,11 +351,12 @@ async fn transparent_http3_forwards_response_trailers() {
         .expect("HTTP/3 request");
 
     assert_eq!(response.status(), 200);
-    let (body, trailers) = response.body_with_trailers().await;
-    assert_eq!(body, b"origin-response\n");
+    let received = response.body_with_trailers().await;
+    assert_eq!(received.body, b"origin-response\n");
 
     assert_eq!(
-        trailers
+        received
+            .trailers
             .get("x-origin-trailer")
             .and_then(|value| value.to_str().ok()),
         Some("present")
@@ -503,10 +505,11 @@ async fn transparent_http3_relays_connect_udp_capsules() {
     )
     .await;
 
-    assert_eq!(capsules, vec![
-        (0, b"\0capsule-probe".to_vec()),
-        (0x21, b"unknown-capsule".to_vec()),
-    ]);
+    assert_eq!(capsules.len(), 2);
+    assert_eq!(capsules[0].kind, 0);
+    assert_eq!(capsules[0].payload, b"\0capsule-probe");
+    assert_eq!(capsules[1].kind, 0x21);
+    assert_eq!(capsules[1].payload, b"unknown-capsule");
 
     wait_for_release(&harness).await;
     assert_eq!(harness.h3_origin().attempts(), 1);

@@ -1,0 +1,53 @@
+id: no-tuple-type
+valid:
+  - |-
+    fn unit_arg(x: ()) {}
+  - |-
+    fn unit_ret() -> () {}
+  - |-
+    struct Point { x: f64, y: f64 }
+  - |-
+    struct Pair(u8, u16);
+  - |-
+    enum Shape { Point(u8, u16), Named { x: u8 } }
+  - |-
+    fn tuple_expr() {
+        let y = (1, 2);
+    }
+  - |-
+    fn fn_ptr(f: fn(u8, u16) -> u8) {}
+  - |-
+    fn paren(x: (u8)) {}
+  - |-
+    fn generic_paren(x: (Result<u8, u16>)) {}
+  - |-
+    fn commented_paren(x: (u8 /* , */)) {}
+  - |-
+    fn dyn_ok(error: &(dyn Error + 'static)) {}
+  - |-
+    // tuple-looking text in a comment (u8, u16) must not match
+    fn comment_ok() {}
+  - |-
+    fn string_ok() {
+        let doc = "(u8, u16) in a string";
+    }
+invalid:
+  - |-
+    fn pair(x: (u8, u16)) {}
+  - |-
+    fn ret() -> (u8, u16) { loop {} }
+  - |-
+    fn nested(x: Vec<(u8, (u16, u32))>) {}
+  - |-
+    fn multiline(
+        x: (
+            u8,
+            u16,
+        ),
+    ) {}
+  - |-
+    fn singleton(x: (u8,)) {}
+  - |-
+    fn refs(x: &(u8, u16), y: Box<(u8, u16)>) {}
+  - |-
+    fn ret_trait() -> (impl Fn(u8), u8) { loop {} }

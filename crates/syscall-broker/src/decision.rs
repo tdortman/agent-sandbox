@@ -143,14 +143,14 @@ pub async fn decide(
         NormalizedNotification::Target {
             target: SyscallTarget::Filesystem(target),
         } => {
-            for (path, access) in &target.checks {
+            for check in &target.checks {
                 if let Some(plan) = filesystem_plan(
-                    path,
-                    *access,
+                    &check.path,
+                    check.access,
                     client
                         .check_filesystem(
-                            path,
-                            *access,
+                            &check.path,
+                            check.access,
                             sandbox_session_id.map(str::to_owned),
                             pid,
                             timeout,
@@ -232,7 +232,7 @@ mod tests {
 
     use agent_sandbox_core::{
         DeviceAccess, FileAccess, FilesystemCheckReply, ResourceAccess, ResourceCheckReply,
-        ResourceKind, Verdict, VerdictSource,
+        ResourceKind, Verdict, VerdictSource, policy::FilesystemCheck,
     };
     use agent_sandbox_syscall_broker::{
         FilesystemMutation, FilesystemTarget, PersistentPolicyClient, ResourceTarget,
@@ -253,7 +253,10 @@ mod tests {
 
     fn filesystem_target() -> FilesystemTarget {
         FilesystemTarget {
-            checks: vec![("/tmp/example".into(), FileAccess::Write)],
+            checks: vec![FilesystemCheck {
+                path: "/tmp/example".into(),
+                access: FileAccess::Write,
+            }],
             operation: FilesystemMutation::Ftruncate {
                 fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("dev null exists")),
                 len: 0,
@@ -370,30 +373,30 @@ mod tests {
     #[test]
     fn filesystem_verdict_maps_to_plan() {
         let target = filesystem_target();
-        let (path, access) = &target.checks[0];
+        let check = &target.checks[0];
 
         let allowed = FilesystemCheckReply {
             ok: true,
             verdict: Verdict::allowed(VerdictSource::User),
-            path: path.clone(),
-            access: *access,
+            path: check.path.clone(),
+            access: check.access,
             error: None,
         };
 
-        assert!(filesystem_plan(path, *access, Ok(allowed)).is_none());
+        assert!(filesystem_plan(&check.path, check.access, Ok(allowed)).is_none());
 
         let denied = FilesystemCheckReply {
             ok: true,
             verdict: Verdict::denied(VerdictSource::Policy {
                 comment: Some("blocked".into()),
             }),
-            path: path.clone(),
-            access: *access,
+            path: check.path.clone(),
+            access: check.access,
             error: Some("blocked".into()),
         };
 
         assert!(matches!(
-            filesystem_plan(path, *access, Ok(denied)),
+            filesystem_plan(&check.path, check.access, Ok(denied)),
             Some(ResponsePlan::FilesystemPolicyDenied { .. })
         ));
 

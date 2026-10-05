@@ -45,10 +45,11 @@ use crate::{
 pub(super) const MAX_WEBTRANSPORT_SESSIONS: usize = 64;
 pub(super) const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
-pub(super) type ResolvedRequestValue = (
-    http::Request<()>,
-    RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-);
+/// One resolved downstream HTTP/3 request with its stream.
+pub(super) struct ResolvedRequestValue {
+    pub(super) request: http::Request<()>,
+    pub(super) stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+}
 
 pub(super) type ResolvedRequest = Result<ResolvedRequestValue, StreamError>;
 
@@ -547,7 +548,11 @@ fn spawn_h3_request_resolution(
     resolved_tx: mpsc::UnboundedSender<ResolvedRequest>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let _ = resolved_tx.send(resolver.resolve_request().await);
+        let resolved = resolver
+            .resolve_request()
+            .await
+            .map(|(request, stream)| ResolvedRequestValue { request, stream });
+        let _ = resolved_tx.send(resolved);
     })
 }
 
@@ -572,9 +577,13 @@ async fn handle_resolved_request(
     h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
     webtransport_tx: &mpsc::UnboundedSender<WebTransportPrep>,
 ) -> bool {
-    let Some((request, mut stream)) = resolved_request(resolved) else {
+    let Some(resolved) = resolved_request(resolved) else {
         return false;
     };
+    let ResolvedRequestValue {
+        request,
+        mut stream,
+    } = resolved;
 
     if reject_0rtt_stream(&mut stream) {
         return false;

@@ -9,10 +9,7 @@ use std::{path::Path, sync::Arc};
 use agent_sandbox_core::{DEFAULT_MAX_TTL, DnsCache, network_revocation::NetworkPolicyRevocation};
 use tracing::{debug, info, warn};
 
-use crate::{
-    flow::NfqState,
-    verdict_cache::VerdictCache,
-};
+use crate::{flow::NfqState, verdict_cache::VerdictCache};
 
 /// Background thread that consumes `{"ip","host","ttl"}` lines from the DNS
 /// forwarder's push socket and inserts them into the in-memory cache. The
@@ -58,7 +55,9 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
             let mut buf = [0u8; 512];
 
             loop {
-                let Ok((n, cred)) = recv_datagram_with_creds(&listener, &mut buf) else {
+                let Ok(DatagramReceipt { len: n, cred }) =
+                    recv_datagram_with_creds(&listener, &mut buf)
+                else {
                     continue;
                 };
 
@@ -89,7 +88,9 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
                     continue;
                 };
 
-                if let Err(error) = apply_push_mapping(&cache, revocation.as_deref(), verdicts.as_deref(), &entry) {
+                if let Err(error) =
+                    apply_push_mapping(&cache, revocation.as_deref(), verdicts.as_deref(), &entry)
+                {
                     warn!(%error, "cannot revoke network grants before DNS push");
                 }
             }
@@ -102,6 +103,12 @@ struct UnixPeerCred {
     pid: u32,
     uid: u32,
     gid: u32,
+}
+
+/// Bytes received on the push socket with the sender's credentials.
+struct DatagramReceipt {
+    len: usize,
+    cred: UnixPeerCred,
 }
 
 fn restrict_push_socket_permissions(path: &Path) -> std::io::Result<()> {
@@ -119,7 +126,7 @@ fn enable_passcred(sock: &std::os::unix::net::UnixDatagram) -> std::io::Result<(
 fn recv_datagram_with_creds(
     sock: &std::os::unix::net::UnixDatagram,
     buf: &mut [u8],
-) -> std::io::Result<(usize, UnixPeerCred)> {
+) -> std::io::Result<DatagramReceipt> {
     use std::{io::IoSliceMut, os::unix::io::AsRawFd};
 
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
@@ -152,7 +159,10 @@ fn recv_datagram_with_creds(
             )
         })?;
 
-    Ok((msg.bytes, cred))
+    Ok(DatagramReceipt {
+        len: msg.bytes,
+        cred,
+    })
 }
 
 /// Apply a validated push mapping to the in-memory DNS cache.
@@ -249,7 +259,9 @@ mod tests {
         let listener_thread = std::thread::spawn(move || {
             let mut buf = [0_u8; 512];
 
-            let Ok((n, cred)) = recv_datagram_with_creds(&listener, &mut buf) else {
+            let Ok(DatagramReceipt { len: n, cred }) =
+                recv_datagram_with_creds(&listener, &mut buf)
+            else {
                 return false;
             };
 

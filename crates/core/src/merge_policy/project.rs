@@ -127,7 +127,8 @@ pub fn trusted_project_policy_path(project_root: &Path) -> Result<PathBuf, Proje
         return Ok(canonical_policy);
     }
 
-    // File does not exist yet — the constructed path cannot be a symlink escape.
+    // File does not exist yet — the constructed path cannot be a symlink
+    // escape.
     Ok(policy_path)
 }
 

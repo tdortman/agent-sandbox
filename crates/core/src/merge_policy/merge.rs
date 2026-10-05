@@ -76,7 +76,7 @@ fn dbus_rules_overlap(deny: &DbusRule, allow: &DbusRule) -> bool {
 }
 
 fn merge_dbus(layers: &[Policy]) -> DbusSection {
-    let (allow, deny) = merge_rules(
+    let MergedRules { allow, deny } = merge_rules(
         layers,
         |policy| &policy.dbus.allow,
         |policy| &policy.dbus.deny,
@@ -99,13 +99,18 @@ fn network_rules_overlap(deny: &NetworkRule, allow: &NetworkRule) -> bool {
     host_pattern_matches(&deny.host, &allow.host) || host_pattern_matches(&allow.host, &deny.host)
 }
 
+struct MergedRules<R> {
+    allow: Vec<R>,
+    deny: Vec<R>,
+}
+
 fn merge_rules<R, K, Allow, Deny, Key, Overlap>(
     layers: &[Policy],
     allow_rules: Allow,
     deny_rules: Deny,
     key: Key,
     overlaps: Overlap,
-) -> (Vec<R>, Vec<R>)
+) -> MergedRules<R>
 where
     R: Clone,
     K: Ord,
@@ -137,11 +142,18 @@ where
             .any(|deny_rule| overlaps(deny_rule, allow_rule))
     });
 
-    (allow.into_values().collect(), deny.into_values().collect())
+    MergedRules {
+        allow: allow.into_values().collect(),
+        deny: deny.into_values().collect(),
+    }
 }
 
 fn merge_http_rules(layers: &[Policy], allow_rules: bool) -> Vec<HttpRule> {
-    let mut merged: BTreeMap<HttpUrl, (HttpMethodMatcher, Option<String>)> = BTreeMap::new();
+    struct Methods {
+        methods: HttpMethodMatcher,
+        comment: Option<String>,
+    }
+    let mut merged: BTreeMap<HttpUrl, Methods> = BTreeMap::new();
 
     for layer in layers {
         let rules = if allow_rules {
@@ -157,18 +169,21 @@ fn merge_http_rules(layers: &[Policy], allow_rules: bool) -> Vec<HttpRule> {
 
             let url = target.url;
 
-            if let Some((methods, comment)) = merged.get_mut(&url) {
+            if let Some(Methods { methods, comment }) = merged.get_mut(&url) {
                 *methods = methods.union(&target.method);
                 comment.clone_from(&rule.comment);
             } else {
-                merged.insert(url, (target.method, rule.comment.clone()));
+                merged.insert(url, Methods {
+                    methods: target.method,
+                    comment: rule.comment.clone(),
+                });
             }
         }
     }
 
     merged
         .into_iter()
-        .map(|(url, (methods, comment))| {
+        .map(|(url, Methods { methods, comment })| {
             let methods = methods
                 .to_methods()
                 .into_iter()
@@ -184,7 +199,10 @@ fn http_rule_target(rule: &HttpRule) -> Option<HttpRuleTarget> {
 }
 
 fn merge_network(layers: &[Policy]) -> NetworkSection {
-    let (direct_allow, direct_deny) = merge_rules(
+    let MergedRules {
+        allow: direct_allow,
+        deny: direct_deny,
+    } = merge_rules(
         layers,
         |policy| &policy.network.direct.allow,
         |policy| &policy.network.direct.deny,
@@ -226,7 +244,7 @@ fn sudo_rules_overlap(deny: &SudoRule, allow: &SudoRule) -> bool {
 }
 
 fn merge_sudo(layers: &[Policy]) -> SudoSection {
-    let (allow, deny) = merge_rules(
+    let MergedRules { allow, deny } = merge_rules(
         layers,
         |policy| &policy.sudo.allow,
         |policy| &policy.sudo.deny,
@@ -255,7 +273,7 @@ fn filesystem_rules_overlap(deny: &FilesystemRule, allow: &FilesystemRule) -> bo
 }
 
 fn merge_filesystem(layers: &[Policy]) -> FilesystemSection {
-    let (allow, deny) = merge_rules(
+    let MergedRules { allow, deny } = merge_rules(
         layers,
         |policy| &policy.filesystem.allow,
         |policy| &policy.filesystem.deny,
@@ -279,7 +297,7 @@ fn resource_rules_overlap(deny: &ResourceRule, allow: &ResourceRule) -> bool {
 }
 
 fn merge_resources(layers: &[Policy]) -> ResourceSection {
-    let (allow, deny) = merge_rules(
+    let MergedRules { allow, deny } = merge_rules(
         layers,
         |policy| &policy.resources.allow,
         |policy| &policy.resources.deny,
@@ -347,7 +365,8 @@ mod tests {
 
     #[test]
     fn resource_exact_deny_shadows_allow_on_merge() {
-        // Same path, deny access is a superset of allow access: strip the allow.
+        // Same path, deny access is a superset of allow access: strip the
+        // allow.
         let low = Policy {
             resources: ResourceSection {
                 allow: vec![ResourceRule::new(

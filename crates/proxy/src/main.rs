@@ -214,7 +214,10 @@ async fn main() -> Result<(), BoxError> {
             .map_or_else(Vec::new, |backend| backend.bound_ports().to_vec());
 
         if let Some(path) = &args.write_bound_ports {
-            config.write_bound_ports = Some((path.clone(), http3_ports));
+            config.write_bound_ports = Some(agent_sandbox_proxy::tcp_backend::BoundPortsReport {
+                path: path.clone(),
+                http3_ports,
+            });
         }
 
         config

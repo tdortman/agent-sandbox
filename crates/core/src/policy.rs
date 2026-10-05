@@ -1787,10 +1787,10 @@ impl StaticPolicyAllow {
 
     /// Whether the static snapshot allows every path/access pair.
     #[must_use]
-    pub fn allows_all(&self, checks: &[(PathBuf, FileAccess)]) -> bool {
+    pub fn allows_all(&self, checks: &[FilesystemCheck]) -> bool {
         checks
             .iter()
-            .all(|(path, access)| self.allows(path, *access, PathResolution::Unresolved))
+            .all(|check| self.allows(&check.path, check.access, PathResolution::Unresolved))
     }
 
     /// Whether the snapshot holds no usable rules (load failed or empty
@@ -1801,15 +1801,24 @@ impl StaticPolicyAllow {
     }
 }
 
+/// One filesystem path and the access required by an operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemCheck {
+    /// Path to evaluate against filesystem policy.
+    pub path: PathBuf,
+    /// Access required at this path.
+    pub access: FileAccess,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        DeviceAccess, FileAccess, FilesystemRule, PathResolution, Policy, ResourceAccess,
-        ResourceKind, ResourceRule, SocketAccess, StaticPolicyAllow, SudoRule, contract_home_path,
-        contract_project_path, expand_home_path, expire_rule_path_cache, filesystem_approval_paths,
-        open_flags_to_file_access,
+        DeviceAccess, FileAccess, FilesystemCheck, FilesystemRule, PathResolution, Policy,
+        ResourceAccess, ResourceKind, ResourceRule, SocketAccess, StaticPolicyAllow, SudoRule,
+        contract_home_path, contract_project_path, expand_home_path, expire_rule_path_cache,
+        filesystem_approval_paths, open_flags_to_file_access,
     };
 
     #[test]
@@ -1977,7 +1986,8 @@ mod tests {
         assert!(rule.path_matches(Path::new("/home/user/state/opencode"), None));
         assert!(rule.path_matches(Path::new("/home/user/state/opencode/model.json"), None));
 
-        // Prefix boundary: a longer name sharing the prefix stem must not match.
+        // Prefix boundary: a longer name sharing the prefix stem must not
+        // match.
         assert!(!rule.path_matches(Path::new("/home/user/state/opencode-other"), None));
 
         assert!(!rule.path_matches(Path::new("/home/user/elsewhere"), None));
@@ -2525,13 +2535,25 @@ mod tests {
         );
 
         assert!(eval.allows_all(&[
-            (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
-            (PathBuf::from("/readonly"), FileAccess::Read),
+            FilesystemCheck {
+                path: PathBuf::from("/home/user/bench/a"),
+                access: FileAccess::Read
+            },
+            FilesystemCheck {
+                path: PathBuf::from("/readonly"),
+                access: FileAccess::Read
+            },
         ]));
 
         assert!(!eval.allows_all(&[
-            (PathBuf::from("/home/user/bench/a"), FileAccess::Read),
-            (PathBuf::from("/denied"), FileAccess::Read),
+            FilesystemCheck {
+                path: PathBuf::from("/home/user/bench/a"),
+                access: FileAccess::Read
+            },
+            FilesystemCheck {
+                path: PathBuf::from("/denied"),
+                access: FileAccess::Read
+            },
         ]));
     }
 

@@ -247,8 +247,8 @@ pub async fn run_tcp_listener(
     let listen_port = v4.local_addr()?.port();
 
     #[cfg(debug_assertions)]
-    if let Some((path, http3_ports)) = &config.write_bound_ports {
-        write_bound_ports_file(path, listen_port, http3_ports)?;
+    if let Some(report) = &config.write_bound_ports {
+        write_bound_ports_file(&report.path, listen_port, &report.http3_ports)?;
     }
 
     let service = build_listener_service(
@@ -408,7 +408,17 @@ pub struct ListenConfig {
 
     #[cfg(debug_assertions)]
     /// Test-only: write the bound listener ports for the harness.
-    pub write_bound_ports: Option<(PathBuf, Vec<u16>)>,
+    pub write_bound_ports: Option<BoundPortsReport>,
+}
+
+/// Test-only bound listener ports reported to the harness.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone)]
+pub struct BoundPortsReport {
+    /// File the bound ports are written to.
+    pub path: PathBuf,
+    /// Bound HTTP/3 UDP ports.
+    pub http3_ports: Vec<u16>,
 }
 
 fn build_listener_service(
@@ -467,8 +477,9 @@ fn build_listener_service(
             // Ports do not identify protocols: peek at the stream to tell
             // HTTP(S) apart from raw TCP. The peek replays the classified
             // bytes to whichever path runs next.
-            let (sniff, stream) = peek::peek_protocol(stream, claim.owner_cgroup.as_deref()).await;
-            if !matches!(sniff, TcpSniff::Tls | TcpSniff::Http) {
+            let peeked = peek::peek_protocol(stream, claim.owner_cgroup.as_deref()).await;
+            let stream = peeked.stream;
+            if !matches!(peeked.sniff, TcpSniff::Tls | TcpSniff::Http) {
                 let result = serve_passthrough(
                     stream,
                     &policy,
@@ -489,7 +500,7 @@ fn build_listener_service(
             let state = {
                 FlowState {
                     destination,
-                    tls: test_tls || matches!(sniff, TcpSniff::Tls),
+                    tls: test_tls || matches!(peeked.sniff, TcpSniff::Tls),
                     active_checks: active_checks.clone(),
                     policy: policy.clone(),
                     claim: claim.clone(),
@@ -667,11 +678,20 @@ fn original_destination(stream: &TcpStream) -> Option<SocketAddr> {
         })
 }
 
+/// One approved downstream HTTP request with its policy decision.
+#[derive(Debug)]
+struct CheckedHttpPolicy {
+    semantic_request: SemanticRequest,
+    check: HttpCheckReply,
+    authority: String,
+    path: String,
+}
+
 async fn check_http_policy(
     request: &Request,
     state: &FlowState,
     shutdown: &Arc<Notify>,
-) -> Result<(SemanticRequest, HttpCheckReply, String, String), BoxError> {
+) -> Result<CheckedHttpPolicy, BoxError> {
     let header_host = request
         .headers()
         .get("host")
@@ -741,7 +761,12 @@ async fn check_http_policy(
         )
         .await?;
 
-    Ok((semantic_request, check, authority, path))
+    Ok(CheckedHttpPolicy {
+        semantic_request,
+        check,
+        authority,
+        path,
+    })
 }
 
 async fn proxy_request(
@@ -757,8 +782,12 @@ async fn proxy_request(
 
     let response_context = ResponseVersionAdaptCtx::from_request(&request);
     let doh = is_doh_request(&request);
-    let (semantic_request, check, authority, path) =
-        check_http_policy(&request, &state, &shutdown).await?;
+    let CheckedHttpPolicy {
+        semantic_request,
+        check,
+        authority,
+        path,
+    } = check_http_policy(&request, &state, &shutdown).await?;
     if !check.ok || !check.verdict.allowed {
         info!(
             %authority, %path, method = %request.method().as_str(),
@@ -775,7 +804,7 @@ async fn proxy_request(
 
     let original_uri = request.uri().to_string();
 
-    let (mut response, upstream_authority) = upstream::send_upstream_request(
+    let upstream_result = upstream::send_upstream_request(
         request,
         &state,
         semantic_request,
@@ -784,6 +813,8 @@ async fn proxy_request(
         websocket,
     )
     .await?;
+    let mut response = upstream_result.response;
+    let upstream_authority = upstream_result.authority;
     let response_status = response.status();
     let response_version = response.version();
 
@@ -981,7 +1012,8 @@ fn is_websocket_upgrade_request(request: &Request) -> bool {
 }
 
 fn force_websocket_http11(request: &Request, target: &HttpUrl, patterns: &[HttpUrl]) {
-    // RequestVersionAdapter translates H2 WebSocket CONNECT into H1 GET/Upgrade.
+    // RequestVersionAdapter translates H2 WebSocket CONNECT into H1
+    // GET/Upgrade.
     if is_websocket_upgrade_request(request)
         && patterns.iter().any(|pattern| pattern.matches(target))
     {
@@ -1767,14 +1799,14 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (semantic, check, authority, path) =
-            check_http_policy(&request, &state, &shutdown).await?;
+        let checked = check_http_policy(&request, &state, &shutdown).await?;
+        drop(state);
 
-        assert!(check.ok);
-        assert!(check.verdict.allowed);
-        assert_eq!(authority, "127.0.0.1:8080");
-        assert_eq!(path, "/");
-        assert_eq!(semantic.authority(), "127.0.0.1:8080");
+        assert!(checked.check.ok);
+        assert!(checked.check.verdict.allowed);
+        assert_eq!(checked.authority, "127.0.0.1:8080");
+        assert_eq!(checked.path, "/");
+        assert_eq!(checked.semantic_request.authority(), "127.0.0.1:8080");
         Ok(())
     }
 }

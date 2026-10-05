@@ -135,8 +135,9 @@ impl CertificateIssuer {
         }
 
         let mut params = CertificateParams::new(vec![server_name])?;
-        // RFC 5280 requires the Authority Key Identifier in CA-issued certificates.
-        // Strict verifiers, such as Python 3.13+ by default, reject leaves without it.
+        // RFC 5280 requires the Authority Key Identifier in CA-issued
+        // certificates. Strict verifiers, such as Python 3.13+ by
+        // default, reject leaves without it.
         params.use_authority_key_identifier_extension = true;
         let key_pair = KeyPair::generate_for(match algorithm {
             LeafKeyAlgorithm::EcdsaP256 => &rcgen::PKCS_ECDSA_P256_SHA256,

@@ -45,8 +45,8 @@ pub fn file_passwd_home<'a>(nsswitch: &str, passwd: &'a str, uid: u32) -> io::Re
         }
         configured = true;
         let mut services = services.split_ascii_whitespace();
-        // ponytail: accept the default SUCCESS=return only; parse action clauses
-        // when a deployment actually needs them.
+        // ponytail: accept the default SUCCESS=return only; parse action
+        // clauses when a deployment actually needs them.
         if services.next() != Some("files")
             || !services.all(|service| {
                 service

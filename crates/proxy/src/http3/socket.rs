@@ -25,7 +25,11 @@ use rama_net::socket::core::{Domain, Protocol, Socket as Socket2, Type};
 use tokio::io::unix::AsyncFd;
 
 /// One received UDP datagram and its metadata.
-type ReceivedDatagram = (usize, Option<SocketAddr>, Option<IpAddr>);
+struct ReceivedDatagram {
+    length: usize,
+    source: Option<SocketAddr>,
+    destination: Option<IpAddr>,
+}
 
 /// One project-owned transparent UDP socket.
 ///
@@ -144,7 +148,11 @@ impl TransparentUdpSocket {
         }
 
         let original_destination = original_destination.or(packet_destination);
-        Ok(Some((message.bytes, source, original_destination)))
+        Ok(Some(ReceivedDatagram {
+            length: message.bytes,
+            source,
+            destination: original_destination,
+        }))
     }
 
     fn send_one(
@@ -259,15 +267,15 @@ impl quinn::AsyncUdpSocket for TransparentUdpSocket {
             };
 
             match self.recv_one(buffer) {
-                Ok(Some((length, source, original_destination))) => {
+                Ok(Some(datagram)) => {
                     let destination = if self.transparent {
-                        original_destination.ok_or_else(|| {
+                        datagram.destination.ok_or_else(|| {
                             io::Error::other(
                                 "transparent UDP datagram arrived without original destination",
                             )
                         })?
                     } else {
-                        original_destination.unwrap_or_else(|| {
+                        datagram.destination.unwrap_or_else(|| {
                             if self.bound.is_ipv4() {
                                 IpAddr::V4(Ipv4Addr::UNSPECIFIED)
                             } else {
@@ -276,11 +284,11 @@ impl quinn::AsyncUdpSocket for TransparentUdpSocket {
                         })
                     };
 
-                    meta.addr = source.ok_or_else(|| {
+                    meta.addr = datagram.source.ok_or_else(|| {
                         io::Error::other("UDP datagram arrived without a source address")
                     })?;
-                    meta.len = length;
-                    meta.stride = length;
+                    meta.len = datagram.length;
+                    meta.stride = datagram.length;
                     meta.ecn = None;
                     meta.dst_ip = Some(destination);
 

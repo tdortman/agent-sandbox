@@ -101,27 +101,52 @@ const DEFAULT_MAX_AGE: Duration = Duration::from_hours(24);
 /// Default port for an `h3` alternative.
 const H3_DEFAULT_PORT: u16 = 443;
 
+/// One parsed alternative endpoint: the host and port.
+struct HostPort<'a> {
+    host: &'a str,
+    port: u16,
+}
+
+/// One alternative transport endpoint keyed in the mapping store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EndpointKey {
+    ip: IpAddr,
+    port: u16,
+}
+
 /// Split `host` and an optional port into the host and port.
 ///
 /// A malformed explicit port filters the alternative instead of silently
 /// becoming the default port.
-fn parse_host_port<'a>(host: &'a str, port: Option<&str>) -> Option<(&'a str, u16)> {
+fn parse_host_port<'a>(host: &'a str, port: Option<&str>) -> Option<HostPort<'a>> {
     match port {
-        Some(port) => Some((host, port.parse().ok()?)),
-        None => Some((host, H3_DEFAULT_PORT)),
+        Some(port) => Some(HostPort {
+            host,
+            port: port.parse().ok()?,
+        }),
+        None => Some(HostPort {
+            host,
+            port: H3_DEFAULT_PORT,
+        }),
     }
 }
 
 /// Mapping store shared by the TCP and HTTP/3 proxy backends.
 pub struct AltSvcStore {
     intercepted_udp_ports: Mutex<Vec<u16>>,
-    entries: Mutex<HashMap<(IpAddr, u16), OriginEntry>>,
+    entries: Mutex<HashMap<EndpointKey, OriginEntry>>,
 }
 
 #[derive(Debug, Clone)]
 struct OriginEntry {
     origin: String,
     expiry: Instant,
+}
+
+/// One validated alternative with its recorded origin entry.
+struct AltSvcMapping {
+    endpoint: EndpointKey,
+    entry: OriginEntry,
 }
 
 impl AltSvcStore {
@@ -163,7 +188,7 @@ impl AltSvcStore {
     /// Panics when the entry lock is poisoned by a panicking task.
     pub async fn record(&self, origin: &str, values: &[&[u8]]) -> Option<Vec<u8>> {
         let mut preserved = Vec::new();
-        let mut new_entries = Vec::new();
+        let mut new_entries: Vec<AltSvcMapping> = Vec::new();
         let mut cleared = false;
 
         for value in values {
@@ -172,11 +197,11 @@ impl AltSvcStore {
                     Alternative::Clear => cleared = true,
 
                     Alternative::Service(service) => {
-                        let Some(entry) = self.resolved_entry(origin, &service).await else {
+                        let Some(mappings) = self.resolved_entry(origin, &service).await else {
                             continue;
                         };
 
-                        new_entries.extend(entry);
+                        new_entries.extend(mappings);
                         preserved.push(service.raw.to_vec());
                     }
                 }
@@ -198,7 +223,9 @@ impl AltSvcStore {
         {
             let mut entries = self.entries.lock().expect("alt-svc entries lock");
             entries.retain(|_, entry| entry.origin != origin);
-            entries.extend(new_entries);
+            for mapping in new_entries {
+                entries.insert(mapping.endpoint, mapping.entry);
+            }
         }
 
         Some(preserved.join(&b", "[..]))
@@ -212,7 +239,7 @@ impl AltSvcStore {
         &self,
         origin: &str,
         service: &ServiceAlternative<'_>,
-    ) -> Option<Vec<((IpAddr, u16), OriginEntry)>> {
+    ) -> Option<Vec<AltSvcMapping>> {
         if !self.is_intercepted(service.port) {
             debug!(
                 port = service.port,
@@ -243,11 +270,15 @@ impl AltSvcStore {
 
         Some(
             ips.into_iter()
-                .map(|ip| {
-                    ((ip, service.port), OriginEntry {
+                .map(|ip| AltSvcMapping {
+                    endpoint: EndpointKey {
+                        ip,
+                        port: service.port,
+                    },
+                    entry: OriginEntry {
                         origin: origin.clone(),
                         expiry,
-                    })
+                    },
                 })
                 .collect(),
         )
@@ -262,12 +293,13 @@ impl AltSvcStore {
     /// Panics when the entry lock is poisoned by a panicking task.
     #[must_use]
     pub fn origin_for(&self, ip: IpAddr, port: u16) -> Option<String> {
+        let key = EndpointKey { ip, port };
         let origin = {
             let mut entries = self.entries.lock().expect("alt-svc entries lock");
-            let entry = entries.get(&(ip, port))?;
+            let entry = entries.get(&key)?;
 
             if entry.expiry <= Instant::now() {
-                entries.remove(&(ip, port));
+                entries.remove(&key);
                 drop(entries);
                 return None;
             }
@@ -397,7 +429,7 @@ fn parse_authority(authority: &str) -> Option<ParsedAuthority<'_>> {
 
     // Bracketed IPv6 literals split at the closing bracket; everything else
     // splits at the last colon. A malformed port filters the alternative.
-    let (host, port) = if let Some((host, suffix)) = authority
+    let endpoint = if let Some((host, suffix)) = authority
         .strip_prefix('[')
         .and_then(|rest| rest.split_once(']'))
     {
@@ -411,8 +443,8 @@ fn parse_authority(authority: &str) -> Option<ParsedAuthority<'_>> {
     };
 
     Some(ParsedAuthority {
-        host: Some(host),
-        port,
+        host: Some(endpoint.host),
+        port: endpoint.port,
     })
 }
 

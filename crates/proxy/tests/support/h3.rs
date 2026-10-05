@@ -227,15 +227,18 @@ impl Http3Response {
 
     /// Read the complete response body.
     pub async fn body(self) -> Vec<u8> {
-        self.body_with_trailers().await.0
+        self.body_with_trailers().await.body
     }
 
     /// Read the complete response body and trailers.
-    pub async fn body_with_trailers(mut self) -> (Vec<u8>, http::HeaderMap) {
+    pub async fn body_with_trailers(mut self) -> ResponseBodyWithTrailers {
         let mut body = Vec::new();
 
         let Some(mut stream) = self.stream.take() else {
-            return (body, http::HeaderMap::new());
+            return ResponseBodyWithTrailers {
+                body,
+                trailers: http::HeaderMap::new(),
+            };
         };
 
         while let Some(mut chunk) = stream
@@ -252,8 +255,24 @@ impl Http3Response {
             .unwrap_or_else(|error| panic!("response trailers failed: {error}"))
             .unwrap_or_default();
 
-        (body, trailers)
+        ResponseBodyWithTrailers { body, trailers }
     }
+}
+
+/// One HTTP/3 response body with its trailers.
+pub struct ResponseBodyWithTrailers {
+    /// The complete response body bytes.
+    pub body: Vec<u8>,
+    /// The response trailers.
+    pub trailers: http::HeaderMap,
+}
+
+/// One HTTP/3 response with its interim informational responses.
+pub struct InformationalHttp3Response {
+    /// The interim 1xx responses.
+    pub informational: Vec<http::Response<()>>,
+    /// The final response.
+    pub response: Http3Response,
 }
 
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
@@ -453,11 +472,11 @@ impl Http3Client {
         server_name: &str,
         path: &str,
     ) -> Result<Http3Response, String> {
-        let (_, response) = self
+        let answered = self
             .request_with_informational(server, server_name, path)
             .await?;
 
-        Ok(response)
+        Ok(answered.response)
     }
 
     /// Send one GET request and retain informational responses.
@@ -466,7 +485,7 @@ impl Http3Client {
         server: SocketAddr,
         server_name: &str,
         path: &str,
-    ) -> Result<(Vec<http::Response<()>>, Http3Response), String> {
+    ) -> Result<InformationalHttp3Response, String> {
         let connection = self.connect_quic(server, server_name).await?;
         let h3 = h3_quinn::Connection::new(connection);
 
@@ -490,13 +509,16 @@ impl Http3Client {
             .await
             .map_err(|error| format!("response failed: {error}"))?;
 
-        Ok((informational, Http3Response {
-            status: response.status().as_u16(),
-            headers: response.headers().clone(),
-            stream: Some(stream),
-            _send_request: send_request,
-            _connection: connection,
-        }))
+        Ok(InformationalHttp3Response {
+            informational,
+            response: Http3Response {
+                status: response.status().as_u16(),
+                headers: response.headers().clone(),
+                stream: Some(stream),
+                _send_request: send_request,
+                _connection: connection,
+            },
+        })
     }
 
     /// Send a POST request that waits for `100 Continue` before its body.
@@ -949,7 +971,7 @@ impl Http3Client {
         server: SocketAddr,
         server_name: &str,
         path: &str,
-    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    ) -> Result<Vec<TestCapsule>, String> {
         self.connect_udp_capsule_probe_with_settings(server, server_name, path, false, true)
             .await
     }
@@ -983,7 +1005,7 @@ impl Http3Client {
         path: &str,
         malformed: bool,
         capsule_protocol: bool,
-    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    ) -> Result<Vec<TestCapsule>, String> {
         let quinn_connection = self.connect_quic(server, server_name).await?;
         let h3_quic = h3_quinn::Connection::new(quinn_connection);
         let mut builder = h3::client::builder();
@@ -1286,20 +1308,29 @@ fn encode_test_capsule(kind: u64, payload: &[u8]) -> Vec<u8> {
     encoded
 }
 
-fn decode_test_capsules(mut encoded: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, String> {
+/// One decoded test capsule with its type and payload.
+pub struct TestCapsule {
+    /// The capsule type.
+    pub kind: u64,
+    /// The capsule payload.
+    pub payload: Vec<u8>,
+}
+
+fn decode_test_capsules(mut encoded: &[u8]) -> Result<Vec<TestCapsule>, String> {
     let mut capsules = Vec::new();
 
     while !encoded.is_empty() {
-        let Some((kind, kind_len)) = decode_test_varint(encoded) else {
+        let Some(kind) = decode_test_varint(encoded) else {
             return Err("truncated Capsule Protocol type".to_owned());
         };
 
-        let Some((length, length_len)) = decode_test_varint(&encoded[kind_len..]) else {
+        let Some(length) = decode_test_varint(&encoded[kind.encoded_len..]) else {
             return Err("truncated Capsule Protocol length".to_owned());
         };
 
-        let length = usize::try_from(length).map_err(|_| "Capsule Protocol length is too large")?;
-        let start = kind_len + length_len;
+        let start = kind.encoded_len + length.encoded_len;
+        let length =
+            usize::try_from(length.value).map_err(|_| "Capsule Protocol length is too large")?;
 
         let end = start
             .checked_add(length)
@@ -1309,7 +1340,10 @@ fn decode_test_capsules(mut encoded: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, Strin
             return Err("truncated Capsule Protocol payload".to_owned());
         }
 
-        capsules.push((kind, encoded[start..end].to_vec()));
+        capsules.push(TestCapsule {
+            kind: kind.value,
+            payload: encoded[start..end].to_vec(),
+        });
         encoded = &encoded[end..];
     }
 
@@ -1337,7 +1371,13 @@ fn encode_test_varint(value: u64, output: &mut Vec<u8>) {
     }
 }
 
-fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
+/// One decoded test varint with its encoded length.
+struct TestVarint {
+    value: u64,
+    encoded_len: usize,
+}
+
+fn decode_test_varint(encoded: &[u8]) -> Option<TestVarint> {
     let first = encoded.first().copied()?;
     let length = 1usize << (first >> 6);
 
@@ -1351,5 +1391,8 @@ fn decode_test_varint(encoded: &[u8]) -> Option<(u64, usize)> {
         value = (value << 8) | u64::from(*byte);
     }
 
-    Some((value, length))
+    Some(TestVarint {
+        value,
+        encoded_len: length,
+    })
 }

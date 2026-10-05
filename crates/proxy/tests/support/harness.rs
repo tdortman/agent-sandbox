@@ -64,7 +64,7 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
     if options.tls {
         let origin_address = SocketAddr::new(options.ip, options.origin_port);
 
-        let (origin, tls_origin) = start_tls_origin(
+        let origin = start_tls_origin(
             origin_address,
             &options.certificate,
             &options.private_key,
@@ -73,8 +73,8 @@ async fn start_harness_origin(options: OriginOptions) -> HarnessOrigins {
         .await;
 
         return HarnessOrigins {
-            tcp: origin,
-            tls: Some(tls_origin),
+            tcp: origin.tcp,
+            tls: Some(origin.tls),
             h3: None,
         };
     }
@@ -132,13 +132,21 @@ fn spawn_harness_proxy(mut command: Command, proxy_log: &Path, ready: &Path) -> 
         .expect("start proxy")
 }
 
-fn write_harness_ca(root: &TempDir) -> (PathBuf, PathBuf) {
+struct HarnessCa {
+    certificate: PathBuf,
+    key: PathBuf,
+}
+
+fn write_harness_ca(root: &TempDir) -> HarnessCa {
     let ca = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("generate CA");
     let ca_cert = root.path().join("ca.pem");
     let ca_key = root.path().join("ca-key.pem");
     std::fs::write(&ca_cert, ca.cert.pem()).expect("write CA certificate");
     std::fs::write(&ca_key, ca.signing_key.serialize_pem()).expect("write CA key");
-    (ca_cert, ca_key)
+    HarnessCa {
+        certificate: ca_cert,
+        key: ca_key,
+    }
 }
 
 fn start_harness_policy(root: &TempDir, claim_errors: bool) -> FakePolicy {
@@ -147,6 +155,16 @@ fn start_harness_policy(root: &TempDir, claim_errors: bool) -> FakePolicy {
     } else {
         FakePolicy::start(root.path())
     }
+}
+
+pub struct PooledResponses {
+    pub first: Vec<u8>,
+    pub second: Vec<u8>,
+}
+
+pub struct StreamedResponse {
+    pub first: Vec<u8>,
+    pub rest: Vec<u8>,
 }
 
 pub struct TransparentHarness {
@@ -316,7 +334,10 @@ impl TransparentHarness {
 
         let root = tempfile::tempdir().expect("temporary harness directory");
         let policy = start_harness_policy(&root, claim_errors);
-        let (ca_cert, ca_key) = write_harness_ca(&root);
+        let HarnessCa {
+            certificate: ca_cert,
+            key: ca_key,
+        } = write_harness_ca(&root);
 
         let origins = start_harness_origin(OriginOptions {
             ip,
@@ -412,8 +433,10 @@ impl TransparentHarness {
         let proxy = spawn_harness_proxy(proxy_command, &proxy_log, &ready);
         wait_for_path(&ready).await;
 
-        let (proxy_address, h3_alt_address) =
-            resolve_harness_addresses(&root, ip, &read_bound_ports(&bound_ports_path));
+        let HarnessAddresses {
+            proxy_address,
+            h3_alt_address,
+        } = resolve_harness_addresses(&root, ip, &read_bound_ports(&bound_ports_path));
 
         Self {
             proxy_address,
@@ -454,7 +477,7 @@ impl TransparentHarness {
         response
     }
 
-    pub async fn pooled_requests(&self) -> (Vec<u8>, Vec<u8>) {
+    pub async fn pooled_requests(&self) -> PooledResponses {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
@@ -476,7 +499,10 @@ impl TransparentHarness {
             .expect("write second pooled request");
 
         let second_response = read_http_response(&mut stream).await;
-        (first_response, second_response)
+        PooledResponses {
+            first: first_response,
+            second: second_response,
+        }
     }
 
     pub async fn websocket_request(&self) -> Vec<u8> {
@@ -547,7 +573,7 @@ impl TransparentHarness {
         response
     }
 
-    pub async fn streaming_request(&self, path: &str) -> (Vec<u8>, Vec<u8>) {
+    pub async fn streaming_request(&self, path: &str) -> StreamedResponse {
         let mut stream = TcpStream::connect(self.proxy_address)
             .await
             .expect("connect proxy");
@@ -591,7 +617,7 @@ impl TransparentHarness {
             .await
             .expect("read remaining response");
 
-        (first, rest)
+        StreamedResponse { first, rest }
     }
 
     pub async fn abort_streaming_request(&self, path: &str) {
@@ -780,13 +806,18 @@ struct BoundProxyPorts {
     http3_alts: Vec<u16>,
 }
 
+struct HarnessAddresses {
+    proxy_address: SocketAddr,
+    h3_alt_address: Option<SocketAddr>,
+}
+
 /// Derive the client-facing addresses from the proxy's reported ports and
 /// publish the alternative port to the origin's advertisement file.
 fn resolve_harness_addresses(
     root: &TempDir,
     ip: IpAddr,
     bound_ports: &BoundProxyPorts,
-) -> (SocketAddr, Option<SocketAddr>) {
+) -> HarnessAddresses {
     let proxy_address = SocketAddr::new(ip, bound_ports.http3_main.unwrap_or(bound_ports.tcp));
 
     let h3_alt_address = bound_ports
@@ -800,7 +831,10 @@ fn resolve_harness_addresses(
             .expect("write origin alt-svc port");
     }
 
-    (proxy_address, h3_alt_address)
+    HarnessAddresses {
+        proxy_address,
+        h3_alt_address,
+    }
 }
 
 fn read_bound_ports(path: &Path) -> BoundProxyPorts {

@@ -590,7 +590,7 @@ impl HttpUrl {
             return Self::parse(raw);
         }
 
-        let (sanitized, tokens) = replace_pattern_metacharacters(raw);
+        let SanitizedPattern { sanitized, tokens } = replace_pattern_metacharacters(raw);
         let mut url = Self::parse(&sanitized)?;
 
         if tokens.is_empty() {
@@ -599,7 +599,11 @@ impl HttpUrl {
 
         let mut pattern = url.to_string();
 
-        for (token, metacharacter) in tokens {
+        for PatternToken {
+            token,
+            metacharacter,
+        } in tokens
+        {
             if pattern.matches(&token).count() != 1 {
                 return Err(HttpParseError::InvalidUrl);
             }
@@ -999,17 +1003,18 @@ impl HttpRuleTarget {
         {
             return Self::new(method, base);
         }
-        let (normalized, effective) = HttpRule::normalize_url_and_port(&rule.url, Some(rule.port))?;
-        let normalized_url = HttpUrl::parse_pattern(&normalized)?;
-        let url = if effective.get() == normalized_url.scheme.default_port() {
-            if normalized_url.authority.port() != effective {
+        let NormalizedRuleUrl { url, port } =
+            HttpRule::normalize_url_and_port(&rule.url, Some(rule.port))?;
+        let normalized_url = HttpUrl::parse_pattern(&url)?;
+        let url = if port.get() == normalized_url.scheme.default_port() {
+            if normalized_url.authority.port() != port {
                 return Err(HttpParseError::InvalidPort);
             }
             normalized_url
         } else {
-            let effective_raw = inject_rule_port(&normalized, effective)?;
+            let effective_raw = inject_rule_port(&url, port)?;
             let effective_url = HttpUrl::parse_pattern(&effective_raw)?;
-            if effective_url.authority.port() != effective {
+            if effective_url.authority.port() != port {
                 return Err(HttpParseError::InvalidPort);
             }
             effective_url
@@ -1134,7 +1139,7 @@ impl<'de> Deserialize<'de> for HttpRule {
             comment: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        let (url, port) =
+        let NormalizedRuleUrl { url, port } =
             Self::normalize_url_and_port(&wire.url, wire.port).map_err(D::Error::custom)?;
         Ok(Self {
             methods: wire.methods,
@@ -1144,6 +1149,14 @@ impl<'de> Deserialize<'de> for HttpRule {
         })
     }
 }
+/// Canonical rule URL with its authoritative effective port.
+pub struct NormalizedRuleUrl {
+    /// Rule URL without an embedded port.
+    pub url: String,
+    /// Effective port, including a scheme default when no port was supplied.
+    pub port: NonZeroU16,
+}
+
 impl HttpRule {
     /// Normalize a raw rule URL and optional explicit port into canonical
     /// storage form (stripped URL, authoritative port).
@@ -1157,21 +1170,13 @@ impl HttpRule {
     pub fn normalize_url_and_port(
         url: &str,
         port: Option<NonZeroU16>,
-    ) -> Result<(String, NonZeroU16), HttpParseError> {
-        let (normalized, effective, _) = Self::normalize_inner(url, port)?;
-        Ok((normalized, effective))
-    }
-
-    fn normalize_inner(
-        url: &str,
-        port: Option<NonZeroU16>,
-    ) -> Result<(String, NonZeroU16, HttpScheme), HttpParseError> {
+    ) -> Result<NormalizedRuleUrl, HttpParseError> {
         let parsed = HttpUrl::parse_pattern(url)?;
         let scheme = parsed.scheme;
         let scheme_default =
             NonZeroU16::new(scheme.default_port()).ok_or(HttpParseError::InvalidPort)?;
         let embedded = embedded_rule_port(url)?;
-        let effective = match (embedded, port) {
+        let port = match (embedded, port) {
             (Some(embedded), Some(explicit)) if embedded != explicit => {
                 return Err(HttpParseError::InvalidPort);
             }
@@ -1179,11 +1184,11 @@ impl HttpRule {
             (None, Some(explicit)) => explicit,
             (None, None) => scheme_default,
         };
-        let normalized = match embedded {
+        let url = match embedded {
             Some(_) => strip_rule_port(url)?,
             None => url.to_owned(),
         };
-        Ok((normalized, effective, scheme))
+        Ok(NormalizedRuleUrl { url, port })
     }
 
     /// Construct a raw rule, deriving the authoritative port from the URL and
@@ -1196,7 +1201,7 @@ impl HttpRule {
         comment: impl Into<String>,
     ) -> Result<Self, HttpParseError> {
         let url = url.into();
-        let (url, port) = Self::normalize_url_and_port(&url, None)?;
+        let NormalizedRuleUrl { url, port } = Self::normalize_url_and_port(&url, None)?;
         Ok(Self {
             methods,
             url,
@@ -1217,7 +1222,7 @@ impl HttpRule {
         comment: impl Into<String>,
     ) -> Result<Self, HttpParseError> {
         let url = url.into();
-        let (url, port) = Self::normalize_url_and_port(&url, Some(port))?;
+        let NormalizedRuleUrl { url, port } = Self::normalize_url_and_port(&url, Some(port))?;
         Ok(Self {
             methods,
             url,
@@ -1559,7 +1564,17 @@ fn glob_pattern_for_matching(url: &HttpUrl, pattern: &str) -> String {
     )
 }
 
-fn replace_pattern_metacharacters(raw: &str) -> (String, Vec<(String, char)>) {
+struct PatternToken {
+    token: String,
+    metacharacter: char,
+}
+
+struct SanitizedPattern {
+    sanitized: String,
+    tokens: Vec<PatternToken>,
+}
+
+fn replace_pattern_metacharacters(raw: &str) -> SanitizedPattern {
     let mut sanitized = String::with_capacity(raw.len());
     let mut replacements = Vec::new();
     let mut index = 0usize;
@@ -1596,10 +1611,16 @@ fn replace_pattern_metacharacters(raw: &str) -> (String, Vec<(String, char)>) {
         };
 
         sanitized.push_str(&token);
-        replacements.push((token, character));
+        replacements.push(PatternToken {
+            token,
+            metacharacter: character,
+        });
     }
 
-    (sanitized, replacements)
+    SanitizedPattern {
+        sanitized,
+        tokens: replacements,
+    }
 }
 
 const fn is_method_byte(byte: u8) -> bool {

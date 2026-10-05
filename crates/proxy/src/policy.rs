@@ -175,7 +175,8 @@ impl PolicySession {
             .map_err(|error| PolicyError::Rpc(error.to_string()))?;
         let result = decode(reply)?;
         // Interrupted, failed, or malformed exchanges drop their connection.
-        // Never hold the idle-list lock across an RPC or wait for a busy client.
+        // Never hold the idle-list lock across an RPC or wait for a busy
+        // client.
         {
             let mut idle = self
                 .idle

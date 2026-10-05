@@ -189,7 +189,9 @@ pub fn validate_socket_identity_with_hint(identity: SocketIdentity, fd_hint: Opt
         return false;
     }
 
-    let Some((task, _)) = process_socket_descriptor(pid, expected_inode, fd_hint) else {
+    let Some(TaskSocketDescriptor { task, .. }) =
+        process_socket_descriptor(pid, expected_inode, fd_hint)
+    else {
         return false;
     };
 
@@ -319,13 +321,22 @@ fn socket_table_entries_from_proc(
     entries
 }
 
+struct TaskSocketDescriptor {
+    task: PathBuf,
+    fd: u32,
+}
+
 /// Check the leader first, then threads with potentially private descriptor
 /// tables. Keep the task path so credentials are read from the actual holder.
-fn process_socket_descriptor(pid: u32, inode: u64, fd_hint: Option<u32>) -> Option<(PathBuf, u32)> {
+fn process_socket_descriptor(
+    pid: u32,
+    inode: u64,
+    fd_hint: Option<u32>,
+) -> Option<TaskSocketDescriptor> {
     let process = PathBuf::from(format!("/proc/{pid}"));
 
     if let Some(fd) = task_socket_descriptor(&process, inode, fd_hint) {
-        return Some((process, fd));
+        return Some(TaskSocketDescriptor { task: process, fd });
     }
 
     // ponytail: scan thread tables on a leader miss; the BPF iterator avoids
@@ -341,7 +352,8 @@ fn process_socket_descriptor(pid: u32, inode: u64, fd_hint: Option<u32>) -> Opti
         })
         .find_map(|task| {
             let path = task.path();
-            task_socket_descriptor(&path, inode, fd_hint).map(|fd| (path, fd))
+            task_socket_descriptor(&path, inode, fd_hint)
+                .map(|fd| TaskSocketDescriptor { task: path, fd })
         })
 }
 
@@ -388,7 +400,9 @@ fn process_candidates(
             continue;
         };
 
-        let Some((task, fd)) = process_socket_descriptor(pid, inode.get(), None) else {
+        let Some(TaskSocketDescriptor { task, fd }) =
+            process_socket_descriptor(pid, inode.get(), None)
+        else {
             continue;
         };
 

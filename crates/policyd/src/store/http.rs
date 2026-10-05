@@ -45,12 +45,19 @@ pub(super) fn target_for_request(request: &HttpRequest) -> HttpRuleTarget {
     .expect("validated HTTP request must construct an exact target")
 }
 
+/// Declarative HTTP verdicts for one request: the deny-wins deny verdict
+/// (checked first) and the allow verdict (the fallback).
+struct HttpPolicyVerdicts {
+    deny: Option<Verdict>,
+    allow: Option<Verdict>,
+}
+
 impl PolicyStore {
     fn http_policy_verdicts(
         &self,
         request: &HttpRequest,
         ctx: &ResolvedRequestContext,
-    ) -> (Option<Verdict>, Option<Verdict>) {
+    ) -> HttpPolicyVerdicts {
         let merged = self.merged_for_worker(ctx);
 
         let denied = merged.network.http.deny.iter().find_map(|rule| {
@@ -73,7 +80,10 @@ impl PolicyStore {
             })
         });
 
-        (denied.map(Verdict::denied), allowed.map(Verdict::allowed))
+        HttpPolicyVerdicts {
+            deny: denied.map(Verdict::denied),
+            allow: allowed.map(Verdict::allowed),
+        }
     }
 
     async fn evaluate_http(
@@ -81,9 +91,9 @@ impl PolicyStore {
         request: &HttpRequest,
         ctx: &ResolvedRequestContext,
     ) -> Option<Verdict> {
-        let (policy_deny, policy_allow) = self.http_policy_verdicts(request, ctx);
+        let verdicts = self.http_policy_verdicts(request, ctx);
 
-        if let Some(verdict) = policy_deny {
+        if let Some(verdict) = verdicts.deny {
             return Some(verdict);
         }
 
@@ -141,7 +151,7 @@ impl PolicyStore {
             }
         }
 
-        policy_allow
+        verdicts.allow
     }
 
     /// Evaluate one decoded HTTP request and wait for a typed policy verdict.
@@ -619,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_http_denial_returns_serializable_user_source() {
-        let (store, ..) = test_http_store().await;
+        let HttpTestFixture { store, .. } = test_http_store().await;
 
         let request =
             HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
@@ -712,30 +722,38 @@ mod tests {
             HttpRequest::parse_absolute("POST", "https://api.example.com/v1/private/item")
                 .expect("valid POST request");
 
-        let (get_deny, get_allow) = store.http_policy_verdicts(&get_public, &ctx);
-        assert!(get_deny.is_none());
+        let get_verdicts = store.http_policy_verdicts(&get_public, &ctx);
+        assert!(get_verdicts.deny.is_none());
 
         assert_eq!(
-            get_allow,
+            get_verdicts.allow,
             Some(Verdict::allowed(VerdictSource::policy_with_comment(
                 "allow GET"
             )))
         );
 
-        let (post_deny, post_allow) = store.http_policy_verdicts(&post_public, &ctx);
-        assert!(post_deny.is_none());
-        assert!(post_allow.is_none());
-        let (private_deny, _) = store.http_policy_verdicts(&post_private, &ctx);
+        let post_verdicts = store.http_policy_verdicts(&post_public, &ctx);
+        assert!(post_verdicts.deny.is_none());
+        assert!(post_verdicts.allow.is_none());
+        let private_verdicts = store.http_policy_verdicts(&post_private, &ctx);
 
         assert_eq!(
-            private_deny,
+            private_verdicts.deny,
             Some(Verdict::denied(VerdictSource::policy_with_comment(
                 "deny POST"
             )))
         );
     }
 
-    async fn test_http_store() -> (PolicyStore, ProxySessionToken, AttributionToken) {
+    /// Store with one registered and claimed flow for HTTP approval tests:
+    /// the proxy session and its attribution token.
+    struct HttpTestFixture {
+        store: PolicyStore,
+        proxy_session: ProxySessionToken,
+        attribution_token: AttributionToken,
+    }
+
+    async fn test_http_store() -> HttpTestFixture {
         let store = PolicyStore::new(crate::store::test_args(
             "/tmp/http-once-test.sock".into(),
             "/tmp/http-once-test-sandbox.sock".into(),
@@ -785,12 +803,20 @@ mod tests {
             .expect("claim flow")
             .attribution_token;
 
-        (store, proxy_session, attribution_token)
+        HttpTestFixture {
+            store,
+            proxy_session,
+            attribution_token,
+        }
     }
 
     #[tokio::test]
     async fn http_approval_requires_process_identity_for_freezing() {
-        let (store, proxy_session, attribution_token) = test_http_store().await;
+        let HttpTestFixture {
+            store,
+            proxy_session,
+            attribution_token,
+        } = test_http_store().await;
 
         let request =
             HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");
@@ -822,7 +848,11 @@ mod tests {
 
     #[tokio::test]
     async fn once_http_decision_resolves_all_coalesced_waiters_without_cache() {
-        let (store, proxy_session, attribution_token) = test_http_store().await;
+        let HttpTestFixture {
+            store,
+            proxy_session,
+            attribution_token,
+        } = test_http_store().await;
 
         let request =
             HttpRequest::parse_absolute("GET", "https://example.com/resource").expect("request");

@@ -6,6 +6,14 @@ use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths};
 
 use super::decisions::DecisionAction;
 
+/// Audit identity for one scope-apply reply: the optional host/port plus
+/// the human-readable detail recorded in the audit log.
+#[derive(Clone, Copy)]
+pub(super) struct ScopeAudit<'a> {
+    pub(super) host: Option<&'a str>,
+    pub(super) port: Option<u16>,
+    pub(super) detail: &'a str,
+}
 impl super::types::PolicyStore {
     pub(crate) fn audit(action: &str, host: Option<&str>, port: Option<u16>, detail: &str) {
         tracing::info!(target: "audit", action, host, port, detail, "policy event");
@@ -14,19 +22,19 @@ impl super::types::PolicyStore {
     /// Shared tail of every scope-apply flow: export policy files, emit the
     /// audit event, then build the scope reply. Only the audit target, the
     /// audit detail, and the concrete `ok_*` reply differ across capabilities.
-    pub(crate) fn finalize_scope_reply<F>(
+    pub(super) fn finalize_scope_reply<F>(
         &self,
         paths: &SandboxPaths,
         scope: ApprovalScope,
         action: DecisionAction,
-        audit: (Option<&str>, Option<u16>, &str),
+        audit: ScopeAudit<'_>,
         reply: F,
     ) -> RpcReply
     where
         F: FnOnce(ApprovalScope, Option<PathBuf>) -> RpcReply,
     {
         let _ = self.export_policy_files(paths.clone());
-        Self::audit(action.audit_verb(), audit.0, audit.1, audit.2);
+        Self::audit(action.audit_verb(), audit.host, audit.port, audit.detail);
 
         let policy_path = match (paths.home(), paths.project_root()) {
             (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),
@@ -105,8 +113,8 @@ mod tests {
 
     #[test]
     fn host_matches_ipv6_prefix_wildcard_hextet_boundary_respected() {
-        // "2001:db" is a valid 2-digit hex prefix. Need a case where a part is not 1-4
-        // hex chars.
+        // "2001:db" is a valid 2-digit hex prefix. Need a case where a part is
+        // not 1-4 hex chars.
         assert!(!host_pattern_matches("2001:dbg:*", "2001:db8::1"));
     }
 

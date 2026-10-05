@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    net::SocketAddrV4,
     path::{Path, PathBuf},
     sync::{Arc, RwLock, atomic::AtomicU64},
     time::{Duration, Instant},
@@ -11,6 +12,7 @@ use agent_sandbox_core::{
     AttributionToken, DbusTarget, FileAccess, FlowRegistration, HttpContextKey, HttpRequest,
     HttpRuleTarget, PendingHttpId, PendingSummary, ProxyConnectionId, ProxySessionToken,
     ResolvedRequestContext, ResourceAccess, ResourceKind, SocketIdentity, VerdictSource,
+    network_snapshot::ObservedNetworkSources,
 };
 use tokio::{
     net::unix::OwnedWriteHalf,
@@ -143,6 +145,16 @@ pub fn enforce_verdict_cache_limit<K: Clone + Eq + std::hash::Hash>(
 
 /// Monotonic source of client ids across the store.
 pub static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+/// Per-package declarative base policy file, keyed by package name.
+/// Loaded as the package layer (between the global declarative policy
+/// and the user policy) for sessions attributed to that package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageDeclarative {
+    /// Package the base policy file applies to.
+    pub name: String,
+    /// Base policy file for the package.
+    pub path: PathBuf,
+}
 
 /// Process startup and policy arguments for the policy daemon.
 #[derive(Debug, Clone)]
@@ -180,7 +192,7 @@ pub struct PolicydArgs {
     /// Per-package declarative base policy files, keyed by package name.
     /// Loaded as the package layer (between the global declarative policy
     /// and the user policy) for sessions attributed to that package.
-    pub package_declarative: Vec<(String, PathBuf)>,
+    pub package_declarative: Vec<PackageDeclarative>,
 
     /// Path to the agent-sandbox-fsmon binary.
     pub fs_monitor_cmd: Option<PathBuf>,
@@ -192,6 +204,15 @@ pub struct PolicydArgs {
 
     /// Path to the agent-sandbox-syscall-broker binary.
     pub syscall_broker_cmd: Option<PathBuf>,
+}
+
+/// File layers observed for one network grant compilation: the captured
+/// source documents plus the compiled endpoint grants.
+pub struct ObservedNetworkGrants {
+    /// Captured source documents in the caller's source order.
+    pub observed: ObservedNetworkSources,
+    /// Endpoints the observed layers grant.
+    pub grants: Vec<SocketAddrV4>,
 }
 
 pub(super) struct PendingResult<I, T> {

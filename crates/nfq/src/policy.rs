@@ -344,7 +344,7 @@ mod tests {
     use super::*;
     use crate::{
         flow::{
-            handle_packet_payload_with_registration,
+            PacketOutcome, handle_packet_payload_with_registration,
             tests::{DNS_IP, build_udp_data_packet, policy_allow, policy_deny, state_for_tests},
         },
         verdict_cache::{VerdictCache, dest_key},
@@ -355,10 +355,20 @@ mod tests {
     const TEST_NETNS: u64 = 4242;
 
     /// Key the fake cache replays: namespace cookie, protocol, address, port.
-    type FakeKey = (u64, u8, [u8; 16], u16);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct FakeKey {
+        netns_cookie: u64,
+        proto: u8,
+        ip: [u8; 16],
+        port: u16,
+    }
 
     /// Cached verdict and the generation it was published under.
-    type FakeEntry = (u8, u32);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FakeEntry {
+        verdict: u8,
+        generation: u32,
+    }
 
     /// In-memory [`VerdictCache`] for decision-contract tests: no kernel maps.
     #[derive(Debug)]
@@ -375,18 +385,30 @@ mod tests {
             }
         }
 
+        fn fake_key(key: &DestKey) -> FakeKey {
+            FakeKey {
+                netns_cookie: key.netns_cookie,
+                proto: key.proto,
+                ip: key.ip,
+                port: key.port(),
+            }
+        }
+
         fn insert(&self, key: &DestKey, verdict: u8, generation: u32) {
             self.entries.lock().expect("lock fake entries").insert(
-                (key.netns_cookie, key.proto, key.ip, key.port()),
-                (verdict, generation),
+                Self::fake_key(key),
+                FakeEntry {
+                    verdict,
+                    generation,
+                },
             );
         }
 
-        fn get(&self, key: &DestKey) -> Option<(u8, u32)> {
+        fn get(&self, key: &DestKey) -> Option<FakeEntry> {
             self.entries
                 .lock()
                 .expect("lock fake entries")
-                .get(&(key.netns_cookie, key.proto, key.ip, key.port()))
+                .get(&Self::fake_key(key))
                 .copied()
         }
     }
@@ -395,8 +417,8 @@ mod tests {
         fn cached_verdict(&self, key: &DestKey) -> Option<u8> {
             let generation = *self.generation.lock().expect("lock fake generation");
             self.get(key)
-                .filter(|(_, entry_generation)| *entry_generation == generation)
-                .map(|(verdict, _)| verdict)
+                .filter(|entry| entry.generation == generation)
+                .map(|entry| entry.verdict)
         }
 
         fn publish_verdict(&self, key: &DestKey, verdict: u8) {
@@ -405,12 +427,10 @@ mod tests {
         }
 
         fn clear_verdict(&self, key: &DestKey) {
-            self.entries.lock().expect("lock fake entries").remove(&(
-                key.netns_cookie,
-                key.proto,
-                key.ip,
-                key.port(),
-            ));
+            self.entries
+                .lock()
+                .expect("lock fake entries")
+                .remove(&Self::fake_key(key));
         }
 
         fn invalidate(&self) {
@@ -490,7 +510,10 @@ mod tests {
         assert_eq!(calls.get(), 1, "cache miss must consult policyd");
         assert_eq!(
             cache.get(&dest_key(TEST_NETNS, meta)),
-            Some((VERDICT_ALLOW, 1)),
+            Some(FakeEntry {
+                verdict: VERDICT_ALLOW,
+                generation: 1
+            }),
             "IP-literal static allow must be published under the current generation"
         );
     }
@@ -516,7 +539,10 @@ mod tests {
         assert_eq!(calls.get(), 1, "stale entry must consult policyd");
         assert_eq!(
             cache.get(&dest_key(TEST_NETNS, meta)),
-            Some((VERDICT_DENY, 2)),
+            Some(FakeEntry {
+                verdict: VERDICT_DENY,
+                generation: 2
+            }),
             "fresh denial must replace the stale entry under the new generation"
         );
     }
@@ -607,7 +633,10 @@ mod tests {
         );
         assert_eq!(
             cache.get(&dest_key(TEST_NETNS, meta)),
-            Some((VERDICT_DENY, 0)),
+            Some(FakeEntry {
+                verdict: VERDICT_DENY,
+                generation: 0
+            }),
             "transient error must neither publish nor clear"
         );
     }
@@ -718,7 +747,8 @@ mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
         assert_eq!(v, Verdict::Accept);
 
         assert_eq!(
@@ -740,7 +770,8 @@ mod tests {
 
         let pkt = build_udp_data_packet(443);
         let mut check = |_: CheckDestinationArgs<'_>| policy_allow();
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
         assert_eq!(v, Verdict::Accept);
 
         let aliases = state

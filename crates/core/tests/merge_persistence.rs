@@ -36,7 +36,8 @@ fn merged_policy_persists_normalized_layers_and_home_paths() {
     )];
 
     let merged = merge_layers(&[base, project_layer]);
-    assert_eq!(merged.network.direct.allow, [] as [agent_sandbox_core::NetworkRule; 0]);
+    assert_eq!(merged.network.direct.allow, []
+        as [agent_sandbox_core::NetworkRule; 0]);
     assert_eq!(merged.network.direct.deny.len(), 1);
     assert_eq!(merged.filesystem.allow.len(), 1);
     assert_eq!(merged.filesystem.deny.len(), 1);

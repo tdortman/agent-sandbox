@@ -443,12 +443,17 @@ pub(super) const fn harness_tls_alpn(advertise_http11_alpn: bool) -> TlsAlpn {
     }
 }
 
+pub(super) struct StartedTlsOrigin {
+    pub tcp: TcpOrigin,
+    pub tls: TlsOrigin,
+}
+
 pub(super) async fn start_tls_origin(
     address: SocketAddr,
     certificate: &Path,
     key: &Path,
     tls_alpn: TlsAlpn,
-) -> (TcpOrigin, TlsOrigin) {
+) -> StartedTlsOrigin {
     let listener = TcpListener::bind(address).await.expect("bind TLS origin");
     let address = listener.local_addr().expect("TLS origin address");
 
@@ -504,8 +509,8 @@ pub(super) async fn start_tls_origin(
         }
     });
 
-    (
-        TcpOrigin {
+    StartedTlsOrigin {
+        tcp: TcpOrigin {
             address,
             attempts,
             resets: Arc::new(AtomicUsize::new(0)),
@@ -513,12 +518,12 @@ pub(super) async fn start_tls_origin(
             request_heads: Arc::new(Mutex::new(Vec::new())),
             task: None,
         },
-        TlsOrigin {
+        tls: TlsOrigin {
             child,
             task,
             _socket_dir: socket_dir,
         },
-    )
+    }
 }
 
 pub struct UdpOrigin {

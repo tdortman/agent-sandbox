@@ -34,6 +34,45 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Session anchor for descendant adoption: the session id plus the pid
+/// (root, else launcher) a candidate peer must descend from and the
+/// owning uid that must match.
+struct SessionAnchor {
+    id: String,
+    anchor: u32,
+    owner_uid: u32,
+}
+
+/// Descendant adoption candidate: the session id and the anchor pid that
+/// matched, used to pick the innermost session.
+struct AdoptionCandidate {
+    id: String,
+    anchor: u32,
+}
+
+/// Verified sandbox peer paths, constrained to the registered project root.
+struct PeerPaths {
+    cwd: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+}
+
+/// The three per-package policy sources for one package: the base file from
+/// `--package-declarative`, the home extension, and the project file.
+#[derive(Default)]
+struct PackageLayerPaths {
+    base: Option<PathBuf>,
+    home_extension: Option<PathBuf>,
+    project: Option<PathBuf>,
+}
+
+/// Sandbox peer identity that passes the launcher binding check: the real
+/// parent (launcher) pid and the test process (peer) pid.
+#[cfg(test)]
+struct LauncherPair {
+    launcher: u32,
+    peer: u32,
+}
+
 impl PolicyStore {
     pub(crate) fn note_sandbox_peer(
         &self,
@@ -298,44 +337,46 @@ impl PolicyStore {
     /// `pid`. Session adoption requires the owner uid to match the process
     /// uid. For nested sandboxes the innermost matching anchor wins.
     fn session_id_for_descendant(&self, pid: u32, uid: Option<u32>) -> Option<String> {
-        let registrations: Vec<(String, u32, u32)> = self
+        let registrations: Vec<SessionAnchor> = self
             .sandbox_sessions
             .read()
             .ok()?
             .iter()
-            .map(|(id, reg)| {
-                (
-                    id.clone(),
-                    if reg.root_pid > 0 {
-                        reg.root_pid
-                    } else {
-                        reg.launcher_pid
-                    },
-                    reg.owner_uid,
-                )
+            .map(|(id, reg)| SessionAnchor {
+                id: id.clone(),
+                anchor: if reg.root_pid > 0 {
+                    reg.root_pid
+                } else {
+                    reg.launcher_pid
+                },
+                owner_uid: reg.owner_uid,
             })
             .collect();
 
-        let mut candidates: Vec<(String, u32)> = Vec::new();
+        let mut candidates: Vec<AdoptionCandidate> = Vec::new();
 
-        for (id, anchor, owner_uid) in &registrations {
-            if *owner_uid != 0 && Some(*owner_uid) != uid {
+        for registration in &registrations {
+            if registration.owner_uid != 0 && Some(registration.owner_uid) != uid {
                 continue;
             }
 
-            if *anchor > 0 && is_descendant_of(*anchor, pid) {
-                candidates.push((id.clone(), *anchor));
+            if registration.anchor > 0 && is_descendant_of(registration.anchor, pid) {
+                candidates.push(AdoptionCandidate {
+                    id: registration.id.clone(),
+                    anchor: registration.anchor,
+                });
             }
         }
 
         candidates
             .iter()
-            .find(|(_, anchor)| {
-                !candidates
-                    .iter()
-                    .any(|(_, other)| other != anchor && is_descendant_of(*anchor, *other))
+            .find(|candidate| {
+                !candidates.iter().any(|other| {
+                    other.anchor != candidate.anchor
+                        && is_descendant_of(candidate.anchor, other.anchor)
+                })
             })
-            .map(|(id, _)| id.clone())
+            .map(|candidate| candidate.id.clone())
     }
 
     /// Read the launcher env vars and `/proc` paths for a verified sandbox
@@ -344,7 +385,7 @@ impl PolicyStore {
         pid: u32,
         trusted_uid: Option<u32>,
         registration: Option<&SandboxSessionRegistration>,
-    ) -> (Option<PathBuf>, Option<PathBuf>) {
+    ) -> PeerPaths {
         let proc = peer_context(pid, trusted_uid);
         let cwd = proc.cwd;
         let mut project_root = proc.project_root;
@@ -356,7 +397,7 @@ impl PolicyStore {
             project_root = None;
         }
 
-        (cwd, project_root)
+        PeerPaths { cwd, project_root }
     }
 
     fn resolve_from_peer(
@@ -456,11 +497,10 @@ impl PolicyStore {
             }
 
             if pid_allowed {
-                let (peer_cwd, peer_project) =
-                    Self::peer_paths(pid, trusted_uid, registration.as_ref());
+                let peer_paths = Self::peer_paths(pid, trusted_uid, registration.as_ref());
 
-                cwd = cwd.or(peer_cwd);
-                project_root = project_root.or(peer_project);
+                cwd = cwd.or(peer_paths.cwd);
+                project_root = project_root.or(peer_paths.project_root);
             }
         }
 
@@ -552,19 +592,19 @@ impl PolicyStore {
     pub fn file_policy_sources(&self, ctx: &ResolvedRequestContext) -> [Option<PathBuf>; 6] {
         let home = ctx.paths.home();
         let project = ctx.paths.project_root();
-        let (package_base, package_home, package_project) = ctx
+        let package_layers = ctx
             .package
             .as_deref()
             .filter(|name| validate_package_name(name).is_ok())
             .map_or_default(|name| self.package_layer_paths(name, home, project));
         [
             Some(self.args.declarative.clone()),
-            package_base,
-            package_home,
+            package_layers.base,
+            package_layers.home_extension,
             home.map(|home| home.join(".config/agent-sandbox/policy.json")),
             home.and(project)
                 .and_then(|root| trusted_project_policy_path(root).ok()),
-            package_project,
+            package_layers.project,
         ]
     }
 
@@ -588,10 +628,7 @@ impl PolicyStore {
         endpoints: &[std::net::SocketAddrV4],
         additional_sources: &[&Path],
         watch_only: &[&Path],
-    ) -> std::io::Result<(
-        agent_sandbox_core::network_snapshot::ObservedNetworkSources,
-        Vec<std::net::SocketAddrV4>,
-    )> {
+    ) -> std::io::Result<crate::store::ObservedNetworkGrants> {
         use agent_sandbox_core::network_snapshot::{
             ObservedNetworkSources, compile_file_network_grants,
         };
@@ -639,7 +676,7 @@ impl PolicyStore {
             position += 1;
         }
         let grants = compile_file_network_grants(&layers, endpoints)?;
-        Ok((observed, grants))
+        Ok(crate::store::ObservedNetworkGrants { observed, grants })
     }
 
     fn file_policy_candidates(&self, ctx: &ResolvedRequestContext) -> [Option<PathBuf>; 6] {
@@ -656,23 +693,23 @@ impl PolicyStore {
 
     /// Paths of the three per-package policy sources for `package`.
     ///
-    /// Returns `(base, home_extension, package_project)`, where the base
-    /// comes from the `--package-declarative` args map and the extension and
-    /// project files are derived from the resolved home and project root.
+    /// The base comes from the `--package-declarative` args map and the
+    /// extension and project files are derived from the resolved home and
+    /// project root.
     fn package_layer_paths(
         &self,
         package: &str,
         home_path: Option<&Path>,
         project_root_path: Option<&Path>,
-    ) -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    ) -> PackageLayerPaths {
         let base = self
             .args
             .package_declarative
             .iter()
-            .find(|(name, _)| name == package)
-            .map(|(_, path)| path.clone());
+            .find(|entry| entry.name == package)
+            .map(|entry| entry.path.clone());
 
-        let home_ext = home_path.map(|home| {
+        let home_extension = home_path.map(|home| {
             home.join(".config")
                 .join("agent-sandbox")
                 .join("packages")
@@ -685,7 +722,11 @@ impl PolicyStore {
                 .join(format!("{package}.json"))
         });
 
-        (base, home_ext, project)
+        PackageLayerPaths {
+            base,
+            home_extension,
+            project,
+        }
     }
 
     /// Load merged policy from async handlers without blocking the Tokio
@@ -813,12 +854,12 @@ mod tests {
     use super::*;
     use crate::store::test_store;
 
-    /// `(launcher_pid, peer_pid)` that passes the launcher binding check:
-    /// the test process is the peer and its real parent is the launcher.
-    fn launcher_pair() -> (u32, u32) {
-        let pid = std::process::id();
-        let parent = read_proc_ppid(pid).expect("parent of the test process");
-        (parent, pid)
+    /// Launcher pair that passes the launcher binding check: the test
+    /// process is the peer and its real parent is the launcher.
+    fn launcher_pair() -> LauncherPair {
+        let peer = std::process::id();
+        let launcher = read_proc_ppid(peer).expect("parent of the test process");
+        LauncherPair { launcher, peer }
     }
 
     #[test]
@@ -922,7 +963,10 @@ mod tests {
     fn env_stripped_descendant_adopts_session_by_ancestry() {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
-        let (launcher_pid, peer_pid) = launcher_pair();
+        let LauncherPair {
+            launcher: launcher_pid,
+            peer: peer_pid,
+        } = launcher_pair();
 
         store
             .register_sandbox("sandbox-desc", "codex", uid, launcher_pid, peer_pid)
@@ -954,7 +998,10 @@ mod tests {
     fn foreign_uid_descendant_does_not_adopt_session() {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
-        let (launcher_pid, peer_pid) = launcher_pair();
+        let LauncherPair {
+            launcher: launcher_pid,
+            peer: peer_pid,
+        } = launcher_pair();
         let foreign_uid = uid.wrapping_add(1).max(1);
 
         store
@@ -1181,7 +1228,7 @@ mod tests {
     #[test]
     fn register_sandbox_stores_package_and_owner() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
 
         store
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
@@ -1204,7 +1251,7 @@ mod tests {
     #[test]
     fn register_sandbox_stores_launcher_pid() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
 
         store
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
@@ -1230,7 +1277,7 @@ mod tests {
     #[test]
     fn register_sandbox_rejects_mismatched_launcher_pid() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
         let zero = store.register_sandbox("sandbox-a", "omp", 1000, 0, peer);
 
         assert!(
@@ -1267,7 +1314,7 @@ mod tests {
     #[test]
     fn note_sandbox_peer_adopts_only_launcher_descendants() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
 
         store
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
@@ -1331,7 +1378,7 @@ mod tests {
     #[test]
     fn register_sandbox_rejects_different_package() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
 
         store
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
@@ -1363,7 +1410,7 @@ mod tests {
     #[test]
     fn register_sandbox_same_package_re_registers() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
 
         store
             .register_sandbox("sandbox-a", "omp", 1000, launcher, peer)
@@ -1387,7 +1434,7 @@ mod tests {
     #[test]
     fn register_sandbox_rejects_invalid_package_names() {
         let store = test_store();
-        let (launcher, peer) = launcher_pair();
+        let LauncherPair { launcher, peer } = launcher_pair();
 
         for package in ["", "a/b", "..", "a/../b", "bad\nname"] {
             let result = store.register_sandbox("sandbox-a", package, 1000, launcher, peer);
@@ -1412,7 +1459,10 @@ mod tests {
     #[test]
     fn note_sandbox_peer_preserves_package_and_adopts_root() {
         let store = test_store();
-        let (launcher, pid) = launcher_pair();
+        let LauncherPair {
+            launcher,
+            peer: pid,
+        } = launcher_pair();
 
         store
             .register_sandbox("sandbox-a", "omp", 1000, launcher, pid)
@@ -1443,7 +1493,10 @@ mod tests {
         drop(sessions);
     }
 
-    fn package_store(dir: &tempfile::TempDir, packages: &[(&str, PathBuf)]) -> PolicyStore {
+    fn package_store(
+        dir: &tempfile::TempDir,
+        packages: Vec<crate::store::PackageDeclarative>,
+    ) -> PolicyStore {
         let mut args = crate::store::test_args(
             dir.path().join("test.sock"),
             dir.path().join("test-sandbox.sock"),
@@ -1453,10 +1506,7 @@ mod tests {
             true,
         );
 
-        args.package_declarative = packages
-            .iter()
-            .map(|(name, path)| (name.to_string(), path.clone()))
-            .collect();
+        args.package_declarative = packages;
 
         PolicyStore::new(args)
     }
@@ -1531,7 +1581,10 @@ mod tests {
             &[],
         );
 
-        let store = package_store(&dir, &[("omp", base)]);
+        let store = package_store(&dir, vec![crate::store::PackageDeclarative {
+            name: "omp".to_string(),
+            path: base,
+        }]);
         let merged = store.merged_for(&omp_context(home, project, Some("omp")));
 
         assert!(
@@ -1583,7 +1636,10 @@ mod tests {
             &[],
         );
 
-        let store = package_store(&dir, &[("omp", base)]);
+        let store = package_store(&dir, vec![crate::store::PackageDeclarative {
+            name: "omp".to_string(),
+            path: base,
+        }]);
         let merged = store.merged_for(&omp_context(home, project, Some("omp")));
 
         // Declarative deny shadows the package allow from the base and the
@@ -1633,7 +1689,10 @@ mod tests {
             &[],
         );
 
-        let store = package_store(&dir, &[("omp", dir.path().join("omp-base.json"))]);
+        let store = package_store(&dir, vec![crate::store::PackageDeclarative {
+            name: "omp".to_string(),
+            path: dir.path().join("omp-base.json"),
+        }]);
         let omp = store.merged_for(&omp_context(home.clone(), project.clone(), Some("omp")));
         assert!(fs_allowed(&omp, "/omp-only"));
         assert!(!fs_allowed(&omp, "/codex-only"));
@@ -1660,7 +1719,10 @@ mod tests {
             &[],
         );
 
-        let store = package_store(&dir, &[("omp", base.clone())]);
+        let store = package_store(&dir, vec![crate::store::PackageDeclarative {
+            name: "omp".to_string(),
+            path: base.clone(),
+        }]);
         let ctx = omp_context(home, project, None);
         let sources = store.file_policy_sources(&ctx);
         assert!([1, 2, 5].into_iter().all(|index| sources[index].is_none()));
@@ -1699,7 +1761,7 @@ mod tests {
         let package_file = project.join(".agent-sandbox/packages/omp.json");
         std::os::unix::fs::symlink(&external, &project_file).expect("project symlink");
         std::os::unix::fs::symlink(&external, &package_file).expect("package symlink");
-        let store = package_store(&dir, &[]);
+        let store = package_store(&dir, Vec::new());
         let ctx = omp_context(home, project, Some("omp"));
         let sources = store.file_policy_sources(&ctx);
         assert!(sources[4].is_none());
@@ -1730,7 +1792,10 @@ mod tests {
         write_fs_policy(&base, &[], &[]);
         write_fs_policy(&ext, &[], &[]);
         write_fs_policy(&pkg_project, &[], &[]);
-        let store = package_store(&dir, &[("omp", base.clone())]);
+        let store = package_store(&dir, vec![crate::store::PackageDeclarative {
+            name: "omp".to_string(),
+            path: base.clone(),
+        }]);
         let ctx = omp_context(home, project, Some("omp"));
         let merged = store.merged_for(&ctx);
 
@@ -1765,7 +1830,7 @@ mod tests {
         let ext = home.join(".config/agent-sandbox/packages/omp.json");
         write_fs_policy(&dir.path().join("declarative.json"), &[], &[]);
         write_fs_policy(&ext, &["/granted/v1"], &[]);
-        let store = package_store(&dir, &[]);
+        let store = package_store(&dir, Vec::new());
         let ctx = omp_context(home, project, Some("omp"));
         assert!(fs_allowed(&store.merged_for(&ctx), "/granted/v1"));
         write_fs_policy(&ext, &["/granted/v2"], &[]);
@@ -1791,8 +1856,14 @@ mod tests {
         let base = dir.path().join("omp-base.json");
         write_fs_policy(&dir.path().join("declarative.json"), &[], &[]);
         write_fs_policy(&base, &["/granted/base"], &[]);
-        let store = package_store(&dir, &[("omp", base)]);
-        let (launcher, owner_pid) = launcher_pair();
+        let store = package_store(&dir, vec![crate::store::PackageDeclarative {
+            name: "omp".to_string(),
+            path: base,
+        }]);
+        let LauncherPair {
+            launcher,
+            peer: owner_pid,
+        } = launcher_pair();
 
         store
             .register_sandbox("s1", "omp", 1000, launcher, owner_pid)

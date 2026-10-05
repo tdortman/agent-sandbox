@@ -540,8 +540,6 @@ impl PolicyStore {
     /// so hardlinks to files inside a denied directory are caught by inode
     /// comparison regardless of the path the tracee used.
     fn rebuild_deny_inode_cache(fingerprint: Vec<DenyFingerprint>) -> DenyInodeCache {
-        use std::os::unix::fs::MetadataExt;
-
         let mut inodes: HashMap<InodeIdentity, Vec<DenyCacheEntry>> = HashMap::new();
         let mut budget = MAX_DENY_INODE_ENTRIES;
 
@@ -556,7 +554,7 @@ impl PolicyStore {
                 // carries a different access level, or the narrower deny would
                 // be lost. Cycles within one rule's reachable tree terminate
                 // because the set is shared across that rule's recursion.
-                let mut visited_dirs: HashSet<(u64, u64)> = HashSet::new();
+                let mut visited_dirs: HashSet<InodeIdentity> = HashSet::new();
 
                 if !Self::walk_dir_inodes(
                     &entry.path,
@@ -572,12 +570,7 @@ impl PolicyStore {
                          (path-based deny rules still apply)"
                     );
                 }
-            } else {
-                let identity = InodeIdentity {
-                    inode: meta.ino(),
-                    device: meta.dev(),
-                };
-
+            } else if let Some(identity) = InodeIdentity::from_path(&entry.path) {
                 inodes.entry(identity).or_default().push(DenyCacheEntry {
                     path: entry.path.clone(),
                     access: entry.access,
@@ -606,19 +599,17 @@ impl PolicyStore {
         dir: &Path,
         access: FileAccess,
         inodes: &mut HashMap<InodeIdentity, Vec<DenyCacheEntry>>,
-        visited_dirs: &mut HashSet<(u64, u64)>,
+        visited_dirs: &mut HashSet<InodeIdentity>,
         budget: &mut usize,
     ) -> bool {
-        use std::os::unix::fs::MetadataExt;
-
         // The followed target of `dir`: `read_dir` and recursion below follow
         // a symlinked directory, so key the visit on the real directory's
         // inode. This both terminates cycles and dedups aliases.
-        let Ok(dir_meta) = std::fs::metadata(dir) else {
+        let Some(identity) = InodeIdentity::from_path(dir) else {
             return true;
         };
 
-        if !visited_dirs.insert((dir_meta.dev(), dir_meta.ino())) {
+        if !visited_dirs.insert(identity) {
             return true;
         }
 
@@ -662,15 +653,12 @@ impl PolicyStore {
 
             *budget -= 1;
 
-            let identity = InodeIdentity {
-                inode: meta.ino(),
-                device: meta.dev(),
-            };
-
-            inodes.entry(identity).or_default().push(DenyCacheEntry {
-                path: entry.path(),
-                access,
-            });
+            if let Some(identity) = InodeIdentity::from_path(&entry.path()) {
+                inodes.entry(identity).or_default().push(DenyCacheEntry {
+                    path: entry.path(),
+                    access,
+                });
+            }
         }
 
         true
@@ -2228,7 +2216,14 @@ mod tests {
         );
     }
 
-    async fn dbus_session_store() -> (super::super::types::PolicyStore, ResolvedRequestContext) {
+    /// Store plus a session-attributed request context for D-Bus tests: the
+    /// UI session owns `sandbox-dbus` and the context routes there by default.
+    struct DbusSessionFixture {
+        store: super::super::types::PolicyStore,
+        ctx: ResolvedRequestContext,
+    }
+
+    async fn dbus_session_store() -> DbusSessionFixture {
         let dir = tempfile::tempdir().expect("create tempdir");
 
         let store = super::super::types::PolicyStore::new(crate::store::test_args(
@@ -2267,12 +2262,12 @@ mod tests {
                 });
         }
 
-        (store, ctx)
+        DbusSessionFixture { store, ctx }
     }
 
     #[tokio::test]
     async fn dbus_session_allow_matches_exact_and_wildcard_targets() {
-        let (store, ctx) = dbus_session_store().await;
+        let DbusSessionFixture { store, ctx } = dbus_session_store().await;
 
         let concrete = DbusTarget::session(
             "org.example.Service",

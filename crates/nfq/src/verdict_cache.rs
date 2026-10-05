@@ -194,33 +194,62 @@ pub fn replayable_verdict(
 /// Returns the cache with the namespace cookie and proxy uid it was opened
 /// for. Any failure degrades to no cache: the daemon consults policyd for
 /// every flow, exactly as without the flag.
-pub fn open_verdict_cache(cli: &Cli) -> (Option<Arc<dyn VerdictCache>>, u64, u32) {
+pub struct VerdictCacheHandle {
+    /// Pinned-map verdict cache, or `None` when unavailable.
+    pub cache: Option<Arc<dyn VerdictCache>>,
+    /// Namespace cookie the cache was opened for.
+    pub netns: u64,
+    /// Proxy uid the cache was opened for.
+    pub proxy_uid: u32,
+}
+
+pub fn open_verdict_cache(cli: &Cli) -> VerdictCacheHandle {
     let Some(directory) = cli.verdict_map.as_deref() else {
         info!(
             "verdict cache unavailable: no verdict map directory; consulting policyd for every \
              flow"
         );
-        return (None, 0, 0);
+        return VerdictCacheHandle {
+            cache: None,
+            netns: 0,
+            proxy_uid: 0,
+        };
     };
     let Some(proxy_uid) = cli.proxy_uid else {
         info!("verdict cache unavailable: no proxy uid; consulting policyd for every flow");
-        return (None, 0, 0);
+        return VerdictCacheHandle {
+            cache: None,
+            netns: 0,
+            proxy_uid: 0,
+        };
     };
     let netns = match current_netns_cookie() {
         Ok(netns) => netns,
         Err(error) => {
             info!(%error, "verdict cache unavailable: cannot read namespace cookie");
-            return (None, 0, 0);
+            return VerdictCacheHandle {
+                cache: None,
+                netns: 0,
+                proxy_uid: 0,
+            };
         }
     };
     match MapVerdictCache::open(directory, netns, proxy_uid) {
         Ok(cache) => {
             info!(netns, proxy_uid, "verdict cache enabled");
-            (Some(Arc::new(cache)), netns, proxy_uid)
+            VerdictCacheHandle {
+                cache: Some(Arc::new(cache)),
+                netns,
+                proxy_uid,
+            }
         }
         Err(error) => {
             info!(%error, "verdict cache unavailable: cannot open verdict maps");
-            (None, 0, 0)
+            VerdictCacheHandle {
+                cache: None,
+                netns: 0,
+                proxy_uid: 0,
+            }
         }
     }
 }

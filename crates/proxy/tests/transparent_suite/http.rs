@@ -92,10 +92,10 @@ async fn transparent_http10_origin_controls_upstream_version() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http_reuses_same_origin_pool() {
     let harness = TransparentHarness::start_keep_alive(loopback(IpVersion::V4), 0).await;
-    let (first, second) = harness.pooled_requests().await;
+    let responses = harness.pooled_requests().await;
     wait_for_release(&harness).await;
-    assert!(first.ends_with(b"origin-response"));
-    assert!(second.ends_with(b"origin-response"));
+    assert!(responses.first.ends_with(b"origin-response"));
+    assert!(responses.second.ends_with(b"origin-response"));
     assert_eq!(harness.origin.attempts.load(Ordering::SeqCst), 1);
 }
 
@@ -175,17 +175,20 @@ async fn transparent_http_deny_does_not_open_upstream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transparent_http_streaming_response_reaches_client() {
     let harness = TransparentHarness::start(loopback(IpVersion::V4), 0).await;
-    let (first, rest) = harness.streaming_request("/stream").await;
+    let response = harness.streaming_request("/stream").await;
     wait_for_release(&harness).await;
 
     assert!(
-        first
+        response
+            .first
             .windows(b"origin-response".len() / 2)
             .any(|window| { window == b"origin-" })
     );
 
     assert!(
-        rest.windows(b"response".len())
+        response
+            .rest
+            .windows(b"response".len())
             .any(|window| window == b"response")
     );
 

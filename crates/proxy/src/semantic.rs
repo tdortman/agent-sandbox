@@ -97,13 +97,41 @@ impl fmt::Display for HttpVersion {
 
 /// An ordered collection of validated end-to-end headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SemanticHeaders(Vec<(HeaderName, HeaderValue)>);
+pub struct SemanticHeaders(Vec<SemanticHeader>);
+
+/// One validated end-to-end header field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticHeader {
+    /// Lowercased field name.
+    pub name: HeaderName,
+    /// Opaque field value.
+    pub value: HeaderValue,
+}
+
+impl SemanticHeader {
+    /// The field name.
+    #[must_use]
+    pub const fn name(&self) -> &HeaderName {
+        &self.name
+    }
+
+    /// The field value.
+    #[must_use]
+    pub const fn value(&self) -> &HeaderValue {
+        &self.value
+    }
+}
 
 impl SemanticHeaders {
     /// Create an empty header collection.
     #[must_use]
     pub const fn new() -> Self {
         Self(Vec::new())
+    }
+
+    /// Append one validated header field.
+    pub fn push(&mut self, header: SemanticHeader) {
+        self.0.push(header);
     }
 
     /// # Errors
@@ -118,13 +146,13 @@ impl SemanticHeaders {
     {
         let name = HeaderName::from_bytes(name.as_bytes())?;
         let value = HeaderValue::from_bytes(value.as_ref())?;
-        self.0.push((name, value));
+        self.0.push(SemanticHeader { name, value });
         Ok(())
     }
 
     /// The headers as a slice, in insertion order.
     #[must_use]
-    pub fn as_slice(&self) -> &[(HeaderName, HeaderValue)] {
+    pub fn as_slice(&self) -> &[SemanticHeader] {
         &self.0
     }
 }

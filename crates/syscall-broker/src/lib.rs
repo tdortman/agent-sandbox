@@ -18,7 +18,9 @@ use std::{
     sync::OnceLock,
 };
 
-use agent_sandbox_core::{DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess};
+use agent_sandbox_core::{
+    DeviceAccess, FileAccess, ResourceAccess, ResourceKind, SocketAccess, policy::FilesystemCheck,
+};
 use agent_sandbox_syscall::policy::nr;
 pub use policy_client::PersistentPolicyClient;
 
@@ -417,7 +419,7 @@ pub enum FilesystemMutation {
 #[derive(Debug)]
 pub struct FilesystemTarget {
     /// Path/access pairs to check against policyd's filesystem policy.
-    pub checks: Vec<(PathBuf, FileAccess)>,
+    pub checks: Vec<FilesystemCheck>,
 
     /// Immutable syscall operation captured at classification time.
     pub operation: FilesystemMutation,
@@ -991,7 +993,7 @@ fn sockaddr_target(
 }
 
 const fn filesystem_target(
-    checks: Vec<(PathBuf, FileAccess)>,
+    checks: Vec<FilesystemCheck>,
     operation: FilesystemMutation,
 ) -> SyscallTarget {
     SyscallTarget::Filesystem(FilesystemTarget { checks, operation })
@@ -1093,7 +1095,14 @@ fn tracee_dir_handle(pid: u32, dirfd: u64) -> io::Result<OwnedFd> {
     agent_sandbox_sysutil::dup_tracee_fd(pid, fd)
 }
 
-fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<(MutationDir, Vec<u8>)> {
+/// Directory handle and raw name captured from the tracee at
+/// classification time, before any policy round trip.
+struct CapturedPath {
+    dir: MutationDir,
+    raw: Vec<u8>,
+}
+
+fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<CapturedPath> {
     let raw = read_raw_path(notif.pid, ptr)?;
 
     if raw.is_empty() {
@@ -1101,13 +1110,16 @@ fn capture_path(notif: &SeccompNotif, dirfd: u64, ptr: u64) -> io::Result<(Mutat
     }
 
     if path_from_raw(&raw).is_absolute() {
-        return Ok((MutationDir::Root, raw));
+        return Ok(CapturedPath {
+            dir: MutationDir::Root,
+            raw,
+        });
     }
 
-    Ok((
-        MutationDir::Handle(tracee_dir_handle(notif.pid, dirfd)?),
+    Ok(CapturedPath {
+        dir: MutationDir::Handle(tracee_dir_handle(notif.pid, dirfd)?),
         raw,
-    ))
+    })
 }
 
 /// Broker-side absolute path for a captured relative name, resolved through
@@ -1133,19 +1145,25 @@ fn two_path_target(
     new_ptr: u64,
     operation: impl FnOnce(MutationDir, Vec<u8>, MutationDir, Vec<u8>) -> FilesystemMutation,
 ) -> io::Result<SyscallTarget> {
-    let (old_dir, old) = capture_path(notif, old_dirfd, old_ptr)?;
-    let (new_dir, new) = capture_path(notif, new_dirfd, new_ptr)?;
+    let CapturedPath {
+        dir: old_dir,
+        raw: old,
+    } = capture_path(notif, old_dirfd, old_ptr)?;
+    let CapturedPath {
+        dir: new_dir,
+        raw: new,
+    } = capture_path(notif, new_dirfd, new_ptr)?;
 
     Ok(filesystem_target(
         vec![
-            (
-                normalize_captured_path(&old_dir, &old)?,
-                FileAccess::ReadWrite,
-            ),
-            (
-                normalize_captured_path(&new_dir, &new)?,
-                FileAccess::ReadWrite,
-            ),
+            FilesystemCheck {
+                path: normalize_captured_path(&old_dir, &old)?,
+                access: FileAccess::ReadWrite,
+            },
+            FilesystemCheck {
+                path: normalize_captured_path(&new_dir, &new)?,
+                access: FileAccess::ReadWrite,
+            },
         ],
         operation(old_dir, old, new_dir, new),
     ))
@@ -1226,14 +1244,20 @@ fn target_from_linkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
             if nix::sys::stat::fstat(&fd)?.st_nlink == 0 {
                 source.pop();
             }
-            let (new_dir, new) = capture_path(notif, notif.data.args[2], notif.data.args[3])?;
+            let CapturedPath {
+                dir: new_dir,
+                raw: new,
+            } = capture_path(notif, notif.data.args[2], notif.data.args[3])?;
             return Ok(filesystem_target(
                 vec![
-                    (source, FileAccess::ReadWrite),
-                    (
-                        normalize_captured_path(&new_dir, &new)?,
-                        FileAccess::ReadWrite,
-                    ),
+                    FilesystemCheck {
+                        path: source,
+                        access: FileAccess::ReadWrite,
+                    },
+                    FilesystemCheck {
+                        path: normalize_captured_path(&new_dir, &new)?,
+                        access: FileAccess::ReadWrite,
+                    },
                 ],
                 FilesystemMutation::LinkFd {
                     fd,
@@ -1273,17 +1297,23 @@ fn proc_self_fd(raw: &[u8]) -> Option<i32> {
 
 fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let target = read_raw_path(notif.pid, notif.data.args[0])?;
-    let (link_dir, link) = capture_path(notif, at_fdcwd_arg(), notif.data.args[1])?;
+    let CapturedPath {
+        dir: link_dir,
+        raw: link,
+    } = capture_path(notif, at_fdcwd_arg(), notif.data.args[1])?;
     let resolved = capture_fallback_path(&link_dir, &link)?;
     let target_path = resolve_symlink_target_path(&target, &resolved);
 
     Ok(filesystem_target(
         vec![
-            (normalize_path(&target_path), FileAccess::Read),
-            (
-                normalize_captured_path(&link_dir, &link)?,
-                FileAccess::Write,
-            ),
+            FilesystemCheck {
+                path: normalize_path(&target_path),
+                access: FileAccess::Read,
+            },
+            FilesystemCheck {
+                path: normalize_captured_path(&link_dir, &link)?,
+                access: FileAccess::Write,
+            },
         ],
         FilesystemMutation::Symlink {
             target,
@@ -1295,17 +1325,23 @@ fn target_from_symlink(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 
 fn target_from_symlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     let target = read_raw_path(notif.pid, notif.data.args[0])?;
-    let (link_dir, link) = capture_path(notif, notif.data.args[1], notif.data.args[2])?;
+    let CapturedPath {
+        dir: link_dir,
+        raw: link,
+    } = capture_path(notif, notif.data.args[1], notif.data.args[2])?;
     let resolved = capture_fallback_path(&link_dir, &link)?;
     let target_path = resolve_symlink_target_path(&target, &resolved);
 
     Ok(filesystem_target(
         vec![
-            (normalize_path(&target_path), FileAccess::Read),
-            (
-                normalize_captured_path(&link_dir, &link)?,
-                FileAccess::Write,
-            ),
+            FilesystemCheck {
+                path: normalize_path(&target_path),
+                access: FileAccess::Read,
+            },
+            FilesystemCheck {
+                path: normalize_captured_path(&link_dir, &link)?,
+                access: FileAccess::Write,
+            },
         ],
         FilesystemMutation::Symlink {
             target,
@@ -1333,10 +1369,13 @@ fn single_path_target(
     operation: impl FnOnce(MutationDir, Vec<u8>) -> FilesystemMutation,
     access: FileAccess,
 ) -> io::Result<SyscallTarget> {
-    let (dir, raw) = capture_path(notif, dirfd, ptr)?;
+    let CapturedPath { dir, raw } = capture_path(notif, dirfd, ptr)?;
 
     Ok(filesystem_target(
-        vec![(normalize_captured_path(&dir, &raw)?, access)],
+        vec![FilesystemCheck {
+            path: normalize_captured_path(&dir, &raw)?,
+            access,
+        }],
         operation(dir, raw),
     ))
 }
@@ -1369,13 +1408,16 @@ fn target_from_unlinkat(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
 }
 
 fn target_from_truncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
-    let (dir, raw) = capture_path(notif, at_fdcwd_arg(), notif.data.args[0])?;
+    let CapturedPath { dir, raw } = capture_path(notif, at_fdcwd_arg(), notif.data.args[0])?;
 
     let len = i64::try_from(notif.data.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
 
     Ok(filesystem_target(
-        vec![(normalize_captured_path(&dir, &raw)?, FileAccess::Write)],
+        vec![FilesystemCheck {
+            path: normalize_captured_path(&dir, &raw)?,
+            access: FileAccess::Write,
+        }],
         FilesystemMutation::Truncate {
             dir,
             path: raw,
@@ -1461,7 +1503,10 @@ fn target_from_ftruncate(notif: &SeccompNotif) -> io::Result<SyscallTarget> {
     }
 
     Ok(filesystem_target(
-        vec![(path, FileAccess::Write)],
+        vec![FilesystemCheck {
+            path,
+            access: FileAccess::Write,
+        }],
         FilesystemMutation::Ftruncate { fd, len },
     ))
 }
@@ -1486,7 +1531,7 @@ fn mknod_target(
     mode: u32,
     device: u64,
 ) -> io::Result<SyscallTarget> {
-    let (dir, raw) = capture_path(notif, dirfd, ptr)?;
+    let CapturedPath { dir, raw } = capture_path(notif, dirfd, ptr)?;
 
     if raw.is_empty() {
         return Ok(SyscallTarget::Errno(libc::ENOENT));
@@ -1497,7 +1542,10 @@ fn mknod_target(
     }
 
     Ok(filesystem_target(
-        vec![(normalize_captured_path(&dir, &raw)?, FileAccess::Write)],
+        vec![FilesystemCheck {
+            path: normalize_captured_path(&dir, &raw)?,
+            access: FileAccess::Write,
+        }],
         FilesystemMutation::Mknod {
             dir,
             path: raw,
@@ -1527,7 +1575,7 @@ fn mkdir_target(
     ptr: u64,
     mode: u32,
 ) -> io::Result<SyscallTarget> {
-    let (dir, raw) = capture_path(notif, dirfd, ptr)?;
+    let CapturedPath { dir, raw } = capture_path(notif, dirfd, ptr)?;
 
     if raw.is_empty() {
         return Ok(SyscallTarget::Errno(libc::ENOENT));
@@ -1538,7 +1586,10 @@ fn mkdir_target(
     }
 
     Ok(filesystem_target(
-        vec![(normalize_captured_path(&dir, &raw)?, FileAccess::Write)],
+        vec![FilesystemCheck {
+            path: normalize_captured_path(&dir, &raw)?,
+            access: FileAccess::Write,
+        }],
         FilesystemMutation::Mkdir {
             dir,
             path: raw,
@@ -1763,7 +1814,10 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
         return None;
     }
 
-    let (open_flags, open_mode) = read_tracee_open_flags_mode(notif);
+    let OpenFlagsMode {
+        flags: open_flags,
+        mode: open_mode,
+    } = read_tracee_open_flags_mode(notif);
     let raw = path.to_string_lossy().into_owned().into_bytes();
     let acc = open_flags & libc::O_ACCMODE;
 
@@ -1906,24 +1960,29 @@ fn openat2_resolve_flags(notif: &SeccompNotif) -> io::Result<u64> {
 /// requested, including reading `struct open_how` for `openat2`, so the
 /// broker never re-reads these pointer-bearing args after policy approval.
 /// For `creat`, returns `O_WRONLY | O_CREAT | O_TRUNC` with the tracee's mode.
-fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> (i32, u32) {
+struct OpenFlagsMode {
+    flags: i32,
+    mode: u32,
+}
+
+fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> OpenFlagsMode {
     let nr_val = i64::from(notif.data.nr);
 
     match nr_val {
-        nr::OPEN => (
-            i32::try_from(notif.data.args[1]).unwrap_or(libc::O_RDONLY),
-            u32::try_from(notif.data.args[2]).unwrap_or(0),
-        ),
+        nr::OPEN => OpenFlagsMode {
+            flags: i32::try_from(notif.data.args[1]).unwrap_or(libc::O_RDONLY),
+            mode: u32::try_from(notif.data.args[2]).unwrap_or(0),
+        },
 
-        nr::CREAT => (
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            u32::try_from(notif.data.args[1]).unwrap_or(0),
-        ),
+        nr::CREAT => OpenFlagsMode {
+            flags: libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            mode: u32::try_from(notif.data.args[1]).unwrap_or(0),
+        },
 
-        nr::OPENAT => (
-            i32::try_from(notif.data.args[2]).unwrap_or(libc::O_RDONLY),
-            u32::try_from(notif.data.args[3]).unwrap_or(0),
-        ),
+        nr::OPENAT => OpenFlagsMode {
+            flags: i32::try_from(notif.data.args[2]).unwrap_or(libc::O_RDONLY),
+            mode: u32::try_from(notif.data.args[3]).unwrap_or(0),
+        },
 
         _ => {
             // openat2: args[2] points to struct open_how { flags, mode, resolve
@@ -1931,15 +1990,24 @@ fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> (i32, u32) {
             let how_ptr = notif.data.args[2];
 
             if how_ptr == 0 {
-                return (libc::O_RDONLY, 0);
+                return OpenFlagsMode {
+                    flags: libc::O_RDONLY,
+                    mode: 0,
+                };
             }
 
             let Ok(bytes) = read_tracee_bytes(notif.pid, how_ptr, 16) else {
-                return (libc::O_RDONLY, 0);
+                return OpenFlagsMode {
+                    flags: libc::O_RDONLY,
+                    mode: 0,
+                };
             };
 
             if bytes.len() < 16 {
-                return (libc::O_RDONLY, 0);
+                return OpenFlagsMode {
+                    flags: libc::O_RDONLY,
+                    mode: 0,
+                };
             }
 
             let flags = i32::try_from(u64::from_ne_bytes(
@@ -1952,7 +2020,7 @@ fn read_tracee_open_flags_mode(notif: &SeccompNotif) -> (i32, u32) {
             ))
             .unwrap_or(0);
 
-            (flags, mode)
+            OpenFlagsMode { flags, mode }
         }
     }
 }

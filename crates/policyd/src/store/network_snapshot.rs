@@ -38,8 +38,9 @@ impl PolicyStore {
         endpoints: &[std::net::SocketAddrV4],
         dns: &Path,
     ) -> io::Result<RpcReply> {
-        // ponytail: one active snapshot shares the existing global revocation map;
-        // use per-scope state when publishing multiple enforcement scopes.
+        // ponytail: one active snapshot shares the existing global revocation
+        // map; use per-scope state when publishing multiple enforcement
+        // scopes.
         let mut observation = self
             .network_observation
             .lock()
@@ -65,7 +66,7 @@ impl PolicyStore {
         // the captured home: the NSS socket is watched, its server is
         // captured and frozen by the kernel, and the observed passwd must
         // select the same home. Any failure keeps userspace enforcement.
-        let (observed, grants) = if uid == 0 {
+        let grants = if uid == 0 {
             self.observe_file_network_grants(pins, cgroup, &ctx, endpoints, &[dns], &[])?
         } else {
             let nsswitch = Path::new(NSSWITCH_CONF);
@@ -77,22 +78,22 @@ impl PolicyStore {
                 .ok_or_else(|| io::Error::other("captured task has no home"))?;
             // NSS documents are the last two additional sources, in order.
             let additional = [dns, nsswitch, passwd];
-            let (mut observed, grants) =
+            let mut observed_grants =
                 self.observe_file_network_grants(pins, cgroup, &ctx, endpoints, &additional, &[
                     socket,
                 ])?;
-            let count = observed.documents.len();
+            let count = observed_grants.observed.documents.len();
             if count < additional.len() {
                 return Err(io::Error::other("NSS sources were not observed"));
             }
-            observed.capture_nss_peer(
+            observed_grants.observed.capture_nss_peer(
                 &program.with_file_name("init_nss"),
                 socket,
                 [count - 2, count - 1],
                 uid,
                 home,
             )?;
-            (observed, grants)
+            observed_grants
         };
         let transport = program.with_file_name("transport_policy");
         let policy = agent_sandbox_core::network_snapshot::open_policy_map(&transport)?;
@@ -100,17 +101,18 @@ impl PolicyStore {
         controller[..8].copy_from_slice(&captured.start_ns.to_ne_bytes());
         controller[8..16].copy_from_slice(&captured.exec_id.to_ne_bytes());
         controller[16..20].copy_from_slice(&captured.pid.to_ne_bytes());
+        let reply_grants = grants.grants.clone();
         *observation = Some(PendingNetworkPublication {
-            observed,
+            observed: grants.observed,
             policy,
             cgroup,
             controller,
-            grants: grants.clone(),
+            grants: reply_grants.clone(),
         });
         drop(observation);
         Ok(RpcReply::NetworkSnapshot {
             context: Box::new(captured),
-            grants,
+            grants: reply_grants,
         })
     }
 
@@ -140,8 +142,9 @@ impl PolicyStore {
         &self,
         captured: &CapturedNetworkContext,
     ) -> io::Result<ResolvedRequestContext> {
-        // Uniform credentials bind this provisional context to its registration.
-        // Source authority must be established before publishing its grants.
+        // Uniform credentials bind this provisional context to its
+        // registration. Source authority must be established before
+        // publishing its grants.
         let uid = captured.uids[0];
         if captured.uids.iter().any(|&entry| entry != uid) {
             return Err(io::Error::other("captured credentials are not uniform"));

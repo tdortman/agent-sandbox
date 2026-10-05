@@ -6,6 +6,7 @@ use agent_sandbox_core::{NetworkRuleKey, RpcReply, ScopeActionReply, ScopeTarget
 
 use super::{
     decisions::DecisionAction, scope_apply::ScopeLadder, state::apply_bucket, types::PolicyStore,
+    util::ScopeAudit,
 };
 use crate::wire::{NetworkScopeOp, ScopeWire};
 
@@ -97,7 +98,11 @@ impl PolicyStore {
             &paths,
             scope,
             action,
-            (Some(host.as_str()), Some(port), scope.as_str()),
+            ScopeAudit {
+                host: Some(host.as_str()),
+                port: Some(port),
+                detail: scope.as_str(),
+            },
             |scope, policy_path| {
                 RpcReply::ScopeAction(ScopeActionReply::ok_network(
                     host.clone(),

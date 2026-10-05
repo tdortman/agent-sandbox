@@ -19,7 +19,23 @@ pub const DEFAULT_ECH_STATE_DIR: &str = "/run/agent-sandbox";
 const CONFIG_FILE: &str = "ech-config-list";
 const PRIVATE_KEY_FILE: &str = "ech-private-key";
 const PUBLIC_NAME: &[u8] = b"proxy.agent-sandbox.invalid";
-const CIPHER_SUITES: &[(u16, u16)] = &[(0x0001, 0x0002), (0x0001, 0x0001)];
+
+/// One HPKE cipher suite advertised in the proxy ECH configuration.
+struct EchCipherSuite {
+    kdf_id: u16,
+    aead_id: u16,
+}
+
+const CIPHER_SUITES: &[EchCipherSuite] = &[
+    EchCipherSuite {
+        kdf_id: 0x0001,
+        aead_id: 0x0002,
+    },
+    EchCipherSuite {
+        kdf_id: 0x0001,
+        aead_id: 0x0001,
+    },
+];
 
 /// One downstream ECH value: the client-facing configuration and the
 /// matching private key.
@@ -206,9 +222,9 @@ fn encode_config_list(public_key: &[u8; 32]) -> Vec<u8> {
         u16::try_from(cipher_suites_len).expect("ECH cipher suites length fits in u16"),
     );
 
-    for (kdf_id, aead_id) in CIPHER_SUITES {
-        push_u16(&mut config, *kdf_id);
-        push_u16(&mut config, *aead_id);
+    for suite in CIPHER_SUITES {
+        push_u16(&mut config, suite.kdf_id);
+        push_u16(&mut config, suite.aead_id);
     }
 
     config.push(0);

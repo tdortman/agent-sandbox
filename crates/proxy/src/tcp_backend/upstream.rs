@@ -484,6 +484,14 @@ fn is_no_alpn_h2_cancellation(error: &(dyn std::error::Error + 'static)) -> bool
     false
 }
 
+/// One upstream HTTP response with the authority that served it.
+pub struct UpstreamSendResult {
+    /// The response received from the upstream.
+    pub response: Response,
+    /// The upstream authority that served the response.
+    pub authority: String,
+}
+
 pub async fn send_upstream_request(
     mut request: Request,
     state: &FlowState,
@@ -491,7 +499,7 @@ pub async fn send_upstream_request(
     normalized: &HttpRequest,
     downstream_version: Version,
     websocket: bool,
-) -> Result<(Response, String), BoxError> {
+) -> Result<UpstreamSendResult, BoxError> {
     if let Some(sender) = request
         .extensions()
         .get_ref::<rama_http_core::informational::InformationalSender>()
@@ -658,7 +666,10 @@ pub async fn send_upstream_request(
         }
     };
 
-    Ok((response, upstream_authority))
+    Ok(UpstreamSendResult {
+        response,
+        authority: upstream_authority,
+    })
 }
 
 #[cfg(test)]

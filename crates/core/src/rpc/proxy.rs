@@ -799,8 +799,10 @@ struct WireFlowContext {
 /// Sandbox paths and session identity associated with a registered flow.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlowContext {
-    paths: SandboxPaths,
-    sandbox_session_id: Option<String>,
+    /// Paths used to resolve policy scopes for this flow.
+    pub paths: SandboxPaths,
+    /// Sandbox session identity, when the flow is attributed to a session.
+    pub sandbox_session_id: Option<String>,
 }
 
 impl FlowContext {
@@ -824,12 +826,6 @@ impl FlowContext {
     #[must_use]
     pub fn sandbox_session_id(&self) -> Option<&str> {
         self.sandbox_session_id.as_deref()
-    }
-
-    /// Consumes the context, returning its paths and optional session ID.
-    #[must_use]
-    pub fn into_parts(self) -> (SandboxPaths, Option<String>) {
-        (self.paths, self.sandbox_session_id)
     }
 }
 

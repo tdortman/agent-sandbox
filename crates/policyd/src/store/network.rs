@@ -57,6 +57,13 @@ struct NetworkWaitTarget<'a> {
     scheme: &'a str,
 }
 
+/// Waiters displaced when a network wait expires: the cancelled senders and
+/// whether the expiring waiter was the last one (which seals a blocked
+/// verdict into the cache).
+struct ExpiredNetworkWait {
+    canceled: Vec<oneshot::Sender<CheckReply>>,
+    last: bool,
+}
 impl PolicyStore {
     /// Finish pending network checks that declarative/session policy already
     /// allows (e.g. after a UI client registers).
@@ -482,7 +489,7 @@ impl PolicyStore {
         &self,
         target: &NetworkWaitTarget<'_>,
         proxy: Option<&ProxyCheckId>,
-    ) -> (Vec<oneshot::Sender<CheckReply>>, bool) {
+    ) -> ExpiredNetworkWait {
         let mut inner = self.inner.lock().await;
         let canceled = Self::remove_network_waiter_locked(&mut inner, target.pending_id, proxy);
 
@@ -508,7 +515,7 @@ impl PolicyStore {
         }
 
         drop(inner);
-        (canceled, last)
+        ExpiredNetworkWait { canceled, last }
     }
 
     async fn await_network_verdict(
@@ -529,10 +536,9 @@ impl PolicyStore {
             |reason| async move {
                 match reason {
                     VerdictExit::NoUi => {
-                        let (canceled, last) =
-                            self.expire_network_wait(&target, proxy.as_ref()).await;
+                        let expired = self.expire_network_wait(&target, proxy.as_ref()).await;
 
-                        for tx in canceled {
+                        for tx in expired.canceled {
                             let _ = tx.send(CheckReply::blocked(
                                 "agent-sandbox: no policy UI registered",
                             ));
@@ -541,7 +547,7 @@ impl PolicyStore {
                         tracing::warn!(
                             host = %target.policy_host,
                             port = target.port,
-                            last,
+                            last = expired.last,
                             "network approval blocked (no policy UI)"
                         );
 
@@ -552,10 +558,9 @@ impl PolicyStore {
                     }
                     VerdictExit::ChannelClosed => CheckReply::denied(VerdictSource::Blocked),
                     VerdictExit::Timeout => {
-                        let (canceled, last) =
-                            self.expire_network_wait(&target, proxy.as_ref()).await;
+                        let expired = self.expire_network_wait(&target, proxy.as_ref()).await;
 
-                        for tx in canceled {
+                        for tx in expired.canceled {
                             let _ = tx.send(CheckReply::blocked(
                                 "agent-sandbox: network approval timed out",
                             ));
@@ -571,7 +576,7 @@ impl PolicyStore {
                         tracing::warn!(
                             host = %target.policy_host,
                             port = target.port,
-                            last,
+                            last = expired.last,
                             "network approval timed out"
                         );
 
@@ -1026,9 +1031,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_network_approval_prompts_already_registered_standalone_immediately() {
-        // A registered standalone UI must receive the network prompt without delay.
-        // Late UI registration is flushed by `RegisterUi` in `server::client`
-        // (see `flush_pending_to_ui`).
+        // A registered standalone UI must receive the network prompt without
+        // delay. Late UI registration is flushed by `RegisterUi` in
+        // `server::client` (see `flush_pending_to_ui`).
         let store = Arc::new(test_store());
 
         let (a, b) = UnixStream::pair().expect("unix stream pair");
@@ -1071,7 +1076,8 @@ mod tests {
             "expected net: and fast.example in prompt, got: {received}"
         );
 
-        // Approve the pending so the spawned task does not hang on the rx channel.
+        // Approve the pending so the spawned task does not hang on the rx
+        // channel.
         let pending_id = {
             let inner = store.inner.lock().await;
             inner

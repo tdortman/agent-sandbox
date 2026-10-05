@@ -50,6 +50,12 @@ struct ApprovedFlow {
     inserted: Instant,
 }
 
+/// Shutdown handle for the approved-bindings persistence thread.
+struct BindingsWriter {
+    sender: SyncSender<()>,
+    worker: JoinHandle<()>,
+}
+
 pub struct NfqState {
     pub(crate) dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     pub(crate) network_revocation: Option<Arc<NetworkPolicyRevocation>>,
@@ -58,7 +64,7 @@ pub struct NfqState {
     pub(crate) verdict_proxy_uid: u32,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     pub(crate) approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
-    approved_bindings_writer: Option<(SyncSender<()>, JoinHandle<()>)>,
+    approved_bindings_writer: Option<BindingsWriter>,
     approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, ApprovedFlow>>>,
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
@@ -69,12 +75,12 @@ pub struct NfqState {
 
 impl Drop for NfqState {
     fn drop(&mut self) {
-        let Some((sender, worker)) = self.approved_bindings_writer.take() else {
+        let Some(writer) = self.approved_bindings_writer.take() else {
             return;
         };
 
-        drop(sender);
-        if worker.join().is_err()
+        drop(writer.sender);
+        if writer.worker.join().is_err()
             && let Ok(bindings) = self.approved_bindings.lock()
         {
             let _ = bindings.save();
@@ -98,12 +104,12 @@ impl NfqState {
 
         let approved_bindings = ApprovedBindings::load(&approved_bindings_path);
 
-        let (verdict_cache, verdict_netns, verdict_proxy_uid) = open_verdict_cache(cli);
+        let verdict_cache = open_verdict_cache(cli);
 
         let mut state = Self {
-            verdict_cache,
-            verdict_netns,
-            verdict_proxy_uid,
+            verdict_cache: verdict_cache.cache,
+            verdict_netns: verdict_cache.netns,
+            verdict_proxy_uid: verdict_cache.proxy_uid,
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
             network_revocation: None,
@@ -234,7 +240,8 @@ impl NfqState {
             .name("agent-sandbox-nfq-bindings".to_string())
             .spawn(move || {
                 while receiver.recv().is_ok() {
-                    // ponytail: O(n) snapshot; use incremental persistence for large hint tables.
+                    // ponytail: O(n) snapshot; use incremental persistence for
+                    // large hint tables.
                     let snapshot = match approved_bindings.lock() {
                         Ok(bindings) => bindings.clone(),
                         Err(_) => continue,
@@ -246,13 +253,13 @@ impl NfqState {
             return;
         };
 
-        self.approved_bindings_writer = Some((sender, worker));
+        self.approved_bindings_writer = Some(BindingsWriter { sender, worker });
     }
 
     pub(crate) fn notify_approved_bindings(&self) {
         let save_synchronously = match self.approved_bindings_writer.as_ref() {
             None => true,
-            Some((sender, _)) => match sender.try_send(()) {
+            Some(writer) => match writer.sender.try_send(()) {
                 Ok(()) | Err(TrySendError::Full(())) => false,
                 Err(TrySendError::Disconnected(())) => true,
             },
@@ -527,6 +534,17 @@ fn register_proxy_flow(
     }
 }
 
+/// Verdict for one queued packet with the metadata parsed to reach it.
+///
+/// Callers reuse `meta` for side effects (such as the proxy nfmark) without
+/// re-parsing the payload.
+pub struct PacketOutcome {
+    /// NFQUEUE verdict for the packet.
+    pub verdict: Verdict,
+    /// Parsed packet metadata, or `None` when the payload was unparseable.
+    pub meta: Option<packet::PacketMeta>,
+}
+
 /// Core packet handling logic, parameterized over policy and proxy
 /// registration.
 ///
@@ -538,13 +556,16 @@ pub fn handle_packet_payload_with_registration(
     payload: &[u8],
     check: &mut dyn FnMut(policy::CheckDestinationArgs<'_>) -> policy::DestinationVerdict,
     register: Option<&mut dyn FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool>>,
-) -> (Verdict, Option<packet::PacketMeta>) {
+) -> PacketOutcome {
     // Try IPv4 first, then IPv6.
     let meta = packet::parse_ipv4(payload).or_else(|| packet::parse_ipv6(payload));
 
     let Some(meta) = meta else {
         warn!("dropping unparseable queued packet");
-        return (Verdict::Drop, None);
+        return PacketOutcome {
+            verdict: Verdict::Drop,
+            meta: None,
+        };
     };
 
     // UDP DNS responses: cache hostname mappings from the response and accept
@@ -564,7 +585,10 @@ pub fn handle_packet_payload_with_registration(
                 && let Err(error) = guard.revoke()
             {
                 warn!(%error, "cannot revoke network grants before DNS reply");
-                return (Verdict::Drop, Some(meta));
+                return PacketOutcome {
+                    verdict: Verdict::Drop,
+                    meta: Some(meta),
+                };
             }
             // Fresh DNS answers retire cached destination verdicts with the
             // grants they were decided under.
@@ -578,12 +602,18 @@ pub fn handle_packet_payload_with_registration(
             debug!(count = mappings.len(), "cached DNS response mappings");
         }
 
-        return (Verdict::Accept, Some(meta));
+        return PacketOutcome {
+            verdict: Verdict::Accept,
+            meta: Some(meta),
+        };
     }
 
     if policy::is_bypass_traffic(meta.dst_ip, meta.dst_port, state.dns_server_ip) {
         debug!(ip = %meta.dst_ip, port = meta.dst_port, "bypass policy");
-        return (Verdict::Accept, Some(meta));
+        return PacketOutcome {
+            verdict: Verdict::Accept,
+            meta: Some(meta),
+        };
     }
 
     info!(
@@ -597,7 +627,10 @@ pub fn handle_packet_payload_with_registration(
     );
 
     if !meta.is_policy_boundary() {
-        return (Verdict::Accept, Some(meta));
+        return PacketOutcome {
+            verdict: Verdict::Accept,
+            meta: Some(meta),
+        };
     }
 
     // Loopback traffic never traverses the transparent proxy route. Proxy-mode
@@ -623,10 +656,14 @@ pub fn handle_packet_payload_with_registration(
         OwnerResolution::Missing => None,
         OwnerResolution::Ambiguous => {
             warn!(src = %meta.src_ip, port = meta.src_port, "rejecting ambiguous socket ownership");
-            return (
-                policy::nft_reject_and_repeat(&state.nft_binary, meta.dst_ip, meta.dst_port),
-                Some(meta),
-            );
+            return PacketOutcome {
+                verdict: policy::nft_reject_and_repeat(
+                    &state.nft_binary,
+                    meta.dst_ip,
+                    meta.dst_port,
+                ),
+                meta: Some(meta),
+            };
         }
     };
     let src_pid = source_owner.map(OwnerSnapshot::pid_value);
@@ -658,26 +695,40 @@ pub fn handle_packet_payload_with_registration(
     // verdict can confirm the conntrack entry, so already-registered flows
     // skip the verdict RPCs entirely.
     if proxy_flow && is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity)) {
-        return (Verdict::Accept, Some(meta));
+        return PacketOutcome {
+            verdict: Verdict::Accept,
+            meta: Some(meta),
+        };
     }
 
     if proxy_flow {
         let Some(register) = register else {
             warn!("proxy mode has no registration RPC handler");
-            return (Verdict::Drop, Some(meta));
+            return PacketOutcome {
+                verdict: Verdict::Drop,
+                meta: Some(meta),
+            };
         };
 
         // Proxy-owned flows are classified by decoded HTTP requests. The
         // initial HTTP/3 packet must not use network.direct, or HTTP/3 would
         // need a second transport policy rule before reaching HTTP policy.
         let verdict = register_proxy_flow(state, meta, source_owner, register);
-        return (verdict, Some(meta));
+        return PacketOutcome {
+            verdict,
+            meta: Some(meta),
+        };
     }
 
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
     let allowed = match policy::transport_check(state, meta, src_pid, session_id.as_deref(), check)
     {
-        TransportCheck::Rejected(verdict) => return (verdict, Some(meta)),
+        TransportCheck::Rejected(verdict) => {
+            return PacketOutcome {
+                verdict,
+                meta: Some(meta),
+            };
+        }
         TransportCheck::Allowed(destination) => destination,
     };
 
@@ -689,7 +740,10 @@ pub fn handle_packet_payload_with_registration(
         "accept"
     );
 
-    (Verdict::Accept, Some(meta))
+    PacketOutcome {
+        verdict: Verdict::Accept,
+        meta: Some(meta),
+    }
 }
 
 /// Production wrapper: calls `policy::check_destination` via the tokio runtime.
@@ -699,7 +753,7 @@ pub fn handle_packet(
     timeout: Duration,
     message: &nfq_updated::Message,
     runtime: &tokio::runtime::Handle,
-) -> (Verdict, Option<packet::PacketMeta>) {
+) -> PacketOutcome {
     let payload = message.get_payload();
     // These callbacks run sequentially and share one policy connection.
     let policy_client = std::cell::RefCell::new(policy_client);
@@ -880,7 +934,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -908,7 +963,7 @@ pub mod tests {
             panic!("host localhost flows must not register for the proxy")
         };
 
-        let (verdict, _) =
+        let PacketOutcome { verdict, .. } =
             handle_packet_payload_with_registration(&state, &pkt, &mut check, Some(&mut register));
 
         assert_eq!(verdict, Verdict::Accept);
@@ -968,7 +1023,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1026,7 +1081,7 @@ pub mod tests {
 
         let mut register = |_flow: FlowRegistration, _owner_fd_hint: Option<u32>| Ok(true);
 
-        let (verdict, meta) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, meta } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1059,7 +1114,7 @@ pub mod tests {
         // mark for unregistered flows.
         let direct = build_loopback_tcp_syn_packet();
         let mut check = |_args: policy::CheckDestinationArgs<'_>| policy_allow();
-        let (verdict, meta) =
+        let PacketOutcome { verdict, meta } =
             handle_packet_payload_with_registration(&state, &direct, &mut check, None);
 
         assert_eq!(verdict, Verdict::Accept);
@@ -1085,7 +1140,7 @@ pub mod tests {
         packet[20..22].copy_from_slice(&client_addr.port().to_be_bytes());
 
         let mut register = |_flow: FlowRegistration, _owner_fd_hint: Option<u32>| Ok(true);
-        let (verdict, meta) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, meta } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1146,7 +1201,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1203,7 +1258,7 @@ pub mod tests {
         };
 
         for _ in 0..2 {
-            let (verdict, _) = handle_packet_payload_with_registration(
+            let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
                 &state,
                 &packet,
                 &mut check,
@@ -1277,7 +1332,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1344,7 +1399,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1401,7 +1456,7 @@ pub mod tests {
         };
 
         // First packet of the flow: registration without a transport check.
-        let (first, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict: first, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1412,8 +1467,11 @@ pub mod tests {
         assert_eq!(check_count.get(), 0);
         assert_eq!(registration_count.get(), 1);
 
-        // QUIC opening burst: the same flow skips both callbacks on the fast path.
-        let (second, _) = handle_packet_payload_with_registration(
+        // QUIC opening burst: the same flow skips both callbacks on the fast
+        // path.
+        let PacketOutcome {
+            verdict: second, ..
+        } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1465,7 +1523,7 @@ pub mod tests {
             Ok(false)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1540,7 +1598,7 @@ pub mod tests {
 
         let mut register = |_: FlowRegistration, _: Option<u32>| Ok(true);
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1582,7 +1640,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1622,7 +1680,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -1659,7 +1718,7 @@ pub mod tests {
             Ok(true)
         };
 
-        let (verdict, _) = handle_packet_payload_with_registration(
+        let PacketOutcome { verdict, .. } = handle_packet_payload_with_registration(
             &state,
             &packet,
             &mut check,
@@ -1700,13 +1759,15 @@ pub mod tests {
         };
 
         // First check: policy consulted.
-        let (v1, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v1, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v1, Verdict::Accept);
         assert_eq!(call_count.get(), 1);
 
         // Second check: policy consulted again (verdict cache disarmed here).
-        let (v2, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v2, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v2, Verdict::Accept);
         assert_eq!(call_count.get(), 2);
@@ -2101,7 +2162,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -2133,7 +2195,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -2165,7 +2228,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -2187,7 +2251,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 
@@ -2209,7 +2274,8 @@ pub mod tests {
             policy_allow()
         };
 
-        let (v, _) = handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
+        let PacketOutcome { verdict: v, .. } =
+            handle_packet_payload_with_registration(&state, &pkt, &mut check, None);
 
         assert_eq!(v, Verdict::Accept);
 

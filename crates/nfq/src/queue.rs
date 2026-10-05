@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    flow::{NfqState, apply_proxy_mark, handle_packet},
+    flow::{NfqState, PacketOutcome, apply_proxy_mark, handle_packet},
     packet,
 };
 
@@ -104,7 +104,8 @@ pub async fn run_queue(
 
             let barrier = meta.is_none_or(|meta| meta.src_port == 53);
 
-            // Keep same-flow packets ordered and DNS updates between completed batches.
+            // Keep same-flow packets ordered and DNS updates between completed
+            // batches.
             if !active.is_empty() && (barrier || flows.contains(&key)) {
                 deferred = Some(message);
                 break;
@@ -118,7 +119,7 @@ pub async fn run_queue(
             active.spawn_blocking(move || {
                 let mut message = message;
 
-                let (verdict, meta) =
+                let PacketOutcome { verdict, meta } =
                     handle_packet(&state, &mut client, timeout, &message, &runtime);
 
                 apply_proxy_mark(&state, &mut message, verdict, meta);

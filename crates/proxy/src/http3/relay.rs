@@ -440,9 +440,9 @@ pub(super) fn semantic_request(
     for header in headers
         .as_slice()
         .iter()
-        .filter(|header| header.0.as_str() == "host")
+        .filter(|header| header.name.as_str() == "host")
     {
-        let host = std::str::from_utf8(header.1.as_bytes())
+        let host = std::str::from_utf8(header.value.as_bytes())
             .map_err(|_| boxed("HTTP/3 Host header is not valid UTF-8"))?;
 
         reconcile_authorities(&[&authority, host], fallback_port)
@@ -466,13 +466,13 @@ fn has_capsule_protocol(semantic: &SemanticRequest) -> bool {
         .headers()
         .as_slice()
         .iter()
-        .filter(|header| header.0.as_str() == "capsule-protocol");
+        .filter(|header| header.name.as_str() == "capsule-protocol");
 
     let Some(header) = values.next() else {
         return false;
     };
 
-    header.1.as_bytes() == b"?1" && values.next().is_none()
+    header.value.as_bytes() == b"?1" && values.next().is_none()
 }
 
 fn require_capsule_protocol(enabled: bool) -> Result<(), BoxError> {
@@ -533,8 +533,11 @@ async fn relay_request(
 
     let expects_continue = protocol.is_none()
         && semantic.headers().as_slice().iter().any(|header| {
-            header.0.as_str().eq_ignore_ascii_case("expect")
-                && header.1.as_bytes().eq_ignore_ascii_case(b"100-continue")
+            header.name.as_str().eq_ignore_ascii_case("expect")
+                && header
+                    .value
+                    .as_bytes()
+                    .eq_ignore_ascii_case(b"100-continue")
         });
 
     let (continue_tx, continue_rx) = oneshot::channel();
@@ -1155,8 +1158,8 @@ async fn relay_response(
 fn upstream_headers(headers: &SemanticHeaders) -> http::HeaderMap {
     let mut map = http::HeaderMap::new();
 
-    for (name, value) in headers.as_slice() {
-        map.append(name.clone(), value.clone());
+    for header in headers.as_slice() {
+        map.append(header.name.clone(), header.value.clone());
     }
 
     map.remove("host");
