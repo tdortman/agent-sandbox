@@ -118,7 +118,7 @@ pub async fn handle_client(
         }
 
         if is_register && register_succeeded {
-            store.resolve_pending_declarative_allow().await;
+            store.settle_covered_pendings().await;
             store.flush_pending_to_ui().await;
         }
     }

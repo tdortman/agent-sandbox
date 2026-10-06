@@ -20,6 +20,7 @@ mod scope_filesystem;
 mod scope_http;
 mod scope_network;
 mod scope_sudo;
+mod settle;
 mod state;
 mod status;
 mod types;

@@ -42,22 +42,29 @@ impl PolicyStore {
             return PolicydError::HostDeniedByPolicy.into();
         }
 
-        self.apply_network_scope(
-            NetworkScopeOp {
-                host: policy_host,
-                port,
-                scope,
-                wire: ScopeWire {
-                    paths,
-                    session_id,
-                    owner_uid: wire_ids.uid(),
-                    sandbox_session_id: ctx.sandbox_session_id,
-                    comment: None,
-                    package: ctx.package.clone(),
+        let reply = self
+            .apply_network_scope(
+                NetworkScopeOp {
+                    host: policy_host,
+                    port,
+                    scope,
+                    wire: ScopeWire {
+                        paths,
+                        session_id,
+                        owner_uid: wire_ids.uid(),
+                        sandbox_session_id: ctx.sandbox_session_id,
+                        comment: None,
+                        package: ctx.package.clone(),
+                    },
                 },
-            },
-            DecisionAction::Approve,
-        )
-        .await
+                DecisionAction::Approve,
+            )
+            .await;
+
+        if scope != ApprovalScope::Once {
+            self.settle_covered_pendings().await;
+        }
+
+        reply
     }
 }

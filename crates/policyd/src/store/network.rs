@@ -15,8 +15,8 @@ use uuid::Uuid;
 use super::{
     state::ProxyCheckId,
     types::{
-        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingKind,
-        PendingNetwork, PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
+        MAX_PENDING_APPROVALS, MAX_WAITERS_PER_PENDING, NetworkWaiter, Pending, PendingNetwork,
+        PendingResult, PolicyStore, VerdictEntry, enforce_verdict_cache_limit,
     },
     ui::VerdictExit,
 };
@@ -65,65 +65,6 @@ struct ExpiredNetworkWait {
     last: bool,
 }
 impl PolicyStore {
-    /// Finish pending network checks that declarative/session policy already
-    /// allows (e.g. after a UI client registers).
-    pub async fn resolve_pending_declarative_allow(&self) {
-        let pending: Vec<Pending> = self
-            .inner
-            .lock()
-            .await
-            .pending
-            .pending
-            .values()
-            .filter(|p| p.kind() == PendingKind::Network)
-            .cloned()
-            .collect();
-
-        for p in pending {
-            let Pending::Network(net) = &p else {
-                continue;
-            };
-
-            let host = net.host.clone();
-
-            let port = if net.port > 0 {
-                net.port
-            } else {
-                continue;
-            };
-
-            let merge = net.ctx.clone();
-
-            let Some(verdict) = self.allow_verdict(&host, port, &merge).await else {
-                continue;
-            };
-
-            if verdict.is_policy_denied() || verdict.is_once() {
-                continue;
-            }
-
-            tracing::info!(
-                %host,
-                port,
-                source = %verdict.source,
-                pending_id = %p.id(),
-            );
-
-            self.finish_network(
-                p.id(),
-                true,
-                verdict.source,
-                Some(NetworkRuleKey {
-                    host: host.clone(),
-                    port,
-                }),
-            )
-            .await;
-
-            self.inner.lock().await.pending.pending.remove(p.id());
-        }
-    }
-
     pub(crate) async fn finish_network(
         &self,
         pending_id: &str,

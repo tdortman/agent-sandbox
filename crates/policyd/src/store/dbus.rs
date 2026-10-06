@@ -12,26 +12,7 @@ impl PolicyStore {
         target: DbusTarget,
         ctx: ResolvedRequestContext,
     ) -> DbusCheckReply {
-        let policy_verdict = self.dbus_verdict(&target, &ctx);
-
-        if let Some(verdict) = policy_verdict.as_ref()
-            && !verdict.allowed
-        {
-            return DbusCheckReply::from_verdict(verdict.clone(), target);
-        }
-
-        if self.session_dbus_denied(&target, &ctx).await {
-            return DbusCheckReply::denied(VerdictSource::policy(), target);
-        }
-
-        if self.session_dbus_allowed(&target, &ctx).await {
-            return DbusCheckReply::from_verdict(
-                Verdict::allowed(VerdictSource::Scope(ApprovalScope::Session)),
-                target,
-            );
-        }
-
-        if let Some(verdict) = policy_verdict {
+        if let Some(verdict) = self.dbus_decided_verdict(&target, &ctx).await {
             return DbusCheckReply::from_verdict(verdict, target);
         }
 
@@ -53,5 +34,34 @@ impl PolicyStore {
         };
 
         self.request_dbus_approval(target, ctx).await
+    }
+
+    /// Verdict the declarative and session rules give a D-Bus target, or
+    /// `None` when the target needs a prompt. Denies win over allows.
+    pub(crate) async fn dbus_decided_verdict(
+        &self,
+        target: &DbusTarget,
+        ctx: &ResolvedRequestContext,
+    ) -> Option<Verdict> {
+        let policy_verdict = self.dbus_verdict(target, ctx);
+
+        if policy_verdict
+            .as_ref()
+            .is_some_and(|verdict| !verdict.allowed)
+        {
+            return policy_verdict;
+        }
+
+        if self.session_dbus_denied(target, ctx).await {
+            return Some(Verdict::denied(VerdictSource::policy()));
+        }
+
+        if self.session_dbus_allowed(target, ctx).await {
+            return Some(Verdict::allowed(VerdictSource::Scope(
+                ApprovalScope::Session,
+            )));
+        }
+
+        policy_verdict
     }
 }

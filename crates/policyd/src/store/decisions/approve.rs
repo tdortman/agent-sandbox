@@ -37,6 +37,17 @@ impl PolicyStore {
         decision: PendingDecision,
         action: DecisionAction,
     ) -> RpcReply {
+        let scoped = decision.scope != ApprovalScope::Once;
+        let reply = self.decide_pending(decision, action).await;
+
+        if scoped {
+            self.settle_covered_pendings().await;
+        }
+
+        reply
+    }
+
+    async fn decide_pending(&self, decision: PendingDecision, action: DecisionAction) -> RpcReply {
         let decision = match self.take_pending_decision(decision).await {
             Ok(value) => value,
             Err(err) => return *err,
@@ -2168,6 +2179,109 @@ mod tests {
                     },
                 )
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_filesystem_approval_settles_other_covered_pendings() {
+        // Regression: a directory rule approved on one prompt left sibling
+        // prompts it covers pending, so the UI asked about each of them again.
+        let store = Arc::new(test_store("settle-covered").await);
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        let slides = project.join("slides");
+        std::fs::create_dir_all(&slides).expect("create slides dir");
+
+        let names = ["talk.pptx", "poster.png"];
+        for name in names {
+            std::fs::write(slides.join(name), b"").expect("write slide file");
+        }
+
+        let ctx = pending_context(
+            Some(project.clone()),
+            Some(home.clone()),
+            Some(project.clone()),
+            None,
+        );
+
+        let requests = names.map(|name| {
+            let store = Arc::clone(&store);
+            let path = slides.join(name);
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                store
+                    .request_filesystem_approval(path, FileAccess::Read, ctx)
+                    .await
+            })
+        });
+
+        let talk = slides.join("talk.pptx");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let talk_id = loop {
+            let inner = store.inner.lock().await;
+            let pending = &inner.pending.pending;
+            let talk_id = (pending.len() == 2)
+                .then(|| {
+                    pending.values().find_map(|p| match p {
+                        Pending::Filesystem(fs) if fs.path == talk => Some(fs.id.clone()),
+                        _ => None,
+                    })
+                })
+                .flatten();
+            drop(inner);
+            if let Some(id) = talk_id {
+                break id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "both requests must register a pending"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let reply = store
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id: talk_id,
+                    scope: ApprovalScope::Project,
+                    target: Some(ApprovalTarget::FilesystemPath {
+                        path: slides.clone(),
+                    }),
+                    wire: ScopeWire {
+                        paths: SandboxPaths::new(&project, &home, &project),
+                        session_id: None,
+                        owner_uid: Some(1000),
+                        sandbox_session_id: None,
+                        comment: None,
+                        package: None,
+                    },
+                    client_id: 1,
+                    approver_uid: None,
+                },
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(
+            reply.scope_succeeded(),
+            "project directory approval should succeed, got: {reply:?}"
+        );
+
+        for request in requests {
+            let check = tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .expect("a request covered by the new rule must not wait for its own prompt")
+                .expect("request task");
+            assert!(
+                check.verdict.allowed,
+                "covered request must be allowed, got {check:?}"
+            );
+        }
+
+        assert!(
+            store.pending_summaries().await.is_empty(),
+            "covered requests must leave the pending queue"
         );
     }
 }
