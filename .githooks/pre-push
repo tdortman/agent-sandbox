@@ -25,4 +25,15 @@ fi
 
 echo "pre-push: building and pushing to cachix $CACHE_NAME ..." >&2
 out="$(nix build .# --no-link --print-out-paths)"
-cachix push "$CACHE_NAME" "$out"
+
+# cachix resets SIGPIPE to its default after initialising Nix and only
+# ignores it again on macOS, so a write to a closed pipe or socket kills it
+# with status 141, even after a complete upload. Re-running checks every
+# path against the cache and uploads only what is still missing.
+for attempt in 1 2 3; do
+    status=0
+    cachix push "$CACHE_NAME" "$out" || status=$?
+    [[ $status -eq 141 ]] || exit "$status"
+    echo "pre-push: cachix push died of SIGPIPE (attempt $attempt), re-checking ..." >&2
+done
+exit 141
