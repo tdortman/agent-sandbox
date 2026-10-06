@@ -181,9 +181,9 @@ mod tests {
     use std::time::Duration;
 
     use agent_sandbox_core::{
-        ApprovalScope, DbusMessageKind, DbusTarget, ProcessIds, RequestContext,
-        ResolvedRequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest, SandboxPaths,
-        UiPush,
+        ApprovalScope, ApprovalTarget, DbusMessageKind, DbusTarget, FileAccess, ProcessIds,
+        RequestContext, ResolvedRequestContext, RpcConnection, RpcMessage, RpcReply, RpcRequest,
+        SandboxPaths, UiPush,
     };
 
     use super::*;
@@ -745,6 +745,160 @@ mod tests {
             "Approve must remain blocked on a sandbox connection that failed to register, got: \
              {reply:?}"
         );
+
+        server_task.abort();
+    }
+
+    /// Regression: approving one prompt with a directory rule left queued
+    /// prompts it covers pending, so the UI asked about each of them again.
+    #[tokio::test]
+    async fn scoped_decision_settles_queued_prompts_it_covers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let store = Arc::new(PolicyStore::new(args.clone()));
+        let server = PolicyServer::new(store.clone());
+
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Status lists a session's pendings only to the session owner.
+        let launcher_pid = std::fs::read_to_string(format!("/proc/{}/stat", std::process::id()))
+            .ok()
+            .and_then(|stat| {
+                let end = stat.rfind(')')?;
+                let mut fields = stat[end + 1..].split_whitespace();
+                fields.next()?;
+                fields.next()?.parse().ok()
+            })
+            .expect("parent pid of the test process");
+
+        let reply = send_and_recv(&args.host_socket, RpcRequest::RegisterSandbox {
+            session_id: "s1".into(),
+            package: "omp".into(),
+            launcher_pid,
+        })
+        .await
+        .expect("RegisterSandbox");
+        assert!(matches!(&reply, RpcReply::Simple(s) if s.ok), "{reply:?}");
+
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        let slides = project.join("slides");
+        std::fs::create_dir_all(&slides).expect("create slides dir");
+
+        let ui_ctx = RequestContext {
+            cwd: Some(project.clone()),
+            home: Some(home.clone()),
+            project_root: Some(project.clone()),
+            sandbox_session_id: Some("s1".into()),
+            ..Default::default()
+        };
+
+        let mut ui_conn = RpcConnection::connect(&args.host_socket)
+            .await
+            .expect("connect host socket");
+
+        let RpcReply::RegisterUi(registered) = ui_conn
+            .request(RpcRequest::RegisterUi {
+                ui_client: Some("standalone".into()),
+                ctx: ui_ctx.clone(),
+            })
+            .await
+            .expect("RegisterUi")
+        else {
+            panic!("expected UI registration");
+        };
+        assert!(registered.ok);
+
+        let requests = ["talk.pptx", "poster.png"].map(|name| {
+            let path = slides.join(name);
+            std::fs::write(&path, b"").expect("write slide file");
+            let store = store.clone();
+            let ctx = ResolvedRequestContext::new(
+                SandboxPaths::new(&project, &home, &project),
+                ProcessIds::from_options(None, Some(nix::unistd::getuid().as_raw())),
+                Some("s1".into()),
+            );
+
+            tokio::spawn(async move {
+                store
+                    .request_filesystem_approval(path, FileAccess::Read, ctx)
+                    .await
+            })
+        });
+
+        let mut pushes = Vec::new();
+        while pushes.len() < 2 {
+            let message = tokio::time::timeout(Duration::from_secs(1), ui_conn.read_message())
+                .await
+                .expect("filesystem push timeout")
+                .expect("read filesystem push");
+
+            if let RpcMessage::UiPush(push @ UiPush::FilesystemRequest { .. }) = message {
+                pushes.push(push);
+            }
+        }
+
+        let UiPush::FilesystemRequest { id, .. } = &pushes[0] else {
+            unreachable!();
+        };
+
+        let RpcReply::Status(before) = send_and_recv(&args.host_socket, RpcRequest::Status {
+            ctx: ui_ctx.clone(),
+        })
+        .await
+        .expect("status") else {
+            panic!("expected status reply");
+        };
+        assert!(
+            pushes
+                .iter()
+                .all(|push| before.pending.iter().any(|pending| push.is_for(pending))),
+            "status must list both open prompts: {:?}",
+            before.pending
+        );
+
+        let reply = send_and_recv(&args.host_socket, RpcRequest::Approve {
+            id: id.clone(),
+            scope: ApprovalScope::Session,
+            session_id: Some(registered.session_id),
+            target: Some(ApprovalTarget::FilesystemPath {
+                path: slides.clone(),
+            }),
+            comment: None,
+            ctx: ui_ctx.clone(),
+        })
+        .await
+        .expect("approve first prompt");
+        assert!(reply.scope_succeeded(), "approval failed: {reply:?}");
+
+        // The UI checks this before opening the queued second prompt.
+        let RpcReply::Status(status) =
+            send_and_recv(&args.host_socket, RpcRequest::Status { ctx: ui_ctx })
+                .await
+                .expect("status")
+        else {
+            panic!("expected status reply");
+        };
+        assert!(
+            !status
+                .pending
+                .iter()
+                .any(|pending| pushes[1].is_for(pending)),
+            "covered prompt must no longer be pending: {:?}",
+            status.pending
+        );
+
+        for request in requests {
+            let check = tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("covered request must not wait for its own prompt")
+                .expect("request task");
+            assert!(check.verdict.allowed, "covered request denied: {check:?}");
+        }
 
         server_task.abort();
     }

@@ -313,3 +313,28 @@ pub enum UiPush {
         package: Option<String>,
     },
 }
+
+impl UiPush {
+    /// Whether `pending` is the request this push prompts for.
+    #[must_use]
+    pub fn is_for(&self, pending: &PendingSummary) -> bool {
+        match (self, pending) {
+            (Self::HttpRequest { id, .. }, PendingSummary::Http { id: pending, .. }) => {
+                id == pending
+            }
+
+            (Self::NetworkRequest { id, .. }, PendingSummary::Network { id: pending, .. })
+            | (Self::ElevationRequest { id, .. }, PendingSummary::Elevation { id: pending, .. })
+            | (
+                Self::FilesystemRequest { id, .. },
+                PendingSummary::Filesystem { id: pending, .. },
+            )
+            | (Self::ResourceRequest { id, .. }, PendingSummary::Resource { id: pending, .. })
+            | (Self::DbusRequest { id, .. }, PendingSummary::Dbus { id: pending, .. }) => {
+                id == pending
+            }
+
+            _ => false,
+        }
+    }
+}
