@@ -41,6 +41,12 @@ let
   };
   dbusTargetType = lib.types.submodule {
     options = {
+      anyFdMetadata = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Match any file-descriptor metadata, ignoring `fdMetadata`.";
+      };
+
       bus = lib.mkOption {
         type = lib.types.enum [
           "session"

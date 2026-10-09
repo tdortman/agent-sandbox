@@ -1184,6 +1184,10 @@ pub struct DbusTarget {
     #[serde(default)]
     /// Metadata for any file descriptors carried by the message.
     pub fd_metadata: Vec<DbusFdMetadata>,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// As a rule pattern: match any fd metadata, ignoring `fd_metadata`.
+    pub any_fd_metadata: bool,
 }
 
 impl DbusTarget {
@@ -1207,6 +1211,7 @@ impl DbusTarget {
             message_kind,
             signature: signature.into(),
             fd_metadata,
+            any_fd_metadata: false,
         }
     }
 }
@@ -1234,13 +1239,14 @@ impl DbusRule {
 
     /// Whether this rule matches the given message target.
     ///
-    /// The bus, message kind, and fd metadata must match exactly; the other
-    /// string fields match as globset patterns.
+    /// The bus and message kind must match exactly; fd metadata must match
+    /// exactly unless the rule sets `any_fd_metadata`. The other string fields
+    /// match as globset patterns.
     #[must_use]
     pub fn matches(&self, target: &DbusTarget) -> bool {
         if self.target.bus != target.bus
             || self.target.message_kind != target.message_kind
-            || self.target.fd_metadata != target.fd_metadata
+            || (!self.target.any_fd_metadata && self.target.fd_metadata != target.fd_metadata)
         {
             return false;
         }

@@ -95,6 +95,8 @@ let
           signature
           ;
 
+        any_fd_metadata = rule.target.anyFdMetadata;
+
         fd_metadata = map (fd: {
           inherit (fd) kind;
           read_only = fd.readOnly;

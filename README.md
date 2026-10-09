@@ -267,6 +267,8 @@ Filesystem paths, network hosts, HTTP URLs, and D-Bus target string fields suppo
 
 Set `agent-sandbox.policy.dbus.enable = true` to expose filtered dbus sockets. This requires `gates.resources.enable`, which blocks direct host IPC socket connections. The wrapper gives each sandbox its own relay and sets `DBUS_SESSION_BUS_ADDRESS` to that relay. Policyd checks destination, object path, interface, member, message kind, signature, and file-descriptor metadata. Systemd sockets are automatically rejected, to prevent sandbox escapes through means like `systemd-run`.
 
+Destination, object path, interface, member, and signature accept glob patterns, so `"signature": "*"` matches any signature. File-descriptor metadata matches exactly unless the rule sets `"any_fd_metadata": true`. In the approval prompt, enter `*` in the signature or FD metadata field to match any value.
+
 ## Approval UI
 
 `agent-sandbox-ui` uses the packaged Qt dialog and falls back to zenity. Use `agent-sandbox-approve` when no graphical UI is available.

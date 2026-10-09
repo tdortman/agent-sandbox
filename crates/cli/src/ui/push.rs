@@ -451,9 +451,11 @@ fn parse_dbus_target(
     result: &ApprovalFormResult,
     requested: &DbusTarget,
 ) -> Option<ApprovalTarget> {
+    let fd_metadata = result.values.get("fd_metadata")?;
+    let any_fd_metadata = fd_metadata == "*";
     if result.values.get("bus")? != bus_name(requested.bus)
         || result.values.get("message_kind")? != message_kind_name(requested.message_kind)
-        || result.values.get("fd_metadata")? != &dbus_fd_display(requested)
+        || (!any_fd_metadata && fd_metadata != &dbus_fd_display(requested))
     {
         return None;
     }
@@ -469,7 +471,12 @@ fn parse_dbus_target(
             "<empty>" => String::new(),
             signature => signature.to_owned(),
         },
-        fd_metadata: requested.fd_metadata.clone(),
+        fd_metadata: if any_fd_metadata {
+            Vec::new()
+        } else {
+            requested.fd_metadata.clone()
+        },
+        any_fd_metadata,
     };
 
     if !DbusRule::new(target.clone(), "").matches(requested) {
@@ -1639,8 +1646,8 @@ mod tests {
     use std::{collections::HashMap, path::Path};
 
     use agent_sandbox_core::{
-        DbusMessageKind, DbusTarget, HttpRequest, ResourceAccess, ResourceKind, SandboxPaths,
-        SocketAccess,
+        DbusFdMetadata, DbusMessageKind, DbusRule, DbusTarget, HttpRequest, ResourceAccess,
+        ResourceKind, SandboxPaths, SocketAccess,
     };
 
     use super::{
@@ -1967,6 +1974,54 @@ mod tests {
         };
 
         assert!(parse_dbus_target(&result, &requested).is_some());
+    }
+
+    #[test]
+    fn dbus_star_signature_and_fd_metadata_match_any_message() {
+        let requested = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Send",
+            DbusMessageKind::MethodCall,
+            "h",
+            vec![DbusFdMetadata {
+                kind: "unknown".into(),
+                read_only: false,
+            }],
+        );
+
+        let result = ApprovalFormResult {
+            action: Some(PromptAction::Allow),
+            scope: ApprovalScope::Project,
+            values: HashMap::from([
+                ("bus".into(), "session".into()),
+                ("destination".into(), "org.example.Service".into()),
+                ("object_path".into(), "/org/example/Object".into()),
+                ("interface".into(), "org.example.Interface".into()),
+                ("member".into(), "Send".into()),
+                ("message_kind".into(), "method_call".into()),
+                ("signature".into(), "*".into()),
+                ("fd_metadata".into(), "*".into()),
+            ]),
+        };
+
+        let Some(ApprovalTarget::Dbus { target }) = parse_dbus_target(&result, &requested) else {
+            panic!("wildcard D-Bus target rejected");
+        };
+        let rule = DbusRule::new(target, "");
+
+        let no_fds = DbusTarget::session(
+            "org.example.Service",
+            "/org/example/Object",
+            "org.example.Interface",
+            "Send",
+            DbusMessageKind::MethodCall,
+            "",
+            Vec::new(),
+        );
+        assert!(rule.matches(&requested));
+        assert!(rule.matches(&no_fds));
     }
 
     fn form_result(target: &str) -> ApprovalFormResult {

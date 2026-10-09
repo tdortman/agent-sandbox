@@ -101,6 +101,7 @@ pub fn target_from_message(message: &Message, bus: DbusBus) -> DbusTarget {
         message_kind: kind,
         signature,
         fd_metadata,
+        any_fd_metadata: false,
     }
 }
 
