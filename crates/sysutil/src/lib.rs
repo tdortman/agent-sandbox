@@ -963,6 +963,14 @@ pub unsafe fn sendmsg_raw(fd: impl AsFd, msg: &libc::msghdr, flags: i32) -> io::
 
 /// Install a seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
+/// The filter also sets `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19)
+/// so a notification the supervisor has received is only withdrawn by a fatal
+/// signal. Otherwise the cgroup freezer, which pauses the sandbox during an
+/// approval, interrupts the wait: the supervisor's emulated side effect (a
+/// connected socket, a renamed file) lands while the tracee restarts the
+/// syscall and fails against it. Older kernels reject the flag and get the
+/// filter without it.
+///
 /// Returns an `OwnedFd` for the seccomp user-notification listener.
 ///
 /// # Errors
@@ -973,18 +981,32 @@ pub fn install_seccomp_notify(prog: &mut libc::sock_fprog) -> io::Result<OwnedFd
 
     const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
 
-    // SAFETY: `prog` is a valid BPF program. The syscall is the standard
-    // seccomp install path; the kernel validates the program.
-    let raw = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            u64::from(SECCOMP_SET_MODE_FILTER),
-            u64::from(SECCOMP_FILTER_FLAG_NEW_LISTENER),
-            std::ptr::from_mut::<libc::sock_fprog>(prog),
-        )
+    const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: u32 = 1 << 5;
+
+    let install = |flags: u32, prog: &mut libc::sock_fprog| {
+        // SAFETY: `prog` is a valid BPF program. The syscall is the standard
+        // seccomp install path; the kernel validates the program and flags.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                u64::from(SECCOMP_SET_MODE_FILTER),
+                u64::from(flags),
+                std::ptr::from_mut::<libc::sock_fprog>(prog),
+            )
+        };
+
+        fd_from_syscall(raw)
     };
 
-    fd_from_syscall(raw)
+    match install(
+        SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+        prog,
+    ) {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            install(SECCOMP_FILTER_FLAG_NEW_LISTENER, prog)
+        }
+        result => result,
+    }
 }
 
 /// Fork in a single-threaded pre-exec context.
