@@ -14,6 +14,15 @@ use crate::{
     store::types::{SandboxSessionRegistration, TrustedPeer},
 };
 
+/// Nix store paths that hold copies of policy files: project policy
+/// directories, user policy directories (e.g. a dotfiles flake source), and
+/// copied git histories that contain either.
+const STORE_POLICY_COPY_GLOBS: [&str; 3] = [
+    "/nix/store/**/.agent-sandbox{,/**}",
+    "/nix/store/**/agent-sandbox/{policy.json,packages,packages/**}",
+    "/nix/store/*/.git{,/**}",
+];
+
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     let target = resolve_policy_write_path(path, None)?;
 
@@ -574,6 +583,20 @@ impl PolicyStore {
         {
             merged.filesystem.deny.push(FilesystemRule {
                 path: trusted,
+                access: FileAccess::All,
+                comment: Some("trusted policy file".into()),
+            });
+        }
+
+        // The daemon's merged exports and Nix store copies of policy files
+        // (flake sources of a dotfiles or project repo, including their git
+        // history) expose the same rules. Store paths are globs: they are
+        // never walked into the inode cache.
+        let exports = [Some(&self.args.export_json), self.args.export_nix.as_ref()];
+        let store_copies = STORE_POLICY_COPY_GLOBS.iter().map(PathBuf::from);
+        for path in exports.into_iter().flatten().cloned().chain(store_copies) {
+            merged.filesystem.deny.push(FilesystemRule {
+                path,
                 access: FileAccess::All,
                 comment: Some("trusted policy file".into()),
             });

@@ -244,6 +244,9 @@ pkgs.testers.runNixOSTest (_: {
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "test -d /home/.snapshots && test ! -e /home/.snapshots/marker")
     dynamic.succeed("${lib.getExe pkgs.jq} -e . /var/lib/agent-sandbox/exported-policy.json >/dev/null")
     dynamic.succeed("nix-instantiate --eval --strict /var/lib/agent-sandbox/exported-policy.nix >/dev/null")
+    # The merged exports carry every layer's rules, so they stay unreadable.
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", "! cat /var/lib/agent-sandbox/exported-policy.json >/dev/null")
+    sandbox_shell(dynamic, "sandbox-dynamic-bash", "! cat /var/lib/agent-sandbox/exported-policy.nix >/dev/null")
     sandbox_exec(dynamic, "sandbox-dynamic-curl", "--version")
     sandbox_shell(
         dynamic,

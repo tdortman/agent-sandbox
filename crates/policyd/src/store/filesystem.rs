@@ -924,6 +924,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_filesystem_denies_policy_copies_despite_store_static_allow() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let export = dir.path().join("export.json");
+        let store = PolicyStore::new(crate::store::test_args(
+            dir.path().join("sock"),
+            dir.path().join("sandbox.sock"),
+            dir.path().join("declarative.json"),
+            export.clone(),
+            Duration::from_secs(30),
+            false,
+        ));
+        let ctx = ResolvedRequestContext {
+            paths: SandboxPaths::new("/repo", "/home/user", "/repo"),
+            ids: ProcessIds::default(),
+            sandbox_session_id: Some("sandbox-store-copy".into()),
+            package: None,
+        };
+        store
+            .inner
+            .lock()
+            .await
+            .sandbox_filesystem_static_allow
+            .insert("sandbox:sandbox-store-copy".into(), vec![
+                FilesystemRule::new("/nix/store", FileAccess::All, "static store"),
+            ]);
+
+        let source = "/nix/store/0aji9km36ijxgsr0b5sjfjzvivgzdjir-source";
+        for denied in [
+            format!("{source}/.agent-sandbox/policy.json"),
+            format!("{source}/.agent-sandbox/packages/omp.json"),
+            format!("{source}/home/dot_config/agent-sandbox/policy.json"),
+            format!("{source}/home/dot_config/agent-sandbox/packages/omp.json"),
+            format!("{source}/.git/objects/ab/cdef"),
+            export.to_string_lossy().into_owned(),
+        ] {
+            let reply = store
+                .check_filesystem(PathBuf::from(&denied), FileAccess::Read, ctx.clone())
+                .await;
+            assert!(
+                !reply.verdict.allowed,
+                "{denied} must be denied, got {reply:?}"
+            );
+        }
+
+        let reply = store
+            .check_filesystem(
+                PathBuf::from(format!("{source}/flake.nix")),
+                FileAccess::Read,
+                ctx,
+            )
+            .await;
+        assert!(
+            reply.verdict.allowed,
+            "other store files stay allowed, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn check_filesystem_denies_when_broad_static_glob_matches_but_policy_denies() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let project_root = dir.path().join("repo");
