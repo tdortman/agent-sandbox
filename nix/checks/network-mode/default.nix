@@ -400,7 +400,7 @@ let
       while
         _next=$(
           sed -n \
-            -e 's#^[[:space:]]*exec \(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) "\$@"#\1#p' \
+            -e 's#^[[:space:]]*exec \(/nix/store/[^ ]*-agent-sandbox-scope \)\{0,1\}\(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) "\$@"#\2#p' \
             -e 's#.*-- \(/nix/store/[^ ]*/bin/sandboxed-[^ ]*\) .*#\1#p' \
             "$_script" | head -n 1
         ) && test -n "$_next"

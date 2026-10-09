@@ -66,6 +66,20 @@ impl PolicyStore {
             return reply;
         }
 
+        // Freeze the requester's sandbox while the approval pends; a failed
+        // freeze fails closed without creating an approval.
+        let _freeze_hold = match self.cgroup_freeze.acquire(ctx.ids.pid(), ctx.ids.uid()) {
+            Ok(hold) => hold,
+            Err(error) => {
+                return ResourceCheckReply::blocked(
+                    format!("agent-sandbox: cannot freeze sandbox for resource approval: {error}"),
+                    kind,
+                    path,
+                    access,
+                );
+            }
+        };
+
         let result = match self
             .dedup_or_create_pending_resource(kind, &path, access, &ctx)
             .await

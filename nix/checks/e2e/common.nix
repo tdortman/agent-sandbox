@@ -810,6 +810,18 @@ rec {
       };
 
   resourceApprovalPolicy = mkPolicy "resource-approval" {
+    # The nscd deny below sends user lookups to these files; an unanswered
+    # prompt for them would freeze the sandbox for the whole scenario.
+    filesystem = ''
+      {
+        "allow": [
+          { "path": "/etc/passwd", "access": "read" },
+          { "path": "/etc/group", "access": "read" }
+        ],
+        "deny": []
+      }
+    '';
+
     resources = ''
       {
         "allow": [],

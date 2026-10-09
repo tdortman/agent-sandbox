@@ -241,6 +241,22 @@ impl PolicyStore {
             return reply;
         }
 
+        // Freeze the requester's sandbox while the approval pends so the
+        // agent cannot keep working before the user decides. A failed freeze
+        // fails closed without creating an approval.
+        let _freeze_hold = match self.cgroup_freeze.acquire(ctx.ids.pid(), ctx.ids.uid()) {
+            Ok(hold) => hold,
+            Err(error) => {
+                return FilesystemCheckReply::blocked(
+                    format!(
+                        "agent-sandbox: cannot freeze sandbox for filesystem approval: {error}"
+                    ),
+                    path,
+                    access,
+                );
+            }
+        };
+
         let result = match self
             .dedup_or_create_pending_filesystem(&path, access, &ctx)
             .await
@@ -630,6 +646,37 @@ mod tests {
         assert!(
             reply.verdict.allowed,
             "expected allowed reply, got: {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_approval_blocks_when_sandbox_cannot_freeze() {
+        // A real requester pid outside any agent-sandbox scope cannot be
+        // frozen, so the prompt fails closed instead of letting it run on.
+        let store = test_store();
+        let ctx = ResolvedRequestContext {
+            ids: ProcessIds::from_options(Some(std::process::id()), None),
+            ..filesystem_ctx()
+        };
+
+        let reply = store
+            .request_filesystem_approval(PathBuf::from("/repo/file.txt"), FileAccess::Read, ctx)
+            .await;
+
+        assert!(
+            !reply.verdict.allowed,
+            "expected blocked reply, got {reply:?}"
+        );
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("freeze")),
+            "block reason must name the freeze, got {reply:?}"
+        );
+        assert!(
+            store.inner.lock().await.pending.pending.is_empty(),
+            "failed freeze must not create an approval"
         );
     }
 

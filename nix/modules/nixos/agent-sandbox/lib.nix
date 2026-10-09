@@ -614,8 +614,21 @@ in
         ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ]
         ++ lib.optionals (syscallArmPkg != null) [ syscallArmPkg ];
       finalLauncher = scopedLauncher;
-      freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no --unit=\"agent-sandbox-$$_$RANDOM.scope\" -- ";
-      freezeNeedsScope = dbusMode || proxyMode;
+      freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${freezeScopeRunner} ";
+      freezeNeedsScope = dbusMode || proxyMode || dynamicFs || resourceGate;
+      # Approvals freeze the sandbox through its systemd scope. runuser,
+      # sudo -u, and cron leave XDG_RUNTIME_DIR unset, so default it to reach
+      # a lingering user manager. Without a user manager the sandbox runs
+      # unscoped and policyd blocks the requests it cannot freeze for.
+      freezeScopeRunner = pkgs.writeShellScript "agent-sandbox-scope" ''
+        runtime="''${XDG_RUNTIME_DIR:-/run/user/$UID}"
+        if [ -S "$runtime/systemd/private" ]; then
+          exec ${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR="$runtime" \
+            ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect \
+            --expand-environment=no --unit="agent-sandbox-$$_$RANDOM.scope" -- "$@"
+        fi
+        exec "$@"
+      '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
@@ -1070,8 +1083,7 @@ in
 
             text = ''
               set -euo pipefail
-              exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect --expand-environment=no \
-                --unit="agent-sandbox-$$_$RANDOM.scope" -- ${lib.getExe launcher} "$@"
+              exec ${freezeLaunchPrefix}${lib.getExe launcher} "$@"
             '';
           }
         else

@@ -273,6 +273,8 @@ Destination, object path, interface, member, and signature accept glob patterns,
 
 `agent-sandbox-ui` uses the packaged Qt dialog and falls back to zenity. Use `agent-sandbox-approve` when no graphical UI is available.
 
+While a filesystem, resource, network, HTTP, or D-Bus prompt is open, policyd freezes the requesting sandbox's systemd scope, so the agent stays paused until you decide. If the sandbox cannot be frozen, the request is blocked instead of prompting.
+
 ## Architecture
 
 ```mermaid
