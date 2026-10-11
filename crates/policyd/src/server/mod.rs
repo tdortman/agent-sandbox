@@ -598,6 +598,11 @@ mod tests {
 
     #[tokio::test]
     async fn registered_ui_receives_sandbox_elevation_push() {
+        // policyd only prompts for commands it can run from the system
+        // profile, which build sandboxes lack.
+        if !std::path::Path::new("/run/current-system/sw/bin/whoami").is_file() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
         let store = Arc::new(PolicyStore::new(args.clone()));
