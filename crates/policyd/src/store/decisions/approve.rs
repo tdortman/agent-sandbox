@@ -344,12 +344,8 @@ impl PolicyStore {
         {
             Ok(reply) => reply,
             Err(err) => {
-                self.inner
-                    .lock()
-                    .await
-                    .pending
-                    .pending
-                    .insert(elev.id.clone(), Pending::Elevation(elev));
+                self.finish_elevation(&pending_id, Self::unrunnable_elevation(&err))
+                    .await;
                 return err.into();
             }
         };
@@ -2116,6 +2112,91 @@ mod tests {
         assert!(
             reply.scope_succeeded(),
             "host owner CLI approval failed: {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_unrunnable_elevation_resolves_the_request() {
+        let store = test_store("unrunnable-elevation-approval").await;
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner.ui_clients.insert(1, UiClient {
+                session_id: "ui-a".into(),
+                writer: writer(),
+            });
+            inner
+                .ui_context_by_session
+                .insert("ui-a".into(), UiSessionContext {
+                    cwd: Some("/repo".into()),
+                    home: Some("/home/user".into()),
+                    project_root: Some("/repo".into()),
+                    sandbox_session_id: Some("sandbox-a".into()),
+                    owner_uid: Some(1000),
+                    client_id: 1,
+                });
+        }
+
+        let pending = PendingElevation {
+            id: "elev:unrunnable".into(),
+            created_at: 0.0,
+            argv: vec!["-n".into(), "true".into()],
+            ctx: pending_context(
+                Some("/repo".into()),
+                Some("/home/user".into()),
+                Some("/repo".into()),
+                Some("sandbox-a"),
+            ),
+        };
+        let pending_id = pending.id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut inner = store.inner.lock().await;
+            inner
+                .pending
+                .elevation_futures
+                .insert(pending_id.clone(), tx);
+            inner
+                .pending
+                .pending
+                .insert(pending_id.clone(), Pending::Elevation(pending));
+        }
+
+        let reply = store
+            .apply_pending_decision(
+                PendingDecision {
+                    pending_id,
+                    scope: ApprovalScope::Once,
+                    target: None,
+                    wire: scope_wire("ui-a"),
+                    client_id: 1,
+                    approver_uid: None,
+                },
+                DecisionAction::Approve,
+            )
+            .await;
+
+        assert!(
+            matches!(reply, RpcReply::Error(_)),
+            "approver must learn the command cannot run, got: {reply:?}"
+        );
+        assert!(
+            store.pending_summaries().await.is_empty(),
+            "approved request must leave the pending queue"
+        );
+
+        let verdict = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("requester must get a verdict")
+            .expect("verdict channel must not be dropped");
+        assert_ne!(
+            verdict.exit_code, 0,
+            "unrunnable command must fail: {verdict:?}"
+        );
+        assert!(
+            verdict.stderr.contains("elevation argv[0]"),
+            "requester must see why: {verdict:?}"
         );
     }
 

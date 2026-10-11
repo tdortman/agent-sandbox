@@ -170,6 +170,27 @@ impl PolicyStore {
         }
     }
 
+    /// Reply for an argv policyd refuses to execute.
+    pub(crate) fn unrunnable_elevation(err: &PolicydError) -> ElevateReply {
+        let stderr = match err {
+            PolicydError::ElevationArgvNotAbsolute => {
+                "agent-sandbox: elevation argv[0] must be a bare command resolved via \
+                 /run/current-system/sw/bin or an absolute path under /run/current-system, with a \
+                 regular canonical target under /nix/store"
+                    .into()
+            }
+            other => format!("agent-sandbox: {other}"),
+        };
+
+        ElevateReply {
+            ok: true,
+            allowed: false,
+            exit_code: 1,
+            stdout: String::new(),
+            stderr,
+        }
+    }
+
     pub(crate) async fn finish_elevation(&self, pending_id: &str, result: ElevateReply) {
         let mut inner = self.inner.lock().await;
 
@@ -199,26 +220,15 @@ impl PolicyStore {
         }
 
         if self.sudo_policy_allowed(&argv, &ctx) || self.session_sudo_allowed(&argv, &ctx).await {
-            return match self
+            return self
                 .exec_elevation(&argv, cwd.as_deref(), home.as_deref())
                 .await
-            {
-                Ok(reply) => reply,
-                Err(PolicydError::ElevationArgvNotAbsolute) => ElevateReply {
-                    ok: true,
-                    allowed: false,
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: "agent-sandbox: elevation argv[0] must be a bare command resolved via \
-                             /run/current-system/sw/bin or an absolute path under \
-                             /run/current-system, with a regular canonical target under /nix/store"
-                        .into(),
-                },
-                Err(err) => {
-                    tracing::warn!(error = %err, "elevation exec rejected");
-                    ElevateReply::denied()
-                }
-            };
+                .unwrap_or_else(|err| Self::unrunnable_elevation(&err));
+        }
+
+        // Approving a command that cannot run would leave nothing to execute.
+        if let Err(err) = Self::resolve_elevation_argv(&argv) {
+            return Self::unrunnable_elevation(&err);
         }
 
         let Some(entry) = self.create_pending_elevation_entry(&argv, &ctx).await else {
@@ -412,13 +422,16 @@ mod tests {
         // Regression: a CLI approval that arrives during the pre-verdict
         // UI-registration wait used to be ignored. The request would only
         // return after the (multi-minute) UI wait timed out.
+        if system_profile_true().is_none() {
+            return;
+        }
         let store = Arc::new(test_store());
 
         let store_for_task = store.clone();
 
         let task = tokio::spawn(async move {
             store_for_task
-                .request_elevation(vec!["systemctl".into(), "restart".into()], elevation_ctx())
+                .request_elevation(vec!["true".into()], elevation_ctx())
                 .await
         });
 
@@ -458,6 +471,24 @@ mod tests {
             .expect("task should not panic");
 
         assert!(result.allowed, "expected allowed reply, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn unrunnable_elevation_fails_without_prompting() {
+        let store = test_store();
+
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.request_elevation(vec!["-n".into(), "true".into()], elevation_ctx()),
+        )
+        .await
+        .expect("request must fail immediately");
+
+        assert!(!reply.allowed, "got: {reply:?}");
+        assert!(
+            reply.stderr.contains("elevation argv[0]"),
+            "unrunnable command must be rejected before it is queued: {reply:?}"
+        );
     }
 
     #[test]
