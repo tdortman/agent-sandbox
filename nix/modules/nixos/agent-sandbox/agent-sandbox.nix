@@ -697,6 +697,28 @@ in
         '';
       };
 
+      egressInterfaces = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+
+        example.jgu0 = [
+          "0.0.0.0/0"
+          "::/0"
+        ];
+
+        default = { };
+
+        description = ''
+          Host interfaces that carry sandbox traffic, mapped to the IPv4 and
+          IPv6 destination prefixes routed through each one. Routes are
+          installed without a gateway, so this suits point-to-point devices
+          such as WireGuard, tun, or XFRM VPN interfaces that are not the
+          host's default route. Sandbox egress to other destinations keeps
+          the host's main routing table, and network policy still applies to
+          every destination. The interface must exist when
+          agent-sandbox-netns.service starts.
+        '';
+      };
+
       hostIp = lib.mkOption {
         type = lib.types.str;
         default = "169.254.100.1";

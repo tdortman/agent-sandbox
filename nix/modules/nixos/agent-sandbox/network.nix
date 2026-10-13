@@ -2,6 +2,7 @@
   config,
   lib,
   pkgs,
+  utils,
   inputs,
   ...
 }:
@@ -18,6 +19,25 @@ let
     else
       lib.concatMapStringsSep " || " (port: "port == ${toString port}") ports;
   cfg = config.agent-sandbox.network;
+  egressDeviceUnits = map (
+    interface: "sys-subsystem-net-devices-${utils.escapeSystemdPath interface}.device"
+  ) (lib.attrNames cfg.egressInterfaces);
+  # One table for all egress interfaces: a destination without a route here
+  # falls through to the main table.
+  egressRouteTable = "2600";
+  egressRoutes = lib.optionalString (cfg.egressInterfaces != { }) ''
+    ${lib.concatStrings (
+      lib.mapAttrsToList (
+        interface: destinations:
+        lib.concatMapStrings (
+          destination:
+          "ip ${lib.optionalString (lib.hasInfix ":" destination) "-6 "}route replace ${lib.escapeShellArg destination} dev ${lib.escapeShellArg interface} table ${egressRouteTable}\n"
+        ) destinations
+      ) cfg.egressInterfaces
+    )}
+    ip rule add priority ${egressRouteTable} from "$NETNS_IP" lookup ${egressRouteTable}
+    ip -6 rule add priority ${egressRouteTable} from ${runtime.network.netnsIp6} lookup ${egressRouteTable}
+  '';
   flake = import ../../../lib/consumer.nix { inherit inputs pkgs; };
   hostNatPkg = mkNetnsLauncher {
     name = "agent-sandbox-host-nat";
@@ -168,7 +188,8 @@ let
     script = netnsDownScript;
   };
   netnsDownScript = pkgs.replaceVars ./netns/down.sh {
-    inherit loopbackHandoffIp6;
+    inherit egressRouteTable loopbackHandoffIp6;
+    inherit (runtime.network) netnsIp netnsIp6;
     netnsName = runtime.network.netnsName;
     vethHost = runtime.network.vethHost;
   };
@@ -188,7 +209,15 @@ let
   };
   netnsUpScript = pkgs.replaceVars ./netns/up.sh {
     inherit (runtime) hostIp hostIp6;
-    inherit loopbackHandoffIp6 nftRules;
+
+    inherit
+      egressRouteTable
+      egressRoutes
+      loopbackHandoffIp6
+      nftRules
+      ;
+
+    inherit (runtime.network) netnsIp6;
     hostIp6Cidr = "${runtime.hostIp6}/${toString runtime.network.netnsIp6Prefix}";
     hostIpCidr = "${runtime.hostIp}/30";
     hostNatBin = "${hostNatPkg}/bin/agent-sandbox-host-nat";
@@ -928,7 +957,8 @@ in
               "agent-sandbox-policy.service"
             ];
 
-            after = [ "network-pre.target" ];
+            after = [ "network-pre.target" ] ++ egressDeviceUnits;
+            wants = egressDeviceUnits;
             wantedBy = [ "multi-user.target" ];
 
             serviceConfig = networkNamespaceSetupHardening // {

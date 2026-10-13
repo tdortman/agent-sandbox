@@ -72,6 +72,10 @@ pkgs.testers.runNixOSTest (_: {
                   host = "allowed.test";
                   port = 18086;
                 }
+                {
+                  host = "10.78.0.1";
+                  port = 18094;
+                }
               ];
 
               declarativeDeny = [
@@ -94,6 +98,7 @@ pkgs.testers.runNixOSTest (_: {
               ];
 
               dnsForwardTarget = "169.254.100.1:5353";
+              egressInterfaces.egr0 = [ "10.78.0.0/24" ];
               loopback = loopbackPorts;
             };
 
@@ -127,6 +132,34 @@ pkgs.testers.runNixOSTest (_: {
 
                 Restart = "on-failure";
               };
+            };
+
+            # A point-to-point peer in its own netns stands in for a VPN: the
+            # VM has no route to 10.78.0.0/24 except through egr0.
+            agent-sandbox-vm-egress-peer = {
+              before = [ "agent-sandbox-netns.service" ];
+              wantedBy = [ "multi-user.target" ];
+              serviceConfig.Type = "forking";
+
+              script = ''
+                ip netns add egress-peer
+                ip link add egr0 type veth peer name egr1
+                ip link set egr1 netns egress-peer
+                ip addr add 10.77.0.1/24 dev egr0
+                ip link set egr0 up
+                ip -n egress-peer addr add 10.77.0.2/24 dev egr1
+                ip -n egress-peer addr add 10.78.0.1/32 dev lo
+                ip -n egress-peer link set lo up
+                ip -n egress-peer link set egr1 up
+                ip netns exec egress-peer ${pkgs.socat}/bin/socat \
+                  TCP4-LISTEN:18094,bind=10.78.0.1,fork,reuseaddr \
+                  SYSTEM:'echo egress-ok' &
+                ip netns exec egress-peer ${pkgs.socat}/bin/socat \
+                  TCP4-LISTEN:18095,bind=10.78.0.1,fork,reuseaddr \
+                  SYSTEM:'echo egress-unlisted' &
+              '';
+
+              path = [ pkgs.iproute2 ];
             };
 
             agent-sandbox-vm-udp-18082 = {
@@ -245,5 +278,15 @@ pkgs.testers.runNixOSTest (_: {
     sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --fail --silent --show-error --max-time 15 http://allowed.test:18086/allowed | grep -q allowed-get")
     sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --silent --show-error --max-time 5 http://denied.test:18087/denied", expect_success=False)
     sandbox_shell(direct, "sandbox-direct-bash", "curl --noproxy '*' --silent --show-error --max-time 5 http://169.254.100.1:18088/unlisted", expect_success=False)
+
+    # egressInterfaces routes 10.78.0.0/24 through egr0; the host itself has
+    # no such route, so a reply proves sandbox traffic took the extra device.
+    direct.wait_for_unit("agent-sandbox-vm-egress-peer.service")
+    direct.fail("ip route get 10.78.0.1 | grep -q egr0")
+    sandbox_shell(direct, "sandbox-direct-bash", "timeout 5 socat -t 2 - TCP4:10.78.0.1:18094 </dev/null | grep -q egress-ok")
+    # Policy still applies on the extra device: an unlisted port with a live
+    # listener behind egr0 stays unreachable.
+    direct.succeed("ip netns exec egress-peer ss -ltn | grep -q 10.78.0.1:18095")
+    sandbox_shell(direct, "sandbox-direct-bash", "timeout 5 socat -t 2 - TCP4:10.78.0.1:18095 </dev/null | grep -q egress-unlisted", expect_success=False)
   '';
 })

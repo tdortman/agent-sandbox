@@ -53,6 +53,13 @@ EOF
 nft add rule ip agent_sandbox_host postrouting \
   ip saddr "$NETNS_IP" masquerade 2>/dev/null || true
 
+# Route selected destinations through extra host interfaces (e.g. a VPN).
+ip rule del from "$NETNS_IP" lookup @egressRouteTable@ 2>/dev/null || true
+ip -6 rule del from @netnsIp6@ lookup @egressRouteTable@ 2>/dev/null || true
+ip route flush table @egressRouteTable@ 2>/dev/null || true
+ip -6 route flush table @egressRouteTable@ 2>/dev/null || true
+@egressRoutes@
+
 nft list table ip agent_sandbox_fwd >/dev/null 2>&1 \
   || nft add table ip agent_sandbox_fwd
 
