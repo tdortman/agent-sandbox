@@ -240,7 +240,7 @@ fn merge_network(layers: &[Policy]) -> NetworkSection {
 }
 
 fn sudo_rules_overlap(deny: &SudoRule, allow: &SudoRule) -> bool {
-    deny.matches(&allow.argv) || allow.matches(&deny.argv)
+    deny.matches(&allow.argv)
 }
 
 fn merge_sudo(layers: &[Policy]) -> SudoSection {

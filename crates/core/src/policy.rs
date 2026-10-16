@@ -1362,11 +1362,13 @@ pub struct NetworkRule {
 
 /// One allow or deny rule for a `sudo` command.
 ///
-/// The rule matches when the requested argv begins with `argv`, permitting
-/// deny/allow of a command with any arguments.
+/// The rule matches when the requested argv has at least as many arguments as
+/// `argv` and each rule element matches the corresponding requested argument
+/// (exact match or [`globset`] pattern), permitting deny/allow of a command
+/// prefix or wildcarded arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SudoRule {
-    /// Command and (optionally) argument prefix to match against.
+    /// Command and (optionally) argument prefix patterns to match against.
     pub argv: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1410,24 +1412,17 @@ impl SudoRule {
         }
     }
 
-    /// Whether this rule matches the given argv (as a prefix).
+    /// Whether this rule matches the given argv (as a prefix, with globset
+    /// pattern support per argument).
     #[must_use]
     pub fn matches(&self, argv: &[String]) -> bool {
-        !self.argv.is_empty() && argv.starts_with(&self.argv)
-    }
-
-    /// Return every non-empty prefix of the given argv, longest first.
-    ///
-    /// Used to enumerate candidate `sudo` approval targets.
-    #[must_use]
-    pub fn approval_prefixes(argv: &[String]) -> Vec<Vec<String>> {
-        let mut prefixes = Vec::with_capacity(argv.len());
-
-        for len in (1..=argv.len()).rev() {
-            prefixes.push(argv[..len].to_vec());
-        }
-
-        prefixes
+        !self.argv.is_empty()
+            && argv.len() >= self.argv.len()
+            && self
+                .argv
+                .iter()
+                .zip(argv)
+                .all(|(pattern, arg)| pattern == arg || glob_matches(pattern, arg))
     }
 }
 
@@ -1843,29 +1838,27 @@ mod tests {
     }
 
     #[test]
-    fn sudo_rule_matches_prefix() {
-        let rule = SudoRule::new(vec!["systemctl".into(), "restart".into()], "");
-        let argv = ["systemctl".into(), "restart".into(), "nginx".into()];
-        let wrong_argv = ["systemctl".into(), "stop".into()];
+    fn sudo_rule_matches_prefix_and_globs() {
+        let rule = SudoRule::new(
+            vec!["systemctl".into(), "restart".into(), "nginx*".into()],
+            "",
+        );
+        let argv = [
+            "systemctl".into(),
+            "restart".into(),
+            "nginx-staging".into(),
+            "--now".into(),
+        ];
+        let wrong_argv = ["systemctl".into(), "stop".into(), "nginx-staging".into()];
+        let path_rule = SudoRule::new(vec!["/run/current-system/sw/bin/*".into()], "");
+        let path_argv = [
+            "/run/current-system/sw/bin/systemctl".into(),
+            "status".into(),
+        ];
         assert!(rule.matches(&argv));
         assert!(!rule.matches(&wrong_argv));
+        assert!(path_rule.matches(&path_argv));
     }
-
-    #[test]
-    fn sudo_rule_approval_prefixes_descend_from_most_specific() {
-        let argv = vec!["systemctl".into(), "restart".into(), "nginx".into()];
-
-        assert_eq!(SudoRule::approval_prefixes(&argv), vec![
-            vec![
-                "systemctl".to_string(),
-                "restart".to_string(),
-                "nginx".to_string()
-            ],
-            vec!["systemctl".to_string(), "restart".to_string()],
-            vec!["systemctl".to_string()],
-        ]);
-    }
-
     #[test]
     fn normalize_directory_traverse_maps_execute_to_read_on_directories() {
         let dir = tempfile::tempdir().expect("tempdir");

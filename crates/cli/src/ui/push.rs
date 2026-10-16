@@ -23,7 +23,6 @@ use super::{
         ACTION_OPTIONS, ApprovalFormContext, ApprovalFormControl, ApprovalFormField,
         ApprovalFormOption, ApprovalFormPresentation, ApprovalFormRequest, ApprovalFormResult,
         PromptAction, ReviewValidator, ScopeOption, format_command, scope_only_options,
-        sudo_target_options,
     },
     prompt_blocking, signature_display,
 };
@@ -100,41 +99,22 @@ async fn rich_review(
     prompt_blocking(move || review_approval(&request, validate.as_ref())).await
 }
 
-struct ElevationReview {
-    request: ApprovalFormRequest,
-    prefixes: Vec<Vec<String>>,
-}
-
 fn build_elevation_review(
     argv: &[String],
     paths: &SandboxPaths,
     session_id: Option<&str>,
     package: Option<&str>,
-) -> ElevationReview {
-    let prefixes = SudoRule::approval_prefixes(argv);
-
-    let prefix_options = prefixes
-        .iter()
-        .enumerate()
-        .map(|(index, prefix)| ApprovalFormOption {
-            value: index.to_string(),
-            label: format_command(prefix),
-        })
-        .collect();
-
-    ElevationReview {
-        request: ApprovalFormRequest::new(
-            prompt_tag(package),
-            approval_context(paths, session_id, package),
-            Some(elevation_presentation(argv)),
-            approval_scopes(session_id.is_some(), package.is_some()),
-            vec![
-                choice_field("target", "Command prefix", "0", prefix_options),
-                comment_field(),
-            ],
-        ),
-        prefixes,
-    }
+) -> ApprovalFormRequest {
+    ApprovalFormRequest::new(
+        prompt_tag(package),
+        approval_context(paths, session_id, package),
+        Some(elevation_presentation(argv)),
+        approval_scopes(session_id.is_some(), package.is_some()),
+        vec![
+            text_field("target", "Command or pattern", argv.join(" ")),
+            comment_field(),
+        ],
+    )
 }
 
 struct ReviewActionScope {
@@ -142,16 +122,29 @@ struct ReviewActionScope {
     scope: ApprovalScope,
 }
 
-/// Build the sudo approval target from the chosen command-prefix index.
-fn sudo_target_from_result(
-    result: &ApprovalFormResult,
-    prefixes: &[Vec<String>],
-) -> Option<ApprovalTarget> {
-    let index = result.values.get("target")?.parse::<usize>().ok()?;
-    let argv = prefixes.get(index)?.clone();
-    Some(ApprovalTarget::SudoCommand { argv })
+fn parse_sudo_argv(value: &str) -> Option<Vec<String>> {
+    let mut tokens: Vec<&str> = value.split_whitespace().collect();
+    if tokens.first() == Some(&"sudo") {
+        tokens.remove(0);
+    }
+    (!tokens.is_empty() && tokens.iter().all(|token| !token.contains('\0')))
+        .then(|| tokens.into_iter().map(str::to_owned).collect())
 }
 
+/// Parse and validate an editable sudo command prefix or pattern against the
+/// request.
+fn parse_sudo_target(
+    result: &ApprovalFormResult,
+    requested_argv: &[String],
+) -> Option<ApprovalTarget> {
+    let argv = parse_sudo_argv(result.values.get("target")?)?;
+
+    if !SudoRule::new(argv.clone(), "").matches(requested_argv) {
+        return None;
+    }
+
+    Some(ApprovalTarget::SudoCommand { argv })
+}
 struct ReviewedChoice {
     action: PromptAction,
     choice: ScopeOption,
@@ -1028,17 +1021,16 @@ async fn handle_elevation_push(
     let package_available = package.is_some();
     let argv = argv.unwrap_or_default();
     let paths = paths.merged_with(cwd, home, project_root);
-    let elevation_review = build_elevation_review(&argv, &paths, session_id, package);
-    let prefixes = elevation_review.prefixes;
-    let prefixes_clone = prefixes.clone();
+    let review = build_elevation_review(&argv, &paths, session_id, package);
+    let requested_argv = argv.clone();
     let title = format_elevation_title(&argv);
 
     match rich_review(
-        elevation_review.request,
+        review,
         Some(make_validator(
             session_id.is_some(),
             package_available,
-            move |result| sudo_target_from_result(result, &prefixes_clone),
+            move |result| parse_sudo_target(result, &requested_argv),
         )),
     )
     .await?
@@ -1046,7 +1038,7 @@ async fn handle_elevation_push(
         ApprovalReviewOutcome::Submitted(result) => {
             let Some(ReviewedChoice { action, choice }) =
                 reviewed_choice(&result, session_id.is_some(), package_available, |result| {
-                    sudo_target_from_result(result, &prefixes)
+                    parse_sudo_target(result, &argv)
                 })
             else {
                 return deny_cancellation(socket, &paths, sandbox_session_id, &id).await;
@@ -1076,12 +1068,14 @@ async fn handle_elevation_push(
         session_id.is_some(),
         package_available,
         package,
-        move |action, scope| async move {
-            choose_target_level(
-                &format!("{}: {} sudo target?", prompt_tag(package), action.verb()),
-                sudo_target_options(&argv, scope),
-            )
-            .await
+        move |action, _scope| async move {
+            let title = format!("{}: {} sudo command?", prompt_tag(package), action.verb());
+            let default_cmd = argv.join(" ");
+            let entered = prompt_blocking(move || pick_text(&title, &default_cmd)).await?;
+            Ok(entered
+                .as_deref()
+                .and_then(parse_sudo_argv)
+                .map(|argv| ApprovalTarget::SudoCommand { argv }))
         },
     )
     .await?
@@ -1655,8 +1649,8 @@ mod tests {
         elevation_presentation, http_presentation, network_presentation, network_prompt_scheme,
         network_prompt_url, network_prompt_with_aliases, network_prompt_with_transport_hint,
         parse_dbus_target, parse_filesystem_target, parse_network_target, parse_resource_target,
-        resource_presentation, reviewed_choice, suggest_project_rule_path, valid_network_host,
-        valid_rule_path,
+        parse_sudo_target, resource_presentation, reviewed_choice, suggest_project_rule_path,
+        valid_network_host, valid_rule_path,
     };
 
     #[test]
@@ -2131,5 +2125,30 @@ mod tests {
                 path: "/run/agent-sandbox/*".into(),
             })
         );
+    }
+
+    #[test]
+    fn sudo_target_accepts_prefix_and_glob_and_rejects_mismatch() {
+        let requested = vec![
+            "systemctl".to_string(),
+            "restart".to_string(),
+            "nginx-staging".to_string(),
+        ];
+
+        assert_eq!(
+            parse_sudo_target(&form_result("systemctl restart"), &requested),
+            Some(ApprovalTarget::SudoCommand {
+                argv: vec!["systemctl".into(), "restart".into()],
+            })
+        );
+
+        assert_eq!(
+            parse_sudo_target(&form_result("sudo systemctl restart nginx*"), &requested),
+            Some(ApprovalTarget::SudoCommand {
+                argv: vec!["systemctl".into(), "restart".into(), "nginx*".into()],
+            })
+        );
+
+        assert!(parse_sudo_target(&form_result("systemctl stop"), &requested).is_none());
     }
 }

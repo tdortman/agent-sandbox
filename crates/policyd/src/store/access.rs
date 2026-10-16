@@ -6,9 +6,9 @@ use std::{
 use agent_sandbox_core::{
     DbusRule, DbusTarget, FileAccess, FilesystemRule, FilesystemRuleKey, InodeIdentity,
     NetworkRuleKey, Policy, ResolvedRequestContext, ResourceAccess, ResourceKind, ResourceRule,
-    ResourceRuleKey, SocketAccess, Verdict, contains_glob_syntax, discover_git_project_root,
-    expand_policy_path, host_pattern_matches, normalize_directory_traverse_access, normalize_host,
-    rpc::RpcReply, with_canonical_memo,
+    ResourceRuleKey, SocketAccess, SudoRule, Verdict, contains_glob_syntax,
+    discover_git_project_root, expand_policy_path, host_pattern_matches,
+    normalize_directory_traverse_access, normalize_host, rpc::RpcReply, with_canonical_memo,
 };
 
 use super::types::{DenyCacheEntry, DenyFingerprint, DenyInodeCache, PolicyStore};
@@ -32,7 +32,7 @@ fn session_network_matches(bucket: &HashSet<NetworkRuleKey>, host: &str, port: u
 fn session_sudo_matches(bucket: &HashSet<Vec<String>>, argv: &[String]) -> bool {
     bucket
         .iter()
-        .any(|rule| !rule.is_empty() && argv.starts_with(rule))
+        .any(|rule| SudoRule::new(rule.clone(), "").matches(argv))
 }
 
 fn session_dbus_matches(bucket: &HashSet<DbusTarget>, target: &DbusTarget) -> bool {
@@ -1118,12 +1118,12 @@ mod tests {
     }
 
     #[test]
-    fn session_sudo_matches_prefixes() {
-        let bucket = HashSet::from([vec![String::from("sudo"), String::from("apt")]]);
+    fn session_sudo_matches_prefixes_and_globs() {
+        let bucket = HashSet::from([vec![String::from("sudo"), String::from("apt*")]]);
 
         let argv = vec![
             String::from("sudo"),
-            String::from("apt"),
+            String::from("apt-get"),
             String::from("update"),
         ];
 

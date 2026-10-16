@@ -331,12 +331,12 @@ impl PolicyStore {
             scope_result.scope_path()
         };
 
-        let detail = format!("id={pending_id} argv={argv:?}");
+        let detail = format!("id={pending_id} argv={:?} rule_argv={argv:?}", elev.argv);
         Self::audit(action.audit_verb(), None, None, &detail);
 
         let elevation = match self
             .exec_elevation(
-                &argv,
+                &elev.argv,
                 elev.ctx.paths.cwd().or_else(|| scope_wire.paths.cwd()),
                 elev.ctx.paths.home().or_else(|| scope_wire.paths.home()),
             )
@@ -861,11 +861,7 @@ impl PolicyStore {
             }
         };
 
-        let valid_argv = SudoRule::approval_prefixes(pending_argv)
-            .into_iter()
-            .any(|candidate| candidate == argv);
-
-        if !valid_argv {
+        if !SudoRule::new(argv.clone(), "").matches(pending_argv) {
             return Err(PolicydError::InvalidDecisionTarget);
         }
 
@@ -976,29 +972,32 @@ mod tests {
     }
 
     #[test]
-    fn sudo_target_accepts_command_prefixes() {
-        let pending = Pending::Elevation(PendingElevation {
+    fn sudo_target_accepts_command_prefixes_and_globs() {
+        let elev = PendingElevation {
             id: "p1".into(),
             created_at: 0.0,
-            argv: vec!["foo".into(), "bar".into(), "baz".into()],
+            argv: vec!["foo".into(), "bar".into(), "baz-1".into()],
             ctx: pending_context(None, None, None, None),
-        });
+        };
 
-        let target = ApprovalTarget::SudoCommand {
+        let prefix = ApprovalTarget::SudoCommand {
             argv: vec!["foo".into(), "bar".into()],
         };
 
         assert_eq!(
-            PolicyStore::resolve_pending_sudo_target(
-                match &pending {
-                    Pending::Elevation(elev) => elev,
-                    _ => panic!("expected Elevation"),
-                },
-                ApprovalScope::Session,
-                Some(&target),
-            )
-            .expect("resolve pending sudo target"),
+            PolicyStore::resolve_pending_sudo_target(&elev, ApprovalScope::Session, Some(&prefix))
+                .expect("resolve pending sudo prefix"),
             vec!["foo".to_string(), "bar".to_string()]
+        );
+
+        let glob = ApprovalTarget::SudoCommand {
+            argv: vec!["foo".into(), "bar".into(), "baz-*".into()],
+        };
+
+        assert_eq!(
+            PolicyStore::resolve_pending_sudo_target(&elev, ApprovalScope::Project, Some(&glob))
+                .expect("resolve pending sudo glob"),
+            vec!["foo".to_string(), "bar".to_string(), "baz-*".to_string()]
         );
     }
 

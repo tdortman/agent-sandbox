@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_sandbox_core::{ApprovalScope, ApprovalTarget, SudoRule};
+use agent_sandbox_core::{ApprovalScope, ApprovalTarget};
 use serde_json::{Value, json};
 
 pub const ACTION_OPTIONS: &[&str] = &["Allow", "Deny"];
@@ -231,24 +231,6 @@ pub fn scope_only_options(session_available: bool, package_available: bool) -> V
             comment: None,
         })
         .collect()
-}
-
-#[must_use]
-/// Command prefix options for a single scope (step 3 of 3-step flow).
-pub fn sudo_target_options(argv: &[String], scope: ApprovalScope) -> Vec<ScopeOption> {
-    let prefixes = SudoRule::approval_prefixes(argv);
-    let mut options = Vec::with_capacity(prefixes.len());
-
-    for argv in &prefixes {
-        options.push(ScopeOption {
-            label: format_command(argv),
-            scope,
-            target: Some(ApprovalTarget::SudoCommand { argv: argv.clone() }),
-            comment: None,
-        });
-    }
-
-    options
 }
 
 pub fn format_command(argv: &[String]) -> String {
