@@ -133,12 +133,12 @@ pub async fn decide(
 
         NormalizedNotification::Target {
             target: SyscallTarget::Resource(target),
-        } => resource_plan(
-            target.clone(),
-            client
+        } => {
+            let reply = client
                 .check_resource(&target, sandbox_session_id.map(str::to_owned), pid, timeout)
-                .await,
-        ),
+                .await;
+            resource_plan(target, reply)
+        }
 
         NormalizedNotification::Target {
             target: SyscallTarget::Filesystem(target),
@@ -248,6 +248,7 @@ mod tests {
             raw: Vec::new(),
             open_flags: 0,
             open_mode: 0,
+            pinned: None,
         }
     }
 
@@ -341,7 +342,7 @@ mod tests {
         };
 
         assert!(matches!(
-            resource_plan(target.clone(), Ok(allowed)),
+            resource_plan(resource_target(), Ok(allowed)),
             ResponsePlan::EmulateResource { .. }
         ));
 
@@ -357,7 +358,7 @@ mod tests {
         };
 
         assert!(matches!(
-            resource_plan(target.clone(), Ok(denied)),
+            resource_plan(resource_target(), Ok(denied)),
             ResponsePlan::ResourcePolicyDenied { .. }
         ));
 

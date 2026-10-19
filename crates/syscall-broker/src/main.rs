@@ -852,6 +852,7 @@ mod tests {
             raw: path.as_bytes().to_vec(),
             open_flags: 0,
             open_mode: 0,
+            pinned: None,
         }
     }
 
@@ -884,6 +885,7 @@ mod tests {
             raw: b"/run/agent-sandbox/policy.sock".to_vec(),
             open_flags: 0,
             open_mode: 0,
+            pinned: None,
         };
 
         assert!(!is_policy_socket_bypass(

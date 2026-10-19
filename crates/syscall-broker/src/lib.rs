@@ -252,7 +252,7 @@ pub struct NetworkTarget {
 /// tracee during target parsing, so the broker never re-reads
 /// pointer-bearing args after policy approval (which would be
 /// TOCTOU-racy).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ResourceTarget {
     /// Classifies what the target is: a Unix socket path or a device node.
     pub kind: ResourceKind,
@@ -276,6 +276,11 @@ pub struct ResourceTarget {
     /// Captured open mode for device opens. Set during target parsing.
     /// For `AF_UNIX` targets, this is 0.
     pub open_mode: u32,
+
+    /// Socket inode pinned for a filesystem `AF_UNIX` path. `raw` names it as
+    /// `/proc/self/fd/<n>`, so it must live until emulation. `None` for
+    /// abstract sockets and devices.
+    pub pinned: Option<OwnedFd>,
 }
 
 /// Captured operation semantics for a filesystem mutation. Pointer-bearing
@@ -969,27 +974,78 @@ fn sockaddr_target(
             scheme: scheme.to_string(),
         }),
 
-        SockaddrTarget::Unix { address, raw } => {
-            let path = match address {
-                UnixAddress::Path(p) => normalize_path(Path::new(&p)),
-                // Abstract namespace names are hex-encoded strings (@hex:...),
-                // not filesystem paths, but ride in the same PathBuf field and
-                // serde-serialize as strings for policyd's Path::New matching.
-                UnixAddress::AbstractHex(h) => PathBuf::from(h),
-            };
+        SockaddrTarget::Unix {
+            address: UnixAddress::Path(path),
+            raw,
+        } => pinned_unix_target(notif.pid, &raw[..2], &path, access),
 
-            SyscallTarget::Resource(ResourceTarget {
-                kind: ResourceKind::UnixSocket,
-                path,
-                access,
-                raw,
-                open_flags: 0,
-                open_mode: 0,
-            })
-        }
+        // Abstract namespace names are hex-encoded strings (@hex:...), not
+        // filesystem paths, but ride in the same PathBuf field and
+        // serde-serialize as strings for policyd's Path::New matching.
+        SockaddrTarget::Unix {
+            address: UnixAddress::AbstractHex(name),
+            raw,
+        } => SyscallTarget::Resource(ResourceTarget {
+            kind: ResourceKind::UnixSocket,
+            path: PathBuf::from(name),
+            access,
+            raw,
+            open_flags: 0,
+            open_mode: 0,
+            pinned: None,
+        }),
     };
 
     Ok(Some(target))
+}
+
+/// Pin the socket inode a filesystem `sun_path` names, resolving a relative
+/// path against the tracee's working directory. The policy key comes from the
+/// pinned inode and the emulated syscall connects through it, so a `chdir`, a
+/// symlink swap, or a replaced socket after classification cannot redirect an
+/// approval. Failures deny with the errno the lookup would give the tracee.
+fn pinned_unix_target(
+    pid: u32,
+    family: &[u8],
+    name: &str,
+    access: ResourceAccess,
+) -> SyscallTarget {
+    let pinned = if name.starts_with('/') {
+        open_path_handle(Path::new(name))
+    } else {
+        open_path_handle(Path::new(&format!("/proc/{pid}/cwd"))).and_then(|cwd| {
+            nix::fcntl::openat(
+                &cwd,
+                Path::new(name),
+                nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            )
+            .map_err(io::Error::from)
+        })
+    };
+
+    let pinned = match pinned {
+        Ok(fd) => fd,
+        Err(err) => return mutation_errno(&err),
+    };
+
+    // Unlinked since the lookup: connecting by name would fail the same way.
+    let Some(path) = fd_path(pinned.as_fd()) else {
+        return SyscallTarget::Errno(libc::ENOENT);
+    };
+
+    let mut raw = family.to_vec();
+    raw.extend_from_slice(format!("/proc/self/fd/{}\0", pinned.as_raw_fd()).as_bytes());
+
+    SyscallTarget::Resource(ResourceTarget {
+        kind: ResourceKind::UnixSocket,
+        path,
+        access,
+        raw,
+        open_flags: 0,
+        open_mode: 0,
+        pinned: Some(pinned),
+    })
 }
 
 const fn filesystem_target(
@@ -1685,13 +1741,7 @@ fn normalize_captured_path(dir: &MutationDir, raw: &[u8]) -> io::Result<PathBuf>
 
     match fd {
         Ok(fd) => {
-            if let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-                && resolved.is_absolute()
-                && !resolved
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .ends_with(b" (deleted)")
-            {
+            if let Some(resolved) = fd_path(fd.as_fd()) {
                 return Ok(resolved);
             }
         }
@@ -1715,19 +1765,26 @@ fn normalize_path_handle(path: &Path, fd: io::Result<OwnedFd>) -> PathBuf {
         Err(_) => None,
     };
 
-    if let Some(fd) = fd
-        && let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        && resolved.is_absolute()
-        && !resolved
-            .as_os_str()
-            .as_encoded_bytes()
-            .ends_with(b" (deleted)")
-    {
+    if let Some(resolved) = fd.and_then(|fd| fd_path(fd.as_fd())) {
         return resolved;
     }
 
     // Anonymous descriptors and unlinked handles have no canonical pathname.
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Absolute path the kernel reports for `fd`; `None` for anonymous or
+/// unlinked objects.
+fn fd_path(fd: BorrowedFd<'_>) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .ok()
+        .filter(|resolved| {
+            resolved.is_absolute()
+                && !resolved
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .ends_with(b" (deleted)")
+        })
 }
 
 /// Built-in bypass list of `/dev` paths the broker always continues without
@@ -1836,6 +1893,7 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
         raw,
         open_flags,
         open_mode,
+        pinned: None,
     }))
 }
 
