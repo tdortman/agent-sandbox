@@ -78,6 +78,11 @@ pub struct SandboxSessionRegistration {
     /// Launcher's kernel start time in clock ticks, captured at registration.
     /// Zero denotes a session without a registered launcher.
     pub launcher_start_ticks: u64,
+
+    /// Agent systemd scope of the session anchor, captured when the anchor
+    /// is recorded. Daemons that double-fork out of the sandbox process tree
+    /// keep this cgroup after reparenting to a host subreaper.
+    pub cgroup: Option<PathBuf>,
 }
 
 /// Exact HTTP request and context used for pending approval deduplication.

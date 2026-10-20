@@ -8,7 +8,10 @@ use agent_sandbox_core::{
     resolve_policy_write_path, sandbox_session_id_from_pid, trusted_project_policy_path,
 };
 
-use super::types::PolicyStore;
+use super::{
+    freeze::{agent_scope_cgroup, process_cgroup},
+    types::PolicyStore,
+};
 use crate::{
     error::PolicydError,
     store::types::{SandboxSessionRegistration, TrustedPeer},
@@ -44,12 +47,12 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// Session anchor for descendant adoption: the session id plus the pid
-/// (root, else launcher) a candidate peer must descend from and the
-/// owning uid that must match.
+/// (root, else launcher) a candidate peer must descend from and the agent
+/// scope it may share instead.
 struct SessionAnchor {
     id: String,
     anchor: u32,
-    owner_uid: u32,
+    cgroup: Option<PathBuf>,
 }
 
 /// Descendant adoption candidate: the session id and the anchor pid that
@@ -118,6 +121,9 @@ impl PolicyStore {
             if adopt_root || update_project {
                 self.revoke_network_grants()?;
                 reg.root_pid = root_pid;
+                if adopt_root {
+                    reg.cgroup = agent_scope_cgroup(root_pid);
+                }
                 if update_project {
                     reg.project_root = project_root;
                 }
@@ -131,6 +137,7 @@ impl PolicyStore {
                 package: None,
                 launcher_pid: 0,
                 launcher_start_ticks: 0,
+                cgroup: agent_scope_cgroup(peer.pid),
             });
         }
         drop(sessions);
@@ -218,6 +225,7 @@ impl PolicyStore {
                 package: Some(package.to_string()),
                 launcher_pid,
                 launcher_start_ticks,
+                cgroup: agent_scope_cgroup(launcher_pid),
             });
         }
 
@@ -344,13 +352,16 @@ impl PolicyStore {
 
     /// Adopt the sandbox session whose launcher or root pid is an ancestor of
     /// `pid`. Session adoption requires the owner uid to match the process
-    /// uid. For nested sandboxes the innermost matching anchor wins.
+    /// uid. For nested sandboxes the innermost matching anchor wins. A pid
+    /// outside every anchor's tree falls back to the session whose agent
+    /// scope it shares, when exactly one session claims that scope.
     fn session_id_for_descendant(&self, pid: u32, uid: Option<u32>) -> Option<String> {
         let registrations: Vec<SessionAnchor> = self
             .sandbox_sessions
             .read()
             .ok()?
             .iter()
+            .filter(|(_, reg)| reg.owner_uid == 0 || Some(reg.owner_uid) == uid)
             .map(|(id, reg)| SessionAnchor {
                 id: id.clone(),
                 anchor: if reg.root_pid > 0 {
@@ -358,17 +369,13 @@ impl PolicyStore {
                 } else {
                     reg.launcher_pid
                 },
-                owner_uid: reg.owner_uid,
+                cgroup: reg.cgroup.clone(),
             })
             .collect();
 
         let mut candidates: Vec<AdoptionCandidate> = Vec::new();
 
         for registration in &registrations {
-            if registration.owner_uid != 0 && Some(registration.owner_uid) != uid {
-                continue;
-            }
-
             if registration.anchor > 0 && is_descendant_of(registration.anchor, pid) {
                 candidates.push(AdoptionCandidate {
                     id: registration.id.clone(),
@@ -377,7 +384,7 @@ impl PolicyStore {
             }
         }
 
-        candidates
+        let innermost = candidates
             .iter()
             .find(|candidate| {
                 !candidates.iter().any(|other| {
@@ -385,7 +392,18 @@ impl PolicyStore {
                         && is_descendant_of(candidate.anchor, other.anchor)
                 })
             })
-            .map(|candidate| candidate.id.clone())
+            .map(|candidate| candidate.id.clone());
+
+        if innermost.is_some() {
+            return innermost;
+        }
+
+        let cgroup = process_cgroup(pid).ok()?;
+        let mut scoped = registrations
+            .iter()
+            .filter(|registration| registration.cgroup.as_ref() == Some(&cgroup));
+        let session = scoped.next()?;
+        scoped.next().is_none().then(|| session.id.clone())
     }
 
     /// Read the launcher env vars and `/proc` paths for a verified sandbox
@@ -1018,6 +1036,67 @@ mod tests {
     }
 
     #[test]
+    fn reparented_daemon_adopts_session_by_agent_scope() {
+        let store = test_store();
+        let uid = nix::unistd::getuid().as_raw();
+        let spawn_sleep = || {
+            std::process::Command::new("sleep")
+                .arg("5")
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .spawn()
+                .expect("spawn sleep")
+        };
+
+        // The daemon is a sibling of the session root, like a double-forked
+        // server reparented to a host subreaper: outside the root's process
+        // tree, without AGENT_SANDBOX_SESSION_ID, yet in the root's scope.
+        let mut root = spawn_sleep();
+        let mut daemon = spawn_sleep();
+        let scope = process_cgroup(root.id()).expect("root cgroup");
+        let registration = |cgroup: &Path| SandboxSessionRegistration {
+            root_pid: root.id(),
+            owner_uid: uid,
+            project_root: PathBuf::new(),
+            package: Some("omp".into()),
+            launcher_pid: 0,
+            launcher_start_ticks: 0,
+            cgroup: Some(cgroup.to_path_buf()),
+        };
+        let resolve_daemon = || {
+            store
+                .resolve_trusted_context(&ResolvedRequestContext::new(
+                    SandboxPaths::default(),
+                    ProcessIds::new(daemon.id(), uid),
+                    None,
+                ))
+                .sandbox_session_id
+        };
+
+        store
+            .sandbox_sessions
+            .write()
+            .expect("sessions lock")
+            .insert("sandbox-scope".into(), registration(&scope));
+
+        assert_eq!(resolve_daemon().as_deref(), Some("sandbox-scope"));
+
+        // Two sessions claiming one scope cannot be told apart.
+        store
+            .sandbox_sessions
+            .write()
+            .expect("sessions lock")
+            .insert("sandbox-twin".into(), registration(&scope));
+
+        assert_eq!(resolve_daemon(), None);
+
+        for child in [&mut root, &mut daemon] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
     fn foreign_uid_descendant_does_not_adopt_session() {
         let store = test_store();
         let uid = nix::unistd::getuid().as_raw();
@@ -1101,6 +1180,7 @@ mod tests {
                     launcher_pid,
                 )
                 .expect("launcher start time"),
+                cgroup: None,
             });
         }
 
@@ -1157,6 +1237,7 @@ mod tests {
                     launcher_pid,
                 )
                 .expect("launcher start time"),
+                cgroup: None,
             });
         }
 

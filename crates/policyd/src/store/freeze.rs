@@ -240,6 +240,11 @@ pub(super) fn process_cgroup(pid: u32) -> Result<PathBuf, CgroupFreezeError> {
     Ok(Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/')))
 }
 
+/// The cgroup of `pid` when it is an agent sandbox scope.
+pub(super) fn agent_scope_cgroup(pid: u32) -> Option<PathBuf> {
+    process_cgroup(pid).ok().filter(|path| is_agent_scope(path))
+}
+
 fn process_uid(pid: u32) -> Result<u32, CgroupFreezeError> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|source| CgroupFreezeError::ProcessCgroup { pid, source })?;

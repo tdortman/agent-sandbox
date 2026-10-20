@@ -1893,6 +1893,7 @@ mod tests {
                 package: None,
                 launcher_pid: 0,
                 launcher_start_ticks: 0,
+                cgroup: None,
             },
         );
 
@@ -2072,6 +2073,7 @@ mod tests {
                 package: None,
                 launcher_pid: 0,
                 launcher_start_ticks: 0,
+                cgroup: None,
             },
         );
 
