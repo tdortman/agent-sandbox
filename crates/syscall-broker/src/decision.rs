@@ -53,6 +53,12 @@ pub enum ResponsePlan {
         target: ResourceTarget,
     },
 
+    /// Install a descriptor the broker opened, completing the syscall.
+    InstallFd {
+        fd: std::os::fd::OwnedFd,
+        cloexec: bool,
+    },
+
     EmulateFilesystem {
         target: FilesystemTarget,
     },

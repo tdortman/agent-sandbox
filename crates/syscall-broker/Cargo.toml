@@ -16,6 +16,7 @@ agent-sandbox-sysutil.workspace = true
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "process", "resource", "signal", "socket"] }
+rustix.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

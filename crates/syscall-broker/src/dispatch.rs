@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{net::SocketAddr, os::fd::AsRawFd, path::Path, time::Duration};
 
 use agent_sandbox_core::{NetworkOwnership, ResourceKind, StaticPolicyAllow};
 use agent_sandbox_syscall_broker::{
     PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget,
-    notification_arch_valid, send_response,
+    notification_arch_valid, reopen_held_terminal, send_addfd, send_response,
 };
 use tracing::{debug, info, warn};
 
@@ -48,6 +48,22 @@ fn static_policy_allows(facts: &NormalizedNotification, static_allow: &StaticPol
     };
 
     !static_allow.is_empty() && static_allow.allows_all(&target.checks)
+}
+
+/// The tracee reopening a terminal it already holds needs no policy decision;
+/// see [`reopen_held_terminal`].
+fn held_terminal_plan(facts: &NormalizedNotification, pid: u32) -> Option<ResponsePlan> {
+    let NormalizedNotification::Target {
+        target: SyscallTarget::Resource(target),
+    } = facts
+    else {
+        return None;
+    };
+
+    reopen_held_terminal(pid, target).map(|fd| ResponsePlan::InstallFd {
+        fd,
+        cloexec: target.open_flags & libc::O_CLOEXEC != 0,
+    })
 }
 
 pub async fn dispatch_notification_with_mode(
@@ -119,6 +135,8 @@ pub async fn dispatch_notification_with_mode(
             } => ResponsePlan::emulate_filesystem(target),
             _ => unreachable!("static_policy_allows accepts only filesystem targets"),
         }
+    } else if let Some(plan) = held_terminal_plan(&facts, notif.pid) {
+        plan
     } else {
         decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
@@ -188,6 +206,20 @@ fn execute_response_plan(
         } => {
             warn!(path = %path.display(), access = ?access, error = %error, "filesystem policy RPC failed");
             respond_denied(listener_fd, notif);
+        }
+
+        ResponsePlan::InstallFd { fd, cloexec } => {
+            if let Err(err) = send_addfd(listener_fd, notif.id, fd.as_raw_fd(), cloexec) {
+                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
+                info!(error = %err, errno, pid = notif.pid, "installing reopened terminal failed");
+                super::log_notification_response(send_response(
+                    listener_fd,
+                    notif.id,
+                    0,
+                    -errno,
+                    0,
+                ));
+            }
         }
 
         ResponsePlan::EmulateResource { target } => {

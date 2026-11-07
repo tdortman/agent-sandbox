@@ -1885,6 +1885,130 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
     }))
 }
 
+/// Inode identity of an open file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl From<&std::fs::Metadata> for FileIdentity {
+    fn from(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// Open a pty terminal (`/dev/pts/N`) the tracee already holds, without a
+/// policy decision.
+///
+/// The tracee holds it when it has the terminal open (a sandbox reopening its
+/// inherited terminal by path, as libuv does for every TTY stdio) or the pty's
+/// controller from `/dev/ptmx` (`openpty` falling back to the terminal path,
+/// or Go `creack/pty`). Reopening a terminal the process can already read and
+/// write grants nothing new. Every other pty stays policy-gated, so a sandbox
+/// cannot read or inject into another terminal's session.
+///
+/// Both cases match by inode against the terminal the captured path names in
+/// the broker's view, so a pty number recycled in between, or one from another
+/// devpts instance, is refused. A held controller yields its own terminal
+/// through `TIOCGPTPEER`.
+#[must_use]
+pub fn reopen_held_terminal(pid: u32, target: &ResourceTarget) -> Option<OwnedFd> {
+    if !matches!(target.kind, ResourceKind::Device) {
+        return None;
+    }
+
+    let index = target
+        .path
+        .strip_prefix("/dev/pts")
+        .ok()?
+        .to_str()?
+        .parse::<u32>()
+        .ok()?;
+    let wanted = FileIdentity::from(&std::fs::metadata(&target.path).ok()?);
+    let flags = target.open_flags | libc::O_NOCTTY;
+
+    let opened = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let fd = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let link = std::fs::read_link(entry.path()).ok()?;
+
+            if link == target.path {
+                held_terminal_reopen(pid, fd, target, flags, wanted)
+            } else if link == Path::new("/dev/ptmx") || link == Path::new("/dev/pts/ptmx") {
+                held_controller_peer(pid, fd, index, flags, wanted)
+            } else {
+                None
+            }
+        })?;
+
+    (FileIdentity::from(&opened.metadata().ok()?) == wanted).then(|| opened.into())
+}
+
+/// Open the captured terminal path when the tracee's descriptor `fd` is that
+/// same terminal.
+fn held_terminal_reopen(
+    pid: u32,
+    fd: i32,
+    target: &ResourceTarget,
+    flags: i32,
+    wanted: FileIdentity,
+) -> Option<std::fs::File> {
+    let held = std::fs::metadata(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    if FileIdentity::from(&held) != wanted {
+        return None;
+    }
+
+    let oflag = nix::fcntl::OFlag::from_bits_truncate(flags);
+    let mode = nix::sys::stat::Mode::from_bits_truncate(target.open_mode);
+
+    nix::fcntl::open(&target.path, oflag, mode)
+        .ok()
+        .map(std::fs::File::from)
+}
+
+/// Open the terminal of the tracee's pty controller `fd` when that controller
+/// belongs to pty `index`.
+fn held_controller_peer(
+    pid: u32,
+    fd: i32,
+    index: u32,
+    flags: i32,
+    wanted: FileIdentity,
+) -> Option<std::fs::File> {
+    // Checking the index first keeps TIOCGPTPEER off unrelated controllers,
+    // whose terminals would otherwise see an extra open and close.
+    let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    let held_index = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("tty-index:"))?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if held_index != index {
+        return None;
+    }
+
+    let controller = agent_sandbox_sysutil::dup_tracee_fd(pid, fd).ok()?;
+    let peer_flags =
+        flags & (libc::O_ACCMODE | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let peer = rustix::pty::ioctl_tiocgptpeer(
+        &controller,
+        rustix::pty::OpenptFlags::from_bits_retain(peer_flags.cast_unsigned()),
+    )
+    .ok()?;
+    let peer = std::fs::File::from(peer);
+
+    (FileIdentity::from(&peer.metadata().ok()?) == wanted).then_some(peer)
+}
+
 /// A path that names the calling process, and what it means under that
 /// process's `/proc/<tid>`.
 struct ProcAlias {
