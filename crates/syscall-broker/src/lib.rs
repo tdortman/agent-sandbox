@@ -43,10 +43,9 @@ fn tracee_fd_path(pid: u32, fd: u64) -> io::Result<PathBuf> {
 }
 
 fn is_device_bypass(path: &Path) -> bool {
-    DEVICE_BYPASS.iter().any(|entry| {
-        let entry = Path::new(entry);
-        path == entry || path.starts_with(entry)
-    })
+    agent_sandbox_syscall::floor::UNGATED_DEVICES
+        .iter()
+        .any(|entry| path == Path::new(entry))
 }
 
 fn is_device_node_for_resource_gate(path: &Path) -> bool {
@@ -1787,18 +1786,6 @@ fn fd_path(fd: BorrowedFd<'_>) -> Option<PathBuf> {
         })
 }
 
-/// Built-in bypass list of `/dev` paths the broker always continues without
-/// a policy check. These are safe, side-effect-free devices that every
-/// sandboxed runtime expects to open without prompting.
-const DEVICE_BYPASS: &[&str] = &[
-    "/dev/null",
-    "/dev/zero",
-    "/dev/urandom",
-    "/dev/random",
-    "/dev/full",
-    "/dev/tty",
-];
-
 /// Whether the open flags prove the syscall cannot reach an existing device
 /// node, which is the only target class this gate covers.
 ///
@@ -1855,6 +1842,7 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
     let Ok(Some(raw_path)) = read_tracee_open_path(notif) else {
         return None;
     };
+    let raw_path = tracee_proc_alias(notif.pid, raw_path);
 
     // stat follows aliases, so definite non-devices need no canonical pathname.
     if device_file_type(&raw_path) == Some(false) {
@@ -1895,6 +1883,56 @@ fn target_from_open(notif: &SeccompNotif) -> Option<SyscallTarget> {
         open_mode,
         pinned: None,
     }))
+}
+
+/// A path that names the calling process, and what it means under that
+/// process's `/proc/<tid>`.
+struct ProcAlias {
+    alias: &'static str,
+    under_proc: &'static str,
+}
+
+const PROC_ALIASES: &[ProcAlias] = &[
+    ProcAlias {
+        alias: "/proc/self",
+        under_proc: "",
+    },
+    ProcAlias {
+        alias: "/proc/thread-self",
+        under_proc: "",
+    },
+    ProcAlias {
+        alias: "/dev/fd",
+        under_proc: "fd",
+    },
+    ProcAlias {
+        alias: "/dev/stdin",
+        under_proc: "fd/0",
+    },
+    ProcAlias {
+        alias: "/dev/stdout",
+        under_proc: "fd/1",
+    },
+    ProcAlias {
+        alias: "/dev/stderr",
+        under_proc: "fd/2",
+    },
+];
+
+/// Rewrite a path that names the calling process to the tracee thread's
+/// `/proc/<tid>`. The broker would otherwise resolve it as itself.
+fn tracee_proc_alias(pid: u32, path: PathBuf) -> PathBuf {
+    PROC_ALIASES
+        .iter()
+        .find_map(|entry| {
+            let rest = path.strip_prefix(entry.alias).ok()?;
+            Some(
+                Path::new(&format!("/proc/{pid}"))
+                    .join(entry.under_proc)
+                    .join(rest),
+            )
+        })
+        .unwrap_or(path)
 }
 
 const RESOLVE_IN_ROOT: u64 = 0x10;
@@ -2399,7 +2437,11 @@ mod tests {
         let alias =
             std::env::temp_dir().join(format!("broker-device-alias-{}", std::process::id()));
 
-        std::os::unix::fs::symlink("/dev/ptmx", &alias).expect("create device alias");
+        // Opening a pty pair is ungated, but its terminal end is gated, and it
+        // exists wherever the tests run.
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let terminal = nix::unistd::ttyname(&pty.slave).expect("terminal name");
+        std::os::unix::fs::symlink(&terminal, &alias).expect("create device alias");
         let cpath = std::ffi::CString::new(alias.as_os_str().as_encoded_bytes()).expect("path");
 
         let notif = SeccompNotif {
@@ -2421,7 +2463,7 @@ mod tests {
 
         assert_eq!(
             target.path,
-            fs::canonicalize("/dev/ptmx").expect("canonical device")
+            fs::canonicalize(&terminal).expect("canonical device")
         );
     }
 

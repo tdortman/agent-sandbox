@@ -5,8 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+landlock.workspace = true
 libc.workspace = true
 seccompiler.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+nix = { workspace = true, features = ["term"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

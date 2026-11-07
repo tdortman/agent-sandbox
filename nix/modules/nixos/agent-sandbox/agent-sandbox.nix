@@ -641,7 +641,10 @@ in
       resources.enable = lib.mkEnableOption ''
         seccomp-backed resource gates for all AF_UNIX sockets and
         broker-opened host device nodes under /dev in dynamic filesystem mode.
-        Requires gates.filesystem.enable.
+        Requires gates.filesystem.enable. Whenever the syscall-arm helper is
+        wired, the sandbox also runs under a Landlock domain that blocks device
+        nodes and UNIX sockets the broker has not opened for it; this needs a
+        kernel with Landlock ABI 9 (Linux 7.1), and the sandbox refuses to start without it.
       '';
 
       syscalls.enable = lib.mkEnableOption ''

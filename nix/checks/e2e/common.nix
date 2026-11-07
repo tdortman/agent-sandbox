@@ -6,7 +6,12 @@
 }:
 rec {
   baseNode = {
-    boot.kernelParams = [ "audit=0" ];
+    boot = {
+      # The syscall-arm's Landlock floor needs ABI 9, newer than the default kernel.
+      kernelPackages = pkgs.linuxPackages_latest;
+      kernelParams = [ "audit=0" ];
+    };
+
     environment.etc."agent-sandbox-test/hidden-file".text = "hidden file marker\n";
     networking.firewall.enable = false;
     nixpkgs.overlays = lib.mkForce [ ];

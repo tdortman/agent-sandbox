@@ -356,10 +356,10 @@ fn kill_descendants() {
 /// Return true if the target is a connect to the broker's own policyd
 /// socket. These connects are infrastructure traffic from fs-arm (which
 /// runs under the seccomp filter), not agent actions, and should not
-/// prompt. The policy socket is `--ro-bind`'d into the sandbox, so the
-/// agent cannot impersonate it. The broker issues `CONTINUE` so the tracee
-/// completes the paused `connect()` with frozen args (TOCTOU-safe) and
-/// policyd observes the tracee pid on `SO_PEERCRED`.
+/// prompt. The broker issues `CONTINUE` so policyd observes the tracee pid
+/// on `SO_PEERCRED`. The kernel re-reads the sockaddr after `CONTINUE`; the
+/// arm's Landlock floor allows resolving only this socket, so a swapped
+/// address cannot reach another one.
 ///
 /// Compares by inode and device, not path, to defeat hardlink aliases:
 /// `link(policy_sock, ~/evil.sock)` creates a second path to the same

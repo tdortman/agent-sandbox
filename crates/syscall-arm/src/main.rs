@@ -55,10 +55,21 @@ fn cstring(bytes: &[u8]) -> CString {
     })
 }
 
+fn policy_socket() -> String {
+    env::var("AGENT_SANDBOX_POLICY_SOCKET").unwrap_or_else(|_| DEFAULT_POLICY_SOCKET.to_string())
+}
+
 fn install_filter(include_filesystem: bool) -> OwnedFd {
     set_no_new_privs()
         .map_err(|_| ())
         .unwrap_or_else(|()| die("prctl PR_SET_NO_NEW_PRIVS failed"));
+
+    // The broker continues syscalls whose pointer arguments the tracee can
+    // rewrite afterwards; the floor keeps those away from gated targets.
+    if let Err(err) = agent_sandbox_syscall::floor::restrict_self(policy_socket().as_ref()) {
+        eprintln!("agent-sandbox-syscall-arm: Landlock floor failed: {err}");
+        process::exit(1);
+    }
 
     let syscalls = if include_filesystem {
         default_syscalls()
@@ -102,8 +113,7 @@ fn exec_broker(listener_fd: &impl AsRawFd, child_pid: Pid) -> ! {
     let fd_arg = listener_fd.as_raw_fd().to_string();
     let child_arg = child_pid.as_raw().to_string();
 
-    let policy_socket = env::var("AGENT_SANDBOX_POLICY_SOCKET")
-        .unwrap_or_else(|_| DEFAULT_POLICY_SOCKET.to_string());
+    let policy_socket = policy_socket();
 
     let mut broker_args = vec![
         cstring(b"agent-sandbox-syscall-broker"),

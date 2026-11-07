@@ -5,6 +5,7 @@
 //! filter loaded via `prctl`.
 
 pub mod bpf;
+pub mod floor;
 
 pub mod policy;
 pub use bpf::build_filter;
