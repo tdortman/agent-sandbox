@@ -36,7 +36,7 @@ rama-tls = { version = "0.4.0", default-features = false }
 rcgen = { version = "0.14.8", features = ["pem", "ring", "x509-parser"] }
 ring = "0.17.14"
 rustix = { version = "1.1.4", features = ["pty"] }
-rustls = { version = "0.23.42", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
@@ -66,7 +66,7 @@ git = "https://github.com/hyperium/h3.git"
 rev = "43745ad87e95b0c035ac9c547aad467303213425"
 
 [workspace.dependencies.quinn]
-version = "0.11.11"
+version = "0.11.12"
 default-features = false
 features = ["futures-io", "runtime-tokio", "rustls-ring"]
 
@@ -185,9 +185,9 @@ missing_docs = "warn"  # Every public symbol documented
 
 [patch.crates-io]
 rama-http-core = { path = "vendor/rama-http-core-0.4.0" }
-quinn = { path = "vendor/quinn-0.11.11" }
-quinn-proto = { path = "vendor/quinn-proto-0.11.16" }
-rustls = { path = "vendor/rustls-0.23.43" }
+quinn = { path = "vendor/quinn-0.11.12" }
+quinn-proto = { path = "vendor/quinn-proto-0.11.19" }
+rustls = { path = "vendor/rustls-0.23.46" }
 
 [patch."https://github.com/hyperium/h3.git"]
 h3 = { path = "vendor/h3" }

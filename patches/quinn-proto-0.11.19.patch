@@ -32,7 +32,7 @@
      /// Whether the spin bit is in use for this connection
      spin_enabled: bool,
      /// Outgoing spin bit state
-@@ -305,6 +311,16 @@
+@@ -312,6 +318,16 @@
              retry_src_cid: None,
              events: VecDeque::new(),
              endpoint_events: VecDeque::new(),
@@ -49,7 +49,7 @@
              spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
              spin: false,
              spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
-@@ -407,6 +423,17 @@
+@@ -415,6 +431,17 @@
          self.endpoint_events.pop_front().map(EndpointEvent)
      }
  
@@ -67,7 +67,7 @@
      /// Provide control over streams
      #[must_use]
      pub fn streams(&mut self) -> Streams<'_> {
-@@ -1141,6 +1168,16 @@
+@@ -1167,6 +1194,16 @@
              }
              NewIdentifiers(ids, now) => {
                  self.local_cid_state.new_cids(&ids, now);
@@ -84,7 +84,7 @@
                  ids.into_iter().rev().for_each(|frame| {
                      self.spaces[SpaceId::Data].pending.new_cids.push(frame);
                  });
-@@ -1171,6 +1208,7 @@
+@@ -1197,6 +1234,7 @@
              match timer {
                  Timer::Close => {
                      self.state = State::Drained;
@@ -92,7 +92,7 @@
                      self.endpoint_events.push_back(EndpointEventInner::Drained);
                  }
                  Timer::Idle => {
-@@ -1903,7 +1941,12 @@
+@@ -1934,7 +1972,12 @@
          spin: bool,
          is_1rtt: bool,
      ) {
@@ -105,7 +105,7 @@
          self.reset_keep_alive(now);
          self.reset_idle_timeout(now, space_id);
          self.permit_idle_reset = true;
-@@ -2382,6 +2425,7 @@
+@@ -2413,6 +2456,7 @@
              }
          }
          if !was_drained && self.state.is_drained() {
@@ -113,7 +113,7 @@
              self.endpoint_events.push_back(EndpointEventInner::Drained);
              // Close timer may have been started previously, e.g. if we sent a close and got a
              // stateless reset in response
-@@ -2871,6 +2915,12 @@
+@@ -2902,6 +2946,12 @@
                      let allow_more_cids = self
                          .local_cid_state
                          .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
@@ -126,7 +126,7 @@
                      self.endpoint_events
                          .push_back(EndpointEventInner::RetireConnectionId(
                              now,
-@@ -3115,6 +3165,31 @@
+@@ -3132,6 +3182,31 @@
          self.peer_params.stateless_reset_token = Some(reset_token);
      }
  
@@ -158,7 +158,7 @@
      /// Issue an initial set of connection IDs to the peer upon connection
      fn issue_first_cids(&mut self, now: Instant) {
          if self.local_cid_state.cid_len() == 0 {
-@@ -3697,6 +3772,7 @@
+@@ -3744,6 +3819,7 @@
          self.close_common();
          self.error = Some(reason);
          self.state = State::Drained;
@@ -219,7 +219,7 @@
  pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
 --- a/src/tests/mod.rs
 +++ b/src/tests/mod.rs
-@@ -1592,6 +1592,73 @@
+@@ -1996,6 +1996,73 @@
  }
  
  #[test]

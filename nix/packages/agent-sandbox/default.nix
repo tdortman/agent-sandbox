@@ -23,16 +23,16 @@ let
       hash = "sha256-vYMlYwApeXVOYZU3oNWGGx8cjftQW3HDFMzXgbJpcyQ=";
     })
     (pkgs.fetchurl {
-      url = "https://static.crates.io/crates/quinn/quinn-0.11.11.crate";
-      hash = "sha256-DBpB5De2u9SJNyzUlx3hKOhchV9WxX8oPSD/AWz3wKg=";
+      url = "https://static.crates.io/crates/quinn/quinn-0.11.12.crate";
+      hash = "sha256-QFHiPpGFwlWn4z71nNvKh6ItNZBS7s0i/GuQH7N9nRE=";
     })
     (pkgs.fetchurl {
-      url = "https://static.crates.io/crates/quinn-proto/quinn-proto-0.11.16.crate";
-      hash = "sha256-L0v8AVJiud9jyIRQcs5ZBohT/1hyGAws4vEwOLlw5WA=";
+      url = "https://static.crates.io/crates/quinn-proto/quinn-proto-0.11.19.crate";
+      hash = "sha256-DnUMylX+TwQ5oV0LtSnallHnmZPo5yxhqJmjbUYr774=";
     })
     (pkgs.fetchurl {
-      url = "https://static.crates.io/crates/rustls/rustls-0.23.43.crate";
-      hash = "sha256-AoM4bOAqvAFR4XYdCIAt/obBc7C0lK9cvAhldORT2gY=";
+      url = "https://static.crates.io/crates/rustls/rustls-0.23.46.crate";
+      hash = "sha256-SOE72MDpNlxDz6XJ6PmtSdPIREkmyarIGeDk3FA8j98=";
     })
   ];
   qtDialog = pkgs.stdenv.mkDerivation {

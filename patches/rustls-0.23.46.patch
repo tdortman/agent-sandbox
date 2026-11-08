@@ -1,6 +1,6 @@
 --- a/src/error.rs
 +++ b/src/error.rs
-@@ -310,6 +310,7 @@
+@@ -313,6 +313,7 @@
      UnsolicitedServerHelloExtension,
      WrongGroupForKeyShare,
      UnsolicitedEchExtension,
@@ -97,7 +97,7 @@
  }
 --- /dev/null
 +++ b/src/server/ech.rs
-@@ -0,0 +1,726 @@
+@@ -0,0 +1,915 @@
 +//! Server-side Encrypted Client Hello (ECH) support, per [RFC 9849].
 +//!
 +//! The server holds one or more [`EchKeys`] entries, each pairing an
@@ -280,13 +280,13 @@
 +///
 +/// When the client did not offer ECH, no key matches, or decryption fails,
 +/// `accepted` is `None` and the handshake continues with the outer hello.
-+/// On the retry leg (`done_retry`), `ech` holds the state from the first
++/// On the retry leg (`retrying`), `ech` holds the state from the first
 +/// hello; a missing or inconsistent offer is then a fatal error, per
 +/// RFC 9849 section 7.1.1.
 +pub(crate) fn process_client_hello_ech(
 +    keys: &[EchKeys],
 +    m: &Message<'_>,
-+    done_retry: bool,
++    retrying: bool,
 +    ech: Option<EchHandshakeState>,
 +    common: &mut CommonState,
 +) -> Result<EchOutcome, Error> {
@@ -295,6 +295,14 @@
 +    let outer = match &client_hello.encrypted_client_hello {
 +        Some(EncryptedClientHello::Outer(outer)) => outer,
 +        // No offer, or a malformed inner-type extension in the outer hello.
++        _ if retrying && ech.is_some() => {
++            return Err(fatal_alert(
++                common,
++                AlertDescription::MissingExtension,
++                PeerMisbehaved::InvalidEchClientHello,
++                "ECH retry omitted the encrypted_client_hello extension",
++            ));
++        }
 +        _ => {
 +            return Ok(EchOutcome {
 +                offered: false,
@@ -312,7 +320,7 @@
 +    };
 +    let raw = encoded.bytes();
 +
-+    let (opener, config_id, cipher_suite, plaintext) = if done_retry {
++    let (opener, config_id, cipher_suite, plaintext) = if retrying {
 +        // A retry hello after an accepted offer must continue with the same
 +        // configuration and HPKE context (RFC 9849 section 7.1.1).
 +        let Some(mut state) = ech else {
@@ -808,50 +816,231 @@
 +    #[test]
 +    fn hello_layout_walks_extension_entries() {
 +        // ClientHello with empty session id, one cipher suite, one
-+        // compression method, and a single 4-byte extension.
-+        let mut hello = vec![0u8; 46];
++        // compression method, and a single empty extension.
++        let mut hello = vec![0u8; 47];
 +        hello[34] = 0; // empty session id
-+        hello[35] = 2; // cipher suites length (1 suite)
-+        hello[37] = 1; // compression length (1 method)
-+        hello[38] = 0; // extensions length high byte
-+        hello[39] = 6; // extensions length low byte (4 + 2)
++        hello[36] = 2; // cipher suites length (1 suite)
++        hello[39] = 1; // compression length (1 method)
++        hello[42] = 4; // extensions length (one 4-byte header)
 +        let layout = hello_layout(&hello).expect("well-formed hello");
-+        assert_eq!(layout.hello_len, 46);
-+        assert_eq!(layout.ext_start, 40);
++        assert_eq!(layout.hello_len, 47);
++        assert_eq!(layout.ext_start, 43);
 +        assert_eq!(layout.entries.len(), 1);
 +        assert_eq!(layout.entries[0].ty, 0);
-+        assert_eq!(layout.entries[0].start, 40);
-+        assert_eq!(layout.entries[0].end, 46);
++        assert_eq!(layout.entries[0].start, 43);
++        assert_eq!(layout.entries[0].end, 47);
++    }
++
++    use alloc::sync::Arc;
++    use alloc::vec;
++    use std::io::Cursor;
++
++    use rcgen::{CertifiedKey, generate_simple_self_signed};
++
++    use crate::client::{EchConfig, EchMode, EchStatus};
++    use crate::crypto::aws_lc_rs::{self, hpke::DH_KEM_X25519_HKDF_SHA256_AES_128, kx_group};
++    use crate::crypto::{CryptoProvider, SupportedKxGroup};
++    use crate::pki_types::{PrivateKeyDer, ServerName};
++    use crate::{
++        ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConfig,
++        ServerConnection, version::TLS13,
++    };
++
++    /// An `ECHConfigList` with one X25519 / HKDF-SHA256 / AES-128-GCM
++    /// configuration for `public.example`.
++    fn config_list(public_key: &[u8]) -> Vec<u8> {
++        let name = b"public.example";
++        let mut contents = vec![7u8];
++        contents.extend(0x0020u16.to_be_bytes());
++        contents.extend(
++            u16::try_from(public_key.len())
++                .expect("key length fits u16")
++                .to_be_bytes(),
++        );
++        contents.extend(public_key);
++        contents.extend(4u16.to_be_bytes());
++        contents.extend([0, 1, 0, 1]);
++        contents.push(32);
++        contents.push(u8::try_from(name.len()).expect("name length fits u8"));
++        contents.extend(name);
++        contents.extend(0u16.to_be_bytes());
++
++        let mut config = ECH_EXTENSION_TYPE.to_be_bytes().to_vec();
++        config.extend(
++            u16::try_from(contents.len())
++                .expect("config length fits u16")
++                .to_be_bytes(),
++        );
++        config.extend(contents);
++
++        let mut list = u16::try_from(config.len())
++            .expect("list length fits u16")
++            .to_be_bytes()
++            .to_vec();
++        list.extend(config);
++        list
++    }
++
++    fn provider(groups: Vec<&'static dyn SupportedKxGroup>) -> Arc<CryptoProvider> {
++        let mut provider = aws_lc_rs::default_provider();
++        provider.kx_groups = groups;
++        Arc::new(provider)
++    }
++
++    /// A client that offers P-256 and X25519 with a P-256 share and a server
++    /// that only supports X25519, so the server answers the first hello with
++    /// a `HelloRetryRequest`.
++    fn retry_pair() -> (ClientConnection, ServerConnection) {
++        let CertifiedKey { cert, signing_key } =
++            generate_simple_self_signed(vec!["inner.example".into()])
++                .expect("self-signed certificate");
++        let mut roots = RootCertStore::empty();
++        roots
++            .add(cert.der().clone())
++            .expect("certificate is a valid trust anchor");
++
++        let suite: &'static dyn Hpke = DH_KEM_X25519_HKDF_SHA256_AES_128;
++        let (public_key, private_key) = suite.generate_key_pair().expect("HPKE key pair");
++        let list = config_list(&public_key.0);
++
++        let ech = EchConfig::new(EchConfigListBytes::from(list.as_slice()), &[suite])
++            .expect("compatible ECH configuration");
++        let client_config = ClientConfig::builder_with_provider(provider(vec![
++            kx_group::SECP256R1,
++            kx_group::X25519,
++        ]))
++        .with_ech(EchMode::Enable(ech))
++        .expect("ECH-capable client configuration")
++        .with_root_certificates(roots)
++        .with_no_client_auth();
++
++        let keys = EchKeys::new(
++            EchConfigListBytes::from(list.as_slice()),
++            private_key.secret_bytes(),
++            suite,
++        )
++        .expect("ECH keys");
++        let server_config = ServerConfig::builder_with_provider(provider(vec![kx_group::X25519]))
++        .with_protocol_versions(&[&TLS13])
++        .expect("TLS 1.3 server configuration")
++        .with_no_client_auth()
++        .with_single_cert(
++            vec![cert.der().clone()],
++            PrivateKeyDer::try_from(signing_key.serialize_der()).expect("PKCS#8 key"),
++        )
++        .expect("server certificate")
++        .with_ech_keys(vec![keys])
++        .expect("ECH keys accepted");
++
++        let client = ClientConnection::new(
++            Arc::new(client_config),
++            ServerName::try_from("inner.example").expect("valid name"),
++        )
++        .expect("client connection");
++        let server = ServerConnection::new(Arc::new(server_config)).expect("server connection");
++        (client, server)
++    }
++
++    macro_rules! take_flight {
++        ($from:expr) => {{
++            let mut bytes = Vec::new();
++            while $from.wants_write() {
++                $from.write_tls(&mut bytes).expect("write to memory");
++            }
++            bytes
++        }};
++    }
++
++    macro_rules! deliver {
++        ($to:expr, $bytes:expr) => {{
++            let mut cursor = Cursor::new($bytes);
++            while usize::try_from(cursor.position()).expect("position fits usize")
++                < cursor.get_ref().len()
++            {
++                $to.read_tls(&mut cursor).expect("read from memory");
++            }
++            $to.process_new_packets()
++        }};
++    }
++
++    #[test]
++    fn ech_is_accepted_across_hello_retry_request() {
++        let (mut client, mut server) = retry_pair();
++
++        while client.is_handshaking() || server.is_handshaking() {
++            let flight = take_flight!(client);
++            deliver!(server, flight).expect("server processes client flight");
++            let flight = take_flight!(server);
++            deliver!(client, flight).expect("client processes server flight");
++        }
++
++        assert_eq!(
++            client.handshake_kind(),
++            Some(HandshakeKind::FullWithHelloRetryRequest)
++        );
++        assert_eq!(client.ech_status(), EchStatus::Accepted);
++        assert_eq!(server.server_name(), Some("inner.example"));
++    }
++
++    #[test]
++    fn second_hello_without_ech_after_acceptance_is_rejected() {
++        let (mut client, mut server) = retry_pair();
++
++        let first = take_flight!(client);
++        deliver!(server, first).expect("server accepts first hello");
++        let retry = take_flight!(server);
++        deliver!(client, retry).expect("client follows the retry");
++
++        let mut second = take_flight!(client);
++        // Walk the records to the handshake record and rename its ECH
++        // extension to an unknown type of the same length.
++        let mut at = 0;
++        while at < second.len() {
++            let len = usize::from(u16::from_be_bytes([second[at + 3], second[at + 4]]));
++            if second[at] == 22 {
++                let layout = hello_layout(&second[at + 9..at + 5 + len]).expect("client hello");
++                let ech = layout
++                    .entries
++                    .iter()
++                    .find(|entry| entry.ty == ECH_EXTENSION_TYPE)
++                    .expect("second hello carries ECH");
++                second[at + 9 + ech.start + 1] ^= 0x01;
++            }
++            at += 5 + len;
++        }
++
++        let error = deliver!(server, second).expect_err("ECH omission must abort");
++        assert_eq!(error, Error::PeerMisbehaved(PeerMisbehaved::InvalidEchClientHello));
 +    }
 +}
 --- a/src/server/hs.rs
 +++ b/src/server/hs.rs
-@@ -315,6 +315,8 @@
+@@ -314,6 +314,8 @@
+     #[cfg(feature = "tls12")]
      pub(super) using_ems: bool,
-     pub(super) done_retry: bool,
-     pub(super) send_tickets: usize,
+     pub(super) previous_hello: Option<PreviousClientHello>,
 +    /// ECH handshake state, when the first client hello was accepted.
 +    pub(super) ech: Option<super::ech::EchHandshakeState>,
+     pub(super) send_tickets: usize,
  }
  
- impl ExpectClientHello {
-@@ -338,6 +340,7 @@
+@@ -337,6 +339,7 @@
+             #[cfg(feature = "tls12")]
              using_ems: false,
-             done_retry: false,
-             send_tickets: 0,
+             previous_hello: None,
 +            ech: None,
+             send_tickets: 0,
          }
      }
- 
-@@ -505,6 +508,7 @@
-                 done_retry: self.done_retry,
+@@ -519,6 +522,7 @@
+                 suite,
+                 randoms,
+                 previous_hello: self.previous_hello,
++                ech: self.ech,
                  send_tickets: self.send_tickets,
                  extra_exts: self.extra_exts,
-+                ech: self.ech,
              }
-             .handle_client_hello(cx, certkey, m, client_hello, skxg, sig_schemes),
-             #[cfg(feature = "tls12")]
-@@ -668,6 +672,55 @@
+@@ -689,6 +693,44 @@
      where
          Self: 'm,
      {
@@ -859,24 +1048,16 @@
 +        // processing: an accepted offer replaces the client hello entirely.
 +        if self.config.ech_keys.is_some() {
 +            let mut this = self;
-+            let ech = if this.done_retry {
-+                this.ech.take()
-+            } else {
-+                None
-+            };
++            let retrying = this.previous_hello.is_some();
++            let ech = if retrying { this.ech.take() } else { None };
 +            let keys: &[super::ech::EchKeys] = this
 +                .config
 +                .ech_keys
 +                .as_deref()
 +                .map(Vec::as_slice)
 +                .unwrap_or(&[]);
-+            let outcome = super::ech::process_client_hello_ech(
-+                keys,
-+                &m,
-+                this.done_retry,
-+                ech,
-+                &mut cx.common,
-+            )?;
++            let outcome =
++                super::ech::process_client_hello_ech(keys, &m, retrying, ech, &mut cx.common)?;
 +            if outcome.offered && outcome.accepted.is_none() {
 +                // The client offered ECH but no key could decrypt it; the
 +                // outer hello is used, and the EncryptedExtensions
@@ -885,28 +1066,25 @@
 +            }
 +            if let Some(accepted) = outcome.accepted {
 +                // The inner hello becomes the client hello for the rest of
-+                // the handshake.  The transcript buffer is fresh: the TLS 1.3
-+                // handler adds the (inner) hello message itself.
-+                let mut transcript_buffer = HandshakeHashBuffer::new();
-+                if this.config.verifier.offer_client_auth() {
-+                    transcript_buffer.set_client_auth_enabled();
-+                }
-+                this.transcript = HandshakeHashOrBuffer::Buffer(transcript_buffer);
++                // the handshake.  The transcript is left as is: it is empty on
++                // the first leg and holds the inner hello and the
++                // HelloRetryRequest on the retry leg; the TLS 1.3 handler adds
++                // the (inner) hello message itself.
 +                this.ech = Some(accepted.state);
 +                cx.data.ech_accepted = true;
 +
 +                let (client_hello, sig_schemes) =
-+                    process_client_hello(&accepted.message, this.done_retry, cx)?;
++                    process_client_hello(&accepted.message, retrying, cx)?;
 +                return this.with_certified_key(sig_schemes, client_hello, &accepted.message, cx);
 +            }
 +            // ECH was offered but not accepted: continue with the outer hello.
-+            let (client_hello, sig_schemes) = process_client_hello(&m, this.done_retry, cx)?;
++            let (client_hello, sig_schemes) = process_client_hello(&m, retrying, cx)?;
 +            return this.with_certified_key(sig_schemes, client_hello, &m, cx);
 +        }
 +
-         let (client_hello, sig_schemes) = process_client_hello(&m, self.done_retry, cx)?;
+         let (client_hello, sig_schemes) =
+             process_client_hello(&m, self.previous_hello.is_some(), cx)?;
          self.with_certified_key(sig_schemes, client_hello, &m, cx)
-     }
 --- a/src/server/server_conn.rs
 +++ b/src/server/server_conn.rs
 @@ -459,9 +459,41 @@
@@ -973,8 +1151,8 @@
  };
  use crate::msgs::message::{Message, MessagePayload};
  use crate::msgs::persist;
-@@ -73,6 +73,8 @@
-         pub(in crate::server) done_retry: bool,
+@@ -74,6 +74,8 @@
+         pub(in crate::server) previous_hello: Option<PreviousClientHello>,
          pub(in crate::server) send_tickets: usize,
          pub(in crate::server) extra_exts: ServerExtensionsInput<'static>,
 +        /// ECH handshake state, when the client hello was accepted.
@@ -982,7 +1160,7 @@
      }
  
      fn max_early_data_size(configured: u32) -> usize {
-@@ -225,6 +227,7 @@
+@@ -241,6 +243,7 @@
                      client_hello.session_id,
                      cx.common,
                      selected_kxg.name(),
@@ -990,23 +1168,23 @@
                  );
                  emit_fake_ccs(cx.common);
  
-@@ -240,6 +243,7 @@
-                     done_retry: true,
+@@ -261,6 +264,7 @@
+                     }),
                      send_tickets: self.send_tickets,
                      extra_exts: self.extra_exts,
 +                    ech: self.ech.take(),
                  });
  
                  return if early_data_requested {
-@@ -368,6 +372,7 @@
+@@ -389,6 +393,7 @@
                      .as_ref()
                      .map(|x| &x.master_secret.0[..]),
                  &self.config,
 +                self.ech.as_ref(),
              )?;
-             if !self.done_retry {
+             if !self.previous_hello.is_some() {
                  emit_fake_ccs(cx.common);
-@@ -512,6 +517,7 @@
+@@ -533,6 +538,7 @@
          chosen_psk_idx: Option<usize>,
          resuming_psk: Option<&[u8]>,
          config: &ServerConfig,
@@ -1014,7 +1192,7 @@
      ) -> Result<KeyScheduleHandshake, Error> {
          // Prepare key exchange; the caller already found the matching SupportedKxGroup
          let (share, kxgroup) = share_and_kxgroup;
-@@ -524,6 +530,46 @@
+@@ -545,6 +551,46 @@
              })?;
          cx.common.kx_state.complete();
  
@@ -1061,7 +1239,7 @@
          let extensions = Box::new(ServerExtensions {
              key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
              selected_version: Some(ProtocolVersion::TLSv1_3),
-@@ -536,7 +582,7 @@
+@@ -557,7 +603,7 @@
              payload: MessagePayload::handshake(HandshakeMessagePayload(
                  HandshakePayload::ServerHello(ServerHelloPayload {
                      legacy_version: ProtocolVersion::TLSv1_2,
@@ -1070,7 +1248,7 @@
                      session_id: *session_id,
                      cipher_suite: suite.common.suite,
                      compression_method: Compression::Null,
-@@ -599,18 +645,44 @@
+@@ -620,18 +666,44 @@
          session_id: SessionId,
          common: &mut CommonState,
          group: NamedGroup,
@@ -1116,9 +1294,9 @@
          let m = Message {
              version: ProtocolVersion::TLSv1_2,
              payload: MessagePayload::handshake(HandshakeMessagePayload(
-@@ -697,6 +769,21 @@
-         let mut ep = hs::ExtensionProcessing::new(extra_exts);
-         ep.process_common(config, cx, ocsp_response, hello, resumedata)?;
+@@ -729,6 +801,21 @@
+             resuming.map(|(_, session)| session),
+         )?;
  
 +        // RFC 9849 section 7.1: a server with ECH keys that rejected the
 +        // client's offer advertises its current configurations so the client
@@ -1167,7 +1345,7 @@
          )
      }
  
-@@ -932,6 +920,20 @@
+@@ -935,6 +923,20 @@
      })
  }
  

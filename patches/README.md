@@ -51,10 +51,10 @@ the revision pinned in `Cargo.toml`.
 - A successful caller-provided response still gets the
   `sec-webtransport-http3-draft: draft02` header if it is missing.
 
-## quinn 0.11.11 and quinn-proto 0.11.16 (generated)
+## quinn 0.11.12 and quinn-proto 0.11.19 (generated)
 
-Generated from `patches/quinn-0.11.11.patch` and
-`patches/quinn-proto-0.11.16.patch` by `scripts/materialize-vendor.sh`.
+Generated from `patches/quinn-0.11.12.patch` and
+`patches/quinn-proto-0.11.19.patch` by `scripts/materialize-vendor.sh`.
 
 - `quinn-proto` now emits authenticated `ConnectionIdEvent` values for
   locally-issued connection IDs, and `quinn::Connection` exposes them
@@ -62,10 +62,12 @@ Generated from `patches/quinn-0.11.11.patch` and
 - The transparent HTTP/3 backend uses these events to bind active and
   retired connection IDs to policy ownership without parsing encrypted
   QUIC packets.
+- The `quinn` patch requires `cfg_aliases` 0.2.2, because 0.2.1 triggers a
+  future-incompatibility warning in the build script.
 
-## rustls 0.23.43 (generated)
+## rustls 0.23.46 (generated)
 
-Generated from `patches/rustls-0.23.43.patch` by
+Generated from `patches/rustls-0.23.46.patch` by
 `scripts/materialize-vendor.sh`.
 
 - Added RFC 9849 shared-mode server ECH, which upstream rustls does not
@@ -79,10 +81,22 @@ Generated from `patches/rustls-0.23.43.patch` by
   `HelloRetryRequest` carries the section 7.2.1 confirmation; rejected
   offers advertise `retry_configs` in `EncryptedExtensions` only when the
   client offered ECH.
-- Upstream server ECH has no release target, so this crate stays pinned
-  at 0.23.43 (matching the workspace version requirement, so quinn and
-  rama keep resolving to it unchanged) until upstream offers an
-  equivalent API.
+- After an accepted `HelloRetryRequest`, the second ClientHelloOuter must
+  carry the same `config_id` and cipher suite with an empty `enc`, and is
+  decrypted with the HPKE context of the first. A missing extension aborts
+  with `missing_extension` (section 7.1.1). The retry state sits beside
+  upstream's `previous_hello`, and the handshake transcript carries the first
+  inner hello and the retry request into the second.
+- HPKE `open` only advances the sequence number after a successful
+  decryption (upstream rustls#3340), so a failed trial decryption does not
+  disturb a later one.
+- Upstream server ECH has no release target, so this crate stays patched
+  (matching the workspace version requirement, so quinn and rama keep
+  resolving to it unchanged) until upstream offers an equivalent API.
+- The patch adds unit tests in `server/ech.rs`: a full in-memory handshake
+  that accepts ECH across a `HelloRetryRequest`, and a retry hello that drops
+  the extension. They need the upstream `rustls` workspace to build, because
+  the published `.crate` omits the test CA files other unit tests include.
 
 ## rama-http-core 0.4.0 (generated)
 

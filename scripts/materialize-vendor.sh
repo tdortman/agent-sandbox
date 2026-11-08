@@ -27,9 +27,9 @@ cd "$root"
 # h3-datagram through `../h3-datagram`, so it must sit beside it in vendor/.
 entries=(
   "crate rama-http-core 0.4.0 bd832563002979754e619537a0d5861b1f1c8dfb505b71c314ccd781b2697324 patches/rama-http-core-0.4.0.patch"
-  "crate rustls 0.23.43 0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06 patches/rustls-0.23.43.patch"
-  "crate quinn 0.11.11 0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8 patches/quinn-0.11.11.patch"
-  "crate quinn-proto 0.11.16 2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560 patches/quinn-proto-0.11.16.patch"
+  "crate rustls 0.23.46 48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf patches/rustls-0.23.46.patch"
+  "crate quinn 0.11.12 4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11 patches/quinn-0.11.12.patch"
+  "crate quinn-proto 0.11.19 0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe patches/quinn-proto-0.11.19.patch"
   "git h3 0.0.8 h3 https://github.com/hyperium/h3.git 43745ad87e95b0c035ac9c547aad467303213425 patches/h3-0.0.8.patch"
   "git h3-datagram 0.0.2 h3-datagram https://github.com/hyperium/h3.git 43745ad87e95b0c035ac9c547aad467303213425 -"
   "git h3-webtransport 0.1.2 h3-webtransport https://github.com/hyperium/h3.git 43745ad87e95b0c035ac9c547aad467303213425 patches/h3-webtransport-0.1.2.patch"
