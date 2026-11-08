@@ -1,6 +1,7 @@
 //! JSON-line policyd client helpers.
 
 use std::{
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -95,6 +96,28 @@ impl RpcConnection {
         })
     }
 
+    /// Whether the peer has closed or reset the connection while it sat idle.
+    ///
+    /// Peeks without consuming or blocking, so unread bytes stay available to
+    /// [`read_message`](Self::read_message). Pending data means the peer is
+    /// still there.
+    fn peer_has_closed(&self) -> bool {
+        use nix::{
+            errno::Errno,
+            sys::socket::{MsgFlags, recv},
+        };
+
+        let stream: &UnixStream = self.reader.get_ref().as_ref();
+        let mut probe = [0_u8; 1];
+        let flags = MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT;
+
+        match recv(stream.as_raw_fd(), &mut probe, flags) {
+            Ok(received) => received == 0,
+            Err(Errno::EAGAIN | Errno::EINTR) => false,
+            Err(_) => true,
+        }
+    }
+
     /// Write a serialized RPC request to the connection.
     ///
     /// # Errors
@@ -163,10 +186,13 @@ fn peer_is_trusted_non_local(stream: &UnixStream) -> bool {
 ///
 /// A request uses the current connection, establishing it lazily on the first
 /// request. Requests are intentionally sequential (`&mut self`), so a reply
-/// can never be attributed to the wrong request. Any transport, framing, JSON,
-/// or timeout failure discards the connection. In particular, a failed request
-/// is never replayed: after request bytes may have reached policyd, retrying
-/// could duplicate a one-shot approval.
+/// can never be attributed to the wrong request. A reused connection whose
+/// peer closed it while idle (for example across a policyd restart) is
+/// replaced by a fresh one before anything is written, so nothing is sent
+/// twice. Any transport, framing, JSON, or timeout failure discards the
+/// connection. In particular, a failed request is never replayed: after
+/// request bytes may have reached policyd, retrying could duplicate a
+/// one-shot approval.
 pub struct PersistentRpcClient {
     socket_path: PathBuf,
     connection: Option<RpcConnection>,
@@ -218,6 +244,13 @@ impl PersistentRpcClient {
         timeout: Duration,
     ) -> Result<RpcReply, RpcClientError> {
         let result = time::timeout(timeout, async {
+            if self
+                .connection
+                .as_ref()
+                .is_some_and(RpcConnection::peer_has_closed)
+            {
+                self.connection = None;
+            }
             if self.connection.is_none() {
                 let connection = if self.require_trusted_peer {
                     RpcConnection::connect_trusted(&self.socket_path).await?
@@ -326,6 +359,52 @@ mod tests {
         }
 
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connection_closed_while_idle_is_replaced_before_sending() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+
+        let first_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.expect("read request") > 0);
+            write.write_all(ALLOWED_REPLY).await.expect("write reply");
+            write.flush().await.expect("flush reply");
+        });
+
+        let mut client = PersistentRpcClient::new(&socket);
+        client
+            .request(request(), Duration::from_secs(1))
+            .await
+            .expect("first request succeeds");
+        first_server.await.expect("first server task");
+
+        // A restarted policyd serves the same path from a new socket.
+        std::fs::remove_file(&socket).expect("remove old socket");
+        let listener = UnixListener::bind(&socket).expect("rebind policy socket");
+
+        let second_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.expect("read request") > 0);
+            write.write_all(ALLOWED_REPLY).await.expect("write reply");
+            write.flush().await.expect("flush reply");
+        });
+
+        let reply = client
+            .request(request(), Duration::from_secs(1))
+            .await
+            .expect("second request reconnects");
+
+        assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
+        second_server.await.expect("second server task");
     }
 
     #[tokio::test]
