@@ -41,9 +41,14 @@ fn session_dbus_matches(bucket: &HashSet<DbusTarget>, target: &DbusTarget) -> bo
         .any(|candidate| DbusRule::new(candidate.clone(), "").matches(target))
 }
 
+/// Static allow key of a sandbox session.
+pub(super) fn sandbox_session_static_allow_key(session_id: &str) -> String {
+    format!("sandbox:{session_id}")
+}
+
 fn sandbox_filesystem_static_allow_key(ctx: &ResolvedRequestContext) -> String {
     if let Some(id) = &ctx.sandbox_session_id {
-        return format!("sandbox:{id}");
+        return sandbox_session_static_allow_key(id);
     }
 
     let cwd = ctx
@@ -427,6 +432,8 @@ impl PolicyStore {
         if rules.is_empty() {
             return;
         }
+
+        self.persist_static_allow(ctx.sandbox_session_id.as_deref(), &rules);
 
         let key = sandbox_filesystem_static_allow_key(ctx);
 

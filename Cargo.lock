@@ -116,6 +116,7 @@ dependencies = [
  "agent-sandbox-core",
  "clap",
  "nix",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

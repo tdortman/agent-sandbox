@@ -15,6 +15,7 @@ mod network_snapshot;
 pub(crate) mod persist;
 mod proxy;
 mod resource;
+mod sandbox_state;
 mod scope_apply;
 mod scope_filesystem;
 mod scope_http;
@@ -92,6 +93,7 @@ impl PolicyStore {
         Self {
             args,
             sandbox_sessions: Arc::new(RwLock::new(HashMap::new())),
+            sandbox_state: std::sync::Mutex::new(None),
             inner: tokio::sync::Mutex::new(types::PolicyDecisionState::default()),
             network_observation: std::sync::Mutex::new(None),
             network_revocation: std::sync::Mutex::new(None),

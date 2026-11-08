@@ -14,6 +14,7 @@ use agent_sandbox_core::{
     ResolvedRequestContext, ResourceAccess, ResourceKind, SocketIdentity, VerdictSource,
     network_snapshot::ObservedNetworkSources,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
     net::unix::OwnedWriteHalf,
     sync::{Mutex, oneshot},
@@ -56,7 +57,7 @@ pub struct TrustedPeer {
 }
 
 /// Registration of a sandbox session against the policy store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxSessionRegistration {
     /// Root pid of the sandbox session.
     pub root_pid: u32,
@@ -611,6 +612,7 @@ pub struct PolicyStore {
     pub(crate) ui_spawn_lock: Mutex<()>,
 
     pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
+    pub(super) sandbox_state: std::sync::Mutex<Option<super::sandbox_state::SandboxStateFile>>,
     pub(crate) cgroup_freeze: super::freeze::CgroupFreezeManager,
 }
 

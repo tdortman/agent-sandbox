@@ -107,6 +107,7 @@ impl PolicyStore {
             .sandbox_sessions
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut persist = false;
 
         if let Some(reg) = sessions.get_mut(sandbox_session_id) {
             // Only the launcher's descendants may adopt a registered session.
@@ -119,6 +120,7 @@ impl PolicyStore {
                 && (reg.project_root.as_os_str().is_empty()
                     || is_path_descendant(&project_root, &reg.project_root));
             if adopt_root || update_project {
+                persist = reg.launcher_pid > 0;
                 self.revoke_network_grants()?;
                 reg.root_pid = root_pid;
                 if adopt_root {
@@ -141,6 +143,9 @@ impl PolicyStore {
             });
         }
         drop(sessions);
+        if persist {
+            self.persist_sandbox_state();
+        }
         Ok(())
     }
 
@@ -230,6 +235,7 @@ impl PolicyStore {
         }
 
         drop(sessions);
+        self.persist_sandbox_state();
         Ok(())
     }
 
