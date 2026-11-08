@@ -538,14 +538,11 @@ async fn serve_request(
     };
 
     if matches!(path, "/expect" | "/request-trailers") {
-        let early_body = if path == "/expect" {
-            matches!(
+        let early_body = path == "/expect"
+            && matches!(
                 tokio::time::timeout(Duration::from_millis(250), stream.recv_data()).await,
                 Ok(Ok(Some(_)))
-            )
-        } else {
-            false
-        };
+            );
 
         if path == "/expect" {
             stream
