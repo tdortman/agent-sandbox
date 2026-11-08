@@ -3,7 +3,7 @@
 use std::{
     io::BufRead,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -56,6 +56,20 @@ fn wait_fsmon_ready(stdout: std::process::ChildStdout) -> Result<(), String> {
             return Ok(());
         }
     }
+}
+
+/// Wait for `child` on its own thread so an exited monitor never lingers as a
+/// zombie. A monitor that never became ready is killed first.
+fn reap_in_background(mut child: Child, kill: bool) {
+    std::thread::spawn(move || {
+        if kill && let Err(error) = child.kill() {
+            tracing::debug!(%error, "fsmon already exited before kill");
+        }
+
+        if let Err(error) = child.wait() {
+            tracing::warn!(%error, "failed to reap fsmon");
+        }
+    });
 }
 
 fn expand_static_allow_rules(
@@ -170,6 +184,7 @@ impl PolicyStore {
 
         let Some(stdout) = child.stdout.take() else {
             tracing::error!("fsmon stdout not captured");
+            reap_in_background(child, true);
             return FilesystemMonitorReply::failed("stdout not captured");
         };
 
@@ -184,17 +199,25 @@ impl PolicyStore {
         match result {
             Ok(Ok(Ok(()))) => {
                 tracing::info!(peer_pid, "fsmon ready");
+                reap_in_background(child, false);
                 FilesystemMonitorReply::active()
             }
 
-            Ok(Ok(Err(err))) => FilesystemMonitorReply::failed(format!("ready wait failed: {err}")),
+            Ok(Ok(Err(err))) => {
+                reap_in_background(child, true);
+                FilesystemMonitorReply::failed(format!("ready wait failed: {err}"))
+            }
 
             Ok(Err(err)) => {
                 tracing::error!(error = %err, "fsmon ready wait panicked");
+                reap_in_background(child, true);
                 FilesystemMonitorReply::failed("internal error waiting for fsmon")
             }
 
-            Err(_) => FilesystemMonitorReply::failed("fsmon ready timeout"),
+            Err(_) => {
+                reap_in_background(child, true);
+                FilesystemMonitorReply::failed("fsmon ready timeout")
+            }
         }
     }
 

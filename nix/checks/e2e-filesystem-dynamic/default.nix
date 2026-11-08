@@ -335,5 +335,64 @@ pkgs.testers.runNixOSTest (_: {
     flushed = sum(counter("marks_flushed", line) for line in counters.splitlines())
     assert added > 0, f"no ignore marks were installed: {counters}"
     assert flushed == added, f"flush did not release every mark: {counters}"
+
+    # Sandbox lifetime: nothing in a sandbox's scope outlives its launcher or
+    # its agent, and its fsmon exits with it. A setsid grandchild leaves the
+    # agent's process group but stays in the scope.
+    lifetime_dir = "/var/lib/agent-sandbox-test/dynamic-mutations"
+
+    def fsmon_pids():
+        return set(dynamic.succeed("pgrep -f '^/nix/store/[^ ]*/bin/agent-sandbox-fsmon' || true").split())
+
+    def start_lifetime_sandbox(tag, duration, script):
+        before = fsmon_pids()
+        launch = command("runuser", "-u", "sandbox", "--", *session_wrapper, "sandbox-dynamic-bash", "-c", script)
+        dynamic.succeed(command(
+            "systemd-run", "--unit=lifetime-" + tag, "--service-type=exec",
+            "--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin",
+            "sh", "-c", "exec " + launch + " </dev/null >/dev/null 2>/tmp/lifetime-" + tag + "-errors",
+        ))
+        match = "'^sleep " + str(duration) + "$'"
+        try:
+            dynamic.wait_until_succeeds("pgrep -u sandbox -f " + match, timeout=60)
+        except Exception:
+            print(dynamic.succeed("cat /tmp/lifetime-" + tag + "-errors"))
+            raise
+        grandchild = dynamic.succeed("pgrep -u sandbox -f " + match).split()[0]
+        cgroup = dynamic.succeed("sed -n 's/^0:://p' /proc/" + grandchild + "/cgroup").strip()
+        scope = re.fullmatch(r".*/agent-sandbox-(\d+)_\d+\.scope", cgroup)
+        assert scope, f"sandbox is not in its own scope: {cgroup}"
+        started = fsmon_pids() - before
+        assert len(started) == 1, f"expected one new fsmon, got {started}"
+        return {
+            "grandchild": grandchild,
+            "cgroup": cgroup,
+            "launcher": scope.group(1),
+            "fsmon": started.pop(),
+        }
+
+    def assert_sandbox_gone(sandbox):
+        # Reaping fsmon is policyd's job, so a zombie fsmon fails this too.
+        dynamic.wait_until_fails("test -e /proc/" + sandbox["grandchild"], timeout=5)
+        dynamic.wait_until_fails("test -e /proc/" + sandbox["fsmon"], timeout=5)
+        dynamic.wait_until_fails("test -e /sys/fs/cgroup" + sandbox["cgroup"], timeout=10)
+
+    # The launcher is killed: the broker dies with bwrap and the agent would
+    # keep a seccomp filter without a listener.
+    killed = start_lifetime_sandbox("kill", 7001, "setsid sleep 7001 & exec sleep 7000")
+    dynamic.succeed("kill -KILL " + killed["launcher"])
+    assert_sandbox_gone(killed)
+    dynamic.fail("pgrep -u sandbox -f '^sleep 700[01]$'")
+
+    # The agent exits normally while a detached grandchild still runs.
+    go_file = lifetime_dir + "/lifetime-go"
+    dynamic.succeed("rm -f " + go_file)
+    exited = start_lifetime_sandbox(
+        "exit", 7002,
+        "setsid sleep 7002 & while [ ! -e " + go_file + " ]; do sleep 0.2; done",
+    )
+    dynamic.succeed("touch " + go_file)
+    assert_sandbox_gone(exited)
+    dynamic.succeed("rm -f " + go_file)
   '';
 })
