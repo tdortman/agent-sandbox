@@ -7,8 +7,13 @@ pub(crate) mod peer;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{path::Path, sync::Arc};
+use std::{
+    os::fd::{AsRawFd, OwnedFd},
+    path::Path,
+    sync::Arc,
+};
 
+use nix::sys::socket::{SockType, UnixAddr, getsockname, getsockopt, sockopt};
 use tokio::net::UnixListener;
 
 use crate::store::PolicyStore;
@@ -19,6 +24,7 @@ use crate::store::PolicyStore;
 /// connections until the returned future completes.
 pub struct PolicyServer {
     store: Arc<PolicyStore>,
+    inherited_sandbox_listener: Option<OwnedFd>,
 }
 
 impl PolicyServer {
@@ -26,7 +32,43 @@ impl PolicyServer {
     ///
     /// The caller is responsible for invoking [`PolicyServer::run`].
     pub const fn new(store: Arc<PolicyStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            inherited_sandbox_listener: None,
+        }
+    }
+
+    /// Serve the sandbox socket on a listener inherited from the service
+    /// manager instead of binding it.
+    ///
+    /// The socket inode then outlives this process, so sandboxes holding a
+    /// bind mount of it keep a live path across a policyd restart. A
+    /// descriptor that is not a listening Unix stream socket bound to the
+    /// configured sandbox socket path is ignored and the path is bound
+    /// normally.
+    #[must_use]
+    pub fn with_inherited_sandbox_listener(mut self, fd: OwnedFd) -> Self {
+        self.inherited_sandbox_listener = Some(fd);
+        self
+    }
+
+    fn adopt_inherited_listener(fd: OwnedFd, expected_path: &Path) -> Option<UnixListener> {
+        let bound = getsockname::<UnixAddr>(fd.as_raw_fd()).ok()?;
+        let is_expected_path = bound.path() == Some(expected_path);
+        let is_listening_stream = getsockopt(&fd, sockopt::AcceptConn).ok()?
+            && getsockopt(&fd, sockopt::SockType).ok()? == SockType::Stream;
+
+        if !is_expected_path || !is_listening_stream {
+            tracing::warn!(
+                socket = %expected_path.display(),
+                "ignoring inherited socket that is not the listening sandbox socket"
+            );
+            return None;
+        }
+
+        let listener = std::os::unix::net::UnixListener::from(fd);
+        listener.set_nonblocking(true).ok()?;
+        UnixListener::from_std(listener).ok()
     }
 
     fn bind_socket(path: &Path, mode: u32, group: Option<u32>) -> std::io::Result<UnixListener> {
@@ -93,7 +135,7 @@ impl PolicyServer {
     /// Returns an error if the host and sandbox socket paths are identical, if
     /// socket binding fails (permissions, path length, or filesystem
     /// issues), or if Unix-domain socket setup fails.
-    pub async fn run(self) -> std::io::Result<()> {
+    pub async fn run(mut self) -> std::io::Result<()> {
         let host_socket_path = self.store.args().host_socket.clone();
         let sandbox_socket_path = self.store.args().sandbox_socket.clone();
 
@@ -130,7 +172,14 @@ impl PolicyServer {
         // mode; RPC auth limits it to request ops.
         let host_listener = Self::bind_socket(&host_socket_path, 0o666, None)?;
 
-        let sandbox_listener = Self::bind_socket(&sandbox_socket_path, 0o666, None)?;
+        let sandbox_listener = match self
+            .inherited_sandbox_listener
+            .take()
+            .and_then(|fd| Self::adopt_inherited_listener(fd, &sandbox_socket_path))
+        {
+            Some(listener) => listener,
+            None => Self::bind_socket(&sandbox_socket_path, 0o666, None)?,
+        };
 
         if let Some(proxy_path) = proxy_path {
             let proxy_listener = Self::bind_socket(&proxy_path, 0o660, proxy_gid)?;
@@ -904,6 +953,78 @@ mod tests {
                 .expect("request task");
             assert!(check.verdict.allowed, "covered request denied: {check:?}");
         }
+
+        server_task.abort();
+    }
+
+    async fn sandbox_register_ui_error(socket: &std::path::Path) -> String {
+        let reply = send_and_recv(socket, RpcRequest::RegisterUi {
+            ui_client: Some("standalone".into()),
+            ctx: RequestContext::default(),
+        })
+        .await
+        .expect("sandbox RegisterUi");
+
+        let RpcReply::Error(error) = reply else {
+            panic!("expected error reply, got {reply:?}");
+        };
+        error.error
+    }
+
+    #[tokio::test]
+    async fn inherited_sandbox_listener_serves_connections_queued_before_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let inherited =
+            std::os::unix::net::UnixListener::bind(&args.sandbox_socket).expect("bind inherited");
+        let inode = std::fs::metadata(&args.sandbox_socket).expect("metadata");
+
+        // The kernel queues this connection until the server accepts it.
+        let queued = tokio::spawn({
+            let socket = args.sandbox_socket.clone();
+            async move { sandbox_register_ui_error(&socket).await }
+        });
+
+        let store = Arc::new(PolicyStore::new(args.clone()));
+        let server = PolicyServer::new(store).with_inherited_sandbox_listener(inherited.into());
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        assert_eq!(
+            queued.await.expect("queued request"),
+            "request not allowed on sandbox policy socket"
+        );
+
+        let served = std::fs::metadata(&args.sandbox_socket).expect("metadata");
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&served),
+            std::os::unix::fs::MetadataExt::ino(&inode),
+            "the inherited socket inode must not be replaced"
+        );
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn inherited_listener_for_another_path_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let unrelated = std::os::unix::net::UnixListener::bind(dir.path().join("other.sock"))
+            .expect("bind unrelated");
+
+        let store = Arc::new(PolicyStore::new(args.clone()));
+        let server = PolicyServer::new(store).with_inherited_sandbox_listener(unrelated.into());
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            sandbox_register_ui_error(&args.sandbox_socket).await,
+            "request not allowed on sandbox policy socket"
+        );
 
         server_task.abort();
     }

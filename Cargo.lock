@@ -114,6 +114,7 @@ name = "agent-sandbox-policyd"
 version = "0.65.3"
 dependencies = [
  "agent-sandbox-core",
+ "agent-sandbox-sysutil",
  "clap",
  "nix",
  "serde",

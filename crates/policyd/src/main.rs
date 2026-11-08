@@ -1,6 +1,6 @@
 //! Agent sandbox policy daemon entry point.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{os::fd::OwnedFd, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_sandbox_core::SandboxPaths;
 use agent_sandbox_policyd::{
@@ -177,8 +177,19 @@ fn parse_package_declarative(value: &str) -> Result<PackageDeclarative, String> 
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<(), PolicydError> {
+fn main() -> Result<(), PolicydError> {
+    // Consumed before the runtime starts: removing the activation variables
+    // mutates the process environment, which is only sound while
+    // single-threaded.
+    let inherited_sandbox_listener = agent_sandbox_sysutil::take_systemd_listen_fd("sandbox")?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(inherited_sandbox_listener))
+}
+
+async fn run(inherited_sandbox_listener: Option<OwnedFd>) -> Result<(), PolicydError> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -227,7 +238,10 @@ async fn main() -> Result<(), PolicydError> {
     store.enable_cgroup_freezer();
     let store = Arc::new(store);
     store.export_policy_files(SandboxPaths::default())?;
-    let server = PolicyServer::new(store.clone());
+    let mut server = PolicyServer::new(store.clone());
+    if let Some(fd) = inherited_sandbox_listener {
+        server = server.with_inherited_sandbox_listener(fd);
+    }
     server.run().await?;
     Ok(())
 }

@@ -735,103 +735,127 @@ in
 
         networking.dhcpcd.denyInterfaces = lib.optional cfg.enable runtime.network.vethHost;
 
-        systemd.services.agent-sandbox-policy = {
-          description = "Policy daemon for agent-sandbox";
-          before = lib.optionals cfg.enable [ "agent-sandbox-nfq.service" ];
+        systemd = {
+          services.agent-sandbox-policy = {
+            description = "Policy daemon for agent-sandbox";
+            before = lib.optionals cfg.enable [ "agent-sandbox-nfq.service" ];
 
-          after =
-            lib.optionals cfg.enable [
+            after =
+              lib.optionals cfg.enable [
+                "agent-sandbox-dns.service"
+                "agent-sandbox-netns.service"
+              ]
+              ++ [
+                "agent-sandbox-policy.socket"
+                "network.target"
+              ];
+
+            requires = [
+              "agent-sandbox-policy.socket"
+            ]
+            ++ lib.optionals cfg.enable [
               "agent-sandbox-dns.service"
               "agent-sandbox-netns.service"
-            ]
-            ++ [ "network.target" ];
+            ];
 
-          requires = lib.optionals cfg.enable [
-            "agent-sandbox-dns.service"
-            "agent-sandbox-netns.service"
-          ];
+            wantedBy = [ "multi-user.target" ];
 
-          wantedBy = [ "multi-user.target" ];
+            serviceConfig = {
+              Type = "simple";
 
-          serviceConfig = {
-            Type = "simple";
-
-            ExecStart = lib.escapeShellArgs (
-              [
-                (
-                  if runtime.httpProxy.enable then
-                    "${proxyPolicyLauncher}/bin/agent-sandbox-policy-launch"
-                  else
-                    "${sandboxPkg}/bin/agent-sandbox-policyd"
-                )
-                "--socket"
-                runtime.policySocket
-                "--sandbox-socket"
-                runtime.sandboxPolicySocket
-                "--declarative"
-                "/etc/agent-sandbox/policy.json"
-                "--export-json"
-                runtime.exportedJson
-                "--approval-timeout"
-                (toString runtime.approvalTimeout)
-              ]
-              ++ lib.concatMap (value: [
-                "--package-declarative"
-                "${packageEffectiveName value}=/etc/agent-sandbox/packages/${packageEffectiveName value}.json"
-              ]) (lib.filter packageHasPolicy rootCfg.packages)
-              ++ lib.optionals (!runtime.interactiveApproval) [
-                "--no-interactive-approval"
-              ]
-              ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
-                "--ui-spawn-cmd"
-                "${sandboxPkg}/bin/agent-sandbox-ui"
-              ]
-              ++ lib.optionals runtime.httpProxy.enable [
-                "--proxy-socket"
-                runtime.httpProxy.socketPath
-              ]
-              ++ lib.optionals (runtime.exportedNix != "") [
-                "--export-nix"
-                runtime.exportedNix
-              ]
-              ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
-                "--fs-monitor-cmd"
-                "${sandboxPkg}/bin/agent-sandbox-fsmon"
-              ]
-              ++
-                lib.optionals
+              ExecStart = lib.escapeShellArgs (
+                [
                   (
-                    (config.agent-sandbox.gates.syscalls.enable && config.agent-sandbox.network.enable)
-                    || config.agent-sandbox.gates.resources.enable
-                    || config.agent-sandbox.gates.filesystem.enable
+                    if runtime.httpProxy.enable then
+                      "${proxyPolicyLauncher}/bin/agent-sandbox-policy-launch"
+                    else
+                      "${sandboxPkg}/bin/agent-sandbox-policyd"
                   )
-                  [
-                    "--syscall-broker-cmd"
-                    "${sandboxPkg}/bin/agent-sandbox-syscall-broker"
-                  ]
-            );
+                  "--socket"
+                  runtime.policySocket
+                  "--sandbox-socket"
+                  runtime.sandboxPolicySocket
+                  "--declarative"
+                  "/etc/agent-sandbox/policy.json"
+                  "--export-json"
+                  runtime.exportedJson
+                  "--approval-timeout"
+                  (toString runtime.approvalTimeout)
+                ]
+                ++ lib.concatMap (value: [
+                  "--package-declarative"
+                  "${packageEffectiveName value}=/etc/agent-sandbox/packages/${packageEffectiveName value}.json"
+                ]) (lib.filter packageHasPolicy rootCfg.packages)
+                ++ lib.optionals (!runtime.interactiveApproval) [
+                  "--no-interactive-approval"
+                ]
+                ++ lib.optionals (runtime.autoSpawnPolicyUi && runtime.uiBackend != "none") [
+                  "--ui-spawn-cmd"
+                  "${sandboxPkg}/bin/agent-sandbox-ui"
+                ]
+                ++ lib.optionals runtime.httpProxy.enable [
+                  "--proxy-socket"
+                  runtime.httpProxy.socketPath
+                ]
+                ++ lib.optionals (runtime.exportedNix != "") [
+                  "--export-nix"
+                  runtime.exportedNix
+                ]
+                ++ lib.optionals config.agent-sandbox.gates.filesystem.enable [
+                  "--fs-monitor-cmd"
+                  "${sandboxPkg}/bin/agent-sandbox-fsmon"
+                ]
+                ++
+                  lib.optionals
+                    (
+                      (config.agent-sandbox.gates.syscalls.enable && config.agent-sandbox.network.enable)
+                      || config.agent-sandbox.gates.resources.enable
+                      || config.agent-sandbox.gates.filesystem.enable
+                    )
+                    [
+                      "--syscall-broker-cmd"
+                      "${sandboxPkg}/bin/agent-sandbox-syscall-broker"
+                    ]
+              );
 
-            ExecStopPost = "+${sandboxPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
-            Restart = "on-failure";
-            RuntimeDirectory = "agent-sandbox";
-            RuntimeDirectoryPreserve = "yes";
-            StateDirectory = "agent-sandbox";
+              ExecStopPost = "+${sandboxPkg}/bin/agent-sandbox-policyd --cleanup-cgroup-freeze";
+              # Per-sandbox fsmon children outlive a policyd restart; they exit when their sandbox ends.
+              KillMode = "process";
+              Restart = "on-failure";
+              RuntimeDirectory = "agent-sandbox";
+              RuntimeDirectoryPreserve = "yes";
+              StateDirectory = "agent-sandbox";
+            };
+
+            environment = {
+              AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
+              AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
+              AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
+              AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
+              AGENT_SANDBOX_UI_BACKEND = runtime.uiBackend;
+            }
+            // lib.optionalAttrs (runtime.httpProxy.enable && runtime.httpProxy.gid != null) {
+              AGENT_SANDBOX_PROXY_GID_OVERRIDE = toString runtime.httpProxy.gid;
+            }
+            // lib.optionalAttrs (runtime.uiBackend == "zenity") {
+              AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
+            };
+
           };
 
-          environment = {
-            AGENT_SANDBOX_DNS_CACHE = "/run/agent-sandbox/dns-cache.json";
-            AGENT_SANDBOX_LOGINCTL = "${pkgs.systemd}/bin/loginctl";
-            AGENT_SANDBOX_NOTIFY_SEND = "${pkgs.libnotify}/bin/notify-send";
-            AGENT_SANDBOX_RUNUSER = "${pkgs.util-linux}/bin/runuser";
-            AGENT_SANDBOX_UI_BACKEND = runtime.uiBackend;
-          }
-          // lib.optionalAttrs (runtime.httpProxy.enable && runtime.httpProxy.gid != null) {
-            AGENT_SANDBOX_PROXY_GID_OVERRIDE = toString runtime.httpProxy.gid;
-          }
-          // lib.optionalAttrs (runtime.uiBackend == "zenity") {
-            AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
-          };
+          # systemd owns the sandbox socket so its inode survives policyd restarts and
+          # connections queue meanwhile; sandboxes bind-mount this single inode.
+          sockets.agent-sandbox-policy = {
+            description = "Sandbox-facing policy socket for agent-sandbox";
 
+            socketConfig = {
+              FileDescriptorName = "sandbox";
+              ListenStream = runtime.sandboxPolicySocket;
+              SocketMode = "0666";
+            };
+
+            wantedBy = [ "sockets.target" ];
+          };
         };
       }
 

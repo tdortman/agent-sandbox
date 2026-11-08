@@ -1039,6 +1039,74 @@ pub fn set_raw_fd_nonblocking(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// First descriptor systemd passes to a socket-activated service.
+const SD_LISTEN_FDS_START: i32 = 3;
+
+/// Descriptor number of the activation socket called `name`, given the
+/// `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` values and our own pid.
+fn listen_fd_number(
+    listen_pid: &str,
+    listen_fds: &str,
+    listen_fdnames: &str,
+    own_pid: u32,
+    name: &str,
+) -> Option<i32> {
+    if listen_pid.parse::<u32>().ok()? != own_pid {
+        return None;
+    }
+
+    let count = listen_fds.parse::<i32>().ok()?;
+    let index = i32::try_from(listen_fdnames.split(':').position(|n| n == name)?).ok()?;
+
+    (index < count).then_some(SD_LISTEN_FDS_START + index)
+}
+
+/// Take ownership of the socket-activation descriptor named `name`.
+///
+/// Follows the `sd_listen_fds` protocol: the descriptor is only ours when
+/// `LISTEN_PID` is this process. The `LISTEN_*` variables are removed whenever
+/// they address this process, so spawned children never see them. The
+/// returned descriptor is close-on-exec.
+///
+/// Call before any other thread exists: this mutates the process environment.
+///
+/// # Errors
+/// Returns the kernel error if the descriptor cannot be made close-on-exec.
+pub fn take_systemd_listen_fd(name: &str) -> io::Result<Option<OwnedFd>> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+    let var = |key: &str| std::env::var(key).unwrap_or_default();
+    let listen_pid = var("LISTEN_PID");
+
+    if listen_pid.parse::<u32>().ok() != Some(std::process::id()) {
+        return Ok(None);
+    }
+
+    let number = listen_fd_number(
+        &listen_pid,
+        &var("LISTEN_FDS"),
+        &var("LISTEN_FDNAMES"),
+        std::process::id(),
+        name,
+    );
+
+    for key in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"] {
+        // SAFETY: documented single-threaded constraint.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    let Some(number) = number else {
+        return Ok(None);
+    };
+
+    // SAFETY: systemd handed this descriptor to this process by number; nothing
+    // else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(number) };
+    fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+
+    Ok(Some(fd))
+}
+
 /// Read the network namespace cookie of a socket (`SO_NETNS_COOKIE`).
 ///
 /// The cookie is stable for the lifetime of the namespace, so a daemon that
@@ -1089,6 +1157,21 @@ pub fn install_shutdown_signals(handler: extern "C" fn(libc::c_int)) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_fd_number_selects_named_descriptor_for_this_pid() {
+        assert_eq!(
+            listen_fd_number("7", "2", "web:sandbox", 7, "sandbox"),
+            Some(4)
+        );
+        assert_eq!(listen_fd_number("7", "1", "sandbox", 7, "sandbox"), Some(3));
+        assert_eq!(listen_fd_number("8", "1", "sandbox", 7, "sandbox"), None);
+        assert_eq!(listen_fd_number("7", "1", "other", 7, "sandbox"), None);
+        assert_eq!(
+            listen_fd_number("7", "1", "web:sandbox", 7, "sandbox"),
+            None
+        );
+    }
 
     #[test]
     fn read_proc_mem_reads_requested_bytes_from_a_file() {
