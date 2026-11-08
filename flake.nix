@@ -30,23 +30,31 @@
           treefmt = inputs.treefmt-nix.lib.evalModule channels.nixpkgs {
             imports = [ inputs.pedantix.treefmtModules.default ];
 
-            programs.pedantix = {
-              enable = true;
+            programs = {
+              pedantix = {
+                enable = true;
 
-              settings = {
-                attrs = {
-                  blank-lines = 1;
-                  blank-lines-mode = "multiline";
-                  flatten = true;
-                  merge = true;
-                  name-style = "identifier";
+                settings = {
+                  attrs = {
+                    blank-lines = 1;
+                    blank-lines-mode = "multiline";
+                    flatten = true;
+                    merge = true;
+                    name-style = "identifier";
+                  };
+
+                  formatter = "nixfmt";
+                  inherit-placement = "front";
+                  inherits.name-style = "identifier";
+                  lets.name-style = "identifier";
+                  lists.sort = false;
                 };
+              };
 
-                formatter = "nixfmt";
-                inherit-placement = "front";
-                inherits.name-style = "identifier";
-                lets.name-style = "identifier";
-                lists.sort = false;
+              # rustfmt.toml uses unstable options, so format with the nightly toolchain the build uses.
+              rustfmt = {
+                enable = true;
+                package = (import ./nix/lib/rust-toolchain.nix { pkgs = channels.nixpkgs; }).toolchain;
               };
             };
 

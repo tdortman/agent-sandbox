@@ -434,8 +434,8 @@ fn build_upstream_client(
     let connector = HttpConnector::new(connector, Executor::default());
     let connector = HttpPooledConnectorConfig {
         // The pool is shared by every intercepted flow, and long responses
-        // (event streams, downloads) hold connections for minutes. Rama's default
-        // of 50 would queue unrelated requests behind them.
+        // (event streams, downloads) hold connections for minutes. Rama's
+        // default of 50 would queue unrelated requests behind them.
         max_total: UPSTREAM_POOL_CONNECTIONS,
         idle_timeout: Some(UPSTREAM_IDLE_TIMEOUT),
         ..HttpPooledConnectorConfig::default()
