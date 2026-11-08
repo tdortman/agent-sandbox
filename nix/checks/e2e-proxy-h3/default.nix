@@ -122,5 +122,33 @@ pkgs.testers.runNixOSTest (_: {
     # The denied HTTP/3 request must complete as a clean 403 response.
     # A stream reset after the deny body would make curl exit non-zero.
     proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -eq 0; grep -F -q 'blocked by agent-sandbox policy' /tmp/h3-denied.log; test \"$before\" = \"$after\"")
+
+    # WebTransport runs through the same transparent HTTP/3 proxy: session,
+    # bidirectional and unidirectional streams, and HTTP Datagrams. The
+    # ordinary request first gives the session a CONNECT stream ID above 0 so
+    # the Quarter Stream ID encoding is exercised.
+    wt_client = "${e2e.sandboxPkg}/bin/wt-client"
+    wt_args = "--ca-file /run/agent-sandbox/proxy-ca-bundle.pem"
+
+    print(
+        sandbox_shell(
+            proxy,
+            "sandbox-proxy-bash",
+            wt_client + " https://h3-allowed.test:443/webtransport " + wt_args + " --warmup-path /allowed",
+            wrapper=session_wrapper,
+        )
+    )
+    for line in [
+        "request CONNECT /webtransport",
+        "webtransport-session",
+        "webtransport-bidi bidi-ping",
+        "webtransport-uni uni-ping",
+        "webtransport-datagram datagram-ping",
+    ]:
+        proxy.succeed(command("grep", "-F", "-x", line, "/var/log/h3-origin.log"))
+
+    # A denied WebTransport session fails at session establishment and never
+    # reaches the origin.
+    proxy.succeed("before=$(grep -F -c 'request CONNECT /webtransport-denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c '" + wt_client + " https://h3-denied.test:443/webtransport-denied " + wt_args + "' >/tmp/wt-denied.log 2>&1; status=$?; set -e; cat /tmp/wt-denied.log; after=$(grep -F -c 'request CONNECT /webtransport-denied' /var/log/h3-origin.log || true); test $status -ne 0; grep -F -q 'session establishment' /tmp/wt-denied.log; test \"$before\" = \"$after\"")
   '';
 })

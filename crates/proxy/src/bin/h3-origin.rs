@@ -24,7 +24,6 @@ use std::{
 use agent_sandbox_proxy::http3::CapsuleDecoder;
 use bytes::{Buf, Bytes};
 use clap::Parser;
-use h3::quic::{SendStream as _, SendStreamUnframed as _};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use rustls::pki_types::pem::PemObject;
 use tokio::io::unix::AsyncFd;
@@ -355,11 +354,68 @@ async fn serve_websocket(
     Ok(())
 }
 
+/// Read one WebTransport receive stream to its end.
+async fn read_to_end<R>(stream: &mut R) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: h3::quic::RecvStream<Buf = Bytes>,
+{
+    let mut received = Vec::new();
+
+    while let Some(mut chunk) = std::future::poll_fn(|context| stream.poll_data(context)).await? {
+        received.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+
+    Ok(received)
+}
+
+/// Write `payload` to a WebTransport send stream and finish it.
+async fn write_and_finish<S>(
+    stream: &mut S,
+    payload: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: h3::quic::SendStream<Bytes> + h3::quic::SendStreamUnframed<Bytes>,
+{
+    let mut payload = Bytes::from(payload);
+
+    while payload.has_remaining() {
+        std::future::poll_fn(|context| stream.poll_send(context, &mut payload)).await?;
+    }
+
+    std::future::poll_fn(|context| stream.poll_finish(context)).await?;
+    Ok(())
+}
+
+type OriginWebTransportSession =
+    h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>;
+
+/// Echo one client unidirectional stream back on a server-initiated
+/// unidirectional stream of the same session.
+async fn echo_webtransport_uni(
+    session: &OriginWebTransportSession,
+    session_id: h3::webtransport::SessionId,
+    mut incoming: h3_webtransport::stream::RecvStream<h3_quinn::RecvStream, Bytes>,
+    log: &Arc<std::sync::Mutex<std::fs::File>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let received = read_to_end(&mut incoming).await?;
+
+    log_line(
+        log,
+        &format!("webtransport-uni {}", String::from_utf8_lossy(&received)),
+    );
+
+    let mut echo = b"uni-echo:".to_vec();
+    echo.extend_from_slice(&received);
+    let mut outgoing = session.open_uni(session_id).await?;
+    write_and_finish(&mut outgoing, echo).await
+}
+
 async fn serve_webtransport(
     request: http::Request<()>,
     stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     h3: h3::server::Connection<h3_quinn::Connection, Bytes>,
     drop_session: bool,
+    log: &Arc<std::sync::Mutex<std::fs::File>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let response = http::Response::builder()
         .status(200)
@@ -375,44 +431,71 @@ async fn serve_webtransport(
         return Ok(());
     }
 
+    log_line(log, "webtransport-session");
     let mut datagram_reader = session.datagram_reader();
     let mut datagram_sender = session.datagram_sender();
+    let datagram_log = log.clone();
 
     let datagram_task = tokio::spawn(async move {
         while let Ok(datagram) = datagram_reader.read_datagram().await {
-            if datagram_sender
-                .send_datagram(datagram.into_payload())
-                .is_err()
-            {
+            let payload = datagram.into_payload();
+
+            log_line(
+                &datagram_log,
+                &format!(
+                    "webtransport-datagram {}",
+                    String::from_utf8_lossy(&payload)
+                ),
+            );
+
+            if datagram_sender.send_datagram(payload).is_err() {
                 break;
             }
         }
     });
 
+    // Accepting both stream kinds from one task keeps every wake-up with
+    // the task that polls the shared connection.
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-        while let Some(resolver) = session.accept_bi().await? {
-            match resolver.resolve().await? {
-                h3_webtransport::server::AcceptedBi::BidiStream(session_id, mut stream) => {
-                    if session_id != session.session_id() {
-                        return Err("invalid WebTransport session identifier".into());
-                    }
+        loop {
+            tokio::select! {
+                bidi = session.accept_bi() => {
+                    let Some(resolver) = bidi? else {
+                        return Ok(());
+                    };
 
-                    let mut response = Bytes::from_static(b"webtransport-response\n");
-                    while response.has_remaining() {
-                        std::future::poll_fn(|context| stream.poll_send(context, &mut response))
-                            .await?;
-                    }
+                    match resolver.resolve().await? {
+                        h3_webtransport::server::AcceptedBi::BidiStream(session_id, mut stream) => {
+                            if session_id != session.session_id() {
+                                return Err("invalid WebTransport session identifier".into());
+                            }
 
-                    std::future::poll_fn(|context| stream.poll_finish(context)).await?;
+                            let received = read_to_end(&mut stream).await?;
+
+                            log_line(
+                                log,
+                                &format!("webtransport-bidi {}", String::from_utf8_lossy(&received)),
+                            );
+
+                            let mut response = b"webtransport-response\n".to_vec();
+                            response.extend_from_slice(&received);
+                            write_and_finish(&mut stream, response).await?;
+                        }
+                        h3_webtransport::server::AcceptedBi::Request(_, mut stream) => {
+                            stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+                            stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                        }
+                    }
                 }
-                h3_webtransport::server::AcceptedBi::Request(_, mut stream) => {
-                    stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
-                    stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                uni = session.accept_uni() => {
+                    let Some((session_id, incoming)) = uni? else {
+                        return Ok(());
+                    };
+
+                    echo_webtransport_uni(&session, session_id, incoming, log).await?;
                 }
             }
         }
-
-        Ok(())
     }
     .await;
 
@@ -477,7 +560,7 @@ async fn serve_connection(
             }
 
             if protocol == h3::ext::Protocol::WEB_TRANSPORT {
-                return serve_webtransport(request, stream, h3, false).await;
+                return serve_webtransport(request, stream, h3, false, &log).await;
             }
         }
 

@@ -634,6 +634,10 @@ rec {
                   url = "https://h3-allowed-v6.test:443/allowed";
                 }
                 {
+                  methods = [ "CONNECT" ];
+                  url = "https://h3-allowed.test:443/webtransport";
+                }
+                {
                   allMethods = true;
                   url = "http://169.254.100.1:8008/doh-ech";
                 }
@@ -659,6 +663,10 @@ rec {
                 {
                   allMethods = true;
                   url = "https://h3-denied.test:443/denied";
+                }
+                {
+                  allMethods = true;
+                  url = "https://h3-denied.test:443/webtransport-denied";
                 }
               ];
 
