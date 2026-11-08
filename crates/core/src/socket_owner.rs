@@ -339,8 +339,9 @@ fn process_socket_descriptor(
         return Some(TaskSocketDescriptor { task: process, fd });
     }
 
-    // ponytail: scan thread tables on a leader miss; the BPF iterator avoids
-    // this repeated procfs work when available.
+    // Threads almost always share the leader's descriptor table, so rescanning
+    // them repeats the leader's miss; only tables kcmp cannot prove shared are
+    // scanned. The BPF iterator avoids this procfs work when available.
     fs::read_dir(process.join("task"))
         .ok()?
         .flatten()
@@ -348,7 +349,10 @@ fn process_socket_descriptor(
             task.file_name()
                 .to_str()
                 .and_then(|name| name.parse::<u32>().ok())
-                != Some(pid)
+                .is_some_and(|tid| {
+                    tid != pid
+                        && !agent_sandbox_sysutil::shares_file_table(pid, tid).unwrap_or(false)
+                })
         })
         .find_map(|task| {
             let path = task.path();
@@ -588,6 +592,36 @@ mod tests {
         assert!(validate_socket_identity_with_hint(identity, hint));
         drop(duplicate);
         assert!(!validate_socket_identity_with_hint(identity, hint));
+    }
+
+    #[test]
+    fn resolves_socket_held_only_by_a_thread_with_a_private_fd_table() {
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let holder = std::thread::spawn(move || {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_FILES)
+                .expect("thread gets a private descriptor table");
+            let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("bind socket in the private table");
+            address_tx
+                .send(socket.local_addr().expect("socket address"))
+                .expect("send socket address");
+            done_rx.recv().expect("wait for the owner lookup");
+        });
+
+        let address = address_rx.recv().expect("receive socket address");
+        let resolution = resolve_owner_snapshot(
+            SocketProtocol::Udp,
+            SocketTuple::from_local(address.ip(), address.port()),
+        );
+        done_tx.send(()).expect("release holder thread");
+        holder.join().expect("holder thread joins");
+
+        let OwnerResolution::Unique(snapshot) = resolution else {
+            panic!("a socket only a private-table thread holds must resolve, got {resolution:?}");
+        };
+        assert_eq!(snapshot.pid_value(), std::process::id());
     }
 
     #[test]

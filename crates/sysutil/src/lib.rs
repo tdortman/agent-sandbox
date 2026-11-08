@@ -139,6 +139,35 @@ fn pidfd_open_with_flags(pid: u32, flags: u32) -> io::Result<OwnedFd> {
     fd_from_syscall(raw)
 }
 
+/// Whether tasks `first` and `second` share one file descriptor table
+/// (`kcmp(2)` with `KCMP_FILES`).
+///
+/// # Errors
+/// Returns the kernel error: `EPERM` without ptrace read access to both
+/// tasks, `ESRCH` when one is gone, `ENOSYS` without `CONFIG_KCMP`.
+pub fn shares_file_table(first: u32, second: u32) -> io::Result<bool> {
+    const KCMP_FILES: libc::c_int = 2;
+
+    // SAFETY: `kcmp(pid_t, pid_t, int type, unsigned long, unsigned long)`
+    // only compares kernel objects; KCMP_FILES ignores both trailing args.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            first.cast_signed(),
+            second.cast_signed(),
+            KCMP_FILES,
+            0_u64,
+            0_u64,
+        )
+    };
+
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result == 0)
+    }
+}
+
 /// Duplicate a foreign fd into this process via `pidfd_getfd(2)` (Linux 5.6+).
 ///
 /// `pidfd` refers to the target task; `fd` is a descriptor in its file table.
