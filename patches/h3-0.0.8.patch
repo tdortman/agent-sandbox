@@ -1,3 +1,5 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c6767a4..d638b3b 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,57 +1,130 @@
@@ -154,6 +156,8 @@
 -h3-datagram = {path = "../h3-datagram" }
 +]
 +default-features = false
+diff --git a/src/client/builder.rs b/src/client/builder.rs
+index 5ae628d..77e7dad 100644
 --- a/src/client/builder.rs
 +++ b/src/client/builder.rs
 @@ -1,12 +1,6 @@
@@ -170,7 +174,7 @@
  use crate::{
      config::Config,
      connection::ConnectionInner,
-@@ -14,8 +8,11 @@
+@@ -14,8 +8,11 @@ use crate::{
      quic::{self},
      shared_state::SharedState,
  };
@@ -184,7 +188,7 @@
  
  /// Start building a new HTTP/3 client
  pub fn builder() -> Builder {
-@@ -90,8 +87,9 @@
+@@ -90,8 +87,9 @@ impl Builder {
  
      /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
      /// to prevent potential interoperability issues in the future.
@@ -196,7 +200,7 @@
      pub fn send_grease(&mut self, enabled: bool) -> &mut Self {
          self.config.send_grease = enabled;
          self
-@@ -105,7 +103,14 @@
+@@ -105,7 +103,14 @@ impl Builder {
          self
      }
  
@@ -212,7 +216,7 @@
      pub fn enable_extended_connect(&mut self, value: bool) -> &mut Self {
          self.config.settings.enable_extended_connect = value;
          self
-@@ -141,6 +146,7 @@
+@@ -141,6 +146,7 @@ impl Builder {
                  inner,
                  sent_closing: None,
                  recv_closing: None,
@@ -220,6 +224,8 @@
              },
              send_request,
          ))
+diff --git a/src/client/connection.rs b/src/client/connection.rs
+index 82b800e..07ddf34 100644
 --- a/src/client/connection.rs
 +++ b/src/client/connection.rs
 @@ -1,23 +1,11 @@
@@ -249,7 +255,7 @@
      },
      frame::FrameStream,
      proto::{frame::Frame, headers::Header, push::PushId},
-@@ -26,22 +14,31 @@
+@@ -26,22 +14,31 @@ use crate::{
      shared_state::{ConnectionState, SharedState},
      stream::{self, BufRecvStream},
  };
@@ -291,7 +297,7 @@
  ///
  /// # Examples
  ///
-@@ -269,14 +266,15 @@
+@@ -269,14 +266,15 @@ where
  
  /// Client connection driver
  ///
@@ -299,15 +305,14 @@
 -/// It needs to be polled continuously via [`poll_close()`]. On connection closure, this
 -/// will resolve to `Ok(())` if the peer sent `HTTP_NO_ERROR`, or `Err()` if a connection-level
 -/// error occurred.
--///
--/// [`shutdown()`] initiates a graceful shutdown of this connection. After calling it, no request
--/// initiation will be further allowed. Then [`poll_close()`] will resolve when all ongoing requests
--/// and push streams complete. Finally, a connection closure with `HTTP_NO_ERROR` code will be
 +/// Maintains the internal state of an HTTP/3 connection, including control and
 +/// QPACK. It needs to be polled continuously via [`poll_close()`]. On
 +/// connection closure, this will resolve to `Ok(())` if the peer sent
 +/// `HTTP_NO_ERROR`, or `Err()` if a connection-level error occurred.
-+///
+ ///
+-/// [`shutdown()`] initiates a graceful shutdown of this connection. After calling it, no request
+-/// initiation will be further allowed. Then [`poll_close()`] will resolve when all ongoing requests
+-/// and push streams complete. Finally, a connection closure with `HTTP_NO_ERROR` code will be
 +/// [`shutdown()`] initiates a graceful shutdown of this connection. After
 +/// calling it, no request initiation will be further allowed. Then
 +/// [`poll_close()`] will resolve when all ongoing requests and push streams
@@ -315,7 +320,7 @@
  /// sent to the server.
  ///
  /// # Examples
-@@ -356,12 +354,17 @@
+@@ -356,12 +354,17 @@ where
      C: quic::Connection<B>,
      B: Buf,
  {
@@ -335,7 +340,7 @@
  }
  
  impl<C, B> ConnectionState for Connection<C, B>
-@@ -379,13 +382,25 @@
+@@ -379,13 +382,25 @@ where
      C: quic::Connection<B>,
      B: Buf,
  {
@@ -362,7 +367,7 @@
      /// Wait until the connection is closed
      #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
      pub async fn wait_idle(&mut self) -> ConnectionError {
-@@ -471,7 +486,7 @@
+@@ -471,7 +486,7 @@ where
          //# receipt of a server-initiated bidirectional stream as a connection
          //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
          //# been negotiated.
@@ -371,6 +376,8 @@
              return Poll::Ready(
                  self.inner
                      .handle_connection_error(InternalConnectionError::new(
+diff --git a/src/client/stream.rs b/src/client/stream.rs
+index b1a9641..1e0a9a2 100644
 --- a/src/client/stream.rs
 +++ b/src/client/stream.rs
 @@ -1,10 +1,3 @@
@@ -384,7 +391,7 @@
  use crate::{
      connection::{self},
      error::{
-@@ -17,27 +10,41 @@
+@@ -17,27 +10,41 @@ use crate::{
      quic::{self},
      shared_state::{ConnectionState, SharedState},
  };
@@ -406,52 +413,48 @@
 -/// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can be awaited by calling
 -/// [`RequestStream::recv_response()`]. A body for this request can be sent with [`RequestStream::send_data()`], then the request
 -/// shall be completed by either sending trailers with  [`RequestStream::finish()`].
--///
--/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`] until it returns
--/// `None`. Then the trailers will eventually be available via [`RequestStream::recv_trailers()`].
--///
--/// TODO: If data is polled before the response has been received, an error will be thrown.
--///
--/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error will be
--/// thrown
--///
--/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`], which will
--/// put an end to any transfer concerning it.
 +/// Once a request has been sent via
 +/// [`crate::client::SendRequest::send_request()`], a response can be awaited by
 +/// calling [`RequestStream::recv_response()`]. A body for this request can be
 +/// sent with [`RequestStream::send_data()`], then the request
 +/// shall be completed by either sending trailers with
 +/// [`RequestStream::finish()`].
-+///
+ ///
+-/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`] until it returns
+-/// `None`. Then the trailers will eventually be available via [`RequestStream::recv_trailers()`].
 +/// After receiving the response's headers, it's body can be read by
 +/// [`RequestStream::recv_data()`] until it returns `None`. Then the trailers
 +/// will eventually be available via [`RequestStream::recv_trailers()`].
-+///
+ ///
+-/// TODO: If data is polled before the response has been received, an error will be thrown.
 +/// TODO: If data is polled before the response has been received, an error will
 +/// be thrown.
-+///
+ ///
+-/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error will be
+-/// thrown
 +/// TODO: If trailers are polled but the body hasn't been fully received, an
 +/// UNEXPECT_FRAME error will be thrown
-+///
+ ///
+-/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`], which will
+-/// put an end to any transfer concerning it.
 +/// Whenever the client wants to cancel this request, it can call
 +/// [`RequestStream::stop_sending()`], which will put an end to any transfer
 +/// concerning it.
  ///
  /// # Examples
  ///
-@@ -90,13 +97,57 @@
+@@ -90,13 +97,57 @@ impl<S, B> RequestStream<S, B>
  where
      S: quic::RecvStream,
  {
 -    /// Receive the HTTP/3 response
 +    /// Receive the final HTTP/3 response.
-+    ///
+     ///
+-    /// This should be called before trying to receive any data with [`recv_data()`].
 +    /// Informational responses are consumed and discarded. Use
 +    /// [`RequestStream::recv_response_with_informational`] when those
 +    /// responses must be retained.
-     ///
--    /// This should be called before trying to receive any data with [`recv_data()`].
++    ///
 +    /// This should be called before trying to receive any data with
 +    /// [`recv_data()`].
      ///
@@ -500,7 +503,7 @@
          let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
              .await
              .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
-@@ -120,10 +171,10 @@
+@@ -120,10 +171,10 @@ where
          //= type=TODO
          //# If a client
          //# receives a push ID that has already been promised and detects a
@@ -513,7 +516,7 @@
              match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
                  //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                  //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-@@ -186,7 +237,8 @@
+@@ -192,7 +243,8 @@ where
  
      /// Receive some of the response body.
      ///
@@ -523,7 +526,7 @@
      // TODO what if called before recv_response ?
      #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
      pub async fn recv_data(&mut self) -> Result<Option<impl Buf>, StreamError> {
-@@ -195,7 +247,8 @@
+@@ -201,7 +253,8 @@ where
  
      /// Receive some of the response body.
      ///
@@ -533,6 +536,8 @@
      pub fn poll_recv_data(
          &mut self,
          cx: &mut Context<'_>,
+diff --git a/src/config.rs b/src/config.rs
+index c2a6fe6..38f8fac 100644
 --- a/src/config.rs
 +++ b/src/config.rs
 @@ -1,6 +1,5 @@
@@ -543,7 +548,7 @@
  
  /// Configures the HTTP/3 connection
  #[derive(Debug, Clone, Copy)]
-@@ -8,8 +7,9 @@
+@@ -8,8 +7,9 @@ use crate::proto::{frame, varint::VarInt};
  pub struct Config {
      /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
      /// to prevent potential interoperability issues in the future.
@@ -555,7 +560,7 @@
      pub(crate) send_grease: bool,
  
      #[cfg(test)]
-@@ -22,11 +22,14 @@
+@@ -22,11 +22,14 @@ pub struct Config {
  /// HTTP/3 Settings
  #[derive(Debug, Clone, Copy)]
  pub struct Settings {
@@ -573,7 +578,7 @@
      pub(crate) max_field_section_size: u64,
  
      /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
-@@ -35,10 +38,13 @@
+@@ -35,10 +38,13 @@ pub struct Settings {
      /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
      /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
      /// That parameter is only defined for HTTP/2.
@@ -588,7 +593,7 @@
      /// The maximum number of concurrent streams that can be opened by the peer.
      pub(crate) max_webtransport_sessions: u64,
  }
-@@ -46,6 +52,8 @@
+@@ -46,6 +52,8 @@ pub struct Settings {
  impl From<&frame::Settings> for Settings {
      fn from(settings: &frame::Settings) -> Self {
          let defaults: Self = Default::default();
@@ -597,7 +602,7 @@
          Self {
              max_field_section_size: settings
                  .get(frame::SettingId::MAX_HEADER_LIST_SIZE)
-@@ -57,10 +65,8 @@
+@@ -57,10 +65,8 @@ impl From<&frame::Settings> for Settings {
              max_webtransport_sessions: settings
                  .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
                  .unwrap_or(defaults.max_webtransport_sessions),
@@ -610,7 +615,7 @@
              enable_extended_connect: settings
                  .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                  .map(|value| value != 0)
-@@ -71,6 +77,7 @@
+@@ -71,6 +77,7 @@ impl From<&frame::Settings> for Settings {
  
  impl TryFrom<Config> for frame::Settings {
      type Error = frame::SettingsError;
@@ -618,7 +623,7 @@
      fn try_from(value: Config) -> Result<Self, Self::Error> {
          let mut settings = frame::Settings::default();
  
-@@ -84,6 +91,7 @@
+@@ -84,6 +91,7 @@ impl TryFrom<Config> for frame::Settings {
                      enable_webtransport,
                      enable_extended_connect,
                      enable_datagram,
@@ -626,7 +631,7 @@
                      max_webtransport_sessions,
                  },
          } = value;
-@@ -141,6 +149,7 @@
+@@ -141,6 +149,7 @@ impl Default for Settings {
              enable_webtransport: false,
              enable_extended_connect: false,
              enable_datagram: false,
@@ -634,7 +639,7 @@
              max_webtransport_sessions: 0,
          }
      }
-@@ -161,10 +170,16 @@
+@@ -161,10 +170,16 @@ impl Settings {
      /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
      /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
      /// That parameter is only defined for HTTP/2.
@@ -652,6 +657,8 @@
  }
  
  impl Default for Config {
+diff --git a/src/connection.rs b/src/connection.rs
+index 44302f1..7122577 100644
 --- a/src/connection.rs
 +++ b/src/connection.rs
 @@ -1,18 +1,3 @@
@@ -673,7 +680,7 @@
  use crate::{
      config::Config,
      error::{
-@@ -35,6 +20,18 @@
+@@ -35,6 +20,18 @@ use crate::{
      stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
      webtransport::SessionId,
  };
@@ -692,7 +699,7 @@
  
  #[allow(missing_docs)]
  pub struct AcceptedStreams<C, B>
-@@ -76,30 +73,36 @@
+@@ -76,30 +73,36 @@ where
      B: Buf,
  {
      pub shared: Arc<SharedState>,
@@ -744,7 +751,7 @@
      accepted_streams: AcceptedStreams<C, B>,
      pending_recv_streams: Vec<Option<AcceptRecvStream<C::RecvStream, B>>>,
      got_peer_settings: bool,
-@@ -154,7 +157,8 @@
+@@ -154,7 +157,8 @@ where
  
          let settings = frame::Settings::try_from(self.config).map_err(|_err| {
              // TODO: converting a config to settings should never fail
@@ -754,7 +761,7 @@
              self.handle_connection_error(InternalConnectionError::new(
                  Code::H3_INTERNAL_ERROR,
                  "error when creating settings frame".to_string(),
-@@ -323,7 +327,8 @@
+@@ -323,7 +327,8 @@ where
          Ok(conn_inner)
      }
  
@@ -764,7 +771,7 @@
      #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
      pub async fn shutdown<T>(
          &mut self,
-@@ -393,7 +398,8 @@
+@@ -393,7 +398,8 @@ where
  
      /// Polls incoming streams
      ///
@@ -774,7 +781,7 @@
      #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
      pub fn poll_accept_recv(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
          let _ = self.poll_connection_error(cx)?;
-@@ -581,10 +587,18 @@
+@@ -585,10 +591,18 @@ where
              }
              Ok(Some(Frame::Settings(settings))) => {
                  if !self.got_peer_settings {
@@ -795,7 +802,7 @@
  
                      Frame::Settings(settings)
                  } else {
-@@ -623,7 +637,8 @@
+@@ -627,7 +641,8 @@ where
              }
              Ok(Some(frame)) => {
                  // All other frames are not allowed on the control stream
@@ -805,6 +812,8 @@
                  //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
                  //= type=implication
                  //# DATA frames MUST be associated with an HTTP request or response.
+diff --git a/src/webtransport/session_id.rs b/src/webtransport/session_id.rs
+index b6f4424..074458a 100644
 --- a/src/webtransport/session_id.rs
 +++ b/src/webtransport/session_id.rs
 @@ -1,10 +1,9 @@
@@ -819,7 +828,7 @@
  
  /// Identifies a WebTransport session
  ///
-@@ -23,6 +22,7 @@
+@@ -23,6 +22,7 @@ impl SessionId {
  
  impl TryFrom<u64> for SessionId {
      type Error = InvalidStreamId;
@@ -827,7 +836,7 @@
      fn try_from(v: u64) -> Result<Self, Self::Error> {
          if v > VarInt::MAX.0 {
              return Err(InvalidStreamId(v));
-@@ -45,6 +45,18 @@
+@@ -45,6 +45,18 @@ impl Decode for SessionId {
  
  impl From<StreamId> for SessionId {
      fn from(value: StreamId) -> Self {

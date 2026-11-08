@@ -11,8 +11,8 @@ let
   # scripts/materialize-vendor.sh for the h3 crates.
   h3Source = pkgs.fetchgit {
     url = "https://github.com/hyperium/h3.git";
-    rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3";
-    hash = "sha256-9s9/OxQm3TTWpcNYK+BUKahro9acdbAqYRBZdnEp1O4=";
+    rev = "43745ad87e95b0c035ac9c547aad467303213425";
+    hash = "sha256-Dmz2HcEkIdypr3HVG4SlSwTu+e00psQVB9SUoCsXZ7Q=";
   };
   # Pristine archives of the crates patched by scripts/materialize-vendor.sh.
   # The lockfile records them as path dependencies, so cargoLock never fetches
@@ -82,7 +82,7 @@ rust.rustPlatform.buildRustPackage {
     lockFile = "${src}/Cargo.lock";
 
     outputHashes = {
-      "h3-quinn-0.0.10" = "sha256-9s9/OxQm3TTWpcNYK+BUKahro9acdbAqYRBZdnEp1O4=";
+      "h3-quinn-0.0.10" = "sha256-Dmz2HcEkIdypr3HVG4SlSwTu+e00psQVB9SUoCsXZ7Q=";
       "seccompiler-0.5.0" = "sha256-k1TNr0GA8GeJYo1RvB/cfuvVg+tN4G7yypkVkhSq+h8=";
     };
   };

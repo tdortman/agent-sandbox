@@ -390,8 +390,8 @@ async fn serve_webtransport(
     });
 
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-        while let Some(accepted) = session.accept_bi().await? {
-            match accepted {
+        while let Some(resolver) = session.accept_bi().await? {
+            match resolver.resolve().await? {
                 h3_webtransport::server::AcceptedBi::BidiStream(session_id, mut stream) => {
                     if session_id != session.session_id() {
                         return Err("invalid WebTransport session identifier".into());

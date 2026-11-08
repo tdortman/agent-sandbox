@@ -1,3 +1,5 @@
+diff --git a/src/server.rs b/src/server.rs
+index a2d711f..b7971c1 100644
 --- a/src/server.rs
 +++ b/src/server.rs
 @@ -1,11 +1,6 @@
@@ -13,13 +15,13 @@
  use bytes::Buf;
  use futures_util::{future::poll_fn, ready, Future};
  use h3::{
-@@ -16,24 +11,23 @@
+@@ -16,24 +11,23 @@ use h3::{
      ext::Protocol,
      frame::FrameStream,
      proto::frame::Frame,
 -    quic::{self, OpenStreams, WriteBuf},
 +    quic::{self, OpenStreams, SendStreamUnframed, StreamId, WriteBuf},
-     server::{Connection, RequestStream},
+     server::{Connection, RequestResolver, RequestStream},
 -    ConnectionState, SharedState,
 -};
 -use h3::{
@@ -47,7 +49,7 @@
  
  /// WebTransport session driver.
  ///
-@@ -50,11 +44,12 @@
+@@ -50,11 +44,12 @@ where
      session_id: SessionId,
      /// The underlying HTTP/3 connection
      server_conn: Mutex<Connection<C, B>>,
@@ -63,7 +65,7 @@
      shared: Arc<SharedState>,
  }
  
-@@ -77,11 +72,23 @@
+@@ -77,11 +72,23 @@ where
  {
      /// Accepts a *CONNECT* request for establishing a WebTransport session.
      ///
@@ -71,7 +73,7 @@
 +    /// TODO: is the API or the user responsible for validating the CONNECT
 +    /// request?
      pub async fn accept(
-         request: Request<()>,
++        request: Request<()>,
 +        stream: RequestStream<C::BidiStream, B>,
 +        conn: Connection<C, B>,
 +    ) -> Result<Self, StreamError> {
@@ -81,14 +83,14 @@
 +
 +    /// Accepts a *CONNECT* request with a caller-provided response.
 +    pub async fn accept_with_response(
-+        request: Request<()>,
+         request: Request<()>,
          mut stream: RequestStream<C::BidiStream, B>,
          mut conn: Connection<C, B>,
 +        response: Response<()>,
      ) -> Result<Self, StreamError> {
          let shared = conn.inner.shared.clone();
  
-@@ -109,8 +116,9 @@
+@@ -109,8 +116,9 @@ where
  
          // The peer is responsible for validating our side of the webtransport support.
          //
@@ -100,7 +102,7 @@
          if !conn.inner.config.settings.enable_webtransport() {
              tracing::warn!("Server does not support webtransport");
          }
-@@ -123,38 +131,35 @@
+@@ -123,38 +131,35 @@ where
              tracing::warn!("Server does not support CONNECT");
          }
  
@@ -152,7 +154,7 @@
      /// Receive a datagram from the client
      pub fn datagram_reader(&self) -> DatagramReader<C::RecvDatagramHandler> {
          self.server_conn.lock().unwrap().get_datagram_reader()
-@@ -167,10 +172,52 @@
+@@ -167,10 +172,52 @@ where
          self.server_conn
              .lock()
              .unwrap()
@@ -207,7 +209,7 @@
      pub fn accept_uni(&self) -> AcceptUni<'_, C, B> {
          AcceptUni {
              conn: &self.server_conn,
-@@ -409,6 +456,34 @@
+@@ -419,6 +466,34 @@ where
      }
  }
  
@@ -242,6 +244,8 @@
  fn validate_wt_connect(request: &Request<()>) -> bool {
      let protocol = request.extensions().get::<Protocol>();
      matches!((request.method(), protocol), (&Method::CONNECT, Some(p)) if p == &Protocol::WEB_TRANSPORT)
+diff --git a/src/stream.rs b/src/stream.rs
+index b3b3d29..1ca6a82 100644
 --- a/src/stream.rs
 +++ b/src/stream.rs
 @@ -1,13 +1,42 @@
@@ -289,7 +293,7 @@
  pin_project! {
      /// WebTransport receive stream
      pub struct RecvStream<S,B> {
-@@ -296,9 +325,8 @@
+@@ -296,9 +325,8 @@ where
      S: quic::BidiStream<B>,
      B: Buf,
  {

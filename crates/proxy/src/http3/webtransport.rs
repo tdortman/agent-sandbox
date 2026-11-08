@@ -38,6 +38,12 @@ use crate::{
     semantic::SemanticRequest,
 };
 
+/// A downstream bidirectional stream classified by its first frame.
+type AcceptedBiResult = Result<
+    h3_webtransport::server::AcceptedBi<h3_quinn::Connection, Bytes>,
+    h3::error::StreamError,
+>;
+
 /// One failed WebTransport route with its human-readable reason.
 struct RouteFailure {
     session_id: h3::webtransport::SessionId,
@@ -577,6 +583,8 @@ struct WebTransportAssociation {
     route_error_tx: mpsc::UnboundedSender<RouteFailure>,
     incoming_rx: mpsc::Receiver<IncomingStreamDelivery>,
     incoming_tx: mpsc::Sender<IncomingStreamDelivery>,
+    accepted_bi_rx: mpsc::UnboundedReceiver<AcceptedBiResult>,
+    accepted_bi_tx: mpsc::UnboundedSender<AcceptedBiResult>,
     routes: HashMap<h3::webtransport::SessionId, WebTransportRoute>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     datagram_tasks: Vec<tokio::task::JoinHandle<Result<(), BoxError>>>,
@@ -610,6 +618,7 @@ impl WebTransportAssociation {
 
         let (route_error_tx, route_error_rx) = mpsc::unbounded_channel();
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
+        let (accepted_bi_tx, accepted_bi_rx) = mpsc::unbounded_channel();
         let session_id = session.session_id();
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mut first_route = first_route;
@@ -640,6 +649,8 @@ impl WebTransportAssociation {
             route_error_tx,
             incoming_rx,
             incoming_tx,
+            accepted_bi_rx,
+            accepted_bi_tx,
             routes: HashMap::new(),
             tasks,
             datagram_tasks: Vec::new(),
@@ -698,13 +709,24 @@ impl WebTransportAssociation {
                         ))),
                     };
 
-                    let Some(accepted) = accepted else {
+                    let Some(resolver) = accepted else {
                         break Ok(());
                     };
-                    if let Err(error) = Box::pin(self.handle_bi(accepted)).await {
-                        warn!(%error, "WebTransport bidirectional stream rejected");
-                    }
+                    // A stream's first frame may never arrive; classify it
+                    // without stalling the association loop.
+                    let accepted_bi_tx = self.accepted_bi_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = accepted_bi_tx.send(resolver.resolve().await);
+                    });
                 }
+                Some(resolved) = self.accepted_bi_rx.recv() => match resolved {
+                    Ok(accepted) => {
+                        if let Err(error) = Box::pin(self.handle_bi(accepted)).await {
+                            warn!(%error, "WebTransport bidirectional stream rejected");
+                        }
+                    }
+                    Err(error) => warn!(%error, "WebTransport bidirectional stream resolution failed"),
+                },
                 Some(failure) = self.route_error_rx.recv() => {
                     self.fail_route(failure.session_id, failure.message).await;
                 }
@@ -893,7 +915,7 @@ impl WebTransportAssociation {
         }
 
         if is_webtransport_request(&request) {
-            return self.handle_webtransport_request(request, stream).await;
+            return Box::pin(self.handle_webtransport_request(request, stream)).await;
         }
 
         let downstream_stream_id = stream.id();

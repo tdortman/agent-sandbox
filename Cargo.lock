@@ -1263,7 +1263,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/hyperium/h3.git?rev=c38a1af632afbbbc8f6716c196ad67f40bc122e3#c38a1af632afbbbc8f6716c196ad67f40bc122e3"
+source = "git+https://github.com/hyperium/h3.git?rev=43745ad87e95b0c035ac9c547aad467303213425#43745ad87e95b0c035ac9c547aad467303213425"
 dependencies = [
  "bytes",
  "futures-util",

@@ -29,12 +29,13 @@ Client response handling:
 
 No other changes.
 
-## h3-datagram 0.0.2 (generated)
+## h3-datagram 0.0.2 (unpatched copy)
 
-Generated from `patches/h3-datagram-0.0.2.patch` by
-`scripts/materialize-vendor.sh`, applied to the `hyperium/h3` checkout at
-the revision pinned in `Cargo.toml`. The patch only removes a commented-out
-dependency line.
+Copied unchanged from the `hyperium/h3` checkout at the revision pinned in
+`Cargo.toml`. It is vendored only because the vendored `h3-webtransport`
+depends on `../h3-datagram`, and every h3 crate must resolve to one copy.
+The pinned revision includes upstream commit `ebd4260` (hyperium/h3#340),
+which encodes the Quarter Stream ID of every sent datagram.
 
 ## h3-webtransport 0.1.2 (generated)
 
