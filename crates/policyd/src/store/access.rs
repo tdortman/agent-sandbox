@@ -1764,7 +1764,7 @@ mod tests {
         assert_eq!(
             store
                 .filesystem_allow_source(
-                    Path::new("/run/agent-sandbox/sandbox-policy.sock"),
+                    Path::new("/run/agent-sandbox/shared/sandbox-policy.sock"),
                     FileAccess::ReadWrite,
                     &ctx,
                 )

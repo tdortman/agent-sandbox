@@ -45,11 +45,7 @@ let
     assert expectFailure socketPathMessage {
       agent-sandbox = {
         gates.filesystem.enable = true;
-
-        policy = {
-          sandboxSocketPath = "/run/agent-sandbox/shared.sock";
-          socketPath = "/run/agent-sandbox/shared.sock";
-        };
+        policy.socketPath = "/run/agent-sandbox/shared/policy.sock";
       };
     };
 
@@ -571,7 +567,7 @@ let
             }
             {
               access = "read";
-              path = "/run/agent-sandbox/session-context.json";
+              path = "/run/agent-sandbox/shared/session-context.json";
             }
             {
               access = "read";
@@ -657,7 +653,7 @@ let
   proxyNetworkMessage = "agent-sandbox.network.httpProxy.enable requires network.enable";
   proxyRulesMessage = "agent-sandbox.network.httpProxy.declarativeAllow/declarativeDeny require httpProxy.enable (configured URLs: https://api.example.com/v1)";
   resourceGateMessage = "agent-sandbox.gates.resources.enable requires gates.filesystem.enable";
-  socketPathMessage = "agent-sandbox.policy.socketPath and sandboxSocketPath must differ when policy is enabled";
+  socketPathMessage = "agent-sandbox.policy.socketPath must not be inside /run/agent-sandbox/shared";
   upstreamCidrMessage = "agent-sandbox.network.httpProxy.upstreamAllowCidrs entries must be non-empty CIDR strings";
   validSystem = mkNixosSystem {
     agent-sandbox = {

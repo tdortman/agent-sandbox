@@ -25,6 +25,7 @@ use crate::store::PolicyStore;
 pub struct PolicyServer {
     store: Arc<PolicyStore>,
     inherited_sandbox_listener: Option<OwnedFd>,
+    inherited_proxy_listener: Option<OwnedFd>,
 }
 
 impl PolicyServer {
@@ -35,20 +36,29 @@ impl PolicyServer {
         Self {
             store,
             inherited_sandbox_listener: None,
+            inherited_proxy_listener: None,
         }
     }
 
     /// Serve the sandbox socket on a listener inherited from the service
     /// manager instead of binding it.
     ///
-    /// The socket inode then outlives this process, so sandboxes holding a
-    /// bind mount of it keep a live path across a policyd restart. A
-    /// descriptor that is not a listening Unix stream socket bound to the
-    /// configured sandbox socket path is ignored and the path is bound
-    /// normally.
+    /// The socket then outlives this process, so sandboxes connecting during
+    /// a policyd restart queue instead of failing. A descriptor that is not a
+    /// listening Unix stream socket bound to the configured sandbox socket
+    /// path is ignored and the path is bound normally.
     #[must_use]
     pub fn with_inherited_sandbox_listener(mut self, fd: OwnedFd) -> Self {
         self.inherited_sandbox_listener = Some(fd);
+        self
+    }
+
+    /// Serve the proxy socket on a listener inherited from the service
+    /// manager, so the proxy's requests queue across a policyd restart. The
+    /// same validation as the sandbox listener applies.
+    #[must_use]
+    pub fn with_inherited_proxy_listener(mut self, fd: OwnedFd) -> Self {
+        self.inherited_proxy_listener = Some(fd);
         self
     }
 
@@ -61,7 +71,7 @@ impl PolicyServer {
         if !is_expected_path || !is_listening_stream {
             tracing::warn!(
                 socket = %expected_path.display(),
-                "ignoring inherited socket that is not the listening sandbox socket"
+                "ignoring inherited socket that is not the expected listening socket"
             );
             return None;
         }
@@ -182,7 +192,14 @@ impl PolicyServer {
         };
 
         if let Some(proxy_path) = proxy_path {
-            let proxy_listener = Self::bind_socket(&proxy_path, 0o660, proxy_gid)?;
+            let proxy_listener = match self
+                .inherited_proxy_listener
+                .take()
+                .and_then(|fd| Self::adopt_inherited_listener(fd, &proxy_path))
+            {
+                Some(listener) => listener,
+                None => Self::bind_socket(&proxy_path, 0o660, proxy_gid)?,
+            };
 
             tokio::join!(
                 Self::accept_loop(
@@ -276,6 +293,7 @@ mod tests {
         //    path.
         let reply = send_and_recv(&args.host_socket, RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
+            resume_session: None,
             ctx: RequestContext::default(),
         })
         .await
@@ -293,6 +311,7 @@ mod tests {
         //    `sandbox_socket_blocks_self_approval_escape` for the full chain.
         let reply = send_and_recv(&args.sandbox_socket, RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
+            resume_session: None,
             ctx: RequestContext::default(),
         })
         .await
@@ -403,6 +422,7 @@ mod tests {
         let reply = conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext {
                     sandbox_session_id: Some("s1".into()),
                     ..Default::default()
@@ -471,6 +491,7 @@ mod tests {
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
                     home: Some("/home/user".into()),
@@ -587,6 +608,7 @@ mod tests {
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
                     home: Some("/home/user".into()),
@@ -670,6 +692,7 @@ mod tests {
         let reply = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
                     home: Some("/home/user".into()),
@@ -724,8 +747,9 @@ mod tests {
     /// Regression for the self-approval sandbox escape.
     ///
     /// Threat model: a malicious agent inside the jail can reach the
-    /// sandbox-facing policy socket (`/run/agent-sandbox/sandbox-policy.sock`,
-    /// bound into the sandbox by bwrap). The attack is:
+    /// sandbox-facing policy socket
+    /// (`/run/agent-sandbox/shared/sandbox-policy.sock`, bound into the sandbox
+    /// by bwrap). The attack is:
     ///   1. Connect to the sandbox socket.
     ///   2. `RegisterUi` to transition the connection to the `UiFd` role.
     ///   3. Issue an `Elevate` (or `Check`) on another connection.
@@ -762,6 +786,7 @@ mod tests {
         let reply = attacker
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext {
                     cwd: Some("/workspace".into()),
                     home: Some("/home/user".into()),
@@ -858,6 +883,7 @@ mod tests {
         let RpcReply::RegisterUi(registered) = ui_conn
             .request(RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: ui_ctx.clone(),
             })
             .await
@@ -957,9 +983,146 @@ mod tests {
         server_task.abort();
     }
 
+    fn spawn_server(store: &Arc<PolicyStore>) -> tokio::task::JoinHandle<()> {
+        let server = PolicyServer::new(store.clone());
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        })
+    }
+
+    struct RegisteredUi {
+        conn: RpcConnection,
+        session_id: String,
+    }
+
+    async fn register_ui(
+        socket: &std::path::Path,
+        ctx: &RequestContext,
+        resume_session: Option<String>,
+    ) -> RegisteredUi {
+        let mut conn = RpcConnection::connect(socket)
+            .await
+            .expect("connect host socket");
+        let RpcReply::RegisterUi(registered) = conn
+            .request(RpcRequest::RegisterUi {
+                ui_client: Some("standalone".into()),
+                resume_session,
+                ctx: ctx.clone(),
+            })
+            .await
+            .expect("RegisterUi")
+        else {
+            panic!("expected UI registration");
+        };
+        assert!(registered.ok);
+        RegisteredUi {
+            conn,
+            session_id: registered.session_id,
+        }
+    }
+
+    /// A policyd restart drops every UI connection. The UI reconnects with
+    /// its previous session id and must keep that session's approvals.
+    #[tokio::test]
+    async fn session_approval_survives_policyd_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = test_args(&dir);
+        let handoff = dir.path().join("policyd-handoff.json");
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let path = project.join("notes.txt");
+        std::fs::write(&path, b"").expect("write file");
+
+        let ui_ctx = RequestContext {
+            cwd: Some(project.clone()),
+            home: Some(home.clone()),
+            project_root: Some(project.clone()),
+            sandbox_session_id: Some("s1".into()),
+            ..Default::default()
+        };
+        let ctx = ResolvedRequestContext::new(
+            SandboxPaths::new(&project, &home, &project),
+            ProcessIds::from_options(None, Some(nix::unistd::getuid().as_raw())),
+            Some("s1".into()),
+        );
+
+        let first = Arc::new(PolicyStore::new(args.clone()));
+        let first_server = spawn_server(&first);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let RegisteredUi {
+            conn: mut ui_conn,
+            session_id,
+        } = register_ui(&args.host_socket, &ui_ctx, None).await;
+
+        let request = tokio::spawn({
+            let first = first.clone();
+            let path = path.clone();
+            let ctx = ctx.clone();
+            async move { first.check_filesystem(path, FileAccess::Read, ctx).await }
+        });
+
+        let id = loop {
+            let message = tokio::time::timeout(Duration::from_secs(1), ui_conn.read_message())
+                .await
+                .expect("filesystem push timeout")
+                .expect("read filesystem push");
+
+            if let RpcMessage::UiPush(UiPush::FilesystemRequest { id, .. }) = message {
+                break id;
+            }
+        };
+
+        let reply = send_and_recv(&args.host_socket, RpcRequest::Approve {
+            id,
+            scope: ApprovalScope::Session,
+            session_id: Some(session_id.clone()),
+            target: Some(ApprovalTarget::FilesystemPath { path: path.clone() }),
+            comment: None,
+            ctx: ui_ctx.clone(),
+        })
+        .await
+        .expect("approve prompt");
+        assert!(reply.scope_succeeded(), "approval failed: {reply:?}");
+        assert!(request.await.expect("request task").verdict.allowed);
+
+        // The stopping daemon exits holding the state lock; here the first
+        // daemon is aborted instead.
+        let frozen = first
+            .write_handoff_to(&handoff)
+            .await
+            .expect("write handoff");
+        first_server.abort();
+        let _ = first_server.await;
+        drop(frozen);
+        drop(ui_conn);
+
+        let mut second = PolicyStore::new(args.clone());
+        second.restore_handoff_from(&handoff);
+        assert!(!handoff.exists(), "a handoff must be applied only once");
+        let second = Arc::new(second);
+        let second_server = spawn_server(&second);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resumed = register_ui(&args.host_socket, &ui_ctx, Some(session_id.clone())).await;
+        assert_eq!(resumed.session_id, session_id);
+
+        let check = tokio::time::timeout(
+            Duration::from_secs(1),
+            second.check_filesystem(path, FileAccess::Read, ctx),
+        )
+        .await
+        .expect("a session approval must not prompt again after a restart");
+        assert!(check.verdict.allowed, "session approval lost: {check:?}");
+
+        second_server.abort();
+    }
+
     async fn sandbox_register_ui_error(socket: &std::path::Path) -> String {
         let reply = send_and_recv(socket, RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
+            resume_session: None,
             ctx: RequestContext::default(),
         })
         .await

@@ -245,8 +245,12 @@ impl UiClient {
     }
 
     async fn run(self) -> Result<(), UiCliError> {
+        // Survives reconnects so policyd keeps this UI's session approvals
+        // across its own restart.
+        let mut session_id = None;
+
         loop {
-            match self.session().await {
+            match self.session(&mut session_id).await {
                 Ok(()) => {}
 
                 Err(UiCliError::Register(err)) => {
@@ -263,13 +267,14 @@ impl UiClient {
         }
     }
 
-    async fn session(&self) -> Result<(), UiCliError> {
+    async fn session(&self, previous_session: &mut Option<String>) -> Result<(), UiCliError> {
         let mut conn = RpcConnection::connect(&self.socket).await?;
         let mut ctx = RequestContext::from(&self.paths);
         ctx.sandbox_session_id.clone_from(&self.sandbox_session_id);
 
         conn.write_request(&RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
+            resume_session: previous_session.clone(),
             ctx,
         })
         .await?;
@@ -292,6 +297,7 @@ impl UiClient {
                 RpcMessage::Reply(_) => {}
             }
         };
+        *previous_session = Some(session_id.clone());
 
         for push in queued_pushes {
             self.handle_prompt(&session_id, push).await;

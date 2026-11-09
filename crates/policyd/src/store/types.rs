@@ -97,7 +97,7 @@ pub struct HttpPendingKey {
 }
 
 /// HTTP scope rule and context used for session/project/global state.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpScopeKey {
     /// HTTP rule target for the scope.
     pub target: HttpRuleTarget,
@@ -622,8 +622,10 @@ pub struct ProxySessionState {
     /// Session token authorizing proxy use.
     pub token: ProxySessionToken,
 
-    /// Identifier of the connection mapped to this session.
-    pub connection_id: u64,
+    /// Identifier of the connection mapped to this session; `None` for a
+    /// session handed over from the previous daemon until the proxy resumes
+    /// it.
+    pub connection_id: Option<u64>,
 
     /// When the session was opened.
     pub opened_at: Instant,

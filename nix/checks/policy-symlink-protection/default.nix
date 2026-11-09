@@ -34,7 +34,6 @@ let
     packageName = "hello";
     policyContext = true;
     policySocket = "/tmp/policy-symlink-regression.sock";
-    sandboxPolicySocket = "/tmp/policy-symlink-regression-sandbox.sock";
   };
 in
 pkgs.runCommand "policy-symlink-regression" { } ''

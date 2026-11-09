@@ -50,15 +50,108 @@ pub struct FlowClaim {
 /// Concurrent requests use separate connections, including pending approvals.
 /// Each proxy holds one session; drops remove the readiness marker.
 pub struct PolicySession {
-    /// The session lease: policyd closes the proxy session when this
-    /// connection ends, so RPC failures must never close this lease.
-    _connection: RpcConnection,
+    /// Keeps the session lease: policyd closes the proxy session when the
+    /// lease connection ends, so RPC failures must never close it. When
+    /// policyd restarts the task resumes the session on the new daemon.
+    lease: tokio::task::JoinHandle<()>,
+    lost: Arc<Notify>,
     idle: Mutex<Vec<PersistentRpcClient>>,
 
     socket: PathBuf,
     token: ProxySessionToken,
     timeout: Duration,
     ready_path: Option<PathBuf>,
+}
+
+/// A connection that holds a proxy session, and the session's token.
+struct Lease {
+    connection: RpcConnection,
+    token: ProxySessionToken,
+}
+
+/// Connect to policyd, waiting up to `timeout` for its socket to appear.
+async fn connect(socket: &Path, timeout: Duration) -> Result<RpcConnection, PolicyError> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match RpcConnection::connect(socket).await {
+                Ok(connection) => break Ok(connection),
+                Err(RpcClientError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| PolicyError::Rpc("policy RPC timed out".to_owned()))?
+    .map_err(|error| PolicyError::Rpc(error.to_string()))
+}
+
+/// Open or resume the proxy session on a new lease connection.
+async fn take_lease(
+    socket: &Path,
+    timeout: Duration,
+    request: RpcRequest,
+) -> Result<Lease, PolicyError> {
+    let mut connection = connect(socket, timeout).await?;
+
+    let reply = tokio::time::timeout(timeout, connection.request(request))
+        .await
+        .map_err(|_| PolicyError::Rpc("policy RPC timed out".to_owned()))?
+        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
+
+    let RpcReply::ProxySession(ProxySessionReply {
+        ok: true,
+        proxy_session,
+    }) = reply
+    else {
+        return Err(PolicyError::UnexpectedReply("proxy_session"));
+    };
+
+    Ok(Lease {
+        connection,
+        token: proxy_session,
+    })
+}
+
+/// Hold the lease, resuming the session each time policyd restarts. Signals
+/// `lost` and stops when the new daemon cannot resume the session.
+async fn keep_lease(
+    mut connection: RpcConnection,
+    socket: PathBuf,
+    token: ProxySessionToken,
+    timeout: Duration,
+    lost: Arc<Notify>,
+) {
+    loop {
+        // policyd never writes to the lease, so reads end only when the
+        // connection does.
+        while connection.read_message().await.is_ok() {}
+        tracing::warn!("policy session lease ended; resuming the session");
+
+        let resume = RpcRequest::ResumeProxySession {
+            proxy_session: token.clone(),
+        };
+
+        match take_lease(&socket, timeout, resume).await {
+            Ok(lease) if lease.token == token => connection = lease.connection,
+            Ok(_) => {
+                tracing::error!("policyd resumed a different proxy session");
+                lost.notify_one();
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, "policy session cannot be resumed");
+                lost.notify_one();
+                return;
+            }
+        }
+    }
 }
 
 /// Cancels a pending HTTP approval when dropped before a reply arrives.
@@ -112,50 +205,32 @@ impl PolicySession {
     /// the session.
     pub async fn open(path: impl AsRef<Path>, timeout: Duration) -> Result<Self, PolicyError> {
         let socket = path.as_ref().to_owned();
-
-        let mut connection = tokio::time::timeout(timeout, async {
-            loop {
-                match RpcConnection::connect(&socket).await {
-                    Ok(connection) => break Ok(connection),
-                    Err(RpcClientError::Io(error))
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::NotFound | ErrorKind::ConnectionRefused
-                        ) =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(error) => break Err(error),
-                }
-            }
-        })
-        .await
-        .map_err(|_| PolicyError::Rpc("policy RPC timed out".to_owned()))?
-        .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        let reply = tokio::time::timeout(timeout, connection.request(RpcRequest::OpenProxySession))
-            .await
-            .map_err(|_| PolicyError::Rpc("policy RPC timed out".to_owned()))?
-            .map_err(|error| PolicyError::Rpc(error.to_string()))?;
-
-        let RpcReply::ProxySession(ProxySessionReply {
-            ok: true,
-            proxy_session,
-        }) = reply
-        else {
-            return Err(PolicyError::UnexpectedReply("open_proxy_session"));
-        };
-
-        let ready_path = session_ready_path();
+        let Lease { connection, token } =
+            take_lease(&socket, timeout, RpcRequest::OpenProxySession).await?;
+        let lost = Arc::new(Notify::new());
+        let lease = tokio::spawn(keep_lease(
+            connection,
+            socket.clone(),
+            token.clone(),
+            timeout,
+            lost.clone(),
+        ));
 
         Ok(Self {
-            _connection: connection,
+            lease,
+            lost,
             idle: Mutex::new(Vec::new()),
             socket,
-            token: proxy_session,
+            token,
             timeout,
-            ready_path,
+            ready_path: session_ready_path(),
         })
+    }
+
+    /// Wait until the session is lost: policyd restarted and could not
+    /// resume it, so every claim this proxy holds is gone.
+    pub async fn lost(&self) {
+        self.lost.notified().await;
     }
 
     async fn rpc<T>(
@@ -457,6 +532,7 @@ impl PolicySession {
 
 impl Drop for PolicySession {
     fn drop(&mut self) {
+        self.lease.abort();
         self.clear_session_ready();
     }
 }
@@ -881,7 +957,7 @@ mod tests {
 
     use agent_sandbox_core::{
         AttributionToken, ErrorReply, HttpCheckReply, HttpRequest, ProxyReply, ProxyReplyBody,
-        ProxyRequestId, RpcReply,
+        ProxyRequestId, ProxySessionReply, ProxySessionToken, RpcReply,
     };
     use tokio::sync::{Notify, Semaphore};
 
@@ -890,6 +966,83 @@ mod tests {
         reconcile_authorities,
     };
     use crate::policy::test_support::{FakePolicy, FakePolicyEvent};
+
+    /// One accepted connection to the fake policyd and the request it sent.
+    struct Accepted {
+        stream: tokio::net::UnixStream,
+        request: serde_json::Value,
+    }
+
+    async fn accept_request(listener: &tokio::net::UnixListener) -> Accepted {
+        use tokio::io::AsyncBufReadExt;
+
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("proxy must connect")
+            .expect("accept");
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read request");
+        Accepted {
+            stream: reader.into_inner(),
+            request: serde_json::from_str(&line).expect("request JSON"),
+        }
+    }
+
+    async fn send_reply(stream: &mut tokio::net::UnixStream, reply: &RpcReply) {
+        use tokio::io::AsyncWriteExt;
+
+        let mut line = serde_json::to_vec(reply).expect("encode reply");
+        line.push(b'\n');
+        stream.write_all(&line).await.expect("write reply");
+    }
+
+    /// policyd restarts end the lease connection. The proxy must resume the
+    /// same session on the new daemon, and report the session lost when a
+    /// daemon refuses to resume it.
+    #[tokio::test]
+    async fn lease_resumes_session_after_policyd_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("policy.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake policyd");
+        let token = ProxySessionToken::from_bytes([7; 32]);
+        let granted = RpcReply::ProxySession(ProxySessionReply {
+            ok: true,
+            proxy_session: token.clone(),
+        });
+
+        let open = tokio::spawn(PolicySession::open(socket, Duration::from_secs(5)));
+        let mut first = accept_request(&listener).await;
+        assert_eq!(first.request["op"], "open_proxy_session");
+        send_reply(&mut first.stream, &granted).await;
+        let session = open.await.expect("open task").expect("open session");
+
+        drop(first);
+        let mut second = accept_request(&listener).await;
+        assert_eq!(second.request["op"], "resume_proxy_session");
+        assert_eq!(
+            second.request["proxy_session"],
+            serde_json::to_value(&token).expect("encode token")
+        );
+        send_reply(&mut second.stream, &granted).await;
+
+        tokio::time::timeout(Duration::from_millis(200), session.lost())
+            .await
+            .expect_err("a resumed session is not lost");
+
+        drop(second);
+        let mut third = accept_request(&listener).await;
+        assert_eq!(third.request["op"], "resume_proxy_session");
+        send_reply(
+            &mut third.stream,
+            &RpcReply::Error(ErrorReply::new("proxy session cannot be resumed")),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), session.lost())
+            .await
+            .expect("a refused resume must report the session lost");
+    }
 
     #[test]
     fn accepts_matching_pipelined_http_reply() -> Result<(), Box<dyn std::error::Error>> {

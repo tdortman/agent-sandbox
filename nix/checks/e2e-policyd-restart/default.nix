@@ -10,6 +10,7 @@ let
     dynamicPackages
     dynamicPolicy
     installPolicy
+    loopbackServices
     module
     ;
   e2e = import ../e2e/common.nix {
@@ -36,7 +37,16 @@ pkgs.testers.runNixOSTest (_: {
 
           network = {
             enable = true;
+
+            declarativeAllow = [
+              {
+                host = "169.254.100.1";
+                port = 18095;
+              }
+            ];
+
             dnsForwardTarget = "169.254.100.1:5353";
+            loopback.tcpPorts = [ 18089 ];
           };
 
           packages = dynamicPackages;
@@ -49,9 +59,34 @@ pkgs.testers.runNixOSTest (_: {
 
         boot.kernel.sysctl."kernel.yama.ptrace_scope" = 1;
 
-        # A changed policyd unit, as a system update produces.
-        specialisation.changed-policyd.configuration.systemd.services.agent-sandbox-policy.environment.AGENT_SANDBOX_TEST_GENERATION =
-          "changed";
+        # A system update that changes policyd and every unit beneath the
+        # sandboxes' network.
+        specialisation.changed-policyd.configuration.systemd.services =
+          lib.genAttrs
+            [
+              "agent-sandbox-dns"
+              "agent-sandbox-loopback"
+              "agent-sandbox-netns"
+              "agent-sandbox-policy"
+            ]
+            (_: {
+              environment.AGENT_SANDBOX_TEST_GENERATION = "changed";
+            });
+
+        systemd.services = {
+          inherit (loopbackServices) agent-sandbox-vm-loopback-host;
+
+          # A TCP echo on the host side of the sandbox veth: a connection a
+          # sandbox holds open breaks if a switch rebuilds the namespace.
+          agent-sandbox-vm-echo = {
+            wantedBy = [ "multi-user.target" ];
+
+            serviceConfig = {
+              ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:18095,fork,reuseaddr EXEC:${pkgs.coreutils}/bin/cat";
+              Restart = "on-failure";
+            };
+          };
+        };
       }
     );
 
@@ -64,7 +99,8 @@ pkgs.testers.runNixOSTest (_: {
 
     mutations = "/var/lib/agent-sandbox-test/dynamic-mutations"
     fsmon_pattern = "^/nix/store/[^ ]*/bin/agent-sandbox-fsmon"
-    sandbox_socket = "/run/agent-sandbox/sandbox-policy.sock"
+    shared_dir = "/run/agent-sandbox/shared"
+    sandbox_socket = shared_dir + "/sandbox-policy.sock"
 
     start_all()
     dynamic.wait_for_unit("multi-user.target")
@@ -81,6 +117,10 @@ pkgs.testers.runNixOSTest (_: {
         "rename) mv \"$first\" \"$second\";; "
         "remove) rm \"$first\";; "
         "read) cat \"$first\" >/dev/null;; "
+        "inode) test \"$(stat -c %i \"$first\")\" = \"$second\";; "
+        "connect) exec 4<>\"/dev/tcp/$first/$second\";; "
+        "echo) printf '%s\\n' \"$first\" >&4 && read -r -t 5 reply <&4 && test \"$reply\" = \"$first\";; "
+        "net) (exec 3<>\"/dev/tcp/$first/$second\");; "
         "esac; "
         "status=$?; printf '%s %s\\n' \"$token\" \"$status\"; done"
     )
@@ -127,8 +167,8 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.succeed("systemctl restart agent-sandbox-policy.service")
     dynamic.wait_for_unit("agent-sandbox-policy.service")
 
-    # The socket inode the sandbox bind-mounted is still the live one, and the
-    # sandbox's own monitor is still running.
+    # systemd kept the socket open across the restart, and the sandbox's own
+    # monitor is still running.
     assert dynamic.succeed(command("stat", "-c", "%i", sandbox_socket)).strip() == socket_inode
     dynamic.succeed(command("kill", "-0", fsmon_pid))
     assert dynamic.succeed(command("pgrep", "-f", fsmon_pattern)).split() == [fsmon_pid]
@@ -139,16 +179,65 @@ pkgs.testers.runNixOSTest (_: {
     probe("read", "/var/lib/agent-sandbox-test/dynamic-unlisted", allowed=False)
     dynamic.succeed(command("kill", "-0", fsmon_pid))
 
-    # A system switch that changes the policyd unit keeps the same socket
-    # inode, so the running sandbox still reaches the new policyd.
-    policyd_pid = dynamic.succeed("systemctl show -p MainPID --value agent-sandbox-policy.service").strip()
+    # A system switch that changes the policyd unit restarts it in place and
+    # leaves the socket open, so requests never find it missing. The same
+    # switch changes the namespace, loopback bridge and DNS forwarder units:
+    # the namespace and bridge stay up, the forwarder restarts alone, and a
+    # connection the sandbox holds open keeps working.
+    def unit(prop, name):
+        return dynamic.succeed(command("systemctl", "show", "-p", prop, "--value", name)).strip()
+
+    netns_path = "/run/netns/agent-sandbox"
+    dynamic.wait_for_unit("agent-sandbox-loopback.service")
+    dynamic.wait_for_unit("agent-sandbox-vm-loopback-host.service")
+    dynamic.wait_for_unit("agent-sandbox-vm-echo.service")
+    probe("net", "127.0.0.1", "18089")
+    probe("connect", "169.254.100.1", "18095")
+    probe("echo", "before-switch")
+
+    before = {
+        "netns": dynamic.succeed(command("stat", "-L", "-c", "%i", netns_path)).strip(),
+        "netns_invocation": unit("InvocationID", "agent-sandbox-netns.service"),
+        "loopback_invocation": unit("InvocationID", "agent-sandbox-loopback.service"),
+        "nfq": unit("MainPID", "agent-sandbox-nfq.service"),
+        "dns": unit("MainPID", "agent-sandbox-dns.service"),
+        "policyd": unit("MainPID", "agent-sandbox-policy.service"),
+    }
     dynamic.succeed("/run/booted-system/specialisation/changed-policyd/bin/switch-to-configuration test")
     dynamic.wait_for_unit("agent-sandbox-policy.service")
-    assert dynamic.succeed("systemctl show -p MainPID --value agent-sandbox-policy.service").strip() != policyd_pid
+    dynamic.wait_for_unit("agent-sandbox-dns.service")
+    assert unit("MainPID", "agent-sandbox-policy.service") != before["policyd"]
+    assert unit("MainPID", "agent-sandbox-dns.service") != before["dns"]
+    assert unit("MainPID", "agent-sandbox-nfq.service") == before["nfq"], "nfq restarted"
+    assert unit("InvocationID", "agent-sandbox-netns.service") == before["netns_invocation"], "netns restarted"
+    assert unit("InvocationID", "agent-sandbox-loopback.service") == before["loopback_invocation"], "loopback restarted"
+    assert dynamic.succeed(command("stat", "-L", "-c", "%i", netns_path)).strip() == before["netns"]
     assert dynamic.succeed(command("stat", "-c", "%i", sandbox_socket)).strip() == socket_inode
+
+    probe("echo", "after-switch")
+    probe("net", "127.0.0.1", "18089")
+    probe("net", "169.254.100.1", "18095")
     mutate_and_check("after-switch")
     probe("read", "/var/lib/agent-sandbox-test/dynamic-unlisted", allowed=False)
     dynamic.succeed(command("kill", "-0", fsmon_pid))
+
+    # Restarting the socket unit replaces the socket inode. The sandbox binds
+    # the shared directory, so it reaches the new socket by path.
+    dynamic.succeed("systemctl restart agent-sandbox-policy.socket agent-sandbox-policy.service")
+    dynamic.wait_for_unit("agent-sandbox-policy.socket")
+    dynamic.wait_for_unit("agent-sandbox-policy.service")
+    assert dynamic.succeed(command("stat", "-c", "%i", sandbox_socket)).strip() != socket_inode
+    mutate_and_check("after-socket-restart")
+    probe("read", "/var/lib/agent-sandbox-test/dynamic-unlisted", allowed=False)
+
+    # A file the host replaces by rename in the shared directory is the new
+    # file inside the running sandbox too.
+    shared_file = shared_dir + "/replaced"
+    dynamic.succeed(command("sh", "-c", "printf old > " + shared_file))
+    probe("inode", shared_file, dynamic.succeed(command("stat", "-c", "%i", shared_file)).strip())
+    dynamic.succeed(command("sh", "-c", "printf new > " + shared_file + ".tmp && mv " + shared_file + ".tmp " + shared_file))
+    probe("inode", shared_file, dynamic.succeed(command("stat", "-c", "%i", shared_file)).strip())
+    dynamic.succeed(command("rm", shared_file))
 
     # A sandbox launched after the restart works against the new policyd.
     dynamic.succeed(command(

@@ -190,9 +190,11 @@ fn peer_is_trusted_non_local(stream: &UnixStream) -> bool {
 /// peer closed it while idle (for example across a policyd restart) is
 /// replaced by a fresh one before anything is written, so nothing is sent
 /// twice. Any transport, framing, JSON, or timeout failure discards the
-/// connection. In particular, a failed request is never replayed: after
-/// request bytes may have reached policyd, retrying could duplicate a
-/// one-shot approval.
+/// connection. When policyd closes the connection before replying, a
+/// request that [`RpcRequest::is_replayable`] is sent once more on a fresh
+/// connection within the same timeout; any other failed request is never
+/// replayed, because its bytes may have reached policyd and retrying could
+/// duplicate a one-shot approval.
 pub struct PersistentRpcClient {
     socket_path: PathBuf,
     connection: Option<RpcConnection>,
@@ -232,37 +234,27 @@ impl PersistentRpcClient {
 
     /// Send one request over the persistent connection.
     ///
-    /// The timeout includes lazy connection establishment and the complete
-    /// write/flush/read operation. The connection is discarded on every error
-    /// so the next call starts with a fresh socket.
+    /// The timeout includes lazy connection establishment, the complete
+    /// write/flush/read operation and a replay. The connection is discarded
+    /// on every error so the next call starts with a fresh socket.
     ///
     /// # Errors
-    /// Returns a policyd RPC or timeout error. A failed request is not retried.
+    /// Returns a policyd RPC or timeout error.
     pub async fn request(
         &mut self,
         req: RpcRequest,
         timeout: Duration,
     ) -> Result<RpcReply, RpcClientError> {
+        let replay = req.is_replayable().then(|| req.clone());
         let result = time::timeout(timeout, async {
-            if self
-                .connection
-                .as_ref()
-                .is_some_and(RpcConnection::peer_has_closed)
+            let result = self.send(req).await;
+            if matches!(result, Err(RpcClientError::Closed))
+                && let Some(req) = replay
             {
                 self.connection = None;
+                return self.send(req).await;
             }
-            if self.connection.is_none() {
-                let connection = if self.require_trusted_peer {
-                    RpcConnection::connect_trusted(&self.socket_path).await?
-                } else {
-                    RpcConnection::connect(&self.socket_path).await?
-                };
-                self.connection = Some(connection);
-            }
-            let Some(connection) = self.connection.as_mut() else {
-                return Err(RpcClientError::Closed);
-            };
-            connection.request(req).await
+            result
         })
         .await;
 
@@ -279,6 +271,28 @@ impl PersistentRpcClient {
                 Err(RpcClientError::Timeout)
             }
         }
+    }
+
+    async fn send(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(RpcConnection::peer_has_closed)
+        {
+            self.connection = None;
+        }
+        if self.connection.is_none() {
+            let connection = if self.require_trusted_peer {
+                RpcConnection::connect_trusted(&self.socket_path).await?
+            } else {
+                RpcConnection::connect(&self.socket_path).await?
+            };
+            self.connection = Some(connection);
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(RpcClientError::Closed);
+        };
+        connection.request(req).await
     }
 }
 
@@ -407,55 +421,80 @@ mod tests {
         second_server.await.expect("second server task");
     }
 
-    #[tokio::test]
-    async fn failed_request_is_discarded_without_replay() {
-        let dir = tempdir().expect("temporary directory");
-        let socket = dir.path().join("policy.sock");
-        let listener = UnixListener::bind(&socket).expect("bind policy socket");
-
-        let server = tokio::spawn(async move {
+    /// A policyd restart closes a connection after reading a request but
+    /// before replying. The server reads one request on the first connection,
+    /// drops it, then serves `replies` requests on a second connection, and
+    /// returns the requests it read there.
+    fn restart_after_first_request(
+        listener: UnixListener,
+        replies: usize,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept first");
-            let (read, _) = stream.into_split();
-            let mut reader = BufReader::new(read);
+            let mut reader = BufReader::new(stream);
             let mut line = String::new();
-            assert!(
-                reader
-                    .read_line(&mut line)
-                    .await
-                    .expect("read first request")
-                    > 0
-            );
+            assert!(reader.read_line(&mut line).await.expect("read first") > 0);
             drop(reader);
 
             let (stream, _) = listener.accept().await.expect("accept second");
             let (read, mut write) = stream.into_split();
             let mut reader = BufReader::new(read);
-            line.clear();
-            assert!(
-                reader
-                    .read_line(&mut line)
-                    .await
-                    .expect("read second request")
-                    > 0
-            );
-            write.write_all(ALLOWED_REPLY).await.expect("write reply");
-            write.flush().await.expect("flush reply");
-        });
+            let mut seen = Vec::new();
+            for _ in 0..replies {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.expect("read request") > 0);
+                seen.push(line);
+                write.write_all(ALLOWED_REPLY).await.expect("write reply");
+                write.flush().await.expect("flush reply");
+            }
+            seen
+        })
+    }
 
+    #[tokio::test]
+    async fn check_is_replayed_after_mid_request_close() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+        let server = restart_after_first_request(listener, 1);
+
+        let reply = PersistentRpcClient::new(socket)
+            .request(request(), Duration::from_secs(1))
+            .await
+            .expect("the check is answered by the restarted policyd");
+
+        assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
+        let seen = server.await.expect("server task");
+        assert!(seen[0].contains(r#""op":"check""#));
+    }
+
+    #[tokio::test]
+    async fn one_shot_request_is_not_replayed() {
+        let dir = tempdir().expect("temporary directory");
+        let socket = dir.path().join("policy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind policy socket");
+        let server = restart_after_first_request(listener, 1);
         let mut client = PersistentRpcClient::new(socket);
 
+        let elevate = RpcRequest::Elevate {
+            argv: vec!["true".to_owned()],
+            ctx: RequestContext::default(),
+        };
         assert!(matches!(
-            client.request(request(), Duration::from_secs(1)).await,
+            client.request(elevate, Duration::from_secs(1)).await,
             Err(RpcClientError::Closed)
         ));
 
-        let reply = client
+        client
             .request(request(), Duration::from_secs(1))
             .await
             .expect("next request reconnects");
 
-        assert!(matches!(reply, RpcReply::Check(reply) if reply.verdict.allowed));
-        server.await.expect("server task");
+        let seen = server.await.expect("server task");
+        assert!(
+            seen[0].contains(r#""op":"check""#),
+            "the elevation must not reach the restarted policyd: {seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -477,9 +516,13 @@ mod tests {
         });
 
         let mut client = PersistentRpcClient::new(socket);
+        let elevate = RpcRequest::Elevate {
+            argv: vec!["true".to_owned()],
+            ctx: RequestContext::default(),
+        };
 
         assert!(matches!(
-            client.request(request(), Duration::from_secs(1)).await,
+            client.request(elevate, Duration::from_secs(1)).await,
             Err(RpcClientError::Closed)
         ));
 

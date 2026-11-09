@@ -4,7 +4,7 @@
 # argument shape: host /run visible (no broad --tmpfs /run), but
 # /run/agent-sandbox masked, /dev left visible via --dev-bind /dev /dev
 # (opened through the syscall broker, not hidden behind tmpfs), GPU/device-path
-# binds suppressed, and the sandbox policy socket re-bound read-only.
+# binds suppressed, and the sandbox shared directory re-bound read-only.
 #
 # Also asserts that a non-resource-gate wrapper preserves the current
 # behavior: broad --tmpfs /run, GPU auto-binds, and devicePaths.
@@ -26,7 +26,6 @@ let
     fsArmPkg = pkgs.hello;
     policyContext = true;
     policySocket = "/tmp/resource-gate-regression.sock";
-    sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
   };
   resourceGateWrapper = agentSandboxLib.mkWrapPackage pkgs {
     package = pkgs.hello;
@@ -44,7 +43,6 @@ let
     policyContext = true;
     policySocket = "/tmp/resource-gate-regression.sock";
     resourceGate = true;
-    sandboxPolicySocket = "/tmp/resource-gate-regression-sandbox.sock";
     syscallArmPkg = pkgs.hello;
   };
 in
@@ -101,9 +99,10 @@ pkgs.runCommand "resource-gate-wrapper-regression" { } ''
     fail "resource-gate: configured devicePaths should be suppressed"
   fi
 
-  # 8. Sandbox policy socket is re-bound read-only.
-  grep -F -q -- '--ro-bind-try /tmp/resource-gate-regression-sandbox.sock' rg-wrapper.sh \
-    || fail "resource-gate: missing sandbox policy socket ro-bind-try"
+  # 8. The shared directory holding the sandbox policy socket is re-bound
+  #    read-only over the /run/agent-sandbox tmpfs.
+  grep -F -q -- '--ro-bind-try /run/agent-sandbox/shared /run/agent-sandbox/shared' rg-wrapper.sh \
+    || fail "resource-gate: missing shared directory ro-bind-try"
 
   # Both buses use relays, never a bind of the raw host system socket.
   grep -F -q -- 'for _asbx_dbus_bus in session system; do' rg-wrapper.sh \

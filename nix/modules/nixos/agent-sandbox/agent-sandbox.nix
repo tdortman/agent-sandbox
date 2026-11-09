@@ -561,7 +561,6 @@ let
           dbus
           network
           policySocket
-          sandboxPolicySocket
           ;
 
         inherit policyPkg;
@@ -1042,12 +1041,6 @@ in
         };
       };
 
-      sandboxSocketPath = lib.mkOption {
-        type = lib.types.str;
-        default = "/run/agent-sandbox/sandbox-policy.sock";
-        description = "Sandbox-facing policyd socket. Bound over policy.socketPath inside sandboxes.";
-      };
-
       socketPath = lib.mkOption {
         type = lib.types.str;
         default = "/run/agent-sandbox/policy.sock";
@@ -1111,8 +1104,12 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = policyContextEnabled -> cfg.policy.socketPath != cfg.policy.sandboxSocketPath;
-        message = "agent-sandbox.policy.socketPath and sandboxSocketPath must differ when policy is enabled";
+        # Sandboxes bind the shared directory, so the host control socket must
+        # live outside it.
+        assertion =
+          policyContextEnabled -> !lib.hasPrefix "${agentSandboxLib.sandboxSharedDir}/" cfg.policy.socketPath;
+
+        message = "agent-sandbox.policy.socketPath must not be inside ${agentSandboxLib.sandboxSharedDir}";
       }
       {
         assertion = !(cfg.gates.resources.enable && !cfg.gates.filesystem.enable);

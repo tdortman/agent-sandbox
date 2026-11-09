@@ -89,11 +89,11 @@ pkgs.testers.runNixOSTest (_: {
         "python3 -c 'import socket; assert socket.getaddrinfo(\"h3-allowed.test\", 443); assert socket.getaddrinfo(\"h3-allowed-v6.test\", 443)'",
         wrapper=session_wrapper,
     )
-    proxy.succeed("set +e; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} reset counters table inet agent_sandbox_proxy_tproxy; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get' >/tmp/h3-allowed.log 2>&1; status=$?; cat /tmp/h3-allowed.log; ip netns exec agent-sandbox ip route get 169.254.100.1 mark 51820; ip netns exec agent-sandbox cat /proc/net/udp /proc/net/udp6; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy; test $status -eq 0")
+    proxy.succeed("set +e; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} reset counters table inet agent_sandbox_proxy_tproxy; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/shared/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get' >/tmp/h3-allowed.log 2>&1; status=$?; cat /tmp/h3-allowed.log; ip netns exec agent-sandbox ip route get 169.254.100.1 mark 51820; ip netns exec agent-sandbox cat /proc/net/udp /proc/net/udp6; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy; test $status -eq 0")
     sandbox_shell(
         proxy,
         "sandbox-proxy-bash",
-        "curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed-v6.test:443/allowed | grep -q allowed-get",
+        "curl --http3-only --cacert /run/agent-sandbox/shared/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed-v6.test:443/allowed | grep -q allowed-get",
         wrapper=session_wrapper,
     )
     # Raw or invalid UDP on intercepted HTTP/3 ports is rejected by the
@@ -106,7 +106,7 @@ pkgs.testers.runNixOSTest (_: {
         sandbox_shell(
             proxy,
             "sandbox-proxy-bash",
-            "alt_svc=/tmp/h3-alt-svc-$$.cache; curl --http3-only --alt-svc \"$alt_svc\" --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get && cat \"$alt_svc\" && test -s \"$alt_svc\" && curl --http3 --alt-svc \"$alt_svc\" --cacert /run/agent-sandbox/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get",
+            "alt_svc=/tmp/h3-alt-svc-$$.cache; curl --http3-only --alt-svc \"$alt_svc\" --cacert /run/agent-sandbox/shared/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get && cat \"$alt_svc\" && test -s \"$alt_svc\" && curl --http3 --alt-svc \"$alt_svc\" --cacert /run/agent-sandbox/shared/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get",
             wrapper=session_wrapper,
         )
     )
@@ -121,14 +121,14 @@ pkgs.testers.runNixOSTest (_: {
 
     # The denied HTTP/3 request must complete as a clean 403 response.
     # A stream reset after the deny body would make curl exit non-zero.
-    proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/proxy-ca-bundle.pem --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -eq 0; grep -F -q 'blocked by agent-sandbox policy' /tmp/h3-denied.log; test \"$before\" = \"$after\"")
+    proxy.succeed("before=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); set +e; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/shared/proxy-ca-bundle.pem --silent --show-error --max-time 15 https://h3-denied.test:443/denied' >/tmp/h3-denied.log 2>&1; status=$?; set -e; cat /tmp/h3-denied.log; after=$(grep -F -c 'request GET /denied' /var/log/h3-origin.log || true); test $status -eq 0; grep -F -q 'blocked by agent-sandbox policy' /tmp/h3-denied.log; test \"$before\" = \"$after\"")
 
     # WebTransport runs through the same transparent HTTP/3 proxy: session,
     # bidirectional and unidirectional streams, and HTTP Datagrams. The
     # ordinary request first gives the session a CONNECT stream ID above 0 so
     # the Quarter Stream ID encoding is exercised.
     wt_client = "${e2e.sandboxPkg}/bin/wt-client"
-    wt_args = "--ca-file /run/agent-sandbox/proxy-ca-bundle.pem"
+    wt_args = "--ca-file /run/agent-sandbox/shared/proxy-ca-bundle.pem"
 
     print(
         sandbox_shell(

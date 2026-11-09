@@ -160,7 +160,7 @@ pkgs.testers.runNixOSTest (_: {
     # own fanotify permission event, so every launch below is a regression
     # test for the second-launch hang.
     dynamic.succeed(
-        "mkdir -p /run/agent-sandbox && printf '%s\\n' '{\"cwd\": \"/home/sandbox\", \"home\": \"/home/sandbox\", \"project_root\": \"/home/sandbox\"}' > /run/agent-sandbox/session-context.json"
+        "mkdir -p /run/agent-sandbox/shared && printf '%s\\n' '{\"cwd\": \"/home/sandbox\", \"home\": \"/home/sandbox\", \"project_root\": \"/home/sandbox\"}' > /run/agent-sandbox/shared/session-context.json"
     )
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "test -r /nix/store")
     sandbox_shell(dynamic, "sandbox-dynamic-bash", "grep -q dynamic-read-marker /var/lib/agent-sandbox-test/dynamic-read")

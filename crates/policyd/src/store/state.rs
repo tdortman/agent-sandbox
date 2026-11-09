@@ -129,6 +129,9 @@ pub struct PolicyDecisionState {
     pub(crate) proxy_cancellations: HashMap<ProxyCheckId, ProxyCancellation>,
     pub(crate) ui_clients: HashMap<u64, UiClient>,
     pub(crate) ui_context_by_session: HashMap<String, UiSessionContext>,
+    /// UI sessions handed over from the previous daemon that no UI has
+    /// resumed yet; their context and decisions wait under the same id.
+    pub(crate) resumable_ui_sessions: HashSet<String>,
     pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
     pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
     pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,

@@ -227,7 +227,13 @@ async fn main() -> Result<(), BoxError> {
         tokio::spawn(http3::run(backend));
     }
 
-    run_tcp_listener(listener_config, executor, policy, shutdown, active_checks).await
+    // Exiting lets systemd restart the proxy with a fresh session; open
+    // connections lose their claims either way.
+    let session = policy.clone();
+    tokio::select! {
+        result = run_tcp_listener(listener_config, executor, policy, shutdown, active_checks) => result,
+        () = session.lost() => Err(BoxError::from_static_str("policy session lost")),
+    }
 }
 
 fn load_ca_issuer(args: &Args) -> Result<CertificateIssuer, BoxError> {

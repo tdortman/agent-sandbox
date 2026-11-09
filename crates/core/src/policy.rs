@@ -188,7 +188,7 @@ pub fn open_flags_to_file_access(flags: i32) -> FileAccess {
 ///
 /// Used as the hash key that deduplicates and aggregates [`FilesystemRule`]s
 /// (e.g. merging an observed access with a matching rule).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FilesystemRuleKey {
     /// Path the rule applies to.
     pub path: PathBuf,
@@ -995,7 +995,7 @@ impl std::fmt::Display for ResourceAccess {
 /// Identity of a resource rule: the resource kind, path, and access level.
 ///
 /// Acts as the hash key that deduplicates and aggregates [`ResourceRule`]s.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ResourceRuleKey {
     /// Kind of resource the rule applies to.
     pub kind: ResourceKind,

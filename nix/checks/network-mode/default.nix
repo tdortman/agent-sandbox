@@ -155,7 +155,7 @@ let
       initService = validPortSystem.config.systemd.services."agent-sandbox-proxy-init";
     in
     assert lib.elem "agent-sandbox-proxy-init.service" dnsService.after;
-    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.requires;
+    assert lib.elem "agent-sandbox-proxy-init.service" dnsService.wants;
     assert lib.hasInfix "--init-ech-state-only" proxyInitSource;
     assert lib.hasInfix "agent-sandbox-proxy" (toString initService.serviceConfig.ExecStart);
     true;
@@ -368,7 +368,6 @@ let
     policyContext = true;
     policyPkg = pkgs.hello;
     policySocket = "/run/test/policy.sock";
-    sandboxPolicySocket = "/run/test/sandbox-policy.sock";
   };
   proxyFirewallSource = builtins.toFile "agent-sandbox-proxy-firewall.sh" (
     builtins.readFile ../../modules/nixos/agent-sandbox/proxy-firewall.sh
@@ -421,7 +420,6 @@ let
     policyContext = true;
     policyPkg = pkgs.hello;
     policySocket = "/run/test/policy.sock";
-    sandboxPolicySocket = "/run/test/sandbox-policy.sock";
   };
   staticProxy = mkWrapper {
     dynamic = false;
@@ -618,9 +616,9 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
   for wrapper in "$static_proxy" "$dynamic_proxy"; do
     grep -F -q -- 'for _asbx_system_ca in /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt; do' "$wrapper" \
       || fail "proxy wrapper does not resolve both system trust store paths"
-    grep -F -q -- 'RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/proxy-ca-bundle.pem "$_asbx_system_ca_target")' "$wrapper" \
+    grep -F -q -- 'RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/shared/proxy-ca-bundle.pem "$_asbx_system_ca_target")' "$wrapper" \
       || fail "proxy wrapper does not bind the proxy CA bundle over the system trust store"
-    if grep -F -q -- '--ro-bind /run/agent-sandbox/proxy-ca-bundle.pem /etc/ssl/certs/' "$wrapper"; then
+    if grep -F -q -- '--ro-bind /run/agent-sandbox/shared/proxy-ca-bundle.pem /etc/ssl/certs/' "$wrapper"; then
       fail "proxy wrapper must bind the resolved system CA target, not the symlinked path"
     fi
   done
@@ -629,25 +627,23 @@ pkgs.runCommand "network-mode-wrapper-regression" { } ''
       fail "direct wrapper must not rewrite the system trust store"
     fi
   done
-  grep -F -q -- '--ro-bind-try /run/agent-sandbox/proxy-ca-bundle.pem /run/agent-sandbox/proxy-ca-bundle.pem' "$static_proxy" \
-    || fail "static proxy wrapper does not mount the CA bundle at its non-symlink path"
-  grep -F -q -- '--setenv SSL_CERT_FILE /run/agent-sandbox/proxy-ca-bundle.pem' "$static_proxy" \
+  grep -F -q -- '--ro-bind-try /run/agent-sandbox/shared /run/agent-sandbox/shared' "$static_proxy" \
+    || fail "static proxy wrapper does not mount the shared directory holding the CA bundle"
+  grep -F -q -- '--setenv SSL_CERT_FILE /run/agent-sandbox/shared/proxy-ca-bundle.pem' "$static_proxy" \
     || fail "static proxy wrapper does not use the mounted CA bundle"
-  grep -F -q -- '--setenv REQUESTS_CA_BUNDLE /run/agent-sandbox/proxy-ca-bundle.pem' "$static_proxy" \
+  grep -F -q -- '--setenv REQUESTS_CA_BUNDLE /run/agent-sandbox/shared/proxy-ca-bundle.pem' "$static_proxy" \
     || fail "static proxy wrapper does not set REQUESTS_CA_BUNDLE to the mounted CA bundle"
-  grep -F -q -- '--setenv CURL_CA_BUNDLE /run/agent-sandbox/proxy-ca-bundle.pem' "$static_proxy" \
+  grep -F -q -- '--setenv CURL_CA_BUNDLE /run/agent-sandbox/shared/proxy-ca-bundle.pem' "$static_proxy" \
     || fail "static proxy wrapper does not set CURL_CA_BUNDLE to the mounted CA bundle"
-  grep -F -q -- '--setenv NODE_EXTRA_CA_CERTS /run/agent-sandbox/proxy-ca-bundle.pem' "$static_proxy" \
+  grep -F -q -- '--setenv NODE_EXTRA_CA_CERTS /run/agent-sandbox/shared/proxy-ca-bundle.pem' "$static_proxy" \
     || fail "static proxy wrapper does not set NODE_EXTRA_CA_CERTS to the mounted CA bundle"
-  grep -F -q -- 'RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/proxy-ca-bundle.pem /run/agent-sandbox/proxy-ca-bundle.pem)' "$dynamic_proxy" \
-    || fail "dynamic proxy wrapper does not mount the CA bundle at its non-symlink path"
-  grep -F -q -- 'RUNTIME_ARGS+=(--setenv SSL_CERT_FILE /run/agent-sandbox/proxy-ca-bundle.pem)' "$dynamic_proxy" \
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv SSL_CERT_FILE /run/agent-sandbox/shared/proxy-ca-bundle.pem)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not use the mounted CA bundle"
-  grep -F -q -- 'RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE /run/agent-sandbox/proxy-ca-bundle.pem)' "$dynamic_proxy" \
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE /run/agent-sandbox/shared/proxy-ca-bundle.pem)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not set REQUESTS_CA_BUNDLE to the mounted CA bundle"
-  grep -F -q -- 'RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE /run/agent-sandbox/proxy-ca-bundle.pem)' "$dynamic_proxy" \
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv CURL_CA_BUNDLE /run/agent-sandbox/shared/proxy-ca-bundle.pem)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not set CURL_CA_BUNDLE to the mounted CA bundle"
-  grep -F -q -- 'RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS /run/agent-sandbox/proxy-ca-bundle.pem)' "$dynamic_proxy" \
+  grep -F -q -- 'RUNTIME_ARGS+=(--setenv NODE_EXTRA_CA_CERTS /run/agent-sandbox/shared/proxy-ca-bundle.pem)' "$dynamic_proxy" \
     || fail "dynamic proxy wrapper does not set NODE_EXTRA_CA_CERTS to the mounted CA bundle"
   ${proxyGroupLookupCheck}/bin/proxy-group-lookup-regression nixbld \
     || fail "single proxy-group lookup was rejected"

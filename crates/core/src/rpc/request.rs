@@ -187,6 +187,11 @@ pub enum RpcRequest {
         #[serde(default)]
         ui_client: Option<String>,
 
+        /// Session id this UI held before policyd restarted. Resuming it
+        /// keeps the session's approvals; an unknown id starts a new session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_session: Option<String>,
+
         /// Context of the registering process.
         #[serde(default)]
         ctx: RequestContext,
@@ -241,6 +246,13 @@ pub enum RpcRequest {
 
     /// Open a new proxy session for outbound network flows.
     OpenProxySession,
+
+    /// Bind an existing proxy session to this connection after policyd
+    /// restarted, keeping the session's claimed flows.
+    ResumeProxySession {
+        /// The session token the proxy received when it opened the session.
+        proxy_session: ProxySessionToken,
+    },
 
     /// Register a network flow so its connections can be attributed back to
     /// a sandboxed process.
@@ -627,6 +639,7 @@ impl RpcRequest {
             | Self::ObserveNetworkGrants { .. }
             | Self::PublishNetworkGrants
             | Self::OpenProxySession
+            | Self::ResumeProxySession { .. }
             | Self::RegisterNetworkFlow { .. }
             | Self::ClaimNetworkFlow { .. }
             | Self::ClaimNetworkFlowBySource { .. }
@@ -636,6 +649,46 @@ impl RpcRequest {
             | Self::CancelCheck { .. }
             | Self::ReleaseNetworkFlow { .. }
             | Self::RegisterSandbox { .. } => None,
+        }
+    }
+
+    /// Whether resending the request after policyd closed the connection
+    /// mid-request cannot duplicate an effect: it only asks for a verdict or
+    /// refreshes state idempotently. A policyd restart closes connections
+    /// with requests in flight, and the new daemon answers the resent one.
+    #[must_use]
+    pub const fn is_replayable(&self) -> bool {
+        match self {
+            Self::Check { .. }
+            | Self::CheckFilesystem { .. }
+            | Self::CheckResource { .. }
+            | Self::CheckDbus { .. }
+            | Self::FilesystemSnapshot { .. }
+            | Self::Status { .. }
+            | Self::RegisterNetworkFlow { .. }
+            | Self::CheckHttp { .. }
+            | Self::CheckNetworkFlow { .. } => true,
+
+            Self::RegisterUi { .. }
+            | Self::UnregisterUi
+            | Self::RegisterSandbox { .. }
+            | Self::StartFilesystemMonitor { .. }
+            | Self::Elevate { .. }
+            | Self::Approve { .. }
+            | Self::ApproveHost { .. }
+            | Self::ApproveHttp { .. }
+            | Self::Deny { .. }
+            | Self::Reload { .. }
+            | Self::BindNetworkRevocation { .. }
+            | Self::ObserveNetworkGrants { .. }
+            | Self::PublishNetworkGrants
+            | Self::OpenProxySession
+            | Self::ResumeProxySession { .. }
+            | Self::ClaimNetworkFlow { .. }
+            | Self::ClaimNetworkFlowBySource { .. }
+            | Self::RebindNetworkFlow { .. }
+            | Self::CancelCheck { .. }
+            | Self::ReleaseNetworkFlow { .. } => false,
         }
     }
 }

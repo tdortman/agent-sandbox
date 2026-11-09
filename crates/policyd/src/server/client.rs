@@ -94,7 +94,10 @@ pub async fn handle_client(
         }
 
         let request_id = proxy_request_id(&req);
-        let is_open_proxy_session = matches!(&req, RpcRequest::OpenProxySession);
+        let is_open_proxy_session = matches!(
+            &req,
+            RpcRequest::OpenProxySession | RpcRequest::ResumeProxySession { .. }
+        );
         let is_register = matches!(req, RpcRequest::RegisterUi { .. });
 
         let resp = match super::dispatch::dispatch(&store, &client, peer, role, req).await {

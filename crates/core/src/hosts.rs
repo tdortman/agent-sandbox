@@ -10,6 +10,7 @@ use std::{
 use globset::{GlobBuilder, GlobMatcher};
 use hickory_proto::rr::Name;
 use idna::domain_to_ascii;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub(crate) fn build_glob(pattern: &str) -> Result<globset::Glob, globset::Error> {
@@ -153,7 +154,7 @@ pub fn normalize_dns_name(host: &str) -> Result<String, DnsNameError> {
 }
 
 /// Orderable key identifying a network rule by normalized host and port.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NetworkRuleKey {
     /// Normalized hostname or IP literal.
     pub host: String,

@@ -126,7 +126,32 @@ fn validate_rebind_candidate(
 }
 
 impl PolicyStore {
+    /// Context a registered flow's checks run under: the registration's
+    /// paths and sandbox session for the verified owner process.
+    pub(super) fn flow_context(&self, registration: &FlowRegistration) -> ResolvedRequestContext {
+        let owner = registration.owner();
+        let agent_sandbox_core::FlowContext {
+            paths,
+            sandbox_session_id,
+        } = registration.context().clone();
+
+        let raw_context = ResolvedRequestContext::new(
+            paths,
+            ProcessIds::new(owner.pid().get(), owner.uid()),
+            sandbox_session_id,
+        );
+
+        // nfq registers flows with empty paths; enrich home/cwd/project_root
+        // from the verified owner uid and pid so HTTP pendings carry enough
+        // context for global/project scope resolution.
+        self.resolve_trusted_context(&raw_context)
+    }
+
     /// Open the one persistent trusted proxy session for a client connection.
+    ///
+    /// A session handed over from the previous daemon that no proxy resumed
+    /// belongs to a proxy that is gone, so it is replaced together with its
+    /// claims.
     ///
     /// # Errors
     ///
@@ -138,15 +163,22 @@ impl PolicyStore {
     ) -> Result<ProxySessionReply, PolicydError> {
         let mut inner = self.inner.lock().await;
 
-        if inner.proxy_session.is_some() {
-            return Err(proxy_error("a proxy session is already active"));
+        match &inner.proxy_session {
+            Some(session) if session.connection_id.is_some() => {
+                return Err(proxy_error("a proxy session is already active"));
+            }
+            Some(_) => {
+                let canceled = clear_proxy_session(&mut inner);
+                debug_assert!(canceled.is_empty(), "an unbound session has no waiters");
+            }
+            None => {}
         }
 
         let token = ProxySessionToken::try_new().map_err(proxy_error)?;
 
         inner.proxy_session = Some(ProxySessionState {
             token: token.clone(),
-            connection_id,
+            connection_id: Some(connection_id),
             opened_at: Instant::now(),
         });
 
@@ -155,6 +187,36 @@ impl PolicyStore {
         Ok(ProxySessionReply {
             ok: true,
             proxy_session: token,
+        })
+    }
+
+    /// Bind the session handed over from the previous daemon to the proxy's
+    /// new persistent connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicydError`] when no unbound session carries `token`.
+    pub async fn resume_proxy_session(
+        &self,
+        token: &ProxySessionToken,
+        connection_id: u64,
+    ) -> Result<ProxySessionReply, PolicydError> {
+        let mut inner = self.inner.lock().await;
+
+        let Some(session) = inner
+            .proxy_session
+            .as_mut()
+            .filter(|session| session.connection_id.is_none() && &session.token == token)
+        else {
+            return Err(proxy_error("proxy session cannot be resumed"));
+        };
+
+        session.connection_id = Some(connection_id);
+        drop(inner);
+
+        Ok(ProxySessionReply {
+            ok: true,
+            proxy_session: token.clone(),
         })
     }
 
@@ -171,21 +233,7 @@ impl PolicyStore {
     ) -> Result<(), PolicydError> {
         let now = Instant::now();
         let owner = registration.owner();
-        let agent_sandbox_core::FlowContext {
-            paths,
-            sandbox_session_id,
-        } = registration.context().clone();
-
-        let raw_context = ResolvedRequestContext::new(
-            paths,
-            ProcessIds::new(owner.pid().get(), owner.uid()),
-            sandbox_session_id,
-        );
-
-        // nfq registers flows with empty paths; enrich home/cwd/project_root
-        // from the verified owner uid and pid so HTTP pendings carry enough
-        // context for global/project scope resolution.
-        let context = self.resolve_trusted_context(&raw_context);
+        let context = self.flow_context(&registration);
 
         let key = registration.flow().clone();
         let mut inner = self.inner.lock().await;
@@ -742,59 +790,16 @@ impl PolicyStore {
 
     /// Clear a session and all claims owned by its persistent connection.
     pub async fn close_proxy_session(&self, connection_id: u64) {
-        let canceled = {
-            let mut inner = self.inner.lock().await;
-            let Some(session) = inner.proxy_session.as_ref() else {
-                return;
-            };
-            if session.connection_id != connection_id {
-                return;
-            }
-            let token = session.token.clone();
-            inner.proxy_session = None;
-            for (_, state) in inner.proxy_cancellations.drain() {
-                if let ProxyCancellation::Active(sender) = state {
-                    let _ = sender.send(());
-                }
-            }
-            for state in inner.proxy_flows.values_mut() {
-                state.attribution_token = None;
-                state.connection_id = None;
-                state.claimed_at = None;
-                state.last_check = Instant::now();
-            }
-
-            let pending_ids = inner
-                .pending
-                .http_futures
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            let mut canceled = Vec::new();
-            for pending_id in pending_ids {
-                let Some(waiters) = inner.pending.http_futures.remove(&pending_id) else {
-                    continue;
-                };
-                let mut retained = Vec::with_capacity(waiters.len());
-                for waiter in waiters {
-                    if waiter.proxy_session == token {
-                        inner.pending.http_waiters.remove(&ProxyCheckId {
-                            session: waiter.proxy_session.clone(),
-                            request: waiter.request_id,
-                        });
-                        canceled.push(waiter.tx);
-                    } else {
-                        retained.push(waiter);
-                    }
-                }
-                if retained.is_empty() {
-                    inner.pending.pending.remove(&pending_id.to_string());
-                } else {
-                    inner.pending.http_futures.insert(pending_id, retained);
-                }
-            }
-            canceled
-        };
+        let mut inner = self.inner.lock().await;
+        if inner
+            .proxy_session
+            .as_ref()
+            .is_none_or(|session| session.connection_id != Some(connection_id))
+        {
+            return;
+        }
+        let canceled = clear_proxy_session(&mut inner);
+        drop(inner);
 
         for sender in canceled {
             let _ = sender.send(HttpCheckReply::blocked(
@@ -870,6 +875,59 @@ impl PolicyStore {
             protocol,
         })
     }
+}
+
+/// Drop the proxy session and every claim, returning the HTTP approval
+/// waiters the session owned so the caller can answer them unlocked.
+fn clear_proxy_session(
+    inner: &mut super::types::PolicyDecisionState,
+) -> Vec<oneshot::Sender<HttpCheckReply>> {
+    let Some(session) = inner.proxy_session.take() else {
+        return Vec::new();
+    };
+    let token = session.token;
+    for (_, state) in inner.proxy_cancellations.drain() {
+        if let ProxyCancellation::Active(sender) = state {
+            let _ = sender.send(());
+        }
+    }
+    for state in inner.proxy_flows.values_mut() {
+        state.attribution_token = None;
+        state.connection_id = None;
+        state.claimed_at = None;
+        state.last_check = Instant::now();
+    }
+
+    let pending_ids = inner
+        .pending
+        .http_futures
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut canceled = Vec::new();
+    for pending_id in pending_ids {
+        let Some(waiters) = inner.pending.http_futures.remove(&pending_id) else {
+            continue;
+        };
+        let mut retained = Vec::with_capacity(waiters.len());
+        for waiter in waiters {
+            if waiter.proxy_session == token {
+                inner.pending.http_waiters.remove(&ProxyCheckId {
+                    session: waiter.proxy_session.clone(),
+                    request: waiter.request_id,
+                });
+                canceled.push(waiter.tx);
+            } else {
+                retained.push(waiter);
+            }
+        }
+        if retained.is_empty() {
+            inner.pending.pending.remove(&pending_id.to_string());
+        } else {
+            inner.pending.http_futures.insert(pending_id, retained);
+        }
+    }
+    canceled
 }
 
 fn validate_session(
@@ -1808,6 +1866,74 @@ mod tests {
             .expect_err("release after session close must reject the stale session");
 
         assert!(error.to_string().contains("proxy session token is invalid"));
+    }
+
+    /// policyd restarts while the proxy keeps running. The proxy resumes its
+    /// session on the new daemon, and its open connections keep their
+    /// claims.
+    #[tokio::test]
+    async fn resumed_proxy_session_keeps_claims_across_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handoff = dir.path().join("policyd-handoff.json");
+
+        std::fs::write(
+            dir.path().join("declarative.json"),
+            r#"{"network":{"http":{"allow":[{"methods":["GET"],"url":"https://example.com/ok"}]}}}"#,
+        )
+        .expect("declarative policy");
+
+        let first = Arc::new(test_store(&dir));
+        let session = first
+            .open_proxy_session(1)
+            .await
+            .expect("open session")
+            .proxy_session;
+
+        let UdpAssociation {
+            socket: _socket,
+            connection_id,
+            token,
+            ..
+        } = test_udp_association(&first, &session).await;
+
+        drop(
+            first
+                .write_handoff_to(&handoff)
+                .await
+                .expect("write handoff"),
+        );
+
+        let mut second = test_store(&dir);
+        second.restore_handoff_from(&handoff);
+        let second = Arc::new(second);
+
+        let resumed = second
+            .resume_proxy_session(&session, 2)
+            .await
+            .expect("resume the handed-over session");
+        assert_eq!(resumed.proxy_session, session);
+
+        let reply = second
+            .check_http(
+                session.clone(),
+                ProxyRequestId::new(),
+                token.clone(),
+                test_http_request("example.com", "/ok"),
+            )
+            .await
+            .expect("a claimed connection must stay attributed after a restart");
+        assert!(reply.verdict.allowed);
+
+        second
+            .resume_proxy_session(&session, 3)
+            .await
+            .expect_err("a session resumes only once");
+
+        second.close_proxy_session(2).await;
+        second
+            .release_network_flow(session, token, connection_id)
+            .await
+            .expect_err("closing the resumed session must drop its claims");
     }
 
     #[tokio::test]

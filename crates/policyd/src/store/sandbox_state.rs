@@ -3,8 +3,9 @@
 //! Launcher-bound session registrations and their static filesystem allows
 //! are written to a state file after each mutation and reloaded by the next
 //! daemon, so a running sandbox keeps its package attribution and static
-//! allows. Session approvals, verdict caches and network grants are not
-//! persisted: losing them re-prompts.
+//! allows even when the previous daemon crashed. Session approvals and the
+//! proxy's flows travel in the stop-time handoff instead; verdict caches and
+//! network grants are not persisted.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -206,7 +207,8 @@ fn read_state(path: &Path) -> Option<LoadedState> {
     }
 }
 
-fn write_atomic(path: &Path, view: &StateView<'_>) -> io::Result<()> {
+/// Replace `path` with `value` as JSON, readable by root only.
+pub(super) fn write_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let mut file: File = OpenOptions::new()
         .write(true)
@@ -216,7 +218,7 @@ fn write_atomic(path: &Path, view: &StateView<'_>) -> io::Result<()> {
         .open(&tmp)?;
 
     file.set_permissions(Permissions::from_mode(0o600))?;
-    file.write_all(&serde_json::to_vec(view).map_err(io::Error::other)?)?;
+    file.write_all(&serde_json::to_vec(value).map_err(io::Error::other)?)?;
     drop(file);
     fs::rename(&tmp, path)
 }

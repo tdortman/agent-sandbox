@@ -1192,50 +1192,61 @@ fn listen_fd_number(
     (index < count).then_some(SD_LISTEN_FDS_START + index)
 }
 
-/// Take ownership of the socket-activation descriptor named `name`.
+/// Take ownership of the socket-activation descriptors named `names`, in
+/// order; a name systemd did not pass yields `None`.
 ///
-/// Follows the `sd_listen_fds` protocol: the descriptor is only ours when
+/// Follows the `sd_listen_fds` protocol: the descriptors are only ours when
 /// `LISTEN_PID` is this process. The `LISTEN_*` variables are removed whenever
 /// they address this process, so spawned children never see them. The
-/// returned descriptor is close-on-exec.
+/// returned descriptors are close-on-exec.
 ///
 /// Call before any other thread exists: this mutates the process environment.
 ///
 /// # Errors
-/// Returns the kernel error if the descriptor cannot be made close-on-exec.
-pub fn take_systemd_listen_fd(name: &str) -> io::Result<Option<OwnedFd>> {
+/// Returns the kernel error if a descriptor cannot be made close-on-exec.
+pub fn take_systemd_listen_fds<const N: usize>(
+    names: [&str; N],
+) -> io::Result<[Option<OwnedFd>; N]> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
     let var = |key: &str| std::env::var(key).unwrap_or_default();
     let listen_pid = var("LISTEN_PID");
 
     if listen_pid.parse::<u32>().ok() != Some(std::process::id()) {
-        return Ok(None);
+        return Ok(std::array::from_fn(|_| None));
     }
 
-    let number = listen_fd_number(
-        &listen_pid,
-        &var("LISTEN_FDS"),
-        &var("LISTEN_FDNAMES"),
-        std::process::id(),
-        name,
-    );
+    let listen_fds = var("LISTEN_FDS");
+    let listen_fdnames = var("LISTEN_FDNAMES");
+    let numbers = names.map(|name| {
+        listen_fd_number(
+            &listen_pid,
+            &listen_fds,
+            &listen_fdnames,
+            std::process::id(),
+            name,
+        )
+    });
 
     for key in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"] {
         // SAFETY: documented single-threaded constraint.
         unsafe { std::env::remove_var(key) };
     }
 
-    let Some(number) = number else {
-        return Ok(None);
-    };
+    let mut fds = std::array::from_fn(|_| None);
+    for (slot, number) in fds.iter_mut().zip(numbers) {
+        let Some(number) = number else {
+            continue;
+        };
 
-    // SAFETY: systemd handed this descriptor to this process by number; nothing
-    // else owns it.
-    let fd = unsafe { OwnedFd::from_raw_fd(number) };
-    fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        // SAFETY: systemd handed this descriptor to this process by number;
+        // nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(number) };
+        fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        *slot = Some(fd);
+    }
 
-    Ok(Some(fd))
+    Ok(fds)
 }
 
 /// Read the network namespace cookie of a socket (`SO_NETNS_COOKIE`).

@@ -4,6 +4,7 @@
   pkgs,
   nvidiaSetupScript,
   policyContextScript,
+  sandboxPolicySocket,
   ...
 }:
 builtin:
@@ -278,21 +279,15 @@ in
   inherit agent-sandbox-base agent-sandbox-dynamic-base;
   inherit rebind-cwd;
 
-  agent-sandbox-context-env =
-    { runtime, ... }:
-    let
-      inherit (runtime) sandboxPolicySocket;
-    in
-    compose [
-      (set-env "AGENT_SANDBOX_POLICY_SOCKET" sandboxPolicySocket)
-      (add-runtime ''
-        # jail.nix base uses --clearenv; only --setenv survives into the jail.
-        # policyd and enforcement daemons read these from /proc/<pid>/environ.
-        ${policyContextScript}
-        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
-        RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
-      '')
-    ];
+  agent-sandbox-context-env = compose [
+    (set-env "AGENT_SANDBOX_POLICY_SOCKET" sandboxPolicySocket)
+    (add-runtime ''
+      # jail.nix base uses --clearenv; only --setenv survives into the jail.
+      # policyd and enforcement daemons read these from /proc/<pid>/environ.
+      ${policyContextScript}
+      RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
+    '')
+  ];
 
   # Bind all host NVIDIA nodes (including nvidia-fs* when nvidia-fs is enabled).
   # Must run after inherit-shell-env so LD_LIBRARY_PATH can prefer /run/opengl-driver.

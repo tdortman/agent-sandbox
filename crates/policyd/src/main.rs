@@ -7,6 +7,7 @@ use agent_sandbox_policyd::{
     PackageDeclarative, PolicyServer, PolicyStore, PolicydArgs, PolicydError,
 };
 use clap::Parser;
+use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,11 +49,12 @@ struct Cli {
 
     /// Sandbox-side Unix socket path. Components running inside the bwrap mount
     /// namespace (agent-sandbox-nfq, agent-sandbox-syscall-arm,
-    /// agent-sandbox-fs-arm) connect here. Must differ from the host socket.
+    /// agent-sandbox-fs-arm) connect here. Must differ from the host socket and
+    /// live in the directory sandboxes bind, never as a lone file bind.
     #[arg(
         long,
         value_name = "SOCKET",
-        default_value = "/run/agent-sandbox/sandbox-policy.sock"
+        default_value = "/run/agent-sandbox/shared/sandbox-policy.sock"
     )]
     sandbox_socket: PathBuf,
 
@@ -181,15 +183,21 @@ fn main() -> Result<(), PolicydError> {
     // Consumed before the runtime starts: removing the activation variables
     // mutates the process environment, which is only sound while
     // single-threaded.
-    let inherited_sandbox_listener = agent_sandbox_sysutil::take_systemd_listen_fd("sandbox")?;
+    let [sandbox, proxy] = agent_sandbox_sysutil::take_systemd_listen_fds(["sandbox", "proxy"])?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(inherited_sandbox_listener))
+        .block_on(run(InheritedListeners { sandbox, proxy }))
 }
 
-async fn run(inherited_sandbox_listener: Option<OwnedFd>) -> Result<(), PolicydError> {
+/// Listening sockets systemd keeps open across policyd restarts.
+struct InheritedListeners {
+    sandbox: Option<OwnedFd>,
+    proxy: Option<OwnedFd>,
+}
+
+async fn run(inherited: InheritedListeners) -> Result<(), PolicydError> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -235,14 +243,30 @@ async fn run(inherited_sandbox_listener: Option<OwnedFd>) -> Result<(), PolicydE
         store.enable_network_revocation(path).await?;
     }
     store.enable_sandbox_state();
+    store.restore_handoff();
     store.enable_cgroup_freezer();
     let store = Arc::new(store);
     store.export_policy_files(SandboxPaths::default())?;
     let mut server = PolicyServer::new(store.clone());
-    if let Some(fd) = inherited_sandbox_listener {
+    if let Some(fd) = inherited.sandbox {
         server = server.with_inherited_sandbox_listener(fd);
     }
-    server.run().await?;
+    if let Some(fd) = inherited.proxy {
+        server = server.with_inherited_proxy_listener(fd);
+    }
+
+    // systemd stops the daemon with SIGTERM; the next daemon takes over the
+    // proxy session and UI sessions from the handoff. The process exits
+    // holding the state lock, so no reply can promise state the handoff
+    // lacks.
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = server.run() => result?,
+        _ = terminate.recv() => {
+            let _frozen = store.write_handoff().await?;
+            std::process::exit(0);
+        }
+    }
     Ok(())
 }
 

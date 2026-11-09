@@ -12,7 +12,6 @@ let
   contract =
     assert runtime.policyContext;
     assert runtime.policySocket == "/run/test/policyd.sock";
-    assert runtime.sandboxPolicySocket == "/run/test/sandbox-policyd.sock";
     assert runtime.exportedJson == "/var/lib/test/policy.json";
     assert runtime.exportedNix == "/var/lib/test/policy.nix";
     assert runtime.interactiveApproval == false;
@@ -56,7 +55,6 @@ let
       exportedJson = "/var/lib/test/policy.json";
       exportedNix = "/var/lib/test/policy.nix";
       interactiveApproval = false;
-      sandboxSocketPath = "/run/test/sandbox-policyd.sock";
       socketPath = "/run/test/policyd.sock";
       uiBackend = "test-ui";
     };

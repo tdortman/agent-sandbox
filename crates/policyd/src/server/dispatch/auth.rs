@@ -15,7 +15,7 @@ pub enum SocketRole {
 /// Whether the request is allowed on the sandbox socket.
 ///
 /// `RegisterUi` is deliberately **excluded**. The sandbox socket is exposed
-/// inside the jail (`/run/agent-sandbox/sandbox-policy.sock`), so any
+/// inside the jail (`/run/agent-sandbox/shared/sandbox-policy.sock`), so any
 /// sandboxed process can connect to it. Allowing `RegisterUi` there would let
 /// a malicious agent register itself as the UI for its own route, receive the
 /// prompt push for its own `Check`/`Elevate` request, and then approve that
@@ -50,6 +50,7 @@ pub const fn is_proxy_request(req: &RpcRequest) -> bool {
     matches!(
         req,
         RpcRequest::OpenProxySession
+            | RpcRequest::ResumeProxySession { .. }
             | RpcRequest::ClaimNetworkFlow { .. }
             | RpcRequest::ClaimNetworkFlowBySource { .. }
             | RpcRequest::RebindNetworkFlow { .. }
@@ -172,6 +173,7 @@ mod tests {
         // tracked by `sandbox_socket_blocks_self_approval_escape`.
         let req = RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
+            resume_session: None,
             ctx: RequestContext::default(),
         };
 
@@ -259,6 +261,7 @@ mod tests {
             },
             RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext::default(),
             },
             RpcRequest::UnregisterUi,
@@ -387,6 +390,7 @@ mod tests {
     fn uifd_rejects_register_ui() {
         let req = RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
+            resume_session: None,
             ctx: RequestContext::default(),
         };
 

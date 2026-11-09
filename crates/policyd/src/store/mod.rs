@@ -9,6 +9,7 @@ mod elevation;
 pub(crate) mod evaluator;
 mod filesystem;
 mod freeze;
+mod handoff;
 mod http;
 mod network;
 mod network_snapshot;

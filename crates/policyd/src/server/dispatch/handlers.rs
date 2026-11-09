@@ -54,6 +54,12 @@ pub async fn handle(
             store.open_proxy_session(client.id).await?,
         )),
 
+        RpcRequest::ResumeProxySession { proxy_session } => Ok(RpcReply::ProxySession(
+            store
+                .resume_proxy_session(&proxy_session, client.id)
+                .await?,
+        )),
+
         RpcRequest::RegisterNetworkFlow {
             registration,
             owner_fd_hint,
@@ -136,9 +142,11 @@ pub async fn handle(
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
-        RpcRequest::RegisterUi { ui_client: _, ctx } => {
-            handle_register_ui(store, client, peer, resolve(&ctx)?).await
-        }
+        RpcRequest::RegisterUi {
+            ui_client: _,
+            resume_session,
+            ctx,
+        } => handle_register_ui(store, client, peer, resolve(&ctx)?, resume_session).await,
 
         RpcRequest::UnregisterUi => {
             store.end_ui_session(client.id).await;
@@ -346,6 +354,7 @@ async fn handle_register_ui(
     client: &crate::store::UiClientHandle,
     peer: ClientPeer,
     ctx: ResolvedRequestContext,
+    resume_session: Option<String>,
 ) -> Result<RpcReply, PolicydError> {
     let paths = ctx.paths;
 
@@ -364,14 +373,19 @@ async fn handle_register_ui(
     }
 
     let session_id = store
-        .start_ui_session(client, peer, crate::store::UiSessionContext {
-            cwd: paths.cwd_path(),
-            home: paths.home_path(),
-            project_root: paths.project_root_path(),
-            sandbox_session_id: Some(sandbox_session_id),
-            owner_uid: (peer.uid > 0).then_some(peer.uid),
-            client_id: client.id,
-        })
+        .start_ui_session(
+            client,
+            peer,
+            crate::store::UiSessionContext {
+                cwd: paths.cwd_path(),
+                home: paths.home_path(),
+                project_root: paths.project_root_path(),
+                sandbox_session_id: Some(sandbox_session_id),
+                owner_uid: (peer.uid > 0).then_some(peer.uid),
+                client_id: client.id,
+            },
+            resume_session.as_deref(),
+        )
         .await;
 
     if let Some(sess) = store.ui_context_for_session(&session_id).await
@@ -439,6 +453,7 @@ mod tests {
                 ProcessIds::default(),
                 Some("sandbox-a".into()),
             ),
+            None,
         )
         .await;
 

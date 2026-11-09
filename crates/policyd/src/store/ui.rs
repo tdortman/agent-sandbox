@@ -256,13 +256,19 @@ impl PolicyStore {
         targets
     }
 
+    /// Bind a UI client to a session and return the session id.
+    ///
+    /// `resume` names the session the UI held before policyd restarted. A
+    /// handed-over session with that id, the same owner and the same sandbox
+    /// session is resumed with its approvals; anything else starts a new
+    /// session.
     pub(crate) async fn start_ui_session(
         &self,
         handle: &UiClientHandle,
         peer: crate::server::peer::ClientPeer,
         context: UiSessionContext,
+        resume: Option<&str>,
     ) -> String {
-        let session_id = Uuid::now_v7().simple().to_string();
         let mut inner = self.inner.lock().await;
         let mut ctx = context;
         ctx.client_id = handle.id;
@@ -270,6 +276,21 @@ impl PolicyStore {
         if ctx.owner_uid.is_none() && peer.uid > 0 {
             ctx.owner_uid = Some(peer.uid);
         }
+
+        let resumable = resume.filter(|id| {
+            inner.resumable_ui_sessions.contains(*id)
+                && inner.ui_context_by_session.get(*id).is_some_and(|handed| {
+                    handed.owner_uid == ctx.owner_uid
+                        && handed.sandbox_session_id == ctx.sandbox_session_id
+                })
+        });
+
+        let session_id = if let Some(id) = resumable {
+            inner.resumable_ui_sessions.remove(id);
+            id.to_owned()
+        } else {
+            Uuid::now_v7().simple().to_string()
+        };
 
         inner.ui_clients.insert(handle.id, UiClient {
             session_id: session_id.clone(),

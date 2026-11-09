@@ -13,7 +13,23 @@ in
 pkgs.testers.runNixOSTest (_: {
   name = "e2e-proxy-http";
   node.specialArgs = { inherit inputs; };
-  nodes.proxy = proxyNode;
+
+  nodes.proxy = lib.recursiveUpdate proxyNode {
+    # A system update that changes policyd and every proxy unit.
+    specialisation.changed-proxy.configuration.systemd.services =
+      lib.genAttrs
+        [
+          "agent-sandbox-dns"
+          "agent-sandbox-policy"
+          "agent-sandbox-proxy"
+          "agent-sandbox-proxy-firewall"
+          "agent-sandbox-proxy-init"
+          "agent-sandbox-proxy-route"
+        ]
+        (_: {
+          environment.AGENT_SANDBOX_TEST_GENERATION = "changed";
+        });
+  };
 
   testScript = ''
     import shlex
@@ -119,11 +135,11 @@ pkgs.testers.runNixOSTest (_: {
     proxy.succeed("curl --fail --silent -X POST http://127.0.0.1:8008/allowed | grep -q post-ok")
     proxy.succeed("curl --fail --silent http://127.0.0.1:8008/unlisted | grep -q unlisted-get")
     proxy.succeed("curl --fail --silent --cacert ${tlsFixture}/ca-cert.pem https://169.254.100.1:8443/allowed | grep -q allowed-get")
-    sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/proxy-ca-bundle.pem && test \"$NODE_EXTRA_CA_CERTS\" = /run/agent-sandbox/proxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "test \"$SSL_CERT_FILE\" = /run/agent-sandbox/shared/proxy-ca-bundle.pem && test \"$NODE_EXTRA_CA_CERTS\" = /run/agent-sandbox/shared/proxy-ca-bundle.pem && test -r \"$SSL_CERT_FILE\"", wrapper=session_wrapper)
     sandbox_shell(
         proxy,
         "sandbox-proxy-bash",
-        "cmp -s /etc/ssl/certs/ca-certificates.crt /run/agent-sandbox/proxy-ca-bundle.pem && cmp -s /etc/ssl/certs/ca-bundle.crt /run/agent-sandbox/proxy-ca-bundle.pem",
+        "cmp -s /etc/ssl/certs/ca-certificates.crt /run/agent-sandbox/shared/proxy-ca-bundle.pem && cmp -s /etc/ssl/certs/ca-bundle.crt /run/agent-sandbox/shared/proxy-ca-bundle.pem",
         wrapper=session_wrapper,
     )
     sandbox_shell(
@@ -167,6 +183,61 @@ pkgs.testers.runNixOSTest (_: {
         "curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}' https://allowed.test:8443/allowed | grep -q 502",
         wrapper=session_wrapper,
     )
+
+    # One keep-alive connection, held by a running sandbox, sends a request
+    # before and after a policyd restart and a system switch. Each request
+    # needs the proxy's claim on that connection, so it answers only if the
+    # proxy kept running and resumed its policy session.
+    proxy.succeed("mkfifo -m 0666 /tmp/keepalive-input")
+    keepalive = (
+        "exec 4<>/dev/tcp/169.254.100.1/8008; "
+        "while read -r token; do "
+        "printf 'GET /allowed HTTP/1.1\\r\\nHost: 169.254.100.1:8008\\r\\n\\r\\n' >&4; "
+        "status=; body=; "
+        "read -r -t 15 status <&4 && "
+        "while read -r -t 15 header <&4 && [ \"$header\" != $'\\r' ]; do :; done && "
+        "read -r -t 15 body <&4; "
+        "printf '%s %s %s\\n' \"$token\" \"$body\" \"$status\"; done"
+    )
+    launch = command("runuser", "-u", "sandbox", "--", *session_wrapper, "sandbox-proxy-bash", "-c", keepalive)
+    # Detached from the driver's console, which a backgrounded runuser holds.
+    detached = "exec " + launch + " < /tmp/keepalive-input > /tmp/keepalive-output 2>/tmp/keepalive-errors"
+    proxy.succeed(command("setsid", "-f", "sh", "-c", detached) + " </dev/null >/dev/null 2>&1")
+    proxy.succeed("sh -c 'exec 3>/tmp/keepalive-input; sleep 600' >/dev/null 2>&1 &")
+
+    def keepalive_request(token):
+        proxy.succeed(command("printf", "%s\\n", token) + " > /tmp/keepalive-input")
+        try:
+            proxy.wait_until_succeeds(command("grep", "-q", "^" + token + " ", "/tmp/keepalive-output"), timeout=60)
+        except Exception:
+            print(proxy.succeed("cat /tmp/keepalive-errors"))
+            raise
+        line = proxy.succeed(command("grep", "^" + token + " ", "/tmp/keepalive-output")).strip()
+        assert line.startswith(token + " allowed-get") and " 200 " in line, f"keep-alive request {token}: {line!r}"
+
+    def unit(prop, name):
+        return proxy.succeed(command("systemctl", "show", "-p", prop, "--value", name)).strip()
+
+    keepalive_request("before")
+    proxy_pid = unit("MainPID", "agent-sandbox-proxy.service")
+    route_invocation = unit("InvocationID", "agent-sandbox-proxy-route.service")
+    firewall_invocation = unit("InvocationID", "agent-sandbox-proxy-firewall.service")
+
+    proxy.succeed("systemctl restart agent-sandbox-policy.service")
+    proxy.wait_for_unit("agent-sandbox-policy.service")
+    keepalive_request("after-restart")
+    assert unit("MainPID", "agent-sandbox-proxy.service") == proxy_pid, "policyd restart restarted the proxy"
+
+    policyd_pid = unit("MainPID", "agent-sandbox-policy.service")
+    proxy.succeed("/run/booted-system/specialisation/changed-proxy/bin/switch-to-configuration test")
+    proxy.wait_for_unit("agent-sandbox-policy.service")
+    assert unit("MainPID", "agent-sandbox-policy.service") != policyd_pid
+    assert unit("MainPID", "agent-sandbox-proxy.service") == proxy_pid, "switch restarted the proxy"
+    assert unit("InvocationID", "agent-sandbox-proxy-route.service") == route_invocation, "switch re-ran the route"
+    assert unit("InvocationID", "agent-sandbox-proxy-firewall.service") == firewall_invocation, "switch restarted the firewall"
+    keepalive_request("after-switch")
+    sandbox_shell(proxy, "sandbox-proxy-bash", "curl --fail --silent --show-error --max-time 30 http://169.254.100.1:8008/allowed | grep -q allowed-get", wrapper=session_wrapper)
+    sandbox_exec(proxy, "sandbox-proxy-curl", "--fail", "--silent", "--show-error", "--max-time", "15", "http://169.254.100.1:8008/unlisted", wrapper=session_wrapper, expect_success=False)
 
   '';
 })

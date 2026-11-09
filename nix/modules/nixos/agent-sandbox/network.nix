@@ -482,10 +482,19 @@ let
     || rootCfg.policy.sudo.declarativeDeny != [ ]
     || lib.any packageHasPolicy rootCfg.packages;
   portSet = ports: lib.concatStringsSep ", " (map toString ports);
-  proxyBundlePath = "/run/agent-sandbox/proxy-ca-bundle.pem";
+  proxyBundlePath = "${agentSandboxLib.sandboxSharedDir}/proxy-ca-bundle.pem";
   proxyCaCertificate = cfg.httpProxy.caCertificateFile;
   proxyCaPrivateKey = cfg.httpProxy.caPrivateKeyFile;
   proxyCidrsPath = "/etc/agent-sandbox/proxy-upstream-cidrs.json";
+  proxyFirewallArgs = [
+    "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
+    proxyUser
+    proxyGroup
+    runtime.hostIp
+    proxyCidrsPath
+    "agent_sandbox_proxy"
+    (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
+  ];
   proxyFirewallPkg = pkgs.writeShellApplication {
     name = "agent-sandbox-proxy-firewall";
 
@@ -702,7 +711,7 @@ in
                       # sandboxed command. Read-only: nothing inside the
                       # sandbox may rewrite the context it is judged by.
                       access = "read";
-                      path = "/run/agent-sandbox/session-context.json";
+                      path = "${agentSandboxLib.sandboxSharedDir}/session-context.json";
                     }
                   ]
                   ++ map (r: { inherit (r) access path; }) rootCfg.policy.filesystem.declarativeAllow;
@@ -748,22 +757,20 @@ in
               ++ [
                 "agent-sandbox-policy.socket"
                 "network.target"
-              ];
+              ]
+              ++ lib.optional runtime.httpProxy.enable "agent-sandbox-policy-proxy.socket";
 
+            wants = lib.optional cfg.enable "agent-sandbox-dns.service";
+
+            # Hard dependencies propagate restarts. policyd outlives a DNS
+            # forwarder restart, so the forwarder is only wanted.
             requires = [
               "agent-sandbox-policy.socket"
             ]
-            ++ lib.optionals cfg.enable [
-              "agent-sandbox-dns.service"
-              "agent-sandbox-netns.service"
-            ];
+            ++ lib.optional cfg.enable "agent-sandbox-netns.service"
+            ++ lib.optional runtime.httpProxy.enable "agent-sandbox-policy-proxy.socket";
 
             wantedBy = [ "multi-user.target" ];
-
-            # Restart in place on a config switch. A stop-and-start makes
-            # switch-to-configuration also restart agent-sandbox-policy.socket,
-            # which replaces the socket inode running sandboxes bind-mounted.
-            stopIfChanged = false;
 
             serviceConfig = {
               Type = "simple";
@@ -779,7 +786,7 @@ in
                   "--socket"
                   runtime.policySocket
                   "--sandbox-socket"
-                  runtime.sandboxPolicySocket
+                  agentSandboxLib.sandboxPolicySocket
                   "--declarative"
                   "/etc/agent-sandbox/policy.json"
                   "--export-json"
@@ -846,20 +853,46 @@ in
               AGENT_SANDBOX_ZENITY = "${pkgs.zenity}/bin/zenity";
             };
 
+            # Restart in place on a config switch. A stop-and-start makes
+            # switch-to-configuration also restart the policy sockets, and
+            # requests fail while a socket is gone. The stopping daemon hands
+            # the proxy session and UI session approvals to its successor.
+            stopIfChanged = false;
+
           };
 
-          # systemd owns the sandbox socket so its inode survives policyd restarts and
-          # connections queue meanwhile; sandboxes bind-mount this single inode.
-          sockets.agent-sandbox-policy = {
-            description = "Sandbox-facing policy socket for agent-sandbox";
+          # systemd owns the sandbox socket so connections queue across policyd
+          # restarts. Sandboxes bind its directory, which also creates it here,
+          # so a re-created socket stays reachable from running sandboxes.
+          sockets = {
+            agent-sandbox-policy = {
+              description = "Sandbox-facing policy socket for agent-sandbox";
 
-            socketConfig = {
-              FileDescriptorName = "sandbox";
-              ListenStream = runtime.sandboxPolicySocket;
-              SocketMode = "0666";
+              socketConfig = {
+                FileDescriptorName = "sandbox";
+                ListenStream = agentSandboxLib.sandboxPolicySocket;
+                SocketMode = "0666";
+              };
+
+              wantedBy = [ "sockets.target" ];
             };
+          }
+          // lib.optionalAttrs runtime.httpProxy.enable {
+            # The transparent proxy's requests queue across policyd restarts
+            # too, so it can resume its session instead of failing closed.
+            agent-sandbox-policy-proxy = {
+              description = "Proxy-facing policy socket for agent-sandbox";
 
-            wantedBy = [ "sockets.target" ];
+              socketConfig = {
+                FileDescriptorName = "proxy";
+                ListenStream = runtime.httpProxy.socketPath;
+                Service = "agent-sandbox-policy.service";
+                SocketGroup = if runtime.httpProxy.gid != null then toString runtime.httpProxy.gid else proxyGroup;
+                SocketMode = "0660";
+              };
+
+              wantedBy = [ "sockets.target" ];
+            };
           };
         };
       }
@@ -934,11 +967,10 @@ in
             ]
             ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
 
-            requires = [
-              "agent-sandbox-netns.service"
-            ]
-            ++ lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
-
+            # Ordered after the CA init for its ECH config, but a re-run of
+            # the init must not restart the forwarder.
+            wants = lib.optional cfg.httpProxy.enable "agent-sandbox-proxy-init.service";
+            requires = [ "agent-sandbox-netns.service" ];
             wantedBy = [ "multi-user.target" ];
 
             serviceConfig = networkDaemonHardening // {
@@ -996,6 +1028,11 @@ in
               ExecStop = "${netnsDownPkg}/bin/agent-sandbox-netns-down";
               RemainAfterExit = true;
             };
+
+            # Every sandbox network stack lives in this namespace; netns-down
+            # deletes it. A switch must never tear it down under running
+            # sandboxes, so changes apply at the next boot.
+            restartIfChanged = false;
           };
 
           agent-sandbox-nfq = {
@@ -1007,12 +1044,14 @@ in
               "agent-sandbox-policy.service"
             ];
 
-            requires = [
+            # nfq reaches policyd and the forwarder through sockets that
+            # outlive their restarts, so neither restart may restart nfq.
+            wants = [
               "agent-sandbox-dns.service"
-              "agent-sandbox-netns.service"
               "agent-sandbox-policy.service"
             ];
 
+            requires = [ "agent-sandbox-netns.service" ];
             wantedBy = [ "multi-user.target" ];
 
             serviceConfig = networkDaemonHardening // {
@@ -1026,7 +1065,7 @@ in
                   "--queue"
                   (toString runtime.queueNumber)
                   "--policy-socket"
-                  runtime.sandboxPolicySocket
+                  agentSandboxLib.sandboxPolicySocket
                   "--policy-timeout"
                   (toString runtime.policyTimeout)
                   "--nft-binary"
@@ -1080,14 +1119,19 @@ in
               "agent-sandbox-proxy-init.service"
             ];
 
-            wants = [ "agent-sandbox-proxy-route.service" ];
-
-            requires = [
+            wants = [
               "agent-sandbox-dns.service"
-              "agent-sandbox-netns.service"
               "agent-sandbox-policy.service"
-              "agent-sandbox-proxy-firewall.service"
               "agent-sandbox-proxy-init.service"
+              "agent-sandbox-proxy-route.service"
+            ];
+
+            # Only a lost namespace or egress firewall must stop the proxy.
+            # It resumes its policy session across policyd restarts, and the
+            # forwarder and CA init may re-run beneath it.
+            requires = [
+              "agent-sandbox-netns.service"
+              "agent-sandbox-proxy-firewall.service"
             ];
 
             wantedBy = [ "multi-user.target" ];
@@ -1120,6 +1164,10 @@ in
               Group = proxyGroup;
               NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
 
+              # Read-only and not a RuntimeDirectory: systemd chowns a runtime
+              # directory recursively to its unit's user, which would hand the
+              # root-owned sockets and state under it to the proxy user and
+              # strip the policy socket's group on every policyd restart.
               ReadOnlyPaths = [
                 proxyBundlePath
                 "/run/agent-sandbox"
@@ -1128,9 +1176,6 @@ in
               ReadWritePaths = [ proxyStateDir ];
               Restart = "always";
               RestartSec = 1;
-              RuntimeDirectory = "agent-sandbox";
-              RuntimeDirectoryMode = "0755";
-              RuntimeDirectoryPreserve = "yes";
               User = proxyUser;
             };
 
@@ -1141,6 +1186,11 @@ in
               REQUESTS_CA_BUNDLE = proxyBundlePath;
               SSL_CERT_FILE = proxyBundlePath;
             };
+
+            # A restart drops every intercepted connection, so a switch keeps
+            # the running proxy; a new proxy takes over at the next boot or
+            # an explicit restart.
+            restartIfChanged = false;
 
           };
 
@@ -1154,49 +1204,24 @@ in
               "network.target"
             ];
 
-            requires = [
-              "agent-sandbox-netns.service"
-              "agent-sandbox-proxy-init.service"
-            ];
-
+            wants = [ "agent-sandbox-proxy-init.service" ];
+            requires = [ "agent-sandbox-netns.service" ];
             wantedBy = [ "multi-user.target" ];
             partOf = [ "agent-sandbox-proxy.service" ];
 
             serviceConfig = networkSetupHardening // {
               Type = "oneshot";
-
-              ExecStart = lib.escapeShellArgs (
-                [
-                  "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-                  proxyUser
-                  proxyGroup
-                  runtime.hostIp
-                  proxyCidrsPath
-                  "agent_sandbox_proxy"
-                ]
-                ++ [
-                  (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
-                ]
-              );
-
-              ExecStopPost = lib.escapeShellArgs (
-                [
-                  "${proxyFirewallPkg}/bin/agent-sandbox-proxy-firewall"
-                  proxyUser
-                  proxyGroup
-                  runtime.hostIp
-                  proxyCidrsPath
-                  "agent_sandbox_proxy"
-                ]
-                ++ [
-                  (if runtime.httpProxy.http3.enable then http3UdpPortsComma else "0")
-                ]
-                ++ [ "cleanup" ]
-              );
-
+              ExecReload = lib.escapeShellArgs proxyFirewallArgs;
+              ExecStart = lib.escapeShellArgs proxyFirewallArgs;
+              ExecStopPost = lib.escapeShellArgs (proxyFirewallArgs ++ [ "cleanup" ]);
               NetworkNamespacePath = "/run/netns/${runtime.network.netnsName}";
               RemainAfterExit = true;
             };
+
+            # A restart would run the cleanup and open a window without the
+            # egress table, and would restart the proxy. The rules script
+            # replaces the table in one transaction, so a switch reloads it.
+            reloadIfChanged = true;
           };
 
           agent-sandbox-proxy-init = {
@@ -1310,6 +1335,9 @@ in
             };
 
             bindsTo = [ "agent-sandbox-proxy.service" ];
+            # A re-run fails closed first, resetting every intercepted
+            # connection, so a switch keeps the installed routes.
+            restartIfChanged = false;
           };
         };
 
@@ -1340,6 +1368,10 @@ in
             ExecStop = "${loopbackBpfPkg}/bin/agent-sandbox-loopback-bpf cleanup";
             RemainAfterExit = true;
           };
+
+          # A restart detaches the bridge before reattaching it, cutting
+          # sandbox access to host localhost services, so a switch keeps it.
+          restartIfChanged = false;
         };
       })
 

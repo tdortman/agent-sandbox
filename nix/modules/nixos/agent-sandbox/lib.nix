@@ -60,7 +60,7 @@ let
       (home-readwrite-mounts homeReadwrite)
     ]
     ++ lib.optionals (runtime != null && runtime.policyContext) [
-      (agent-sandbox-context-env { inherit runtime; })
+      agent-sandbox-context-env
     ]
     ++ lib.optionals (policyContext && policyPkg != null && policySocket != null) [
       (agent-sandbox-register-sandbox {
@@ -263,7 +263,6 @@ let
 
       policySocket = policy.socketPath;
       policyTimeout = lib.max network.policyTimeout policy.approvalTimeout;
-      sandboxPolicySocket = policy.sandboxSocketPath;
     };
   nvidiaSetupScript = bindDevices: ''
     ${lib.optionalString bindDevices ''
@@ -334,6 +333,12 @@ let
     RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_PROJECT_ROOT "$_agent_sandbox_project_root")
     RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_SESSION_ID "$_agent_sandbox_session_id")
   '';
+  sandboxPolicySocket = "${sandboxSharedDir}/sandbox-policy.sock";
+  # Host files sandboxes read, bound as one directory: a socket or file
+  # replaced on the host stays reachable by path in running sandboxes.
+  # Must hold nothing else; the Rust defaults for the session context and
+  # sandbox socket paths name this directory too.
+  sandboxSharedDir = "/run/agent-sandbox/shared";
   splitMountPaths =
     paths:
     let
@@ -361,6 +366,8 @@ in
     httpRuleJson
     mkRuntime
     packageHasPolicy
+    sandboxPolicySocket
+    sandboxSharedDir
     ;
 
   mkWrapPackage =
@@ -393,14 +400,19 @@ in
       resourceGate ? false,
       runtime ? null,
       runtimeReadonlyDirs ? defaultRuntimeReadonlyDirs,
-      sandboxPolicySocket ? null,
       sudoGuard ? null,
       syscallArmPkg ? null,
       unsafeAliasPrefix ? "unsafe-",
     }:
     let
       agentCombinators = import ./combinators.nix {
-        inherit lib pkgs policyContextScript;
+        inherit
+          lib
+          pkgs
+          policyContextScript
+          sandboxPolicySocket
+          ;
+
         nvidiaSetupScript = nvidiaSetupScript true;
       } builtinCombinators;
       applicationExe = lib.getExe' applicationPackage binName;
@@ -880,120 +892,112 @@ in
           ])
           (builtinCombinators.add-runtime proxySystemTrustScript)
         ];
-      policyScript =
-        lib.optionalString (policyContext && policySocket != null && sandboxPolicySocket != null)
-          ''
-            ${policyContextScript}
-            RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
-            # Mask /run so unrelated host IPC sockets are invisible. With
-            # resource gate, only /run/agent-sandbox is tmpfs'd; AF_UNIX
-            # sockets remain visible from the host /run tree and are gated
-            # by the broker. Otherwise, the entire /run is masked and safe
-            # runtime directories are selectively rebound.
-            ${runMaskScript}
+      policyScript = lib.optionalString (policyContext && policySocket != null) ''
+        ${policyContextScript}
+        RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_POLICY_SOCKET ${lib.escapeShellArg sandboxPolicySocket})
+        # Mask /run so unrelated host IPC sockets are invisible. With
+        # resource gate, only /run/agent-sandbox is tmpfs'd; AF_UNIX
+        # sockets remain visible from the host /run tree and are gated
+        # by the broker. Otherwise, the entire /run is masked and safe
+        # runtime directories are selectively rebound.
+        ${runMaskScript}
 
-            # The dynamic path bind-mounts the host root with --bind / /, so
-            # the user's $HOME (including ~/.config/agent-sandbox) is fully
-            # writable inside the sandbox by default. That breaks the trust
-            # model: a compromised agent could rewrite trusted policy files to
-            # add allow rules for itself. Rebind the logical config directory
-            # read-only, and also rebind resolved policy symlink targets (or
-            # their existing parents) read-only. A read-only bind on only the
-            # symlink directory is not enough: writes through the symlink land
-            # on the target path under the broad writable host-root bind.
-            _asbx_user_config="$_agent_sandbox_home/.config/agent-sandbox"
-            _asbx_policy_ro_binds=()
-            _asbx_policy_candidates=()
+        # The dynamic path bind-mounts the host root with --bind / /, so
+        # the user's $HOME (including ~/.config/agent-sandbox) is fully
+        # writable inside the sandbox by default. That breaks the trust
+        # model: a compromised agent could rewrite trusted policy files to
+        # add allow rules for itself. Rebind the logical config directory
+        # read-only, and also rebind resolved policy symlink targets (or
+        # their existing parents) read-only. A read-only bind on only the
+        # symlink directory is not enough: writes through the symlink land
+        # on the target path under the broad writable host-root bind.
+        _asbx_user_config="$_agent_sandbox_home/.config/agent-sandbox"
+        _asbx_policy_ro_binds=()
+        _asbx_policy_candidates=()
 
-            _asbx_ro_bind_once() {
-              local _asbx_path="$1"
-              local _asbx_bound
-              [[ -n "$_asbx_path" && -e "$_asbx_path" ]] || return 0
-              for _asbx_bound in "''${_asbx_policy_ro_binds[@]}"; do
-                [[ "$_asbx_bound" == "$_asbx_path" ]] && return 0
-              done
-              _asbx_policy_ro_binds+=("$_asbx_path")
-              RUNTIME_ARGS+=(--ro-bind "$_asbx_path" "$_asbx_path")
-            }
+        _asbx_ro_bind_once() {
+          local _asbx_path="$1"
+          local _asbx_bound
+          [[ -n "$_asbx_path" && -e "$_asbx_path" ]] || return 0
+          for _asbx_bound in "''${_asbx_policy_ro_binds[@]}"; do
+            [[ "$_asbx_bound" == "$_asbx_path" ]] && return 0
+          done
+          _asbx_policy_ro_binds+=("$_asbx_path")
+          RUNTIME_ARGS+=(--ro-bind "$_asbx_path" "$_asbx_path")
+        }
 
-            _asbx_existing_parent() {
-              local _asbx_path="$1"
-              while [[ "$_asbx_path" != "/" && ! -e "$_asbx_path" ]]; do
-                _asbx_path="$(dirname "$_asbx_path")"
-              done
-              if [[ -e "$_asbx_path" ]]; then
-                readlink -f "$_asbx_path" 2>/dev/null || true
-              fi
-            }
+        _asbx_existing_parent() {
+          local _asbx_path="$1"
+          while [[ "$_asbx_path" != "/" && ! -e "$_asbx_path" ]]; do
+            _asbx_path="$(dirname "$_asbx_path")"
+          done
+          if [[ -e "$_asbx_path" ]]; then
+            readlink -f "$_asbx_path" 2>/dev/null || true
+          fi
+        }
 
-            _asbx_policy_target_parent() {
-              local _asbx_policy_path="$1"
-              local _asbx_policy_dir
-              local _asbx_link_target
-              local _asbx_target
-              _asbx_policy_dir="$(dirname "$_asbx_policy_path")"
-              if [[ -L "$_asbx_policy_path" ]]; then
-                _asbx_link_target="$(readlink "$_asbx_policy_path")" || return 0
-                case "$_asbx_link_target" in
-                  /*) _asbx_target="$_asbx_link_target" ;;
-                  *) _asbx_target="$_asbx_policy_dir/$_asbx_link_target" ;;
-                esac
-              else
-                _asbx_target="$_asbx_policy_path"
-              fi
-              _asbx_existing_parent "$(dirname "$_asbx_target")"
-            }
+        _asbx_policy_target_parent() {
+          local _asbx_policy_path="$1"
+          local _asbx_policy_dir
+          local _asbx_link_target
+          local _asbx_target
+          _asbx_policy_dir="$(dirname "$_asbx_policy_path")"
+          if [[ -L "$_asbx_policy_path" ]]; then
+            _asbx_link_target="$(readlink "$_asbx_policy_path")" || return 0
+            case "$_asbx_link_target" in
+              /*) _asbx_target="$_asbx_link_target" ;;
+              *) _asbx_target="$_asbx_policy_dir/$_asbx_link_target" ;;
+            esac
+          else
+            _asbx_target="$_asbx_policy_path"
+          fi
+          _asbx_existing_parent "$(dirname "$_asbx_target")"
+        }
 
-            if [[ -d "$_asbx_user_config" ]]; then
-              _asbx_ro_bind_once "$_asbx_user_config"
-            fi
-            if [[ -e "$_asbx_user_config/policy.json" || -L "$_asbx_user_config/policy.json" ]]; then
-              _asbx_policy_candidates+=("$_asbx_user_config/policy.json")
-            fi
-            # Package-specific policy files (home extension and package
-            # project file) live under the config directories ro-bound
-            # above, so the write-through risk is the symlink target path:
-            # protect them exactly like the per-scope policy files above.
-            _asbx_package_policy_home="$_asbx_user_config/packages/${lib.escapeShellArg packageName}.json"
-            if [[ -e "$_asbx_package_policy_home" || -L "$_asbx_package_policy_home" ]]; then
-              _asbx_policy_candidates+=("$_asbx_package_policy_home")
-            fi
-            _asbx_package_policy_project="$_agent_sandbox_project_root/.agent-sandbox/packages/${lib.escapeShellArg packageName}.json"
-            if [[ -e "$_asbx_package_policy_project" || -L "$_asbx_package_policy_project" ]]; then
-              _asbx_policy_candidates+=("$_asbx_package_policy_project")
-            fi
-            for _asbx_policy_candidate in "''${_asbx_policy_candidates[@]}"; do
-              _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_policy_candidate")"
-              _asbx_ro_bind_once "$_asbx_policy_parent"
-              if [[ -e "$_asbx_policy_candidate" ]]; then
-                _asbx_policy_real="$(readlink -f "$_asbx_policy_candidate" 2>/dev/null)" || _asbx_policy_real=""
-                _asbx_ro_bind_once "$_asbx_policy_real"
-              fi
-            done
-            _asbx_project_agent_sandbox="$_agent_sandbox_project_root/.agent-sandbox"
-            if [[ -d "$_asbx_project_agent_sandbox" ]]; then
-              _asbx_ro_bind_once "$_asbx_project_agent_sandbox"
-            fi
-            _asbx_project_policy="$_asbx_project_agent_sandbox/policy.json"
-            if [[ -e "$_asbx_project_policy" || -L "$_asbx_project_policy" ]]; then
-              _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_project_policy")"
-              _asbx_ro_bind_once "$_asbx_policy_parent"
-              _asbx_policy_real="$(readlink -f "$_asbx_project_policy" 2>/dev/null)" || _asbx_policy_real=""
-              _asbx_ro_bind_once "$_asbx_policy_real"
-            fi
-            if [[ -f /run/agent-sandbox/dns-cache.json ]]; then
-              RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/dns-cache.json /run/agent-sandbox/dns-cache.json)
-            fi
-            if [[ -f /run/agent-sandbox/session-context.json ]]; then
-              RUNTIME_ARGS+=(--ro-bind /run/agent-sandbox/session-context.json /run/agent-sandbox/session-context.json)
-            fi
-            ${runReadonlyBindScript}
-            ${runReadwriteBindScript}
+        if [[ -d "$_asbx_user_config" ]]; then
+          _asbx_ro_bind_once "$_asbx_user_config"
+        fi
+        if [[ -e "$_asbx_user_config/policy.json" || -L "$_asbx_user_config/policy.json" ]]; then
+          _asbx_policy_candidates+=("$_asbx_user_config/policy.json")
+        fi
+        # Package-specific policy files (home extension and package
+        # project file) live under the config directories ro-bound
+        # above, so the write-through risk is the symlink target path:
+        # protect them exactly like the per-scope policy files above.
+        _asbx_package_policy_home="$_asbx_user_config/packages/${lib.escapeShellArg packageName}.json"
+        if [[ -e "$_asbx_package_policy_home" || -L "$_asbx_package_policy_home" ]]; then
+          _asbx_policy_candidates+=("$_asbx_package_policy_home")
+        fi
+        _asbx_package_policy_project="$_agent_sandbox_project_root/.agent-sandbox/packages/${lib.escapeShellArg packageName}.json"
+        if [[ -e "$_asbx_package_policy_project" || -L "$_asbx_package_policy_project" ]]; then
+          _asbx_policy_candidates+=("$_asbx_package_policy_project")
+        fi
+        for _asbx_policy_candidate in "''${_asbx_policy_candidates[@]}"; do
+          _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_policy_candidate")"
+          _asbx_ro_bind_once "$_asbx_policy_parent"
+          if [[ -e "$_asbx_policy_candidate" ]]; then
+            _asbx_policy_real="$(readlink -f "$_asbx_policy_candidate" 2>/dev/null)" || _asbx_policy_real=""
+            _asbx_ro_bind_once "$_asbx_policy_real"
+          fi
+        done
+        _asbx_project_agent_sandbox="$_agent_sandbox_project_root/.agent-sandbox"
+        if [[ -d "$_asbx_project_agent_sandbox" ]]; then
+          _asbx_ro_bind_once "$_asbx_project_agent_sandbox"
+        fi
+        _asbx_project_policy="$_asbx_project_agent_sandbox/policy.json"
+        if [[ -e "$_asbx_project_policy" || -L "$_asbx_project_policy" ]]; then
+          _asbx_policy_parent="$(_asbx_policy_target_parent "$_asbx_project_policy")"
+          _asbx_ro_bind_once "$_asbx_policy_parent"
+          _asbx_policy_real="$(readlink -f "$_asbx_project_policy" 2>/dev/null)" || _asbx_policy_real=""
+          _asbx_ro_bind_once "$_asbx_policy_real"
+        fi
+        ${runReadonlyBindScript}
+        ${runReadwriteBindScript}
 
-            # Expose only the restricted sandbox request socket. The host
-            # control socket stays hidden by tmpfs.
-            RUNTIME_ARGS+=(--ro-bind-try ${lib.escapeShellArg sandboxPolicySocket} ${lib.escapeShellArg sandboxPolicySocket})
-          '';
+        # Expose only the sandbox-facing files. The host control socket
+        # stays hidden by tmpfs.
+        RUNTIME_ARGS+=(--ro-bind-try ${sandboxSharedDir} ${sandboxSharedDir})
+      '';
       proxyMode = runtime != null && runtime.httpProxy.enable;
       proxySystemTrustScript = lib.optionalString proxyMode ''
         # Tools that ignore the *_CA_BUNDLE variables (git, Go, rustls) read
@@ -1012,14 +1016,13 @@ in
           RUNTIME_ARGS+=(--ro-bind ${proxyTrustBundle} "$_asbx_system_ca_target")
         done
       '';
-      proxyTrustBundle = "/run/agent-sandbox/proxy-ca-bundle.pem";
+      proxyTrustBundle = "${sandboxSharedDir}/proxy-ca-bundle.pem";
       proxyTrustScript = lib.optionalString proxyMode ''
         [[ -f ${proxyTrustBundle} ]] || {
           echo "agent-sandbox proxy trust bundle is unavailable" >&2
           exit 1
         }
         RUNTIME_ARGS+=(--tmpfs /var/lib/agent-sandbox/proxy)
-        RUNTIME_ARGS+=(--ro-bind ${proxyTrustBundle} ${proxyTrustBundle})
         ${proxySystemTrustScript}
         RUNTIME_ARGS+=(--setenv SSL_CERT_FILE ${proxyTrustBundle})
         RUNTIME_ARGS+=(--setenv REQUESTS_CA_BUNDLE ${proxyTrustBundle})
@@ -1067,7 +1070,9 @@ in
           '';
       runReadonlyBindScript = runBindScript "--ro-bind" (readonlyDirs ++ readonlyFiles);
       runReadwriteBindScript = runBindScript "--bind" (readwriteDirs ++ readwriteFiles);
-      runtimeReadonlyDirs' = runtimeReadonlyDirs ++ lib.optionals proxyMode [ proxyTrustBundle ];
+      runtimeReadonlyDirs' =
+        runtimeReadonlyDirs
+        ++ lib.optional (runtime != null && (proxyMode || runtime.policyContext)) sandboxSharedDir;
       sandboxPathStr = lib.makeBinPath sandboxPkgsList;
       sandboxPkgsList = lib.unique (
         [ applicationPackage ]

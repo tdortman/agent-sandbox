@@ -278,6 +278,7 @@ mod tests {
             SocketRole::Host,
             RpcRequest::RegisterUi {
                 ui_client: Some("standalone".into()),
+                resume_session: None,
                 ctx: RequestContext {
                     uid: Some(1000),
                     sandbox_session_id: Some("sandbox-a".into()),

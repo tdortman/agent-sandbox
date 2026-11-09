@@ -12,9 +12,10 @@
 //! - [`daemon_context`]: `/proc`, persisted session file, and daemon env. Full
 //!   daemon-side resolution for requests that name a process.
 //!
-//! The session-context JSON file at `/run/agent-sandbox/session-context.json`
-//! is read and written here. [`persist_session_paths`] exposes the write side
-//! to daemons.
+//! The session-context JSON file at
+//! `/run/agent-sandbox/shared/session-context.json` is read and written here.
+//! Sandboxes bind that directory, so a replaced file stays visible to them.
+//! [`persist_session_paths`] exposes the write side to daemons.
 
 use std::{
     env,
@@ -40,7 +41,7 @@ pub struct SessionContext {
 
 fn session_context_path() -> PathBuf {
     env::var("AGENT_SANDBOX_SESSION_CONTEXT_PATH").map_or_else(
-        |_| PathBuf::from("/run/agent-sandbox/session-context.json"),
+        |_| PathBuf::from("/run/agent-sandbox/shared/session-context.json"),
         PathBuf::from,
     )
 }

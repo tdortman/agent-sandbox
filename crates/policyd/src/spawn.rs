@@ -387,7 +387,7 @@ mod tests {
     fn launch_command_clears_environment_and_discards_stderr() {
         let args = PolicydArgs {
             host_socket: "/run/agent-sandbox/policy.sock".into(),
-            sandbox_socket: "/run/agent-sandbox/sandbox-policy.sock".into(),
+            sandbox_socket: "/run/agent-sandbox/shared/sandbox-policy.sock".into(),
             proxy_socket: None,
             proxy_gid: None,
             declarative: "/etc/agent-sandbox/policy.json".into(),
