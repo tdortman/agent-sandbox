@@ -7,7 +7,7 @@ use std::{
     fs,
     fs::File,
     io,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     mem::size_of,
     os::{
         fd::{AsFd, AsRawFd, OwnedFd},
@@ -237,26 +237,46 @@ impl SandboxLifetime {
         })
     }
 
-    /// Wait up to `timeout`; true once the peer or its parent has exited.
-    fn ended_within(&self, timeout: Duration) -> bool {
+    /// Wait up to `timeout` for the peer or its parent to exit, or for the
+    /// mount table behind `mountinfo` to change.
+    fn wait(&self, mountinfo: &File, timeout: Duration) -> Wake {
         let mut descriptors = [
             PollFd::new(self.peer.as_fd(), PollFlags::POLLIN),
             PollFd::new(self.parent.as_fd(), PollFlags::POLLIN),
+            PollFd::new(mountinfo.as_fd(), PollFlags::POLLPRI),
         ];
 
         match poll(
             &mut descriptors,
             PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX),
         ) {
-            Ok(ready) => ready > 0,
-            Err(Errno::EINTR) => false,
+            Ok(0) | Err(Errno::EINTR) => Wake::Idle,
+            Ok(_) => {
+                let ready = |descriptor: &PollFd<'_>| {
+                    descriptor
+                        .revents()
+                        .is_some_and(|events| !events.is_empty())
+                };
+                if descriptors[..2].iter().any(ready) {
+                    Wake::Ended
+                } else {
+                    Wake::MountsChanged
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, "cannot poll sandbox process handles");
                 std::thread::sleep(timeout);
-                false
+                Wake::Idle
             }
         }
     }
+}
+
+/// Why [`SandboxLifetime::wait`] returned.
+enum Wake {
+    Ended,
+    MountsChanged,
+    Idle,
 }
 
 /// Maximum ppid hops when searching for the sandbox's outer bwrap.
@@ -283,6 +303,35 @@ struct MountRecord {
     mount_point: PathBuf,
     fstype: String,
     readonly_filesystem: bool,
+    fuse_owner: Option<FuseOwner>,
+}
+
+/// Owner of a FUSE mount, from its `user_id=`/`group_id=` super options.
+/// Without `allow_other`, only processes with exactly these ids, root
+/// included, can resolve paths on the mount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FuseOwner {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+impl FuseOwner {
+    fn parse(fstype: &str, super_options: &str) -> Option<Self> {
+        if fstype != "fuse" && !fstype.starts_with("fuse.") {
+            return None;
+        }
+
+        let option = |key: &str| {
+            super_options
+                .split(',')
+                .find_map(|option| option.strip_prefix(key)?.parse().ok())
+        };
+
+        Some(Self {
+            uid: option("user_id=")?,
+            gid: option("group_id=")?,
+        })
+    }
 }
 
 /// Returns true if the filesystem type is synthetic and should be skipped
@@ -334,26 +383,20 @@ fn parse_mountinfo_content(content: &str) -> Vec<MountRecord> {
             .and_then(|i| fields.get(i + 1))
             .copied()
             .unwrap_or("");
+        let super_options = sep_idx
+            .and_then(|i| fields.get(i + 3))
+            .copied()
+            .unwrap_or("");
 
         mounts.push(MountRecord {
             mount_point: PathBuf::from(mount_point),
             fstype: fstype.to_owned(),
-            readonly_filesystem: sep_idx
-                .and_then(|i| fields.get(i + 3))
-                .is_some_and(|options| options.split(',').any(|option| option == "ro")),
+            readonly_filesystem: super_options.split(',').any(|option| option == "ro"),
+            fuse_owner: FuseOwner::parse(fstype, super_options),
         });
     }
 
     mounts
-}
-
-/// Parse mountinfo for a process before entering its mount namespace.
-fn parse_mountinfo_for_pid(host_proc: &HostProc, pid: u32) -> io::Result<Vec<MountRecord>> {
-    let pid = i32::try_from(pid).map_err(|_| io::Error::other("pid does not fit in pid_t"))?;
-
-    Ok(parse_mountinfo_content(
-        &host_proc.read_to_string(pid, "mountinfo")?,
-    ))
 }
 
 /// Return the deepest mount point that contains `target`.
@@ -801,31 +844,30 @@ fn flush_ignore_marks(shared: &Shared) -> io::Result<()> {
 }
 
 /// Mark each mount point, skipping synthetic filesystem types. Returns whether
-/// a marked mount covers the home directory.
+/// a marked mount covers `home`, or why monitoring under `home` cannot be
+/// guaranteed.
 fn mark_mountpoints(
     fan_fd: impl std::os::fd::AsFd,
     mounts: &[MountRecord],
-    home_covering_mount: Option<&Path>,
-    cli_home: Option<&Path>,
-) -> bool {
+    home: Option<&Path>,
+) -> Result<bool, String> {
+    let home_covering_mount = home.and_then(|home| deepest_covering_mount(mounts, home));
     let mut home_covered = false;
 
     for mount in mounts {
-        if home_covering_mount == Some(mount.mount_point.as_path())
-            && is_synthetic_fs(&mount.fstype)
-        {
-            eprintln!(
-                "agent-sandbox-fsmon: --home {} is on unsupported synthetic filesystem {} at {}; \
-                 cannot guarantee filesystem monitoring",
-                cli_home.map_or_else(|| "?".into(), |h| h.to_string_lossy().into_owned()),
-                mount.fstype,
-                mount.mount_point.display()
-            );
-
-            process::exit(1);
-        }
+        let covers_home = home_covering_mount == Some(mount.mount_point.as_path());
 
         if is_synthetic_fs(&mount.fstype) {
+            if covers_home {
+                return Err(format!(
+                    "--home {} is on unsupported synthetic filesystem {} at {}; cannot guarantee \
+                     filesystem monitoring",
+                    home.map_or_else(|| "?".into(), Path::to_string_lossy),
+                    mount.fstype,
+                    mount.mount_point.display()
+                ));
+            }
+
             tracing::debug!(
                 path = %mount.mount_point.display(),
                 fstype = %mount.fstype,
@@ -838,24 +880,32 @@ fn mark_mountpoints(
         let mp_cstr =
             CString::new(mount.mount_point.as_os_str().as_bytes()).expect("null in mount path");
 
-        match agent_sandbox_sysutil::fanotify_mark(&fan_fd, &mp_cstr) {
+        let marked = match (
+            agent_sandbox_sysutil::fanotify_mark(&fan_fd, &mp_cstr),
+            mount.fuse_owner,
+        ) {
+            (Err(error), Some(owner)) if error.raw_os_error() == Some(libc::EACCES) => {
+                agent_sandbox_sysutil::fanotify_mark_as(&fan_fd, &mp_cstr, owner.uid, owner.gid)
+            }
+            (result, _) => result,
+        };
+
+        match marked {
             Ok(()) => {
-                if home_covering_mount == Some(mount.mount_point.as_path()) {
-                    home_covered = true;
-                }
+                home_covered |= covers_home;
                 tracing::debug!(path = %mount.mount_point.display(), "marked mountpoint");
             }
 
+            Err(e)
+                if covers_home || home.is_some_and(|home| mount.mount_point.starts_with(home)) =>
+            {
+                return Err(format!(
+                    "fanotify_mark {} (under --home): {e}",
+                    mount.mount_point.display()
+                ));
+            }
+
             Err(e) => {
-                if home_covering_mount == Some(mount.mount_point.as_path())
-                    || cli_home.is_some_and(|home| mount.mount_point.starts_with(home))
-                {
-                    eprintln!(
-                        "agent-sandbox-fsmon: fanotify_mark {} (under --home): {e}",
-                        mount.mount_point.display()
-                    );
-                    process::exit(1);
-                }
                 tracing::warn!(
                     path = %mount.mount_point.display(),
                     fstype = %mount.fstype,
@@ -866,7 +916,60 @@ fn mark_mountpoints(
         }
     }
 
-    home_covered
+    Ok(home_covered)
+}
+
+/// The target's mount table. Mounts that appear after startup, such as a FUSE
+/// daemon started later or an automount, propagate into the sandbox unmarked
+/// until they are marked here.
+struct MountWatch {
+    mountinfo: File,
+    home: Option<PathBuf>,
+}
+
+impl MountWatch {
+    /// Open before the first [`Self::read`]: every later change to the mount
+    /// table raises `POLLPRI` on this descriptor.
+    fn open(host_proc: &HostProc, pid: i32, home: Option<PathBuf>) -> io::Result<Self> {
+        Ok(Self {
+            mountinfo: host_proc.open_entry(pid, "mountinfo")?,
+            home,
+        })
+    }
+
+    fn read(&mut self) -> io::Result<Vec<MountRecord>> {
+        let mut content = String::new();
+        self.mountinfo.seek(SeekFrom::Start(0))?;
+        self.mountinfo.read_to_string(&mut content)?;
+        Ok(parse_mountinfo_content(&content))
+    }
+}
+
+/// Mark the target's mounts again after its mount table changed. Repeating a
+/// mark on an already marked mount only repeats its mask, so mount id reuse
+/// cannot hide a new mount. A mount under home that cannot be marked would
+/// leave part of home unmonitored, so the sandbox is stopped instead.
+fn remark_mounts(shared: &Shared, watch: &mut MountWatch) {
+    let result = watch
+        .read()
+        .map_err(|error| format!("cannot read target mountinfo: {error}"))
+        .and_then(|mounts| mark_mountpoints(&shared.fan_fd, &mounts, watch.home.as_deref()));
+
+    let Err(reason) = result else {
+        return;
+    };
+
+    tracing::error!(%reason, "new mount cannot be monitored; stopping sandbox");
+    match &shared.scope_kill {
+        Some(scope) => {
+            if let Err(error) = scope.kill() {
+                tracing::error!(%error, "cannot stop sandbox scope");
+            }
+        }
+        None => {
+            tracing::error!("sandbox has no own scope to stop; the new mount stays unmonitored");
+        }
+    }
 }
 
 /// Immutable cgroup identity captured from the sandbox root before `setns`.
@@ -1102,7 +1205,7 @@ fn log_stats(stats: &FsmonStats, reason: &str) {
 
 /// Run permission readers and policy refresh independently of the control
 /// loop, so shutdown and counters remain responsive even during approval waits.
-fn run_event_loop(shared: Shared) {
+fn run_event_loop(shared: Shared, mut mount_watch: MountWatch) {
     let shared = Arc::new(shared);
 
     for _ in 0..std::thread::available_parallelism()
@@ -1118,7 +1221,13 @@ fn run_event_loop(shared: Shared) {
     let mut last_stats_log = Instant::now();
 
     loop {
-        let sandbox_ended = shared.lifetime.ended_within(CONTROL_POLL_INTERVAL);
+        let wake = shared
+            .lifetime
+            .wait(&mount_watch.mountinfo, CONTROL_POLL_INTERVAL);
+        if matches!(wake, Wake::MountsChanged) {
+            remark_mounts(&shared, &mut mount_watch);
+        }
+        let sandbox_ended = matches!(wake, Wake::Ended);
 
         if sandbox_ended {
             tracing::info!("sandbox ended; stopping its scope");
@@ -1410,13 +1519,6 @@ fn main() {
         process::exit(1);
     });
 
-    // Read mountinfo through the host procfs before entering the target
-    // namespace.
-    let mounts = parse_mountinfo_for_pid(&host_proc, cli.pid).unwrap_or_else(|e| {
-        eprintln!("agent-sandbox-fsmon: failed to parse target mountinfo: {e}");
-        process::exit(1);
-    });
-
     // Resolve the request context before joining the sandbox mount namespace.
     // wire_context reads /run/agent-sandbox/session-context.json, and after
     // mark_mountpoints installs FAN_OPEN_PERM marks below, that read would
@@ -1434,6 +1536,18 @@ fn main() {
 
     let target_pid = i32::try_from(cli.pid).unwrap_or_else(|_| {
         eprintln!("agent-sandbox-fsmon: --pid does not fit in pid_t");
+        process::exit(1);
+    });
+
+    // Read mountinfo through the host procfs before entering the target
+    // namespace. The watch stays open to mark mounts added later.
+    let mut mount_watch = MountWatch::open(&host_proc, target_pid, cli.home.clone())
+        .unwrap_or_else(|e| {
+            eprintln!("agent-sandbox-fsmon: failed to open target mountinfo: {e}");
+            process::exit(1);
+        });
+    let mounts = mount_watch.read().unwrap_or_else(|e| {
+        eprintln!("agent-sandbox-fsmon: failed to parse target mountinfo: {e}");
         process::exit(1);
     });
     let sandbox_cgroup = SandboxCgroup::read(&host_proc, target_pid).unwrap_or_else(|| {
@@ -1476,18 +1590,11 @@ fn main() {
         })
         .collect();
 
-    let home_covering_mount = cli
-        .home
-        .as_deref()
-        .and_then(|home| deepest_covering_mount(&mounts, home))
-        .map(Path::to_path_buf);
-
-    let home_covered = mark_mountpoints(
-        &fd,
-        &mounts,
-        home_covering_mount.as_deref(),
-        cli.home.as_deref(),
-    );
+    let home_covered =
+        mark_mountpoints(&fd, &mounts, cli.home.as_deref()).unwrap_or_else(|reason| {
+            eprintln!("agent-sandbox-fsmon: {reason}");
+            process::exit(1);
+        });
 
     // Before signaling ready, require that at least one marked mount covers
     // --home.
@@ -1515,23 +1622,28 @@ fn main() {
         tracing::warn!(%error, "cannot install shutdown signals; ignore marks will not be flushed");
     }
 
-    run_event_loop(Shared {
-        fan_fd: fd,
-        self_pid,
-        sandbox_cgroup,
-        host_proc,
-        ctx,
-        socket_path: cli.socket,
-        policy: RwLock::new(policy),
-        ignore_marks: (cli.fs_ignore_static_allows && scope_kill.is_some()).then(|| IgnoreMarks {
-            readonly_devices,
-            marked: Mutex::new(HashSet::new()),
-            cap_warned: AtomicBool::new(false),
-        }),
-        scope_kill,
-        lifetime,
-        stats: FsmonStats::default(),
-    });
+    run_event_loop(
+        Shared {
+            fan_fd: fd,
+            self_pid,
+            sandbox_cgroup,
+            host_proc,
+            ctx,
+            socket_path: cli.socket,
+            policy: RwLock::new(policy),
+            ignore_marks: (cli.fs_ignore_static_allows && scope_kill.is_some()).then(|| {
+                IgnoreMarks {
+                    readonly_devices,
+                    marked: Mutex::new(HashSet::new()),
+                    cap_warned: AtomicBool::new(false),
+                }
+            }),
+            scope_kill,
+            lifetime,
+            stats: FsmonStats::default(),
+        },
+        mount_watch,
+    );
 }
 
 /// Note a terminate request for the control loop. Runs in signal context:
@@ -1837,13 +1949,20 @@ mod tests {
             .spawn()
             .expect("spawn peer");
         let lifetime = SandboxLifetime::open(&host_proc, peer.id()).expect("watch peer");
+        let mountinfo = File::open("/proc/self/mountinfo").expect("open mountinfo");
 
-        assert!(!lifetime.ended_within(Duration::from_millis(50)));
+        assert!(!matches!(
+            lifetime.wait(&mountinfo, Duration::from_millis(50)),
+            Wake::Ended
+        ));
 
         peer.kill().expect("kill peer");
         peer.wait().expect("reap peer");
 
-        assert!(lifetime.ended_within(Duration::from_secs(5)));
+        assert!(matches!(
+            lifetime.wait(&mountinfo, Duration::from_secs(5)),
+            Wake::Ended
+        ));
     }
 
     #[test]
@@ -1897,6 +2016,29 @@ mod tests {
         assert!(is_synthetic_fs("proc"));
         assert!(is_synthetic_fs("sysfs"));
         assert!(is_synthetic_fs("cgroup2"));
+    }
+
+    #[test]
+    fn fuse_owner_comes_from_super_options_of_fuse_mounts_only() {
+        let mounts = parse_mountinfo_content(
+            "578 55 0:219 / /home/tim/checkouts rw,nosuid,nodev,noatime shared:1091 - fuse.ovnfs \
+             ovnfs rw,user_id=1000,group_id=100,default_permissions,max_read=1048576\n90 30 0:50 \
+             / /mnt/gdrive rw,nosuid,nodev,relatime shared:60 - fuse.rclone gdrive: \
+             rw,user_id=0,group_id=0,allow_other\n55 1 0:33 /home /home rw,noatime shared:5 - \
+             btrfs /dev/nvme1n1p2 rw,user_id=7,group_id=7\n91 30 0:51 / /mnt/broken rw shared:61 \
+             - fuse.x x rw,user_id=1000\n",
+        );
+        let owners: Vec<_> = mounts.iter().map(|mount| mount.fuse_owner).collect();
+
+        assert_eq!(owners, [
+            Some(FuseOwner {
+                uid: 1000,
+                gid: 100
+            }),
+            Some(FuseOwner { uid: 0, gid: 0 }),
+            None,
+            None,
+        ]);
     }
 
     #[test]

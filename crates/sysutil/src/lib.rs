@@ -699,6 +699,10 @@ pub fn fanotify_init_content() -> io::Result<FanotifyInit> {
 /// # Errors
 /// Returns an error if the mark cannot be applied.
 pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
+    mark_mount(fan_fd.as_fd().as_raw_fd(), path)
+}
+
+fn mark_mount(fan_fd: libc::c_int, path: &CStr) -> io::Result<()> {
     let mask = FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
 
     // SAFETY: `fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
@@ -706,7 +710,7 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_fanotify_mark,
-            fan_fd.as_fd().as_raw_fd(),
+            fan_fd,
             i64::from(FAN_MARK_ADD | FAN_MARK_MOUNT),
             mask,
             libc::AT_FDCWD,
@@ -714,11 +718,109 @@ pub fn fanotify_mark(fan_fd: impl AsFd, path: &CStr) -> io::Result<()> {
         )
     };
 
-    if ret == 0 {
-        return Ok(());
-    }
+    syscall_ok(ret)
+}
 
-    Err(io::Error::last_os_error())
+/// Like [`fanotify_mark`], but resolve `path` as `uid`/`gid` in a forked
+/// child that keeps `CAP_SYS_ADMIN`.
+///
+/// A FUSE mount without `allow_other` refuses every process whose real,
+/// effective and saved ids differ from the mount owner's, root included. The
+/// mark lands in the shared fanotify group, so the caller's own credentials
+/// never change. The child makes only raw syscalls, so a multi-threaded
+/// caller is safe.
+///
+/// # Errors
+/// Returns the child's errno if the mark cannot be applied, or an error if the
+/// child cannot be forked or reaped.
+pub fn fanotify_mark_as(
+    fan_fd: impl AsFd,
+    path: &CStr,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> io::Result<()> {
+    let fan_fd = fan_fd.as_fd().as_raw_fd();
+
+    // SAFETY: the child runs only raw syscalls before `_exit`.
+    match unsafe { nix::unistd::fork() }.map_err(io::Error::from)? {
+        nix::unistd::ForkResult::Child => {
+            let code = match mark_mount_as(fan_fd, path, uid, gid) {
+                Ok(()) => 0,
+                Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
+            };
+            // SAFETY: `_exit` skips the parent's atexit handlers and buffers.
+            unsafe { libc::_exit(code) }
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            match nix::sys::wait::waitpid(child, None).map_err(io::Error::from)? {
+                nix::sys::wait::WaitStatus::Exited(_, 0) => Ok(()),
+                nix::sys::wait::WaitStatus::Exited(_, code) => {
+                    Err(io::Error::from_raw_os_error(code))
+                }
+                status => Err(io::Error::other(format!(
+                    "fanotify mark helper ended abnormally: {status:?}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Kernel `struct __user_cap_header_struct`.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// Kernel `struct __user_cap_data_struct`.
+#[repr(C)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+/// `CAP_SYS_ADMIN` from `linux/capability.h`; `libc` does not export it.
+const CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
+
+fn mark_mount_as(
+    fan_fd: libc::c_int,
+    path: &CStr,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> io::Result<()> {
+    // SAFETY: plain syscalls on integer arguments.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_prctl, libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) })?;
+    // SAFETY: plain syscall on integer arguments; ids change while still root.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_setresgid, gid, gid, gid) })?;
+    let groups = [gid];
+    // SAFETY: `groups` holds one live gid for the call. Root's supplementary
+    // groups still make the mount refuse the lookup.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_setgroups, 1, groups.as_ptr()) })?;
+    // SAFETY: plain syscall on integer arguments.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_setresuid, uid, uid, uid) })?;
+
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [
+        CapData {
+            effective: CAP_SYS_ADMIN_BIT,
+            permitted: CAP_SYS_ADMIN_BIT,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    // SAFETY: the header and both data words are live for the call.
+    syscall_ok(unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr()) })?;
+
+    mark_mount(fan_fd, path)
 }
 
 /// Add an ignore mask of permission events to the inode pinned by the event
