@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    ApprovalScope, CheckReply, ElevateReply, FilesystemCheckReply, FilesystemMonitorReply,
-    HttpCheckReply, ProxyReply, ProxyReplyBody, ProxyRequestId, RegisterUiReply,
-    ResourceCheckReply, RpcMessage, RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply,
-    StatusReply, UiPush, Verdict, VerdictSource,
+    ApprovalScope, CheckReply, FilesystemCheckReply, FilesystemMonitorReply, HttpCheckReply,
+    ProxyReply, ProxyReplyBody, ProxyRequestId, RegisterUiReply, ResourceCheckReply, RpcMessage,
+    RpcReply, RpcRequest, ScopeActionReply, SimpleOkReply, StatusReply, UiPush, Verdict,
+    VerdictSource,
 };
 use crate::{
     ResourceKind,
@@ -143,19 +143,6 @@ fn blocked_http_reply_without_request_deserializes() {
 }
 
 #[test]
-fn filesystem_monitor_error_reply_deserializes_as_monitor() {
-    let reply: RpcReply = serde_json::from_str(
-        r#"{"ok":true,"active":false,"error":"fs_monitor_cmd not configured"}"#,
-    )
-    .expect("deserialize monitor reply");
-
-    assert!(matches!(
-        reply,
-        RpcReply::FilesystemMonitor(FilesystemMonitorReply { active: false, .. })
-    ));
-}
-
-#[test]
 fn status_reply_includes_merged_policy() {
     let reply = StatusReply {
         ok: true,
@@ -173,49 +160,18 @@ fn status_reply_includes_merged_policy() {
 }
 
 #[test]
-fn check_reply_deserializes_as_check_not_simple() {
-    let line = serde_json::to_string(&CheckReply::allowed(VerdictSource::Scope(
-        ApprovalScope::Once,
-    )))
-    .expect("serialize rpc reply");
-
-    let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
-
-    assert!(matches!(
-        reply,
-        RpcReply::Check(c) if c.verdict.allowed
-            && c.verdict.source == VerdictSource::Scope(ApprovalScope::Once)
-    ));
-}
-
-#[test]
 fn package_scope_verdict_sources_round_trip() {
     for scope in [ApprovalScope::ProjectPackage, ApprovalScope::GlobalPackage] {
         let line = serde_json::to_string(&CheckReply::allowed(VerdictSource::Scope(scope)))
-            .expect("serialize rpc reply");
+            .expect("serialize check reply");
 
-        let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
+        let reply: CheckReply = serde_json::from_str(&line).expect("deserialize check reply");
 
-        assert!(matches!(
-            reply,
-            RpcReply::Check(c)
-                if c.verdict.allowed
-                    && matches!(c.verdict.source, VerdictSource::Scope(s) if s == scope)
-        ));
+        assert!(
+            reply.verdict.allowed
+                && matches!(reply.verdict.source, VerdictSource::Scope(s) if s == scope)
+        );
     }
-}
-
-#[test]
-fn elevate_reply_deserializes_as_elevate_not_simple() {
-    let line = serde_json::to_string(&ElevateReply::executed(0, "root\n".into(), String::new()))
-        .expect("serialize rpc reply");
-
-    let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
-
-    assert!(matches!(
-        reply,
-        RpcReply::Elevate(e) if e.allowed && e.exit_code == 0 && e.stdout == "root\n"
-    ));
 }
 
 #[test]
@@ -258,43 +214,23 @@ fn filesystem_monitor_reply_roundtrip() {
 }
 
 #[test]
-fn filesystem_check_reply_deserializes_as_filesystem_check() {
-    let line = serde_json::to_string(&FilesystemCheckReply::allowed(
-        VerdictSource::Scope(ApprovalScope::Once),
-        "/data".into(),
-        FileAccess::All,
-    ))
-    .expect("serialize rpc reply");
-
-    let reply: RpcReply = serde_json::from_str(&line).expect("deserialize rpc reply");
-
-    assert!(matches!(
-        reply,
-        RpcReply::FilesystemCheck(c)
-            if c.verdict.allowed
-                && c.verdict.source == VerdictSource::Scope(ApprovalScope::Once)
-                && c.path == Path::new("/data")
-    ));
-}
-
-#[test]
 fn check_reply_roundtrips_allow_comment_wire_string() {
     let line = r#"{"ok":true,"allowed":true,"source":"allow:trusted policy file"}"#;
-    let reply: RpcReply = serde_json::from_str(line).expect("deserialize rpc reply");
+    let reply: CheckReply = serde_json::from_str(line).expect("deserialize check reply");
 
     assert!(matches!(
         &reply,
-        RpcReply::Check(CheckReply {
+        CheckReply {
             verdict: Verdict {
                 allowed: true,
                 source,
             },
             error: None,
             ..
-        }) if source == &VerdictSource::policy_with_comment("trusted policy file")
+        } if source == &VerdictSource::policy_with_comment("trusted policy file")
     ));
 
-    let json = serde_json::to_value(&reply).expect("serialize rpc reply");
+    let json = serde_json::to_value(&reply).expect("serialize check reply");
     assert_eq!(json["source"], "allow:trusted policy file");
 }
 

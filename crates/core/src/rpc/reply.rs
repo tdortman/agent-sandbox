@@ -24,7 +24,6 @@ use crate::{
 /// The request identifier is part of the response rather than relying on
 /// response ordering, because proxy checks may complete out of order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProxyReply {
     /// Identifier of the request this reply answers.
     pub request_id: ProxyRequestId,
@@ -71,14 +70,14 @@ impl ProxyReply {
 
 /// policyd → client response line.
 ///
-/// Variants with optional `error` fields come before `Error` so untagged
-/// serde does not greedily match them as `Error`. `Simple` must be last:
-/// it only has `ok`, so it would otherwise accept any `{"ok": true, ...}`
-/// object and drop fields.
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+/// Tagged by `result`, so a client selects the variant by name. Reply
+/// structs accept fields they do not know: a sandbox launched before a
+/// policyd upgrade keeps decoding replies that gained fields since.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
 pub enum RpcReply {
     /// Kernel-captured task and grants selected by the daemon's policy store.
+    #[serde(skip_deserializing)]
     NetworkSnapshot {
         /// Captured task facts; no publisher-supplied path overrides.
         context: Box<crate::network_snapshot::CapturedNetworkContext>,
@@ -141,63 +140,6 @@ pub enum RpcReply {
     Simple(SimpleOkReply),
 }
 
-impl<'de> Deserialize<'de> for RpcReply {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Snapshot {
-            filesystem: crate::FilesystemSection,
-            denied_inodes: std::collections::HashSet<crate::InodeIdentity>,
-        }
-
-        let value = serde_json::Value::deserialize(deserializer)?;
-        if value.get("filesystem").is_some() {
-            return serde_json::from_value(value)
-                .map(|snapshot: Snapshot| Self::FilesystemSnapshot {
-                    filesystem: snapshot.filesystem,
-                    denied_inodes: snapshot.denied_inodes,
-                })
-                .map_err(serde::de::Error::custom);
-        }
-
-        macro_rules! try_variant {
-            ($variant:ident, $ty:ty) => {
-                match serde_json::from_value::<$ty>(value.clone()) {
-                    Ok(reply) => return Ok(Self::$variant(reply)),
-                    Err(err) => {
-                        let err = err.to_string();
-                        if err.contains("invalid source") {
-                            return Err(serde::de::Error::custom(err));
-                        }
-                    }
-                }
-            };
-        }
-
-        try_variant!(Proxy, ProxyReply);
-        try_variant!(ProxySession, ProxySessionReply);
-        try_variant!(FlowClaim, FlowClaimReply);
-        try_variant!(RegisterUi, RegisterUiReply);
-        try_variant!(FilesystemCheck, FilesystemCheckReply);
-        try_variant!(ResourceCheck, ResourceCheckReply);
-        try_variant!(FilesystemMonitor, FilesystemMonitorReply);
-        try_variant!(DbusCheck, DbusCheckReply);
-        try_variant!(Check, CheckReply);
-        try_variant!(HttpCheck, HttpCheckReply);
-        try_variant!(Elevate, ElevateReply);
-        try_variant!(ScopeAction, ScopeActionReply);
-        try_variant!(Status, StatusReply);
-        try_variant!(Error, ErrorReply);
-        try_variant!(Simple, SimpleOkReply);
-
-        Err(serde::de::Error::custom(
-            "data did not match any RpcReply variant",
-        ))
-    }
-}
-
 /// Failure reply carrying a human-readable error message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorReply {
@@ -232,7 +174,6 @@ impl From<ScopeResolveError> for RpcReply {
 
 /// Minimal success acknowledgment, carrying only an `ok` flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SimpleOkReply {
     /// Whether the operation succeeded.
     pub ok: bool,
@@ -440,7 +381,6 @@ impl Serialize for Verdict {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireVerdict {
     allowed: bool,
     source: String,
@@ -469,7 +409,6 @@ impl From<ApprovalScope> for VerdictSource {
 
 /// Result of a network-flow access check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
@@ -518,7 +457,6 @@ impl CheckReply {
 
 /// HTTP request verdict with the exact normalized request echoed on success.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HttpCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
@@ -561,7 +499,6 @@ impl HttpCheckReply {
 
 /// Reply acknowledging creation of a proxied session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProxySessionReply {
     /// Whether the session was created.
     pub ok: bool,
@@ -572,7 +509,6 @@ pub struct ProxySessionReply {
 
 /// Reply to a claim of a network flow for attribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FlowClaimReply {
     /// Whether the flow was claimed.
     pub ok: bool,
@@ -595,7 +531,6 @@ pub struct FlowClaimReply {
 
 /// Result of a network-flow access check carried on an untyped wire body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NetworkFlowCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
@@ -669,7 +604,6 @@ impl ElevateReply {
 
 /// Result of a filesystem access check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FilesystemCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
@@ -729,7 +663,6 @@ impl FilesystemCheckReply {
 
 /// Result of a resource access check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResourceCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
@@ -814,7 +747,6 @@ impl ResourceCheckReply {
 
 /// Result of a D-Bus access check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DbusCheckReply {
     /// Whether the request was processed (protocol-level success).
     pub ok: bool,
@@ -1234,28 +1166,8 @@ impl fmt::Display for RpcReply {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ApprovalScope, DbusCheckReply, DbusTarget, RpcReply, ScopeActionReply, VerdictSource,
-    };
+    use super::{ApprovalScope, DbusCheckReply, DbusTarget, ScopeActionReply, VerdictSource};
     use crate::policy::DbusMessageKind;
-
-    #[test]
-    fn scope_action_reply_deserializes_as_scope_action() {
-        let line = serde_json::to_string(&ScopeActionReply::ok_network(
-            "example.com".into(),
-            443,
-            ApprovalScope::Once,
-            None,
-        ))
-        .unwrap();
-
-        let reply: RpcReply = serde_json::from_str(&line).unwrap();
-
-        assert!(matches!(
-            reply,
-            RpcReply::ScopeAction(ScopeActionReply::Network { .. })
-        ));
-    }
 
     #[test]
     fn scope_action_reply_omits_irrelevant_fields() {

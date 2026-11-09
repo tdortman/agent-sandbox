@@ -325,7 +325,7 @@ mod tests {
         }
     }
 
-    const ALLOWED_REPLY: &[u8] = br#"{"ok":true,"allowed":true,"source":"allow"}
+    const ALLOWED_REPLY: &[u8] = br#"{"result":"check","ok":true,"allowed":true,"source":"allow"}
 "#;
 
     #[tokio::test]
@@ -471,7 +471,7 @@ mod tests {
             let mut reader = BufReader::new(read);
             assert!(reader.read_line(&mut line).await.expect("read request") > 0);
             write
-                .write_all(br#"{"ok":true,"allowed":true,"source":"allow"}"#)
+                .write_all(br#"{"result":"check","ok":true,"allowed":true,"source":"allow"}"#)
                 .await
                 .expect("write incomplete reply");
         });
