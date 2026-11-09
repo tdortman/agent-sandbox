@@ -760,6 +760,11 @@ in
 
             wantedBy = [ "multi-user.target" ];
 
+            # Restart in place on a config switch. A stop-and-start makes
+            # switch-to-configuration also restart agent-sandbox-policy.socket,
+            # which replaces the socket inode running sandboxes bind-mounted.
+            stopIfChanged = false;
+
             serviceConfig = {
               Type = "simple";
 

@@ -48,6 +48,10 @@ pkgs.testers.runNixOSTest (_: {
         };
 
         boot.kernel.sysctl."kernel.yama.ptrace_scope" = 1;
+
+        # A changed policyd unit, as a system update produces.
+        specialisation.changed-policyd.configuration.systemd.services.agent-sandbox-policy.environment.AGENT_SANDBOX_TEST_GENERATION =
+          "changed";
       }
     );
 
@@ -132,6 +136,17 @@ pkgs.testers.runNixOSTest (_: {
     # The same sandbox keeps mutating and stays confined.
     mutate_and_check("after-restart")
     probe("read", "/var/lib/agent-sandbox-test/dynamic-read")
+    probe("read", "/var/lib/agent-sandbox-test/dynamic-unlisted", allowed=False)
+    dynamic.succeed(command("kill", "-0", fsmon_pid))
+
+    # A system switch that changes the policyd unit keeps the same socket
+    # inode, so the running sandbox still reaches the new policyd.
+    policyd_pid = dynamic.succeed("systemctl show -p MainPID --value agent-sandbox-policy.service").strip()
+    dynamic.succeed("/run/booted-system/specialisation/changed-policyd/bin/switch-to-configuration test")
+    dynamic.wait_for_unit("agent-sandbox-policy.service")
+    assert dynamic.succeed("systemctl show -p MainPID --value agent-sandbox-policy.service").strip() != policyd_pid
+    assert dynamic.succeed(command("stat", "-c", "%i", sandbox_socket)).strip() == socket_inode
+    mutate_and_check("after-switch")
     probe("read", "/var/lib/agent-sandbox-test/dynamic-unlisted", allowed=False)
     dynamic.succeed(command("kill", "-0", fsmon_pid))
 
