@@ -413,24 +413,33 @@ impl PolicyStore {
     }
 
     /// Read the launcher env vars and `/proc` paths for a verified sandbox
-    /// peer, then constrain the project root to the registered one.
+    /// peer, then hold the project root to the registered one.
     fn peer_paths(
         pid: u32,
         trusted_uid: Option<u32>,
         registration: Option<&SandboxSessionRegistration>,
     ) -> PeerPaths {
         let proc = peer_context(pid, trusted_uid);
-        let cwd = proc.cwd;
-        let mut project_root = proc.project_root;
+        let registered = registration
+            .map(|reg| &reg.project_root)
+            .filter(|root| !root.as_os_str().is_empty());
 
-        if let (Some(pr), Some(reg)) = (&project_root, registration)
-            && !reg.project_root.as_os_str().is_empty()
-            && !is_path_descendant(pr, &reg.project_root)
-        {
-            project_root = None;
+        // Session members whose environment lacks the claim (tools such as
+        // an agent's Python kernel start with a scrubbed env) or names a root
+        // outside the session get the session's own root.
+        let project_root = match registered {
+            Some(root) => Some(
+                proc.project_root
+                    .filter(|pr| is_path_descendant(pr, root))
+                    .unwrap_or_else(|| root.clone()),
+            ),
+            None => proc.project_root,
+        };
+
+        PeerPaths {
+            cwd: proc.cwd,
+            project_root,
         }
-
-        PeerPaths { cwd, project_root }
     }
 
     fn resolve_from_peer(
@@ -1263,6 +1272,15 @@ mod tests {
             resolved.package.as_deref(),
             Some("codex"),
             "the broker's tracee must be attributed to its session"
+        );
+
+        // The tracee carries no AGENT_SANDBOX_PROJECT_ROOT under /work/project
+        // (a scrubbed-env tool such as a Python kernel); it must still get the
+        // session's project policy layer.
+        assert_eq!(
+            resolved.paths.project_root(),
+            Some(Path::new("/work/project")),
+            "a tracee without a project root claim must use the registered root"
         );
     }
 
