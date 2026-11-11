@@ -517,23 +517,78 @@ pub fn read_proc_mem(mem_path: &Path, addr: u64, buf: &mut [u8]) -> io::Result<(
     Ok(())
 }
 
-/// Read a NUL-terminated path pointer from the tracee via `read_bytes`, which
-/// fetches `len` bytes from the tracee at `addr`. Returns `None` for a null
-/// pointer or non-UTF-8 path.
+/// Longest pathname the kernel accepts, terminating NUL included.
+pub const PATH_MAX: usize = 4096;
+
+/// Prefix length read first: nearly every pathname fits, and the copy is paid
+/// on every notified open.
+const SHORT_PATH: usize = 256;
+
+/// Read the NUL-terminated pathname at `addr`, without the terminator.
+///
+/// `read_bytes` fetches up to `len` bytes of tracee memory; a short result is
+/// a partial read that ran into unmapped memory.
+///
+/// Reads a short prefix first and only reads up to [`PATH_MAX`] when that
+/// prefix has no terminator. The result is never a truncated prefix: a name
+/// with no NUL within [`PATH_MAX`] bytes is `ENAMETOOLONG`, and one cut short
+/// by unmapped memory is `EFAULT`, as the kernel would report.
 ///
 /// # Errors
-/// Returns the error from `read_bytes` when the tracee memory cannot be read.
+/// `EFAULT` for a null pointer or unreadable memory, `ENAMETOOLONG` for an
+/// unterminated name, or the error from `read_bytes`.
+pub fn read_tracee_path_with<R>(mut read_bytes: R, addr: u64) -> io::Result<Vec<u8>>
+where
+    R: FnMut(u64, usize) -> io::Result<Vec<u8>>,
+{
+    if addr == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EFAULT));
+    }
+
+    let mut asked = SHORT_PATH;
+    let mut bytes = read_bytes(addr, asked)?;
+
+    if bytes.len() == asked && !bytes.contains(&0) {
+        asked = PATH_MAX;
+        bytes = read_bytes(addr, asked)?;
+    }
+
+    let Some(end) = bytes.iter().position(|&byte| byte == 0) else {
+        let errno = if bytes.len() == asked && asked == PATH_MAX {
+            libc::ENAMETOOLONG
+        } else {
+            libc::EFAULT
+        };
+        return Err(io::Error::from_raw_os_error(errno));
+    };
+
+    bytes.truncate(end);
+    Ok(bytes)
+}
+
+/// [`read_tracee_path_with`] over the default tracee memory readers.
+///
+/// # Errors
+/// See [`read_tracee_path_with`].
+pub fn read_tracee_path(pid: u32, addr: u64) -> io::Result<Vec<u8>> {
+    read_tracee_path_with(|addr, len| read_tracee_bytes(pid, addr, len), addr)
+}
+
+/// [`read_tracee_path_with`] for a caller that treats a null pointer or a
+/// non-UTF-8 name as "no path".
+///
+/// # Errors
+/// See [`read_tracee_path_with`]; a null pointer is `Ok(None)`.
 pub fn read_tracee_path_ptr_with<R>(read_bytes: R, path_ptr: u64) -> io::Result<Option<PathBuf>>
 where
-    R: FnOnce(u64, usize) -> io::Result<Vec<u8>>,
+    R: FnMut(u64, usize) -> io::Result<Vec<u8>>,
 {
     if path_ptr == 0 {
         return Ok(None);
     }
 
-    let bytes = read_bytes(path_ptr, 4096)?;
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Ok(std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from))
+    let bytes = read_tracee_path_with(read_bytes, path_ptr)?;
+    Ok(String::from_utf8(bytes).ok().map(PathBuf::from))
 }
 
 /// Read the `SO_TYPE` of a socket fd. Returns `None` on any failure so
@@ -1426,5 +1481,60 @@ mod tests {
         let mut buf = [0_u8; 1];
         let mut file = std::fs::File::from(dup);
         assert_eq!(std::io::Read::read(&mut file, &mut buf).unwrap_or(0), 0);
+    }
+
+    fn self_path_reader() -> impl FnMut(u64, usize) -> io::Result<Vec<u8>> {
+        |addr, len| read_tracee_bytes(std::process::id(), addr, len)
+    }
+
+    #[test]
+    fn path_reader_stops_at_the_terminator_after_one_short_read() {
+        let name = b"/dev/kvm\0trailing";
+        let mut reads = 0;
+        let path = read_tracee_path_with(
+            |addr, len| {
+                reads += 1;
+                read_tracee_bytes(std::process::id(), addr, len)
+            },
+            name.as_ptr() as u64,
+        )
+        .expect("read path");
+        assert_eq!(path, b"/dev/kvm");
+        assert_eq!(reads, 1, "a short name costs a single read");
+    }
+
+    #[test]
+    fn path_reader_reads_names_longer_than_the_short_prefix() {
+        let mut name = vec![b'a'; 300];
+        name.push(0);
+        let path = read_tracee_path_with(self_path_reader(), name.as_ptr() as u64)
+            .expect("read long path");
+        assert_eq!(path.len(), 300);
+    }
+
+    #[test]
+    fn path_reader_rejects_names_without_a_terminator_within_path_max() {
+        let unterminated = vec![b'a'; PATH_MAX];
+        let error = read_tracee_path_with(self_path_reader(), unterminated.as_ptr() as u64)
+            .expect_err("unterminated name");
+        assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+        let ptr_error = read_tracee_path_ptr_with(self_path_reader(), unterminated.as_ptr() as u64)
+            .expect_err("unterminated name");
+        assert_eq!(ptr_error.raw_os_error(), Some(libc::ENAMETOOLONG));
+    }
+
+    #[test]
+    fn path_reader_reports_unreadable_memory_as_efault() {
+        let null = read_tracee_path_with(self_path_reader(), 0).expect_err("null pointer");
+        assert_eq!(null.raw_os_error(), Some(libc::EFAULT));
+        assert_eq!(
+            read_tracee_path_ptr_with(self_path_reader(), 0).expect("null path"),
+            None
+        );
+
+        // A read cut short by unmapped memory carries no terminator.
+        let cut = read_tracee_path_with(|_, _| Ok(b"abc".to_vec()), 1).expect_err("cut name");
+        assert_eq!(cut.raw_os_error(), Some(libc::EFAULT));
     }
 }

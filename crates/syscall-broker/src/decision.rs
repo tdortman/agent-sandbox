@@ -2,8 +2,8 @@ use std::{io, path::Path, time::Duration};
 
 use agent_sandbox_core::{FileAccess, FilesystemCheckReply, ResourceCheckReply, VerdictSource};
 use agent_sandbox_syscall_broker::{
-    FilesystemTarget, PersistentPolicyClient, ResourceTarget, SeccompNotif, SyscallTarget,
-    target_from_notification,
+    FilesystemTarget, PersistentPolicyClient, Resolver, ResourceTarget, SeccompNotif,
+    SyscallTarget, target_from_notification,
 };
 
 /// Facts extracted from a raw seccomp notification before policy evaluation.
@@ -32,8 +32,11 @@ impl NormalizedNotification {
 }
 
 /// Convert a kernel notification into policy-independent facts.
-pub fn normalize(notif: &SeccompNotif) -> Result<NormalizedNotification, io::Error> {
-    target_from_notification(notif).map(|target| match target {
+pub fn normalize(
+    resolver: &Resolver,
+    notif: &SeccompNotif,
+) -> Result<NormalizedNotification, io::Error> {
+    target_from_notification(resolver, notif).map(|target| match target {
         None => NormalizedNotification::Continue,
         Some(SyscallTarget::Errno(errno)) => NormalizedNotification::Deny { errno },
         Some(target) => NormalizedNotification::Target { target },
@@ -221,8 +224,8 @@ impl ResponsePlan {
     }
 }
 
-pub fn normalize_or_failure(notif: &SeccompNotif) -> NormalizedNotification {
-    match normalize(notif) {
+pub fn normalize_or_failure(resolver: &Resolver, notif: &SeccompNotif) -> NormalizedNotification {
+    match normalize(resolver, notif) {
         Ok(facts) => facts,
 
         Err(error) => {
@@ -241,7 +244,8 @@ mod tests {
         ResourceKind, Verdict, VerdictSource, policy::FilesystemCheck,
     };
     use agent_sandbox_syscall_broker::{
-        FilesystemMutation, FilesystemTarget, PersistentPolicyClient, ResourceTarget,
+        DeviceCapture, FilesystemMutation, FilesystemTarget, PersistentPolicyClient,
+        ResourceCapture, ResourceTarget,
     };
 
     use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
@@ -251,10 +255,16 @@ mod tests {
             kind: ResourceKind::Device,
             path: "/dev/example".into(),
             access: ResourceAccess::Device(DeviceAccess::Read),
-            raw: Vec::new(),
-            open_flags: 0,
-            open_mode: 0,
-            pinned: None,
+            capture: ResourceCapture::Device(DeviceCapture {
+                pinned: nix::fcntl::open(
+                    "/dev/null",
+                    nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )
+                .expect("pin /dev/null"),
+                flags: 0,
+                mode: 0,
+            }),
         }
     }
 

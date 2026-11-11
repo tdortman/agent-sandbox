@@ -10,24 +10,29 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use agent_sandbox_core::{DeviceAccess, ResourceAccess, ResourceKind};
-use agent_sandbox_syscall_broker::{ResourceTarget, reopen_held_terminal};
+use agent_sandbox_syscall_broker::{DeviceCapture, Resolver, reopen_held_terminal};
 use nix::{
-    fcntl::{FcntlArg, FdFlag, fcntl},
+    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     pty::openpty,
     unistd::ttyname,
 };
 
-fn device_target(path: &Path) -> ResourceTarget {
-    ResourceTarget {
-        kind: ResourceKind::Device,
-        path: path.to_path_buf(),
-        access: ResourceAccess::Device(DeviceAccess::ReadWrite),
-        raw: path.as_os_str().as_encoded_bytes().to_vec(),
-        open_flags: libc::O_RDWR | libc::O_CLOEXEC,
-        open_mode: 0,
-        pinned: None,
-    }
+/// Ask whether the tracee `pid` may reopen the terminal at `path`, as the
+/// broker does for a classified `open(path, O_RDWR)`.
+fn reopen(pid: u32, path: &Path) -> Option<OwnedFd> {
+    let pinned = nix::fcntl::open(
+        path,
+        OFlag::O_PATH | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .expect("pin terminal");
+    let device = DeviceCapture {
+        pinned,
+        flags: libc::O_RDWR | libc::O_CLOEXEC,
+        mode: 0,
+    };
+
+    reopen_held_terminal(&Resolver::default(), pid, path, &device)
 }
 
 /// A pty pair whose descriptors the spawned tracee does not inherit.
@@ -77,8 +82,8 @@ fn tracee_reopens_only_the_terminal_it_holds() {
     let other = private_pty();
 
     let mut tracee = tracee_holding(own.terminal.try_clone().expect("dup own terminal"));
-    let reopened = reopen_held_terminal(tracee.id(), &device_target(&own.terminal_path));
-    let foreign = reopen_held_terminal(tracee.id(), &device_target(&other.terminal_path));
+    let reopened = reopen(tracee.id(), &own.terminal_path);
+    let foreign = reopen(tracee.id(), &other.terminal_path);
     tracee.kill().expect("kill tracee");
     tracee.wait().expect("reap tracee");
 
@@ -95,8 +100,8 @@ fn tracee_holding_a_controller_opens_only_its_own_terminal() {
     let other = private_pty();
 
     let mut tracee = tracee_holding(own.controller.try_clone().expect("dup own controller"));
-    let reopened = reopen_held_terminal(tracee.id(), &device_target(&own.terminal_path));
-    let foreign = reopen_held_terminal(tracee.id(), &device_target(&other.terminal_path));
+    let reopened = reopen(tracee.id(), &own.terminal_path);
+    let foreign = reopen(tracee.id(), &other.terminal_path);
     tracee.kill().expect("kill tracee");
     tracee.wait().expect("reap tracee");
 

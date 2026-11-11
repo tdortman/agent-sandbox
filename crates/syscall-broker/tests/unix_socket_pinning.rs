@@ -15,7 +15,8 @@ use std::{
 
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    ResourceTarget, SeccompData, SeccompNotif, SyscallTarget, target_from_notification,
+    Resolver, ResourceCapture, ResourceTarget, SeccompData, SeccompNotif, SyscallTarget,
+    target_from_notification,
 };
 use nix::{
     sched::CloneFlags,
@@ -91,7 +92,7 @@ fn classify_connect(cwd: &Path, sun_path: &str, client: &OwnedFd) -> ResourceTar
         ..SeccompNotif::default()
     };
 
-    let target = target_from_notification(&notif).expect("classify connect");
+    let target = target_from_notification(&Resolver::default(), &notif).expect("classify connect");
     done_tx.send(()).expect("release tracee");
     tracee.join().expect("tracee joins");
 
@@ -99,6 +100,14 @@ fn classify_connect(cwd: &Path, sun_path: &str, client: &OwnedFd) -> ResourceTar
         panic!("expected unix socket resource target, got {target:?}");
     };
     target
+}
+
+/// The sockaddr the emulated syscall connects with.
+fn unix_addr(target: &ResourceTarget) -> &[u8] {
+    let ResourceCapture::Unix(unix) = &target.capture else {
+        panic!("unix socket target carries a unix capture");
+    };
+    &unix.addr
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -112,7 +121,7 @@ fn relative_unix_connect_reaches_socket_in_tracee_cwd() {
     let target = classify_connect(&dir, "rel.sock", &client);
 
     assert_eq!(target.path, socket_path);
-    agent_sandbox_sysutil::connect_raw(&client, &target.raw)
+    agent_sandbox_sysutil::connect_raw(&client, unix_addr(&target))
         .expect("emulated connect reaches the tracee-relative socket");
     approved.accept().expect("listener receives the connection");
 
@@ -141,7 +150,7 @@ fn socket_swapped_after_classification_does_not_redirect_connect() {
     std::fs::remove_file(&alias).expect("remove alias");
     std::os::unix::fs::symlink(&other, &alias).expect("alias -> other");
 
-    agent_sandbox_sysutil::connect_raw(&client, &target.raw)
+    agent_sandbox_sysutil::connect_raw(&client, unix_addr(&target))
         .expect("emulated connect reaches the approved socket");
     approved
         .accept()

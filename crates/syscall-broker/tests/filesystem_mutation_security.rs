@@ -12,13 +12,12 @@ use std::{
 use agent_sandbox_core::{FileAccess, policy::FilesystemCheck};
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    FilesystemMutation, FilesystemTarget, MutationDir, SeccompData, SeccompNotif, SyscallTarget,
-    init_root_handle, target_from_notification,
+    FilesystemMutation, FilesystemTarget, MutationDir, Resolver, SeccompData, SeccompNotif,
+    SyscallTarget,
 };
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn ensure_root_handle() {
-    init_root_handle().expect("init root handle");
+fn target_from_notification(notif: &SeccompNotif) -> std::io::Result<Option<SyscallTarget>> {
+    agent_sandbox_syscall_broker::target_from_notification(&Resolver::default(), notif)
 }
 
 fn as_seccomp_nr(raw: i64) -> i32 {
@@ -88,7 +87,6 @@ fn ftruncate_target(fd: &impl AsFd, len: u64) -> FilesystemTarget {
 
 #[test]
 fn ftruncate_memfd_resizes_pinned_memory_without_path_approval() {
-    ensure_root_handle();
     let mut fd =
         nix::sys::memfd::memfd_create(c"state table", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
             .expect("anonymous memory file");
@@ -132,7 +130,6 @@ fn ftruncate_memfd_preserves_kernel_seals() {
 
 #[test]
 fn ftruncate_named_deleted_and_tmpfile_objects_still_require_approval() {
-    ensure_root_handle();
     for directory in [std::env::temp_dir(), PathBuf::from("/dev/shm")] {
         let path = directory.join(format!(
             "memfd:broker-regression-{} (deleted)",
@@ -179,7 +176,6 @@ fn linkat_notif(source: &str, destination: &str, flags: u64) -> SeccompNotif {
 
 #[test]
 fn linkat_anonymous_file_checks_backing_directory() {
-    ensure_root_handle();
     let root = std::env::temp_dir().join(format!("broker-tmpfile-{}", std::process::id()));
     std::fs::create_dir(&root).expect("temporary directory");
     let fd = nix::fcntl::open(
@@ -234,7 +230,6 @@ fn linkat_anonymous_file_checks_backing_directory() {
 
 #[test]
 fn linkat_named_source_pins_fd_and_checks_actual_path() {
-    ensure_root_handle();
     let root = std::env::temp_dir().join(format!("broker-link-fd-{}", std::process::id()));
     std::fs::create_dir(&root).expect("temporary directory");
     let source = root.join("source");
@@ -272,7 +267,6 @@ fn linkat_named_source_pins_fd_and_checks_actual_path() {
 
 #[test]
 fn linkat_without_follow_does_not_capture_proc_descriptor() {
-    ensure_root_handle();
     let fd = std::fs::File::open("/dev/null").unwrap();
     let alias = format!("/proc/self/fd/{}", fd.as_raw_fd());
     let notif = linkat_notif(&alias, "/unapproved/destination", 0);
@@ -287,7 +281,6 @@ fn linkat_without_follow_does_not_capture_proc_descriptor() {
 
 #[test]
 fn linkat_missing_proc_descriptor_returns_ebadf_without_policy() {
-    ensure_root_handle();
     let notif = linkat_notif(
         "/proc/self/fd/2147483647",
         "/unapproved/destination",
@@ -302,7 +295,6 @@ fn linkat_missing_proc_descriptor_returns_ebadf_without_policy() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn rename_and_link_register_all_mutation_endpoints() {
-    ensure_root_handle();
     let rename_checks = filesystem_checks(&notif_with_path_args(nr::RENAME, &[
         "/repo/old.txt",
         "/repo/new.txt",
@@ -347,7 +339,6 @@ fn rename_and_link_register_all_mutation_endpoints() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn symlink_checks_target_read_and_linkpath_write() {
-    ensure_root_handle();
     let symlink_checks = filesystem_checks(&notif_with_path_args(nr::SYMLINK, &[
         "/tmp/target",
         "/tmp/link",
@@ -372,7 +363,6 @@ fn symlink_checks_target_read_and_linkpath_write() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn single_path_mutation_syscalls_require_write_access() {
-    ensure_root_handle();
     struct SyscallCase {
         nr: libc::c_long,
         path: &'static str,
@@ -407,7 +397,6 @@ fn single_path_mutation_syscalls_require_write_access() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn mkdir_skips_policy_only_when_target_exists() {
-    ensure_root_handle();
     let current_dir = std::env::current_dir().expect("current directory");
     let existing = current_dir.to_string_lossy();
 
@@ -444,7 +433,6 @@ fn mkdir_skips_policy_only_when_target_exists() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn long_multicomponent_path_classifies_full_endpoint() {
-    ensure_root_handle();
     let mut long = String::from("/tmp");
     while long.len() <= 256 {
         long.push_str("/abcdefghijklmno");
@@ -463,7 +451,6 @@ fn long_multicomponent_path_classifies_full_endpoint() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn unterminated_path_max_buffer_is_enametoolong() {
-    ensure_root_handle();
     let len = libc::PATH_MAX as usize;
     let buf = vec![b'a'; len];
     let ptr = buf.as_ptr() as u64;
@@ -487,7 +474,6 @@ fn unterminated_path_max_buffer_is_enametoolong() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_mutation_captures_tracee_cwd() {
-    ensure_root_handle();
     let notif = notif_with_path_args(nr::UNLINK, &["relative-path"]);
     let target = target_from_notification(&notif).expect("classify relative unlink");
     let current_dir = std::env::current_dir().expect("current directory");
@@ -521,7 +507,6 @@ fn relative_mutation_captures_tracee_cwd() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_mutation_resolves_live_symlink_targets() {
-    ensure_root_handle();
     let cwd = std::env::current_dir().expect("current directory");
     let root = cwd.join(format!("broker-relative-{}", std::process::id()));
     std::fs::create_dir(&root).expect("temporary directory");
@@ -556,7 +541,6 @@ fn relative_mutation_resolves_live_symlink_targets() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_unlinkat_accepts_zero_extended_at_fdcwd() {
-    ensure_root_handle();
     let mut notif = notif_with_path_args(nr::UNLINKAT, &["relative-path"]);
     notif.data.args[1] = notif.data.args[0];
     notif.data.args[0] = u64::from(libc::AT_FDCWD.cast_unsigned());
@@ -572,7 +556,6 @@ fn relative_unlinkat_accepts_zero_extended_at_fdcwd() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn relative_renameat2_accepts_zero_extended_at_fdcwd() {
-    ensure_root_handle();
     let mut notif = notif_with_path_args(nr::RENAMEAT2, &["old-path", "new-path"]);
     let old = notif.data.args[0];
     let new = notif.data.args[1];

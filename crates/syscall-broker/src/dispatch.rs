@@ -2,8 +2,9 @@ use std::{net::SocketAddr, os::fd::AsRawFd, path::Path, time::Duration};
 
 use agent_sandbox_core::{NetworkOwnership, ResourceKind, StaticPolicyAllow};
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget,
-    notification_arch_valid, reopen_held_terminal, send_addfd, send_response,
+    PersistentPolicyClient, Resolver, ResourceCapture, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    SeccompNotif, SyscallTarget, notification_arch_valid, reopen_held_terminal, send_addfd,
+    send_response,
 };
 use tracing::{debug, info, warn};
 
@@ -52,7 +53,11 @@ fn static_policy_allows(facts: &NormalizedNotification, static_allow: &StaticPol
 
 /// The tracee reopening a terminal it already holds needs no policy decision;
 /// see [`reopen_held_terminal`].
-fn held_terminal_plan(facts: &NormalizedNotification, pid: u32) -> Option<ResponsePlan> {
+fn held_terminal_plan(
+    resolver: &Resolver,
+    facts: &NormalizedNotification,
+    pid: u32,
+) -> Option<ResponsePlan> {
     let NormalizedNotification::Target {
         target: SyscallTarget::Resource(target),
     } = facts
@@ -60,14 +65,19 @@ fn held_terminal_plan(facts: &NormalizedNotification, pid: u32) -> Option<Respon
         return None;
     };
 
-    reopen_held_terminal(pid, target).map(|fd| ResponsePlan::InstallFd {
+    let ResourceCapture::Device(device) = &target.capture else {
+        return None;
+    };
+
+    reopen_held_terminal(resolver, pid, &target.path, device).map(|fd| ResponsePlan::InstallFd {
         fd,
-        cloexec: target.open_flags & libc::O_CLOEXEC != 0,
+        cloexec: device.flags & libc::O_CLOEXEC != 0,
     })
 }
 
 pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
+    resolver: &Resolver,
     client: &mut PersistentPolicyClient,
     static_allow: &StaticPolicyAllow,
     sandbox_session_id: Option<&str>,
@@ -87,7 +97,7 @@ pub async fn dispatch_notification_with_mode(
         return;
     }
 
-    let facts = normalize_or_failure(notif);
+    let facts = normalize_or_failure(resolver, notif);
 
     if let NormalizedNotification::ClassificationFailure { error, transient } = &facts {
         if *transient {
@@ -116,7 +126,7 @@ pub async fn dispatch_notification_with_mode(
         &facts,
         NormalizedNotification::Target {
             target: agent_sandbox_syscall_broker::SyscallTarget::Resource(target),
-        } if super::is_policy_socket_bypass(target, policy_socket)
+        } if super::is_policy_socket_bypass(resolver, target, policy_socket)
     );
 
     let plan = if policy_socket_bypass {
@@ -135,13 +145,13 @@ pub async fn dispatch_notification_with_mode(
             } => ResponsePlan::emulate_filesystem(target),
             _ => unreachable!("static_policy_allows accepts only filesystem targets"),
         }
-    } else if let Some(plan) = held_terminal_plan(&facts, notif.pid) {
+    } else if let Some(plan) = held_terminal_plan(resolver, &facts, notif.pid) {
         plan
     } else {
         decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
 
-    execute_response_plan(plan, listener_fd, notif, policy_socket_bypass);
+    execute_response_plan(plan, resolver, listener_fd, notif, policy_socket_bypass);
 }
 
 /// Reply to the tracee with `EACCES` and log the notification response.
@@ -151,6 +161,7 @@ fn respond_denied(listener_fd: i32, notif: &SeccompNotif) {
 
 fn execute_response_plan(
     plan: ResponsePlan,
+    resolver: &Resolver,
     listener_fd: i32,
     notif: &SeccompNotif,
     policy_socket_bypass: bool,
@@ -223,7 +234,7 @@ fn execute_response_plan(
         }
 
         ResponsePlan::EmulateResource { target } => {
-            if let Err(err) = super::emulate_resource(listener_fd, notif, &target) {
+            if let Err(err) = super::emulate::resource(resolver, listener_fd, notif, &target) {
                 let errno = err.raw_os_error().unwrap_or(libc::EACCES);
                 if matches!(target.kind, ResourceKind::Device) {
                     info!(error = %err, errno, path = %target.path.display(), pid = notif.pid, "device open emulation failed in syscall broker before fanotify");
@@ -241,7 +252,9 @@ fn execute_response_plan(
         }
 
         ResponsePlan::EmulateFilesystem { target } => {
-            if let Err(err) = super::emulate_filesystem_mutation(listener_fd, notif, &target) {
+            if let Err(err) =
+                super::emulate::filesystem_mutation(resolver, listener_fd, notif, &target)
+            {
                 let errno = err.raw_os_error().unwrap_or(libc::EACCES);
                 warn!(error = %err, target = ?target, "filesystem mutation emulation failed");
                 super::log_notification_response(send_response(

@@ -1735,6 +1735,23 @@ mod tests {
     }
 
     #[test]
+    fn tracee_path_reader_rejects_unterminated_names_instead_of_truncating() {
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits i32");
+        let unterminated = vec![b'a'; agent_sandbox_sysutil::PATH_MAX];
+        let terminated = b"/dev/kvm\0";
+
+        let error = read_tracee_path_ptr(&host_proc, pid, unterminated.as_ptr() as u64)
+            .expect_err("unterminated name");
+        assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+        assert_eq!(
+            read_tracee_path_ptr(&host_proc, pid, terminated.as_ptr() as u64)
+                .expect("read terminated name"),
+            Some(PathBuf::from("/dev/kvm"))
+        );
+    }
+
+    #[test]
     fn read_write_grant_skips_access_lookup_for_non_exec_opens_only() {
         let read_write = static_allow(r#"{"path": "/srv/project", "access": "read_write"}"#);
         assert!(!open_needs_access_lookup(
