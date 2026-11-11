@@ -36,6 +36,14 @@ pub struct ScopeOption {
     pub(crate) comment: Option<String>,
 }
 
+/// A decision ready to send to policyd: the user's action with its scope,
+/// target and comment.
+#[derive(Debug, Clone)]
+pub struct ReviewedChoice {
+    pub(crate) action: PromptAction,
+    pub(crate) choice: ScopeOption,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalFormContext {
     pub(crate) label: String,

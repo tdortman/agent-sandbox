@@ -20,12 +20,8 @@ pub async fn resolve_choice(
     sandbox_session_id: Option<&str>,
     id: &str,
     action: PromptAction,
-    choice: Option<ScopeOption>,
+    choice: ScopeOption,
 ) -> Result<(), UiCliError> {
-    let Some(choice) = choice else {
-        return deny_cancellation(socket, paths, sandbox_session_id, id).await;
-    };
-
     if choice.scope == ApprovalScope::Session && session_id.is_none() {
         let noun = match action {
             PromptAction::Allow => "approval",

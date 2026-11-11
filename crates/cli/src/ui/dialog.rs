@@ -3,13 +3,17 @@ use std::{
     io::{BufRead, Write},
     path::Path,
     process::{Command, Stdio},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use agent_sandbox_core::{graphical_session_env, tool_path};
 use tracing::info;
 
-use super::options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator};
+use super::{
+    error::UiCliError,
+    options::{ApprovalFormRequest, ApprovalFormResult, ReviewValidator},
+    prompt_blocking,
+};
 
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_RESULT_BYTES: usize = 16 * 1024;
@@ -25,7 +29,99 @@ pub enum ApprovalReviewOutcome {
 /// Mutex serialising graphical prompts: only one prompt UI at a time.
 static GRAPHICAL_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
-pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
+/// Shows prompts to the user: the seam between settlement logic and the Qt
+/// and zenity front ends. Calls block until the user answers.
+pub trait Renderer: Send + Sync + 'static {
+    /// Show the review form; the dialog keeps it open until `validate`
+    /// accepts the submission.
+    fn review(
+        &self,
+        request: &ApprovalFormRequest,
+        validate: Option<&ReviewValidator>,
+    ) -> ApprovalReviewOutcome;
+
+    /// Ask the user to pick one of `options`; `None` when cancelled or no
+    /// dialog is available.
+    fn pick_option(&self, title: &str, options: &[&str]) -> Option<String>;
+
+    /// Ask for free-form text; `None` when cancelled or no dialog is
+    /// available.
+    fn pick_text(&self, title: &str, default_text: &str) -> Option<String>;
+}
+
+/// The Qt dialog helper with a zenity fallback.
+pub struct Graphical;
+
+impl Renderer for Graphical {
+    fn review(
+        &self,
+        request: &ApprovalFormRequest,
+        validate: Option<&ReviewValidator>,
+    ) -> ApprovalReviewOutcome {
+        review_approval(request, validate)
+    }
+
+    fn pick_option(&self, title: &str, options: &[&str]) -> Option<String> {
+        pick_option(title, options)
+    }
+
+    fn pick_text(&self, title: &str, default_text: &str) -> Option<String> {
+        pick_text(title, default_text)
+    }
+}
+
+/// Async access to a [`Renderer`]: each call runs on the blocking pool so a
+/// waiting dialog never stalls the runtime.
+#[derive(Clone)]
+pub struct Dialogs {
+    renderer: Arc<dyn Renderer>,
+}
+
+impl Dialogs {
+    pub fn new(renderer: impl Renderer) -> Self {
+        Self {
+            renderer: Arc::new(renderer),
+        }
+    }
+
+    pub async fn review(
+        &self,
+        request: ApprovalFormRequest,
+        validate: Option<ReviewValidator>,
+    ) -> Result<ApprovalReviewOutcome, UiCliError> {
+        let renderer = Arc::clone(&self.renderer);
+        prompt_blocking(move || renderer.review(&request, validate.as_ref())).await
+    }
+
+    pub async fn pick_option(
+        &self,
+        title: &str,
+        options: &[&str],
+    ) -> Result<Option<String>, UiCliError> {
+        let renderer = Arc::clone(&self.renderer);
+        let title = title.to_owned();
+        let options: Vec<String> = options.iter().map(|option| (*option).to_owned()).collect();
+
+        prompt_blocking(move || {
+            let options: Vec<&str> = options.iter().map(String::as_str).collect();
+            renderer.pick_option(&title, &options)
+        })
+        .await
+    }
+
+    pub async fn pick_text(
+        &self,
+        title: &str,
+        default_text: &str,
+    ) -> Result<Option<String>, UiCliError> {
+        let renderer = Arc::clone(&self.renderer);
+        let title = title.to_owned();
+        let default_text = default_text.to_owned();
+        prompt_blocking(move || renderer.pick_text(&title, &default_text)).await
+    }
+}
+
+fn pick_option(title: &str, options: &[&str]) -> Option<String> {
     if prefer_graphical() {
         if let Some(c) = pick_with_backends(title, options) {
             return Some(c);
@@ -39,7 +135,7 @@ pub fn pick_option(title: &str, options: &[&str]) -> Option<String> {
 
 /// Prompt for free-form text (e.g. an editable policy path). Returns the
 /// trimmed user input on success.
-pub fn pick_text(title: &str, default_text: &str) -> Option<String> {
+fn pick_text(title: &str, default_text: &str) -> Option<String> {
     if prefer_graphical() {
         if let Some(c) = input_with_backends(title, default_text) {
             return Some(c);
@@ -130,7 +226,7 @@ fn input_with_backends(title: &str, default_text: &str) -> Option<String> {
     }
 }
 
-pub fn review_approval(
+fn review_approval(
     request: &ApprovalFormRequest,
     validate: Option<&ReviewValidator>,
 ) -> ApprovalReviewOutcome {

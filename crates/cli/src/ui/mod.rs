@@ -1,11 +1,13 @@
 //! Long-lived policyd UI client (graphical Qt / zenity prompts).
 
 mod choice;
-
 mod dialog;
 mod error;
+mod fallback;
+mod kinds;
 mod options;
-mod push;
+mod prompt;
+mod settle;
 
 use std::{
     fs::{File, OpenOptions},
@@ -19,8 +21,10 @@ use agent_sandbox_core::{
     RpcRequest, SandboxPaths, UiPush,
 };
 use clap::Parser;
+use dialog::{Dialogs, Graphical};
 pub use error::UiCliError;
 use nix::fcntl::{Flock, FlockArg, OFlag};
+use prompt::ClientContext;
 use tracing::{info, warn};
 
 /// Return the D-Bus bus name string (`"session"` or `"system"`) for `bus`.
@@ -329,50 +333,15 @@ impl UiClient {
             }
         };
 
-        // Pushes queue while a dialog is open; a decision on an earlier
-        // prompt can settle the request behind this one in the meantime.
-        if !self.still_pending(&push).await {
-            info!("skipping prompt already settled by an earlier decision");
-            return;
-        }
+        let client = ClientContext {
+            socket: &self.socket,
+            paths: &self.paths,
+            session_id: Some(session_id),
+            sandbox_session_id: self.sandbox_session_id.as_deref(),
+        };
 
-        if let Err(err) = push::handle_push(
-            &self.socket,
-            &self.paths,
-            Some(session_id),
-            self.sandbox_session_id.as_deref(),
-            push,
-        )
-        .await
-        {
+        if let Err(err) = settle::handle_push(&client, &Dialogs::new(Graphical), push).await {
             warn!(error = %err, "prompt error");
-        }
-    }
-
-    /// Whether policyd still waits on the request `push` prompts for. A
-    /// failed status check prompts anyway rather than drop a live request.
-    async fn still_pending(&self, push: &UiPush) -> bool {
-        let mut ctx = RequestContext::from(&self.paths);
-        ctx.sandbox_session_id.clone_from(&self.sandbox_session_id);
-
-        match agent_sandbox_core::policy_rpc(
-            &self.socket,
-            RpcRequest::Status { ctx },
-            Duration::from_secs(10),
-        )
-        .await
-        {
-            Ok(RpcReply::Status(status)) => {
-                status.pending.iter().any(|pending| push.is_for(pending))
-            }
-            Ok(reply) => {
-                warn!(?reply, "unexpected status reply; prompting anyway");
-                true
-            }
-            Err(err) => {
-                warn!(error = %err, "pending status check failed; prompting anyway");
-                true
-            }
         }
     }
 }
