@@ -19,6 +19,7 @@ agent-sandbox-sysutil.workspace = true
 clap = { workspace = true, features = ["env"] }
 libc.workspace = true
 nix = { workspace = true, features = ["dir", "fs", "poll"] }
+rustix = { workspace = true, features = ["process"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 tracing.workspace = true

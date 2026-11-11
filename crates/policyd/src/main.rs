@@ -242,8 +242,7 @@ async fn run(inherited: InheritedListeners) -> Result<(), PolicydError> {
     if let Some(path) = &cli.network_revocation_map {
         store.enable_network_revocation(path).await?;
     }
-    store.enable_sandbox_state();
-    store.restore_handoff();
+    store.restore();
     store.enable_cgroup_freezer();
     let store = Arc::new(store);
     store.export_policy_files(SandboxPaths::default())?;

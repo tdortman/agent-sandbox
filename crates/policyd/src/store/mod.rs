@@ -9,20 +9,21 @@ mod decisions;
 mod elevation;
 pub(crate) mod evaluator;
 mod filesystem;
-mod freeze;
 mod handoff;
 mod http;
+mod lifecycle;
 mod network;
 mod network_snapshot;
 pub(crate) mod persist;
 mod proxy;
 mod resource;
-mod sandbox_state;
+mod restart;
 mod scope_apply;
 mod scope_filesystem;
 mod scope_http;
 mod scope_network;
 mod scope_sudo;
+mod session_export;
 mod settle;
 mod state;
 mod status;
@@ -39,7 +40,10 @@ use std::{
 use std::{path::PathBuf, time::Duration};
 
 pub(crate) use decisions::DecisionAction;
-pub use freeze::cleanup_cgroup_freeze;
+pub use lifecycle::cleanup_cgroup_freeze;
+#[cfg(test)]
+pub(crate) use restart::RestartPaths;
+pub(crate) use session_export::run_session_export_ticker;
 pub(crate) use types::evict_oldest;
 pub use types::{
     DenyFingerprint, DenyInodeCache, HttpPendingKey, HttpScopeKey, MAX_CONNECTIONS_PER_UID,
@@ -92,22 +96,25 @@ impl PolicyStore {
     /// Create a new [`PolicyStore`] from the given daemon arguments.
     #[must_use]
     pub fn new(args: PolicydArgs) -> Self {
+        let sandbox_sessions = Arc::new(RwLock::new(HashMap::new()));
+
         Self {
             args,
-            sandbox_sessions: Arc::new(RwLock::new(HashMap::new())),
-            sandbox_state: std::sync::Mutex::new(None),
+            sandbox_sessions: Arc::clone(&sandbox_sessions),
+            lifecycle: lifecycle::ScopeLifecycle::host(sandbox_sessions),
+            restart: std::sync::Mutex::new(None),
             inner: tokio::sync::Mutex::new(types::PolicyDecisionState::default()),
             network_observation: std::sync::Mutex::new(None),
             network_revocation: std::sync::Mutex::new(None),
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
             ui_spawn_lock: tokio::sync::Mutex::new(()),
-            cgroup_freeze: freeze::CgroupFreezeManager::new_without_recovery(),
+            cgroup_freeze: lifecycle::CgroupFreezeManager::new_without_recovery(),
         }
     }
 
     /// Enable the cgroup freezer (used across cgroup freeze requests).
     pub fn enable_cgroup_freezer(&mut self) {
-        self.cgroup_freeze = freeze::CgroupFreezeManager::new();
+        self.cgroup_freeze = lifecycle::CgroupFreezeManager::new();
     }
 
     /// Bind experimental file-only network grants to runtime decisions.

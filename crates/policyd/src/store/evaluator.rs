@@ -74,6 +74,10 @@ impl PolicyStore {
     ) -> Option<Verdict> {
         let access = normalize_directory_traverse_access(path, access);
 
+        if let Some(verdict) = self.session_export_verdict(path, access, ctx) {
+            return Some(verdict);
+        }
+
         if is_sandbox_infrastructure_path(path) {
             return Some(Verdict::allowed(VerdictSource::Infrastructure));
         }

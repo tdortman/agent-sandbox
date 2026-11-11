@@ -213,7 +213,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::{test_store, types::UiSessionContext};
+    use crate::store::{RestartPaths, test_store, types::UiSessionContext};
 
     const SESSION: &str = "ui-session";
 
@@ -355,8 +355,12 @@ mod tests {
     #[tokio::test]
     async fn handoff_carries_every_session_bucket() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("handoff.json");
-        let first = test_store();
+        let paths = RestartPaths {
+            state: dir.path().join("sandbox-state.json"),
+            handoff: dir.path().join("policyd-handoff.json"),
+        };
+        let mut first = test_store();
+        first.restore_from(paths.clone());
 
         {
             let mut inner = first.inner.lock().await;
@@ -371,10 +375,10 @@ mod tests {
                 .insert(SESSION.to_owned(), UiSessionContext::default());
         }
 
-        drop(first.write_handoff_to(&path).await.expect("write handoff"));
+        drop(first.write_handoff().await.expect("write handoff"));
 
         let file: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read handoff"))
+            serde_json::from_str(&std::fs::read_to_string(&paths.handoff).expect("read handoff"))
                 .expect("handoff is JSON");
         let mut keys: Vec<&str> = file["ui_sessions"][0]["decisions"]
             .as_object()
@@ -399,7 +403,7 @@ mod tests {
         ]);
 
         let mut second = test_store();
-        second.restore_handoff_from(&path);
+        second.restore_from(paths);
 
         let original = first.inner.lock().await;
         let restored = second.inner.lock().await;

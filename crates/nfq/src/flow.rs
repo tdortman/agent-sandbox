@@ -18,8 +18,8 @@ use agent_sandbox_core::{
     FlowContext, FlowOwner, FlowRegistration, NetworkFlowKey, NetworkOwnership,
     NormalizedPolicyHost, OwnerResolution, OwnerSnapshot, SandboxPaths, SocketIdentity,
     VerdictSource, is_quic_initial, lookup_dns_cache, mappings_from_response,
-    network_revocation::NetworkPolicyRevocation, sandbox_session_id_from_pid,
-    socket_owner::KernelOwnerResolver,
+    network_revocation::NetworkPolicyRevocation, replayable_destination_verdict,
+    sandbox_session_id_from_pid, socket_owner::KernelOwnerResolver,
 };
 use nfq_updated::{Message, Verdict};
 use tracing::{debug, info, warn};
@@ -212,7 +212,7 @@ impl NfqState {
             return;
         }
         let key = verdict_cache::dest_key(self.verdict_netns, meta);
-        match verdict_cache::replayable_verdict(allowed, source, hostname, dst_ip) {
+        match replayable_destination_verdict(allowed, source, hostname, dst_ip) {
             Some(verdict) => cache.publish_verdict(&key, verdict),
             None if allowed && source.is_some() => cache.clear_verdict(&key),
             None => {}

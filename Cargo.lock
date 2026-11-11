@@ -86,6 +86,7 @@ dependencies = [
  "clap",
  "libc",
  "nix",
+ "rustix",
  "serde_json",
  "tokio",
  "tracing",

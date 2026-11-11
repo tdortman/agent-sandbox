@@ -19,17 +19,18 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use agent_sandbox_core::{
-    FileAccess, InodeIdentity, PathResolution, Policy, ProcessIds, StaticPolicyAllow,
+    FileAccess, FilesystemReplica, InodeIdentity, LocalFilesystem, PathResolution,
+    PersistentRpcClient, PolicydRpc, ProcessIds, REFRESH_INTERVAL, StaticPolicyAllow,
     normalize_directory_traverse_access, open_flags_to_file_access, wire_context,
 };
-use agent_sandbox_fsmon::{FilesystemSnapshot, MonitorClient};
+use agent_sandbox_fsmon::MonitorClient;
 use agent_sandbox_sysutil::{
     FanotifyEventMetadata, FanotifyResponse, fanotify_flush_inode_marks, fanotify_mark_ignore,
     fanotify_response_bytes, take_fanotify_event_fd,
@@ -204,14 +205,22 @@ impl HostProc {
     }
 }
 
+/// How long a finished sandbox's launcher may take to exit on its own before
+/// it is killed.
+const LAUNCHER_EXIT_GRACE: Duration = Duration::from_secs(1);
+
 /// Process pidfds that bound the sandbox's lifetime.
 ///
 /// The peer is the agent. Its parent is the broker or bwrap: when that dies
 /// (the launcher was killed) the agent keeps a seccomp filter with no
-/// listener, so the sandbox is over even though the peer lives.
+/// listener, so the sandbox is over even though the peer lives. The launcher
+/// is the outer bwrap. policyd kills the sandbox's scope once the launcher it
+/// registered exits, so killing the launcher stops every process of the
+/// sandbox.
 struct SandboxLifetime {
     peer: OwnedFd,
     parent: OwnedFd,
+    launcher: Option<OwnedFd>,
 }
 
 impl SandboxLifetime {
@@ -231,10 +240,51 @@ impl SandboxLifetime {
             return Err(io::Error::other("the peer's parent changed while opening"));
         }
 
+        let launcher = outer_bwrap_pid(host_proc, peer_pid).and_then(|pid| {
+            let launcher = agent_sandbox_sysutil::pidfd_open(u32::try_from(pid).ok()?)
+                .inspect_err(|error| tracing::warn!(%error, "cannot watch the sandbox launcher"))
+                .ok()?;
+
+            (outer_bwrap_pid(host_proc, peer_pid) == Some(pid)).then_some(launcher)
+        });
+
         Ok(Self {
             peer: peer_fd,
             parent: parent_fd,
+            launcher,
         })
+    }
+
+    /// Whether the sandbox can be stopped from here.
+    const fn can_stop(&self) -> bool {
+        self.launcher.is_some()
+    }
+
+    /// Kill the launcher unless it exits within `grace`.
+    fn stop(&self, grace: Duration) -> io::Result<()> {
+        let launcher = self
+            .launcher
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the sandbox has no launcher handle"))?;
+
+        if !grace.is_zero() {
+            let mut exited = [PollFd::new(launcher.as_fd(), PollFlags::POLLIN)];
+
+            if matches!(
+                poll(
+                    &mut exited,
+                    PollTimeout::try_from(grace).unwrap_or(PollTimeout::MAX)
+                ),
+                Ok(ready) if ready > 0
+            ) {
+                return Ok(());
+            }
+        }
+
+        match rustix::process::pidfd_send_signal(launcher, rustix::process::Signal::KILL) {
+            Err(rustix::io::Errno::SRCH) => Ok(()),
+            result => result.map_err(io::Error::from),
+        }
     }
 
     /// Wait up to `timeout` for the peer or its parent to exit, or for the
@@ -727,32 +777,20 @@ fn open_needs_access_lookup(mask: u64, path: &EventPath, static_allow: &StaticPo
 /// a denied inode, or when a link may postdate the denied inode set: `link`
 /// updates the inode's ctime. Directory link counts describe subdirectories,
 /// not file hard links.
-fn needs_inode_check(event_fd: &OwnedFd, policy: &LocalPolicy) -> bool {
+fn needs_inode_check(event_fd: &OwnedFd, policy: &LocalFilesystem) -> bool {
     fstat(event_fd).map_or(true, |stat| {
         let changed_nanos =
             i128::from(stat.st_ctime) * 1_000_000_000 + i128::from(stat.st_ctime_nsec);
         SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG)
             && stat.st_nlink != 1
-            && (changed_nanos >= policy.links_settled_before
-                || policy.snapshot.denied_inodes.contains(&InodeIdentity {
+            && policy.hard_link_needs_policyd(
+                &InodeIdentity {
                     inode: stat.st_ino,
                     device: stat.st_dev,
-                }))
+                },
+                changed_nanos,
+            )
     })
-}
-
-/// Filesystems stamp ctime from a coarse clock that can trail the realtime
-/// clock, so a link made just after a snapshot request may carry an earlier
-/// ctime. Only inodes changed this long before the request are trusted.
-const CTIME_CLOCK_SLACK: Duration = Duration::from_secs(1);
-
-/// Realtime nanoseconds before which a changed inode is covered by a
-/// snapshot requested at `requested`; 0 trusts no hard-linked inode.
-fn links_settled_before(requested: SystemTime) -> i128 {
-    requested
-        .checked_sub(CTIME_CLOCK_SLACK)
-        .and_then(|settled| settled.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |settled| i128::try_from(settled.as_nanos()).unwrap_or(0))
 }
 
 /// Mark regular files the sandbox can never write: files on read-only
@@ -960,15 +998,8 @@ fn remark_mounts(shared: &Shared, watch: &mut MountWatch) {
     };
 
     tracing::error!(%reason, "new mount cannot be monitored; stopping sandbox");
-    match &shared.scope_kill {
-        Some(scope) => {
-            if let Err(error) = scope.kill() {
-                tracing::error!(%error, "cannot stop sandbox scope");
-            }
-        }
-        None => {
-            tracing::error!("sandbox has no own scope to stop; the new mount stays unmonitored");
-        }
+    if let Err(error) = shared.lifetime.stop(Duration::ZERO) {
+        tracing::error!(%error, "cannot stop sandbox; the new mount stays unmonitored");
     }
 }
 
@@ -977,9 +1008,9 @@ fn remark_mounts(shared: &Shared, watch: &mut MountWatch) {
 /// A process remains in its cgroup after daemonisation/reparenting, while its
 /// `PPid` ancestry can immediately point at an unrelated host process.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SandboxCgroup(String);
+struct CgroupPath(String);
 
-impl SandboxCgroup {
+impl CgroupPath {
     fn read(host_proc: &HostProc, pid: i32) -> Option<Self> {
         let content = host_proc.read_to_string(pid, "cgroup").ok()?;
 
@@ -994,95 +1025,6 @@ impl SandboxCgroup {
     fn contains(&self, host_proc: &HostProc, pid: i32) -> Option<bool> {
         Some(Self::read(host_proc, pid)?.0 == self.0)
     }
-
-    /// Pid `P` of a `agent-sandbox-<P>_<N>.scope` leaf, the name the launcher
-    /// gives the sandbox's own transient scope.
-    fn scope_owner_pid(&self) -> Option<i32> {
-        let leaf = self.0.rsplit('/').next()?;
-        let (pid, nonce) = leaf
-            .strip_prefix("agent-sandbox-")?
-            .strip_suffix(".scope")?
-            .split_once('_')?;
-
-        if nonce.is_empty() || !nonce.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-
-        pid.parse().ok()
-    }
-
-    /// Open `cgroup.kill` for this cgroup only when it is the scope of the
-    /// sandbox whose entry process is `peer`. A nested sandbox started without
-    /// its own scope sits in its enclosing sandbox's scope, and an unscoped one
-    /// in the user's session; neither may be killed from here.
-    fn open_own_scope_kill(
-        &self,
-        host_proc: &HostProc,
-        peer: i32,
-        self_pid: i32,
-    ) -> Option<ScopeKill> {
-        if self.0 == "/" || Self::read(host_proc, self_pid).is_none_or(|own| own == *self) {
-            return None;
-        }
-
-        let launcher = outer_bwrap_pid(host_proc, peer)
-            .filter(|launcher| self.scope_owner_pid() == Some(*launcher));
-
-        let Some(launcher) = launcher.and_then(|pid| u32::try_from(pid).ok()) else {
-            tracing::warn!(
-                cgroup = %self.0,
-                "sandbox is not in its own scope; it will not be stopped from here"
-            );
-            return None;
-        };
-
-        let launcher = agent_sandbox_sysutil::pidfd_open(launcher)
-            .inspect_err(|error| tracing::warn!(%error, "cannot watch the sandbox launcher"))
-            .ok()?;
-
-        let kill = fs::OpenOptions::new()
-            .write(true)
-            .open(format!("/sys/fs/cgroup{}/cgroup.kill", self.0))
-            .inspect_err(|error| tracing::warn!(%error, "cannot open sandbox kill handle"))
-            .ok()?;
-
-        Some(ScopeKill { kill, launcher })
-    }
-}
-
-/// How long a finished sandbox's launcher may take to exit on its own before
-/// its scope is killed.
-const LAUNCHER_EXIT_GRACE: Duration = Duration::from_secs(1);
-
-/// A sandbox's own transient scope. The launcher (outer bwrap) lives in it
-/// and reports the agent's exit status, so a finished sandbox's scope is
-/// killed only after the launcher is gone.
-struct ScopeKill {
-    kill: File,
-    launcher: OwnedFd,
-}
-
-impl ScopeKill {
-    /// Kill every process in the scope. A scope that already vanished
-    /// (`ENODEV`) has nothing left to kill.
-    fn kill(&self) -> io::Result<()> {
-        match (&self.kill).write_all(b"1") {
-            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(()),
-            result => result,
-        }
-    }
-
-    /// Kill what the sandbox left behind once its launcher has exited, or after
-    /// [`LAUNCHER_EXIT_GRACE`] when the launcher does not exit.
-    fn kill_after_launcher_exit(&self) -> io::Result<()> {
-        let mut launcher = [PollFd::new(self.launcher.as_fd(), PollFlags::POLLIN)];
-        let _ = poll(
-            &mut launcher,
-            PollTimeout::try_from(LAUNCHER_EXIT_GRACE).unwrap_or(PollTimeout::MAX),
-        );
-
-        self.kill()
-    }
 }
 
 /// Maximum concurrent permission decisions. Each worker reads one event from
@@ -1096,57 +1038,18 @@ struct Job {
     event_fd: OwnedFd,
 }
 
-struct LocalPolicy {
-    snapshot: FilesystemSnapshot,
-    allow: StaticPolicyAllow,
-    /// Realtime nanoseconds; hard-linked inodes with a later ctime may have
-    /// gained a link the snapshot's denied inode set does not reflect.
-    links_settled_before: i128,
-}
-
-impl LocalPolicy {
-    /// Build from the snapshot requested at `requested`. Without a snapshot
-    /// no local grant applies and every hard-linked file goes to policyd.
-    fn new(
-        snapshot: Option<FilesystemSnapshot>,
-        requested: SystemTime,
-        project_root: Option<PathBuf>,
-    ) -> Self {
-        let links_settled_before = if snapshot.is_some() {
-            links_settled_before(requested)
-        } else {
-            0
-        };
-        let snapshot = snapshot.unwrap_or_default();
-        let allow = StaticPolicyAllow::from_policy(
-            Policy {
-                filesystem: snapshot.filesystem.clone(),
-                ..Policy::default()
-            },
-            project_root,
-        );
-        Self {
-            snapshot,
-            allow,
-            links_settled_before,
-        }
-    }
-}
-
 /// Policy readers cover local responses and mark installation. Replacement
 /// takes the write lock, then the mark lock, so old workers cannot restore
 /// marks.
 struct Shared {
     fan_fd: OwnedFd,
     self_pid: i32,
-    sandbox_cgroup: SandboxCgroup,
+    sandbox_cgroup: CgroupPath,
     host_proc: HostProc,
     ctx: agent_sandbox_core::RequestContext,
     socket_path: PathBuf,
-    policy: RwLock<LocalPolicy>,
+    policy: FilesystemReplica,
     ignore_marks: Option<IgnoreMarks>,
-    /// The sandbox's own scope, when fsmon owns one.
-    scope_kill: Option<ScopeKill>,
     lifetime: SandboxLifetime,
     stats: FsmonStats,
 }
@@ -1160,9 +1063,6 @@ struct IgnoreMarks {
 
 /// Maximum tracked ignore-marked paths.
 const IGNORE_MARK_CAP: usize = 65536;
-
-/// Interval between fetching the sandbox's current merged filesystem rules.
-const POLICY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the control loop logs the decision counters.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -1230,20 +1130,17 @@ fn run_event_loop(shared: Shared, mut mount_watch: MountWatch) {
         let sandbox_ended = matches!(wake, Wake::Ended);
 
         if sandbox_ended {
-            tracing::info!("sandbox ended; stopping its scope");
-            if let Some(scope) = &shared.scope_kill
-                && let Err(error) = scope.kill_after_launcher_exit()
+            tracing::info!("sandbox ended; stopping its launcher");
+            if shared.lifetime.can_stop()
+                && let Err(error) = shared.lifetime.stop(LAUNCHER_EXIT_GRACE)
             {
-                tracing::error!(%error, "cannot stop sandbox scope");
+                tracing::error!(%error, "cannot stop sandbox launcher");
             }
         }
 
         if sandbox_ended || SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             tracing::info!("flushing ignore marks before exit");
-            let _policy = shared
-                .policy
-                .write()
-                .unwrap_or_else(|poison| poison.into_inner());
+            let _policy = shared.policy.lock_exclusive();
             flush_or_stop_sandbox(&shared);
             log_stats(&shared.stats, "shutdown");
             return;
@@ -1256,38 +1153,17 @@ fn run_event_loop(shared: Shared, mut mount_watch: MountWatch) {
 /// Snapshot I/O runs independently of the permission workers because the
 /// monitor's own opens can generate permission events.
 fn refresh_policy(shared: &Shared) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let mut rpc = MonitorClient::new(shared.socket_path.clone());
-    while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-        std::thread::sleep(POLICY_POLL_INTERVAL);
-        let requested = SystemTime::now();
-        let snapshot = runtime
-            .block_on(rpc.filesystem_snapshot(shared.ctx.clone()))
-            .inspect_err(|error| {
-                tracing::warn!(%error, "filesystem snapshot unavailable; disabling local grants");
-            })
-            .ok();
-        let next = LocalPolicy::new(snapshot, requested, shared.ctx.project_root.clone());
-        // Rebuild even an unchanged snapshot: deny rule symlink aliases are
-        // resolved once per build. Only a rule change revokes ignore marks.
-        let changed = shared
-            .policy
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .snapshot
-            != next.snapshot;
-        let mut policy = shared
-            .policy
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if changed {
-            flush_or_stop_sandbox(shared);
-        }
-        *policy = next;
-    }
+    let mut source = PolicydRpc::new(
+        PersistentRpcClient::new(shared.socket_path.clone()),
+        shared.ctx.clone(),
+    )
+    .expect("tokio runtime");
+    shared.policy.follow(
+        &mut source,
+        REFRESH_INTERVAL,
+        || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
+        || flush_or_stop_sandbox(shared),
+    );
 }
 
 /// An unremovable ignore mark must not survive as an unrevocable grant. Keep
@@ -1295,15 +1171,13 @@ fn refresh_policy(shared: &Shared) {
 fn flush_or_stop_sandbox(shared: &Shared) {
     while let Err(error) = flush_ignore_marks(shared) {
         tracing::error!(%error, "cannot revoke inode grants; stopping sandbox");
-        if let Some(scope) = &shared.scope_kill {
-            match scope.kill() {
-                Ok(()) => return,
-                Err(error) => {
-                    tracing::error!(%error, "cannot stop sandbox after mark flush failure");
-                }
+        match shared.lifetime.stop(Duration::ZERO) {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(%error, "cannot stop sandbox after mark flush failure");
             }
         }
-        std::thread::sleep(POLICY_POLL_INTERVAL);
+        std::thread::sleep(REFRESH_INTERVAL);
     }
 }
 
@@ -1400,14 +1274,11 @@ fn handle_permission_event(
     };
 
     let access = {
-        let policy = shared
-            .policy
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let policy = shared.policy.read();
         let inode_check = needs_inode_check(&event_fd, &policy);
-        if !inode_check && !open_needs_access_lookup(mask, &path, &policy.allow) {
+        if !inode_check && !open_needs_access_lookup(mask, &path, policy.allow()) {
             respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
-            maybe_mark_static_allow(shared, &policy.allow, &path, &event_fd);
+            maybe_mark_static_allow(shared, policy.allow(), &path, &event_fd);
             drop(policy);
             shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1418,11 +1289,11 @@ fn handle_permission_event(
         );
         if !inode_check
             && policy
-                .allow
+                .allow()
                 .allows(Path::new(&path.path), access, path.resolution)
         {
             respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
-            maybe_mark_static_allow(shared, &policy.allow, &path, &event_fd);
+            maybe_mark_static_allow(shared, policy.allow(), &path, &event_fd);
             drop(policy);
             shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1550,32 +1421,20 @@ fn main() {
         eprintln!("agent-sandbox-fsmon: failed to parse target mountinfo: {e}");
         process::exit(1);
     });
-    let sandbox_cgroup = SandboxCgroup::read(&host_proc, target_pid).unwrap_or_else(|| {
+    let sandbox_cgroup = CgroupPath::read(&host_proc, target_pid).unwrap_or_else(|| {
         eprintln!("agent-sandbox-fsmon: cannot read target cgroup membership");
         process::exit(1);
     });
-    // Retain the scope's host cgroup handle and the process pidfds before
-    // setns. Ignore marks need the sandbox's own scope.
-    let scope_kill = sandbox_cgroup.open_own_scope_kill(&host_proc, target_pid, self_pid);
+    // Open the process pidfds before setns.
     let lifetime = SandboxLifetime::open(&host_proc, cli.pid).unwrap_or_else(|error| {
         eprintln!("agent-sandbox-fsmon: cannot watch sandbox processes: {error}");
         process::exit(1);
     });
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let mut snapshots = PolicydRpc::new(PersistentRpcClient::new(cli.socket.clone()), ctx.clone())
         .expect("tokio runtime");
-    let mut rpc = MonitorClient::new(cli.socket.clone());
-    let requested = SystemTime::now();
-    let snapshot = runtime
-        .block_on(rpc.filesystem_snapshot(ctx.clone()))
-        .inspect_err(|error| {
-            tracing::warn!(%error, "initial filesystem snapshot unavailable; disabling local grants");
-        })
-        .ok();
-    let policy = LocalPolicy::new(snapshot, requested, cli.project_root.clone());
-    drop(runtime);
+    let policy = FilesystemReplica::fetch(&mut snapshots, cli.project_root.clone());
+    drop(snapshots);
 
     // setns into the target mount namespace before marking its mounts.
     join_target_mount_namespace(cli.pid);
@@ -1630,15 +1489,14 @@ fn main() {
             host_proc,
             ctx,
             socket_path: cli.socket,
-            policy: RwLock::new(policy),
-            ignore_marks: (cli.fs_ignore_static_allows && scope_kill.is_some()).then(|| {
+            policy,
+            ignore_marks: (cli.fs_ignore_static_allows && lifetime.can_stop()).then(|| {
                 IgnoreMarks {
                     readonly_devices,
                     marked: Mutex::new(HashSet::new()),
                     cap_warned: AtomicBool::new(false),
                 }
             }),
-            scope_kill,
             lifetime,
             stats: FsmonStats::default(),
         },
@@ -1668,7 +1526,7 @@ fn try_fast_path_allow(
     pid: i32,
     event_fd: &OwnedFd,
     self_pid: i32,
-    sandbox_cgroup: &SandboxCgroup,
+    sandbox_cgroup: &CgroupPath,
     host_proc: &HostProc,
     pid_cgroup_cache: &mut HashSet<i32>,
 ) -> bool {
@@ -1716,15 +1574,10 @@ mod tests {
     }
 
     fn static_allow(rule: &str) -> StaticPolicyAllow {
-        let path = std::env::temp_dir().join(format!("fsmon-static-{}.json", std::process::id()));
-        std::fs::write(
-            &path,
-            format!("{{\"filesystem\": {{\"allow\": [{rule}]}}}}"),
-        )
-        .expect("write policy fixture");
-        let allow = StaticPolicyAllow::load(&path, None);
-        std::fs::remove_file(&path).expect("remove policy fixture");
-        allow
+        let policy: agent_sandbox_core::Policy =
+            serde_json::from_str(&format!("{{\"filesystem\": {{\"allow\": [{rule}]}}}}"))
+                .expect("parse policy fixture");
+        StaticPolicyAllow::from_policy(policy, None)
     }
 
     fn canonical(path: &str) -> EventPath {
@@ -1944,18 +1797,36 @@ mod tests {
     }
 
     #[test]
-    fn scope_owner_pid_parses_only_launcher_scope_names() {
-        let owner = |path: &str| SandboxCgroup(path.to_string()).scope_owner_pid();
+    fn stop_kills_the_launcher_and_a_missing_launcher_is_an_error() {
+        let host_proc = test_host_proc();
+        let mut peer = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn peer");
+        let mut launcher = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn launcher");
+        let mut lifetime = SandboxLifetime::open(&host_proc, peer.id()).expect("watch peer");
 
-        assert_eq!(
-            owner("/user.slice/user@1000.service/app.slice/agent-sandbox-4242_17.scope"),
-            Some(4242)
-        );
-        assert_eq!(owner("/user.slice/session-3.scope"), None);
-        assert_eq!(owner("/user.slice/agent-sandbox-4242_17.service"), None);
-        assert_eq!(owner("/user.slice/agent-sandbox-4242.scope"), None);
-        assert_eq!(owner("/user.slice/agent-sandbox-4242_x.scope"), None);
-        assert_eq!(owner("/user.slice/agent-sandbox-_17.scope"), None);
+        assert!(!lifetime.can_stop());
+        lifetime
+            .stop(Duration::ZERO)
+            .expect_err("no launcher handle");
+
+        lifetime.launcher =
+            Some(agent_sandbox_sysutil::pidfd_open(launcher.id()).expect("open launcher pidfd"));
+        assert!(lifetime.can_stop());
+        lifetime.stop(Duration::ZERO).expect("kill launcher");
+
+        let status = launcher.wait().expect("reap launcher");
+
+        assert!(!status.success(), "the launcher must die by signal");
+        lifetime
+            .stop(Duration::ZERO)
+            .expect("an exited launcher is already stopped");
+        peer.kill().expect("kill peer");
+        peer.wait().expect("reap peer");
     }
 
     #[test]
@@ -2072,9 +1943,12 @@ mod tests {
 
     #[test]
     fn cgroup_membership_is_stable_identity_not_parent_ancestry() {
-        let session = SandboxCgroup("/sandbox/session.scope".to_string());
-        assert_eq!(session.0, "/sandbox/session.scope");
-        assert_ne!(session.0, "/");
+        let host_proc = test_host_proc();
+        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        let own = CgroupPath::read(&host_proc, pid).expect("own cgroup");
+
+        assert_eq!(own.contains(&host_proc, pid), Some(true));
+        assert_eq!(own.contains(&host_proc, i32::MAX), None);
     }
 
     #[test]

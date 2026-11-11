@@ -288,5 +288,37 @@ pkgs.testers.runNixOSTest (_: {
     # listener behind egr0 stays unreachable.
     direct.succeed("ip netns exec egress-peer ss -ltn | grep -q 10.78.0.1:18095")
     sandbox_shell(direct, "sandbox-direct-bash", "timeout 5 socat -t 2 - TCP4:10.78.0.1:18095 </dev/null | grep -q egress-unlisted", expect_success=False)
+
+    # Sandbox lifetime with the syscall and network gates alone: no fsmon runs,
+    # yet the sandbox sits in its own agent scope and policyd kills that scope
+    # when the registered launcher exits, taking a detached (setsid) process
+    # with it.
+    import re
+
+    def scope_kills():
+        return int(direct.succeed(
+            "journalctl -u agent-sandbox-policy.service --no-pager | grep -c 'sandbox launcher exited; killed its scope' || true"
+        ).strip())
+
+    direct.fail("pgrep -f '/bin/agent-sandbox-fsmon'")
+    kills_before = scope_kills()
+    direct.succeed(
+        "nohup runuser -u sandbox -- sandbox-direct-bash -c 'setsid sleep 7001 & exec sleep 7000' "
+        "</dev/null >/dev/null 2>/tmp/lifetime-errors &"
+    )
+    try:
+        direct.wait_until_succeeds("pgrep -u sandbox -f '^sleep 7001$'", timeout=60)
+    except Exception:
+        print(direct.succeed("cat /tmp/lifetime-errors"))
+        raise
+    orphan = direct.succeed("pgrep -u sandbox -f '^sleep 7001$'").split()[0]
+    orphan_cgroup = direct.succeed("sed -n 's/^0:://p' /proc/" + orphan + "/cgroup").strip()
+    orphan_scope = re.fullmatch(r".*/agent-sandbox-(\d+)_\d+\.scope", orphan_cgroup)
+    assert orphan_scope, f"sandbox is not in its own scope: {orphan_cgroup}"
+    direct.succeed("kill -KILL " + orphan_scope.group(1))
+    direct.wait_until_fails("test -e /proc/" + orphan, timeout=10)
+    direct.wait_until_fails("pgrep -u sandbox -f '^sleep 700[01]$'", timeout=10)
+    direct.wait_until_fails("test -e /sys/fs/cgroup" + orphan_cgroup, timeout=10)
+    assert scope_kills() > kills_before, "policyd did not kill the scope"
   '';
 })

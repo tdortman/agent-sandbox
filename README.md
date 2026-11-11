@@ -275,6 +275,8 @@ Destination, object path, interface, member, and signature accept glob patterns,
 
 While a filesystem, resource, network, HTTP, or D-Bus prompt is open, policyd freezes the requesting sandbox's systemd scope, so the agent stays paused until you decide. If the sandbox cannot be frozen, the request is blocked instead of prompting.
 
+Each sandbox runs in its own systemd scope when a user manager is reachable. When the sandbox's launcher exits, policyd kills every process left in that scope, including daemons the agent detached. A sandbox started without a user manager runs unscoped, and policyd logs that it cannot stop its leftovers.
+
 ## Architecture
 
 ```mermaid

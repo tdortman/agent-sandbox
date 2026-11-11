@@ -141,9 +141,15 @@ impl PolicyStore {
             }
         }
 
+        // Ignore marks are grants the monitor can only revoke by stopping the
+        // sandbox, which it does by killing the launcher; that stops every
+        // process only when policyd kills the launcher's scope in turn.
+        let ignore_static_allows = self.args.fs_ignore_static_allows
+            && self.launcher_scope_stops_sandbox(sandbox_session_id.as_deref(), peer_pid);
+
         command
             .arg("--fs-ignore-static-allows")
-            .arg(if self.args.fs_ignore_static_allows {
+            .arg(if ignore_static_allows {
                 "true"
             } else {
                 "false"
@@ -200,6 +206,11 @@ impl PolicyStore {
             Ok(Ok(Ok(()))) => {
                 tracing::info!(peer_pid, "fsmon ready");
                 reap_in_background(child, false);
+
+                if let Some(session_id) = &sandbox_session_id {
+                    self.record_export_reader(session_id, peer_pid);
+                }
+
                 FilesystemMonitorReply::active()
             }
 

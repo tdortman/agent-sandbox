@@ -1894,6 +1894,7 @@ mod tests {
                 launcher_pid: 0,
                 launcher_start_ticks: 0,
                 cgroup: None,
+                export_reader: None,
             },
         );
 
@@ -2074,6 +2075,7 @@ mod tests {
                 launcher_pid: 0,
                 launcher_start_ticks: 0,
                 cgroup: None,
+                export_reader: None,
             },
         );
 

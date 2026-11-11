@@ -13,12 +13,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use agent_sandbox_core::{
-    VerdictSource,
-    verdict_map::{
-        DestKey, NamespaceState, VERDICT_ALLOW, VERDICT_DENY, VERDICT_PROTO_TCP, VERDICT_PROTO_UDP,
-        VerdictMap,
-    },
+use agent_sandbox_core::verdict_map::{
+    DestKey, NamespaceState, VERDICT_PROTO_TCP, VERDICT_PROTO_UDP, VerdictMap,
 };
 use tracing::{debug, info, warn};
 
@@ -152,41 +148,6 @@ pub fn dest_key(netns: u64, meta: PacketMeta) -> DestKey {
         TransportProtocol::Udp => VERDICT_PROTO_UDP,
     };
     DestKey::new(netns, proto, meta.dst_ip, meta.dst_port)
-}
-
-/// Decide whether a policyd answer may be replayed from the cache.
-///
-/// Published: denials from a real policyd verdict (any source; fail-fast and
-/// healed by the generation bump when grants change), and allows from the
-/// static policy layers ([`VerdictSource::Policy`], `Static`, or
-/// `Infrastructure`) for an IP-literal destination (`hostname == dst_ip`, so
-/// no DNS mapping can change under the entry).
-///
-/// Never published: anything derived from a hostname that can change (DNS
-/// rebinding would move the approval to another address), `Once`-scope
-/// allows (consumable single-use grants), session/project/global approvals
-/// (their lifetimes are shorter than the cache and expire without a signal
-/// nfq observes), and local fail-closed denies (transient errors, not
-/// decisions).
-#[must_use]
-pub fn replayable_verdict(
-    allowed: bool,
-    source: Option<&VerdictSource>,
-    hostname: &str,
-    dst_ip: &str,
-) -> Option<u8> {
-    let source = source?;
-    if !allowed {
-        return Some(VERDICT_DENY);
-    }
-    match source {
-        VerdictSource::Policy { .. } | VerdictSource::Static | VerdictSource::Infrastructure
-            if hostname == dst_ip =>
-        {
-            Some(VERDICT_ALLOW)
-        }
-        _ => None,
-    }
 }
 
 /// Open the verdict cache for this daemon, or explain once why it stays off.

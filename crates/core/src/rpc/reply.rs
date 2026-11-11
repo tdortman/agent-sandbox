@@ -241,6 +241,24 @@ impl VerdictSource {
         }
     }
 
+    /// Whether an allow from this source may be replayed from a cache for an
+    /// IP-literal destination.
+    ///
+    /// Replayable: the static policy layers, whose revocation retires the
+    /// cache. Not replayable:
+    /// approval scopes (`Once` grants are consumable, the others expire
+    /// without a signal a cache observes), and sources that never carry an
+    /// allow.
+    ///
+    /// The match is exhaustive: a new source must choose its replay rule.
+    #[must_use]
+    pub const fn replayable_allow(&self) -> bool {
+        match self {
+            Self::Policy { .. } | Self::Static | Self::Infrastructure => true,
+            Self::Scope(_) | Self::User | Self::Blocked | Self::PortZero => false,
+        }
+    }
+
     /// A blocked verdict.
     #[must_use]
     pub const fn blocked() -> Self {

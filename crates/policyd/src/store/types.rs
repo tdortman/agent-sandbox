@@ -84,6 +84,54 @@ pub struct SandboxSessionRegistration {
     /// is recorded. Daemons that double-fork out of the sandbox process tree
     /// keep this cgroup after reparenting to a host subreaper.
     pub cgroup: Option<PathBuf>,
+
+    /// The process allowed to read the session's filesystem export, recorded
+    /// when policyd starts the session's filesystem monitor. The export is
+    /// written only while this is set, because only a monitored sandbox has
+    /// its reads of the export directory checked.
+    #[serde(default)]
+    pub export_reader: Option<ExportReader>,
+}
+
+/// The process that reads a session's filesystem export: the parent of the
+/// process that armed the filesystem monitor, which is the syscall broker
+/// when that gate is on and bwrap otherwise. The start time tells it apart
+/// from a later process that reuses the pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportReader {
+    /// Pid of the reader's thread group leader.
+    pub pid: u32,
+
+    /// Kernel start time of the reader in clock ticks.
+    pub start_ticks: u64,
+}
+
+impl ExportReader {
+    /// The reader identity of the running process `pid`.
+    #[must_use]
+    pub fn of(pid: u32) -> Option<Self> {
+        agent_sandbox_core::socket_owner::process_start_time_ticks(pid)
+            .filter(|ticks| *ticks > 0)
+            .map(|start_ticks| Self { pid, start_ticks })
+    }
+
+    /// Whether `pid`, a process or thread id, belongs to the reader process
+    /// that is still the one recorded.
+    #[must_use]
+    pub fn is_thread_of_reader(self, pid: u32) -> bool {
+        thread_group_leader(pid) == Some(self.pid) && Self::of(self.pid) == Some(self)
+    }
+}
+
+/// The thread group leader of `pid`, which may be a thread id.
+fn thread_group_leader(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Exact HTTP request and context used for pending approval deduplication.
@@ -612,8 +660,9 @@ pub struct PolicyStore {
     pub(crate) ui_spawn_lock: Mutex<()>,
 
     pub(crate) sandbox_sessions: Arc<RwLock<HashMap<String, SandboxSessionRegistration>>>,
-    pub(super) sandbox_state: std::sync::Mutex<Option<super::sandbox_state::SandboxStateFile>>,
-    pub(crate) cgroup_freeze: super::freeze::CgroupFreezeManager,
+    pub(super) lifecycle: super::lifecycle::ScopeLifecycle,
+    pub(super) restart: std::sync::Mutex<Option<super::restart::RestartState>>,
+    pub(crate) cgroup_freeze: super::lifecycle::CgroupFreezeManager,
 }
 
 /// State for an established proxy session.

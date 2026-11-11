@@ -7,7 +7,8 @@
 //! connections; a reconnecting UI that presents its previous session id keeps
 //! its session decisions. A daemon that dies without `SIGTERM` writes nothing
 //! and its successor starts empty. Pending prompts are not handed over: their
-//! clients retry against the new daemon.
+//! clients retry against the new daemon. `restart.rs` restores this file
+//! together with the state a crash preserves.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -27,13 +28,10 @@ use tokio::sync::MutexGuard;
 use tracing::{info, warn};
 
 use super::{
-    sandbox_state::write_atomic,
+    restart::write_atomic,
     state::{PolicyDecisionState, SessionState, with_session_buckets},
     types::{HttpScopeKey, PolicyStore, ProxyFlowState, ProxySessionState, UiSessionContext},
 };
-
-const DEFAULT_HANDOFF_PATH: &str = "/run/agent-sandbox/policyd-handoff.json";
-const HANDOFF_PATH_ENV: &str = "AGENT_SANDBOX_POLICYD_HANDOFF";
 
 /// Handoff file contents.
 #[derive(Default, Serialize, Deserialize)]
@@ -128,35 +126,19 @@ fn restore_bucket<K: Eq + Hash>(
     }
 }
 
-fn handoff_path() -> PathBuf {
-    std::env::var_os(HANDOFF_PATH_ENV)
-        .map_or_else(|| PathBuf::from(DEFAULT_HANDOFF_PATH), PathBuf::from)
-}
-
 impl PolicyStore {
-    /// Write the handoff for the next daemon to the path named by
-    /// `AGENT_SANDBOX_POLICYD_HANDOFF`.
+    /// Write the handoff for the next daemon to the path [`Self::restore`]
+    /// was configured with.
     ///
     /// Returns the decision state lock still held: no request may change the
     /// state after the snapshot, so the caller exits without releasing it.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the file cannot be written.
+    /// Returns the I/O error when restart state is not configured or the file
+    /// cannot be written.
     pub async fn write_handoff(&self) -> io::Result<MutexGuard<'_, PolicyDecisionState>> {
-        self.write_handoff_to(&handoff_path()).await
-    }
-
-    /// Take over the handoff the previous daemon wrote to the path named by
-    /// `AGENT_SANDBOX_POLICYD_HANDOFF`.
-    pub fn restore_handoff(&mut self) {
-        self.restore_handoff_from(&handoff_path());
-    }
-
-    pub(crate) async fn write_handoff_to(
-        &self,
-        path: &Path,
-    ) -> io::Result<MutexGuard<'_, PolicyDecisionState>> {
+        let path = self.handoff_path()?;
         let inner = self.inner.lock().await;
 
         let proxy = inner.proxy_session.as_ref().map(|session| ProxyHandoff {
@@ -190,13 +172,16 @@ impl PolicyStore {
             })
             .collect();
 
-        write_atomic(path, &Handoff { proxy, ui_sessions })?;
+        let handoff =
+            serde_json::to_vec(&Handoff { proxy, ui_sessions }).map_err(io::Error::other)?;
+
+        write_atomic(&path, &handoff)?;
         Ok(inner)
     }
 
     // The file is trusted because it lives in a root-owned directory and is
     // written only by root; sandboxes cannot modify it.
-    pub(crate) fn restore_handoff_from(&mut self, path: &Path) {
+    pub(super) fn restore_handoff_from(&mut self, path: &Path) {
         let Some(handoff) = take_handoff(path) else {
             return;
         };

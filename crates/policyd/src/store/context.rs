@@ -10,7 +10,7 @@ use agent_sandbox_core::{
 
 use super::{
     attribution::{HostProcfs, PeerRequest, ProcFacts, attribute_peer, attribute_trusted},
-    freeze::agent_scope_cgroup,
+    lifecycle::agent_scope_cgroup,
     types::PolicyStore,
 };
 use crate::{
@@ -82,50 +82,43 @@ impl PolicyStore {
             .or_else(|| trusted.cwd.clone())
             .unwrap_or_default();
 
-        let mut sessions = self
-            .sandbox_sessions
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut persist = false;
-
-        if let Some(reg) = sessions.get_mut(sandbox_session_id) {
-            // Only the launcher's descendants may adopt a registered session.
-            let adopt_root = reg.root_pid == 0
-                && (reg.launcher_pid == 0 || is_descendant_of(reg.launcher_pid, peer.pid));
-            let root_pid = if adopt_root { peer.pid } else { reg.root_pid };
-            let update_project = is_descendant_of(root_pid, peer.pid)
-                && !project_root.as_os_str().is_empty()
-                && project_root != reg.project_root
-                && (reg.project_root.as_os_str().is_empty()
-                    || is_path_descendant(&project_root, &reg.project_root));
-            if adopt_root || update_project {
-                persist = reg.launcher_pid > 0;
+        self.update_registry(|sessions| {
+            if let Some(reg) = sessions.get_mut(sandbox_session_id) {
+                // Only the launcher's descendants may adopt a registered
+                // session.
+                let adopt_root = reg.root_pid == 0
+                    && (reg.launcher_pid == 0 || is_descendant_of(reg.launcher_pid, peer.pid));
+                let root_pid = if adopt_root { peer.pid } else { reg.root_pid };
+                let update_project = is_descendant_of(root_pid, peer.pid)
+                    && !project_root.as_os_str().is_empty()
+                    && project_root != reg.project_root
+                    && (reg.project_root.as_os_str().is_empty()
+                        || is_path_descendant(&project_root, &reg.project_root));
+                if adopt_root || update_project {
+                    self.revoke_network_grants()?;
+                    reg.root_pid = root_pid;
+                    if adopt_root {
+                        reg.cgroup = agent_scope_cgroup(root_pid);
+                    }
+                    if update_project {
+                        reg.project_root = project_root;
+                    }
+                }
+            } else {
                 self.revoke_network_grants()?;
-                reg.root_pid = root_pid;
-                if adopt_root {
-                    reg.cgroup = agent_scope_cgroup(root_pid);
-                }
-                if update_project {
-                    reg.project_root = project_root;
-                }
+                sessions.insert(sandbox_session_id.to_string(), SandboxSessionRegistration {
+                    root_pid: peer.pid,
+                    owner_uid: peer.uid,
+                    project_root,
+                    package: None,
+                    launcher_pid: 0,
+                    launcher_start_ticks: 0,
+                    cgroup: agent_scope_cgroup(peer.pid),
+                    export_reader: None,
+                });
             }
-        } else {
-            self.revoke_network_grants()?;
-            sessions.insert(sandbox_session_id.to_string(), SandboxSessionRegistration {
-                root_pid: peer.pid,
-                owner_uid: peer.uid,
-                project_root,
-                package: None,
-                launcher_pid: 0,
-                launcher_start_ticks: 0,
-                cgroup: agent_scope_cgroup(peer.pid),
-            });
-        }
-        drop(sessions);
-        if persist {
-            self.persist_sandbox_state();
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Register a sandbox session's package identity.
@@ -178,44 +171,47 @@ impl PolicyStore {
             return Err(PolicydError::InvalidLauncherPid);
         }
 
-        let mut sessions = self
-            .sandbox_sessions
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        if let Some(reg) = sessions.get_mut(session_id) {
-            if let Some(existing) = &reg.package
-                && existing != package
-            {
-                return Err(PolicydError::PackageImmutable);
-            }
-            if reg.package.as_deref() != Some(package)
-                || reg.owner_uid != owner_uid
-                || reg.launcher_pid != launcher_pid
-                || reg.launcher_start_ticks != launcher_start_ticks
-            {
+        self.update_registry(|sessions| {
+            if let Some(reg) = sessions.get_mut(session_id) {
+                if let Some(existing) = &reg.package
+                    && existing != package
+                {
+                    return Err(PolicydError::PackageImmutable);
+                }
+                if reg.package.as_deref() != Some(package)
+                    || reg.owner_uid != owner_uid
+                    || reg.launcher_pid != launcher_pid
+                    || reg.launcher_start_ticks != launcher_start_ticks
+                {
+                    self.revoke_network_grants()?;
+                }
+                if reg.launcher_pid != launcher_pid
+                    || reg.launcher_start_ticks != launcher_start_ticks
+                {
+                    // The reader belongs to the sandbox the previous launcher
+                    // ran.
+                    reg.export_reader = None;
+                }
+                reg.package = Some(package.to_string());
+                reg.owner_uid = owner_uid;
+                reg.launcher_pid = launcher_pid;
+                reg.launcher_start_ticks = launcher_start_ticks;
+            } else {
                 self.revoke_network_grants()?;
+                sessions.insert(session_id.to_string(), SandboxSessionRegistration {
+                    root_pid: 0,
+                    owner_uid,
+                    project_root: PathBuf::new(),
+                    package: Some(package.to_string()),
+                    launcher_pid,
+                    launcher_start_ticks,
+                    cgroup: agent_scope_cgroup(launcher_pid),
+                    export_reader: None,
+                });
             }
-            reg.package = Some(package.to_string());
-            reg.owner_uid = owner_uid;
-            reg.launcher_pid = launcher_pid;
-            reg.launcher_start_ticks = launcher_start_ticks;
-        } else {
-            self.revoke_network_grants()?;
-            sessions.insert(session_id.to_string(), SandboxSessionRegistration {
-                root_pid: 0,
-                owner_uid,
-                project_root: PathBuf::new(),
-                package: Some(package.to_string()),
-                launcher_pid,
-                launcher_start_ticks,
-                cgroup: agent_scope_cgroup(launcher_pid),
-            });
-        }
 
-        drop(sessions);
-        self.persist_sandbox_state();
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Resolve an incoming RPC [`ResolvedRequestContext`] into a fully
@@ -423,7 +419,14 @@ impl PolicyStore {
         // never walked into the inode cache.
         let exports = [Some(&self.args.export_json), self.args.export_nix.as_ref()];
         let store_copies = STORE_POLICY_COPY_GLOBS.iter().map(PathBuf::from);
-        for path in exports.into_iter().flatten().cloned().chain(store_copies) {
+        let session_exports = self.session_export_dir();
+        for path in exports
+            .into_iter()
+            .flatten()
+            .cloned()
+            .chain(store_copies)
+            .chain(session_exports)
+        {
             merged.filesystem.deny.push(FilesystemRule {
                 path,
                 access: FileAccess::All,
@@ -599,7 +602,8 @@ impl PolicyStore {
         }
     }
 
-    /// Export merged policy to JSON and optionally Nix-format files.
+    /// Export merged policy to JSON and optionally Nix-format files, and
+    /// bring every live session's filesystem export up to date.
     ///
     /// # Errors
     ///
@@ -651,6 +655,8 @@ impl PolicyStore {
             lines.extend(["  ];".to_string(), "}".to_string(), String::new()]);
             atomic_write_text(nix_path, &lines.join("\n"))?;
         }
+
+        self.export_session_filesystems();
 
         Ok(())
     }
@@ -931,6 +937,7 @@ mod tests {
                 )
                 .expect("launcher start time"),
                 cgroup: None,
+                export_reader: None,
             });
         }
 
@@ -988,6 +995,7 @@ mod tests {
                 )
                 .expect("launcher start time"),
                 cgroup: None,
+                export_reader: None,
             });
         }
 

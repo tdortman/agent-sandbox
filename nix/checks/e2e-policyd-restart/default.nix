@@ -106,6 +106,9 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.wait_for_unit("multi-user.target")
     dynamic.wait_for_unit("agent-sandbox-policy.socket")
     dynamic.wait_for_unit("agent-sandbox-policy.service")
+    # The live sandbox must start in its own scope, so the lingering user
+    # manager has to be up first.
+    dynamic.wait_for_unit("user@1000.service")
 
     # One long-lived sandbox, driven through a fifo so every probe runs in the
     # same sandbox before and after the restart.
@@ -247,7 +250,7 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.succeed(command("test", "!", "-e", mutations + "/fresh-renamed"))
 
     # The node runs the network-mode launcher: no PID namespace, so only
-    # fsmon's scope kill stops what a finished sandbox leaves behind.
+    # policyd's scope kill stops what a finished sandbox leaves behind.
     session_wrapper = (
         "env",
         "XDG_RUNTIME_DIR=/run/user/1000",
@@ -276,7 +279,8 @@ pkgs.testers.runNixOSTest (_: {
         scope = re.fullmatch(r".*/agent-sandbox-(\d+)_\d+\.scope", cgroup)
         assert scope, f"sandbox is not in its own scope: {cgroup}"
         launcher = scope.group(1)
-        argv = dynamic.succeed("tr '\\0' '\\n' < /proc/" + launcher + "/cmdline").split()
+        bwrap = dynamic.succeed("pgrep -P " + launcher + " -x bwrap").split()[0]
+        argv = dynamic.succeed("tr '\\0' '\\n' < /proc/" + bwrap + "/cmdline").split()
         assert "--unshare-user" in argv and "--unshare-pid" not in argv, f"not the network-mode launcher: {argv}"
         started = fsmon_pids() - before
         assert len(started) == 1, f"expected one new fsmon, got {started}"
@@ -301,7 +305,7 @@ pkgs.testers.runNixOSTest (_: {
     dynamic.fail("pgrep -u sandbox -f '^sleep 700[01]$'")
 
     # The agent exits with a detached grandchild still running; the launcher
-    # reports the agent's own exit status, not the scope kill's.
+    # reports the agent's own exit status, not the kill's.
     go_file = mutations + "/lifetime-go"
     dynamic.succeed("rm -f " + go_file)
     exited = start_lifetime_sandbox(
@@ -314,5 +318,24 @@ pkgs.testers.runNixOSTest (_: {
     status = dynamic.succeed("systemctl show -p ExecMainStatus --value lifetime-exit.service").strip()
     assert status == "7", f"agent exit status lost: {status}"
     dynamic.succeed("rm -f " + go_file)
+
+    # The long-lived sandbox registered with a policyd that has been
+    # restarted since. policyd restored the registration and armed its
+    # launcher watch again, so killing the launcher still takes the whole
+    # scope, and the sandbox's own fsmon, with it.
+    # runuser and its shell parent carry the same command line but run in the
+    # restart-live service unit; only the sandboxed processes are in the scope.
+    live_scope = None
+    for pid in dynamic.succeed("pgrep -u sandbox -f 'while read -r token'").split():
+        cgroup = dynamic.succeed("sed -n 's/^0:://p' /proc/" + pid + "/cgroup").strip()
+        match = re.fullmatch(r".*/agent-sandbox-(\d+)_\d+\.scope", cgroup)
+        if match:
+            live, live_cgroup, live_scope = pid, cgroup, match
+            break
+    assert live_scope, "the live sandbox is not in its own scope"
+    dynamic.succeed("kill -KILL " + live_scope.group(1))
+    dynamic.wait_until_fails("test -e /proc/" + live, timeout=10)
+    dynamic.wait_until_fails("test -e /proc/" + fsmon_pid, timeout=10)
+    dynamic.wait_until_fails("test -e /sys/fs/cgroup" + live_cgroup, timeout=10)
   '';
 })

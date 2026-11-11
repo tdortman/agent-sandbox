@@ -628,8 +628,10 @@ in
             and flushes ignore marks before replacing its local snapshot. A
             failed refresh disables local grants and flushes marks. Marks also
             flush on shutdown. If flushing fails, the monitor stops its sandbox
-            rather than leaving stale grants active. Marks require a usable
-            sandbox cgroup.kill descriptor.
+            rather than leaving stale grants active. Marks require a launcher
+            registered with policyd in its own agent scope: the monitor stops
+            the sandbox by killing the launcher, and policyd then kills the
+            scope.
 
             Disable to receive a permission event on every open, including
             opens the monitor can allow from its current policy snapshot.

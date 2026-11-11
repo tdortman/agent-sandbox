@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, os::fd::AsRawFd, path::Path, time::Duration};
 
-use agent_sandbox_core::{NetworkOwnership, ResourceKind, StaticPolicyAllow};
+use agent_sandbox_core::{FilesystemReplica, NetworkOwnership, ResourceKind};
 use agent_sandbox_syscall_broker::{
     PersistentPolicyClient, Resolver, ResourceCapture, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
     SeccompNotif, SyscallTarget, notification_arch_valid, reopen_held_terminal, send_addfd,
@@ -35,12 +35,12 @@ pub struct NetworkPolicyBypass {
     pub dns_endpoint: Option<SocketAddr>,
 }
 
-/// Whether a classified filesystem target is covered by the static policy
-/// snapshot exported by policyd, so its emulation can proceed without a
+/// Whether a classified filesystem target is covered by the local copy of
+/// policyd's filesystem policy, so its emulation can proceed without a
 /// policyd round trip. Live verdicts (denies, session buckets, approvals)
-/// still round-trip: anything the snapshot does not allow is decided by
+/// still round-trip: anything the copy does not allow is decided by
 /// `decide`.
-fn static_policy_allows(facts: &NormalizedNotification, static_allow: &StaticPolicyAllow) -> bool {
+fn static_policy_allows(facts: &NormalizedNotification, local: &FilesystemReplica) -> bool {
     let NormalizedNotification::Target {
         target: SyscallTarget::Filesystem(target),
     } = facts
@@ -48,7 +48,7 @@ fn static_policy_allows(facts: &NormalizedNotification, static_allow: &StaticPol
         return false;
     };
 
-    !static_allow.is_empty() && static_allow.allows_all(&target.checks)
+    local.allows_all(&target.checks)
 }
 
 /// The tracee reopening a terminal it already holds needs no policy decision;
@@ -79,7 +79,7 @@ pub async fn dispatch_notification_with_mode(
     policy_socket: &Path,
     resolver: &Resolver,
     client: &mut PersistentPolicyClient,
-    static_allow: &StaticPolicyAllow,
+    local_filesystem: &FilesystemReplica,
     sandbox_session_id: Option<&str>,
     listener_fd: i32,
     notif: &SeccompNotif,
@@ -138,7 +138,7 @@ pub async fn dispatch_notification_with_mode(
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // delegates every TCP and UDP target to the packet filter and proxy.
         ResponsePlan::Continue
-    } else if static_policy_allows(&facts, static_allow) {
+    } else if static_policy_allows(&facts, local_filesystem) {
         match facts {
             NormalizedNotification::Target {
                 target: SyscallTarget::Filesystem(target),
@@ -271,14 +271,93 @@ fn execute_response_plan(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        path::Path,
+        time::Duration,
+    };
 
-    use agent_sandbox_core::NetworkOwnership;
-    use agent_sandbox_syscall_broker::NetworkTarget;
+    use agent_sandbox_core::{
+        FileAccess, FilesystemReplica, NetworkOwnership, SessionExport, policy::FilesystemCheck,
+    };
+    use agent_sandbox_syscall_broker::{
+        FilesystemMutation, FilesystemTarget, MutationDir, NetworkTarget,
+    };
 
     use super::{
         NetworkPolicyBypass, NormalizedNotification, SyscallTarget, should_bypass_network_policy,
+        static_policy_allows,
     };
+
+    fn write_export(path: &Path, allow: &str, deny: Option<&str>) {
+        let rule = |path: &str| format!(r#"{{"path": "{path}", "access": "all"}}"#);
+        let deny: Vec<_> = deny.map(rule).into_iter().collect();
+        let staged = path.with_extension("tmp");
+        std::fs::write(
+            &staged,
+            format!(
+                r#"{{"allow": [{}], "deny": [{}]}}"#,
+                rule(allow),
+                deny.join(",")
+            ),
+        )
+        .expect("write export");
+        std::fs::rename(staged, path).expect("replace export");
+    }
+
+    fn mkdir(path: &str) -> NormalizedNotification {
+        NormalizedNotification::Target {
+            target: SyscallTarget::Filesystem(FilesystemTarget {
+                checks: vec![FilesystemCheck {
+                    path: path.into(),
+                    access: FileAccess::Write,
+                }],
+                operation: FilesystemMutation::Mkdir {
+                    dir: MutationDir::Root,
+                    path: path.as_bytes().to_vec(),
+                    mode: 0o755,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn local_allow_follows_the_session_export() {
+        let dir = std::env::temp_dir().join(format!("broker-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("export directory");
+        let export = dir.join("filesystem.json");
+        write_export(&export, "/srv/project", None);
+        let mut source = SessionExport::new(export.clone());
+        let replica = FilesystemReplica::fetch(&mut source, None);
+        let facts = mkdir("/srv/project/secret/dir");
+        assert!(static_policy_allows(&facts, &replica));
+
+        let mut refetch = || {
+            let polls = std::cell::Cell::new(0);
+            replica.follow(
+                &mut source,
+                Duration::ZERO,
+                || {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 1
+                },
+                || {},
+            );
+        };
+
+        write_export(&export, "/srv/project", Some("/srv/project/secret"));
+        refetch();
+        assert!(!static_policy_allows(&facts, &replica));
+        assert!(static_policy_allows(&mkdir("/srv/project/other"), &replica));
+
+        std::fs::remove_file(&export).expect("remove export");
+        refetch();
+        assert!(!static_policy_allows(
+            &mkdir("/srv/project/other"),
+            &replica
+        ));
+        std::fs::remove_dir_all(dir).expect("remove export directory");
+    }
 
     fn bypass(proxy_mode: bool, dns_endpoint: Option<SocketAddr>) -> NetworkPolicyBypass {
         NetworkPolicyBypass {

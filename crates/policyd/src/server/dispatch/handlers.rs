@@ -157,9 +157,11 @@ pub async fn handle(
             session_id,
             package,
             launcher_pid,
-        } => store
-            .register_sandbox(&session_id, &package, peer.uid, launcher_pid, peer.pid)
-            .map(|()| RpcReply::Simple(SimpleOkReply::OK)),
+        } => {
+            store.register_sandbox(&session_id, &package, peer.uid, launcher_pid, peer.pid)?;
+            PolicyStore::blocking(|| store.export_session_filesystem(&session_id));
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
 
         RpcRequest::Check {
             host,

@@ -336,9 +336,10 @@ pkgs.testers.runNixOSTest (_: {
     assert added > 0, f"no ignore marks were installed: {counters}"
     assert flushed == added, f"flush did not release every mark: {counters}"
 
-    # Sandbox lifetime: nothing in a sandbox's scope outlives its launcher or
-    # its agent, and its fsmon exits with it. A setsid grandchild leaves the
-    # agent's process group but stays in the scope.
+    # Sandbox lifetime: policyd kills a sandbox's scope when its launcher
+    # exits, fsmon stops the launcher when the agent ends, and fsmon exits
+    # with the sandbox. A setsid grandchild leaves the agent's process group
+    # but stays in the scope.
     lifetime_dir = "/var/lib/agent-sandbox-test/dynamic-mutations"
 
     def fsmon_pids():

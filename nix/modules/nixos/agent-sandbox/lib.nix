@@ -336,8 +336,9 @@ let
   sandboxPolicySocket = "${sandboxSharedDir}/sandbox-policy.sock";
   # Host files sandboxes read, bound as one directory: a socket or file
   # replaced on the host stays reachable by path in running sandboxes.
-  # Must hold nothing else; the Rust defaults for the session context and
-  # sandbox socket paths name this directory too.
+  # Holds only the sandbox socket, the session context, and policyd's
+  # per-session `sessions/` exports; the Rust defaults for those paths name
+  # this directory too.
   sandboxSharedDir = "/run/agent-sandbox/shared";
   splitMountPaths =
     paths:
@@ -569,7 +570,7 @@ in
           ${proxyTrustScript}
 
 
-          ${freezeLaunchPrefix}${pkgs.bubblewrap}/bin/bwrap \
+          ${scopeLaunchPrefix}${pkgs.bubblewrap}/bin/bwrap \
             --bind / / \
             --tmpfs /tmp \
             --proc /proc \
@@ -626,21 +627,6 @@ in
         ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ]
         ++ lib.optionals (syscallArmPkg != null) [ syscallArmPkg ];
       finalLauncher = scopedLauncher;
-      freezeLaunchPrefix = lib.optionalString freezeNeedsScope "${freezeScopeRunner} ";
-      freezeNeedsScope = dbusMode || proxyMode || dynamicFs || resourceGate;
-      # Approvals freeze the sandbox through its systemd scope. runuser,
-      # sudo -u, and cron leave XDG_RUNTIME_DIR unset, so default it to reach
-      # a lingering user manager. Without a user manager the sandbox runs
-      # unscoped and policyd blocks the requests it cannot freeze for.
-      freezeScopeRunner = pkgs.writeShellScript "agent-sandbox-scope" ''
-        runtime="''${XDG_RUNTIME_DIR:-/run/user/$UID}"
-        if [ -S "$runtime/systemd/private" ]; then
-          exec ${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR="$runtime" \
-            ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect \
-            --expand-environment=no --unit="agent-sandbox-$$_$RANDOM.scope" -- "$@"
-        fi
-        exec "$@"
-      '';
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})
       '';
@@ -1081,18 +1067,40 @@ in
         ++ lib.optionals (sudoGuard != null) [ sudoGuard ]
       );
       sandboxedName = "sandboxed-${binName}";
+      # The calling shell passes its own pid: it is the launcher it registered
+      # with policyd, whether it execs the runner or waits for it.
+      scopeLaunchPrefix = "${scopeRunner} \"$$\" ";
+      # Every sandbox runs in its own systemd scope: policyd freezes it while
+      # an approval pends and kills it when the registered launcher exits. The
+      # unit name carries the launcher pid given as the first argument.
+      # runuser, sudo -u, and cron leave XDG_RUNTIME_DIR unset, so default it
+      # to reach a lingering user manager. Without a user manager the sandbox
+      # runs unscoped: policyd blocks the requests it cannot freeze for and
+      # cannot kill the sandbox when its launcher exits.
+      scopeRunner = pkgs.writeShellScript "agent-sandbox-scope" ''
+        launcher="$1"
+        shift
+        runtime="''${XDG_RUNTIME_DIR:-/run/user/$UID}"
+        if [ -S "$runtime/systemd/private" ]; then
+          exec ${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR="$runtime" \
+            ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect \
+            --expand-environment=no --unit="agent-sandbox-''${launcher}_$RANDOM.scope" -- "$@"
+        fi
+        exec "$@"
+      '';
+      # The dynamic filesystem launcher enters the scope itself, at its bwrap.
       scopedLauncher =
-        if freezeNeedsScope && !dynamicFs then
+        if dynamicFs then
+          launcher
+        else
           pkgs.writeShellApplication {
             name = sandboxedName;
 
             text = ''
               set -euo pipefail
-              exec ${freezeLaunchPrefix}${lib.getExe launcher} "$@"
+              exec ${scopeLaunchPrefix}${lib.getExe launcher} "$@"
             '';
-          }
-        else
-          launcher;
+          };
       staticAllowJson = builtins.toJSON staticAllowRules;
       staticAllowJsonArg = lib.escapeShellArg staticAllowJson;
       staticAllowRules = [

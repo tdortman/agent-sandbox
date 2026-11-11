@@ -156,6 +156,8 @@ impl PolicyServer {
             ));
         }
 
+        tokio::spawn(crate::store::run_session_export_ticker(self.store.clone()));
+
         let proxy_path = self.store.args().proxy_socket.clone();
         let proxy_gid = self.store.args().proxy_gid;
 
@@ -253,7 +255,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::PolicydArgs;
+    use crate::store::{PolicydArgs, RestartPaths};
 
     fn test_args(dir: &tempfile::TempDir) -> PolicydArgs {
         crate::store::test_args(
@@ -1027,7 +1029,10 @@ mod tests {
     async fn session_approval_survives_policyd_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = test_args(&dir);
-        let handoff = dir.path().join("policyd-handoff.json");
+        let paths = RestartPaths {
+            state: dir.path().join("sandbox-state.json"),
+            handoff: dir.path().join("policyd-handoff.json"),
+        };
         let home = dir.path().join("home");
         let project = home.join("project");
         std::fs::create_dir_all(&project).expect("create project dir");
@@ -1047,7 +1052,9 @@ mod tests {
             Some("s1".into()),
         );
 
-        let first = Arc::new(PolicyStore::new(args.clone()));
+        let mut first = PolicyStore::new(args.clone());
+        first.restore_from(paths.clone());
+        let first = Arc::new(first);
         let first_server = spawn_server(&first);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1089,18 +1096,18 @@ mod tests {
 
         // The stopping daemon exits holding the state lock; here the first
         // daemon is aborted instead.
-        let frozen = first
-            .write_handoff_to(&handoff)
-            .await
-            .expect("write handoff");
+        let frozen = first.write_handoff().await.expect("write handoff");
         first_server.abort();
         let _ = first_server.await;
         drop(frozen);
         drop(ui_conn);
 
         let mut second = PolicyStore::new(args.clone());
-        second.restore_handoff_from(&handoff);
-        assert!(!handoff.exists(), "a handoff must be applied only once");
+        second.restore_from(paths.clone());
+        assert!(
+            !paths.handoff.exists(),
+            "a handoff must be applied only once"
+        );
         let second = Arc::new(second);
         let second_server = spawn_server(&second);
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -316,7 +316,7 @@ impl PolicyStore {
             attribution_token,
             flow,
             policy_host,
-            owner_cgroup: super::freeze::process_cgroup(owner_pid).ok(),
+            owner_cgroup: super::lifecycle::process_cgroup(owner_pid).ok(),
         })
     }
 
@@ -973,7 +973,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::types::PolicyStore;
+    use crate::store::{RestartPaths, types::PolicyStore};
 
     fn test_store(dir: &tempfile::TempDir) -> PolicyStore {
         PolicyStore::new(crate::store::test_args(
@@ -1874,7 +1874,10 @@ mod tests {
     #[tokio::test]
     async fn resumed_proxy_session_keeps_claims_across_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let handoff = dir.path().join("policyd-handoff.json");
+        let paths = RestartPaths {
+            state: dir.path().join("sandbox-state.json"),
+            handoff: dir.path().join("policyd-handoff.json"),
+        };
 
         std::fs::write(
             dir.path().join("declarative.json"),
@@ -1882,7 +1885,9 @@ mod tests {
         )
         .expect("declarative policy");
 
-        let first = Arc::new(test_store(&dir));
+        let mut first = test_store(&dir);
+        first.restore_from(paths.clone());
+        let first = Arc::new(first);
         let session = first
             .open_proxy_session(1)
             .await
@@ -1896,15 +1901,10 @@ mod tests {
             ..
         } = test_udp_association(&first, &session).await;
 
-        drop(
-            first
-                .write_handoff_to(&handoff)
-                .await
-                .expect("write handoff"),
-        );
+        drop(first.write_handoff().await.expect("write handoff"));
 
         let mut second = test_store(&dir);
-        second.restore_handoff_from(&handoff);
+        second.restore_from(paths.clone());
         let second = Arc::new(second);
 
         let resumed = second

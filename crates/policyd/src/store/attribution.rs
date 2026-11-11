@@ -15,7 +15,7 @@ use agent_sandbox_core::{
 
 use super::{
     context::read_proc_ppid,
-    freeze::process_cgroup,
+    lifecycle::process_cgroup,
     types::{PolicyStore, SandboxSessionRegistration, TrustedPeer},
 };
 
@@ -519,6 +519,7 @@ mod tests {
             launcher_pid: LAUNCHER,
             launcher_start_ticks: 1,
             cgroup: None,
+            export_reader: None,
         }
     }
 

@@ -17,11 +17,12 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use agent_sandbox_core::{
-    EXPORTED_POLICY_PATH, InodeIdentity, NetworkOwnership, ResourceKind, StaticPolicyAllow,
+    FilesystemReplica, InodeIdentity, NetworkOwnership, REFRESH_INTERVAL, ResourceKind,
+    SessionExport, session_export_path,
 };
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
@@ -121,7 +122,7 @@ const WORKER_LIMIT: usize = 2;
 /// State every broker worker shares.
 struct Shared {
     policy_socket: PathBuf,
-    static_allow: StaticPolicyAllow,
+    local_filesystem: FilesystemReplica,
     resolver: Resolver,
     sandbox_session_id: Option<String>,
     listener_fd: i32,
@@ -160,9 +161,23 @@ fn main() -> std::io::Result<()> {
         .ok()
         .map(PathBuf::from);
 
+    // The broker runs as the sandbox user, so it cannot ask policyd for the
+    // merged policy; it reads the export policyd keeps for its session in
+    // the directory shared with sandboxes, next to the policy socket.
+    let export_path = cli
+        .sandbox_session_id
+        .as_deref()
+        .zip(cli.policy_socket.parent())
+        .and_then(|(session, shared_dir)| session_export_path(shared_dir, session));
+
+    let local_filesystem = match &export_path {
+        Some(path) => FilesystemReplica::fetch(&mut SessionExport::new(path.clone()), project_root),
+        None => FilesystemReplica::new(None, SystemTime::now(), project_root),
+    };
+
     let shared = Arc::new(Shared {
         policy_socket: cli.policy_socket.clone(),
-        static_allow: StaticPolicyAllow::load(Path::new(EXPORTED_POLICY_PATH), project_root),
+        local_filesystem,
         resolver: Resolver::default(),
         sandbox_session_id: cli.sandbox_session_id.clone(),
         listener_fd: cli.listener_fd,
@@ -181,6 +196,18 @@ fn main() -> std::io::Result<()> {
     let workers = std::thread::available_parallelism()
         .map_or(1, |parallelism| parallelism.get().min(WORKER_LIMIT))
         .max(1);
+
+    if let Some(path) = export_path {
+        let follower = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            follower.local_filesystem.follow(
+                &mut SessionExport::new(path),
+                REFRESH_INTERVAL,
+                || false,
+                || {},
+            );
+        });
+    }
 
     let mut handles = Vec::with_capacity(workers - 1);
     for _ in 1..workers {
@@ -258,7 +285,7 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
             &shared.policy_socket,
             &shared.resolver,
             &mut policy_client,
-            &shared.static_allow,
+            &shared.local_filesystem,
             shared.sandbox_session_id.as_deref(),
             shared.listener_fd,
             &notif,

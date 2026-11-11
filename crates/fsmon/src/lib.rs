@@ -27,15 +27,6 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 /// so 30 seconds is ample headroom.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Policy state a monitor answers opens from without asking policyd.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct FilesystemSnapshot {
-    /// Merged filesystem allow and deny rules.
-    pub filesystem: agent_sandbox_core::FilesystemSection,
-    /// Inodes whose hard links policyd must still check.
-    pub denied_inodes: std::collections::HashSet<agent_sandbox_core::InodeIdentity>,
-}
-
 /// Async policyd client for the fanotify monitor event loop.
 ///
 /// Wraps core's [`PersistentRpcClient`] for filesystem checks. Any error or
@@ -46,38 +37,6 @@ pub struct MonitorClient {
 }
 
 impl MonitorClient {
-    /// Fetch the sandbox's current policy without waiting on user approval.
-    ///
-    /// # Errors
-    /// Returns transport, timeout or unexpected-reply errors.
-    pub async fn filesystem_snapshot(
-        &mut self,
-        ctx: RequestContext,
-    ) -> Result<FilesystemSnapshot, RpcClientError> {
-        let reply = self
-            .client
-            .request(
-                RpcRequest::FilesystemSnapshot { ctx },
-                Duration::from_secs(1),
-            )
-            .await?;
-        if let RpcReply::FilesystemSnapshot {
-            filesystem,
-            denied_inodes,
-        } = reply
-        {
-            Ok(FilesystemSnapshot {
-                filesystem,
-                denied_inodes,
-            })
-        } else {
-            self.client.invalidate();
-            Err(RpcClientError::UnexpectedReply(
-                "expected filesystem snapshot",
-            ))
-        }
-    }
-
     /// Create a client that connects lazily on its first request.
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
