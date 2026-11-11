@@ -1,6 +1,7 @@
 //! Policy merge, pending approvals, and UI session state.
 
 mod access;
+mod attribution;
 
 mod context;
 mod dbus;

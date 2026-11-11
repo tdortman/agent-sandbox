@@ -185,12 +185,7 @@ impl PolicyStore {
         if spawn_uid.is_none_or(|u| u == 0)
             && let Some(session_id) = sandbox_session_id
         {
-            spawn_uid = self
-                .sandbox_sessions
-                .read()
-                .ok()
-                .and_then(|sessions| sessions.get(session_id).map(|reg| reg.owner_uid))
-                .filter(|uid| *uid > 0);
+            spawn_uid = self.session_owner_uid(session_id).filter(|uid| *uid > 0);
         }
 
         let spawn = UiSpawnContext {

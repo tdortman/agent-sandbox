@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use agent_sandbox_core::{
     FileAccess, FilesystemRule, Policy, ProcessIds, ResolvedRequestContext, SandboxPaths,
     home_from_uid, is_descendant_of, is_path_descendant, load_policy, merge_layers, peer_context,
-    resolve_policy_write_path, sandbox_session_id_from_pid, trusted_project_policy_path,
+    resolve_policy_write_path, trusted_project_policy_path,
 };
 
 use super::{
-    freeze::{agent_scope_cgroup, process_cgroup},
+    attribution::{HostProcfs, PeerRequest, ProcFacts, attribute_peer, attribute_trusted},
+    freeze::agent_scope_cgroup,
     types::PolicyStore,
 };
 use crate::{
@@ -44,28 +45,6 @@ fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, &target)?;
     Ok(())
-}
-
-/// Session anchor for descendant adoption: the session id plus the pid
-/// (root, else launcher) a candidate peer must descend from and the agent
-/// scope it may share instead.
-struct SessionAnchor {
-    id: String,
-    anchor: u32,
-    cgroup: Option<PathBuf>,
-}
-
-/// Descendant adoption candidate: the session id and the anchor pid that
-/// matched, used to pick the innermost session.
-struct AdoptionCandidate {
-    id: String,
-    anchor: u32,
-}
-
-/// Verified sandbox peer paths, constrained to the registered project root.
-struct PeerPaths {
-    cwd: Option<PathBuf>,
-    project_root: Option<PathBuf>,
 }
 
 /// The three per-package policy sources for one package: the base file from
@@ -297,23 +276,11 @@ impl PolicyStore {
     ) -> ResolvedRequestContext {
         let uid = ctx.ids.uid();
         let pid = ctx.ids.pid();
-        let mut sandbox_session_id = ctx.sandbox_session_id.clone();
+        let procs = HostProcfs::default();
 
-        if sandbox_session_id.is_none()
-            && let Some(pid) = pid
-        {
-            sandbox_session_id = sandbox_session_id_from_pid(pid);
-        }
-
-        // Sandbox children that run with a filtered environment (agents
-        // spawn tools and runtimes with a whitelisted env that drops
-        // AGENT_SANDBOX_SESSION_ID) are attributed by process ancestry
-        // against the registered session launcher/root instead.
-        if sandbox_session_id.is_none()
-            && let Some(pid) = pid
-        {
-            sandbox_session_id = self.session_id_for_descendant(pid, uid);
-        }
+        let attribution = self.with_registrations(|sessions| {
+            attribute_trusted(&procs, sessions, ctx.sandbox_session_id.clone(), pid, uid)
+        });
 
         let mut cwd = ctx.paths.cwd_path();
         let mut home = ctx.paths.home_path();
@@ -326,7 +293,7 @@ impl PolicyStore {
         if (cwd.is_none() || project_root.is_none())
             && let Some(pid) = pid
         {
-            let proc = peer_context(pid, uid);
+            let proc = procs.paths(pid, uid);
 
             if cwd.is_none() {
                 cwd = proc.cwd;
@@ -337,108 +304,11 @@ impl PolicyStore {
             }
         }
 
-        // Root and internal callers are policyd-side trusted: there is no
-        // peer uid to check, so the package is adopted straight from the
-        // session registration.
-        let package = sandbox_session_id.as_ref().and_then(|id| {
-            self.sandbox_sessions
-                .read()
-                .ok()
-                .and_then(|sessions| sessions.get(id).cloned())
-                .and_then(|reg| reg.package)
-        });
-
         ResolvedRequestContext {
             paths: SandboxPaths::from_wire(cwd, home, project_root),
             ids: ProcessIds::from_options(pid, uid),
-            sandbox_session_id,
-            package,
-        }
-    }
-
-    /// Adopt the sandbox session whose launcher or root pid is an ancestor of
-    /// `pid`. Session adoption requires the owner uid to match the process
-    /// uid. For nested sandboxes the innermost matching anchor wins. A pid
-    /// outside every anchor's tree falls back to the session whose agent
-    /// scope it shares, when exactly one session claims that scope.
-    fn session_id_for_descendant(&self, pid: u32, uid: Option<u32>) -> Option<String> {
-        let registrations: Vec<SessionAnchor> = self
-            .sandbox_sessions
-            .read()
-            .ok()?
-            .iter()
-            .filter(|(_, reg)| reg.owner_uid == 0 || Some(reg.owner_uid) == uid)
-            .map(|(id, reg)| SessionAnchor {
-                id: id.clone(),
-                anchor: if reg.root_pid > 0 {
-                    reg.root_pid
-                } else {
-                    reg.launcher_pid
-                },
-                cgroup: reg.cgroup.clone(),
-            })
-            .collect();
-
-        let mut candidates: Vec<AdoptionCandidate> = Vec::new();
-
-        for registration in &registrations {
-            if registration.anchor > 0 && is_descendant_of(registration.anchor, pid) {
-                candidates.push(AdoptionCandidate {
-                    id: registration.id.clone(),
-                    anchor: registration.anchor,
-                });
-            }
-        }
-
-        let innermost = candidates
-            .iter()
-            .find(|candidate| {
-                !candidates.iter().any(|other| {
-                    other.anchor != candidate.anchor
-                        && is_descendant_of(candidate.anchor, other.anchor)
-                })
-            })
-            .map(|candidate| candidate.id.clone());
-
-        if innermost.is_some() {
-            return innermost;
-        }
-
-        let cgroup = process_cgroup(pid).ok()?;
-        let mut scoped = registrations
-            .iter()
-            .filter(|registration| registration.cgroup.as_ref() == Some(&cgroup));
-        let session = scoped.next()?;
-        scoped.next().is_none().then(|| session.id.clone())
-    }
-
-    /// Read the launcher env vars and `/proc` paths for a verified sandbox
-    /// peer, then hold the project root to the registered one.
-    fn peer_paths(
-        pid: u32,
-        trusted_uid: Option<u32>,
-        registration: Option<&SandboxSessionRegistration>,
-    ) -> PeerPaths {
-        let proc = peer_context(pid, trusted_uid);
-        let registered = registration
-            .map(|reg| &reg.project_root)
-            .filter(|root| !root.as_os_str().is_empty());
-
-        // Session members whose environment lacks the claim (tools such as
-        // an agent's Python kernel start with a scrubbed env) or names a root
-        // outside the session get the session's own root.
-        let project_root = match registered {
-            Some(root) => Some(
-                proc.project_root
-                    .filter(|pr| is_path_descendant(pr, root))
-                    .unwrap_or_else(|| root.clone()),
-            ),
-            None => proc.project_root,
-        };
-
-        PeerPaths {
-            cwd: proc.cwd,
-            project_root,
+            sandbox_session_id: attribution.session_id,
+            package: attribution.package,
         }
     }
 
@@ -459,100 +329,26 @@ impl PolicyStore {
             ));
         }
 
-        let peer = Some(peer);
-        let peer_pid = peer.map(|p| p.pid);
-        let trusted_uid = peer.and_then(|p| (p.uid > 0).then_some(p.uid));
+        let procs = HostProcfs::default();
 
-        let verified_pid = match (ctx.ids.pid().filter(|&p| p > 0), peer) {
-            // syscall-arm: the broker parent connects on behalf of the tracee
-            // during emulated connects; prefer the wire tracee pid when it is
-            // the peer or a direct descendant (fs-arm after fork).
-            (Some(wire_pid), Some(p)) if is_descendant_of(p.pid, wire_pid) => Some(wire_pid),
-            (wire_pid, None) => wire_pid,
-            (_, Some(p)) if p.pid > 0 => Some(p.pid),
-            _ => None,
-        };
+        let resolved = self.with_registrations(|sessions| {
+            attribute_peer(&procs, sessions, &PeerRequest {
+                wire_session_id: ctx.sandbox_session_id.as_deref(),
+                wire_pid: ctx.ids.pid(),
+                peer,
+            })
+        });
 
-        let trusted_uid = trusted_uid.or_else(|| ctx.ids.uid());
-        let mut sandbox_session_id = ctx.sandbox_session_id.clone();
-
-        if sandbox_session_id.is_none()
-            && let Some(pid) = verified_pid
-        {
-            sandbox_session_id = sandbox_session_id_from_pid(pid);
-        }
-
-        // Never trust wire home/cwd/project_root from sandbox peers — a
+        // Never trust wire home/cwd/project_root from sandbox peers: a
         // compromised agent can forge them on the sandbox socket. Use the
         // peer uid's passwd home and launcher env vars from /proc instead.
-        let home = trusted_uid
-            .and_then(|u| home_from_uid(Some(u)))
-            .map(PathBuf::from);
-
-        let mut cwd = None;
-        let mut project_root = None;
-        let mut package = None;
-
-        if let Some(pid) = verified_pid {
-            let registration = sandbox_session_id.as_ref().and_then(|id| {
-                self.sandbox_sessions
-                    .read()
-                    .ok()
-                    .and_then(|sessions| sessions.get(id).cloned())
-            });
-
-            let pid_allowed = registration.as_ref().is_none_or(|reg| {
-                // Only a peer inside the sandbox's own process tree (a
-                // strict descendant of the recorded launcher) may inherit
-                // the package. The launcher itself and same-uid host
-                // processes above it (the user's shell, the agent client
-                // that spawned the sandbox) stay excluded, so a forged
-                // session id cannot claim a foreign package.
-                let peer_in_sandbox = reg.launcher_pid > 0
-                    && peer_pid.is_some_and(|pp| {
-                        pp != reg.launcher_pid && is_descendant_of(reg.launcher_pid, pp)
-                    });
-
-                peer_in_sandbox
-                    && (reg.root_pid == pid
-                        || is_descendant_of(reg.root_pid, pid)
-                        // The syscall broker is the parent of the session
-                        // root (the fs-arm entry process), never its
-                        // descendant, and its CheckResource carries the
-                        // tracee pid, which lives beside the root rather
-                        // than under it, so neither root-based check can
-                        // pass. The authenticated peer's host pid is the
-                        // broker: accept it when it is an ancestor of the
-                        // adopted root.
-                        || peer_pid.is_some_and(|pp| is_descendant_of(pp, reg.root_pid)))
-            });
-
-            // Package attribution is unforgeable: the wire session id alone
-            // is attacker-controlled, so the package is only adopted when
-            // the requesting peer owns the registration (same uid) and is
-            // the session root or one of its descendants.
-            if pid_allowed
-                && let Some(reg) = &registration
-                && reg.owner_uid == trusted_uid.unwrap_or(0)
-            {
-                package.clone_from(&reg.package);
-            }
-
-            if pid_allowed {
-                let peer_paths = Self::peer_paths(pid, trusted_uid, registration.as_ref());
-
-                cwd = cwd.or(peer_paths.cwd);
-                project_root = project_root.or(peer_paths.project_root);
-            }
-        }
-
-        let ids = ProcessIds::from_options(verified_pid, trusted_uid);
+        let home = home_from_uid(Some(peer.uid)).map(PathBuf::from);
 
         ResolvedRequestContext {
-            paths: SandboxPaths::from_wire(cwd, home, project_root),
-            ids,
-            sandbox_session_id,
-            package,
+            paths: SandboxPaths::from_wire(resolved.paths.cwd, home, resolved.paths.project_root),
+            ids: ProcessIds::from_options(resolved.verified_pid, Some(peer.uid)),
+            sandbox_session_id: resolved.attribution.session_id,
+            package: resolved.attribution.package,
         }
     }
 
@@ -1048,67 +844,6 @@ mod tests {
         assert_eq!(resolved.package.as_deref(), Some("codex"));
         let _ = child.kill();
         let _ = child.wait();
-    }
-
-    #[test]
-    fn reparented_daemon_adopts_session_by_agent_scope() {
-        let store = test_store();
-        let uid = nix::unistd::getuid().as_raw();
-        let spawn_sleep = || {
-            std::process::Command::new("sleep")
-                .arg("5")
-                .env_clear()
-                .env("PATH", std::env::var("PATH").unwrap_or_default())
-                .spawn()
-                .expect("spawn sleep")
-        };
-
-        // The daemon is a sibling of the session root, like a double-forked
-        // server reparented to a host subreaper: outside the root's process
-        // tree, without AGENT_SANDBOX_SESSION_ID, yet in the root's scope.
-        let mut root = spawn_sleep();
-        let mut daemon = spawn_sleep();
-        let scope = process_cgroup(root.id()).expect("root cgroup");
-        let registration = |cgroup: &Path| SandboxSessionRegistration {
-            root_pid: root.id(),
-            owner_uid: uid,
-            project_root: PathBuf::new(),
-            package: Some("omp".into()),
-            launcher_pid: 0,
-            launcher_start_ticks: 0,
-            cgroup: Some(cgroup.to_path_buf()),
-        };
-        let resolve_daemon = || {
-            store
-                .resolve_trusted_context(&ResolvedRequestContext::new(
-                    SandboxPaths::default(),
-                    ProcessIds::new(daemon.id(), uid),
-                    None,
-                ))
-                .sandbox_session_id
-        };
-
-        store
-            .sandbox_sessions
-            .write()
-            .expect("sessions lock")
-            .insert("sandbox-scope".into(), registration(&scope));
-
-        assert_eq!(resolve_daemon().as_deref(), Some("sandbox-scope"));
-
-        // Two sessions claiming one scope cannot be told apart.
-        store
-            .sandbox_sessions
-            .write()
-            .expect("sessions lock")
-            .insert("sandbox-twin".into(), registration(&scope));
-
-        assert_eq!(resolve_daemon(), None);
-
-        for child in [&mut root, &mut daemon] {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 
     #[test]
