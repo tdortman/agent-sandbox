@@ -348,24 +348,7 @@ impl PolicyStore {
         client_id: u64,
     ) -> bool {
         inner.ui_clients.remove(&client_id).is_some_and(|client| {
-            inner.session.session_allow.remove(&client.session_id);
-            inner.session.session_deny.remove(&client.session_id);
-            inner.session.session_sudo_allow.remove(&client.session_id);
-            inner.session.session_sudo_deny.remove(&client.session_id);
-
-            inner
-                .session
-                .session_filesystem_allow
-                .remove(&client.session_id);
-
-            inner.session.session_dbus_allow.remove(&client.session_id);
-            inner.session.session_dbus_deny.remove(&client.session_id);
-
-            inner
-                .session
-                .session_filesystem_deny
-                .remove(&client.session_id);
-
+            inner.session.forget_session(&client.session_id);
             inner.ui_context_by_session.remove(&client.session_id);
             true
         })

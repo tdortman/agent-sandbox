@@ -4,12 +4,16 @@ use std::path::Path;
 
 use agent_sandbox_core::{
     ApprovalScope, DbusTarget, FilesystemRuleKey, ResourceRuleKey, RpcReply, ScopeActionReply,
-    ScopeTarget, expand_policy_path,
+    expand_policy_path,
 };
 
 use super::{
-    decisions::DecisionAction, persist::PersistResourceRuleArgs, scope_apply::ScopeLadder,
-    state::apply_bucket, types::PolicyStore, util::ScopeAudit,
+    decisions::DecisionAction,
+    persist::PersistResourceRuleArgs,
+    scope_apply::{NoEffects, ScopeLadder},
+    state::SessionState,
+    types::PolicyStore,
+    util::ScopeAudit,
 };
 use crate::wire::{FilesystemScopeOp, ResourceScopeOp, ScopeWire};
 
@@ -55,6 +59,10 @@ impl PolicyStore {
         if let Err(err) = self
             .apply_scope_ladder(
                 ScopeLadder {
+                    action,
+                    key: &key,
+                    bucket: SessionState::filesystem_buckets,
+                    effects: NoEffects,
                     scope,
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
@@ -62,28 +70,6 @@ impl PolicyStore {
 
                     project_log: Some("project filesystem policy saved"),
                     project_package_log: Some("project package filesystem policy saved"),
-                },
-                |inner, target| {
-                    match target {
-                        ScopeTarget::Ephemeral => {}
-
-                        ScopeTarget::Session { session_id } => {
-                            apply_bucket(
-                                &mut inner.session.session_filesystem_allow,
-                                &mut inner.session.session_filesystem_deny,
-                                action,
-                                session_id,
-                                &key,
-                            );
-                        }
-
-                        ScopeTarget::Global { .. }
-                        | ScopeTarget::GlobalPackage { .. }
-                        | ScopeTarget::Project { .. }
-                        | ScopeTarget::ProjectPackage { .. } => {}
-                    }
-
-                    Ok(())
                 },
                 &mut persist,
             )
@@ -151,6 +137,10 @@ impl PolicyStore {
         let applied = self
             .apply_scope_ladder(
                 ScopeLadder {
+                    action,
+                    key: &target,
+                    bucket: SessionState::dbus_buckets,
+                    effects: NoEffects,
                     scope,
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
@@ -158,28 +148,6 @@ impl PolicyStore {
 
                     project_log: None,
                     project_package_log: None,
-                },
-                |inner, scope_target| {
-                    match scope_target {
-                        ScopeTarget::Ephemeral => {}
-
-                        ScopeTarget::Session { session_id } => {
-                            apply_bucket(
-                                &mut inner.session.session_dbus_allow,
-                                &mut inner.session.session_dbus_deny,
-                                action,
-                                session_id,
-                                &target,
-                            );
-                        }
-
-                        ScopeTarget::Global { .. }
-                        | ScopeTarget::GlobalPackage { .. }
-                        | ScopeTarget::Project { .. }
-                        | ScopeTarget::ProjectPackage { .. } => {}
-                    }
-
-                    Ok(())
                 },
                 &mut persist,
             )
@@ -190,14 +158,14 @@ impl PolicyStore {
             Err(err) => return err.into(),
         };
 
-        let _ = self.export_policy_files(paths);
-
-        Self::audit(
-            action.audit_verb(),
-            None,
-            None,
-            &format!("D-Bus target={target:?} scope={scope_label}"),
-        );
+        // The reply carries the written policy file for every persistent
+        // scope, not only the project display path `finalize_scope_reply`
+        // reports, so dbus records and builds its reply itself.
+        self.record_scope_applied(&paths, action, ScopeAudit {
+            host: None,
+            port: None,
+            detail: &format!("D-Bus target={target:?} scope={scope_label}"),
+        });
 
         RpcReply::ScopeAction(ScopeActionReply::ok_dbus(target, scope, policy_path))
     }
@@ -243,6 +211,10 @@ impl PolicyStore {
         if let Err(err) = self
             .apply_scope_ladder(
                 ScopeLadder {
+                    action,
+                    key: &key,
+                    bucket: SessionState::resource_buckets,
+                    effects: NoEffects,
                     scope,
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
@@ -250,28 +222,6 @@ impl PolicyStore {
 
                     project_log: Some("project resource policy saved"),
                     project_package_log: Some("project package resource policy saved"),
-                },
-                |inner, target| {
-                    match target {
-                        ScopeTarget::Ephemeral => {}
-
-                        ScopeTarget::Session { session_id } => {
-                            apply_bucket(
-                                &mut inner.session.session_resource_allow,
-                                &mut inner.session.session_resource_deny,
-                                action,
-                                session_id,
-                                &key,
-                            );
-                        }
-
-                        ScopeTarget::Global { .. }
-                        | ScopeTarget::GlobalPackage { .. }
-                        | ScopeTarget::Project { .. }
-                        | ScopeTarget::ProjectPackage { .. } => {}
-                    }
-
-                    Ok(())
                 },
                 &mut persist,
             )

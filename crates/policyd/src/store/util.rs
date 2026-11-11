@@ -19,9 +19,20 @@ impl super::types::PolicyStore {
         tracing::info!(target: "audit", action, host, port, detail, "policy event");
     }
 
-    /// Shared tail of every scope-apply flow: export policy files, emit the
-    /// audit event, then build the scope reply. Only the audit target, the
-    /// audit detail, and the concrete `ok_*` reply differ across capabilities.
+    /// Export policy files and emit the audit event of an applied scope.
+    pub(super) fn record_scope_applied(
+        &self,
+        paths: &SandboxPaths,
+        action: DecisionAction,
+        audit: ScopeAudit<'_>,
+    ) {
+        let _ = self.export_policy_files(paths.clone());
+        Self::audit(action.audit_verb(), audit.host, audit.port, audit.detail);
+    }
+
+    /// Shared tail of every scope-apply flow: [`Self::record_scope_applied`],
+    /// then build the scope reply. Only the audit target, the audit detail,
+    /// and the concrete `ok_*` reply differ across capabilities.
     pub(super) fn finalize_scope_reply<F>(
         &self,
         paths: &SandboxPaths,
@@ -33,8 +44,7 @@ impl super::types::PolicyStore {
     where
         F: FnOnce(ApprovalScope, Option<PathBuf>) -> RpcReply,
     {
-        let _ = self.export_policy_files(paths.clone());
-        Self::audit(action.audit_verb(), audit.host, audit.port, audit.detail);
+        self.record_scope_applied(paths, action, audit);
 
         let policy_path = match (paths.home(), paths.project_root()) {
             (_, Some(p)) if scope == ApprovalScope::Project => Self::project_policy_path_display(p),

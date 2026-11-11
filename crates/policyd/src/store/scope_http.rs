@@ -10,9 +10,9 @@ use agent_sandbox_core::{
 use super::{
     decisions::DecisionAction,
     http::{http_context, target_for_request},
-    scope_apply::{ScopeApplyError, ScopeLadder},
-    state::apply_bucket,
-    types::{HttpPendingKey, Pending, PendingHttp, PolicyStore},
+    scope_apply::{ScopeApplyError, ScopeEffects, ScopeLadder},
+    state::SessionState,
+    types::{HttpPendingKey, HttpScopeKey, Pending, PendingHttp, PolicyDecisionState, PolicyStore},
 };
 use crate::{error::PolicydError, wire::ScopeWire};
 
@@ -56,53 +56,41 @@ fn build_once_keys(
         .collect())
 }
 
-fn apply_http_memory_locked(
-    inner: &mut super::types::PolicyDecisionState,
-    target: &HttpRuleTarget,
-    scope_target: &ScopeTarget,
-    context: &HttpContextKey,
-    allowed: bool,
-) -> Result<(), PolicydError> {
-    match scope_target {
-        ScopeTarget::Ephemeral => {
-            for key in build_once_keys(target, context)? {
-                if allowed {
-                    inner.session.http_once_deny.remove(&key);
-                    inner.session.http_once_allow.insert(key);
-                } else {
-                    inner.session.http_once_allow.remove(&key);
-                    inner.session.http_once_deny.insert(key);
+/// HTTP decisions drop the HTTP verdict cache before any in-memory change,
+/// and a once decision parks its keys in the once sets until a pending
+/// request consumes them.
+struct HttpEffects<'a> {
+    target: &'a HttpRuleTarget,
+    context: &'a HttpContextKey,
+}
+
+impl ScopeEffects for HttpEffects<'_> {
+    fn before(
+        &self,
+        inner: &mut PolicyDecisionState,
+        _target: &ScopeTarget,
+    ) -> Result<(), PolicydError> {
+        PolicyStore::clear_http_verdict_cache_locked(inner);
+        Ok(())
+    }
+
+    fn once(&self, session: &mut SessionState, action: DecisionAction) -> Result<(), PolicydError> {
+        for key in build_once_keys(self.target, self.context)? {
+            match action {
+                DecisionAction::Approve => {
+                    session.http_once_deny.remove(&key);
+                    session.http_once_allow.insert(key);
+                }
+
+                DecisionAction::Deny => {
+                    session.http_once_allow.remove(&key);
+                    session.http_once_deny.insert(key);
                 }
             }
         }
 
-        ScopeTarget::Session { session_id } => {
-            let key = super::types::HttpScopeKey {
-                target: target.clone(),
-                context: context.clone(),
-            };
-            let action = if allowed {
-                DecisionAction::Approve
-            } else {
-                DecisionAction::Deny
-            };
-
-            apply_bucket(
-                &mut inner.session.http_session_allow,
-                &mut inner.session.http_session_deny,
-                action,
-                session_id,
-                &key,
-            );
-        }
-
-        ScopeTarget::Project { .. }
-        | ScopeTarget::ProjectPackage { .. }
-        | ScopeTarget::Global { .. }
-        | ScopeTarget::GlobalPackage { .. } => {}
+        Ok(())
     }
-
-    Ok(())
 }
 
 impl PolicyStore {
@@ -149,11 +137,13 @@ impl PolicyStore {
         }
 
         let context = http_context(&ctx);
+        let scope_key = HttpScopeKey {
+            target: target.clone(),
+            context: context.clone(),
+        };
 
-        // HTTP invalidation is broader than the ladder's merged-policy flag:
-        // every persistent write also drops the HTTP verdict cache, so this
-        // caller clears both caches itself after the ladder's write and the
-        // ladder's own invalidation stays off.
+        // The HTTP verdict cache is also cleared after a persistent write,
+        // below, in addition to `HttpEffects::before`.
         let mut persist = |policy_path: &Path, home: Option<&Path>| -> std::io::Result<()> {
             Self::persist_http_rule(
                 policy_path,
@@ -168,16 +158,23 @@ impl PolicyStore {
         let applied = self
             .apply_scope_ladder(
                 ScopeLadder {
+                    action: if allowed {
+                        DecisionAction::Approve
+                    } else {
+                        DecisionAction::Deny
+                    },
+                    key: &scope_key,
+                    bucket: SessionState::http_buckets,
+                    effects: HttpEffects {
+                        target: &target,
+                        context: &context,
+                    },
                     scope,
                     session_id: session_id.as_deref(),
                     package: ctx.package.as_deref(),
                     paths: &ctx.paths,
                     project_log: None,
                     project_package_log: None,
-                },
-                |inner, scope_target| {
-                    Self::clear_http_verdict_cache_locked(inner);
-                    apply_http_memory_locked(inner, &target, scope_target, &context, allowed)
                 },
                 &mut persist,
             )
@@ -493,14 +490,18 @@ mod tests {
         )
         .expect("valid target");
 
-        let context = HttpContextKey::default();
-        let mut inner = store.inner.lock().await;
+        let ctx = ResolvedRequestContext::new(
+            SandboxPaths::new("/work", "/home/user", "/work"),
+            ProcessIds::default(),
+            None,
+        );
 
-        apply_http_memory_locked(&mut inner, &target, &ScopeTarget::Ephemeral, &context, true)
+        store
+            .apply_http_scope(target, ApprovalScope::Once, None, ctx, true)
+            .await
             .expect("store any-of once target");
 
-        assert_eq!(inner.session.http_once_allow.len(), 2);
-        drop(inner);
+        assert_eq!(store.inner.lock().await.session.http_once_allow.len(), 2);
     }
 
     #[tokio::test]

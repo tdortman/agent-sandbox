@@ -2,10 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply, ScopeTarget};
+use agent_sandbox_core::{RpcReply, SandboxPaths, ScopeActionReply};
 
 use super::{
-    decisions::DecisionAction, scope_apply::ScopeLadder, state::apply_bucket, types::PolicyStore,
+    decisions::DecisionAction,
+    scope_apply::{NoEffects, ScopeLadder},
+    state::SessionState,
+    types::PolicyStore,
     util::ScopeAudit,
 };
 use crate::wire::{ScopeWire, SudoScopeOp};
@@ -46,6 +49,10 @@ impl PolicyStore {
         if let Err(err) = self
             .apply_scope_ladder(
                 ScopeLadder {
+                    action,
+                    key: &argv,
+                    bucket: SessionState::sudo_buckets,
+                    effects: NoEffects,
                     scope,
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
@@ -53,28 +60,6 @@ impl PolicyStore {
 
                     project_log: Some("project sudo policy saved"),
                     project_package_log: Some("project package sudo policy saved"),
-                },
-                |inner, target| {
-                    match target {
-                        ScopeTarget::Ephemeral => {}
-
-                        ScopeTarget::Session { session_id } => {
-                            apply_bucket(
-                                &mut inner.session.session_sudo_allow,
-                                &mut inner.session.session_sudo_deny,
-                                action,
-                                session_id,
-                                &argv,
-                            );
-                        }
-
-                        ScopeTarget::Global { .. }
-                        | ScopeTarget::GlobalPackage { .. }
-                        | ScopeTarget::Project { .. }
-                        | ScopeTarget::ProjectPackage { .. } => {}
-                    }
-
-                    Ok(())
                 },
                 &mut persist,
             )

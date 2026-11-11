@@ -1,19 +1,72 @@
 //! Policy store: the shared scope ladder lifecycle.
 //!
 //! Every capability scope decision runs the same ladder: resolve the
-//! [`ScopeTarget`] from the [`ApprovalScope`], apply the in-memory session
-//! arms under the state lock, then run the four persistent arms through the
-//! capability's rule writer. Project-scope writes emit the ladder's log lines.
+//! [`ScopeTarget`] from the [`ApprovalScope`], apply the in-memory arms under
+//! the state lock (the ladder owns the `Session` arm; the `Ephemeral` arm and
+//! pre-memory invalidation are the capability's [`ScopeEffects`]), then run
+//! the four persistent arms through the capability's rule writer.
+//! Project-scope writes emit the ladder's log lines.
 
-use std::path::{Path, PathBuf};
+use std::{
+    hash::Hash,
+    path::{Path, PathBuf},
+};
 
 use agent_sandbox_core::{ApprovalScope, RpcReply, SandboxPaths, ScopeContext, ScopeTarget};
 
-use super::types::{PolicyDecisionState, PolicyStore};
+use super::{
+    decisions::DecisionAction,
+    state::{SessionBuckets, SessionState},
+    types::{PolicyDecisionState, PolicyStore},
+};
 use crate::error::PolicydError;
 
-/// The capability-independent inputs of one scope decision.
-pub struct ScopeLadder<'a> {
+/// Capability-specific in-memory work around the ladder's session arm.
+pub trait ScopeEffects {
+    /// Runs under the state lock for every resolved target, before the
+    /// in-memory arms.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that rejects the decision before any memory write.
+    fn before(
+        &self,
+        _inner: &mut PolicyDecisionState,
+        _target: &ScopeTarget,
+    ) -> Result<(), PolicydError> {
+        Ok(())
+    }
+
+    /// The `Ephemeral` arm: record a once decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that rejects the once decision.
+    fn once(
+        &self,
+        _session: &mut SessionState,
+        _action: DecisionAction,
+    ) -> Result<(), PolicydError> {
+        Ok(())
+    }
+}
+
+/// Capabilities with no once set and no invalidation: `Ephemeral` writes
+/// nothing.
+pub struct NoEffects;
+
+impl ScopeEffects for NoEffects {}
+
+/// The inputs of one scope decision: the request, the decision, the rule
+/// key, and the session bucket the key belongs to.
+pub struct ScopeLadder<'a, K, E> {
+    pub action: DecisionAction,
+    pub key: &'a K,
+
+    /// Selects the capability's session bucket, e.g.
+    /// `SessionState::sudo_buckets`.
+    pub bucket: fn(&mut SessionState) -> SessionBuckets<'_, K>,
+    pub effects: E,
     pub scope: ApprovalScope,
     pub session_id: Option<&'a str>,
     pub package: Option<&'a str>,
@@ -58,21 +111,21 @@ impl From<ScopeApplyError> for RpcReply {
 impl PolicyStore {
     /// Run the full scope ladder for one capability decision.
     ///
-    /// `memory` runs under the state lock for every resolved target and owns
-    /// the in-memory arms (`Ephemeral`, `Session`); it ignores the persistent
-    /// targets. `persist` is the capability's rule writer, invoked once per
-    /// persistent arm with the policy path and the home the rule belongs to.
+    /// The in-memory arms run under the state lock: `Session` writes the
+    /// key into the capability's bucket, `Ephemeral` defers to
+    /// [`ScopeEffects::once`]. `persist` is the capability's rule writer,
+    /// invoked once per persistent arm with the policy path and the home the
+    /// rule belongs to.
     ///
     /// # Errors
     ///
     /// Returns [`ScopeApplyError::Resolve`] when the approval scope is not
     /// valid for this request, [`ScopeApplyError::Memory`] when the
-    /// capability's memory step rejects the decision, and
+    /// capability's effects reject the decision, and
     /// [`ScopeApplyError::Persist`] when a persistent rule write fails.
-    pub async fn apply_scope_ladder(
+    pub async fn apply_scope_ladder<K: Clone + Eq + Hash + Sync, E: ScopeEffects + Send>(
         &self,
-        ladder: ScopeLadder<'_>,
-        memory: impl FnOnce(&mut PolicyDecisionState, &ScopeTarget) -> Result<(), PolicydError>,
+        ladder: ScopeLadder<'_, K, E>,
         persist: &mut impl FnMut(&Path, Option<&Path>) -> std::io::Result<()>,
     ) -> Result<ScopeApplied, ScopeApplyError> {
         let home = ladder.paths.home();
@@ -91,7 +144,30 @@ impl PolicyStore {
 
         {
             let mut inner = self.inner.lock().await;
-            memory(&mut inner, &target).map_err(ScopeApplyError::Memory)?;
+            ladder
+                .effects
+                .before(&mut inner, &target)
+                .map_err(ScopeApplyError::Memory)?;
+
+            match &target {
+                ScopeTarget::Ephemeral => ladder
+                    .effects
+                    .once(&mut inner.session, ladder.action)
+                    .map_err(ScopeApplyError::Memory)?,
+
+                ScopeTarget::Session { session_id } => {
+                    (ladder.bucket)(&mut inner.session).apply(
+                        ladder.action,
+                        session_id,
+                        ladder.key,
+                    );
+                }
+
+                ScopeTarget::Global { .. }
+                | ScopeTarget::GlobalPackage { .. }
+                | ScopeTarget::Project { .. }
+                | ScopeTarget::ProjectPackage { .. } => {}
+            }
         }
 
         let policy_path = match &target {

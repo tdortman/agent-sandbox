@@ -10,7 +10,10 @@
 //! clients retry against the new daemon.
 
 use std::{
-    fs, io,
+    collections::{HashMap, HashSet},
+    fs,
+    hash::Hash,
+    io,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -25,7 +28,7 @@ use tracing::{info, warn};
 
 use super::{
     sandbox_state::write_atomic,
-    state::{PolicyDecisionState, SessionState},
+    state::{PolicyDecisionState, SessionState, with_session_buckets},
     types::{HttpScopeKey, PolicyStore, ProxyFlowState, ProxySessionState, UiSessionContext},
 };
 
@@ -71,16 +74,19 @@ struct UiSessionHandoff {
     decisions: SessionDecisions,
 }
 
-/// Declares [`SessionDecisions`] with one list per per-session bucket of
-/// [`SessionState`], named after the bucket.
+/// Declares [`SessionDecisions`] from the bucket list of
+/// [`with_session_buckets`]: one list per allow and deny bucket, named after
+/// the [`SessionState`] field, which is the file's JSON key.
 macro_rules! session_decisions {
-    ($($bucket:ident: $key:ty),* $(,)?) => {
+    ($($accessor:ident: $key:ty { allow: $allow:ident, deny: $deny:ident $(,)? }),* $(,)?) => {
         /// One session's entries in every per-session decision bucket.
         #[derive(Default, Serialize, Deserialize)]
         struct SessionDecisions {
             $(
                 #[serde(default)]
-                $bucket: Vec<$key>,
+                $allow: Vec<$key>,
+                #[serde(default)]
+                $deny: Vec<$key>,
             )*
         }
 
@@ -88,41 +94,38 @@ macro_rules! session_decisions {
             fn of(state: &SessionState, session_id: &str) -> Self {
                 Self {
                     $(
-                        $bucket: state
-                            .$bucket
-                            .get(session_id)
-                            .map(|bucket| bucket.iter().cloned().collect())
-                            .unwrap_or_default(),
+                        $allow: bucket_entries(&state.$allow, session_id),
+                        $deny: bucket_entries(&state.$deny, session_id),
                     )*
                 }
             }
 
             fn restore(self, state: &mut SessionState, session_id: &str) {
                 $(
-                    if !self.$bucket.is_empty() {
-                        state
-                            .$bucket
-                            .insert(session_id.to_owned(), self.$bucket.into_iter().collect());
-                    }
+                    restore_bucket(&mut state.$allow, session_id, self.$allow);
+                    restore_bucket(&mut state.$deny, session_id, self.$deny);
                 )*
             }
         }
     };
 }
 
-session_decisions! {
-    session_allow: NetworkRuleKey,
-    session_deny: NetworkRuleKey,
-    session_sudo_allow: Vec<String>,
-    session_sudo_deny: Vec<String>,
-    session_filesystem_allow: FilesystemRuleKey,
-    session_filesystem_deny: FilesystemRuleKey,
-    session_resource_allow: ResourceRuleKey,
-    session_resource_deny: ResourceRuleKey,
-    session_dbus_allow: DbusTarget,
-    session_dbus_deny: DbusTarget,
-    http_session_allow: HttpScopeKey,
-    http_session_deny: HttpScopeKey,
+with_session_buckets!(session_decisions);
+
+fn bucket_entries<K: Clone>(bucket: &HashMap<String, HashSet<K>>, session_id: &str) -> Vec<K> {
+    bucket
+        .get(session_id)
+        .map_or_default(|keys| keys.iter().cloned().collect())
+}
+
+fn restore_bucket<K: Eq + Hash>(
+    bucket: &mut HashMap<String, HashSet<K>>,
+    session_id: &str,
+    keys: Vec<K>,
+) {
+    if !keys.is_empty() {
+        bucket.insert(session_id.to_owned(), keys.into_iter().collect());
+    }
 }
 
 fn handoff_path() -> PathBuf {

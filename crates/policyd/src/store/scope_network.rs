@@ -5,10 +5,45 @@ use std::path::Path;
 use agent_sandbox_core::{NetworkRuleKey, RpcReply, ScopeActionReply, ScopeTarget};
 
 use super::{
-    decisions::DecisionAction, scope_apply::ScopeLadder, state::apply_bucket, types::PolicyStore,
+    decisions::DecisionAction,
+    scope_apply::{ScopeEffects, ScopeLadder},
+    state::SessionState,
+    types::{PolicyDecisionState, PolicyStore},
     util::ScopeAudit,
 };
-use crate::wire::{NetworkScopeOp, ScopeWire};
+use crate::{
+    error::PolicydError,
+    wire::{NetworkScopeOp, ScopeWire},
+};
+
+/// Network decisions revoke the kernel-side grants before any in-memory
+/// change, and a once approval waits in `once_allow` for its one check.
+struct NetworkEffects<'a> {
+    store: &'a PolicyStore,
+    key: &'a NetworkRuleKey,
+}
+
+impl ScopeEffects for NetworkEffects<'_> {
+    fn before(
+        &self,
+        _inner: &mut PolicyDecisionState,
+        target: &ScopeTarget,
+    ) -> Result<(), PolicydError> {
+        if matches!(target, ScopeTarget::Ephemeral | ScopeTarget::Session { .. }) {
+            self.store.revoke_network_grants()?;
+        }
+
+        Ok(())
+    }
+
+    fn once(&self, session: &mut SessionState, action: DecisionAction) -> Result<(), PolicydError> {
+        if action == DecisionAction::Approve {
+            session.once_allow.insert(self.key.clone());
+        }
+
+        Ok(())
+    }
+}
 
 impl PolicyStore {
     pub(crate) async fn apply_network_scope(
@@ -50,6 +85,13 @@ impl PolicyStore {
         if let Err(err) = self
             .apply_scope_ladder(
                 ScopeLadder {
+                    action,
+                    key: &key,
+                    bucket: SessionState::network_buckets,
+                    effects: NetworkEffects {
+                        store: self,
+                        key: &key,
+                    },
                     scope,
                     session_id: session_id.as_deref(),
                     package: package.as_deref(),
@@ -57,35 +99,6 @@ impl PolicyStore {
 
                     project_log: Some("project policy saved"),
                     project_package_log: Some("project package policy saved"),
-                },
-                |inner, target| {
-                    if matches!(target, ScopeTarget::Ephemeral | ScopeTarget::Session { .. }) {
-                        self.revoke_network_grants()?;
-                    }
-                    match target {
-                        ScopeTarget::Ephemeral => {
-                            if action == DecisionAction::Approve {
-                                inner.session.once_allow.insert(key.clone());
-                            }
-                        }
-
-                        ScopeTarget::Session { session_id } => {
-                            apply_bucket(
-                                &mut inner.session.session_allow,
-                                &mut inner.session.session_deny,
-                                action,
-                                session_id,
-                                &key,
-                            );
-                        }
-
-                        ScopeTarget::Global { .. }
-                        | ScopeTarget::GlobalPackage { .. }
-                        | ScopeTarget::Project { .. }
-                        | ScopeTarget::ProjectPackage { .. } => {}
-                    }
-
-                    Ok(())
                 },
                 &mut persist,
             )

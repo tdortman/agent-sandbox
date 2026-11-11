@@ -896,7 +896,7 @@ mod tests {
         is_protected_host_ipc_socket, session_filesystem_matches, session_network_matches,
         session_sudo_matches,
     };
-    use crate::store::{UiSessionContext, state::apply_bucket, types::UiClient};
+    use crate::store::{UiSessionContext, types::UiClient};
 
     #[test]
     fn session_filesystem_matches_honors_project_relative_paths() {
@@ -1590,10 +1590,7 @@ mod tests {
         {
             let mut inner = store.inner.lock().await;
             let key = FilesystemRuleKey::new("./.git", FileAccess::ReadWrite);
-            let session = &mut inner.session;
-            apply_bucket(
-                &mut session.session_filesystem_allow,
-                &mut session.session_filesystem_deny,
+            inner.session.filesystem_buckets().apply(
                 crate::store::decisions::DecisionAction::Deny,
                 ui_session_id,
                 &key,
