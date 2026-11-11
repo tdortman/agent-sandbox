@@ -43,7 +43,7 @@ fn is_doh_response(response: &Response) -> bool {
 /// Rewrite a successful `DoH` DNS response before returning it to the client.
 ///
 /// Only `application/dns-message` responses are inspected. Unsupported content
-/// encodings and DNSSEC-protected ECH answers fail closed.
+/// encodings fail closed.
 pub async fn rewrite_doh_response(
     mut response: Response,
     ech_config_list: Option<&[u8]>,
@@ -72,9 +72,6 @@ pub async fn rewrite_doh_response(
     let body = match rewrite_ech_config(&body, replacement)? {
         EchRewrite::Rewritten(body) => body,
         EchRewrite::Unchanged => body.to_vec(),
-        EchRewrite::DnssecProtected => {
-            return Err(Box::new(PolicyDenied));
-        }
     };
 
     response.headers_mut().remove("transfer-encoding");

@@ -317,7 +317,8 @@ async fn serve_origin_body(
 }
 
 /// One canned `application/dns-message` response with an HTTPS record whose
-/// ECH configuration the proxy must rewrite (or reject when DNSSEC-bearing).
+/// ECH configuration the proxy must rewrite, optionally marked
+/// DNSSEC-authenticated.
 fn doh_dns_message(dnssec: bool) -> Vec<u8> {
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},

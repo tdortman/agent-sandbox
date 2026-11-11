@@ -23,9 +23,6 @@ pub struct DnsMapping {
 }
 
 /// Result of attempting to replace an ECH configuration in a DNS response.
-///
-/// The caller must treat `DnssecProtected` as a fail-closed result rather than
-/// forwarding a response whose authenticated contents were modified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EchRewrite {
     /// At least one ECH configuration was replaced and the message re-encoded.
@@ -35,15 +32,12 @@ pub enum EchRewrite {
 
     /// No ECH configuration was present, or the message was not changed.
     Unchanged,
-
-    /// The response contains DNSSEC evidence and must not be rewritten.
-    DnssecProtected,
 }
 
-/// Replace only advertised ECH configurations in an unsigned DNS response.
+/// Replace advertised ECH configurations in a DNS response.
 ///
-/// DNSSEC-bearing responses are returned unchanged so the caller can fail
-/// closed instead of forwarding an internally inconsistent response.
+/// A rewritten response no longer matches its signatures, so it is returned
+/// without DNSSEC evidence (see [`strip_dnssec`]).
 ///
 /// # Errors
 ///
@@ -73,18 +67,11 @@ pub fn rewrite_ech_config(data: &[u8], replacement: &[u8]) -> Result<EchRewrite,
             _ => false,
         });
 
-    let dnssec_evidence = has_ech
-        && (message.metadata.authentic_data
-            || message
-                .answers
-                .iter()
-                .chain(&message.authorities)
-                .chain(&message.additionals)
-                .any(|record| record.record_type().is_dnssec()));
-
-    if dnssec_evidence {
-        return Ok(EchRewrite::DnssecProtected);
+    if !has_ech {
+        return Ok(EchRewrite::Unchanged);
     }
+
+    strip_dnssec(&mut message);
 
     let mut rewritten = false;
 
@@ -120,6 +107,23 @@ pub fn rewrite_ech_config(data: &[u8], replacement: &[u8]) -> Result<EchRewrite,
         .to_vec()
         .map(EchRewrite::Rewritten)
         .map_err(|error| error.to_string())
+}
+
+/// Present a response the caller has modified as unauthenticated: clear the AD
+/// bit and drop DNSSEC records whose signatures no longer match.
+///
+/// Validating stubs then accept the answer as insecure instead of rejecting it
+/// as bogus, while unmodified responses keep their DNSSEC evidence.
+pub fn strip_dnssec(message: &mut Message) {
+    message.metadata.authentic_data = false;
+
+    for records in [
+        &mut message.answers,
+        &mut message.authorities,
+        &mut message.additionals,
+    ] {
+        records.retain(|record| !record.record_type().is_dnssec());
+    }
 }
 
 fn query_name(message: &Message) -> Option<String> {
@@ -259,7 +263,7 @@ mod tests {
         rr::{
             Name, RData, Record, RecordType,
             rdata::{
-                A, AAAA, CNAME, HTTPS,
+                A, AAAA, CNAME, HTTPS, NULL,
                 svcb::{EchConfigList, IpHint, SVCB, SvcParamKey, SvcParamValue},
             },
         },
@@ -447,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_rewrite_authenticated_ech_config() {
+    fn rewrites_authenticated_ech_config_as_unauthenticated() {
         let qname = Name::from_ascii("example.com.").expect("valid name");
 
         let svcb = SVCB::new(1, Name::root(), vec![(
@@ -460,11 +464,34 @@ mod tests {
 
         message
             .add_query(Query::query(qname.clone(), RecordType::HTTPS))
-            .add_answer(Record::from_rdata(qname, 60, RData::HTTPS(HTTPS(svcb))));
+            .add_answer(Record::from_rdata(
+                qname.clone(),
+                60,
+                RData::HTTPS(HTTPS(svcb)),
+            ))
+            .add_answer(Record::from_rdata(qname, 60, RData::Unknown {
+                code: RecordType::RRSIG,
+                rdata: NULL::with(vec![0; 4]),
+            }));
+
+        let EchRewrite::Rewritten(bytes) =
+            rewrite_ech_config(&message.to_vec().expect("encode"), &[4, 5, 6]).expect("rewrite")
+        else {
+            panic!("expected rewritten response");
+        };
+
+        let rewritten = Message::from_vec(&bytes).expect("decode rewritten response");
+
+        assert!(!rewritten.metadata.authentic_data);
+        assert_eq!(rewritten.answers.len(), 1);
+
+        let RData::HTTPS(https) = &rewritten.answers[0].data else {
+            panic!("expected HTTPS answer");
+        };
 
         assert_eq!(
-            rewrite_ech_config(&message.to_vec().expect("encode"), &[4, 5, 6]).expect("rewrite"),
-            EchRewrite::DnssecProtected
+            https.0.svc_params[0].1,
+            SvcParamValue::EchConfigList(EchConfigList(vec![4, 5, 6]))
         );
     }
 

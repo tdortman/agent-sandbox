@@ -29,7 +29,9 @@ pub use context::{
     sandbox_session_id_from_pid, wire_context,
 };
 pub use dns_cache::{DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, lookup_dns_cache};
-pub use dns_wire::{DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config};
+pub use dns_wire::{
+    DnsMapping, EchRewrite, mappings_from_response, rewrite_ech_config, strip_dnssec,
+};
 pub use error::{InvalidScopeError, ProjectPolicyError, ScopeResolveError};
 pub use graphical_env::{graphical_session_env, tool_path};
 pub use hosts::{

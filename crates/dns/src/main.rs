@@ -16,7 +16,7 @@ use std::{
 
 use agent_sandbox_core::{
     DEFAULT_CACHE_PATH, DEFAULT_MAX_TTL, DnsCache, EchRewrite, mappings_from_response,
-    rewrite_ech_config,
+    rewrite_ech_config, strip_dnssec,
 };
 use clap::Parser;
 use hickory_proto::{
@@ -374,12 +374,6 @@ impl DnsForwarder {
             match rewrite_ech_config(&response, &replacement) {
                 Ok(EchRewrite::Rewritten(response)) => response,
                 Ok(EchRewrite::Unchanged) => response,
-                Ok(EchRewrite::DnssecProtected) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "refusing to rewrite DNSSEC-bearing response",
-                    ));
-                }
                 Err(error) => {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
                 }
@@ -396,20 +390,31 @@ impl DnsForwarder {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
 
-        let dnssec_evidence = message.metadata.authentic_data
-            || message
-                .answers
-                .iter()
-                .chain(&message.authorities)
-                .chain(&message.additionals)
-                .any(|record| record.record_type().is_dnssec());
+        // Records keep only their ECH parameter and are dropped when nothing
+        // remains.
+        let needs_strip = message
+            .answers
+            .iter()
+            .chain(&message.authorities)
+            .chain(&message.additionals)
+            .any(|record| {
+                let params = match &record.data {
+                    RData::HTTPS(https) => &https.0.svc_params,
+                    RData::SVCB(svcb) => &svcb.svc_params,
+                    _ => return false,
+                };
 
-        if dnssec_evidence {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "refusing to suppress metadata in DNSSEC-bearing response",
-            ));
+                params.is_empty()
+                    || params
+                        .iter()
+                        .any(|(key, _)| *key != SvcParamKey::EchConfigList)
+            });
+
+        if !needs_strip {
+            return Ok(response);
         }
+
+        strip_dnssec(&mut message);
 
         let strip_metadata = |records: &mut Vec<hickory_proto::rr::Record>| {
             records.retain_mut(|record| {
@@ -599,7 +604,8 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_strip_dnssec_authenticated_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    fn strips_dnssec_authenticated_metadata_as_unauthenticated()
+    -> Result<(), Box<dyn std::error::Error>> {
         use hickory_proto::rr::rdata::svcb::SVCB;
 
         let name = Name::from_ascii("example.com.")?;
@@ -615,11 +621,31 @@ mod tests {
         let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
         forwarder.suppress_https_svcb = true;
 
-        let error = forwarder
-            .sanitize_response(message.to_vec()?)
-            .expect_err("DNSSEC-authenticated metadata must not be stripped");
+        let filtered = Message::from_vec(&forwarder.sanitize_response(message.to_vec()?)?)?;
 
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!filtered.metadata.authentic_data);
+        assert_eq!(filtered.answers, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn passes_dnssec_authenticated_answers_without_svcb_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let name = Name::from_ascii("example.com.")?;
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        message.metadata.authentic_data = true;
+        message.add_query(Query::query(name.clone(), RecordType::A));
+        message.add_answer(Record::from_rdata(
+            name,
+            300,
+            RData::A(std::net::Ipv4Addr::new(192, 0, 2, 7).into()),
+        ));
+        let response = message.to_vec()?;
+
+        let mut forwarder = test_forwarder("127.0.0.1:53".parse()?);
+        forwarder.suppress_https_svcb = true;
+
+        assert_eq!(forwarder.sanitize_response(response.clone())?, response);
         Ok(())
     }
 
