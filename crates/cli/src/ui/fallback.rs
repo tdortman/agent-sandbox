@@ -7,7 +7,7 @@ use agent_sandbox_core::{
 use tracing::warn;
 
 use super::{
-    dialog::Dialogs,
+    dialog::{Dialogs, Renderer},
     error::UiCliError,
     options::{ACTION_OPTIONS, PromptAction, ReviewedChoice, ScopeOption, scope_only_options},
     prompt::{Fallback, FallbackTarget, prompt_tag},
@@ -17,7 +17,7 @@ use super::{
 ///
 /// Returns `Ok(None)` when the user cancels at any step.
 pub async fn ask(
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     session_available: bool,
     package: Option<&str>,
     fallback: &Fallback,
@@ -71,7 +71,7 @@ pub async fn ask(
 }
 
 async fn ask_target(
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     action: PromptAction,
     scope: ApprovalScope,
     package: Option<&str>,
@@ -96,7 +96,7 @@ async fn ask_target(
 
 /// Choose the HTTP method and path target for a non-`Once` approval scope.
 async fn choose_http_scope_target(
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     action: PromptAction,
     scope: ApprovalScope,
     request: &HttpRequest,
@@ -149,16 +149,21 @@ async fn choose_http_scope_target(
     .await
 }
 
-/// Ask for a URL pattern until it parses and covers the request.
+/// Attempts to enter a valid URL pattern before the question counts as
+/// cancelled.
+const MAX_HTTP_TARGET_ATTEMPTS: usize = 8;
+
+/// Ask for a URL pattern until it parses and covers the request, giving up
+/// after [`MAX_HTTP_TARGET_ATTEMPTS`] rejected answers.
 async fn choose_http_target(
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     title: &str,
     request: &HttpRequest,
     method: HttpMethodMatcher,
 ) -> Result<Option<ApprovalTarget>, UiCliError> {
     let default_url = request.url.to_string();
 
-    loop {
+    for _ in 0..MAX_HTTP_TARGET_ATTEMPTS {
         let Some(raw_url) = dialogs.pick_text(title, &default_url).await? else {
             return Ok(None);
         };
@@ -186,10 +191,13 @@ async fn choose_http_target(
 
         return Ok(Some(ApprovalTarget::Http { target }));
     }
+
+    warn!("no valid HTTP approval target after repeated attempts; cancelling");
+    Ok(None)
 }
 
 async fn choose_scope(
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     title: &str,
     options: Vec<ScopeOption>,
 ) -> Result<Option<ScopeOption>, UiCliError> {

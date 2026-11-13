@@ -123,36 +123,74 @@ struct Cli {
     command: Vec<std::ffi::OsString>,
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let path = resolve_netns_path(&cli.netns).unwrap_or_else(|e| die("resolve netns", &e));
+struct UnjoinedNetns {
+    netns: String,
+    command: Vec<std::ffi::OsString>,
+}
 
-    let file = OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .unwrap_or_else(|e| die("open netns", &e));
+struct JoinedNetns {
+    command: Vec<std::ffi::OsString>,
+}
 
-    if let Err(err) = setns(&file, CloneFlags::CLONE_NEWNET) {
-        if err == nix::errno::Errno::EPERM {
-            eprintln!("setns: need CAP_SYS_ADMIN on agent-sandbox-enter (rebuild NixOS)");
+struct CapabilitiesDropped {
+    command: Vec<std::ffi::OsString>,
+}
+
+impl UnjoinedNetns {
+    fn join(self) -> JoinedNetns {
+        let path = resolve_netns_path(&self.netns).unwrap_or_else(|e| die("resolve netns", &e));
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap_or_else(|e| die("open netns", &e));
+
+        if let Err(err) = setns(&file, CloneFlags::CLONE_NEWNET) {
+            if err == nix::errno::Errno::EPERM {
+                eprintln!("setns: need CAP_SYS_ADMIN on agent-sandbox-enter (rebuild NixOS)");
+            }
+
+            die("setns", &io::Error::other(err));
         }
 
-        die("setns", &io::Error::other(err));
+        JoinedNetns {
+            command: self.command,
+        }
     }
+}
 
-    if let Err(err) = drop_capabilities() {
-        die("drop capabilities", &err);
+impl JoinedNetns {
+    fn drop_caps(self) -> CapabilitiesDropped {
+        if let Err(err) = drop_capabilities() {
+            die("drop capabilities", &err);
+        }
+        CapabilitiesDropped {
+            command: self.command,
+        }
     }
+}
 
-    let (prog, args) = cli
-        .command
-        .split_first()
-        .expect("clap requires at least one command");
+impl CapabilitiesDropped {
+    fn exec_command(self) -> ! {
+        let (prog, args) = self
+            .command
+            .split_first()
+            .expect("clap requires at least one command");
 
-    // Replaces the process image; only returns when the exec fails.
-    let err = process::Command::new(prog).args(args).exec();
+        // Replaces the process image; only returns when the exec fails.
+        let err = process::Command::new(prog).args(args).exec();
+        die("exec", &err);
+    }
+}
 
-    die("exec", &err);
+fn main() {
+    let cli = Cli::parse();
+    UnjoinedNetns {
+        netns: cli.netns,
+        command: cli.command,
+    }
+    .join()
+    .drop_caps()
+    .exec_command();
 }
 
 #[cfg(test)]

@@ -153,47 +153,86 @@ struct RelayChannels {
     upstream_connection: Connection,
 }
 
-async fn handle_client(
-    client_socket: UnixStream,
-    mut config: RelayConfig,
-) -> Result<(), RelayError> {
-    let credentials = peer_cred_unix(&client_socket)
-        .ok_or_else(|| RelayError::Message("cannot read D-Bus peer credentials".to_owned()))?;
+struct AcceptedClient {
+    socket: UnixStream,
+    config: RelayConfig,
+}
 
-    config.context.pid = Some(credentials.pid);
-    config.context.uid = Some(credentials.uid);
+struct AuthenticatedClient {
+    client_stream: zbus::MessageStream,
+    config: RelayConfig,
+}
 
-    let client_stream = Builder::unix_stream(client_socket)
-        .p2p()
-        .server(Guid::generate())?
-        .build_message_stream()
-        .await?;
+struct ReadyRelay {
+    channels: RelayChannels,
+    upstream_name: String,
+    config: RelayConfig,
+}
 
-    let upstream_stream = Builder::address(config.upstream_address.as_str())?
-        .build_message_stream()
-        .await?;
+impl AcceptedClient {
+    async fn authenticate(mut self) -> Result<AuthenticatedClient, RelayError> {
+        let credentials = peer_cred_unix(&self.socket)
+            .ok_or_else(|| RelayError::Message("cannot read D-Bus peer credentials".to_owned()))?;
+        self.config.context.pid = Some(credentials.pid);
+        self.config.context.uid = Some(credentials.uid);
 
-    let client_connection = Connection::from(&client_stream);
-    let upstream_connection = Connection::from(&upstream_stream);
+        let client_stream = Builder::unix_stream(self.socket)
+            .p2p()
+            .server(Guid::generate())?
+            .build_message_stream()
+            .await?;
 
-    let upstream_name = upstream_connection
-        .unique_name()
-        .map(ToString::to_string)
-        .ok_or_else(|| RelayError::Message("upstream has no unique name".into()))?;
-
-    let mut policy = PersistentRpcClient::new_trusted(config.policy_socket.clone());
-
-    relay_loop(
-        RelayChannels {
+        Ok(AuthenticatedClient {
             client_stream,
-            upstream_stream,
-            client_connection,
-            upstream_connection,
-        },
-        upstream_name,
-        &mut policy,
-        &config,
-    )
+            config: self.config,
+        })
+    }
+}
+
+impl AuthenticatedClient {
+    async fn connect_upstream(self) -> Result<ReadyRelay, RelayError> {
+        let upstream_stream = Builder::address(self.config.upstream_address.as_str())?
+            .build_message_stream()
+            .await?;
+
+        let client_connection = Connection::from(&self.client_stream);
+        let upstream_connection = Connection::from(&upstream_stream);
+
+        let upstream_name = upstream_connection
+            .unique_name()
+            .map(ToString::to_string)
+            .ok_or_else(|| RelayError::Message("upstream has no unique name".into()))?;
+
+        Ok(ReadyRelay {
+            channels: RelayChannels {
+                client_stream: self.client_stream,
+                upstream_stream,
+                client_connection,
+                upstream_connection,
+            },
+            upstream_name,
+            config: self.config,
+        })
+    }
+}
+
+impl ReadyRelay {
+    async fn run(self) -> Result<(), RelayError> {
+        let mut policy = PersistentRpcClient::new_trusted(self.config.policy_socket.clone());
+        relay_loop(self.channels, self.upstream_name, &mut policy, &self.config).await
+    }
+}
+
+async fn handle_client(client_socket: UnixStream, config: RelayConfig) -> Result<(), RelayError> {
+    AcceptedClient {
+        socket: client_socket,
+        config,
+    }
+    .authenticate()
+    .await?
+    .connect_upstream()
+    .await?
+    .run()
     .await
 }
 

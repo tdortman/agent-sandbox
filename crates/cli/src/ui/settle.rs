@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use super::{
     choice::{deny_cancellation, resolve_choice},
-    dialog::{ApprovalReviewOutcome, Dialogs},
+    dialog::{ApprovalReviewOutcome, Dialogs, Renderer},
     error::UiCliError,
     fallback, kinds,
     options::{ApprovalFormResult, PromptAction, ReviewValidator, ReviewedChoice, ScopeOption},
@@ -30,22 +30,38 @@ use super::{
 /// policyd fails.
 pub async fn handle_push(
     client: &ClientContext<'_>,
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     push: UiPush,
 ) -> Result<(), UiCliError> {
     // Pushes queue while a dialog is open; a decision on an earlier
     // prompt can settle the request behind this one in the meantime.
-    if !still_pending(client, &push).await {
-        info!("skipping prompt already settled by an earlier decision");
-        return Ok(());
+    match still_pending(client, &push).await {
+        PendingCheck::Pending => {}
+
+        PendingCheck::Resolved => {
+            info!("skipping prompt already settled by an earlier decision");
+            return Ok(());
+        }
+
+        // Dropping a live request would hang the sandbox, so an unanswered
+        // status check prompts anyway.
+        PendingCheck::Unknown => info!("pending status unknown; prompting anyway"),
     }
 
     settle(client, dialogs, kinds::prompt_for(client, push)).await
 }
 
-/// Whether policyd still waits on the request `push` prompts for. A failed
-/// status check prompts anyway rather than drop a live request.
-async fn still_pending(client: &ClientContext<'_>, push: &UiPush) -> bool {
+/// What policyd reports about the request a push prompts for.
+enum PendingCheck {
+    /// policyd still waits on the request.
+    Pending,
+    /// policyd no longer lists the request.
+    Resolved,
+    /// The status check failed or got an unexpected reply.
+    Unknown,
+}
+
+async fn still_pending(client: &ClientContext<'_>, push: &UiPush) -> PendingCheck {
     let mut ctx = RequestContext::from(client.paths);
     ctx.sandbox_session_id = client.sandbox_session_id.map(str::to_owned);
 
@@ -56,23 +72,29 @@ async fn still_pending(client: &ClientContext<'_>, push: &UiPush) -> bool {
     )
     .await
     {
-        Ok(RpcReply::Status(status)) => status.pending.iter().any(|pending| push.is_for(pending)),
+        Ok(RpcReply::Status(status)) => {
+            if status.pending.iter().any(|pending| push.is_for(pending)) {
+                PendingCheck::Pending
+            } else {
+                PendingCheck::Resolved
+            }
+        }
 
         Ok(reply) => {
-            warn!(?reply, "unexpected status reply; prompting anyway");
-            true
+            warn!(?reply, "unexpected status reply");
+            PendingCheck::Unknown
         }
 
         Err(err) => {
-            warn!(error = %err, "pending status check failed; prompting anyway");
-            true
+            warn!(error = %err, "pending status check failed");
+            PendingCheck::Unknown
         }
     }
 }
 
 async fn settle(
     client: &ClientContext<'_>,
-    dialogs: &Dialogs,
+    dialogs: &Dialogs<impl Renderer>,
     prompt: Prompt,
 ) -> Result<(), UiCliError> {
     let Prompt {
@@ -100,7 +122,7 @@ async fn settle(
 
         ApprovalReviewOutcome::Cancelled => None,
 
-        ApprovalReviewOutcome::Unavailable => {
+        ApprovalReviewOutcome::Unavailable | ApprovalReviewOutcome::Failed => {
             fallback::ask(
                 dialogs,
                 session_available,

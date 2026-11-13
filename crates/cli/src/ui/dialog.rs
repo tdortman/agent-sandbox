@@ -23,6 +23,7 @@ const MAX_REVIEW_VALUE_BYTES: usize = 8 * 1024;
 pub enum ApprovalReviewOutcome {
     Unavailable,
     Cancelled,
+    Failed,
     Submitted(ApprovalFormResult),
 }
 
@@ -73,12 +74,12 @@ impl Renderer for Graphical {
 /// Async access to a [`Renderer`]: each call runs on the blocking pool so a
 /// waiting dialog never stalls the runtime.
 #[derive(Clone)]
-pub struct Dialogs {
-    renderer: Arc<dyn Renderer>,
+pub struct Dialogs<R: Renderer = Graphical> {
+    renderer: Arc<R>,
 }
 
-impl Dialogs {
-    pub fn new(renderer: impl Renderer) -> Self {
+impl<R: Renderer> Dialogs<R> {
+    pub fn new(renderer: R) -> Self {
         Self {
             renderer: Arc::new(renderer),
         }
@@ -247,10 +248,31 @@ fn review_approval(
         return ApprovalReviewOutcome::Unavailable;
     };
 
-    qt_dialog_review(&binary, request, &env, validate).map_or(
-        ApprovalReviewOutcome::Cancelled,
-        ApprovalReviewOutcome::Submitted,
-    )
+    qt_dialog_review(&binary, request, &env, validate)
+}
+
+struct SpawnedQtDialog(Option<std::process::Child>);
+
+impl SpawnedQtDialog {
+    const fn child_mut(&mut self) -> Option<&mut std::process::Child> {
+        self.0.as_mut()
+    }
+
+    fn wait_status(mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self.0.take().expect("dialog child present");
+        drop(child.stdin.take());
+        child.wait()
+    }
+}
+
+impl Drop for SpawnedQtDialog {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn qt_dialog_review(
@@ -258,80 +280,106 @@ fn qt_dialog_review(
     request: &ApprovalFormRequest,
     env: &HashMap<String, String>,
     validate: Option<&ReviewValidator>,
-) -> Option<ApprovalFormResult> {
-    let mut encoded = serde_json::to_vec(&request.to_json()).ok()?;
+) -> ApprovalReviewOutcome {
+    let Ok(mut encoded) = serde_json::to_vec(&request.to_json()) else {
+        return ApprovalReviewOutcome::Failed;
+    };
     encoded.push(b'\n');
 
     if encoded.len() > MAX_REVIEW_REQUEST_BYTES {
-        return None;
+        return ApprovalReviewOutcome::Failed;
     }
 
-    let _lock = GRAPHICAL_LOCK.lock().ok()?;
+    let Ok(_lock) = GRAPHICAL_LOCK.lock() else {
+        return ApprovalReviewOutcome::Failed;
+    };
 
-    let mut child = Command::new(binary)
+    let Ok(child) = Command::new(binary)
         .arg("--review")
         .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+    else {
+        return ApprovalReviewOutcome::Failed;
+    };
 
-    let stdin = child.stdin.as_mut()?;
-    stdin.write_all(&encoded).ok()?;
-    stdin.flush().ok()?;
-    let stdout = child.stdout.take()?;
+    let mut dialog = SpawnedQtDialog(Some(child));
+    let Some(child) = dialog.child_mut() else {
+        return ApprovalReviewOutcome::Failed;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return ApprovalReviewOutcome::Failed;
+    };
+    let Some(stdin) = child.stdin.as_mut() else {
+        return ApprovalReviewOutcome::Failed;
+    };
+    if stdin.write_all(&encoded).is_err() || stdin.flush().is_err() {
+        return ApprovalReviewOutcome::Failed;
+    }
     let mut reader = std::io::BufReader::new(stdout);
 
     loop {
         let mut line = String::new();
 
-        if reader.read_line(&mut line).ok()? == 0 {
-            let _ = child.wait();
-            return None;
+        let Ok(read) = reader.read_line(&mut line) else {
+            return ApprovalReviewOutcome::Failed;
+        };
+        if read == 0 {
+            return match dialog.wait_status() {
+                Ok(status) if status.success() => ApprovalReviewOutcome::Cancelled,
+                Ok(_) | Err(_) => ApprovalReviewOutcome::Failed,
+            };
         }
 
-        let result = parse_review_result(line.as_bytes())?;
+        let Some(result) = parse_review_result(line.as_bytes()) else {
+            return ApprovalReviewOutcome::Failed;
+        };
+
+        let Some(stdin) = dialog.child_mut().and_then(|c| c.stdin.as_mut()) else {
+            return ApprovalReviewOutcome::Failed;
+        };
 
         // Cancel exits without validation. Deny with a persistent scope
         // still needs a valid target to create the deny rule.
         if result.action.is_none() {
-            writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
-            stdin.flush().ok()?;
-
-            if !child.wait().ok()?.success() {
-                return None;
+            if writeln!(stdin, r#"{{"valid":true}}"#).is_err() || stdin.flush().is_err() {
+                return ApprovalReviewOutcome::Failed;
             }
-
-            return Some(result);
+            return match dialog.wait_status() {
+                Ok(status) if status.success() => ApprovalReviewOutcome::Submitted(result),
+                Ok(_) | Err(_) => ApprovalReviewOutcome::Failed,
+            };
         }
 
         if let Some(validator) = validate {
             match validator(&result) {
                 Ok(()) => {
-                    writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
-                    stdin.flush().ok()?;
-                    if !child.wait().ok()?.success() {
-                        return None;
+                    if writeln!(stdin, r#"{{"valid":true}}"#).is_err() || stdin.flush().is_err() {
+                        return ApprovalReviewOutcome::Failed;
                     }
-                    return Some(result);
+                    return match dialog.wait_status() {
+                        Ok(status) if status.success() => ApprovalReviewOutcome::Submitted(result),
+                        Ok(_) | Err(_) => ApprovalReviewOutcome::Failed,
+                    };
                 }
 
                 Err(error) => {
                     let response = serde_json::json!({"valid": false, "error": error});
-                    writeln!(stdin, "{response}").ok()?;
-                    stdin.flush().ok()?;
+                    if writeln!(stdin, "{response}").is_err() || stdin.flush().is_err() {
+                        return ApprovalReviewOutcome::Failed;
+                    }
                 }
             }
         } else {
-            writeln!(stdin, r#"{{"valid":true}}"#).ok()?;
-            stdin.flush().ok()?;
-
-            if !child.wait().ok()?.success() {
-                return None;
+            if writeln!(stdin, r#"{{"valid":true}}"#).is_err() || stdin.flush().is_err() {
+                return ApprovalReviewOutcome::Failed;
             }
-
-            return Some(result);
+            return match dialog.wait_status() {
+                Ok(status) if status.success() => ApprovalReviewOutcome::Submitted(result),
+                Ok(_) | Err(_) => ApprovalReviewOutcome::Failed,
+            };
         }
     }
 }
@@ -516,7 +564,9 @@ mod tests {
     use agent_sandbox_core::ApprovalScope;
     use tempfile::{NamedTempFile, TempPath};
 
-    use super::{ApprovalFormRequest, parse_review_result, qt_dialog_review};
+    use super::{
+        ApprovalFormRequest, ApprovalReviewOutcome, parse_review_result, qt_dialog_review,
+    };
     use crate::ui::options::{ApprovalFormContext, ReviewValidator, scope_only_options};
 
     struct EofReviewHelper {
@@ -628,13 +678,15 @@ printf '%s' "$$" > "$PID_FILE"
         env.insert("MODE".into(), "multi".into());
         let request = review_request();
 
-        let result = qt_dialog_review(
+        let outcome = qt_dialog_review(
             helper.to_str().expect("helper path is UTF-8"),
             &request,
             &env,
             Some(&target_validator()),
-        )
-        .expect("review helper should return corrected result");
+        );
+        let ApprovalReviewOutcome::Submitted(result) = outcome else {
+            panic!("review helper should return corrected result, got {outcome:?}");
+        };
 
         assert_eq!(result.values["target"], "good");
     }
@@ -646,13 +698,15 @@ printf '%s' "$$" > "$PID_FILE"
         env.insert("MODE".into(), "none".into());
         let request = review_request();
 
-        let result = qt_dialog_review(
+        let outcome = qt_dialog_review(
             helper.to_str().expect("helper path is UTF-8"),
             &request,
             &env,
             None,
-        )
-        .expect("review helper should receive an automatic acknowledgement");
+        );
+        let ApprovalReviewOutcome::Submitted(result) = outcome else {
+            panic!("review helper should receive an automatic acknowledgement, got {outcome:?}");
+        };
 
         assert_eq!(result.values["target"], "bad");
     }
@@ -671,14 +725,14 @@ printf '%s' "$$" > "$PID_FILE"
                 .into(),
         );
 
-        let result = qt_dialog_review(
+        let outcome = qt_dialog_review(
             helper.executable.to_str().expect("helper path is UTF-8"),
             &review_request(),
             &env,
             None,
         );
 
-        assert!(result.is_none());
+        assert_eq!(outcome, ApprovalReviewOutcome::Cancelled);
 
         let pid = std::fs::read_to_string(&helper.pid_file)
             .expect("helper should write its PID")
@@ -689,6 +743,16 @@ printf '%s' "$$" > "$PID_FILE"
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "helper process {pid} should be reaped"
         );
+    }
+    #[test]
+    fn qt_dialog_review_reports_failed_when_helper_missing() {
+        let outcome = qt_dialog_review(
+            "/nonexistent/agent-sandbox-qt-dialog-helper",
+            &review_request(),
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(outcome, ApprovalReviewOutcome::Failed);
     }
 
     #[test]

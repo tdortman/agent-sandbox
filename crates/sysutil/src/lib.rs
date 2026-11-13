@@ -691,6 +691,15 @@ pub const FAN_ALLOW: u32 = 0x01;
 /// fanotify response value denying the requested access.
 pub const FAN_DENY: u32 = 0x02;
 
+/// How fanotify event metadata identifies the opener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanotifyPidMode {
+    /// `meta.pid` is the process thread-group id.
+    ProcessTgid,
+    /// `meta.pid` is the opener thread id (`FAN_REPORT_TID`).
+    ThreadTid,
+}
+
 /// Fanotify descriptor and the process identity format reported by the kernel.
 pub struct FanotifyInit {
     /// Owned descriptor receiving permission events.
@@ -700,6 +709,17 @@ pub struct FanotifyInit {
     pub reports_tid: bool,
 }
 
+impl FanotifyInit {
+    /// Process identity mode reported in event metadata.
+    #[must_use]
+    pub const fn pid_mode(&self) -> FanotifyPidMode {
+        if self.reports_tid {
+            FanotifyPidMode::ThreadTid
+        } else {
+            FanotifyPidMode::ProcessTgid
+        }
+    }
+}
 /// Open a fanotify fd suitable for open permission events.
 ///
 /// Returns a descriptor with `reports_tid` true when the kernel

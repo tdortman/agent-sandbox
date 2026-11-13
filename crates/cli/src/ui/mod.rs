@@ -10,6 +10,7 @@ mod prompt;
 mod settle;
 
 use std::{
+    collections::VecDeque,
     fs::{File, OpenOptions},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
@@ -233,6 +234,70 @@ pub async fn run() -> Result<(), UiCliError> {
         .await
 }
 
+/// Pushes held between sending the registration and its acknowledgement.
+const MAX_QUEUED_PUSHES: usize = 64;
+
+/// Where the client stands with policyd's registration handshake.
+enum ClientSessionState {
+    /// Registration is in flight; early pushes wait in `queued`.
+    Registering {
+        /// Session to resume from an earlier connection, if any.
+        resume_session: Option<String>,
+        queued: VecDeque<UiPush>,
+    },
+
+    /// policyd acknowledged the registration.
+    Registered { session_id: String },
+}
+
+impl ClientSessionState {
+    const fn new() -> Self {
+        Self::Registering {
+            resume_session: None,
+            queued: VecDeque::new(),
+        }
+    }
+
+    fn resume_session(&self) -> Option<&str> {
+        match self {
+            Self::Registering { resume_session, .. } => resume_session.as_deref(),
+            Self::Registered { session_id } => Some(session_id),
+        }
+    }
+
+    /// Begin registering on a fresh connection, keeping the known session
+    /// id to resume.
+    fn restart_registration(&mut self) {
+        *self = Self::Registering {
+            resume_session: self.resume_session().map(str::to_owned),
+            queued: VecDeque::new(),
+        };
+    }
+
+    /// Hold a push that arrived before the registration reply. Pushes past
+    /// [`MAX_QUEUED_PUSHES`] are dropped.
+    fn queue_push(&mut self, push: UiPush) {
+        match self {
+            Self::Registering { queued, .. } if queued.len() < MAX_QUEUED_PUSHES => {
+                queued.push_back(push);
+            }
+
+            Self::Registering { .. } => warn!("push queue full before registration; dropping push"),
+
+            Self::Registered { .. } => warn!("push queued outside registration; dropping push"),
+        }
+    }
+
+    /// Record the acknowledged session and hand back the pushes that
+    /// arrived first.
+    fn complete_registration(&mut self, session_id: String) -> VecDeque<UiPush> {
+        match std::mem::replace(self, Self::Registered { session_id }) {
+            Self::Registering { queued, .. } => queued,
+            Self::Registered { .. } => VecDeque::new(),
+        }
+    }
+}
+
 struct UiClient {
     socket: PathBuf,
     paths: SandboxPaths,
@@ -251,10 +316,10 @@ impl UiClient {
     async fn run(self) -> Result<(), UiCliError> {
         // Survives reconnects so policyd keeps this UI's session approvals
         // across its own restart.
-        let mut session_id = None;
+        let mut state = ClientSessionState::new();
 
         loop {
-            match self.session(&mut session_id).await {
+            match self.session(&mut state).await {
                 Ok(()) => {}
 
                 Err(UiCliError::Register(err)) => {
@@ -271,19 +336,19 @@ impl UiClient {
         }
     }
 
-    async fn session(&self, previous_session: &mut Option<String>) -> Result<(), UiCliError> {
+    async fn session(&self, state: &mut ClientSessionState) -> Result<(), UiCliError> {
         let mut conn = RpcConnection::connect(&self.socket).await?;
         let mut ctx = RequestContext::from(&self.paths);
         ctx.sandbox_session_id.clone_from(&self.sandbox_session_id);
 
+        state.restart_registration();
+
         conn.write_request(&RpcRequest::RegisterUi {
             ui_client: Some("standalone".into()),
-            resume_session: previous_session.clone(),
+            resume_session: state.resume_session().map(str::to_owned),
             ctx,
         })
         .await?;
-
-        let mut queued_pushes = Vec::new();
 
         let session_id = loop {
             let msg = conn.read_message().await?;
@@ -296,14 +361,15 @@ impl UiClient {
                     return Err(UiCliError::Register(e.error));
                 }
                 RpcMessage::UiPush(push) => {
-                    queued_pushes.push(push);
+                    state.queue_push(push);
                 }
                 RpcMessage::Reply(_) => {}
             }
         };
-        *previous_session = Some(session_id.clone());
 
-        for push in queued_pushes {
+        let queued = state.complete_registration(session_id.clone());
+
+        for push in queued {
             self.handle_prompt(&session_id, push).await;
         }
 
@@ -423,5 +489,48 @@ mod tests {
             .expect("second worker acquisition timed out");
 
         second_worker.await.expect("second worker task");
+    }
+
+    fn network_push(id: &str) -> UiPush {
+        UiPush::NetworkRequest {
+            id: id.into(),
+            host: None,
+            port: None,
+            scheme: None,
+            url: None,
+            cwd: None,
+            home: None,
+            project_root: None,
+            package: None,
+        }
+    }
+
+    #[test]
+    fn registration_queue_is_bounded() {
+        let mut state = ClientSessionState::new();
+
+        for index in 0..=MAX_QUEUED_PUSHES {
+            state.queue_push(network_push(&index.to_string()));
+        }
+
+        assert_eq!(
+            state.complete_registration("session".into()).len(),
+            MAX_QUEUED_PUSHES
+        );
+    }
+
+    #[test]
+    fn restarted_registration_resumes_previous_session() {
+        let mut state = ClientSessionState::new();
+        assert_eq!(state.resume_session(), None);
+
+        state.queue_push(network_push("early"));
+        state.complete_registration("session".into());
+        assert_eq!(state.resume_session(), Some("session"));
+
+        state.restart_registration();
+
+        assert_eq!(state.resume_session(), Some("session"));
+        assert!(state.complete_registration("session".into()).is_empty());
     }
 }

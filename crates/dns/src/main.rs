@@ -149,8 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache,
         max_ttl: args.max_ttl,
         suppress_https_svcb: args.suppress_https_svcb,
-        push_socket: push_socket.clone(),
-        push_socket_path: args.push_socket.clone(),
+        push_socket,
+        push_socket_path: args.push_socket,
         cache_client_ip: args.cache_client_ip,
         ech_config_path: args.ech_config_path,
         forward_target: args.forward_target,
@@ -178,13 +178,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Ok((len, peer)) = udp.recv_from(&mut buf).await else {
                 continue;
             };
-            let data = buf[..len].to_vec();
-            let sock = Arc::clone(&udp);
-            let forwarder = udp_forwarder.clone();
-            let Ok(permit) = forwarder.admission.clone().try_acquire_owned() else {
+            let Ok(permit) = Arc::clone(&udp_forwarder.admission).try_acquire_owned() else {
                 debug!(%peer, "dns work admission full; dropping udp request");
                 continue;
             };
+            let data = buf[..len].to_vec();
+            let sock = Arc::clone(&udp);
+            let forwarder = udp_forwarder.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(err) = forwarder.handle_udp(data, peer, sock).await {
@@ -201,12 +201,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Ok((stream, peer)) = tcp.accept().await else {
                 continue;
             };
-            let forwarder = tcp_forwarder.clone();
-            let Ok(permit) = forwarder.admission.clone().try_acquire_owned() else {
+            let Ok(permit) = Arc::clone(&tcp_forwarder.admission).try_acquire_owned() else {
                 debug!(%peer, "dns work admission full; rejecting tcp connection");
                 drop(stream);
                 continue;
             };
+            let forwarder = tcp_forwarder.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(err) = forwarder.handle_tcp(stream, peer).await {
@@ -255,7 +255,8 @@ impl DnsForwarder {
     }
 
     async fn handle_tcp(&self, mut stream: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
-        for _ in 0..TCP_MAX_REQUESTS {
+        let mut handled = 0_usize;
+        while handled < TCP_MAX_REQUESTS {
             let len = match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_u16()).await {
                 Ok(Ok(0)) => continue,
                 Ok(Ok(n)) => n,
@@ -263,6 +264,7 @@ impl DnsForwarder {
                 Ok(Err(err)) => return Err(err),
                 Err(_) => return Ok(()),
             };
+            handled += 1;
 
             let mut data = vec![0_u8; usize::from(len)];
 
@@ -295,8 +297,11 @@ impl DnsForwarder {
                 }
             };
 
+            let Ok(resp_len) = u16::try_from(resp.len()) else {
+                warn!(len = resp.len(), "dns tcp response exceeds u16 length");
+                continue;
+            };
             self.record_mappings_from_response(&resp, peer);
-            let resp_len = u16::try_from(resp.len()).unwrap_or(0);
             stream.write_u16(resp_len).await?;
             stream.write_all(&resp).await?;
         }
