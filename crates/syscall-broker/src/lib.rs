@@ -297,72 +297,111 @@ pub const fn notification_arch_valid(notif: &SeccompNotif) -> bool {
     notif.data.arch == agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE
 }
 
+/// A received notification the tracee still waits on.
+///
+/// Only [`recv_notification`] creates one, and answering consumes it, so each
+/// notification is answered at most once; `#[must_use]` flags a dropped one.
+#[derive(Debug)]
+#[must_use = "an unanswered notification leaves the tracee blocked"]
+pub struct PendingNotif {
+    listener_fd: i32,
+    id: u64,
+}
+
+/// A kernel notification and the token that answers it.
+#[derive(Debug)]
+pub struct Received {
+    /// The notified syscall.
+    pub notif: SeccompNotif,
+
+    /// The obligation to answer `notif`.
+    pub pending: PendingNotif,
+}
+
+/// [`PendingNotif::send_addfd`] failed; the notification is still pending, so
+/// the caller answers it through `pending`.
+#[derive(Debug)]
+pub struct AddfdFailure {
+    /// Why the descriptor could not be installed.
+    pub error: io::Error,
+
+    /// The still-unanswered notification.
+    pub pending: PendingNotif,
+}
+
 /// Receive a seccomp notification from the listener fd.
 ///
 /// # Errors
 ///
 /// Returns an error if the `SECCOMP_IOCTL_NOTIF_RECV` ioctl fails.
-pub fn recv_notification(listener_fd: i32) -> io::Result<SeccompNotif> {
+pub fn recv_notification(listener_fd: i32) -> io::Result<Received> {
     let mut notif = SeccompNotif::default();
     agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif)?;
-    Ok(notif)
+    Ok(Received {
+        pending: PendingNotif {
+            listener_fd,
+            id: notif.id,
+        },
+        notif,
+    })
 }
 
-/// Send a response to a seccomp notification.
-///
-/// `val` is the syscall return value and `error` is the negative errno to
-/// inject. `flags` may request `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
-///
-/// The kernel validates the notification id while holding the filter lock, so
-/// a stale id is rejected here with `ENOENT` without a preceding
-/// `SECCOMP_IOCTL_NOTIF_ID_VALID` round trip on the per-syscall hot path.
-///
-/// # Errors
-///
-/// Returns an error if the notification id is stale or the
-/// `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
-pub fn send_response(
-    listener_fd: i32,
-    id: u64,
-    val: i64,
-    error: i32,
-    flags: u32,
-) -> io::Result<()> {
-    let mut resp = SeccompNotifResp {
-        id,
-        val,
-        error,
-        flags,
-    };
+impl PendingNotif {
+    /// Send a response to the seccomp notification.
+    ///
+    /// `val` is the syscall return value and `error` is the negative errno to
+    /// inject. `flags` may request `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+    ///
+    /// The kernel validates the notification id while holding the filter lock,
+    /// so a stale id is rejected here with `ENOENT` without a preceding
+    /// `SECCOMP_IOCTL_NOTIF_ID_VALID` round trip on the per-syscall hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification id is stale or the
+    /// `SECCOMP_IOCTL_NOTIF_SEND` ioctl fails.
+    pub fn send_response(self, val: i64, error: i32, flags: u32) -> io::Result<()> {
+        let mut resp = SeccompNotifResp {
+            id: self.id,
+            val,
+            error,
+            flags,
+        };
 
-    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
-}
+        agent_sandbox_sysutil::ioctl(self.listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &mut resp)
+    }
 
-/// Duplicate a broker-held fd into the tracee as the syscall result.
-///
-/// `SECCOMP_ADDFD_FLAG_SEND` makes the kernel atomically install the fd
-/// into the tracee's fd table AND complete the notification in one step,
-/// so no follow-up `SECCOMP_IOCTL_NOTIF_SEND` is required.
-///
-/// Used to emulate `open`/`openat`/`openat2`/`creat` of policy-allowed
-/// resources: the broker opens the device with its own privileges and hands
-/// the resulting fd to the tracee, so the tracee never performs the open
-/// directly.
-///
-/// # Errors
-///
-/// Returns an error if the notification id is stale or the
-/// `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails.
-pub fn send_addfd(listener_fd: i32, id: u64, srcfd: i32, cloexec: bool) -> io::Result<()> {
-    let mut addfd = SeccompNotifAddfd {
-        id,
-        flags: SECCOMP_ADDFD_FLAG_SEND,
-        srcfd: u32::try_from(srcfd).unwrap_or(u32::MAX),
-        newfd: 0,
-        newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
-    };
+    /// Duplicate a broker-held fd into the tracee as the syscall result.
+    ///
+    /// `SECCOMP_ADDFD_FLAG_SEND` makes the kernel atomically install the fd
+    /// into the tracee's fd table AND complete the notification in one step,
+    /// so no follow-up `SECCOMP_IOCTL_NOTIF_SEND` is required.
+    ///
+    /// Used to emulate `open`/`openat`/`openat2`/`creat` of policy-allowed
+    /// resources: the broker opens the device with its own privileges and
+    /// hands the resulting fd to the tracee, so the tracee never performs the
+    /// open directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AddfdFailure`] if the notification id is stale or the
+    /// `SECCOMP_IOCTL_NOTIF_ADDFD` ioctl fails; it hands the token back so the
+    /// caller can still answer with an errno.
+    pub fn send_addfd(self, srcfd: i32, cloexec: bool) -> Result<(), AddfdFailure> {
+        let mut addfd = SeccompNotifAddfd {
+            id: self.id,
+            flags: SECCOMP_ADDFD_FLAG_SEND,
+            srcfd: u32::try_from(srcfd).unwrap_or(u32::MAX),
+            newfd: 0,
+            newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+        };
 
-    agent_sandbox_sysutil::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &mut addfd)
+        agent_sandbox_sysutil::ioctl(self.listener_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &mut addfd)
+            .map_err(|error| AddfdFailure {
+                error,
+                pending: self,
+            })
+    }
 }
 
 /// Returns true for tracee memory read failures that are routine races (tracee

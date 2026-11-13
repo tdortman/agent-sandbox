@@ -15,9 +15,9 @@ use std::{
 use agent_sandbox_core::ResourceKind;
 use agent_sandbox_syscall::policy::nr;
 use agent_sandbox_syscall_broker::{
-    FilesystemMutation, FilesystemTarget, MutationDir, Resolver, ResourceCapture, ResourceTarget,
-    SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, UnixCapture, read_tracee_bytes, send_addfd,
-    send_response,
+    AddfdFailure, FilesystemMutation, FilesystemTarget, MutationDir, PendingNotif, Resolver,
+    ResourceCapture, ResourceTarget, SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, UnixCapture,
+    read_tracee_bytes,
 };
 use agent_sandbox_sysutil::{
     connect_raw, ftruncate, is_socket_connected, linkat, mkdirat, mknodat, renameat, sendmsg_raw,
@@ -54,33 +54,50 @@ fn errno_of(err: &io::Error) -> i32 {
     err.raw_os_error().unwrap_or(libc::EACCES)
 }
 
-/// Send `completion` to the kernel as the notification's response.
-fn complete(listener_fd: i32, notif: &SeccompNotif, completion: Completion) -> io::Result<()> {
-    match completion {
-        Completion::Continue => send_response(
-            listener_fd,
-            notif.id,
-            0,
-            0,
-            SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-        ),
-        Completion::Return(value) => send_response(listener_fd, notif.id, value, 0, 0),
-        Completion::Errno(errno) => send_response(listener_fd, notif.id, 0, -errno, 0),
+/// Answer the notification with `completion`, logging a failed send.
+fn complete(pending: PendingNotif, completion: Completion) {
+    let sent = match completion {
+        Completion::Continue => pending.send_response(0, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE),
+        Completion::Return(value) => pending.send_response(value, 0, 0),
+        Completion::Errno(errno) => pending.send_response(0, -errno, 0),
+        // `fd` closes on drop once the kernel has installed its copy.
         Completion::InstallFd { fd, cloexec } => {
-            // `fd` closes on drop once the kernel has installed its copy.
-            send_addfd(listener_fd, notif.id, fd.as_raw_fd(), cloexec)
+            match pending.send_addfd(fd.as_raw_fd(), cloexec) {
+                Ok(()) => Ok(()),
+                Err(AddfdFailure { error, pending }) => {
+                    debug!(error = %error, "installing descriptor failed");
+                    pending.send_response(0, -errno_of(&error), 0)
+                }
+            }
         }
-    }
+    };
+
+    super::log_notification_response(sent);
 }
 
-/// Emulate a policy-allowed resource syscall without continuing it.
+/// Emulate a policy-allowed resource syscall without continuing it and answer
+/// the notification.
+///
+/// # Errors
+///
+/// The emulation could not be planned; the notification is already answered
+/// with the error's errno, so the error is only for logging.
 pub fn resource(
     resolver: &Resolver,
-    listener_fd: i32,
+    pending: PendingNotif,
     notif: &SeccompNotif,
     target: &ResourceTarget,
 ) -> io::Result<()> {
-    complete(listener_fd, notif, plan_resource(resolver, notif, target)?)
+    match plan_resource(resolver, notif, target) {
+        Ok(completion) => {
+            complete(pending, completion);
+            Ok(())
+        }
+        Err(err) => {
+            complete(pending, Completion::Errno(errno_of(&err)));
+            Err(err)
+        }
+    }
 }
 
 /// Decide how a policy-allowed resource syscall completes.
@@ -276,12 +293,34 @@ fn plan_sendmsg(notif: &SeccompNotif, dup: &OwnedFd, unix: &UnixCapture) -> io::
 }
 
 /// Emulate a captured filesystem mutation and answer the notification.
+///
+/// # Errors
+///
+/// The mutation could not be set up; the notification is already answered
+/// with the error's errno, so the error is only for logging.
 pub fn filesystem_mutation(
     resolver: &Resolver,
-    listener_fd: i32,
+    pending: PendingNotif,
     notif: &SeccompNotif,
     target: &FilesystemTarget,
 ) -> io::Result<()> {
+    match apply_mutation(resolver, notif, target) {
+        Ok(completion) => {
+            complete(pending, completion);
+            Ok(())
+        }
+        Err(err) => {
+            complete(pending, Completion::Errno(errno_of(&err)));
+            Err(err)
+        }
+    }
+}
+
+fn apply_mutation(
+    resolver: &Resolver,
+    notif: &SeccompNotif,
+    target: &FilesystemTarget,
+) -> io::Result<Completion> {
     fn cstring(bytes: &[u8]) -> io::Result<CString> {
         CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
     }
@@ -384,7 +423,7 @@ pub fn filesystem_mutation(
         }
     };
 
-    complete(listener_fd, notif, completion)
+    Ok(completion)
 }
 
 #[cfg(test)]

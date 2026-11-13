@@ -238,20 +238,29 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
         // loop and ready to receive. The child traps from the first openat
         // onward (dynamic linker), and if the kernel finds a USER_NOTIF filter
         // with no listener-fd holder, it returns ENOSYS to the tracee. The
-        // first worker to get here resumes the child, once.
-        if !shared.child_resumed.swap(true, Ordering::AcqRel)
-            && let Some(pid) = shared.child_pid
+        // first worker to get here resumes the child, once it succeeds.
+        if let Some(pid) = shared.child_pid
+            && shared
+                .child_resumed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         {
-            let _ = nix::sys::signal::kill(
+            match nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGCONT,
-            );
-
-            debug!(child_pid = pid, "resumed sandboxed child");
+            ) {
+                Ok(()) => debug!(child_pid = pid, "resumed sandboxed child"),
+                Err(err) => {
+                    // The latch only records a delivered SIGCONT: reopen it so
+                    // a later iteration retries instead of stranding the child.
+                    warn!(child_pid = pid, error = %err, "resuming sandboxed child failed");
+                    shared.child_resumed.store(false, Ordering::Release);
+                }
+            }
         }
 
-        let notif = match recv_notification(shared.listener_fd) {
-            Ok(notif) => notif,
+        let received = match recv_notification(shared.listener_fd) {
+            Ok(received) => received,
             Err(err) => match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) => {
@@ -287,8 +296,7 @@ fn serve(shared: &Shared) -> std::io::Result<()> {
             &mut policy_client,
             &shared.local_filesystem,
             shared.sandbox_session_id.as_deref(),
-            shared.listener_fd,
-            &notif,
+            received,
             shared.timeout,
             shared.network_policy.clone(),
         ));

@@ -188,71 +188,84 @@ fn main() {
         }
 
         ForkResult::Parent { child } => {
-            // Parent: drop the write end, read the listener fd number from the
-            // pipe, reopen the actual listener fd file descriptor from the
-            // child via pidfd_open + pidfd_getfd (the child still
-            // holds it open while SIGSTOP'd), then SIGCONT and exec
-            // the broker. This replaces the `sendmsg(SCM_RIGHTS)`
-            // handoff, which trapped sendmsg and forced the
-            // broker to be single-arg-only. With the fd-number handoff the
-            // broker never touches SCM_RIGHTS and the listener fd
-            // is acquired through the same pidfd path it already
-            // uses for socket emulation.
             drop(write_end);
-            let mut pipe = std::fs::File::from(read_end);
-            let mut text = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                pipe.read_exact(&mut byte)
-                    .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
-                if byte[0] == b'\n' {
-                    break;
-                }
-                text.push(byte[0]);
-                if text.len() > 11 {
-                    die("listener fd on handoff pipe was not a decimal integer");
-                }
-            }
-            let listener_fd_number: i32 = std::str::from_utf8(&text)
-                .ok()
-                .and_then(|text| text.parse().ok())
-                .unwrap_or_else(|| die("listener fd on handoff pipe was not a decimal integer"));
-
-            // pidfd_open(2): Linux 5.3+. Refer to the child pid so we can dup
-            // its fds without racing /proc.
-            let child_pid = u32::try_from(child.as_raw()).unwrap_or_else(|_| {
-                eprintln!("agent-sandbox-syscall-arm: child pid out of range");
-                process::exit(1);
-            });
-            let pidfd = pidfd_open(child_pid).unwrap_or_else(|_| die("pidfd_open child failed"));
-
-            // pidfd_getfd(2): Linux 5.6+. Duplicate the child's listener fd
-            // into the parent's fd table. The child is SIGSTOP'd,
-            // so the fd is still valid. We will SIGCONT only after
-            // acquiring it.
-            let listener_fd = pidfd_getfd(&pidfd, listener_fd_number)
-                .unwrap_or_else(|_| die("pidfd_getfd listener fd failed"));
-
-            // pidfd_getfd sets FD_CLOEXEC on the duplicated fd (per the Linux
-            // man page). The parent execs the broker immediately
-            // after, which would close the listener fd during exec,
-            // leaving the broker with a stale fd. Clear FD_CLOEXEC
-            // so the listener survives execvp into the broker.
-            if let Ok(flags) = fcntl(&listener_fd, FcntlArg::F_GETFD) {
-                let _ = fcntl(
-                    &listener_fd,
-                    FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC),
-                );
-            }
-            // Do NOT SIGCONT the child here. The broker must be ready to
-            // receive seccomp notifications before the child
-            // resumes, otherwise the child's first openat (during
-            // dynamic linking) traps with no broker listening,
-            // causing ENOSYS. The broker SIGCONTs the child on the first
-            // iteration of its notification loop, ensuring it is
-            // inside the loop and the listener fd is held before
-            // the child resumes.
-            exec_broker(&listener_fd, child);
+            StoppedChild { child, read_end }
+                .read_listener_ref()
+                .extract_listener()
+                .exec_broker();
         }
+    }
+}
+
+struct StoppedChild {
+    child: Pid,
+    read_end: std::os::fd::OwnedFd,
+}
+
+struct ListenerRef {
+    child: Pid,
+    listener_fd_number: i32,
+}
+
+struct ExtractedListener {
+    child: Pid,
+    listener_fd: std::os::fd::OwnedFd,
+}
+
+impl StoppedChild {
+    fn read_listener_ref(self) -> ListenerRef {
+        let mut pipe = std::fs::File::from(self.read_end);
+        let mut text = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            pipe.read_exact(&mut byte)
+                .unwrap_or_else(|_| die("reading listener fd from handoff pipe failed"));
+            if byte[0] == b'\n' {
+                break;
+            }
+            text.push(byte[0]);
+            if text.len() > 11 {
+                die("listener fd on handoff pipe was not a decimal integer");
+            }
+        }
+        let listener_fd_number: i32 = std::str::from_utf8(&text)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_else(|| die("listener fd on handoff pipe was not a decimal integer"));
+        ListenerRef {
+            child: self.child,
+            listener_fd_number,
+        }
+    }
+}
+
+impl ListenerRef {
+    fn extract_listener(self) -> ExtractedListener {
+        let child_pid = u32::try_from(self.child.as_raw()).unwrap_or_else(|_| {
+            eprintln!("agent-sandbox-syscall-arm: child pid out of range");
+            process::exit(1);
+        });
+        let pidfd = pidfd_open(child_pid).unwrap_or_else(|_| die("pidfd_open child failed"));
+        let listener_fd = pidfd_getfd(&pidfd, self.listener_fd_number)
+            .unwrap_or_else(|_| die("pidfd_getfd listener fd failed"));
+
+        if let Ok(flags) = fcntl(&listener_fd, FcntlArg::F_GETFD) {
+            let _ = fcntl(
+                &listener_fd,
+                FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC),
+            );
+        }
+        ExtractedListener {
+            child: self.child,
+            listener_fd,
+        }
+    }
+}
+
+impl ExtractedListener {
+    fn exec_broker(self) -> ! {
+        // Do NOT SIGCONT the child here; the broker SIGCONTs on its first
+        // notification loop iteration so no early syscall hits ENOSYS.
+        exec_broker(&self.listener_fd, self.child);
     }
 }

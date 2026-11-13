@@ -46,7 +46,15 @@ pub fn normalize(
 /// Semantic actions emitted by policy routing.
 #[derive(Debug)]
 pub enum ResponsePlan {
+    /// Let the kernel run the syscall: nothing gates it.
     Continue,
+
+    /// Let the kernel run the policy-socket connect the broker itself needs.
+    ContinuePolicySocket,
+
+    /// Tracee memory was unreadable for a routine reason (the tracee raced
+    /// away); let the kernel run the syscall and fail it itself.
+    ContinueTransient,
 
     DenyErrno {
         errno: i32,
@@ -113,10 +121,11 @@ pub async fn decide(
     facts: NormalizedNotification,
 ) -> ResponsePlan {
     match facts {
-        NormalizedNotification::Continue
-        | NormalizedNotification::ClassificationFailure {
+        NormalizedNotification::Continue => ResponsePlan::Continue,
+
+        NormalizedNotification::ClassificationFailure {
             transient: true, ..
-        } => ResponsePlan::Continue,
+        } => ResponsePlan::ContinueTransient,
 
         NormalizedNotification::Deny { errno } => ResponsePlan::deny(errno),
 
@@ -153,7 +162,7 @@ pub async fn decide(
             target: SyscallTarget::Filesystem(target),
         } => {
             for check in &target.checks {
-                if let Some(plan) = filesystem_plan(
+                if let FilesystemDecision::Plan(plan) = filesystem_plan(
                     &check.path,
                     check.access,
                     client
@@ -191,22 +200,32 @@ fn resource_plan(target: ResourceTarget, reply: io::Result<ResourceCheckReply>) 
     }
 }
 
+/// What one filesystem check means for the syscall.
+#[derive(Debug)]
+enum FilesystemDecision {
+    /// The check passed; the remaining checks decide.
+    Allow,
+
+    /// The check failed; answer the syscall with this plan.
+    Plan(ResponsePlan),
+}
+
 fn filesystem_plan(
     path: &Path,
     access: FileAccess,
     reply: io::Result<FilesystemCheckReply>,
-) -> Option<ResponsePlan> {
+) -> FilesystemDecision {
     match reply {
-        Ok(reply) if reply.verdict.allowed => None,
+        Ok(reply) if reply.verdict.allowed => FilesystemDecision::Allow,
 
-        Ok(reply) => Some(ResponsePlan::FilesystemPolicyDenied {
+        Ok(reply) => FilesystemDecision::Plan(ResponsePlan::FilesystemPolicyDenied {
             path: reply.path,
             access: reply.access,
             source: reply.verdict.source,
             error: reply.error,
         }),
 
-        Err(error) => Some(ResponsePlan::FilesystemRpcFailure {
+        Err(error) => FilesystemDecision::Plan(ResponsePlan::FilesystemRpcFailure {
             path: path.to_path_buf(),
             access,
             error: error.to_string(),
@@ -248,7 +267,10 @@ mod tests {
         ResourceCapture, ResourceTarget,
     };
 
-    use super::{NormalizedNotification, ResponsePlan, decide, filesystem_plan, resource_plan};
+    use super::{
+        FilesystemDecision, NormalizedNotification, ResponsePlan, decide, filesystem_plan,
+        resource_plan,
+    };
 
     fn resource_target() -> ResourceTarget {
         ResourceTarget {
@@ -327,6 +349,21 @@ mod tests {
                 errno: libc::EACCES
             }
         ));
+
+        assert!(matches!(
+            decide(
+                &mut client,
+                None,
+                0,
+                Duration::from_secs(1),
+                NormalizedNotification::classification_failure(
+                    io::Error::from_raw_os_error(libc::ESRCH),
+                    true,
+                ),
+            )
+            .await,
+            ResponsePlan::ContinueTransient
+        ));
     }
 
     #[test]
@@ -400,7 +437,10 @@ mod tests {
             error: None,
         };
 
-        assert!(filesystem_plan(&check.path, check.access, Ok(allowed)).is_none());
+        assert!(matches!(
+            filesystem_plan(&check.path, check.access, Ok(allowed)),
+            FilesystemDecision::Allow
+        ));
 
         let denied = FilesystemCheckReply {
             ok: true,
@@ -414,7 +454,7 @@ mod tests {
 
         assert!(matches!(
             filesystem_plan(&check.path, check.access, Ok(denied)),
-            Some(ResponsePlan::FilesystemPolicyDenied { .. })
+            FilesystemDecision::Plan(ResponsePlan::FilesystemPolicyDenied { .. })
         ));
 
         assert!(matches!(
@@ -423,7 +463,7 @@ mod tests {
                 FileAccess::Write,
                 Err(io::Error::new(io::ErrorKind::TimedOut, "timeout")),
             ),
-            Some(ResponsePlan::FilesystemRpcFailure { .. })
+            FilesystemDecision::Plan(ResponsePlan::FilesystemRpcFailure { .. })
         ));
     }
 }

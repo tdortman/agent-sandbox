@@ -2,9 +2,9 @@ use std::{net::SocketAddr, os::fd::AsRawFd, path::Path, time::Duration};
 
 use agent_sandbox_core::{FilesystemReplica, NetworkOwnership, ResourceKind};
 use agent_sandbox_syscall_broker::{
-    PersistentPolicyClient, Resolver, ResourceCapture, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-    SeccompNotif, SyscallTarget, notification_arch_valid, reopen_held_terminal, send_addfd,
-    send_response,
+    AddfdFailure, PendingNotif, PersistentPolicyClient, Received, Resolver, ResourceCapture,
+    SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SyscallTarget, notification_arch_valid,
+    reopen_held_terminal,
 };
 use tracing::{debug, info, warn};
 
@@ -81,23 +81,24 @@ pub async fn dispatch_notification_with_mode(
     client: &mut PersistentPolicyClient,
     local_filesystem: &FilesystemReplica,
     sandbox_session_id: Option<&str>,
-    listener_fd: i32,
-    notif: &SeccompNotif,
+    received: Received,
     timeout: Duration,
     network_policy: NetworkPolicyBypass,
 ) {
-    if !notification_arch_valid(notif) {
+    let Received { notif, pending } = received;
+
+    if !notification_arch_valid(&notif) {
         warn!(
             arch = notif.data.arch,
             native = agent_sandbox_syscall::policy::AUDIT_ARCH_NATIVE,
             "seccomp notification arch mismatch; denying"
         );
 
-        super::log_notification_response(send_response(listener_fd, notif.id, 0, -libc::EACCES, 0));
+        respond_denied(pending);
         return;
     }
 
-    let facts = normalize_or_failure(resolver, notif);
+    let facts = normalize_or_failure(resolver, &notif);
 
     if let NormalizedNotification::ClassificationFailure { error, transient } = &facts {
         if *transient {
@@ -133,7 +134,7 @@ pub async fn dispatch_notification_with_mode(
         // The broker must be able to service the policy RPC that authorizes
         // every other notification; routing this infrastructure connection
         // back through the resource policy would deadlock the gate.
-        ResponsePlan::Continue
+        ResponsePlan::ContinuePolicySocket
     } else if should_bypass_network_policy(&network_policy, &facts) {
         // The configured DNS forwarder is sandbox infrastructure. Proxy mode
         // delegates every TCP and UDP target to the packet filter and proxy.
@@ -151,40 +152,45 @@ pub async fn dispatch_notification_with_mode(
         decide(client, sandbox_session_id, notif.pid, timeout, facts).await
     };
 
-    execute_response_plan(plan, resolver, listener_fd, notif, policy_socket_bypass);
+    execute_response_plan(plan, resolver, pending, &notif);
 }
 
 /// Reply to the tracee with `EACCES` and log the notification response.
-fn respond_denied(listener_fd: i32, notif: &SeccompNotif) {
-    super::log_notification_response(send_response(listener_fd, notif.id, 0, -libc::EACCES, 0));
+fn respond_denied(pending: PendingNotif) {
+    super::log_notification_response(pending.send_response(0, -libc::EACCES, 0));
 }
 
+/// Let the kernel run the syscall and log the notification response.
+fn respond_continue(pending: PendingNotif) {
+    super::log_notification_response(pending.send_response(0, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE));
+}
+
+/// Fail the syscall with `errno` and log the notification response.
+fn respond_errno(pending: PendingNotif, errno: i32) {
+    super::log_notification_response(pending.send_response(0, -errno, 0));
+}
+
+/// Answer `pending` according to `plan`; every arm consumes the token.
 fn execute_response_plan(
     plan: ResponsePlan,
     resolver: &Resolver,
-    listener_fd: i32,
+    pending: PendingNotif,
     notif: &SeccompNotif,
-    policy_socket_bypass: bool,
 ) {
     match plan {
         ResponsePlan::Continue => {
-            if policy_socket_bypass {
-                debug!("bypassing policy socket (infrastructure connect)");
-            } else {
-                debug!(syscall = notif.data.nr, "continuing non-gated syscall");
-            }
-            super::log_notification_response(send_response(
-                listener_fd,
-                notif.id,
-                0,
-                0,
-                SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-            ));
+            debug!(syscall = notif.data.nr, "continuing non-gated syscall");
+            respond_continue(pending);
         }
 
-        ResponsePlan::DenyErrno { errno } => {
-            super::log_notification_response(send_response(listener_fd, notif.id, 0, -errno, 0));
+        ResponsePlan::ContinuePolicySocket => {
+            debug!("bypassing policy socket (infrastructure connect)");
+            respond_continue(pending);
         }
+
+        ResponsePlan::ContinueTransient => respond_continue(pending),
+
+        ResponsePlan::DenyErrno { errno } => respond_errno(pending, errno),
 
         ResponsePlan::ResourcePolicyDenied {
             target,
@@ -192,12 +198,12 @@ fn execute_response_plan(
             error,
         } => {
             info!(target = ?target, source = ?source, error = ?error, "resource syscall denied by policy");
-            respond_denied(listener_fd, notif);
+            respond_denied(pending);
         }
 
         ResponsePlan::ResourceRpcFailure { target, error } => {
             warn!(target = ?target, error = %error, "resource policy RPC failed");
-            respond_denied(listener_fd, notif);
+            respond_denied(pending);
         }
 
         ResponsePlan::FilesystemPolicyDenied {
@@ -207,7 +213,7 @@ fn execute_response_plan(
             error,
         } => {
             info!(path = %path.display(), access = ?access, source = ?source, error = ?error, "filesystem syscall denied by policy");
-            respond_denied(listener_fd, notif);
+            respond_denied(pending);
         }
 
         ResponsePlan::FilesystemRpcFailure {
@@ -216,54 +222,36 @@ fn execute_response_plan(
             error,
         } => {
             warn!(path = %path.display(), access = ?access, error = %error, "filesystem policy RPC failed");
-            respond_denied(listener_fd, notif);
+            respond_denied(pending);
         }
 
         ResponsePlan::InstallFd { fd, cloexec } => {
-            if let Err(err) = send_addfd(listener_fd, notif.id, fd.as_raw_fd(), cloexec) {
-                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
-                info!(error = %err, errno, pid = notif.pid, "installing reopened terminal failed");
-                super::log_notification_response(send_response(
-                    listener_fd,
-                    notif.id,
-                    0,
-                    -errno,
-                    0,
-                ));
+            if let Err(AddfdFailure { error, pending }) =
+                pending.send_addfd(fd.as_raw_fd(), cloexec)
+            {
+                let errno = error.raw_os_error().unwrap_or(libc::EACCES);
+                info!(error = %error, errno, pid = notif.pid, "installing reopened terminal failed");
+                respond_errno(pending, errno);
             }
         }
 
+        // The emulators answer `pending` themselves, including when they
+        // fail; the error is only logged here.
         ResponsePlan::EmulateResource { target } => {
-            if let Err(err) = super::emulate::resource(resolver, listener_fd, notif, &target) {
+            if let Err(err) = super::emulate::resource(resolver, pending, notif, &target) {
                 let errno = err.raw_os_error().unwrap_or(libc::EACCES);
                 if matches!(target.kind, ResourceKind::Device) {
                     info!(error = %err, errno, path = %target.path.display(), pid = notif.pid, "device open emulation failed in syscall broker before fanotify");
                 } else {
                     debug!(error = %err, errno, target = ?target, "resource emulation failed");
                 }
-                super::log_notification_response(send_response(
-                    listener_fd,
-                    notif.id,
-                    0,
-                    -errno,
-                    0,
-                ));
             }
         }
 
         ResponsePlan::EmulateFilesystem { target } => {
-            if let Err(err) =
-                super::emulate::filesystem_mutation(resolver, listener_fd, notif, &target)
+            if let Err(err) = super::emulate::filesystem_mutation(resolver, pending, notif, &target)
             {
-                let errno = err.raw_os_error().unwrap_or(libc::EACCES);
                 warn!(error = %err, target = ?target, "filesystem mutation emulation failed");
-                super::log_notification_response(send_response(
-                    listener_fd,
-                    notif.id,
-                    0,
-                    -errno,
-                    0,
-                ));
             }
         }
     }

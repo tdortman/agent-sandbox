@@ -217,10 +217,15 @@ const LAUNCHER_EXIT_GRACE: Duration = Duration::from_secs(1);
 /// is the outer bwrap. policyd kills the sandbox's scope once the launcher it
 /// registered exits, so killing the launcher stops every process of the
 /// sandbox.
+enum LauncherCapability {
+    MonitoringOnly,
+    Controllable(OwnedFd),
+}
+
 struct SandboxLifetime {
     peer: OwnedFd,
     parent: OwnedFd,
-    launcher: Option<OwnedFd>,
+    launcher: LauncherCapability,
 }
 
 impl SandboxLifetime {
@@ -240,13 +245,20 @@ impl SandboxLifetime {
             return Err(io::Error::other("the peer's parent changed while opening"));
         }
 
-        let launcher = outer_bwrap_pid(host_proc, peer_pid).and_then(|pid| {
-            let launcher = agent_sandbox_sysutil::pidfd_open(u32::try_from(pid).ok()?)
-                .inspect_err(|error| tracing::warn!(%error, "cannot watch the sandbox launcher"))
-                .ok()?;
+        let launcher = outer_bwrap_pid(host_proc, peer_pid)
+            .and_then(|pid| {
+                let launcher = agent_sandbox_sysutil::pidfd_open(u32::try_from(pid).ok()?)
+                    .inspect_err(
+                        |error| tracing::warn!(%error, "cannot watch the sandbox launcher"),
+                    )
+                    .ok()?;
 
-            (outer_bwrap_pid(host_proc, peer_pid) == Some(pid)).then_some(launcher)
-        });
+                (outer_bwrap_pid(host_proc, peer_pid) == Some(pid)).then_some(launcher)
+            })
+            .map_or(
+                LauncherCapability::MonitoringOnly,
+                LauncherCapability::Controllable,
+            );
 
         Ok(Self {
             peer: peer_fd,
@@ -257,16 +269,14 @@ impl SandboxLifetime {
 
     /// Whether the sandbox can be stopped from here.
     const fn can_stop(&self) -> bool {
-        self.launcher.is_some()
+        matches!(self.launcher, LauncherCapability::Controllable(_))
     }
 
     /// Kill the launcher unless it exits within `grace`.
     fn stop(&self, grace: Duration) -> io::Result<()> {
-        let launcher = self
-            .launcher
-            .as_ref()
-            .ok_or_else(|| io::Error::other("the sandbox has no launcher handle"))?;
-
+        let LauncherCapability::Controllable(launcher) = &self.launcher else {
+            return Err(io::Error::other("the sandbox has no launcher handle"));
+        };
         if !grace.is_zero() {
             let mut exited = [PollFd::new(launcher.as_fd(), PollFlags::POLLIN)];
 
@@ -1169,16 +1179,23 @@ fn refresh_policy(shared: &Shared) {
 /// An unremovable ignore mark must not survive as an unrevocable grant. Keep
 /// the fanotify group and policy writer alive while stopping the sandbox.
 fn flush_or_stop_sandbox(shared: &Shared) {
-    while let Err(error) = flush_ignore_marks(shared) {
-        tracing::error!(%error, "cannot revoke inode grants; stopping sandbox");
-        match shared.lifetime.stop(Duration::ZERO) {
-            Ok(()) => return,
-            Err(error) => {
-                tracing::error!(%error, "cannot stop sandbox after mark flush failure");
+    const MAX_FLUSH_STOP_ATTEMPTS: usize = 10;
+    for _ in 0..MAX_FLUSH_STOP_ATTEMPTS {
+        if let Err(error) = flush_ignore_marks(shared) {
+            tracing::error!(%error, "cannot revoke inode grants; stopping sandbox");
+            match shared.lifetime.stop(Duration::ZERO) {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::error!(%error, "cannot stop sandbox after mark flush failure");
+                }
             }
+            std::thread::sleep(REFRESH_INTERVAL);
+        } else {
+            return;
         }
-        std::thread::sleep(REFRESH_INTERVAL);
     }
+    tracing::error!("exhausted flush/stop retries; requesting monitor shutdown");
+    request_shutdown(0);
 }
 
 fn run_periodic_work(shared: &Shared, last_stats_log: &mut Instant) {
@@ -1207,8 +1224,15 @@ fn worker(shared: &Shared) -> ! {
         let length = match nix::unistd::read(&shared.fan_fd, &mut buf) {
             Ok(length) => length,
             Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EBADF | nix::errno::Errno::EINVAL) => {
+                tracing::error!("fanotify fd became invalid; stopping worker");
+                request_shutdown(0);
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
             Err(error) => {
                 eprintln!("agent-sandbox-fsmon: read from fanotify fd: {error}");
+                std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
         };
@@ -1226,8 +1250,16 @@ fn worker(shared: &Shared) -> ! {
             pid: meta.pid,
             event_fd,
         };
-        handle_permission_event(shared, job, &mut rpc, &runtime, &mut pid_cgroup_cache);
+        let _responded =
+            handle_permission_event(shared, job, &mut rpc, &runtime, &mut pid_cgroup_cache);
     }
+}
+
+struct RespondedEvent;
+
+fn finish_event(fan_fd: &OwnedFd, event_fd: &OwnedFd, verdict: u32) -> RespondedEvent {
+    respond(fan_fd, event_fd, verdict);
+    RespondedEvent
 }
 
 /// Answer a permission event, counting the decision and installing an ignore
@@ -1239,7 +1271,7 @@ fn handle_permission_event(
     rpc: &mut MonitorClient,
     runtime: &tokio::runtime::Runtime,
     pid_cgroup_cache: &mut HashSet<i32>,
-) {
+) -> RespondedEvent {
     let Job {
         mask,
         pid,
@@ -1250,38 +1282,39 @@ fn handle_permission_event(
 
     // The fast path answers from process identity (self pid, non-sandbox
     // cgroup), not from static policy, so no ignore mark applies here.
-    if try_fast_path_allow(
-        &shared.fan_fd,
+    match classify_fast_path(
         pid,
-        &event_fd,
         shared.self_pid,
         &shared.sandbox_cgroup,
         &shared.host_proc,
         pid_cgroup_cache,
     ) {
-        shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-        return;
+        FastPathDecision::Allow => {
+            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
+            return finish_event(&shared.fan_fd, &event_fd, FAN_ALLOW);
+        }
+        FastPathDecision::Deny => {
+            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
+            return finish_event(&shared.fan_fd, &event_fd, FAN_DENY);
+        }
+        FastPathDecision::NeedsPolicy => {}
     }
 
-    let path = match resolve_blocked_open_path(&shared.host_proc, pid, &event_fd).ok_or(FAN_DENY) {
-        Ok(path) => path,
-        Err(verdict) => {
-            tracing::warn!(pid, "path resolution failed, denying (fail-closed)");
-            respond(&shared.fan_fd, &event_fd, verdict);
-            shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+    let Some(path) = resolve_blocked_open_path(&shared.host_proc, pid, &event_fd) else {
+        tracing::warn!(pid, "path resolution failed, denying (fail-closed)");
+        shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
+        return finish_event(&shared.fan_fd, &event_fd, FAN_DENY);
     };
 
     let access = {
         let policy = shared.policy.read();
         let inode_check = needs_inode_check(&event_fd, &policy);
         if !inode_check && !open_needs_access_lookup(mask, &path, policy.allow()) {
-            respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+            let responded = finish_event(&shared.fan_fd, &event_fd, FAN_ALLOW);
             maybe_mark_static_allow(shared, policy.allow(), &path, &event_fd);
             drop(policy);
             shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return;
+            return responded;
         }
         let access = normalize_directory_traverse_access(
             Path::new(&path.path),
@@ -1292,11 +1325,11 @@ fn handle_permission_event(
                 .allow()
                 .allows(Path::new(&path.path), access, path.resolution)
         {
-            respond(&shared.fan_fd, &event_fd, FAN_ALLOW);
+            let responded = finish_event(&shared.fan_fd, &event_fd, FAN_ALLOW);
             maybe_mark_static_allow(shared, policy.allow(), &path, &event_fd);
             drop(policy);
             shared.stats.local_answers.fetch_add(1, Ordering::Relaxed);
-            return;
+            return responded;
         }
         drop(policy);
         access
@@ -1319,7 +1352,7 @@ fn handle_permission_event(
         tracing::info!(path = %path.path, ?access, "denied by policy");
     }
 
-    respond(&shared.fan_fd, &event_fd, verdict);
+    finish_event(&shared.fan_fd, &event_fd, verdict)
 }
 
 /// Join the mount namespace of `target_pid`, refusing when it is our own.
@@ -1433,7 +1466,7 @@ fn main() {
 
     let mut snapshots = PolicydRpc::new(PersistentRpcClient::new(cli.socket.clone()), ctx.clone())
         .expect("tokio runtime");
-    let policy = FilesystemReplica::fetch(&mut snapshots, cli.project_root.clone());
+    let policy = FilesystemReplica::fetch(&mut snapshots, cli.project_root);
     drop(snapshots);
 
     // setns into the target mount namespace before marking its mounts.
@@ -1521,18 +1554,21 @@ extern "C" fn request_shutdown(_signum: libc::c_int) {
 /// can only ever belong to another sandbox process, and a hypothetical host
 /// process hitting a stale entry is still policy-mediated rather than
 /// auto-allowed.
-fn try_fast_path_allow(
-    fan_fd: &OwnedFd,
+enum FastPathDecision {
+    Allow,
+    Deny,
+    NeedsPolicy,
+}
+
+fn classify_fast_path(
     pid: i32,
-    event_fd: &OwnedFd,
     self_pid: i32,
     sandbox_cgroup: &CgroupPath,
     host_proc: &HostProc,
     pid_cgroup_cache: &mut HashSet<i32>,
-) -> bool {
+) -> FastPathDecision {
     if pid == self_pid {
-        respond(fan_fd, event_fd, FAN_ALLOW);
-        return true;
+        return FastPathDecision::Allow;
     }
 
     if pid_cgroup_cache.insert(pid) {
@@ -1544,19 +1580,17 @@ fn try_fast_path_allow(
 
             Some(false) => {
                 pid_cgroup_cache.remove(&pid);
-                respond(fan_fd, event_fd, FAN_ALLOW);
-                return true;
+                return FastPathDecision::Allow;
             }
 
             None => {
                 pid_cgroup_cache.remove(&pid);
-                respond(fan_fd, event_fd, FAN_DENY);
-                return true;
+                return FastPathDecision::Deny;
             }
         }
     }
 
-    false
+    FastPathDecision::NeedsPolicy
 }
 
 #[cfg(test)]
@@ -1814,8 +1848,9 @@ mod tests {
             .stop(Duration::ZERO)
             .expect_err("no launcher handle");
 
-        lifetime.launcher =
-            Some(agent_sandbox_sysutil::pidfd_open(launcher.id()).expect("open launcher pidfd"));
+        lifetime.launcher = LauncherCapability::Controllable(
+            agent_sandbox_sysutil::pidfd_open(launcher.id()).expect("open launcher pidfd"),
+        );
         assert!(lifetime.can_stop());
         lifetime.stop(Duration::ZERO).expect("kill launcher");
 
