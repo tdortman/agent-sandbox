@@ -4,6 +4,31 @@ use std::{io, path::Path, sync::Mutex};
 
 use aya::maps::{Array, Map, MapData, MapType};
 
+/// Kernel revocation flag states: 0 unpublished, 1 eligible, 2 revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum RevocationState {
+    /// Map created, grants not yet published.
+    Unpublished = 0,
+    /// Grants published and eligible for fast path.
+    Eligible = 1,
+    /// Permanently revoked; reopening never rearms old grants.
+    Revoked = 2,
+}
+
+impl TryFrom<u64> for RevocationState {
+    type Error = io::Error;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unpublished),
+            1 => Ok(Self::Eligible),
+            2 => Ok(Self::Revoked),
+            _ => Err(io::Error::other("invalid network revocation state")),
+        }
+    }
+}
+
 /// A trusted publisher's kernel flag: 0 unpublished, 1 eligible, 2 revoked.
 /// The daemon only writes 2. Reopening the map never rearms old grants.
 // ponytail: any runtime decision disables this file-only snapshot; compile
@@ -32,9 +57,7 @@ impl NetworkPolicyRevocation {
             .map_err(io::Error::other)?
             .get(&0, 0)
             .map_err(io::Error::other)?;
-        if value > 2 {
-            return Err(io::Error::other("invalid network revocation state"));
-        }
+        let _state = RevocationState::try_from(value)?;
         Ok(Self {
             map: Mutex::new(map),
         })
@@ -52,7 +75,7 @@ impl NetworkPolicyRevocation {
             .map_err(|_| io::Error::other("network revocation lock poisoned"))?;
         Array::<_, u64>::try_from(&mut *map)
             .map_err(io::Error::other)?
-            .set(0, 2, 0)
+            .set(0, RevocationState::Revoked as u64, 0)
             .map_err(io::Error::other)
     }
 }

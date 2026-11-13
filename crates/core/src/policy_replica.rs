@@ -188,13 +188,18 @@ struct FileStamp {
     len: u64,
 }
 
+enum ExportCache {
+    Empty,
+    Cached(ParsedExport),
+}
+
 /// Snapshots read from the per-session export policyd maintains.
 ///
 /// The file is parsed again only when its [`FileStamp`] changes. A missing,
 /// unreadable or malformed file yields no snapshot.
 pub struct SessionExport {
     path: PathBuf,
-    parsed: Option<ParsedExport>,
+    parsed: ExportCache,
 }
 
 /// The last parsed export and the stamp of the file it came from.
@@ -207,7 +212,10 @@ impl SessionExport {
     /// A source reading the export at `path`.
     #[must_use]
     pub const fn new(path: PathBuf) -> Self {
-        Self { path, parsed: None }
+        Self {
+            path,
+            parsed: ExportCache::Empty,
+        }
     }
 }
 
@@ -223,8 +231,8 @@ impl SnapshotSource for SessionExport {
             };
 
             match &self.parsed {
-                Some(parsed) if parsed.stamp == stamp => Ok(parsed.snapshot.clone()),
-                _ => {
+                ExportCache::Cached(parsed) if parsed.stamp == stamp => Ok(parsed.snapshot.clone()),
+                ExportCache::Empty | ExportCache::Cached(_) => {
                     let filesystem: FilesystemSection =
                         serde_json::from_slice(&std::fs::read(&self.path)?)
                             .map_err(std::io::Error::other)?;
@@ -232,7 +240,7 @@ impl SnapshotSource for SessionExport {
                         filesystem,
                         denied_inodes: HashSet::new(),
                     };
-                    self.parsed = Some(ParsedExport {
+                    self.parsed = ExportCache::Cached(ParsedExport {
                         stamp,
                         snapshot: snapshot.clone(),
                     });
@@ -245,7 +253,7 @@ impl SnapshotSource for SessionExport {
         match outcome {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
-                self.parsed = None;
+                self.parsed = ExportCache::Empty;
                 tracing::warn!(
                     path = %self.path.display(),
                     %error,
@@ -258,13 +266,18 @@ impl SnapshotSource for SessionExport {
     }
 }
 
+/// Whether hard-linked regular files can be trusted locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkTrust {
+    Untrusted,
+    SettledBefore(i128),
+}
+
 /// One immutable generation of the local filesystem policy.
 pub struct LocalFilesystem {
     snapshot: FilesystemSnapshot,
     allow: StaticPolicyAllow,
-    /// Realtime nanoseconds; hard-linked inodes with a later ctime may have
-    /// gained a link the snapshot's denied inode set does not reflect.
-    links_settled_before: i128,
+    link_trust: LinkTrust,
 }
 
 impl LocalFilesystem {
@@ -275,10 +288,10 @@ impl LocalFilesystem {
         requested: SystemTime,
         project_root: Option<PathBuf>,
     ) -> Self {
-        let links_settled_before = if snapshot.is_some() {
+        let link_trust = if snapshot.is_some() {
             links_settled_before(requested)
         } else {
-            0
+            LinkTrust::Untrusted
         };
         let snapshot = snapshot.unwrap_or_default();
         let allow = StaticPolicyAllow::from_policy(
@@ -292,7 +305,7 @@ impl LocalFilesystem {
         Self {
             snapshot,
             allow,
-            links_settled_before,
+            link_trust,
         }
     }
 
@@ -314,17 +327,22 @@ impl LocalFilesystem {
     /// because `link` updates the inode's ctime.
     #[must_use]
     pub fn hard_link_needs_policyd(&self, inode: &InodeIdentity, changed_nanos: i128) -> bool {
-        changed_nanos >= self.links_settled_before || self.snapshot.denied_inodes.contains(inode)
+        let postdates = match self.link_trust {
+            LinkTrust::Untrusted => true,
+            LinkTrust::SettledBefore(cutoff) => changed_nanos >= cutoff,
+        };
+        postdates || self.snapshot.denied_inodes.contains(inode)
     }
 }
 
 /// Realtime nanoseconds before which a changed inode is covered by a
-/// snapshot requested at `requested`; 0 trusts no hard-linked inode.
-fn links_settled_before(requested: SystemTime) -> i128 {
+/// snapshot requested at `requested`.
+fn links_settled_before(requested: SystemTime) -> LinkTrust {
     requested
         .checked_sub(CTIME_CLOCK_SLACK)
         .and_then(|settled| settled.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |settled| i128::try_from(settled.as_nanos()).unwrap_or(0))
+        .and_then(|settled| i128::try_from(settled.as_nanos()).ok())
+        .map_or(LinkTrust::Untrusted, LinkTrust::SettledBefore)
 }
 
 /// The local copy of one sandbox's filesystem policy.

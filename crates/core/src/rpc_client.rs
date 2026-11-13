@@ -182,6 +182,11 @@ fn peer_is_trusted_non_local(stream: &UnixStream) -> bool {
     }
 }
 
+enum ClientConnection {
+    Disconnected,
+    Connected(RpcConnection),
+}
+
 /// Persistent sequential policyd client.
 ///
 /// A request uses the current connection, establishing it lazily on the first
@@ -197,7 +202,7 @@ fn peer_is_trusted_non_local(stream: &UnixStream) -> bool {
 /// duplicate a one-shot approval.
 pub struct PersistentRpcClient {
     socket_path: PathBuf,
-    connection: Option<RpcConnection>,
+    connection: ClientConnection,
     require_trusted_peer: bool,
 }
 
@@ -206,7 +211,7 @@ impl PersistentRpcClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
-            connection: None,
+            connection: ClientConnection::Disconnected,
             require_trusted_peer: false,
         }
     }
@@ -229,7 +234,7 @@ impl PersistentRpcClient {
 
     /// Discard the current connection after a protocol-level mismatch.
     pub fn invalidate(&mut self) {
-        self.connection = None;
+        self.connection = ClientConnection::Disconnected;
     }
 
     /// Send one request over the persistent connection.
@@ -251,7 +256,7 @@ impl PersistentRpcClient {
             if matches!(result, Err(RpcClientError::Closed))
                 && let Some(req) = replay
             {
-                self.connection = None;
+                self.connection = ClientConnection::Disconnected;
                 return self.send(req).await;
             }
             result
@@ -262,36 +267,40 @@ impl PersistentRpcClient {
             Ok(Ok(reply)) => Ok(reply),
 
             Ok(Err(error)) => {
-                self.connection = None;
+                self.connection = ClientConnection::Disconnected;
                 Err(error)
             }
 
             Err(_) => {
-                self.connection = None;
+                self.connection = ClientConnection::Disconnected;
                 Err(RpcClientError::Timeout)
             }
         }
     }
 
-    async fn send(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
-        if self
-            .connection
-            .as_ref()
-            .is_some_and(RpcConnection::peer_has_closed)
-        {
-            self.connection = None;
+    async fn ensure_connected(&mut self) -> Result<&mut RpcConnection, RpcClientError> {
+        if matches!(
+            &self.connection,
+            ClientConnection::Connected(conn) if conn.peer_has_closed()
+        ) {
+            self.connection = ClientConnection::Disconnected;
         }
-        if self.connection.is_none() {
+        if matches!(self.connection, ClientConnection::Disconnected) {
             let connection = if self.require_trusted_peer {
                 RpcConnection::connect_trusted(&self.socket_path).await?
             } else {
                 RpcConnection::connect(&self.socket_path).await?
             };
-            self.connection = Some(connection);
+            self.connection = ClientConnection::Connected(connection);
         }
-        let Some(connection) = self.connection.as_mut() else {
-            return Err(RpcClientError::Closed);
-        };
+        match &mut self.connection {
+            ClientConnection::Connected(conn) => Ok(conn),
+            ClientConnection::Disconnected => unreachable!("just connected"),
+        }
+    }
+
+    async fn send(&mut self, req: RpcRequest) -> Result<RpcReply, RpcClientError> {
+        let connection = self.ensure_connected().await?;
         connection.request(req).await
     }
 }
