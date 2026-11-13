@@ -75,7 +75,12 @@ rust.rustPlatform.buildRustPackage {
     cmake
     makeWrapper
     pkgs.gitMinimal
+    pkgs.pkg-config
     rust.rustPlatform.bindgenHook
+  ];
+
+  buildInputs = [
+    pkgs.aws-lc
   ];
 
   cargoLock = {

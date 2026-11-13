@@ -81,6 +81,14 @@ pkgs.testers.runNixOSTest (_: {
     for node in [proxy]:
         node.wait_for_unit("multi-user.target")
 
+    # Proxy mode gates UDP at the packet layer: new flows are queued for a
+    # transport check (one prompt per host:port), then established flows
+    # pass via conntrack. Run before h3-allowed.test resolves 169.254.100.1
+    # into nfq's reverse-IP cache.
+    proxy.wait_for_unit("agent-sandbox-vm-udp-18082.service")
+    proxy.wait_for_unit("agent-sandbox-vm-udp-18083.service")
+    sandbox_shell(proxy, "sandbox-proxy-bash", "printf udp-ok | timeout 5 socat - UDP4:169.254.100.1:18082 | grep -q udp-ok", wrapper=session_wrapper)
+    sandbox_shell(proxy, "sandbox-proxy-bash", "printf blocked | timeout 3 socat - UDP4:169.254.100.1:18083 | grep -q blocked", wrapper=session_wrapper, expect_success=False)
     # HTTP/3 policy is enforced per decoded request over IPv4 and IPv6.
     proxy.wait_for_unit("agent-sandbox-vm-h3-http.service", timeout=120)
     sandbox_shell(
@@ -89,6 +97,7 @@ pkgs.testers.runNixOSTest (_: {
         "python3 -c 'import socket; assert socket.getaddrinfo(\"h3-allowed.test\", 443); assert socket.getaddrinfo(\"h3-allowed-v6.test\", 443)'",
         wrapper=session_wrapper,
     )
+
     proxy.succeed("set +e; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} reset counters table inet agent_sandbox_proxy_tproxy; runuser -u sandbox -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus sandbox-proxy-bash -c 'curl --http3-only --cacert /run/agent-sandbox/shared/proxy-ca-bundle.pem --fail --silent --show-error --max-time 15 https://h3-allowed.test:443/allowed | grep -q allowed-get' >/tmp/h3-allowed.log 2>&1; status=$?; cat /tmp/h3-allowed.log; ip netns exec agent-sandbox ip route get 169.254.100.1 mark 51820; ip netns exec agent-sandbox cat /proc/net/udp /proc/net/udp6; ip netns exec agent-sandbox ${lib.getExe pkgs.nftables} -a list table inet agent_sandbox_proxy_tproxy; test $status -eq 0")
     sandbox_shell(
         proxy,
@@ -110,13 +119,6 @@ pkgs.testers.runNixOSTest (_: {
             wrapper=session_wrapper,
         )
     )
-    # Proxy mode gates UDP at the packet layer: new flows are queued for a
-    # transport check (one prompt per host:port), then established flows
-    # pass via conntrack.
-    proxy.wait_for_unit("agent-sandbox-vm-udp-18082.service")
-    proxy.wait_for_unit("agent-sandbox-vm-udp-18083.service")
-    sandbox_shell(proxy, "sandbox-proxy-bash", "printf udp-ok | timeout 5 socat - UDP4:169.254.100.1:18082 | grep -q udp-ok", wrapper=session_wrapper)
-    sandbox_shell(proxy, "sandbox-proxy-bash", "printf blocked | timeout 3 socat - UDP4:169.254.100.1:18083 | grep -q blocked", wrapper=session_wrapper, expect_success=False)
     proxy.succeed("journalctl --no-pager -b -u agent-sandbox-proxy.service | grep -F -q 'attributed alternative QUIC endpoint'")
 
     # The denied HTTP/3 request must complete as a clean 403 response.
