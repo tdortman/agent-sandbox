@@ -56,11 +56,67 @@ pub struct TrustedPeer {
     pub uid: u32,
 }
 
+/// Whether a sandbox session has a root process yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAdoption {
+    /// No descendant of the launcher has claimed the session yet.
+    Unadopted,
+
+    /// The session's root process.
+    Adopted {
+        /// Pid of the root process.
+        pid: u32,
+    },
+}
+
+impl RootAdoption {
+    /// The root pid, once adopted.
+    #[must_use]
+    pub const fn pid(self) -> Option<u32> {
+        match self {
+            Self::Unadopted => None,
+            Self::Adopted { pid } => Some(pid),
+        }
+    }
+}
+
+/// Whether a sandbox session was pre-registered by a launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherBinding {
+    /// No launcher registered the session. Nothing ties it to a process
+    /// tree, so no later peer can adopt it as its root.
+    Unbound,
+
+    /// The launcher (wrapper) process that pre-registered the session.
+    Bound {
+        /// Pid of the launcher.
+        pid: u32,
+
+        /// Launcher's kernel start time in clock ticks, captured at
+        /// registration; tells it apart from a later process reusing the pid.
+        start_ticks: u64,
+    },
+}
+
+impl LauncherBinding {
+    /// The launcher pid, once bound.
+    #[must_use]
+    pub const fn pid(self) -> Option<u32> {
+        match self {
+            Self::Unbound => None,
+            Self::Bound { pid, .. } => Some(pid),
+        }
+    }
+}
+
 /// Registration of a sandbox session against the policy store.
+///
+/// Serialized as the flat state-file record of [`RegistrationRecord`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RegistrationRecord", into = "RegistrationRecord")]
 pub struct SandboxSessionRegistration {
-    /// Root pid of the sandbox session.
-    pub root_pid: u32,
+    /// Root process of the sandbox session, once adopted.
+    pub root: RootAdoption,
 
     /// Uid that owns the sandbox session.
     pub owner_uid: u32,
@@ -71,14 +127,9 @@ pub struct SandboxSessionRegistration {
     /// Optional package the session is attributed to.
     pub package: Option<String>,
 
-    /// PID of the launcher (wrapper) process that pre-registered the
-    /// session. 0 means the session was not pre-registered. Such sessions
-    /// keep the first-peer-claims-root adoption model.
-    pub launcher_pid: u32,
-
-    /// Launcher's kernel start time in clock ticks, captured at registration.
-    /// Zero denotes a session without a registered launcher.
-    pub launcher_start_ticks: u64,
+    /// Launcher that pre-registered the session. A session without one keeps
+    /// the first-peer-claims-root model and is never adopted afterwards.
+    pub launcher: LauncherBinding,
 
     /// Agent systemd scope of the session anchor, captured when the anchor
     /// is recorded. Daemons that double-fork out of the sandbox process tree
@@ -89,8 +140,64 @@ pub struct SandboxSessionRegistration {
     /// when policyd starts the session's filesystem monitor. The export is
     /// written only while this is set, because only a monitored sandbox has
     /// its reads of the export directory checked.
-    #[serde(default)]
     pub export_reader: Option<ExportReader>,
+}
+
+/// State-file shape of [`SandboxSessionRegistration`]: pids and start ticks
+/// as plain numbers, zero meaning absent. Keeps files written before the
+/// enums existed readable.
+#[derive(Serialize, Deserialize)]
+struct RegistrationRecord {
+    root_pid: u32,
+    owner_uid: u32,
+    project_root: PathBuf,
+    package: Option<String>,
+    launcher_pid: u32,
+    launcher_start_ticks: u64,
+    cgroup: Option<PathBuf>,
+    #[serde(default)]
+    export_reader: Option<ExportReader>,
+}
+
+impl From<RegistrationRecord> for SandboxSessionRegistration {
+    fn from(record: RegistrationRecord) -> Self {
+        Self {
+            root: match record.root_pid {
+                0 => RootAdoption::Unadopted,
+                pid => RootAdoption::Adopted { pid },
+            },
+            owner_uid: record.owner_uid,
+            project_root: record.project_root,
+            package: record.package,
+            launcher: match record.launcher_pid {
+                0 => LauncherBinding::Unbound,
+                pid => LauncherBinding::Bound {
+                    pid,
+                    start_ticks: record.launcher_start_ticks,
+                },
+            },
+            cgroup: record.cgroup,
+            export_reader: record.export_reader,
+        }
+    }
+}
+
+impl From<SandboxSessionRegistration> for RegistrationRecord {
+    fn from(registration: SandboxSessionRegistration) -> Self {
+        Self {
+            root_pid: registration.root.pid().unwrap_or(0),
+            owner_uid: registration.owner_uid,
+            project_root: registration.project_root,
+            package: registration.package,
+            launcher_pid: registration.launcher.pid().unwrap_or(0),
+            launcher_start_ticks: match registration.launcher {
+                LauncherBinding::Unbound => 0,
+                LauncherBinding::Bound { start_ticks, .. } => start_ticks,
+            },
+            cgroup: registration.cgroup,
+            export_reader: registration.export_reader,
+        }
+    }
 }
 
 /// The process that reads a session's filesystem export: the parent of the
@@ -623,6 +730,22 @@ pub struct UiSessionContext {
     pub client_id: u64,
 }
 
+/// How long a UI session handed over from the previous daemon waits for its
+/// UI to reconnect before its context and decisions are dropped.
+pub const HANDED_OVER_UI_SESSION_TTL: Duration = Duration::from_secs(600);
+
+/// A UI session inherited from the previous daemon that no UI has resumed
+/// yet. Its decisions wait in the session buckets under the same id until a
+/// matching UI resumes it or [`HANDED_OVER_UI_SESSION_TTL`] expires.
+#[derive(Debug, Clone)]
+pub struct HandedOverUiSession {
+    /// When the session was restored from the handoff file.
+    pub handed_over_at: Instant,
+
+    /// Context the previous UI registered the session with.
+    pub context: UiSessionContext,
+}
+
 /// Handle to a connected UI approval client.
 #[derive(Clone)]
 pub struct UiClientHandle {
@@ -646,7 +769,7 @@ pub struct PolicyStore {
     pub(crate) args: PolicydArgs,
     pub(crate) inner: Mutex<PolicyDecisionState>,
     pub(super) network_observation:
-        std::sync::Mutex<Option<super::network_snapshot::PendingNetworkPublication>>,
+        std::sync::Mutex<super::network_snapshot::NetworkObservationState>,
     pub(crate) network_revocation:
         std::sync::Mutex<Option<agent_sandbox_core::network_revocation::NetworkPolicyRevocation>>,
 

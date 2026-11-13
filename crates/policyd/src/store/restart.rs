@@ -295,8 +295,15 @@ impl PolicyStore {
 /// The registration with a root pid that is no longer inside the launcher's
 /// tree cleared, so the next descendant adopts the session.
 fn adopt_orphaned_root(mut registration: SandboxSessionRegistration) -> SandboxSessionRegistration {
-    if !is_descendant_of(registration.launcher_pid, registration.root_pid) {
-        registration.root_pid = 0;
+    if let (
+        crate::store::types::LauncherBinding::Bound {
+            pid: launcher_pid, ..
+        },
+        crate::store::types::RootAdoption::Adopted { pid: root_pid },
+    ) = (registration.launcher, registration.root)
+        && !is_descendant_of(launcher_pid, root_pid)
+    {
+        registration.root = crate::store::types::RootAdoption::Unadopted;
     }
 
     registration
@@ -396,13 +403,20 @@ mod tests {
     }
 
     fn registration(launcher_pid: u32, launcher_start_ticks: u64) -> SandboxSessionRegistration {
+        let launcher = if launcher_pid == 0 {
+            crate::store::types::LauncherBinding::Unbound
+        } else {
+            crate::store::types::LauncherBinding::Bound {
+                pid: launcher_pid,
+                start_ticks: launcher_start_ticks,
+            }
+        };
         SandboxSessionRegistration {
-            root_pid: 0,
+            root: crate::store::types::RootAdoption::Unadopted,
             owner_uid: nix::unistd::getuid().as_raw(),
             project_root: PathBuf::new(),
             package: Some("omp".into()),
-            launcher_pid,
-            launcher_start_ticks,
+            launcher,
             cgroup: None,
             export_reader: None,
         }

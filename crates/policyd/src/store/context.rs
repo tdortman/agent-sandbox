@@ -86,19 +86,29 @@ impl PolicyStore {
             if let Some(reg) = sessions.get_mut(sandbox_session_id) {
                 // Only the launcher's descendants may adopt a registered
                 // session.
-                let adopt_root = reg.root_pid == 0
-                    && (reg.launcher_pid == 0 || is_descendant_of(reg.launcher_pid, peer.pid));
-                let root_pid = if adopt_root { peer.pid } else { reg.root_pid };
-                let update_project = is_descendant_of(root_pid, peer.pid)
+                let adopt_root = matches!(reg.root, crate::store::types::RootAdoption::Unadopted)
+                    && matches!(
+                        reg.launcher,
+                        crate::store::types::LauncherBinding::Bound { pid, .. }
+                            if is_descendant_of(pid, peer.pid)
+                    );
+                let new_root = if adopt_root {
+                    crate::store::types::RootAdoption::Adopted { pid: peer.pid }
+                } else {
+                    reg.root
+                };
+                let update_project = new_root
+                    .pid()
+                    .is_some_and(|root_pid| is_descendant_of(root_pid, peer.pid))
                     && !project_root.as_os_str().is_empty()
                     && project_root != reg.project_root
                     && (reg.project_root.as_os_str().is_empty()
                         || is_path_descendant(&project_root, &reg.project_root));
                 if adopt_root || update_project {
                     self.revoke_network_grants()?;
-                    reg.root_pid = root_pid;
+                    reg.root = new_root;
                     if adopt_root {
-                        reg.cgroup = agent_scope_cgroup(root_pid);
+                        reg.cgroup = agent_scope_cgroup(peer.pid);
                     }
                     if update_project {
                         reg.project_root = project_root;
@@ -107,12 +117,11 @@ impl PolicyStore {
             } else {
                 self.revoke_network_grants()?;
                 sessions.insert(sandbox_session_id.to_string(), SandboxSessionRegistration {
-                    root_pid: peer.pid,
+                    root: crate::store::types::RootAdoption::Adopted { pid: peer.pid },
                     owner_uid: peer.uid,
                     project_root,
                     package: None,
-                    launcher_pid: 0,
-                    launcher_start_ticks: 0,
+                    launcher: crate::store::types::LauncherBinding::Unbound,
                     cgroup: agent_scope_cgroup(peer.pid),
                     export_reader: None,
                 });
@@ -171,6 +180,10 @@ impl PolicyStore {
             return Err(PolicydError::InvalidLauncherPid);
         }
 
+        let new_launcher = crate::store::types::LauncherBinding::Bound {
+            pid: launcher_pid,
+            start_ticks: launcher_start_ticks,
+        };
         self.update_registry(|sessions| {
             if let Some(reg) = sessions.get_mut(session_id) {
                 if let Some(existing) = &reg.package
@@ -178,33 +191,29 @@ impl PolicyStore {
                 {
                     return Err(PolicydError::PackageImmutable);
                 }
+                let launcher_changed = reg.launcher != new_launcher;
                 if reg.package.as_deref() != Some(package)
                     || reg.owner_uid != owner_uid
-                    || reg.launcher_pid != launcher_pid
-                    || reg.launcher_start_ticks != launcher_start_ticks
+                    || launcher_changed
                 {
                     self.revoke_network_grants()?;
                 }
-                if reg.launcher_pid != launcher_pid
-                    || reg.launcher_start_ticks != launcher_start_ticks
-                {
+                if launcher_changed {
                     // The reader belongs to the sandbox the previous launcher
                     // ran.
                     reg.export_reader = None;
                 }
                 reg.package = Some(package.to_string());
                 reg.owner_uid = owner_uid;
-                reg.launcher_pid = launcher_pid;
-                reg.launcher_start_ticks = launcher_start_ticks;
+                reg.launcher = new_launcher;
             } else {
                 self.revoke_network_grants()?;
                 sessions.insert(session_id.to_string(), SandboxSessionRegistration {
-                    root_pid: 0,
+                    root: crate::store::types::RootAdoption::Unadopted,
                     owner_uid,
                     project_root: PathBuf::new(),
                     package: Some(package.to_string()),
-                    launcher_pid,
-                    launcher_start_ticks,
+                    launcher: new_launcher,
                     cgroup: agent_scope_cgroup(launcher_pid),
                     export_reader: None,
                 });
@@ -927,15 +936,17 @@ mod tests {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             sessions.insert("broker-session".into(), SandboxSessionRegistration {
-                root_pid,
+                root: crate::store::types::RootAdoption::Adopted { pid: root_pid },
                 owner_uid: uid,
                 project_root: PathBuf::from("/work/project"),
                 package: Some("codex".into()),
-                launcher_pid,
-                launcher_start_ticks: agent_sandbox_core::socket_owner::process_start_time_ticks(
-                    launcher_pid,
-                )
-                .expect("launcher start time"),
+                launcher: crate::store::types::LauncherBinding::Bound {
+                    pid: launcher_pid,
+                    start_ticks: agent_sandbox_core::socket_owner::process_start_time_ticks(
+                        launcher_pid,
+                    )
+                    .expect("launcher start time"),
+                },
                 cgroup: None,
                 export_reader: None,
             });
@@ -985,15 +996,17 @@ mod tests {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             sessions.insert("broker-tracee-session".into(), SandboxSessionRegistration {
-                root_pid,
+                root: crate::store::types::RootAdoption::Adopted { pid: root_pid },
                 owner_uid: uid,
                 project_root: PathBuf::from("/work/project"),
                 package: Some("codex".into()),
-                launcher_pid,
-                launcher_start_ticks: agent_sandbox_core::socket_owner::process_start_time_ticks(
-                    launcher_pid,
-                )
-                .expect("launcher start time"),
+                launcher: crate::store::types::LauncherBinding::Bound {
+                    pid: launcher_pid,
+                    start_ticks: agent_sandbox_core::socket_owner::process_start_time_ticks(
+                        launcher_pid,
+                    )
+                    .expect("launcher start time"),
+                },
                 cgroup: None,
                 export_reader: None,
             });
@@ -1138,7 +1151,8 @@ mod tests {
             .expect("registration must exist after register_sandbox");
 
         assert_eq!(
-            reg.launcher_pid, launcher,
+            reg.launcher.pid(),
+            Some(launcher),
             "registration must record the verified launcher pid"
         );
 
@@ -1205,7 +1219,8 @@ mod tests {
         let reg = sessions.get("sandbox-a").expect("registration exists");
 
         assert_eq!(
-            reg.root_pid, 0,
+            reg.root,
+            crate::store::types::RootAdoption::Unadopted,
             "a non-descendant peer must not claim a pre-registered session's root"
         );
 
@@ -1237,7 +1252,8 @@ mod tests {
         let reg = sessions.get("sandbox-a").expect("registration exists");
 
         assert_eq!(
-            reg.root_pid, child_pid,
+            reg.root.pid(),
+            Some(child_pid),
             "a descendant of the launcher must be adopted as the session root"
         );
 
@@ -1357,7 +1373,8 @@ mod tests {
         );
 
         assert_eq!(
-            reg.root_pid, pid,
+            reg.root.pid(),
+            Some(pid),
             "note_sandbox_peer must adopt the first sandbox peer as the session root"
         );
 

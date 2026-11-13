@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use super::{
     types::{
-        CLIENT_ID, Pending, PendingFilesystem, PendingResource, PolicyStore, UiClient,
-        UiClientHandle, UiSessionContext,
+        CLIENT_ID, HANDED_OVER_UI_SESSION_TTL, Pending, PendingFilesystem, PendingResource,
+        PolicyStore, UiClient, UiClientHandle, UiSessionContext,
     },
     ui_route::{UiRoute, paths_match},
 };
@@ -277,16 +277,20 @@ impl PolicyStore {
             ctx.owner_uid = Some(peer.uid);
         }
 
+        Self::prune_handed_over_ui_sessions(&mut inner);
+
         let resumable = resume.filter(|id| {
-            inner.resumable_ui_sessions.contains(*id)
-                && inner.ui_context_by_session.get(*id).is_some_and(|handed| {
-                    handed.owner_uid == ctx.owner_uid
-                        && handed.sandbox_session_id == ctx.sandbox_session_id
+            inner
+                .handed_over_ui_sessions
+                .get(*id)
+                .is_some_and(|handed| {
+                    handed.context.owner_uid == ctx.owner_uid
+                        && handed.context.sandbox_session_id == ctx.sandbox_session_id
                 })
         });
 
         let session_id = if let Some(id) = resumable {
-            inner.resumable_ui_sessions.remove(id);
+            inner.handed_over_ui_sessions.remove(id);
             id.to_owned()
         } else {
             Uuid::now_v7().simple().to_string()
@@ -343,6 +347,23 @@ impl PolicyStore {
         }
     }
 
+    /// Drop handed-over sessions whose UI did not reconnect within the TTL,
+    /// together with the session decisions that waited for it.
+    fn prune_handed_over_ui_sessions(inner: &mut super::types::PolicyDecisionState) {
+        let now = Instant::now();
+        let session = &mut inner.session;
+
+        inner.handed_over_ui_sessions.retain(|id, handed| {
+            let live = now.duration_since(handed.handed_over_at) < HANDED_OVER_UI_SESSION_TTL;
+
+            if !live {
+                session.forget_session(id);
+            }
+
+            live
+        });
+    }
+
     fn remove_ui_client_locked(
         inner: &mut super::types::PolicyDecisionState,
         client_id: u64,
@@ -350,6 +371,7 @@ impl PolicyStore {
         inner.ui_clients.remove(&client_id).is_some_and(|client| {
             inner.session.forget_session(&client.session_id);
             inner.ui_context_by_session.remove(&client.session_id);
+            Self::prune_handed_over_ui_sessions(inner);
             true
         })
     }

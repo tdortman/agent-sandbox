@@ -380,7 +380,7 @@ impl PolicyStore {
     /// Returns [`PolicydError`] when the proxy session is not active.
     pub async fn cancel_http_check(
         &self,
-        proxy_session: agent_sandbox_core::ProxySessionToken,
+        proxy_session: &agent_sandbox_core::ProxySessionToken,
         request_id: agent_sandbox_core::ProxyRequestId,
     ) -> Result<(), PolicydError> {
         let tx = {
@@ -388,11 +388,11 @@ impl PolicyStore {
             if inner
                 .proxy_session
                 .as_ref()
-                .is_none_or(|session| session.token != proxy_session)
+                .is_none_or(|session| &session.token != proxy_session)
             {
                 return Err(PolicydError::Proxy("proxy session is not active".into()));
             }
-            let tx = Self::remove_http_waiter_locked(&mut inner, &proxy_session, request_id);
+            let tx = Self::remove_http_waiter_locked(&mut inner, proxy_session, request_id);
             drop(inner);
             tx
         };

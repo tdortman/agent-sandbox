@@ -28,6 +28,15 @@ pub(super) struct PendingNetworkPublication {
     grants: Vec<std::net::SocketAddrV4>,
 }
 
+/// Lifecycle of the daemon's experimental network-grant observation.
+#[derive(Default)]
+pub(super) enum NetworkObservationState {
+    #[default]
+    Idle,
+    Observed(Box<PendingNetworkPublication>),
+    Published,
+}
+
 impl PolicyStore {
     pub(crate) fn observe_captured_network_grants(
         &self,
@@ -45,7 +54,7 @@ impl PolicyStore {
             .network_observation
             .lock()
             .map_err(|_| io::Error::other("network observation lock poisoned"))?;
-        if observation.is_some() {
+        if !matches!(*observation, NetworkObservationState::Idle) {
             return Err(io::Error::other("network sources are already observed"));
         }
         if self
@@ -102,13 +111,13 @@ impl PolicyStore {
         controller[8..16].copy_from_slice(&captured.exec_id.to_ne_bytes());
         controller[16..20].copy_from_slice(&captured.pid.to_ne_bytes());
         let reply_grants = grants.grants.clone();
-        *observation = Some(PendingNetworkPublication {
+        *observation = NetworkObservationState::Observed(Box::new(PendingNetworkPublication {
             observed: grants.observed,
             policy,
             cgroup,
             controller,
             grants: reply_grants.clone(),
-        });
+        }));
         drop(observation);
         Ok(RpcReply::NetworkSnapshot {
             context: Box::new(captured),
@@ -122,9 +131,18 @@ impl PolicyStore {
             .network_observation
             .lock()
             .map_err(|_| io::Error::other("network observation lock poisoned"))?;
-        let pending = observation
-            .as_mut()
-            .ok_or_else(|| io::Error::other("network sources have not been observed"))?;
+        let mut pending =
+            match std::mem::replace(&mut *observation, NetworkObservationState::Published) {
+                NetworkObservationState::Observed(pending) => pending,
+                NetworkObservationState::Idle => {
+                    return Err(io::Error::other("network sources have not been observed"));
+                }
+                NetworkObservationState::Published => {
+                    return Err(io::Error::other(
+                        "network sources have already been published",
+                    ));
+                }
+            };
         // Finalize the epoch before installing rules: with no outer entry the
         // transport denies, so a failed install below stays fail-closed.
         pending.observed.publish()?;
@@ -169,11 +187,20 @@ impl PolicyStore {
             .map_err(|_| io::Error::other("sandbox registration lock poisoned"))?;
         let registration = sessions
             .get(session)
-            .filter(|reg| reg.owner_uid == uid && reg.launcher_pid != 0)
+            .filter(|reg| reg.owner_uid == uid)
             .ok_or_else(|| io::Error::other("captured task has no matching registration"))?;
-        if registration.launcher_start_ticks == 0
-            || captured.parent_start_ticks != registration.launcher_start_ticks
-            || captured.parent_pid != registration.launcher_pid
+        let crate::store::types::LauncherBinding::Bound {
+            pid: launcher_pid,
+            start_ticks: launcher_start_ticks,
+        } = registration.launcher
+        else {
+            return Err(io::Error::other(
+                "captured task has no matching registration",
+            ));
+        };
+        if launcher_start_ticks == 0
+            || captured.parent_start_ticks != launcher_start_ticks
+            || captured.parent_pid != launcher_pid
         {
             return Err(io::Error::other(
                 "captured task is not the registered launcher's child",
@@ -240,13 +267,12 @@ mod tests {
             }
             assert!(store.captured_network_policy_context(&invalid).is_err());
         }
-        store
-            .sandbox_sessions
-            .write()
-            .expect("registrations")
-            .get_mut("captured")
-            .expect("registration")
-            .launcher_start_ticks += 1;
+        let mut sessions = store.sandbox_sessions.write().expect("registrations");
+        let reg = sessions.get_mut("captured").expect("registration");
+        if let crate::store::types::LauncherBinding::Bound { start_ticks, .. } = &mut reg.launcher {
+            *start_ticks += 1;
+        }
+        drop(sessions);
         assert!(
             store.captured_network_policy_context(&captured).is_err(),
             "reused launcher PID must not inherit a registration"

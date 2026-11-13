@@ -372,7 +372,7 @@ mod tests {
 
         assert_eq!(reg.package.as_deref(), Some("omp"));
         assert_eq!(reg.owner_uid, 1000);
-        assert_eq!(reg.launcher_pid, launcher_pid);
+        assert_eq!(reg.launcher.pid(), Some(launcher_pid));
         drop(sessions);
         child.kill().expect("kill child");
         let _ = child.wait();

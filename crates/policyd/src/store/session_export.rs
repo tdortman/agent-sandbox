@@ -141,7 +141,7 @@ impl PolicyStore {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session_id)
-            .map(|registration| registration.launcher_pid);
+            .and_then(|registration| registration.launcher.pid());
         let reader = read_proc_ppid(peer_pid)
             .filter(|parent| launcher_pid.is_some_and(|pid| is_descendant_of(pid, *parent)))
             .and_then(ExportReader::of);
@@ -355,12 +355,22 @@ mod tests {
                 .write()
                 .expect("sessions")
                 .insert(id.to_owned(), SandboxSessionRegistration {
-                    root_pid,
+                    root: if root_pid == 0 {
+                        crate::store::types::RootAdoption::Unadopted
+                    } else {
+                        crate::store::types::RootAdoption::Adopted { pid: root_pid }
+                    },
                     owner_uid: nix::unistd::Uid::current().as_raw(),
                     project_root: PathBuf::new(),
                     package: None,
-                    launcher_pid,
-                    launcher_start_ticks: 1,
+                    launcher: if launcher_pid == 0 {
+                        crate::store::types::LauncherBinding::Unbound
+                    } else {
+                        crate::store::types::LauncherBinding::Bound {
+                            pid: launcher_pid,
+                            start_ticks: 1,
+                        }
+                    },
                     cgroup: None,
                     export_reader: ExportReader::of(std::process::id()),
                 });

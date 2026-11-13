@@ -104,7 +104,9 @@ impl PolicyStore {
             lifecycle: lifecycle::ScopeLifecycle::host(sandbox_sessions),
             restart: std::sync::Mutex::new(None),
             inner: tokio::sync::Mutex::new(types::PolicyDecisionState::default()),
-            network_observation: std::sync::Mutex::new(None),
+            network_observation: std::sync::Mutex::new(
+                network_snapshot::NetworkObservationState::Idle,
+            ),
             network_revocation: std::sync::Mutex::new(None),
             deny_inode_rebuild: tokio::sync::Mutex::new(()),
             ui_spawn_lock: tokio::sync::Mutex::new(()),
@@ -148,7 +150,7 @@ impl PolicyStore {
             previous.revoke()?;
         }
         *current = Some(revocation);
-        *observation = None;
+        *observation = network_snapshot::NetworkObservationState::Idle;
         drop(current);
         drop(observation);
         drop(inner);

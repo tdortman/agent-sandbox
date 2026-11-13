@@ -385,14 +385,12 @@ pub(super) struct Launcher {
 impl Launcher {
     /// The launcher a registration is bound to, if it has one.
     pub(super) const fn of(registration: &SandboxSessionRegistration) -> Option<Self> {
-        if registration.launcher_pid == 0 {
-            return None;
+        match registration.launcher {
+            crate::store::types::LauncherBinding::Unbound => None,
+            crate::store::types::LauncherBinding::Bound { pid, start_ticks } => {
+                Some(Self { pid, start_ticks })
+            }
         }
-
-        Some(Self {
-            pid: registration.launcher_pid,
-            start_ticks: registration.launcher_start_ticks,
-        })
     }
 
     /// Whether the registered process is still running.
@@ -546,11 +544,14 @@ impl ScopeLifecycle {
         registration: &SandboxSessionRegistration,
         pid: u32,
     ) -> bool {
+        let Some(launcher_pid) = registration.launcher.pid() else {
+            return false;
+        };
         process_cgroup(pid).is_ok_and(|scope| {
             is_launcher_scope(
                 &self.cgroup_root,
                 &scope,
-                registration.launcher_pid,
+                launcher_pid,
                 registration.owner_uid,
             )
         })
@@ -600,18 +601,17 @@ fn find_launcher_scope(root: &Path, owner_uid: u32, launcher_pid: u32) -> Option
 /// found by the launcher's name. `Ok(false)` means there is no such scope and
 /// nothing was touched; a scope that is already gone counts as killed.
 fn kill_scope(root: &Path, registration: &SandboxSessionRegistration) -> io::Result<bool> {
-    let recorded = registration.cgroup.as_deref().filter(|scope| {
-        is_launcher_scope(
-            root,
-            scope,
-            registration.launcher_pid,
-            registration.owner_uid,
-        )
-    });
+    let Some(launcher_pid) = registration.launcher.pid() else {
+        return Ok(false);
+    };
+    let recorded = registration
+        .cgroup
+        .as_deref()
+        .filter(|scope| is_launcher_scope(root, scope, launcher_pid, registration.owner_uid));
 
     let Some(scope) = recorded
         .map(Path::to_path_buf)
-        .or_else(|| find_launcher_scope(root, registration.owner_uid, registration.launcher_pid))
+        .or_else(|| find_launcher_scope(root, registration.owner_uid, launcher_pid))
     else {
         return Ok(false);
     };
@@ -1142,10 +1142,12 @@ mod tests {
 
         // A new launcher took the id over before the store reaped the old one.
         store.update_registry(|sessions| {
-            sessions
-                .get_mut("s")
-                .expect("registered session")
-                .launcher_start_ticks += 1;
+            let reg = sessions.get_mut("s").expect("registered session");
+            if let crate::store::types::LauncherBinding::Bound { start_ticks, .. } =
+                &mut reg.launcher
+            {
+                *start_ticks += 1;
+            }
         });
         store.reap_ended_sessions().await;
 
@@ -1184,12 +1186,14 @@ mod tests {
             fs::write(dir.join("cgroup.kill"), "").expect("kill file");
 
             let registration = SandboxSessionRegistration {
-                root_pid: 0,
+                root: crate::store::types::RootAdoption::Unadopted,
                 owner_uid: uid,
                 project_root: PathBuf::new(),
                 package: None,
-                launcher_pid: launcher,
-                launcher_start_ticks: 1,
+                launcher: crate::store::types::LauncherBinding::Bound {
+                    pid: launcher,
+                    start_ticks: 1,
+                },
                 cgroup: Some(dir.clone()),
                 export_reader: None,
             };

@@ -30,7 +30,10 @@ use tracing::{info, warn};
 use super::{
     restart::write_atomic,
     state::{PolicyDecisionState, SessionState, with_session_buckets},
-    types::{HttpScopeKey, PolicyStore, ProxyFlowState, ProxySessionState, UiSessionContext},
+    types::{
+        HandedOverUiSession, HttpScopeKey, PolicyStore, ProxyFlowState, ProxySessionState,
+        UiSessionContext,
+    },
 };
 
 /// Handoff file contents.
@@ -224,16 +227,18 @@ impl PolicyStore {
         for session in handoff.ui_sessions {
             session.decisions.restore(&mut inner.session, &session.id);
             inner
-                .ui_context_by_session
-                .insert(session.id.clone(), UiSessionContext {
-                    cwd: session.cwd,
-                    home: session.home,
-                    project_root: session.project_root,
-                    sandbox_session_id: session.sandbox_session_id,
-                    owner_uid: session.owner_uid,
-                    client_id: 0,
+                .handed_over_ui_sessions
+                .insert(session.id, HandedOverUiSession {
+                    handed_over_at: Instant::now(),
+                    context: UiSessionContext {
+                        cwd: session.cwd,
+                        home: session.home,
+                        project_root: session.project_root,
+                        sandbox_session_id: session.sandbox_session_id,
+                        owner_uid: session.owner_uid,
+                        client_id: 0,
+                    },
                 });
-            inner.resumable_ui_sessions.insert(session.id);
         }
 
         info!(

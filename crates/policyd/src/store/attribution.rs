@@ -258,23 +258,23 @@ fn adopt_by_process(
     pid: u32,
     uid: Option<u32>,
 ) -> Option<Adopted> {
+    // A registration with neither a root nor a launcher has no process tree
+    // to anchor on, so it adopts nothing.
     let anchors: Vec<Anchor<'_>> = sessions
         .iter()
         .filter(|(_, reg)| reg.owner_uid == 0 || Some(reg.owner_uid) == uid)
-        .map(|(id, reg)| Anchor {
-            id,
-            pid: if reg.root_pid > 0 {
-                reg.root_pid
-            } else {
-                reg.launcher_pid
-            },
-            cgroup: reg.cgroup.as_ref(),
+        .filter_map(|(id, reg)| {
+            Some(Anchor {
+                id,
+                pid: reg.root.pid().or_else(|| reg.launcher.pid())?,
+                cgroup: reg.cgroup.as_ref(),
+            })
         })
         .collect();
 
     let candidates: Vec<&Anchor<'_>> = anchors
         .iter()
-        .filter(|anchor| anchor.pid > 0 && procs.is_descendant_of(anchor.pid, pid))
+        .filter(|anchor| procs.is_descendant_of(anchor.pid, pid))
         .collect();
 
     let innermost = candidates.iter().find(|candidate| {
@@ -316,15 +316,14 @@ fn peer_standing(
     peer_pid: u32,
     pid: u32,
 ) -> Option<Evidence> {
-    let peer_in_sandbox = reg.launcher_pid > 0
-        && peer_pid != reg.launcher_pid
-        && procs.is_descendant_of(reg.launcher_pid, peer_pid);
+    let launcher = reg.launcher.pid()?;
+    let root = reg.root.pid()?;
 
-    if !peer_in_sandbox {
+    if peer_pid == launcher || !procs.is_descendant_of(launcher, peer_pid) {
         return None;
     }
 
-    if procs.is_descendant_of(reg.root_pid, pid) {
+    if procs.is_descendant_of(root, pid) {
         return Some(Evidence::SessionTree);
     }
 
@@ -334,7 +333,7 @@ fn peer_standing(
     // neither root-based check can pass. The authenticated peer's host pid is
     // the broker: accept it when it is an ancestor of the adopted root.
     procs
-        .is_descendant_of(peer_pid, reg.root_pid)
+        .is_descendant_of(peer_pid, root)
         .then_some(Evidence::BrokerAncestor)
 }
 
@@ -453,6 +452,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::store::types::{LauncherBinding, RootAdoption};
 
     /// Process facts for one fixture: parent links, environments, cgroups and
     /// launcher path claims by pid.
@@ -512,12 +512,14 @@ mod tests {
 
     fn registration() -> SandboxSessionRegistration {
         SandboxSessionRegistration {
-            root_pid: ROOT,
+            root: RootAdoption::Adopted { pid: ROOT },
             owner_uid: OWNER,
             project_root: PathBuf::from("/work/project"),
             package: Some("codex".into()),
-            launcher_pid: LAUNCHER,
-            launcher_start_ticks: 1,
+            launcher: LauncherBinding::Bound {
+                pid: LAUNCHER,
+                start_ticks: 1,
+            },
             cgroup: None,
             export_reader: None,
         }
@@ -564,15 +566,13 @@ mod tests {
 
         let mut scoped = registration();
         scoped.cgroup = Some("/sys/fs/cgroup/agent.scope".into());
-        scoped.root_pid = 0;
-        scoped.launcher_pid = 0;
         let mut scoped_procs = tree();
         scoped_procs
             .cgroups
             .insert(900, "/sys/fs/cgroup/agent.scope".into());
 
         let mut inner = registration();
-        inner.root_pid = 300;
+        inner.root = RootAdoption::Adopted { pid: 300 };
         inner.package = Some("inner".into());
 
         vec![
@@ -776,7 +776,7 @@ mod tests {
             PeerCase {
                 name: "registration without a launcher grants nothing",
                 registration: SandboxSessionRegistration {
-                    launcher_pid: 0,
+                    launcher: LauncherBinding::Unbound,
                     ..registration()
                 },
                 ..case("", None, peer(400), Some(400), None, false)

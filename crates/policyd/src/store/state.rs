@@ -24,8 +24,9 @@ use tokio::sync::oneshot;
 use super::{
     decisions::DecisionAction,
     types::{
-        DenyInodeCache, HttpPendingKey, HttpScopeKey, Pending, ProxyCancellation, ProxyFlowState,
-        ProxySessionState, UiClient, UiSessionContext, VerdictEntry,
+        DenyInodeCache, HandedOverUiSession, HttpPendingKey, HttpScopeKey, Pending,
+        ProxyCancellation, ProxyFlowState, ProxySessionState, UiClient, UiSessionContext,
+        VerdictEntry,
     },
 };
 
@@ -188,10 +189,12 @@ pub struct PolicyDecisionState {
     pub(crate) pending: PendingBoard,
     pub(crate) proxy_cancellations: HashMap<ProxyCheckId, ProxyCancellation>,
     pub(crate) ui_clients: HashMap<u64, UiClient>,
+    /// Contexts of the sessions of connected UI clients.
     pub(crate) ui_context_by_session: HashMap<String, UiSessionContext>,
     /// UI sessions handed over from the previous daemon that no UI has
-    /// resumed yet; their context and decisions wait under the same id.
-    pub(crate) resumable_ui_sessions: HashSet<String>,
+    /// resumed yet, keyed by session id. Disjoint from the live sessions in
+    /// `ui_context_by_session`; entries are pruned after a TTL.
+    pub(crate) handed_over_ui_sessions: HashMap<String, HandedOverUiSession>,
     pub(crate) network_verdict_cache: HashMap<NetworkRuleKey, VerdictEntry>,
     pub(crate) filesystem_verdict_cache: HashMap<FilesystemRuleKey, VerdictEntry>,
     pub(crate) resource_verdict_cache: HashMap<ResourceRuleKey, VerdictEntry>,

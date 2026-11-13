@@ -428,7 +428,7 @@ impl PolicyStore {
         attribution_token: AttributionToken,
     ) -> Result<CheckReply, PolicydError> {
         let key = ProxyCheckId {
-            session: proxy_session.clone(),
+            session: proxy_session,
             request: request_id,
         };
 
@@ -436,7 +436,7 @@ impl PolicyStore {
 
         {
             let mut inner = self.inner.lock().await;
-            validate_session(&inner, &proxy_session)?;
+            validate_session(&inner, &key.session)?;
             match inner.proxy_cancellations.get(&key) {
                 Some(ProxyCancellation::Canceled) => {
                     inner.proxy_cancellations.remove(&key);
@@ -463,10 +463,7 @@ impl PolicyStore {
             port,
             ctx,
             protocol,
-        } = match self
-            .flow_for_check(&proxy_session, &attribution_token)
-            .await
-        {
+        } = match self.flow_for_check(&key.session, &attribution_token).await {
             Ok(value) => value,
             Err(err) => {
                 self.inner.lock().await.proxy_cancellations.remove(&key);
@@ -482,10 +479,7 @@ impl PolicyStore {
                 String::new(),
                 ctx,
                 Vec::new(),
-                Some(ProxyCheckId {
-                    session: proxy_session.clone(),
-                    request: request_id,
-                }),
+                Some(key.clone()),
                 Some(cancel_rx),
             )
             .await;
@@ -508,7 +502,7 @@ impl PolicyStore {
         request: HttpRequest,
     ) -> Result<HttpCheckReply, PolicydError> {
         let key = ProxyCheckId {
-            session: proxy_session.clone(),
+            session: proxy_session,
             request: request_id,
         };
 
@@ -516,7 +510,7 @@ impl PolicyStore {
 
         {
             let mut inner = self.inner.lock().await;
-            validate_session(&inner, &proxy_session)?;
+            validate_session(&inner, &key.session)?;
             match inner.proxy_cancellations.get(&key) {
                 Some(ProxyCancellation::Canceled) => {
                     inner.proxy_cancellations.remove(&key);
@@ -538,19 +532,17 @@ impl PolicyStore {
             }
         }
 
-        let FlowCheck { ctx, .. } = match self
-            .flow_for_check(&proxy_session, &attribution_token)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                self.inner.lock().await.proxy_cancellations.remove(&key);
-                return Err(err);
-            }
-        };
+        let FlowCheck { ctx, .. } =
+            match self.flow_for_check(&key.session, &attribution_token).await {
+                Ok(value) => value,
+                Err(err) => {
+                    self.inner.lock().await.proxy_cancellations.remove(&key);
+                    return Err(err);
+                }
+            };
 
         let approval = self.request_http_approval(
-            proxy_session.clone(),
+            key.session.clone(),
             request_id,
             attribution_token,
             request,
@@ -562,7 +554,7 @@ impl PolicyStore {
         let result = tokio::select! {
             reply = &mut approval => reply,
             _ = cancel_rx => {
-                let _ = self.cancel_http_check(proxy_session.clone(), request_id).await;
+                let _ = self.cancel_http_check(&key.session, request_id).await;
                 Ok(HttpCheckReply::blocked("agent-sandbox: HTTP check cancelled"))
             },
         };
@@ -581,25 +573,25 @@ impl PolicyStore {
         proxy_session: ProxySessionToken,
         request_id: ProxyRequestId,
     ) -> Result<(), PolicydError> {
+        let key = ProxyCheckId {
+            session: proxy_session,
+            request: request_id,
+        };
         let cancel = {
             let mut inner = self.inner.lock().await;
-            validate_session(&inner, &proxy_session)?;
-            match inner.proxy_cancellations.remove(&ProxyCheckId {
-                session: proxy_session.clone(),
-                request: request_id,
-            }) {
+            validate_session(&inner, &key.session)?;
+            match inner.proxy_cancellations.remove(&key) {
                 Some(ProxyCancellation::Active(sender)) => Some(sender),
                 Some(ProxyCancellation::Canceled) => None,
                 None => {
-                    if inner.proxy_cancellations.len() < MAX_PROXY_CANCEL_TOMBSTONES {
-                        inner.proxy_cancellations.insert(
-                            ProxyCheckId {
-                                session: proxy_session.clone(),
-                                request: request_id,
-                            },
-                            ProxyCancellation::Canceled,
-                        );
+                    // A cancel that cannot be recorded would let the check it
+                    // names run uncancelled, so refuse it instead.
+                    if inner.proxy_cancellations.len() >= MAX_PROXY_CANCEL_TOMBSTONES {
+                        return Err(proxy_error("too many in-flight proxy checks"));
                     }
+                    inner
+                        .proxy_cancellations
+                        .insert(key.clone(), ProxyCancellation::Canceled);
                     None
                 }
             }
@@ -609,7 +601,7 @@ impl PolicyStore {
             let _ = cancel.send(());
         }
 
-        self.cancel_http_check(proxy_session, request_id).await
+        self.cancel_http_check(&key.session, request_id).await
     }
 
     /// Rebind a claimed flow to a new tuple after atomic ownership, tuple,

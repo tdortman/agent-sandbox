@@ -148,7 +148,7 @@ impl PolicyStore {
                     .await
                     .pending
                     .pending
-                    .insert(net.id.clone(), Pending::Network(net));
+                    .insert(pending_id, Pending::Network(net));
                 return err.into();
             }
         };
@@ -196,49 +196,25 @@ impl PolicyStore {
             match action {
                 DecisionAction::Approve => {
                     let source = VerdictSource::from(scope);
-                    self.finish_network(
-                        &pending_id,
-                        true,
-                        source,
-                        Some(NetworkRuleKey {
-                            host: resolved.host.clone(),
-                            port: resolved.port,
-                        }),
-                    )
-                    .await;
+                    self.finish_network(&pending_id, true, source, Some(resolved))
+                        .await;
                 }
 
                 DecisionAction::Deny => {
-                    self.finish_network(
-                        &pending_id,
-                        false,
-                        VerdictSource::User,
-                        Some(NetworkRuleKey {
-                            host: resolved.host.clone(),
-                            port: resolved.port,
-                        }),
-                    )
-                    .await;
+                    self.finish_network(&pending_id, false, VerdictSource::User, Some(resolved))
+                        .await;
                 }
             }
         } else if action == DecisionAction::Approve {
-            self.finish_network(
-                &pending_id,
-                false,
-                VerdictSource::Blocked,
-                Some(NetworkRuleKey {
-                    host: resolved.host.clone(),
-                    port: resolved.port,
-                }),
-            )
-            .await;
+            self.finish_network(&pending_id, false, VerdictSource::Blocked, Some(resolved))
+                .await;
         } else {
             self.inner
                 .lock()
                 .await
                 .pending
                 .pending
-                .insert(net.id.clone(), Pending::Network(net));
+                .insert(pending_id, Pending::Network(net));
         }
 
         result
@@ -262,7 +238,7 @@ impl PolicyStore {
                     .await
                     .pending
                     .pending
-                    .insert(elev.id.clone(), Pending::Elevation(elev));
+                    .insert(pending_id, Pending::Elevation(elev));
                 return err.into();
             }
         };
@@ -300,7 +276,7 @@ impl PolicyStore {
                     .await
                     .pending
                     .pending
-                    .insert(elev.id.clone(), Pending::Elevation(elev));
+                    .insert(pending_id, Pending::Elevation(elev));
             }
 
             return result;
@@ -325,7 +301,7 @@ impl PolicyStore {
                     .await
                     .pending
                     .pending
-                    .insert(elev.id.clone(), Pending::Elevation(elev));
+                    .insert(pending_id, Pending::Elevation(elev));
                 return scope_result;
             }
             scope_result.scope_path()
@@ -383,7 +359,7 @@ impl PolicyStore {
                     .await
                     .pending
                     .pending
-                    .insert(fs.id.clone(), Pending::Filesystem(fs));
+                    .insert(pending_id, Pending::Filesystem(fs));
                 return err.into();
             }
         };
@@ -407,10 +383,7 @@ impl PolicyStore {
             .await;
 
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
-                path.clone(),
-                fs.access,
-                scope,
-                None,
+                path, fs.access, scope, None,
             ));
         }
 
@@ -432,10 +405,7 @@ impl PolicyStore {
             .await;
 
             return RpcReply::ScopeAction(ScopeActionReply::ok_filesystem(
-                path.clone(),
-                fs.access,
-                scope,
-                None,
+                path, fs.access, scope, None,
             ));
         }
 
@@ -456,7 +426,7 @@ impl PolicyStore {
 
             self.finish_filesystem(
                 &pending_id,
-                path.clone(),
+                path,
                 fs.access,
                 action == DecisionAction::Approve,
                 source,
@@ -471,7 +441,7 @@ impl PolicyStore {
                 .await
                 .pending
                 .pending
-                .insert(fs.id.clone(), Pending::Filesystem(fs));
+                .insert(pending_id, Pending::Filesystem(fs));
         }
 
         result
@@ -536,10 +506,9 @@ impl PolicyStore {
             return Ok(path);
         }
 
-        if FilesystemRule::new(path.clone(), FileAccess::Read, "")
-            .path_matches(pending_path.as_path(), project_root)
-        {
-            return Ok(path);
+        let rule = FilesystemRule::new(path, FileAccess::Read, "");
+        if rule.path_matches(pending_path.as_path(), project_root) {
+            return Ok(rule.path);
         }
 
         Err(PolicydError::InvalidDecisionTarget)
@@ -556,7 +525,8 @@ impl PolicyStore {
         let dbus_target = match target {
             None => res.target.clone(),
             Some(ApprovalTarget::Dbus { target }) => {
-                if !DbusRule::new(target.clone(), "").matches(&res.target) {
+                let rule = DbusRule::new(target.clone(), "");
+                if !rule.matches(&res.target) {
                     self.inner
                         .lock()
                         .await
@@ -565,7 +535,7 @@ impl PolicyStore {
                         .insert(res.id.clone(), Pending::Dbus(res));
                     return PolicydError::InvalidDecisionTarget.into();
                 }
-                target.clone()
+                rule.target
             }
             Some(_) => {
                 self.inner
@@ -587,8 +557,7 @@ impl PolicyStore {
         };
 
         if scope == ApprovalScope::Once {
-            self.finish_dbus(&res.id, res.target.clone(), allowed, source)
-                .await;
+            self.finish_dbus(&res.id, res.target, allowed, source).await;
 
             return RpcReply::ScopeAction(ScopeActionReply::ok_dbus(dbus_target, scope, None));
         }
@@ -600,8 +569,7 @@ impl PolicyStore {
             .await;
 
         if result.scope_succeeded() {
-            self.finish_dbus(&res.id, res.target.clone(), allowed, source)
-                .await;
+            self.finish_dbus(&res.id, res.target, allowed, source).await;
         } else {
             self.inner
                 .lock()
@@ -639,7 +607,7 @@ impl PolicyStore {
                     .await
                     .pending
                     .pending
-                    .insert(res.id.clone(), Pending::Resource(res));
+                    .insert(pending_id, Pending::Resource(res));
                 return err.into();
             }
         };
@@ -708,7 +676,7 @@ impl PolicyStore {
             self.finish_resource(
                 &pending_id,
                 res.kind,
-                path.clone(),
+                path,
                 res.access,
                 action == DecisionAction::Approve,
                 source,
@@ -730,7 +698,7 @@ impl PolicyStore {
                 .await
                 .pending
                 .pending
-                .insert(res.id.clone(), Pending::Resource(res));
+                .insert(pending_id, Pending::Resource(res));
         }
 
         result
@@ -803,15 +771,14 @@ impl PolicyStore {
             return Ok(path);
         }
 
-        if ResourceRule::new(
+        let rule = ResourceRule::new(
             pending.kind,
-            path.clone(),
+            path,
             ResourceAccess::Socket(SocketAccess::Connect),
             "",
-        )
-        .path_matches(pending_path.as_path(), project_root)
-        {
-            return Ok(path);
+        );
+        if rule.path_matches(pending_path.as_path(), project_root) {
+            return Ok(rule.path);
         }
 
         Err(PolicydError::InvalidDecisionTarget)
@@ -861,15 +828,16 @@ impl PolicyStore {
             }
         };
 
-        if !SudoRule::new(argv.clone(), "").matches(pending_argv) {
+        let rule = SudoRule::new(argv, "");
+        if !rule.matches(pending_argv) {
             return Err(PolicydError::InvalidDecisionTarget);
         }
 
-        if scope == ApprovalScope::Once && argv != *pending_argv {
+        if scope == ApprovalScope::Once && rule.argv != *pending_argv {
             return Err(PolicydError::InvalidDecisionTarget);
         }
 
-        Ok(argv)
+        Ok(rule.argv)
     }
 }
 
@@ -1887,12 +1855,11 @@ mod tests {
         store.sandbox_sessions.write().unwrap().insert(
             "sandbox-a".into(),
             crate::store::types::SandboxSessionRegistration {
-                root_pid: 42,
+                root: crate::store::types::RootAdoption::Adopted { pid: 42 },
                 owner_uid: 1000,
                 project_root: "/repo".into(),
                 package: None,
-                launcher_pid: 0,
-                launcher_start_ticks: 0,
+                launcher: crate::store::types::LauncherBinding::Unbound,
                 cgroup: None,
                 export_reader: None,
             },
@@ -2068,12 +2035,11 @@ mod tests {
         store.sandbox_sessions.write().unwrap().insert(
             "sandbox-a".into(),
             crate::store::types::SandboxSessionRegistration {
-                root_pid: 42,
+                root: crate::store::types::RootAdoption::Adopted { pid: 42 },
                 owner_uid: 1000,
                 project_root: "/repo".into(),
                 package: None,
-                launcher_pid: 0,
-                launcher_start_ticks: 0,
+                launcher: crate::store::types::LauncherBinding::Unbound,
                 cgroup: None,
                 export_reader: None,
             },
