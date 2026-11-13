@@ -123,20 +123,59 @@ impl VerdictCache for MapVerdictCache {
             warn!("verdict cache lock poisoned; skipping invalidation");
             return;
         };
-        if let Err(error) = map.set_blocked(self.netns, true) {
-            warn!(%error, "verdict cache block failed");
-            return;
-        }
-        match map.invalidate(self.netns) {
-            Ok(_) => {}
+        let blocked = match BlockedNamespace::enter(&mut map, self.netns) {
+            Ok(blocked) => blocked,
             Err(error) => {
-                warn!(%error, "verdict cache invalidation failed");
+                warn!(%error, "verdict cache block failed");
                 return;
             }
+        };
+        match blocked.bump() {
+            Ok(bumped) => bumped.reopen(),
+            Err(error) => warn!(%error, "verdict cache invalidation failed"),
         }
-        if let Err(error) = map.set_blocked(self.netns, false) {
+    }
+}
+
+/// A namespace whose new flows the kernel gate is blocking.
+///
+/// Dropping it unblocks the namespace, so every early return after the block
+/// reopens the gate instead of leaving the kernel wedged.
+struct BlockedNamespace<'a> {
+    map: &'a mut VerdictMap,
+    netns: u64,
+}
+
+impl<'a> BlockedNamespace<'a> {
+    /// Block new flows for `netns`.
+    fn enter(map: &'a mut VerdictMap, netns: u64) -> io::Result<Self> {
+        map.set_blocked(netns, true)?;
+        Ok(Self { map, netns })
+    }
+
+    /// Bump the generation so every published entry goes inert. On failure
+    /// the error is returned and dropping `self` unblocks the namespace.
+    fn bump(self) -> io::Result<BumpedNamespace<'a>> {
+        self.map.invalidate(self.netns)?;
+        Ok(BumpedNamespace(self))
+    }
+}
+
+impl Drop for BlockedNamespace<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.map.set_blocked(self.netns, false) {
             warn!(%error, "verdict cache unblock failed");
         }
+    }
+}
+
+/// A blocked namespace whose generation has been bumped.
+struct BumpedNamespace<'a>(BlockedNamespace<'a>);
+
+impl BumpedNamespace<'_> {
+    /// Unblock new flows now that the new generation is published.
+    fn reopen(self) {
+        drop(self.0);
     }
 }
 
@@ -150,67 +189,68 @@ pub fn dest_key(netns: u64, meta: PacketMeta) -> DestKey {
     DestKey::new(netns, proto, meta.dst_ip, meta.dst_port)
 }
 
-/// Open the verdict cache for this daemon, or explain once why it stays off.
+/// Verdict cache state for this daemon.
 ///
-/// Returns the cache with the namespace cookie and proxy uid it was opened
-/// for. Any failure degrades to no cache: the daemon consults policyd for
-/// every flow, exactly as without the flag.
-pub struct VerdictCacheHandle {
-    /// Pinned-map verdict cache, or `None` when unavailable.
-    pub cache: Option<Arc<dyn VerdictCache>>,
-    /// Namespace cookie the cache was opened for.
-    pub netns: u64,
-    /// Proxy uid the cache was opened for.
-    pub proxy_uid: u32,
+/// Any failure to open the cache degrades to [`Self::Disabled`]: the daemon
+/// consults policyd for every flow, exactly as without the flag.
+#[derive(Clone)]
+pub enum VerdictCacheHandle<V: VerdictCache = MapVerdictCache> {
+    /// No cache: every flow consults policyd.
+    Disabled,
+    /// Pinned-map cache opened for one namespace and proxy uid.
+    Enabled {
+        /// Pinned-map verdict cache.
+        cache: Arc<V>,
+        /// Namespace cookie the cache was opened for.
+        netns: u64,
+        /// Proxy uid the cache was opened for.
+        proxy_uid: u32,
+    },
 }
 
+impl<V: VerdictCache> VerdictCacheHandle<V> {
+    /// The cache itself, when enabled.
+    #[must_use]
+    pub const fn cache(&self) -> Option<&Arc<V>> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { cache, .. } => Some(cache),
+        }
+    }
+}
+
+/// Open the verdict cache for this daemon, or explain once why it stays off.
 pub fn open_verdict_cache(cli: &Cli) -> VerdictCacheHandle {
     let Some(directory) = cli.verdict_map.as_deref() else {
         info!(
             "verdict cache unavailable: no verdict map directory; consulting policyd for every \
              flow"
         );
-        return VerdictCacheHandle {
-            cache: None,
-            netns: 0,
-            proxy_uid: 0,
-        };
+        return VerdictCacheHandle::Disabled;
     };
     let Some(proxy_uid) = cli.proxy_uid else {
         info!("verdict cache unavailable: no proxy uid; consulting policyd for every flow");
-        return VerdictCacheHandle {
-            cache: None,
-            netns: 0,
-            proxy_uid: 0,
-        };
+        return VerdictCacheHandle::Disabled;
     };
     let netns = match current_netns_cookie() {
         Ok(netns) => netns,
         Err(error) => {
             info!(%error, "verdict cache unavailable: cannot read namespace cookie");
-            return VerdictCacheHandle {
-                cache: None,
-                netns: 0,
-                proxy_uid: 0,
-            };
+            return VerdictCacheHandle::Disabled;
         }
     };
     match MapVerdictCache::open(directory, netns, proxy_uid) {
         Ok(cache) => {
             info!(netns, proxy_uid, "verdict cache enabled");
-            VerdictCacheHandle {
-                cache: Some(Arc::new(cache)),
+            VerdictCacheHandle::Enabled {
+                cache: Arc::new(cache),
                 netns,
                 proxy_uid,
             }
         }
         Err(error) => {
             info!(%error, "verdict cache unavailable: cannot open verdict maps");
-            VerdictCacheHandle {
-                cache: None,
-                netns: 0,
-                proxy_uid: 0,
-            }
+            VerdictCacheHandle::Disabled
         }
     }
 }

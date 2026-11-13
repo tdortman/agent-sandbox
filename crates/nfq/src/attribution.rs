@@ -38,13 +38,21 @@ struct AttributionEntry {
     hostname: String,
 }
 
+/// Whether the in-memory map matches what was last persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncState {
+    Clean,
+    /// A change is not yet on disk; the next remember retries the write.
+    Dirty,
+}
+
 /// Session-scoped retention of hostname mappings attributed to sandbox
 /// connections.
 #[derive(Debug)]
 pub struct SessionAttribution {
     path: Option<PathBuf>,
     entries: HashMap<SessionIpKey, String>,
-    dirty: bool,
+    sync: SyncState,
 }
 
 impl SessionAttribution {
@@ -54,7 +62,7 @@ impl SessionAttribution {
         Self {
             path: None,
             entries: HashMap::new(),
-            dirty: false,
+            sync: SyncState::Clean,
         }
     }
 
@@ -91,7 +99,7 @@ impl SessionAttribution {
         Self {
             path: Some(path),
             entries,
-            dirty: false,
+            sync: SyncState::Clean,
         }
     }
 
@@ -106,18 +114,17 @@ impl SessionAttribution {
         if let Some(existing) = self.entries.get_mut(&key) {
             if existing != hostname {
                 hostname.clone_into(existing);
-                self.dirty = true;
+                self.sync = SyncState::Dirty;
             }
         } else {
             self.entries.insert(key, hostname.to_owned());
-            self.dirty = true;
+            self.sync = SyncState::Dirty;
         }
 
-        if !self.dirty {
-            return Ok(());
+        match self.sync {
+            SyncState::Clean => Ok(()),
+            SyncState::Dirty => self.persist(),
         }
-
-        self.persist()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -132,7 +139,7 @@ impl SessionAttribution {
 
     fn persist(&mut self) -> std::io::Result<()> {
         let Some(path) = self.path.as_deref() else {
-            self.dirty = false;
+            self.sync = SyncState::Clean;
             return Ok(());
         };
 
@@ -166,7 +173,7 @@ impl SessionAttribution {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, data)?;
         std::fs::rename(tmp, path)?;
-        self.dirty = false;
+        self.sync = SyncState::Clean;
         Ok(())
     }
 }

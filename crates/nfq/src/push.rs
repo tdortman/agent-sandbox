@@ -47,7 +47,7 @@ pub fn spawn_push_socket_listener(push_socket: &Path, trusted_uid: u32, state: &
     info!(socket = %push_socket.display(), trusted_uid, "push socket listener bound");
     let cache = Arc::clone(&state.dns_cache);
     let revocation = state.network_revocation.clone();
-    let verdicts = state.verdict_cache.clone();
+    let verdicts = state.verdict_cache.cache().cloned();
 
     std::thread::Builder::new()
         .name("dns-push-listener".to_string())
@@ -166,10 +166,10 @@ fn recv_datagram_with_creds(
 }
 
 /// Apply a validated push mapping to the in-memory DNS cache.
-fn apply_push_mapping(
+fn apply_push_mapping<V: VerdictCache>(
     cache: &Arc<std::sync::Mutex<DnsCache>>,
     revocation: Option<&NetworkPolicyRevocation>,
-    verdicts: Option<&dyn VerdictCache>,
+    verdicts: Option<&V>,
     entry: &PushMapping,
 ) -> std::io::Result<()> {
     if entry.host.is_empty() {
@@ -216,7 +216,13 @@ mod tests {
             ttl: 300,
         };
 
-        apply_push_mapping(&state.dns_cache, None, None, &entry).expect("apply mapping");
+        apply_push_mapping(
+            &state.dns_cache,
+            None,
+            None::<&crate::verdict_cache::MapVerdictCache>,
+            &entry,
+        )
+        .expect("apply mapping");
 
         assert_eq!(
             state
@@ -271,7 +277,13 @@ mod tests {
 
             let line = std::str::from_utf8(&buf[..n]).expect("utf8");
             let entry: PushMapping = serde_json::from_str(line.trim()).expect("json");
-            apply_push_mapping(&cache, None, None, &entry).expect("apply mapping");
+            apply_push_mapping(
+                &cache,
+                None,
+                None::<&crate::verdict_cache::MapVerdictCache>,
+                &entry,
+            )
+            .expect("apply mapping");
             true
         });
 

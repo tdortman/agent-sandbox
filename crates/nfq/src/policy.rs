@@ -243,12 +243,12 @@ pub enum TransportCheck {
 /// packets resolve faster. When the verdict cache holds a current entry for
 /// this destination, its verdict is reused without consulting policyd; a
 /// miss behaves exactly as without the cache.
-pub fn transport_check(
-    state: &NfqState,
+pub fn transport_check<V: crate::verdict_cache::VerdictCache>(
+    state: &NfqState<V>,
     meta: packet::PacketMeta,
     src_pid: Option<u32>,
     session_id: Option<&str>,
-    check: &mut dyn FnMut(CheckDestinationArgs<'_>) -> DestinationVerdict,
+    check: &mut impl FnMut(CheckDestinationArgs<'_>) -> DestinationVerdict,
 ) -> TransportCheck {
     let dst_ip = policy_destination(meta.dst_ip).to_string();
 
@@ -347,7 +347,7 @@ mod tests {
             PacketOutcome, handle_packet_payload_with_registration,
             tests::{DNS_IP, build_udp_data_packet, policy_allow, policy_deny, state_for_tests},
         },
-        verdict_cache::{VerdictCache, dest_key},
+        verdict_cache::{VerdictCache, VerdictCacheHandle, dest_key},
     };
 
     /// Network namespace cookie the injected cache is keyed by. The value is
@@ -455,10 +455,12 @@ mod tests {
         tcp_meta(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443)
     }
 
-    fn state_with_cache(cache: Arc<FakeVerdictCache>) -> NfqState {
-        let mut state = state_for_tests();
-        state.verdict_cache = Some(cache);
-        state.verdict_netns = TEST_NETNS;
+    fn state_with_cache(cache: Arc<FakeVerdictCache>) -> NfqState<FakeVerdictCache> {
+        let state = state_for_tests().with_verdict_cache(VerdictCacheHandle::Enabled {
+            cache,
+            netns: TEST_NETNS,
+            proxy_uid: 0,
+        });
         // Resolve the test destination to itself so allow-publishability never
         // depends on the machine's on-disk DNS cache.
         state

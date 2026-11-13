@@ -28,8 +28,9 @@ use crate::{
     args::Cli,
     attribution, owner, packet, policy,
     policy::TransportCheck,
-    verdict_cache,
-    verdict_cache::{VerdictCache, open_verdict_cache},
+    verdict_cache::{
+        MapVerdictCache, VerdictCache, VerdictCacheHandle, dest_key, open_verdict_cache,
+    },
 };
 
 /// Packet mark used by the transparent proxy's local routing table.
@@ -50,21 +51,51 @@ struct ApprovedFlow {
     inserted: Instant,
 }
 
+impl ApprovedFlow {
+    /// Whether the registration is still inside the fast-path window.
+    fn is_live(&self) -> bool {
+        self.inserted.elapsed() < APPROVED_FLOW_TTL
+    }
+}
+
+/// Outcome of offering a registered flow to the bounded fast path.
+enum Remembered {
+    Stored,
+    /// The table is full or unavailable; the flow must not be accepted.
+    Refused,
+}
+
+/// How a policy-boundary packet is handled.
+enum FlowRoute {
+    /// Proxy-owned flow already registered: accept without RPCs.
+    ProxyApproved,
+    /// Proxy-owned flow that must register with policyd first.
+    ProxyRegister,
+    /// Checked synchronously against the transport policy.
+    Direct,
+}
+
 /// Shutdown handle for the approved-bindings persistence thread.
 struct BindingsWriter {
     sender: SyncSender<()>,
     worker: JoinHandle<()>,
 }
 
-pub struct NfqState {
+/// How approved-binding changes reach disk.
+enum BindingsPersistence {
+    /// A background thread coalesces saves; dropped state drains it.
+    Async(BindingsWriter),
+    /// Every change is saved on the caller's thread.
+    Sync,
+}
+
+pub struct NfqState<V: VerdictCache = MapVerdictCache> {
     pub(crate) dns_cache: Arc<std::sync::Mutex<DnsCache>>,
     pub(crate) network_revocation: Option<Arc<NetworkPolicyRevocation>>,
-    pub(crate) verdict_cache: Option<Arc<dyn VerdictCache>>,
-    pub(crate) verdict_netns: u64,
-    pub(crate) verdict_proxy_uid: u32,
+    pub(crate) verdict_cache: VerdictCacheHandle<V>,
     attribution: Arc<Mutex<attribution::SessionAttribution>>,
     pub(crate) approved_bindings: Arc<std::sync::Mutex<ApprovedBindings>>,
-    approved_bindings_writer: Option<BindingsWriter>,
+    approved_bindings_persistence: BindingsPersistence,
     approved_flows: Arc<std::sync::Mutex<HashMap<NetworkFlowKey, ApprovedFlow>>>,
     cache_path: PathBuf,
     dns_server_ip: IpAddr,
@@ -73,9 +104,12 @@ pub struct NfqState {
     kernel_owner: Option<KernelOwnerResolver>,
 }
 
-impl Drop for NfqState {
+impl<V: VerdictCache> Drop for NfqState<V> {
     fn drop(&mut self) {
-        let Some(writer) = self.approved_bindings_writer.take() else {
+        let BindingsPersistence::Async(writer) = std::mem::replace(
+            &mut self.approved_bindings_persistence,
+            BindingsPersistence::Sync,
+        ) else {
             return;
         };
 
@@ -107,13 +141,11 @@ impl NfqState {
         let verdict_cache = open_verdict_cache(cli);
 
         let mut state = Self {
-            verdict_cache: verdict_cache.cache,
-            verdict_netns: verdict_cache.netns,
-            verdict_proxy_uid: verdict_cache.proxy_uid,
+            verdict_cache,
             dns_cache: Arc::new(std::sync::Mutex::new(dns_cache)),
             approved_bindings: Arc::new(std::sync::Mutex::new(approved_bindings)),
             network_revocation: None,
-            approved_bindings_writer: None,
+            approved_bindings_persistence: BindingsPersistence::Sync,
             approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path,
             attribution: Arc::new(Mutex::new(attribution::SessionAttribution::load(
@@ -151,6 +183,33 @@ impl NfqState {
         state.start_approved_bindings_writer();
         state
     }
+}
+
+impl<V: VerdictCache> NfqState<V> {
+    #[cfg(test)]
+    pub(crate) fn with_verdict_cache<U: VerdictCache>(
+        mut self,
+        verdict_cache: VerdictCacheHandle<U>,
+    ) -> NfqState<U> {
+        let persistence = std::mem::replace(
+            &mut self.approved_bindings_persistence,
+            BindingsPersistence::Sync,
+        );
+        NfqState {
+            dns_cache: Arc::clone(&self.dns_cache),
+            network_revocation: self.network_revocation.clone(),
+            verdict_cache,
+            attribution: Arc::clone(&self.attribution),
+            approved_bindings: Arc::clone(&self.approved_bindings),
+            approved_bindings_persistence: persistence,
+            approved_flows: Arc::clone(&self.approved_flows),
+            cache_path: self.cache_path.clone(),
+            dns_server_ip: self.dns_server_ip,
+            nft_binary: self.nft_binary.clone(),
+            ownership: self.ownership.clone(),
+            kernel_owner: self.kernel_owner.take(),
+        }
+    }
 
     pub(crate) fn enable_network_revocation(
         &mut self,
@@ -187,11 +246,10 @@ impl NfqState {
     /// armed and holds a current entry. A miss or stale generation returns
     /// `None` so the caller consults policyd exactly as without the cache.
     pub(crate) fn cached_transport_verdict(&self, meta: packet::PacketMeta) -> Option<u8> {
-        let cache = self.verdict_cache.as_ref()?;
-        if self.verdict_netns == 0 {
+        let VerdictCacheHandle::Enabled { cache, netns, .. } = &self.verdict_cache else {
             return None;
-        }
-        cache.cached_verdict(&verdict_cache::dest_key(self.verdict_netns, meta))
+        };
+        cache.cached_verdict(&dest_key(*netns, meta))
     }
 
     /// Record one policyd answer in the verdict cache when it is replayable.
@@ -205,13 +263,10 @@ impl NfqState {
         hostname: &str,
         dst_ip: &str,
     ) {
-        let Some(cache) = self.verdict_cache.as_ref() else {
+        let VerdictCacheHandle::Enabled { cache, netns, .. } = &self.verdict_cache else {
             return;
         };
-        if self.verdict_netns == 0 {
-            return;
-        }
-        let key = verdict_cache::dest_key(self.verdict_netns, meta);
+        let key = dest_key(*netns, meta);
         match replayable_destination_verdict(allowed, source, hostname, dst_ip) {
             Some(verdict) => cache.publish_verdict(&key, verdict),
             None if allowed && source.is_some() => cache.clear_verdict(&key),
@@ -223,10 +278,15 @@ impl NfqState {
     /// effort: failures are logged inside the cache and never reach the
     /// packet loop.
     pub(crate) fn invalidate_verdict_cache(&self) {
-        if let Some(cache) = &self.verdict_cache {
+        if let VerdictCacheHandle::Enabled {
+            cache,
+            netns,
+            proxy_uid,
+        } = &self.verdict_cache
+        {
             debug!(
-                netns = self.verdict_netns,
-                proxy_uid = self.verdict_proxy_uid,
+                netns = *netns,
+                proxy_uid = *proxy_uid,
                 "retiring cached destination verdicts"
             );
             cache.invalidate();
@@ -253,13 +313,14 @@ impl NfqState {
             return;
         };
 
-        self.approved_bindings_writer = Some(BindingsWriter { sender, worker });
+        self.approved_bindings_persistence =
+            BindingsPersistence::Async(BindingsWriter { sender, worker });
     }
 
     pub(crate) fn notify_approved_bindings(&self) {
-        let save_synchronously = match self.approved_bindings_writer.as_ref() {
-            None => true,
-            Some(writer) => match writer.sender.try_send(()) {
+        let save_synchronously = match &self.approved_bindings_persistence {
+            BindingsPersistence::Sync => true,
+            BindingsPersistence::Async(writer) => match writer.sender.try_send(()) {
                 Ok(()) | Err(TrySendError::Full(())) => false,
                 Err(TrySendError::Disconnected(())) => true,
             },
@@ -376,11 +437,10 @@ fn proxy_mark_for(
     let meta = meta?;
 
     let registered = flow_key_for_mark(meta).is_some_and(|flow| {
-        state.approved_flows.lock().is_ok_and(|flows| {
-            flows
-                .get(&flow)
-                .is_some_and(|approved| approved.inserted.elapsed() < APPROVED_FLOW_TTL)
-        })
+        state
+            .approved_flows
+            .lock()
+            .is_ok_and(|flows| flows.get(&flow).is_some_and(ApprovedFlow::is_live))
     });
 
     registered.then_some(PROXY_MARK)
@@ -404,7 +464,7 @@ fn flow_key_for_mark(meta: packet::PacketMeta) -> Option<NetworkFlowKey> {
 /// policy boundary, but only the first one needs the owner snapshot and the
 /// policyd registration round trip.
 fn is_approved_flow(
-    state: &NfqState,
+    state: &NfqState<impl VerdictCache>,
     meta: packet::PacketMeta,
     owner: Option<SocketIdentity>,
 ) -> bool {
@@ -412,50 +472,83 @@ fn is_approved_flow(
         return false;
     };
 
-    let protocol = meta.protocol;
-
-    let Ok(flow) = NetworkFlowKey::try_new(
-        protocol,
-        meta.src_ip,
-        meta.src_port,
-        meta.dst_ip,
-        meta.dst_port,
-    ) else {
+    let Some(flow) = flow_key_for_mark(meta) else {
         return false;
     };
 
     state.approved_flows.lock().is_ok_and(|flows| {
-        flows.get(&flow).is_some_and(|approved| {
-            approved.owner == owner && approved.inserted.elapsed() < APPROVED_FLOW_TTL
-        })
+        flows
+            .get(&flow)
+            .is_some_and(|approved| approved.owner == owner && approved.is_live())
     })
 }
 
 /// Remember a registered flow on the verdict fast path, pruning expired
 /// entries so the cache stays bounded.
-fn remember_approved_flow(state: &NfqState, key: &NetworkFlowKey, owner: SocketIdentity) -> bool {
+fn remember_approved_flow(
+    state: &NfqState<impl VerdictCache>,
+    key: NetworkFlowKey,
+    owner: SocketIdentity,
+) -> Remembered {
     let Ok(mut flows) = state.approved_flows.lock() else {
-        return false;
+        return Remembered::Refused;
     };
 
-    flows.retain(|_, approved| approved.inserted.elapsed() < APPROVED_FLOW_TTL);
+    flows.retain(|_, approved| approved.is_live());
 
     if flows.len() >= MAX_APPROVED_FLOWS {
-        return false;
+        return Remembered::Refused;
     }
 
-    flows.insert(key.clone(), ApprovedFlow {
+    flows.insert(key, ApprovedFlow {
         owner,
         inserted: Instant::now(),
     });
-    true
+    Remembered::Stored
+}
+
+/// Route one policy-boundary packet.
+///
+/// The intercept port steers UDP to the proxy listeners, but the payload
+/// decides: only a QUIC handshake opener registers for the HTTP/3 backend.
+/// Anything else (DTLS, `WireGuard`, game traffic on the same port) is checked
+/// directly. Already approved flows skip the sniff: post-handshake 1-RTT
+/// datagrams use short headers that never look like openers, and QUIC's
+/// opening burst arrives before the first verdict can confirm the conntrack
+/// entry.
+fn flow_route(
+    state: &NfqState<impl VerdictCache>,
+    meta: packet::PacketMeta,
+    payload: &[u8],
+    owner: Option<SocketIdentity>,
+) -> FlowRoute {
+    let proxy_owned = matches!(
+        state.ownership.flow_owner(
+            meta.protocol,
+            policy::policy_destination(meta.dst_ip),
+            meta.dst_port
+        ),
+        FlowOwner::ProxyBackend
+    );
+    if !proxy_owned {
+        return FlowRoute::Direct;
+    }
+    if is_approved_flow(state, meta, owner) {
+        return FlowRoute::ProxyApproved;
+    }
+    if meta.protocol == packet::TransportProtocol::Udp
+        && !packet::udp_payload(payload, &meta).is_some_and(is_quic_initial)
+    {
+        return FlowRoute::Direct;
+    }
+    FlowRoute::ProxyRegister
 }
 
 fn register_proxy_flow(
-    state: &NfqState,
+    state: &NfqState<impl VerdictCache>,
     meta: packet::PacketMeta,
     owner: Option<OwnerSnapshot>,
-    register: &mut dyn FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool>,
+    register: &mut (impl FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool> + ?Sized),
 ) -> Verdict {
     let Some(owner) = owner else {
         warn!(
@@ -505,22 +598,23 @@ fn register_proxy_flow(
     );
 
     match register(registration, Some(owner.fd_number())) {
-        Ok(true) if remember_approved_flow(state, &flow, owner.identity()) => {
-            info!(
-                protocol = meta.protocol.as_str(),
-                src = %meta.src_ip,
-                src_port = meta.src_port,
-                dst = %meta.dst_ip,
-                dst_port = meta.dst_port,
-                "registered proxy flow"
-            );
-            Verdict::Accept
-        }
-
-        Ok(true) => {
-            warn!("dropping proxy flow because the approval cache is full");
-            Verdict::Drop
-        }
+        Ok(true) => match remember_approved_flow(state, flow, owner.identity()) {
+            Remembered::Stored => {
+                info!(
+                    protocol = meta.protocol.as_str(),
+                    src = %meta.src_ip,
+                    src_port = meta.src_port,
+                    dst = %meta.dst_ip,
+                    dst_port = meta.dst_port,
+                    "registered proxy flow"
+                );
+                Verdict::Accept
+            }
+            Remembered::Refused => {
+                warn!("dropping proxy flow because the approval cache is full");
+                Verdict::Drop
+            }
+        },
 
         Ok(false) => {
             warn!("policyd rejected proxy flow registration");
@@ -551,10 +645,10 @@ pub struct PacketOutcome {
 /// Seam for unit testing: inject a mock `check` to verify policy is consulted.
 /// Returns the verdict and the parsed packet metadata, so callers can apply
 /// side effects (such as the proxy nfmark) without re-parsing the payload.
-pub fn handle_packet_payload_with_registration(
-    state: &NfqState,
+pub fn handle_packet_payload_with_registration<V: VerdictCache>(
+    state: &NfqState<V>,
     payload: &[u8],
-    check: &mut dyn FnMut(policy::CheckDestinationArgs<'_>) -> policy::DestinationVerdict,
+    check: &mut impl FnMut(policy::CheckDestinationArgs<'_>) -> policy::DestinationVerdict,
     register: Option<&mut dyn FnMut(FlowRegistration, Option<u32>) -> std::io::Result<bool>>,
 ) -> PacketOutcome {
     // Try IPv4 first, then IPv6.
@@ -668,56 +762,42 @@ pub fn handle_packet_payload_with_registration(
     };
     let src_pid = source_owner.map(OwnerSnapshot::pid_value);
 
-    let mut proxy_flow = matches!(
-        state.ownership.flow_owner(
-            meta.protocol,
-            policy::policy_destination(meta.dst_ip),
-            meta.dst_port
-        ),
-        FlowOwner::ProxyBackend
-    );
-
-    // The intercept port steers UDP to the proxy listeners, but the payload
-    // decides: only a QUIC handshake opener registers for the HTTP/3
-    // backend. Anything else (DTLS, WireGuard, game traffic on the same
-    // port) falls through to the direct transport check below. Already
-    // approved flows skip the sniff: post-handshake 1-RTT datagrams use
-    // short headers that never look like openers.
-    if proxy_flow
-        && meta.protocol == packet::TransportProtocol::Udp
-        && !is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity))
-        && !packet::udp_payload(payload, &meta).is_some_and(is_quic_initial)
-    {
-        proxy_flow = false;
-    }
-
-    // QUIC sends its opening burst of datagrams before the first packet's
-    // verdict can confirm the conntrack entry, so already-registered flows
-    // skip the verdict RPCs entirely.
-    if proxy_flow && is_approved_flow(state, meta, source_owner.map(OwnerSnapshot::identity)) {
-        return PacketOutcome {
-            verdict: Verdict::Accept,
-            meta: Some(meta),
-        };
-    }
-
-    if proxy_flow {
-        let Some(register) = register else {
-            warn!("proxy mode has no registration RPC handler");
+    // Loopback traffic never traverses the transparent proxy route. Proxy-mode
+    // flows are registered and accepted here so the proxy can decode them and
+    // enforce HTTP policy per request. All other destinations stay on the
+    // ordinary kernel route and are checked synchronously below.
+    match flow_route(
+        state,
+        meta,
+        payload,
+        source_owner.map(OwnerSnapshot::identity),
+    ) {
+        FlowRoute::ProxyApproved => {
             return PacketOutcome {
-                verdict: Verdict::Drop,
+                verdict: Verdict::Accept,
                 meta: Some(meta),
             };
-        };
+        }
+        FlowRoute::ProxyRegister => {
+            let Some(register) = register else {
+                warn!("proxy mode has no registration RPC handler");
+                return PacketOutcome {
+                    verdict: Verdict::Drop,
+                    meta: Some(meta),
+                };
+            };
 
-        // Proxy-owned flows are classified by decoded HTTP requests. The
-        // initial HTTP/3 packet must not use network.direct, or HTTP/3 would
-        // need a second transport policy rule before reaching HTTP policy.
-        let verdict = register_proxy_flow(state, meta, source_owner, register);
-        return PacketOutcome {
-            verdict,
-            meta: Some(meta),
-        };
+            // Proxy-owned flows are classified by decoded HTTP requests. The
+            // initial HTTP/3 packet must not use network.direct, or HTTP/3
+            // would need a second transport policy rule before reaching HTTP
+            // policy.
+            let verdict = register_proxy_flow(state, meta, source_owner, register);
+            return PacketOutcome {
+                verdict,
+                meta: Some(meta),
+            };
+        }
+        FlowRoute::Direct => {}
     }
 
     let session_id = src_pid.and_then(sandbox_session_id_from_pid);
@@ -837,10 +917,8 @@ pub mod tests {
                 &approved_bindings_path,
             ))),
             network_revocation: None,
-            verdict_cache: None,
-            verdict_netns: 0,
-            verdict_proxy_uid: 0,
-            approved_bindings_writer: None,
+            verdict_cache: VerdictCacheHandle::Disabled,
+            approved_bindings_persistence: BindingsPersistence::Sync,
             approved_flows: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cache_path: PathBuf::from(DEFAULT_CACHE_PATH),
             dns_server_ip: DNS_IP,
@@ -866,7 +944,10 @@ pub mod tests {
         let mut state = state_for_tests();
         state.approved_bindings = Arc::new(std::sync::Mutex::new(ApprovedBindings::load(&path)));
         state.start_approved_bindings_writer();
-        assert!(state.approved_bindings_writer.is_some());
+        assert!(matches!(
+            state.approved_bindings_persistence,
+            BindingsPersistence::Async(_)
+        ));
 
         for index in 0..64 {
             let ip = format!("192.0.2.{}", index + 1);

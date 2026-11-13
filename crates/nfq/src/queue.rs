@@ -52,9 +52,22 @@ pub async fn run_queue(
         .min(4);
 
     let mut clients: Vec<_> = (0..concurrency)
-        .map(|_| Some(PersistentRpcClient::new(policy_socket.clone())))
+        .map(|_| PersistentRpcClient::new(policy_socket.clone()))
         .collect();
 
+    #[derive(PartialEq, Eq)]
+    struct FlowBatchKey {
+        protocol: agent_sandbox_core::FlowProtocol,
+        src_ip: std::net::IpAddr,
+        src_port: u16,
+        dst_ip: std::net::IpAddr,
+        dst_port: u16,
+    }
+
+    struct WorkerResult {
+        message: nfq_updated::Message,
+        client: PersistentRpcClient,
+    }
     let mut deferred = None;
 
     loop {
@@ -75,7 +88,7 @@ pub async fn run_queue(
         let mut active = JoinSet::new();
         let mut flows = Vec::with_capacity(concurrency);
 
-        for (index, client) in clients.iter_mut().enumerate() {
+        while !clients.is_empty() {
             let message = if let Some(message) = first.take() {
                 message
             } else {
@@ -92,14 +105,12 @@ pub async fn run_queue(
             let meta = packet::parse_ipv4(message.get_payload())
                 .or_else(|| packet::parse_ipv6(message.get_payload()));
 
-            let key = meta.map(|meta| {
-                (
-                    meta.protocol,
-                    meta.src_ip,
-                    meta.src_port,
-                    meta.dst_ip,
-                    meta.dst_port,
-                )
+            let key = meta.map(|meta| FlowBatchKey {
+                protocol: meta.protocol,
+                src_ip: meta.src_ip,
+                src_port: meta.src_port,
+                dst_ip: meta.dst_ip,
+                dst_port: meta.dst_port,
             });
 
             let barrier = meta.is_none_or(|meta| meta.src_port == 53);
@@ -111,9 +122,9 @@ pub async fn run_queue(
                 break;
             }
 
+            let mut client = clients.pop().expect("checked non-empty");
             flows.push(key);
             let state = Arc::clone(&state);
-            let mut client = client.take().expect("policy worker available");
             let runtime = tokio::runtime::Handle::current();
 
             active.spawn_blocking(move || {
@@ -124,7 +135,7 @@ pub async fn run_queue(
 
                 apply_proxy_mark(&state, &mut message, verdict, meta);
                 message.set_verdict(verdict);
-                (index, message, client)
+                WorkerResult { message, client }
             });
 
             if barrier {
@@ -135,8 +146,8 @@ pub async fn run_queue(
         // ponytail: bounded batches; streaming dispatch if batch drain limits
         // throughput.
         while let Some(result) = active.join_next().await {
-            let (index, message, client) = result.map_err(std::io::Error::other)?;
-            clients[index] = Some(client);
+            let WorkerResult { message, client } = result.map_err(std::io::Error::other)?;
+            clients.push(client);
 
             if let Err(error) = queue.get_mut().verdict(message) {
                 tracing::warn!(%error, "nfqueue verdict error");
