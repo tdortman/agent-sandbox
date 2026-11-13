@@ -1,9 +1,6 @@
 use std::{
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -83,9 +80,29 @@ async fn send_connection(connection: UpstreamConnection) -> Result<Response, Box
     connection.conn.serve(request).await
 }
 
+enum ReplaySlot {
+    Available(Body),
+    Taken,
+    Exhausted,
+}
+
 struct ReplayBodyState {
-    body: std::sync::Mutex<Option<Body>>,
-    started: AtomicBool,
+    slot: std::sync::Mutex<ReplaySlot>,
+}
+
+impl ReplayBodyState {
+    const fn new(body: Body) -> Self {
+        Self {
+            slot: std::sync::Mutex::new(ReplaySlot::Available(body)),
+        }
+    }
+
+    fn can_replay(&self) -> bool {
+        matches!(
+            *self.slot.lock().expect("replay body lock"),
+            ReplaySlot::Available(_)
+        )
+    }
 }
 
 struct ReplayBody {
@@ -101,18 +118,13 @@ impl ReplayBody {
 
 impl Drop for ReplayBody {
     fn drop(&mut self) {
-        if self.state.started.load(Ordering::Acquire) {
-            return;
-        }
-
         let Some(body) = self.inner.take() else {
             return;
         };
 
-        let mut shared = self.state.body.lock().expect("replay body lock");
-
-        if shared.is_none() {
-            *shared = Some(body);
+        let mut slot = self.state.slot.lock().expect("replay body lock");
+        if matches!(*slot, ReplaySlot::Taken) {
+            *slot = ReplaySlot::Available(body);
         }
     }
 }
@@ -126,8 +138,21 @@ impl StreamingBody for ReplayBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if self.inner.is_none() {
-            let body = self.state.body.lock().expect("replay body lock").take();
-            self.inner = body;
+            let taken = {
+                let mut slot = self.state.slot.lock().expect("replay body lock");
+                if matches!(*slot, ReplaySlot::Available(_)) {
+                    let ReplaySlot::Available(body) =
+                        std::mem::replace(&mut *slot, ReplaySlot::Taken)
+                    else {
+                        unreachable!();
+                    };
+                    drop(slot);
+                    Some(body)
+                } else {
+                    None
+                }
+            };
+            self.inner = taken;
         }
 
         let Some(inner) = self.inner.as_mut() else {
@@ -137,7 +162,7 @@ impl StreamingBody for ReplayBody {
         let result = Pin::new(inner).poll_frame(cx);
 
         if matches!(&result, Poll::Ready(Some(Ok(_)))) {
-            self.state.started.store(true, Ordering::Release);
+            *self.state.slot.lock().expect("replay body lock") = ReplaySlot::Exhausted;
         }
 
         result
@@ -145,13 +170,9 @@ impl StreamingBody for ReplayBody {
 
     fn is_end_stream(&self) -> bool {
         self.inner.as_ref().map_or_else(
-            || {
-                self.state
-                    .body
-                    .lock()
-                    .expect("replay body lock")
-                    .as_ref()
-                    .is_none_or(StreamingBody::is_end_stream)
+            || match &*self.state.slot.lock().expect("replay body lock") {
+                ReplaySlot::Available(body) => body.is_end_stream(),
+                ReplaySlot::Taken | ReplaySlot::Exhausted => true,
             },
             StreamingBody::is_end_stream,
         )
@@ -159,13 +180,9 @@ impl StreamingBody for ReplayBody {
 
     fn size_hint(&self) -> rama_http::body::SizeHint {
         self.inner.as_ref().map_or_else(
-            || {
-                self.state
-                    .body
-                    .lock()
-                    .expect("replay body lock")
-                    .as_ref()
-                    .map_or_else(rama_http::body::SizeHint::default, StreamingBody::size_hint)
+            || match &*self.state.slot.lock().expect("replay body lock") {
+                ReplaySlot::Available(body) => body.size_hint(),
+                ReplaySlot::Taken | ReplaySlot::Exhausted => rama_http::body::SizeHint::default(),
             },
             StreamingBody::size_hint,
         )
@@ -206,8 +223,7 @@ impl UpstreamClients {
         match send_connection(connection).await {
             Err(error)
                 if version == Version::HTTP_2
-                    && !body.started.load(Ordering::Acquire)
-                    && body.body.lock().expect("replay body lock").is_some()
+                    && body.can_replay()
                     && is_unprocessed_h2(error.as_ref()) =>
             {
                 // One retry, preserving the destination, policy context and
@@ -612,10 +628,7 @@ pub async fn send_upstream_request(
     request = request.map(|body| Body::new(SemanticRequestBody::new(body, semantic_body)));
     let source = std::mem::replace(request.body_mut(), Body::empty());
 
-    let replay_state = Arc::new(ReplayBodyState {
-        body: std::sync::Mutex::new(Some(source)),
-        started: AtomicBool::new(false),
-    });
+    let replay_state = Arc::new(ReplayBodyState::new(source));
 
     let mut retry_request =
         (!h2c && selected_version.is_none_or(|version| version == Version::HTTP_2)).then(|| {
@@ -632,12 +645,11 @@ pub async fn send_upstream_request(
         let connection = match state.upstream_clients.connect(request).await {
             Ok(connection) => connection,
             Err(error)
-                if retry_request.is_some()
-                    && !replay_state.started.load(Ordering::Acquire)
-                    && is_protocol_negotiation_failure(&error) =>
+                if replay_state.can_replay()
+                    && is_protocol_negotiation_failure(&error)
+                    && let Some(retry) = retry_request.take() =>
             {
-                let retry_request = retry_request.take().expect("retry request was checked");
-                state.upstream_clients.connect(retry_request).await?
+                state.upstream_clients.connect(retry).await?
             }
             Err(error) => return Err(error),
         };
@@ -652,13 +664,12 @@ pub async fn send_upstream_request(
             Ok(response) => response,
 
             Err(error)
-                if retry_request.is_some()
-                    && !replay_state.started.load(Ordering::Acquire)
+                if replay_state.can_replay()
                     && (is_h2_protocol_negotiation_failure(error.as_ref(), h2_without_alpn)
-                        || (h2_without_alpn && is_no_alpn_h2_cancellation(error.as_ref()))) =>
+                        || (h2_without_alpn && is_no_alpn_h2_cancellation(error.as_ref())))
+                    && let Some(retry) = retry_request.take() =>
             {
-                let retry_request = retry_request.expect("retry request was checked");
-                let connection = state.upstream_clients.connect(retry_request).await?;
+                let connection = state.upstream_clients.connect(retry).await?;
                 send_connection(connection).await?
             }
 
@@ -676,7 +687,7 @@ pub async fn send_upstream_request(
 mod tests {
     use std::{
         pin::Pin,
-        sync::{Arc, Mutex, atomic::AtomicBool},
+        sync::{Arc, Mutex},
         task::{Context, Poll, Waker},
     };
 
@@ -764,14 +775,11 @@ mod tests {
                 }
             });
             let clients = super::UpstreamClients::new(Arc::default()).unwrap();
-            let state = Arc::new(ReplayBodyState {
-                body: Mutex::new(Some(if upload {
-                    Body::from("payload")
-                } else {
-                    Body::empty()
-                })),
-                started: AtomicBool::new(false),
-            });
+            let state = Arc::new(ReplayBodyState::new(if upload {
+                Body::from("payload")
+            } else {
+                Body::empty()
+            }));
             let request = Request::builder()
                 .method("POST")
                 .uri(format!("http://{address}/test"))
@@ -1024,9 +1032,8 @@ mod tests {
 
     #[test]
     fn unstarted_replay_body_is_available_for_retry() {
-        let state = Arc::new(ReplayBodyState {
-            body: Mutex::new(None),
-            started: AtomicBool::new(false),
+        let state = Arc::new(super::ReplayBodyState {
+            slot: Mutex::new(super::ReplaySlot::Taken),
         });
 
         let mut body = ReplayBody {
@@ -1042,7 +1049,7 @@ mod tests {
         ));
 
         drop(body);
-        assert!(state.body.lock().expect("replay body lock").is_some());
+        assert!(state.can_replay());
     }
 
     #[test]

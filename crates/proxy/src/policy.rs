@@ -21,7 +21,7 @@ use agent_sandbox_core::{
     ProxySessionToken, RpcClientError, RpcConnection, RpcReply, RpcRequest,
 };
 use rama_core::error::{BoxError, BoxErrorExt};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, watch};
 
 /// One claimed intercepted flow and the stable connection identity that owns
 /// the claim. The proxy presents both when it rebinds or releases the
@@ -54,13 +54,21 @@ pub struct PolicySession {
     /// lease connection ends, so RPC failures must never close it. When
     /// policyd restarts the task resumes the session on the new daemon.
     lease: tokio::task::JoinHandle<()>,
-    lost: Arc<Notify>,
+    lost: watch::Receiver<LeaseState>,
     idle: Mutex<Vec<PersistentRpcClient>>,
 
     socket: PathBuf,
     token: ProxySessionToken,
     timeout: Duration,
     ready_path: Option<PathBuf>,
+}
+
+/// Whether the proxy session is still held. A watch (not a one-shot notify)
+/// lets every waiter observe `Lost`, including ones that start waiting late.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseState {
+    Held,
+    Lost,
 }
 
 /// A connection that holds a proxy session, and the session's token.
@@ -126,7 +134,7 @@ async fn keep_lease(
     socket: PathBuf,
     token: ProxySessionToken,
     timeout: Duration,
-    lost: Arc<Notify>,
+    lost: watch::Sender<LeaseState>,
 ) {
     loop {
         // policyd never writes to the lease, so reads end only when the
@@ -142,12 +150,12 @@ async fn keep_lease(
             Ok(lease) if lease.token == token => connection = lease.connection,
             Ok(_) => {
                 tracing::error!("policyd resumed a different proxy session");
-                lost.notify_one();
+                lost.send_replace(LeaseState::Lost);
                 return;
             }
             Err(error) => {
                 tracing::error!(%error, "policy session cannot be resumed");
-                lost.notify_one();
+                lost.send_replace(LeaseState::Lost);
                 return;
             }
         }
@@ -161,7 +169,14 @@ async fn keep_lease(
 pub struct PendingPolicyCheck {
     policy: Arc<PolicySession>,
     request_id: ProxyRequestId,
-    armed: bool,
+    state: PendingState,
+}
+
+/// Whether dropping a [`PendingPolicyCheck`] must cancel the approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingState {
+    Armed,
+    Disarmed,
 }
 
 impl PendingPolicyCheck {
@@ -171,19 +186,19 @@ impl PendingPolicyCheck {
         Self {
             policy,
             request_id,
-            armed: true,
+            state: PendingState::Armed,
         }
     }
 
     /// Disarm the pending check so dropping it does not send a cancellation.
     pub const fn disarm(&mut self) {
-        self.armed = false;
+        self.state = PendingState::Disarmed;
     }
 }
 
 impl Drop for PendingPolicyCheck {
     fn drop(&mut self) {
-        if self.armed {
+        if self.state == PendingState::Armed {
             let policy = self.policy.clone();
             let request_id = self.request_id;
 
@@ -207,18 +222,19 @@ impl PolicySession {
         let socket = path.as_ref().to_owned();
         let Lease { connection, token } =
             take_lease(&socket, timeout, RpcRequest::OpenProxySession).await?;
-        let lost = Arc::new(Notify::new());
+        let lost = watch::Sender::new(LeaseState::Held);
+        let lost_rx = lost.subscribe();
         let lease = tokio::spawn(keep_lease(
             connection,
             socket.clone(),
             token.clone(),
             timeout,
-            lost.clone(),
+            lost,
         ));
 
         Ok(Self {
             lease,
-            lost,
+            lost: lost_rx,
             idle: Mutex::new(Vec::new()),
             socket,
             token,
@@ -230,7 +246,14 @@ impl PolicySession {
     /// Wait until the session is lost: policyd restarted and could not
     /// resume it, so every claim this proxy holds is gone.
     pub async fn lost(&self) {
-        self.lost.notified().await;
+        // An error means the sender dropped: the lease task ended, which also
+        // loses the session.
+        drop(
+            self.lost
+                .clone()
+                .wait_for(|state| *state == LeaseState::Lost)
+                .await,
+        );
     }
 
     async fn rpc<T>(

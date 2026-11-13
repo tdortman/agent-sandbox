@@ -87,19 +87,41 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<DownstreamEch> {
     let config_path = state_dir.join(CONFIG_FILE);
     let private_key_path = state_dir.join(PRIVATE_KEY_FILE);
 
-    let private_key = match fs::read(&private_key_path) {
-        Ok(private_key) => Some(private_key),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
+    for _ in 0..2 {
+        let private_key = match fs::read(&private_key_path) {
+            Ok(private_key) => Some(private_key),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
 
-    if let Some(private_key) = private_key {
-        let private_key: [u8; 32] = private_key.try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid ECH private key length")
-        })?;
+        if let Some(private_key) = private_key {
+            let private_key: [u8; 32] = private_key.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid ECH private key length")
+            })?;
 
-        let key = X25519PrivateKey::from(private_key);
+            let key = X25519PrivateKey::from(private_key);
+            let public_key = X25519PublicKey::from(&key).to_bytes();
+            let config_list = encode_config_list(&public_key);
+            atomic_write(&config_path, &config_list)?;
+
+            return Ok(DownstreamEch {
+                config_list: Arc::new(config_list),
+                private_key,
+            });
+        }
+
+        let key = generate_x25519_private_key()?;
+        let private_key = key.to_bytes();
         let public_key = X25519PublicKey::from(&key).to_bytes();
+
+        if let Err(error) = create_if_missing(&private_key_path, &private_key, 0o600) {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+
+            return Err(error);
+        }
+
         let config_list = encode_config_list(&public_key);
         atomic_write(&config_path, &config_list)?;
 
@@ -109,25 +131,10 @@ pub fn load_or_generate(state_dir: &Path) -> io::Result<DownstreamEch> {
         });
     }
 
-    let key = generate_x25519_private_key()?;
-    let private_key = key.to_bytes();
-    let public_key = X25519PublicKey::from(&key).to_bytes();
-
-    if let Err(error) = create_if_missing(&private_key_path, &private_key, 0o600) {
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            return load_or_generate(state_dir);
-        }
-
-        return Err(error);
-    }
-
-    let config_list = encode_config_list(&public_key);
-    atomic_write(&config_path, &config_list)?;
-
-    Ok(DownstreamEch {
-        config_list: Arc::new(config_list),
-        private_key,
-    })
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "ECH private key race persisted across retry",
+    ))
 }
 
 /// Generate a fresh X25519 private key from the operating system RNG.

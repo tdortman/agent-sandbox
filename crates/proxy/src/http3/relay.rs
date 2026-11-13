@@ -68,16 +68,16 @@ struct RelayRequestOpen {
     protocol: Option<SessionProtocol>,
 }
 
-struct ResponseRelayContext {
+struct ResponseRelayContext<'a> {
     preflight_informational: Vec<http::Response<()>>,
     preflight_response: Option<http::Response<()>>,
-    alt_svc: Arc<AltSvcStore>,
-    origin: String,
+    alt_svc: &'a crate::alt_svc::AltSvcStore,
+    origin: &'a str,
     protocol: Option<SessionProtocol>,
     capsule_protocol: bool,
     binding: Option<SessionBinding>,
     normalized: Option<HttpRequest>,
-    sessions: Arc<SessionRegistry>,
+    sessions: &'a SessionRegistry,
 }
 
 struct RequestRelayResults {
@@ -355,7 +355,7 @@ pub(super) async fn authorize_request(
 ) -> Result<Option<agent_sandbox_core::HttpRequest>, BoxError> {
     let reused = if let Some(protocol) = requested_protocol {
         sessions
-            .approved(semantic, protocol, claim.attribution_token.clone())
+            .approved(semantic, protocol, &claim.attribution_token)
             .await
     } else {
         None
@@ -514,8 +514,7 @@ async fn relay_request(
         state, sessions, ..
     } = context;
 
-    let alt_svc = state.alt_svc.clone();
-    let origin = semantic.authority().to_owned();
+    let origin = semantic.authority();
     let upstream_stream_id = request_stream.id();
 
     let binding = key.map(|key| SessionBinding {
@@ -525,7 +524,6 @@ async fn relay_request(
     });
 
     let binding_id = binding.as_ref().map(|binding| binding.downstream_stream_id);
-    let cleanup_sessions = sessions.clone();
     let (mut send_stream, mut recv_response) = request_stream.split();
     let (mut send_half, mut recv_half) = stream.split();
     let body_protocol = protocol;
@@ -540,7 +538,10 @@ async fn relay_request(
                     .eq_ignore_ascii_case(b"100-continue")
         });
 
-    let (continue_tx, continue_rx) = oneshot::channel();
+    let ContinueChannel {
+        state: continue_state,
+        gate: continue_gate,
+    } = ContinueState::open(expects_continue);
 
     let mut body_task = tokio::spawn(async move {
         relay_request_body(
@@ -548,7 +549,7 @@ async fn relay_request(
             &mut send_stream,
             body_protocol,
             capsule_protocol,
-            expects_continue.then_some(continue_rx),
+            continue_gate,
         )
         .await
     });
@@ -561,15 +562,15 @@ async fn relay_request(
         ResponseRelayContext {
             preflight_informational,
             preflight_response,
-            alt_svc,
+            alt_svc: &state.alt_svc,
             origin,
             protocol,
             binding,
             capsule_protocol,
-            normalized: protocol.map(|_| normalized.clone()),
-            sessions,
+            normalized: protocol.map(|_| normalized),
+            sessions: &sessions,
         },
-        expects_continue.then_some(continue_tx),
+        continue_state,
     );
 
     let RequestRelayResults {
@@ -591,7 +592,7 @@ async fn relay_request(
     if (relay_result.is_err() || body_result.is_err())
         && let Some(binding_id) = binding_id
     {
-        cleanup_sessions.remove(binding_id).await;
+        sessions.remove(binding_id).await;
     }
 
     relay_result?;
@@ -889,10 +890,10 @@ pub(super) async fn relay_request_body(
     send_stream: &mut h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     protocol: Option<SessionProtocol>,
     capsule_protocol: bool,
-    continue_rx: Option<oneshot::Receiver<()>>,
+    continue_gate: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
-    if let Some(continue_rx) = continue_rx {
-        continue_rx
+    if let Some(continue_gate) = continue_gate {
+        continue_gate
             .await
             .map_err(|_| boxed("upstream closed before 100 Continue"))?;
     }
@@ -985,19 +986,65 @@ async fn relay_connect_udp_response_capsules(
     Ok(())
 }
 
+/// Whether the client sent `Expect: 100-continue` and the upstream has
+/// answered it yet.
+enum ContinueState {
+    NotExpected,
+    Awaiting(oneshot::Sender<()>),
+    Signalled,
+}
+
+/// The response-side state paired with the request body's gate.
+struct ContinueChannel {
+    state: ContinueState,
+    gate: Option<oneshot::Receiver<()>>,
+}
+
+impl ContinueState {
+    /// Pair the response-side state with the gate that holds the request
+    /// body back until the upstream answers `100 Continue`.
+    fn open(expected: bool) -> ContinueChannel {
+        if expected {
+            let (sender, receiver) = oneshot::channel();
+
+            ContinueChannel {
+                state: Self::Awaiting(sender),
+                gate: Some(receiver),
+            }
+        } else {
+            ContinueChannel {
+                state: Self::NotExpected,
+                gate: None,
+            }
+        }
+    }
+
+    /// Release the request body once; later calls and unexpected
+    /// continues do nothing.
+    fn signal(&mut self) {
+        match std::mem::replace(self, Self::Signalled) {
+            Self::Awaiting(sender) => {
+                let _ = sender.send(());
+            }
+            Self::NotExpected => *self = Self::NotExpected,
+            Self::Signalled => {}
+        }
+    }
+}
+
 async fn relay_informational_response(
     stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut response: http::Response<()>,
     alt_svc: &AltSvcStore,
     origin: &str,
-    continue_tx: &mut Option<oneshot::Sender<()>>,
+    continue_state: &mut ContinueState,
 ) -> Result<(), BoxError> {
     let is_continue = response.status().as_u16() == 100;
     crate::alt_svc::preserve_response_alt_svc(&mut response, alt_svc, origin).await;
     stream.send_response(response).await?;
 
-    if is_continue && let Some(sender) = continue_tx.take() {
-        let _ = sender.send(());
+    if is_continue {
+        continue_state.signal();
     }
 
     Ok(())
@@ -1023,7 +1070,7 @@ async fn relay_response_heads(
     recv_response: &mut h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
     alt_svc: &AltSvcStore,
     origin: &str,
-    continue_tx: &mut Option<oneshot::Sender<()>>,
+    continue_state: &mut ContinueState,
 ) -> Result<http::Response<()>, BoxError> {
     let mut informational_count = 0;
 
@@ -1043,15 +1090,15 @@ async fn relay_response_heads(
         }
 
         informational_count += 1;
-        relay_informational_response(stream, response, alt_svc, origin, continue_tx).await?;
+        relay_informational_response(stream, response, alt_svc, origin, continue_state).await?;
     }
 }
 
 async fn relay_response(
     stream: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     recv_response: &mut h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
-    context: ResponseRelayContext,
-    continue_tx: Option<oneshot::Sender<()>>,
+    context: ResponseRelayContext<'_>,
+    mut continue_state: ContinueState,
 ) -> Result<(), BoxError> {
     let ResponseRelayContext {
         preflight_informational,
@@ -1065,22 +1112,20 @@ async fn relay_response(
         sessions,
     } = context;
 
-    let mut continue_tx = continue_tx;
-
     let mut response = if let Some(response) = preflight_response {
         for informational_response in preflight_informational {
             relay_informational_response(
                 stream,
                 informational_response,
-                &alt_svc,
-                &origin,
-                &mut continue_tx,
+                alt_svc,
+                origin,
+                &mut continue_state,
             )
             .await?;
         }
         response
     } else {
-        relay_response_heads(stream, recv_response, &alt_svc, &origin, &mut continue_tx).await?
+        relay_response_heads(stream, recv_response, alt_svc, origin, &mut continue_state).await?
     };
 
     if binding.is_some() && !response.status().is_success() {
@@ -1092,10 +1137,10 @@ async fn relay_response(
     }
 
     let binding_id = binding.as_ref().map(|binding| binding.downstream_stream_id);
-    set_session_binding(&sessions, binding.as_ref(), normalized.as_ref()).await?;
+    set_session_binding(sessions, binding.as_ref(), normalized.as_ref()).await?;
 
     let relay_result: Result<(), BoxError> = async {
-        crate::alt_svc::preserve_response_alt_svc(&mut response, &alt_svc, &origin).await;
+        crate::alt_svc::preserve_response_alt_svc(&mut response, alt_svc, origin).await;
         stream.send_response(response).await?;
 
         let mut capsules = session::CapsuleDecoder::default();

@@ -29,7 +29,7 @@ use crate::{
     http3::{
         BoxError, Http3State, boxed,
         connection_id::ConnectionIdBindings,
-        datagram::{DatagramRelay, DatagramRouter, DatagramRouterState},
+        datagram::{DatagramRelay, DatagramRouter, DatagramRouterSlot, DatagramRouterState},
         relay::serve_request,
         session_registry::SessionRegistry,
         varint,
@@ -225,7 +225,7 @@ pub(super) struct H3RequestContext {
     pub(super) origin_authority: Option<String>,
     pub(super) sessions: Arc<SessionRegistry>,
     pub(super) pending_webtransport: PendingWebTransportSessions,
-    pub(super) datagram_router: Option<DatagramRouterState>,
+    pub(super) datagram_router: DatagramRouterSlot,
     pub(super) tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -244,7 +244,7 @@ fn new_h3_request_context(
         origin_authority,
         sessions: Arc::new(SessionRegistry::default()),
         pending_webtransport: PendingWebTransportSessions::default(),
-        datagram_router: None,
+        datagram_router: DatagramRouterSlot::default(),
         tasks: Vec::new(),
     }
 }
@@ -295,15 +295,9 @@ impl H3RequestContext {
             .get::<h3::ext::Protocol>()
             .is_some_and(|protocol| protocol.as_str() == "connect-udp")
         {
-            if self.datagram_router.is_none() {
-                let datagram_state = DatagramRouter::start(h3.get_datagram_reader());
-                self.datagram_router = Some(datagram_state);
-            }
-            let router = &self
+            let router = self
                 .datagram_router
-                .as_ref()
-                .expect("router initialised")
-                .router;
+                .get_or_start(|| h3.get_datagram_reader());
             Some(DatagramRelay {
                 reader: router.register(downstream_stream_id).await,
                 sender: h3.get_datagram_sender(downstream_stream_id),
@@ -314,10 +308,7 @@ impl H3RequestContext {
 
         let has_datagrams = downstream_datagrams.is_some();
 
-        let datagram_router = self
-            .datagram_router
-            .as_ref()
-            .map(|state| state.router.clone());
+        let datagram_router = self.datagram_router.router();
 
         let request_context = Http3RequestContext {
             state: self.state.clone(),
@@ -343,10 +334,12 @@ impl H3RequestContext {
         self.tasks.push(task);
     }
 
-    const fn take_datagram_router(&mut self) -> DatagramRouterState {
+    fn take_datagram_router(
+        &mut self,
+        h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
+    ) -> DatagramRouterState {
         self.datagram_router
-            .take()
-            .expect("WebTransport datagram router")
+            .take_or_start(|| h3.get_datagram_reader())
     }
 }
 
@@ -368,12 +361,9 @@ fn queue_webtransport_preparation(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     prepare_tx: &mpsc::UnboundedSender<WebTransportPrep>,
 ) -> tokio::task::JoinHandle<()> {
-    let datagram_router = request_context
+    request_context
         .datagram_router
-        .take()
-        .unwrap_or_else(|| DatagramRouter::start(h3.get_datagram_reader()));
-
-    request_context.datagram_router = Some(datagram_router);
+        .get_or_start(|| h3.get_datagram_reader());
     let prepare_tx = prepare_tx.clone();
 
     let request_context = Http3RequestContext {
@@ -444,7 +434,7 @@ async fn serve_h3_connection(
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedRequest>();
     let (webtransport_tx, mut webtransport_rx) = mpsc::unbounded_channel::<WebTransportPrep>();
-    let mut webtransport_pending = false;
+    let mut mode = AssociationMode::ServingH3;
     let mut migration_tick = tokio::time::interval(Duration::from_millis(10));
 
     let result = loop {
@@ -478,9 +468,9 @@ async fn serve_h3_connection(
                 }
             },
             Some(WebTransportPrep { request, setup }) = webtransport_rx.recv(),
-                if webtransport_pending => {
-                webtransport_pending = false;
-                let datagram_router = request_context.take_datagram_router();
+                if mode == AssociationMode::PreparingWebTransport => {
+                mode = AssociationMode::ServingH3;
+                let datagram_router = request_context.take_datagram_router(&h3);
                 match setup {
                     Ok(setup) => {
                         request_context
@@ -505,16 +495,18 @@ async fn serve_h3_connection(
                     }
                     Err(error) => {
                         warn!(%error, "downstream WebTransport request rejected");
-                        request_context.datagram_router = Some(datagram_router);
+                        request_context.datagram_router.restore(datagram_router);
                     }
                 }
             },
-            Some(resolved) = resolved_rx.recv(), if !webtransport_pending => {
-                if handle_resolved_request(resolved, &mut request_context, &h3, &webtransport_tx)
-                    .await
-                {
-                    webtransport_pending = true;
-                }
+            Some(resolved) = resolved_rx.recv(), if mode == AssociationMode::ServingH3 => {
+                mode = handle_resolved_request(
+                    resolved,
+                    &mut request_context,
+                    &h3,
+                    &webtransport_tx,
+                )
+                .await;
             }
         }
     };
@@ -567,18 +559,31 @@ fn resolved_request(resolved: ResolvedRequest) -> Option<ResolvedRequestValue> {
     }
 }
 
+/// Whether the association accepts new requests or is waiting on a queued
+/// WebTransport preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssociationMode {
+    /// Resolved requests are dispatched as they arrive.
+    ServingH3,
+
+    /// A WebTransport preparation is in flight; resolved requests wait until
+    /// it completes.
+    PreparingWebTransport,
+}
+
 /// Dispatch one accepted downstream HTTP/3 request.
 ///
-/// Returns whether a WebTransport preparation was queued, which gates further
-/// resolved-request handling until the preparation completes.
+/// Returns [`AssociationMode::PreparingWebTransport`] when a WebTransport
+/// preparation was queued, which gates further resolved-request handling
+/// until the preparation completes.
 async fn handle_resolved_request(
     resolved: ResolvedRequest,
     request_context: &mut H3RequestContext,
     h3: &h3::server::Connection<h3_quinn::Connection, Bytes>,
     webtransport_tx: &mpsc::UnboundedSender<WebTransportPrep>,
-) -> bool {
+) -> AssociationMode {
     let Some(resolved) = resolved_request(resolved) else {
-        return false;
+        return AssociationMode::ServingH3;
     };
     let ResolvedRequestValue {
         request,
@@ -586,7 +591,7 @@ async fn handle_resolved_request(
     } = resolved;
 
     if reject_0rtt_stream(&mut stream) {
-        return false;
+        return AssociationMode::ServingH3;
     }
 
     if is_webtransport_request(&request) {
@@ -595,18 +600,18 @@ async fn handle_resolved_request(
                 warn!(%error, "malformed WebTransport request rejected");
             }
 
-            return false;
+            return AssociationMode::ServingH3;
         }
 
         let task =
             queue_webtransport_preparation(request_context, h3, request, stream, webtransport_tx);
 
         request_context.tasks.push(task);
-        return true;
+        return AssociationMode::PreparingWebTransport;
     }
 
     request_context.serve(request, stream, h3).await;
-    false
+    AssociationMode::ServingH3
 }
 
 pub(super) async fn rebind_migrated_path(

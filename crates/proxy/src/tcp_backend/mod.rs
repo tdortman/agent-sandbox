@@ -867,7 +867,7 @@ fn request_head_clone(request: &Request, version: Version, body: Body) -> Reques
     clone
 }
 
-fn is_protocol_negotiation_failure(error: &dyn Display) -> bool {
+fn is_protocol_negotiation_failure(error: &(impl Display + ?Sized)) -> bool {
     let error = error.to_string().to_ascii_lowercase();
 
     [

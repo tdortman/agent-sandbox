@@ -25,6 +25,53 @@ pub(super) struct DatagramRouterState {
     pub(super) task: tokio::task::JoinHandle<()>,
 }
 
+/// The connection's datagram router, started on first use.
+///
+/// Every accessor either starts the router or tolerates its absence, so no
+/// caller needs an "already started" invariant.
+#[derive(Default)]
+pub(super) struct DatagramRouterSlot {
+    state: Option<DatagramRouterState>,
+}
+
+impl DatagramRouterSlot {
+    /// Start the router from `reader` if it is not running yet.
+    pub(super) fn get_or_start(
+        &mut self,
+        reader: impl FnOnce() -> DatagramReader<RecvDatagramHandler>,
+    ) -> &DatagramRouter {
+        &self
+            .state
+            .get_or_insert_with(|| DatagramRouter::start(reader()))
+            .router
+    }
+
+    /// The running router, if any.
+    pub(super) fn router(&self) -> Option<DatagramRouter> {
+        self.state.as_ref().map(|state| state.router.clone())
+    }
+
+    /// Remove the router, starting it first when it is not running.
+    pub(super) fn take_or_start(
+        &mut self,
+        reader: impl FnOnce() -> DatagramReader<RecvDatagramHandler>,
+    ) -> DatagramRouterState {
+        self.state
+            .take()
+            .unwrap_or_else(|| DatagramRouter::start(reader()))
+    }
+
+    /// Put a router taken with [`Self::take_or_start`] back.
+    pub(super) fn restore(&mut self, state: DatagramRouterState) {
+        self.state = Some(state);
+    }
+
+    /// Remove the router, if running.
+    pub(super) const fn take(&mut self) -> Option<DatagramRouterState> {
+        self.state.take()
+    }
+}
+
 impl DatagramRouter {
     pub(super) fn start(mut reader: DatagramReader<RecvDatagramHandler>) -> DatagramRouterState {
         let routes: Arc<Mutex<HashMap<StreamId, mpsc::Sender<RoutedDatagram>>>> =

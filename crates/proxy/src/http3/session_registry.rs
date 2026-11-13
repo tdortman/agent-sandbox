@@ -26,10 +26,34 @@ struct ApprovedSession {
     normalized: HttpRequest,
 }
 
+/// Leases and approvals share one lock so a lease can never outlive, or be
+/// published without, the approval it pins.
+#[derive(Default)]
+struct RegistryInner {
+    leases: HashMap<StreamId, SessionKey>,
+    approvals: HashMap<SessionKey, ApprovedSession>,
+}
+
+impl RegistryInner {
+    fn reserve(
+        &mut self,
+        downstream_stream_id: StreamId,
+        key: &SessionKey,
+    ) -> Result<(), BoxError> {
+        if let Some(existing) = self.leases.get(&downstream_stream_id)
+            && existing != key
+        {
+            return Err("HTTP/3 session identity changed during reconnect".into());
+        }
+
+        self.leases.insert(downstream_stream_id, key.clone());
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SessionRegistry {
-    leases: Mutex<HashMap<StreamId, SessionKey>>,
-    approvals: Mutex<HashMap<SessionKey, ApprovedSession>>,
+    inner: Mutex<RegistryInner>,
 }
 
 impl SessionRegistry {
@@ -38,17 +62,7 @@ impl SessionRegistry {
         downstream_stream_id: StreamId,
         key: &SessionKey,
     ) -> Result<(), BoxError> {
-        let mut leases = self.leases.lock().await;
-
-        if let Some(existing) = leases.get(&downstream_stream_id)
-            && existing != key
-        {
-            return Err("HTTP/3 session identity changed during reconnect".into());
-        }
-
-        leases.insert(downstream_stream_id, key.clone());
-        drop(leases);
-        Ok(())
+        self.inner.lock().await.reserve(downstream_stream_id, key)
     }
 
     pub(super) async fn validate(
@@ -56,35 +70,39 @@ impl SessionRegistry {
         downstream_stream_id: StreamId,
         key: &SessionKey,
     ) -> Result<(), BoxError> {
-        let leases = self.leases.lock().await;
+        let valid = self.inner.lock().await.leases.get(&downstream_stream_id) == Some(key);
 
-        if leases.get(&downstream_stream_id) == Some(key) {
-            drop(leases);
-            return Ok(());
+        if valid {
+            Ok(())
+        } else {
+            Err("HTTP/3 session identity changed during reconnect".into())
         }
-
-        drop(leases);
-        Err("HTTP/3 session identity changed during reconnect".into())
     }
 
     pub(super) async fn approved(
         &self,
         semantic: &SemanticRequest,
         protocol: SessionProtocol,
-        attribution: agent_sandbox_core::AttributionToken,
+        attribution: &agent_sandbox_core::AttributionToken,
     ) -> Option<HttpRequest> {
         let target = semantic.policy_request().ok()?.url.to_string();
+        let origin = semantic.authority();
+        let target_str = target.as_str();
 
-        let key = SessionKey {
-            origin: semantic.authority().to_owned(),
-            target,
-            protocol,
-            attribution,
-        };
-
-        let approvals = self.approvals.lock().await;
-        let normalized = approvals.get(&key)?.normalized.clone();
-        drop(approvals);
+        let inner = self.inner.lock().await;
+        let normalized = inner
+            .approvals
+            .iter()
+            .find(|(key, _)| {
+                key.protocol == protocol
+                    && key.origin == origin
+                    && key.target == target_str
+                    && &key.attribution == attribution
+            })?
+            .1
+            .normalized
+            .clone();
+        drop(inner);
         Some(normalized)
     }
 
@@ -98,32 +116,25 @@ impl SessionRegistry {
         let upstream_datagram = session::encode_http_datagram(binding.upstream_stream_id, &[])?;
         session::decode_http_datagram(&upstream_datagram, binding.upstream_stream_id)?;
 
-        self.reserve(binding.downstream_stream_id, &binding.key)
-            .await?;
-
-        self.approvals
-            .lock()
-            .await
+        let mut inner = self.inner.lock().await;
+        inner.reserve(binding.downstream_stream_id, &binding.key)?;
+        inner
+            .approvals
             .insert(binding.key.clone(), ApprovedSession {
                 normalized: normalized.clone(),
             });
+        drop(inner);
 
         Ok(())
     }
 
     pub(super) async fn remove(&self, downstream_stream_id: StreamId) {
-        let (key, remove_approval) = {
-            let mut leases = self.leases.lock().await;
-            let key = leases.remove(&downstream_stream_id);
-            let remove_approval = key
-                .as_ref()
-                .is_some_and(|key| !leases.values().any(|lease| lease == key));
-            drop(leases);
-            (key, remove_approval)
-        };
+        let mut inner = self.inner.lock().await;
 
-        if remove_approval && let Some(key) = key {
-            self.approvals.lock().await.remove(&key);
+        if let Some(key) = inner.leases.remove(&downstream_stream_id)
+            && !inner.leases.values().any(|lease| *lease == key)
+        {
+            inner.approvals.remove(&key);
         }
     }
 }
@@ -265,7 +276,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .approved(&semantic(), SessionProtocol::WebSocket, attribution())
+                .approved(&semantic(), SessionProtocol::WebSocket, &attribution())
                 .await,
             Some(normalized)
         );
@@ -303,7 +314,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .approved(&semantic(), SessionProtocol::WebSocket, attribution())
+                .approved(&semantic(), SessionProtocol::WebSocket, &attribution())
                 .await,
             Some(normalized.clone()),
             "the remaining lease still holds the approval"
@@ -313,7 +324,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .approved(&semantic(), SessionProtocol::WebSocket, attribution())
+                .approved(&semantic(), SessionProtocol::WebSocket, &attribution())
                 .await,
             None,
             "the last lease release drops the approval"
