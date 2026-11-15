@@ -387,7 +387,8 @@ in
       filesystemGate ? false,
       fsArmPkg ? null,
       hiddenPaths ? [ ],
-      launchHook ? "",
+      launchArgs ? { },
+      launchHook ? { },
       network ? null,
       packageName ? if binary != null then binary else lib.baseNameOf (lib.getExe package),
       policyContext ? false,
@@ -417,19 +418,9 @@ in
         nvidiaSetupScript = nvidiaSetupScript true;
       } builtinCombinators;
       applicationExe = lib.getExe' applicationPackage binName;
-      applicationPackage =
-        if launchHook == "" then
-          package
-        else
-          pkgs.symlinkJoin {
-            inherit (package) meta name;
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            paths = [ package ];
-
-            postBuild = ''
-              wrapProgram $out/bin/${lib.escapeShellArg binName} --run ${lib.escapeShellArg launchHook}
-            '';
-          };
+      applicationPackage = mkApplicationPackage (launchArgs.sandboxed or [ ]) (
+        launchHook.sandboxed or ""
+      );
       binName = if binary != null then binary else lib.baseNameOf (lib.getExe package);
       blockScript = lib.concatMapStringsSep "\n" (var: "unset ${var} || true") blockEnvVars;
       builtinCombinators = (jail-nix.lib.init pkgs).combinators;
@@ -729,6 +720,22 @@ in
           }
         else
           jailedDrv;
+      mkApplicationPackage =
+        launchArgs: launchHook:
+        if launchHook == "" && launchArgs == [ ] then
+          package
+        else
+          pkgs.symlinkJoin {
+            inherit (package) meta name;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            paths = [ package ];
+
+            postBuild = ''
+              wrapProgram $out/bin/${lib.escapeShellArg binName} \
+                --run ${lib.escapeShellArg launchHook} \
+                --add-flags ${lib.escapeShellArg (lib.escapeShellArgs launchArgs)}
+            '';
+          };
       namespaceFlags =
         if hasNetwork then
           "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup"
@@ -1137,11 +1144,14 @@ in
       # sandbox, then execs its argv tail. The chain is composable with the
       # fs-arm helper so dynamic-FS and syscall-gate can both be active.
       syscallGate = syscallArmPkg != null;
+      unsafeApplicationPackage = mkApplicationPackage (launchArgs.unsandboxed or [ ]) (
+        launchHook.unsandboxed or ""
+      );
 
     in
     pkgs.symlinkJoin {
       name = "${lib.getName package}-agent-sandbox";
-      paths = [ applicationPackage ];
+      paths = [ unsafeApplicationPackage ];
 
       postBuild = ''
         if [ "${if replaceOriginalBinary then "1" else "0"}" = "1" ]; then

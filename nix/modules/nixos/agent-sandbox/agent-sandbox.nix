@@ -296,19 +296,58 @@ let
       '';
     };
 
-    launchHook = lib.mkOption {
-      type = lib.types.lines;
-      example = "unset XDG_DATA_HOME";
-      default = "";
+    launchArgs = {
+      sandboxed = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        example = [ "--dangerously-skip-permissions" ];
+        default = [ ];
 
-      description = ''
-        Bash code run immediately before this package's executable, including
-        the unsafe alias. Sandboxed launches run the hook inside the sandbox,
-        after credential filtering. Use it to unset or export environment
-        variables or perform package-specific initialization. The default is
-        empty. This does not replace ``blockEnvVars``, which filters credentials
-        only for sandboxed launches.
-      '';
+        description = ''
+          Arguments prepended to this package's sandboxed executable arguments.
+          Each entry is passed literally, without shell expansion.
+          Caller-supplied arguments follow these arguments.
+        '';
+      };
+
+      unsandboxed = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+
+        description = ''
+          Arguments prepended only to unsandboxed launches, through the unsafe alias
+          or the original binary when ``replaceOriginalBinary`` is false.
+          Each entry is passed literally, without shell expansion.
+          Caller-supplied arguments follow these arguments.
+        '';
+      };
+    };
+
+    launchHook = {
+      sandboxed = lib.mkOption {
+        type = lib.types.lines;
+        example = "unset XDG_DATA_HOME";
+        default = "";
+
+        description = ''
+          Bash code run immediately before this package's sandboxed executable,
+          inside the sandbox after credential filtering. Use it to unset or export
+          environment variables or perform package-specific initialization. The default is
+          empty. This does not replace ``blockEnvVars``, which filters credentials
+          only for sandboxed launches.
+        '';
+      };
+
+      unsandboxed = lib.mkOption {
+        type = lib.types.lines;
+        example = "unset XDG_DATA_HOME";
+        default = "";
+
+        description = ''
+          Bash code run immediately before unsandboxed launches, through the unsafe
+          alias or the original binary when ``replaceOriginalBinary`` is false.
+          This hook runs on the host, without credential filtering.
+        '';
+      };
     };
 
     name = lib.mkOption {

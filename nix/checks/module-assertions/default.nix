@@ -27,14 +27,29 @@ let
             agent-sandbox.packages = [
               {
                 package = pkgs.hello;
-                launchHook = "unset XDG_DATA_HOME";
+
+                launchArgs = {
+                  sandboxed = [ "--greeting=hello world" ];
+                  unsandboxed = [ "--greeting=host" ];
+                };
+
+                launchHook = {
+                  sandboxed = "unset XDG_DATA_HOME";
+                  unsandboxed = "export HOST_ONLY=1";
+                };
               }
               { package = pkgs.hello; }
             ];
           }).config.agent-sandbox.packages;
       in
-      (builtins.head packages).launchHook == "unset XDG_DATA_HOME"
-      && (builtins.elemAt packages 1).launchHook == "";
+      (builtins.head packages).launchHook.sandboxed == "unset XDG_DATA_HOME"
+      && (builtins.elemAt packages 1).launchHook.sandboxed == ""
+      && (builtins.head packages).launchArgs.sandboxed == [ "--greeting=hello world" ]
+      && (builtins.elemAt packages 1).launchArgs.sandboxed == [ ]
+      && (builtins.head packages).launchArgs.unsandboxed == [ "--greeting=host" ]
+      && (builtins.head packages).launchHook.unsandboxed == "export HOST_ONLY=1"
+      && (builtins.elemAt packages 1).launchArgs.unsandboxed == [ ]
+      && (builtins.elemAt packages 1).launchHook.unsandboxed == "";
     assert
       !(builtins.tryEval (
         builtins.deepSeq
