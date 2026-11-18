@@ -366,6 +366,10 @@ let
         # Handoff flows were judged by the handoff chain before their DNAT.
         ct status dnat ip daddr ${runtime.hostIp} accept
         ct status dnat ip6 daddr ${runtime.hostIp6} accept
+        # policyd's OAuth redirect bridge dials sandbox loopback listeners as
+        # root; sandboxed processes never run as root here.
+        ip daddr 127.0.0.1 meta skuid 0 accept
+        ip6 daddr ::1 meta skuid 0 accept
         # DNS traffic to the forwarder bypasses NFQUEUE
         ip daddr ${runtime.hostIp} udp dport 53 accept
         ip daddr ${runtime.hostIp} tcp dport 53 accept

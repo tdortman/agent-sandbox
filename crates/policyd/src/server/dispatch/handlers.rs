@@ -50,6 +50,11 @@ pub async fn handle(
             Ok(RpcReply::Simple(SimpleOkReply::OK))
         }
 
+        RpcRequest::BridgeLoopback { port } => {
+            crate::loopback_bridge::open(peer, port).await?;
+            Ok(RpcReply::Simple(SimpleOkReply::OK))
+        }
+
         RpcRequest::OpenProxySession => Ok(RpcReply::ProxySession(
             store.open_proxy_session(client.id).await?,
         )),

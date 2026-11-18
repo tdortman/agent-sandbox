@@ -455,7 +455,9 @@ in
           if [[ "$_asbx_dbus_bus" == system ]]; then
             _asbx_dbus_upstream="''${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/run/dbus/system_bus_socket}"
           fi
-          ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
+          AGENT_SANDBOX_CWD="$_agent_sandbox_cwd" \
+            AGENT_SANDBOX_PROJECT_ROOT="$_agent_sandbox_project_root" \
+            ${dbusProxyPkg}/bin/agent-sandbox-dbus-proxy \
             --listen "$_asbx_dbus_socket" \
             --upstream-address "$_asbx_dbus_upstream" \
             --policy-socket ${lib.escapeShellArg policySocket} \
@@ -478,6 +480,10 @@ in
         RUNTIME_ARGS+=(--ro-bind "$_asbx_dbus_dir" "$_asbx_dbus_dir")
         RUNTIME_ARGS+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$_asbx_dbus_dir/session.sock")
         RUNTIME_ARGS+=(--setenv DBUS_SYSTEM_BUS_ADDRESS "unix:path=$_asbx_dbus_dir/system.sock")
+        # Open URLs in the host browser through the desktop portal, the one
+        # path the relay sees, so OAuth redirects get bridged for any agent.
+        RUNTIME_ARGS+=(--setenv NIXOS_XDG_OPEN_USE_PORTAL 1)
+        RUNTIME_ARGS+=(--setenv BROWSER xdg-open)
       '';
       dbusSocketDirectory = if dbus != null then dbus.socketDirectory else "/run/user";
       dbusUpstreamAddress = if dbus != null then dbus.upstreamAddress else null;
@@ -616,7 +622,8 @@ in
       extraPkgs' =
         extraPkgs
         ++ lib.optionals (fsArmPkg != null) [ fsArmPkg ]
-        ++ lib.optionals (syscallArmPkg != null) [ syscallArmPkg ];
+        ++ lib.optionals (syscallArmPkg != null) [ syscallArmPkg ]
+        ++ lib.optionals dbusMode [ pkgs.xdg-utils ];
       finalLauncher = scopedLauncher;
       fsArmScript = lib.optionalString (fsArmPkg != null) ''
         RUNTIME_ARGS+=(--setenv AGENT_SANDBOX_FS_STATIC_ALLOW ${staticAllowJsonArg})

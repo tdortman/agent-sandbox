@@ -1,0 +1,5 @@
+schema = 1
+id = "agent-sandbox-oauth"
+name = "Agent Sandbox OAuth"
+version = "0.1.0"
+window = "window.luau"

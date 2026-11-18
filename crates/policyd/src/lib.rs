@@ -1,6 +1,7 @@
 //! Agent sandbox policy daemon (JSON-line RPC over Unix socket).
 
 pub mod error;
+mod loopback_bridge;
 
 pub mod server;
 pub mod spawn;

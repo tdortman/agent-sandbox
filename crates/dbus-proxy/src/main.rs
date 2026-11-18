@@ -3,15 +3,35 @@
 //! Parses relay configuration from the command line, then runs the
 //! `agent-sandbox-dbus-proxy` library relay against the configured listener
 //! and policy socket.
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 use agent_sandbox_core::{DbusBus, rpc::RequestContext};
-use agent_sandbox_dbus_proxy::{RelayConfig, run};
-use clap::Parser;
+use agent_sandbox_dbus_proxy::{RelayConfig, open_terminal_oauth, run};
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "agent-sandbox-dbus-proxy")]
+#[command(
+    name = "agent-sandbox-dbus-proxy",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
 struct Args {
+    #[command(flatten)]
+    relay: Option<RelayArgs>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Open a terminal OAuth link through the given launcher's session relay.
+    /// Exit 3 means the terminal should handle the link normally.
+    Open { launcher: u32, uri: String },
+}
+
+#[derive(Debug, clap::Args)]
+struct RelayArgs {
     /// Unix socket exposed to sandbox clients.
     #[arg(long)]
     listen: PathBuf,
@@ -54,8 +74,16 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if let Some(Command::Open { launcher, uri }) = args.command {
+        return Ok(if open_terminal_oauth(launcher, uri).await? {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(3)
+        });
+    }
+    let args = args.relay.ok_or("missing relay options")?;
 
     let context = RequestContext {
         cwd: args.cwd,
@@ -76,5 +104,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     run(config).await?;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

@@ -420,6 +420,14 @@ pub enum RpcRequest {
         ctx: RequestContext,
     },
 
+    /// Relay a host loopback port into the caller's network namespace so a
+    /// host browser reaches the OAuth redirect listener of a sandboxed client.
+    BridgeLoopback {
+        /// Port bound on host `127.0.0.1` and `[::1]` and dialed at the same
+        /// address inside the caller's network namespace.
+        port: u16,
+    },
+
     /// Fetch current filesystem rules for a privileged monitor.
     FilesystemSnapshot {
         /// Sandbox context whose policy layers are merged.
@@ -648,6 +656,7 @@ impl RpcRequest {
             | Self::CheckNetworkFlow { .. }
             | Self::CancelCheck { .. }
             | Self::ReleaseNetworkFlow { .. }
+            | Self::BridgeLoopback { .. }
             | Self::RegisterSandbox { .. } => None,
         }
     }
@@ -688,7 +697,8 @@ impl RpcRequest {
             | Self::ClaimNetworkFlowBySource { .. }
             | Self::RebindNetworkFlow { .. }
             | Self::CancelCheck { .. }
-            | Self::ReleaseNetworkFlow { .. } => false,
+            | Self::ReleaseNetworkFlow { .. }
+            | Self::BridgeLoopback { .. } => false,
         }
     }
 }

@@ -1,5 +1,16 @@
 {
     "lsp": {
+        "luau-lsp": {
+            "settings": {
+                "luau-lsp": {
+                    "platform": { "type": "standard" },
+                    "sourcemap": { "enabled": false },
+                    "types": {
+                        "definitionFiles": ["integrations/tern-oauth/tern.d.luau"],
+                    },
+                },
+            },
+        },
         "rust-analyzer": {
             "initialization_options": {
                 "check": {

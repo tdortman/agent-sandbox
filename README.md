@@ -292,6 +292,11 @@ Set `agent-sandbox.policy.dbus.enable = true` to expose filtered dbus sockets. T
 
 Destination, object path, interface, member, and signature accept glob patterns, so `"signature": "*"` matches any signature. File-descriptor metadata matches exactly unless the rule sets `"any_fd_metadata": true`. In the approval prompt, enter `*` in the signature or FD metadata field to match any value.
 
+Inside the sandbox, `xdg-open` and `$BROWSER` open URLs in the host browser through the desktop portal, so allow `org.freedesktop.portal.OpenURI.OpenURI` in the session policy. When the URL carries an OAuth `redirect_uri` on host loopback, policyd forwards that port into the sandbox for up to five minutes so the login callback arrives.
+
+In Home Manager, import `inputs.agent-sandbox.homeModules.agent-sandbox` and set `agent-sandbox.tern-oauth.enable = true`. Without Home Manager, run `tern plugin install ./integrations/tern-oauth`.
+For Luau completions in Zed, run `tern plugin types integrations/tern-oauth`.
+
 ## Approval UI
 
 `agent-sandbox-ui` uses the packaged Qt dialog and falls back to zenity. Use `agent-sandbox-approve` when no graphical UI is available.

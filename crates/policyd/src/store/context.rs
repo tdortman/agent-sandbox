@@ -251,10 +251,26 @@ impl PolicyStore {
         ctx: &ResolvedRequestContext,
         peer: TrustedPeer,
     ) -> ResolvedRequestContext {
-        let pid = ctx
+        let mut pid = ctx
             .ids
             .pid()
             .filter(|_| ctx.ids.uid().is_none_or(|uid| uid == peer.uid));
+        if pid == Some(peer.pid) {
+            // The relay originated the request for a terminal click. Use the
+            // registered sandbox process for policy paths and approval scope.
+            pid = ctx
+                .sandbox_session_id
+                .as_deref()
+                .and_then(|id| {
+                    self.with_registrations(|sessions| {
+                        let registration = sessions.get(id)?;
+                        (registration.owner_uid == peer.uid)
+                            .then(|| registration.root.pid())
+                            .flatten()
+                    })
+                })
+                .or(pid);
+        }
 
         let ids = ProcessIds::from_options(pid, Some(peer.uid));
 

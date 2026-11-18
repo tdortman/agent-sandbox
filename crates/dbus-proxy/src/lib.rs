@@ -1,6 +1,15 @@
 //! Unix-socket D-Bus relay with policy checks.
 
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    fs, io,
+    net::{Ipv4Addr, Ipv6Addr},
+    num::NonZeroU32,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use agent_sandbox_core::{
     peer_cred_unix,
@@ -9,19 +18,26 @@ use agent_sandbox_core::{
     rpc_client::PersistentRpcClient,
 };
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
+use url::{Host, Url};
 use zbus::{
     Connection, Guid, MatchRule, MessageStream,
     connection::Builder,
     message::{Builder as MessageBuilder, Message, Type},
-    zvariant::Fd,
+    zvariant::{Fd, OwnedValue},
 };
 
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const HELLO: &str = "Hello";
 const POLICY_TIMEOUT: Duration = Duration::from_secs(305);
+const BRIDGE_TIMEOUT: Duration = Duration::from_secs(5);
+const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+const OPEN_URI_IFACE: &str = "org.freedesktop.portal.OpenURI";
+const OPEN_URI: &str = "OpenURI";
 
 /// Configuration for the D-Bus relay listener.
 #[derive(Debug, Clone)]
@@ -173,7 +189,16 @@ impl AcceptedClient {
     async fn authenticate(mut self) -> Result<AuthenticatedClient, RelayError> {
         let credentials = peer_cred_unix(&self.socket)
             .ok_or_else(|| RelayError::Message("cannot read D-Bus peer credentials".to_owned()))?;
-        self.config.context.pid = Some(credentials.pid);
+        // A terminal opener runs outside the sandbox. Its own working directory
+        // is not the project whose policy should govern the request.
+        let pid = if self.config.context.uid == Some(credentials.uid)
+            && std::env::current_exe().is_ok_and(|exe| is_relay_process(credentials.pid, &exe))
+        {
+            std::process::id()
+        } else {
+            credentials.pid
+        };
+        self.config.context.pid = Some(pid);
         self.config.context.uid = Some(credentials.uid);
 
         let client_stream = Builder::unix_stream(self.socket)
@@ -285,6 +310,11 @@ async fn relay_loop(
                     send_access_denied(&client_connection, &client_message).await?;
                     continue;
                 }
+                // Bridge before the browser opens: a signed-in user can be
+                // redirected back immediately.
+                if let Some(port) = oauth_redirect_port(&client_message) {
+                    bridge_loopback(policy, port).await;
+                }
                 let serial = client_message.header().primary().serial_num();
                 let forwarded = rewrite_message(&client_message, serial, None)?;
                 upstream_connection.send(&forwarded).await?;
@@ -345,6 +375,152 @@ async fn policy_check(
             warn!(%error, "policyd check failed; denying D-Bus message");
             false
         }
+    }
+}
+
+/// Body of `org.freedesktop.portal.OpenURI.OpenURI`.
+#[derive(Debug, Serialize, Deserialize, zbus::zvariant::Type)]
+struct OpenUriCall {
+    parent_window: String,
+    uri: String,
+    options: HashMap<String, OwnedValue>,
+}
+
+/// Open a clicked OAuth link through the foreground sandbox launcher's session
+/// relay.
+///
+/// Returns `false` for other links or when the launcher has no matching relay.
+///
+/// # Errors
+///
+/// Returns an error if the relay cannot forward the request or policy denies
+/// it.
+pub async fn open_terminal_oauth(launcher: u32, uri: String) -> Result<bool, RelayError> {
+    if oauth_url_port(&uri).is_none_or(|port| port < 1024) {
+        return Ok(false);
+    }
+    let Some(stream) = terminal_relay(launcher).await? else {
+        return Ok(false);
+    };
+    let connection = Builder::unix_stream(stream).build().await?;
+    connection
+        .call_method(
+            Some(PORTAL_DESTINATION),
+            PORTAL_PATH,
+            Some(OPEN_URI_IFACE),
+            OPEN_URI,
+            &OpenUriCall {
+                parent_window: String::new(),
+                uri,
+                options: HashMap::new(),
+            },
+        )
+        .await?;
+    Ok(true)
+}
+
+async fn terminal_relay(launcher: u32) -> io::Result<Option<UnixStream>> {
+    let uid = fs::metadata("/proc/self")?.uid();
+    let parent = PathBuf::from(format!("/proc/{launcher}"));
+    if !parent.metadata().is_ok_and(|meta| meta.uid() == uid) {
+        return Ok(None);
+    }
+    let exe = std::env::current_exe()?;
+    let children = match fs::read_to_string(parent.join(format!("task/{launcher}/children"))) {
+        Ok(children) => children,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut relay = None;
+    // The launcher starts its own session and system relays as direct children.
+    for pid in children
+        .split_whitespace()
+        .filter_map(|pid| pid.parse::<u32>().ok())
+    {
+        if !is_relay_process(pid, &exe) {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let Some(path) = session_relay_path(&cmdline) else {
+            continue;
+        };
+        let stream = UnixStream::connect(path).await?;
+        if !peer_cred_unix(&stream).is_some_and(|peer| peer.pid == pid && peer.uid == uid) {
+            return Err(io::Error::other("session relay peer changed"));
+        }
+        if relay.replace(stream).is_some() {
+            return Err(io::Error::other(
+                "multiple session relays for the terminal job",
+            ));
+        }
+    }
+    Ok(relay)
+}
+
+fn is_relay_process(pid: u32, exe: &Path) -> bool {
+    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path == exe)
+}
+
+fn session_relay_path(cmdline: &[u8]) -> Option<&Path> {
+    let mut args = cmdline.strip_suffix(&[0])?.split(|byte| *byte == 0).skip(1);
+    let mut listen = None;
+    let mut session = false;
+    while let Some(arg) = args.next() {
+        let value = args.next()?;
+        match arg {
+            b"--listen" => listen = Some(Path::new(OsStr::from_bytes(value))),
+            b"--bus" => session = value == b"session",
+            _ => {}
+        }
+    }
+    listen.filter(|path| session && path.is_absolute())
+}
+
+/// Loopback port of the OAuth `redirect_uri` in a URL sent to the portal's
+/// `OpenURI`. The host browser delivers the authorization code to that port,
+/// while the client listens on the sandbox's own loopback.
+fn oauth_redirect_port(message: &Message) -> Option<u16> {
+    let header = message.header();
+    if header.interface()?.as_str() != OPEN_URI_IFACE || header.member()?.as_str() != OPEN_URI {
+        return None;
+    }
+
+    let call: OpenUriCall = message.body().deserialize().ok()?;
+    oauth_url_port(&call.uri)
+}
+
+fn oauth_url_port(uri: &str) -> Option<u16> {
+    let url = Url::parse(uri).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let (_, redirect) = url.query_pairs().find(|(key, _)| key == "redirect_uri")?;
+    let redirect = Url::parse(&redirect).ok()?;
+
+    let loopback = match redirect.host()? {
+        Host::Domain(domain) => domain == "localhost",
+        Host::Ipv4(ip) => ip == Ipv4Addr::LOCALHOST,
+        Host::Ipv6(ip) => ip == Ipv6Addr::LOCALHOST,
+    };
+    if redirect.scheme() != "http" || !loopback {
+        return None;
+    }
+
+    redirect.port()
+}
+
+async fn bridge_loopback(policy: &mut PersistentRpcClient, port: u16) {
+    match policy
+        .request(RpcRequest::BridgeLoopback { port }, BRIDGE_TIMEOUT)
+        .await
+    {
+        Ok(RpcReply::Simple(reply)) if reply.ok => {
+            info!(port, "bridged OAuth redirect port from host loopback");
+        }
+        Ok(other) => warn!(port, reply = %other, "policyd refused OAuth redirect bridge"),
+        Err(error) => warn!(port, %error, "OAuth redirect bridge request failed"),
     }
 }
 
@@ -447,7 +623,7 @@ fn build_raw_body(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{collections::HashMap, num::NonZeroU32};
 
     use serde::{Deserialize, Serialize};
     use zbus::{
@@ -455,7 +631,82 @@ mod tests {
         zvariant::{Endian, ObjectPath, Type},
     };
 
-    use super::{DbusBus, is_forbidden_bus_control, rewrite_message, target_from_message};
+    use super::{
+        DbusBus, OpenUriCall, is_forbidden_bus_control, oauth_redirect_port, rewrite_message,
+        target_from_message,
+    };
+
+    fn open_uri(uri: &str) -> Message {
+        Message::method_call("/org/freedesktop/portal/desktop", "OpenURI")
+            .expect("builder")
+            .destination("org.freedesktop.portal.Desktop")
+            .expect("destination")
+            .interface("org.freedesktop.portal.OpenURI")
+            .expect("interface")
+            .build(&OpenUriCall {
+                parent_window: String::new(),
+                uri: uri.to_owned(),
+                options: HashMap::new(),
+            })
+            .expect("message")
+    }
+
+    struct RedirectCase {
+        redirect: &'static str,
+        port: Option<u16>,
+    }
+
+    #[test]
+    fn open_uri_yields_loopback_oauth_redirect_port() {
+        let authorize = |redirect: &str| {
+            format!(
+                "https://auth.example.com/authorize?client_id=abc&redirect_uri={}&state=s",
+                url::form_urlencoded::byte_serialize(redirect.as_bytes()).collect::<String>()
+            )
+        };
+
+        for case in [
+            RedirectCase {
+                redirect: "http://127.0.0.1:3000/callback",
+                port: Some(3000),
+            },
+            RedirectCase {
+                redirect: "http://localhost:54545/callback",
+                port: Some(54545),
+            },
+            RedirectCase {
+                redirect: "http://[::1]:8085/",
+                port: Some(8085),
+            },
+            RedirectCase {
+                redirect: "http://127.0.0.1/callback",
+                port: None,
+            },
+            RedirectCase {
+                redirect: "https://127.0.0.1:3000/callback",
+                port: None,
+            },
+            RedirectCase {
+                redirect: "http://evil.example.com:3000/callback",
+                port: None,
+            },
+            RedirectCase {
+                redirect: "http://127.0.0.2:3000/callback",
+                port: None,
+            },
+        ] {
+            assert_eq!(
+                oauth_redirect_port(&open_uri(&authorize(case.redirect))),
+                case.port,
+                "{}",
+                case.redirect
+            );
+        }
+        assert_eq!(
+            oauth_redirect_port(&open_uri("https://example.com/?next=http://127.0.0.1:3000")),
+            None
+        );
+    }
 
     /// `org.freedesktop.Secret.Item.GetSecret` reply: session, parameters,
     /// value, and content type. The derived D-Bus struct signature matches
