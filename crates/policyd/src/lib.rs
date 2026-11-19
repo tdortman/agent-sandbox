@@ -6,6 +6,7 @@ mod shutdown;
 
 pub mod server;
 pub mod spawn;
+mod stall;
 pub mod store;
 pub mod wire;
 pub use error::PolicydError;

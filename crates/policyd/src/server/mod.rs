@@ -157,6 +157,7 @@ impl PolicyServer {
         }
 
         tokio::spawn(crate::store::run_session_export_ticker(self.store.clone()));
+        tokio::spawn(crate::stall::watch_state_lock(self.store.clone()));
 
         let proxy_path = self.store.args().proxy_socket.clone();
         let proxy_gid = self.store.args().proxy_gid;
