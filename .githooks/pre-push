@@ -12,9 +12,19 @@ while read -r _local_ref _local_sha remote_ref _remote_sha; do
 done
 
 cd "$(git rev-parse --show-toplevel)"
+
+# `nix-output-monitor` keeps build progress readable during a long check.
+nix_ui() {
+    if command -v nom >/dev/null 2>&1; then
+        nom "$@"
+    else
+        nix "$@"
+    fi
+}
+
 echo "pre-push: running cargo clippy-strict and nix flake check ..." >&2
 cargo clippy-strict
-nix flake check
+nix_ui flake check
 
 [[ -n "$push_to_main" ]] || exit 0
 
@@ -24,7 +34,7 @@ if ! command -v cachix >/dev/null 2>&1; then
 fi
 
 echo "pre-push: building and pushing to cachix $CACHE_NAME ..." >&2
-out="$(nix build .# --no-link --print-out-paths)"
+out="$(nix_ui build .# --no-link --print-out-paths)"
 
 # cachix resets SIGPIPE to its default after initialising Nix and only
 # ignores it again on macOS, so a write to a closed pipe or socket kills it
